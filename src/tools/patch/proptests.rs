@@ -457,3 +457,76 @@ fn test_empty_patches_fails() {
     );
     assert!(matches!(result, Err(PatchError::NoPatches)));
 }
+
+// ============================================================================
+// Integration test: Full "overwrite then replace" with real filesystem
+//
+// This recreates the original aberrant behavior demo
+// ============================================================================
+
+#[test]
+fn test_overwrite_then_replace_with_filesystem() {
+    use super::executor::{execute_effects, read_file_content};
+    use std::fs;
+    
+    let test_dir = std::env::temp_dir();
+    let test_file = test_dir.join("test_patch_demo.txt");
+    
+    // Clean up any existing file
+    let _ = fs::remove_file(&test_file);
+    
+    // Create a fresh planner
+    let mut planner = PatchPlanner::new();
+    
+    // Step 1: Overwrite to create the file with "Hello World"
+    let current_content = read_file_content(&test_file).expect("read should succeed");
+    assert!(current_content.is_none(), "file should not exist yet");
+    
+    let plan1 = planner.plan(
+        test_file.clone(),
+        current_content.as_deref(),
+        &[PatchRequest {
+            operation: Operation::Overwrite,
+            old_text: None,
+            new_text: Some("Hello World".to_string()),
+            to_clipboard: None,
+            from_clipboard: None,
+            reindent: None,
+        }],
+    ).expect("overwrite should succeed");
+    
+    execute_effects(&plan1.effects).expect("execute should succeed");
+    
+    // Verify step 1
+    let content_after_1 = fs::read_to_string(&test_file)
+        .expect("file should exist after overwrite");
+    assert_eq!(content_after_1, "Hello World");
+    
+    // Step 2: Replace "Hello World" with "Hello Phoenix IDE"
+    // This is where the original bug occurred!
+    let current_content = read_file_content(&test_file).expect("read should succeed");
+    assert_eq!(current_content.as_deref(), Some("Hello World"));
+    
+    let plan2 = planner.plan(
+        test_file.clone(),
+        current_content.as_deref(),
+        &[PatchRequest {
+            operation: Operation::Replace,
+            old_text: Some("Hello World".to_string()),
+            new_text: Some("Hello Phoenix IDE".to_string()),
+            to_clipboard: None,
+            from_clipboard: None,
+            reindent: None,
+        }],
+    ).expect("replace should succeed after overwrite - this was the bug!");
+    
+    execute_effects(&plan2.effects).expect("execute should succeed");
+    
+    // Verify step 2
+    let content_after_2 = fs::read_to_string(&test_file)
+        .expect("file should exist after replace");
+    assert_eq!(content_after_2, "Hello Phoenix IDE");
+    
+    // Clean up
+    let _ = fs::remove_file(&test_file);
+}
