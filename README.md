@@ -1,31 +1,64 @@
 # PhoenixIDE
 
-> Rising from the ashes - A new beginning
+> Rising from the ashes - A ground-up rewrite
 
-PhoenixIDE is a complete rewrite born from the lessons learned from rustey-shelley. 
-After a catastrophic data loss, we're starting fresh with a cleaner architecture 
-and the wisdom gained from the previous implementation.
+PhoenixIDE is a Rust implementation of an LLM agent development environment, built from the lessons learned from rustey-shelley and the original Go Shelley.
+
+## Architecture
+
+Built on the Elm Architecture pattern:
+- **Pure state machine** at the core (`transition(state, event) -> (new_state, effects)`)
+- **Effect executors** handle all I/O
+- **Property-based testing** validates invariants
+
+## Specifications
+
+All design is driven by spEARS specifications:
+
+- `specs/bedrock/` - Core conversation state machine
+- `specs/bash/` - Bash tool (most critical tool)
 
 ## Core Principles
 
-1. **Immutable Working Directories** - Each conversation has a fixed working directory
-2. **Clear Separation of Concerns** - Tools, execution, and state management are clearly separated
-3. **Robust Error Handling** - Learn from past mistakes
-4. **Git-First Development** - Regular commits, clear history
+1. **Pure State Transitions** - All business logic in testable pure functions
+2. **Immutable Working Directories** - Each conversation has a fixed working directory  
+3. **Sub-Agents** - Parallel task execution with strict isolation (no nesting)
+4. **Graceful Degradation** - Error recovery and server restart resilience
 
-## Project Status
+## MVP Features
 
-- [x] Initial project setup
-- [ ] Core architecture design
-- [ ] Tool system implementation
-- [ ] LLM integration
-- [ ] Web UI
+- Conversation state machine with full lifecycle
+- Bash tool with foreground/background execution
+- Patch tool for file editing
+- Think tool for reasoning
+- Sub-agent spawning (no nesting)
+- Shelley React UI compatibility (graceful feature degradation)
+- SQLite persistence
+- SSE real-time streaming
 
-## Background
+## Not in MVP
 
-This project rose from the ashes of rustey-shelley after a git repository corruption 
-incident on 2026-01-28. We're taking this opportunity to build something better.
+- Browser tools
+- Context window management/continuation
+- Multi-model switching within conversation
+
+## Development
+
+```bash
+# Build
+cargo build
+
+# Test
+cargo test
+
+# Run
+cargo run -- --port 8000
+```
+
+## Frontend
+
+Uses the existing Shelley React UI. Features not implemented in MVP backend will be gracefully disabled.
 
 ---
 
-*"Sometimes you need to burn it all down to build something better"*
+*"From the ashes of chaos, clarity emerges"*
