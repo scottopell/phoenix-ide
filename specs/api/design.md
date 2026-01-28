@@ -22,8 +22,6 @@ RESTful HTTP API for frontend clients to interact with PhoenixIDE. Designed for 
 | GET | `/api/conversation-by-slug/{slug}` | Get conversation by slug |
 | GET | `/api/validate-cwd` | Validate directory path |
 | GET | `/api/list-directory` | List directory contents |
-| POST | `/api/upload` | Upload file |
-| GET | `/api/read` | Read file |
 | GET | `/api/models` | Get available models |
 | GET | `/version` | Get server version |
 
@@ -123,6 +121,7 @@ Slug generated from random words (e.g., "autumn-river-meadow").
 
 ```
 GET /api/conversation/{id}
+GET /api/conversation/{id}?after_sequence=42
 
 Response 200:
 {
@@ -135,6 +134,8 @@ Response 200:
 
 `agent_working` derived from state machine state.
 `context_window_size` from most recent usage data.
+
+With `after_sequence` param, returns only messages with `sequence_id > N`. Used for reconnection catch-up after SSE interruption.
 
 ### Send Message (REQ-API-004)
 
@@ -188,18 +189,20 @@ data: {"type": "agent_done"}
 | `agent_done` | Agent finished turn | None |
 | `error` | Error occurred | Error message |
 
-### Cancel (REQ-API-006)
+### Cancel (REQ-API-004)
 
 ```
 POST /api/conversation/{id}/cancel
 
 Response 200:
 {
-  "cancelled": true
+  "ok": true
 }
 ```
 
-### Archive/Unarchive/Delete (REQ-API-007)
+Forwards cancel event to state machine. State machine handles cancellation logic (REQ-BED-005).
+
+### Archive/Unarchive/Delete (REQ-API-006)
 
 ```
 POST /api/conversation/{id}/archive
@@ -212,7 +215,7 @@ Response 200:
 }
 ```
 
-### Rename (REQ-API-007)
+### Rename (REQ-API-006)
 
 ```
 POST /api/conversation/{id}/rename
@@ -233,7 +236,7 @@ Response 400:
 }
 ```
 
-### Get by Slug (REQ-API-008)
+### Get by Slug (REQ-API-007)
 
 ```
 GET /api/conversation-by-slug/{slug}
@@ -251,7 +254,7 @@ Response 404:
 }
 ```
 
-### Validate Directory (REQ-API-010)
+### Validate Directory (REQ-API-008)
 
 ```
 GET /api/validate-cwd?path=/home/user/project
@@ -268,7 +271,7 @@ Response 200:
 }
 ```
 
-### List Directory (REQ-API-010)
+### List Directory (REQ-API-008)
 
 ```
 GET /api/list-directory?path=/home/user
@@ -282,31 +285,7 @@ Response 200:
 }
 ```
 
-### File Upload (REQ-API-009)
-
-```
-POST /api/upload
-Content-Type: multipart/form-data
-
-file: <binary data>
-
-Response 200:
-{
-  "path": "/tmp/phoenix-uploads/abc123.png"
-}
-```
-
-### File Read (REQ-API-009)
-
-```
-GET /api/read?path=/tmp/phoenix-uploads/abc123.png
-
-Response 200:
-Content-Type: image/png
-<binary data>
-```
-
-### Available Models (REQ-API-011)
+### Available Models (REQ-API-009)
 
 ```
 GET /api/models

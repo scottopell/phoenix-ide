@@ -10,7 +10,7 @@ As a frontend client, I need a well-defined HTTP API so that I can create conver
 
 WHEN client requests conversation list
 THE SYSTEM SHALL return active conversations ordered by last update
-AND include conversation ID, slug, working directory, and timestamps
+AND include conversation ID, slug, working directory, state, and timestamps
 
 WHEN client requests archived conversations
 THE SYSTEM SHALL return archived conversations separately
@@ -21,12 +21,12 @@ THE SYSTEM SHALL return archived conversations separately
 
 ### REQ-API-002: Conversation Creation
 
-WHEN client requests new conversation
-THE SYSTEM SHALL create conversation with specified working directory
-AND generate unique ID and human-readable slug
+WHEN client requests new conversation with working directory path
+THE SYSTEM SHALL validate path exists and is a directory
+AND create conversation with unique ID and human-readable slug
 AND return the new conversation details
 
-WHEN working directory is invalid
+WHEN path validation fails
 THE SYSTEM SHALL return error without creating conversation
 
 **Rationale:** Users start new conversations from specific directories.
@@ -40,120 +40,108 @@ THE SYSTEM SHALL return all messages in sequence order
 AND include message type, content, timestamps, and display data
 AND include current conversation state and context window usage
 
-**Rationale:** Clients need full conversation history for display.
+WHEN client specifies after_sequence parameter
+THE SYSTEM SHALL return only messages with sequence_id greater than specified
+AND include current state for reconnection sync
+
+**Rationale:** Full retrieval for initial load; partial retrieval for reconnection after SSE interruption.
 
 ---
 
-### REQ-API-004: Message Sending
+### REQ-API-004: User Actions
 
 WHEN client sends chat message
-THE SYSTEM SHALL queue message for processing
+THE SYSTEM SHALL queue message for state machine processing
 AND return acknowledgment immediately
-AND trigger state machine to process message
 
-WHEN message includes images
-THE SYSTEM SHALL accept base64-encoded image data
+WHEN client sends chat message with inline images
+THE SYSTEM SHALL accept base64-encoded image data in message payload
 
-**Rationale:** Users send messages to interact with the agent.
+WHEN client requests cancellation
+THE SYSTEM SHALL forward cancel event to state machine
+AND return acknowledgment
+
+**Rationale:** Users interact with agent via messages and can interrupt operations.
 
 ---
 
 ### REQ-API-005: Real-time Streaming
 
-WHEN client connects to conversation stream
-THE SYSTEM SHALL establish Server-Sent Events connection
-AND send current state immediately
-AND stream new messages as they occur
-AND stream state changes
+WHEN client connects to conversation SSE stream
+THE SYSTEM SHALL send current state and agent_working status immediately
+AND stream new messages as they are persisted
+AND stream state changes as they occur
 
 WHEN multiple clients connect to same conversation
 THE SYSTEM SHALL broadcast updates to all connected clients
 
-**Rationale:** Users expect real-time feedback during agent execution.
+WHEN client reconnects after disconnection
+THE SYSTEM SHALL allow catch-up via REQ-API-003 partial retrieval before reconnecting stream
+
+**Rationale:** Users expect real-time feedback during agent execution. Reconnection flow handles network interruptions.
 
 ---
 
-### REQ-API-006: Cancellation
-
-WHEN client requests cancellation
-THE SYSTEM SHALL trigger state machine cancellation
-AND return acknowledgment
-
-**Rationale:** Users need to interrupt long-running operations.
-
----
-
-### REQ-API-007: Conversation Management
+### REQ-API-006: Conversation Lifecycle
 
 WHEN client requests archive
 THE SYSTEM SHALL mark conversation as archived
-AND remove from active list
+AND remove from active conversation list
 
 WHEN client requests unarchive
 THE SYSTEM SHALL restore conversation to active list
 
 WHEN client requests delete
-THE SYSTEM SHALL permanently remove conversation and messages
+THE SYSTEM SHALL permanently remove conversation and all messages
 
-WHEN client requests rename
-THE SYSTEM SHALL update conversation slug
+WHEN client requests rename with new slug
+THE SYSTEM SHALL update slug if not already taken
 
-**Rationale:** Users manage conversation lifecycle.
+**Rationale:** Users manage conversation lifecycle and organization.
 
 ---
 
-### REQ-API-008: Slug-based Access
+### REQ-API-007: Slug Resolution
 
 WHEN client requests conversation by slug
 THE SYSTEM SHALL resolve slug to conversation ID
-AND return conversation details
+AND return conversation details with messages
 
 WHEN slug does not exist
 THE SYSTEM SHALL return 404 error
 
-**Rationale:** Human-readable URLs improve usability.
+**Rationale:** Human-readable URLs in browser improve usability over opaque IDs.
 
 ---
 
-### REQ-API-009: File Operations
+### REQ-API-008: Directory Browser
 
-WHEN client uploads file
-THE SYSTEM SHALL store file and return reference path
-
-WHEN client requests file read
-THE SYSTEM SHALL return file contents with appropriate content type
-
-**Rationale:** Clients need to upload images and read generated files.
-
----
-
-### REQ-API-010: Directory Validation
-
-WHEN client requests directory validation
+WHEN client requests directory validation for conversation creation
 THE SYSTEM SHALL check if path exists and is a directory
-AND return validation result
+AND return validation result with error message if invalid
 
-WHEN client requests directory listing
-THE SYSTEM SHALL return directory contents for navigation
+WHEN client requests directory listing for path browser UI
+THE SYSTEM SHALL return entries with name and is_directory flag
+AND handle permission errors gracefully
 
-**Rationale:** Clients need to validate and browse directories for conversation creation.
+**Rationale:** Conversation creation UI needs to validate and browse filesystem to select working directory.
 
 ---
 
-### REQ-API-011: Model Information
+### REQ-API-009: Model Information
 
 WHEN client requests available models
-THE SYSTEM SHALL return list of available model IDs
-AND include default model
+THE SYSTEM SHALL return list of model IDs that are currently usable
+AND indicate which model is the default
 
-**Rationale:** Clients display model selection to users.
+**Rationale:** UI displays model selection; only shows models with valid API keys configured.
 
 ---
 
-### REQ-API-012: Static Asset Serving
+### REQ-API-010: Static Assets
 
-WHEN client requests frontend assets
-THE SYSTEM SHALL serve embedded UI files
-AND apply appropriate caching headers
+WHEN client requests path not matching API routes
+THE SYSTEM SHALL serve embedded frontend assets
+AND apply appropriate cache headers
 
-**Rationale:** Single binary deployment includes frontend.
+**Rationale:** Single binary deployment includes frontend; no separate static file server needed.
