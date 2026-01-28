@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_to_awaiting_llm() {
+    fn test_idle_to_llm_requesting() {
         let result = transition(
             &ConvState::Idle,
             &test_context(),
@@ -453,7 +453,7 @@ mod tests {
             },
         ).unwrap();
 
-        assert!(matches!(result.new_state, ConvState::AwaitingLlm));
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!result.effects.is_empty());
     }
 
@@ -485,7 +485,7 @@ mod tests {
             },
         ).unwrap();
 
-        assert!(matches!(result.new_state, ConvState::AwaitingLlm));
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }));
     }
 
     #[test]
