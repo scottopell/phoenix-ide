@@ -12,13 +12,13 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-LLM-001:** Provider Abstraction | ❌ Not Started | LlmService trait |
-| **REQ-LLM-002:** Gateway Support | ❌ Not Started | URL construction |
-| **REQ-LLM-003:** Model Registry | ❌ Not Started | Available model enumeration |
-| **REQ-LLM-004:** Request Format | ❌ Not Started | Common request structure |
-| **REQ-LLM-005:** Response Handling | ❌ Not Started | Normalization logic |
-| **REQ-LLM-006:** Error Classification | ❌ Not Started | LlmErrorKind enum |
-| **REQ-LLM-007:** Usage Tracking | ❌ Not Started | Token counts, cost |
-| **REQ-LLM-008:** Request Logging | ❌ Not Started | LoggingService wrapper |
+| **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
+| **REQ-LLM-002:** Gateway Support | ✅ Complete | Gateway URL construction for Anthropic |
+| **REQ-LLM-003:** Model Registry | ✅ Complete | ModelRegistry with available_models() |
+| **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
+| **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
+| **REQ-LLM-006:** Error Classification | ✅ Complete | LlmErrorKind with is_retryable() |
+| **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
+| **REQ-LLM-008:** Request Logging | ✅ Complete | LoggingService wrapper with tracing |
 
-**Progress:** 0 of 8 complete
+**Progress:** 8 of 8 complete

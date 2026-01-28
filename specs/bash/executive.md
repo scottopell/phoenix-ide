@@ -12,11 +12,11 @@ Implemented as a Tool trait with schema defining `command` (required) and `mode`
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-BASH-001:** Command Execution | ❌ Not Started | Core executor |
-| **REQ-BASH-002:** Timeout Management | ❌ Not Started | Mode-based timeouts |
-| **REQ-BASH-003:** Background Execution | ❌ Not Started | Detached process handling |
-| **REQ-BASH-004:** No TTY Attached | ❌ Not Started | Stdin null, no terminal |
-| **REQ-BASH-005:** Tool Schema | ❌ Not Started | Schema with mode enum |
-| **REQ-BASH-006:** Error Reporting | ❌ Not Started | Exit codes, output formatting |
+| **REQ-BASH-001:** Command Execution | ✅ Complete | bash -c execution with working dir |
+| **REQ-BASH-002:** Timeout Management | ✅ Complete | 30s default, 15min slow mode |
+| **REQ-BASH-003:** Background Execution | ✅ Complete | Detached with output file, returns PID |
+| **REQ-BASH-004:** No TTY Attached | ✅ Complete | stdin null, process group |
+| **REQ-BASH-005:** Tool Schema | ✅ Complete | Schema with mode enum (default/slow/background) |
+| **REQ-BASH-006:** Error Reporting | ✅ Complete | Exit codes, truncated output |
 
-**Progress:** 0 of 6 complete
+**Progress:** 6 of 6 complete

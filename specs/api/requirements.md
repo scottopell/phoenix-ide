@@ -26,10 +26,16 @@ THE SYSTEM SHALL validate path exists and is a directory
 AND create conversation with unique ID and human-readable slug
 AND return the new conversation details
 
+WHEN generating slug
+THE SYSTEM SHALL use format: `{day-of-week}-{time-of-day}-{word}-{word}`
+WHERE day-of-week is from user's local timezone (monday, tuesday, etc.)
+AND time-of-day is morning/afternoon/evening/night based on local hour
+AND words are random dictionary words
+
 WHEN path validation fails
 THE SYSTEM SHALL return error without creating conversation
 
-**Rationale:** Users start new conversations from specific directories.
+**Rationale:** Users start new conversations from specific directories. Time-based slugs help users locate recent conversations; random words ensure uniqueness.
 
 ---
 
@@ -50,9 +56,13 @@ AND include current state for reconnection sync
 
 ### REQ-API-004: User Actions
 
-WHEN client sends chat message
-THE SYSTEM SHALL queue message for state machine processing
+WHEN client sends chat message while conversation is idle or in error state
+THE SYSTEM SHALL forward message to state machine for processing
 AND return acknowledgment immediately
+
+WHEN client sends chat message while agent is busy
+THE SYSTEM SHALL return error indicating agent is busy
+AND inform user they can cancel current operation
 
 WHEN client sends chat message with inline images
 THE SYSTEM SHALL accept base64-encoded image data in message payload
@@ -61,24 +71,25 @@ WHEN client requests cancellation
 THE SYSTEM SHALL forward cancel event to state machine
 AND return acknowledgment
 
-**Rationale:** Users interact with agent via messages and can interrupt operations.
+**Rationale:** Users interact with agent via messages and can interrupt operations. Rejecting messages while busy simplifies the state machine and makes message ordering explicit.
 
 ---
 
 ### REQ-API-005: Real-time Streaming
 
 WHEN client connects to conversation SSE stream
-THE SYSTEM SHALL send current state and agent_working status immediately
+THE SYSTEM SHALL send init event with current state, agent_working status, and last_sequence_id
 AND stream new messages as they are persisted
 AND stream state changes as they occur
+
+WHEN client connects with `after` query parameter
+THE SYSTEM SHALL include only messages with sequence_id > after in init event
+AND then stream new messages normally
 
 WHEN multiple clients connect to same conversation
 THE SYSTEM SHALL broadcast updates to all connected clients
 
-WHEN client reconnects after disconnection
-THE SYSTEM SHALL allow catch-up via REQ-API-003 partial retrieval before reconnecting stream
-
-**Rationale:** Users expect real-time feedback during agent execution. Reconnection flow handles network interruptions.
+**Rationale:** Users expect real-time feedback during agent execution. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions.
 
 ---
 

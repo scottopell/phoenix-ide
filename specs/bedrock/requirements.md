@@ -25,10 +25,24 @@ THE SYSTEM SHALL transition to awaiting LLM response
 AND queue the message for LLM processing
 
 WHEN user sends a message while agent is working
-THE SYSTEM SHALL queue the message as a follow-up
-AND process it after current work completes
+THE SYSTEM SHALL reject the message with "agent is busy" error
+AND inform user they can cancel current operation
 
-**Rationale:** Users expect their messages to be acknowledged and processed in order, even during active agent work.
+**Rationale:** Users can cancel and send a new message if needed. Rejecting during busy state simplifies the state machine and avoids hidden message queues.
+
+---
+
+### REQ-BED-013: Image Handling
+
+WHEN user sends message with attached images
+THE SYSTEM SHALL include images in the message content sent to LLM
+AND persist image references in message history
+
+WHEN preparing LLM request with images
+THE SYSTEM SHALL encode images appropriately for the provider
+AND respect provider image size limits by resizing if necessary
+
+**Rationale:** Users need to share screenshots, diagrams, and other visual context with the agent. Image handling must flow cleanly through the state machine to the LLM provider.
 
 ---
 
@@ -114,11 +128,11 @@ AND attempt to continue the conversation
 WHEN conversation state changes
 THE SYSTEM SHALL persist the new state before executing effects
 
-WHEN server restarts with active conversations
-THE SYSTEM SHALL restore conversations to their persisted state
-AND resume pending operations
+WHEN server restarts
+THE SYSTEM SHALL restore all conversations to idle state
+AND preserve complete message history
 
-**Rationale:** Users expect their conversations to survive server restarts without data loss.
+**Rationale:** Users expect their conversation history to survive server restarts. Resuming from idle is simple and predictable; users can re-send their last message if interrupted.
 
 ---
 

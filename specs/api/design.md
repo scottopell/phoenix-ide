@@ -115,7 +115,7 @@ Response 400:
 }
 ```
 
-Slug generated from random words (e.g., "autumn-river-meadow").
+Slug generated as `{day}-{time}-{word}-{word}` (e.g., "monday-morning-autumn-river").
 
 ### Get Conversation (REQ-API-003)
 
@@ -135,7 +135,7 @@ Response 200:
 `agent_working` derived from state machine state.
 `context_window_size` from most recent usage data.
 
-With `after_sequence` param, returns only messages with `sequence_id > N`. Used for reconnection catch-up after SSE interruption.
+With `after_sequence` param, returns only messages with `sequence_id > N`. Useful for debugging or manual inspection; SSE reconnection should use the `?after` param on the stream endpoint instead.
 
 ### Send Message (REQ-API-004)
 
@@ -165,12 +165,13 @@ Message queued for state machine processing. Updates arrive via SSE stream.
 
 ```
 GET /api/conversation/{id}/stream
+GET /api/conversation/{id}/stream?after=42
 Accept: text/event-stream
 
 Response 200:
 Content-Type: text/event-stream
 
-data: {"type": "init", "conversation": Conversation, "messages": [Message, ...], "agent_working": true}
+data: {"type": "init", "conversation": Conversation, "messages": [Message, ...], "agent_working": true, "last_sequence_id": 57}
 
 data: {"type": "message", "message": Message}
 
@@ -179,11 +180,13 @@ data: {"type": "state_change", "state": "tool_executing", "state_data": {...}}
 data: {"type": "agent_done"}
 ```
 
+With `after=N` parameter, init event includes only messages with `sequence_id > N`. This enables seamless reconnection: client stores last_sequence_id, reconnects with `?after=<last_sequence_id>`, receives missed messages in init, then continues streaming.
+
 #### Event Types
 
 | Type | Description | Payload |
 |------|-------------|--------|
-| `init` | Initial state on connect | Full conversation + messages |
+| `init` | Initial state on connect | Conversation + messages (filtered by after) + last_sequence_id |
 | `message` | New message added | Single message |
 | `state_change` | Conversation state changed | New state + state_data |
 | `agent_done` | Agent finished turn | None |

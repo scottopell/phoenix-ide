@@ -56,9 +56,6 @@ enum ConvState {
         message: String, 
         error_kind: ErrorKind,  // Auth, RateLimit, Network, Unknown
     },
-    
-    /// Server restarted, need to resume
-    RestartPending,
 }
 
 /// Error classification for UI display (REQ-BED-006)
@@ -75,8 +72,8 @@ enum ErrorKind {
 
 ```rust
 enum Event {
-    // User events (REQ-BED-002)
-    UserMessage { text: String, images: Vec<Image> },
+    // User events (REQ-BED-002, REQ-BED-013)
+    UserMessage { text: String, images: Vec<Image> },  // Images handled per REQ-BED-013
     UserCancel,  // REQ-BED-005
     
     // LLM events (REQ-BED-003, REQ-BED-006)
@@ -91,8 +88,6 @@ enum Event {
     // Sub-agent events (REQ-BED-008, REQ-BED-009)
     SubAgentResult { agent_id: String, result: SubAgentResult },
     
-    // System events (REQ-BED-007)
-    ServerRestart,
 }
 ```
 
@@ -308,13 +303,17 @@ fn sub_agent_tools() -> Vec<Tool> {
 | LlmRequesting{3} | LlmError(retryable) | Error | NotifyClient |
 | LlmRequesting | LlmError(non-retryable) | Error | NotifyClient |
 | LlmRequesting | UserCancel | Cancelling | PersistState |
+| LlmRequesting | UserMessage | **REJECT** | Return error "agent is busy" |
 | ToolExecuting(last) | ToolComplete | AwaitingLlm | PersistMessage |
 | ToolExecuting | ToolComplete | ToolExecuting(next) | PersistMessage, ExecuteTool(next) |
 | ToolExecuting | UserCancel | Idle | PersistMessage(synthetic), NotifyClient |
+| ToolExecuting | UserMessage | **REJECT** | Return error "agent is busy" |
 | Cancelling | LlmResponse | Idle | NotifyClient |
+| Cancelling | UserMessage | **REJECT** | Return error "cancellation in progress" |
 | Error | UserMessage | AwaitingLlm | PersistMessage, PersistState |
 | Idle | SpawnSubAgents | AwaitingSubAgents | SpawnSubAgent×N |
 | AwaitingSubAgents | SubAgentResult(last) | AwaitingLlm | PersistMessage |
+| AwaitingSubAgents | UserMessage | **REJECT** | Return error "agent is busy" |
 
 ## Database Schema (REQ-BED-007)
 
@@ -350,15 +349,6 @@ CREATE TABLE messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE TABLE pending_followups (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-);
 ```
 
 ## Runtime Event Loop
