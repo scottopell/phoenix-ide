@@ -22,10 +22,10 @@ AND indicate truncation occurred
 
 ### REQ-BASH-002: Timeout Management
 
-WHEN agent executes command without `slow_ok` flag
+WHEN agent executes command in default mode
 THE SYSTEM SHALL apply 30-second timeout
 
-WHEN agent executes command with `slow_ok=true`
+WHEN agent executes command in slow mode
 THE SYSTEM SHALL apply 15-minute timeout
 
 WHEN command exceeds its timeout
@@ -66,70 +66,33 @@ AND wait for cleanup with 15-second grace period
 
 ---
 
-### REQ-BASH-005: Working Directory Validation
+### REQ-BASH-005: No TTY Attached
 
-WHEN command execution is requested
-THE SYSTEM SHALL verify working directory exists
+WHEN command is executed
+THE SYSTEM SHALL run without a TTY attached
 
-WHEN working directory does not exist
-THE SYSTEM SHALL return error indicating invalid directory
-AND suggest using valid directory
-
-**Rationale:** Agents need clear feedback when operating in invalid directories to recover gracefully.
+**Rationale:** Agents cannot interact with terminal prompts; commands must operate in non-interactive mode.
 
 ---
 
-### REQ-BASH-006: Command Safety Check
-
-WHEN command is received
-THE SYSTEM SHALL perform basic safety validation
-AND reject obviously dangerous patterns
-
-WHEN command fails safety check
-THE SYSTEM SHALL return descriptive error
-AND not execute the command
-
-**Rationale:** Agents benefit from guardrails that prevent accidental destructive operations.
-
----
-
-### REQ-BASH-007: Git Co-authorship
-
-WHEN command contains git commit
-THE SYSTEM SHALL add co-author trailer for the agent
-
-**Rationale:** Users benefit from clear attribution of AI-assisted commits in version history.
-
----
-
-### REQ-BASH-008: Interactive Command Handling
-
-WHEN command would invoke interactive editor
-THE SYSTEM SHALL configure environment to fail gracefully
-
-WHEN git interactive rebase is attempted in foreground
-THE SYSTEM SHALL suggest running as background task
-
-**Rationale:** Agents cannot interact with editors; clear failure messages help agents adapt their approach.
-
----
-
-### REQ-BASH-009: Tool Schema
+### REQ-BASH-006: Tool Schema
 
 WHEN LLM requests bash tool
 THE SYSTEM SHALL provide schema with:
 - `command` (required string): The shell command to execute
-- `slow_ok` (optional boolean): Whether to use extended timeout
-- `background` (optional boolean): Whether to run detached
+- `mode` (optional enum): Execution mode - `default`, `slow`, or `background`
+
+WHEN mode is omitted
+THE SYSTEM SHALL use default mode (30-second foreground)
 
 WHEN schema is provided to LLM
 THE SYSTEM SHALL include current working directory in description
 
-**Rationale:** Agents need clear, well-documented tool interface to use bash effectively.
+**Rationale:** Agents need clear, well-documented tool interface. Single mode enum prevents invalid state combinations.
 
 ---
 
-### REQ-BASH-010: Error Reporting
+### REQ-BASH-007: Error Reporting
 
 WHEN command fails with non-zero exit code
 THE SYSTEM SHALL include exit code in response
