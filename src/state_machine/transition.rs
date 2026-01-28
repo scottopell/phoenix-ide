@@ -67,27 +67,26 @@ pub fn transition(
         // User Message Handling (REQ-BED-002)
         // ============================================================
         
-        // Idle + UserMessage -> AwaitingLlm
+        // Idle + UserMessage -> LlmRequesting
         (ConvState::Idle, Event::UserMessage { text, images }) => {
             let content = build_user_message_content(&text, &images);
-            Ok(TransitionResult::new(ConvState::AwaitingLlm)
+            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::persist_user_message(content))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::RequestLlm))
         }
 
-        // Error + UserMessage -> AwaitingLlm (recovery, REQ-BED-006)
+        // Error + UserMessage -> LlmRequesting (recovery, REQ-BED-006)
         (ConvState::Error { .. }, Event::UserMessage { text, images }) => {
             let content = build_user_message_content(&text, &images);
-            Ok(TransitionResult::new(ConvState::AwaitingLlm)
+            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::persist_user_message(content))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::RequestLlm))
         }
 
         // Busy states + UserMessage -> Reject (REQ-BED-002)
-        (ConvState::AwaitingLlm, Event::UserMessage { .. })
-        | (ConvState::LlmRequesting { .. }, Event::UserMessage { .. })
+        (ConvState::LlmRequesting { .. }, Event::UserMessage { .. })
         | (ConvState::ToolExecuting { .. }, Event::UserMessage { .. })
         | (ConvState::AwaitingSubAgents { .. }, Event::UserMessage { .. }) => {
             Err(TransitionError::AgentBusy)

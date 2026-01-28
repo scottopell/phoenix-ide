@@ -57,7 +57,14 @@ pub struct AnthropicService {
 impl AnthropicService {
     pub fn new(api_key: String, model: AnthropicModel, gateway: Option<&str>) -> Self {
         let base_url = match gateway {
-            Some(gw) => format!("{}/_/gateway/anthropic/v1/messages", gw.trim_end_matches('/')),
+            Some(gw) => {
+                // Support both exe.dev internal gateway and external gateway
+                if gw.contains("169.254.169.254") || gw.starts_with("http://169") {
+                    format!("{}/gateway/llm/anthropic/v1/messages", gw.trim_end_matches('/'))
+                } else {
+                    format!("{}/_/gateway/anthropic/v1/messages", gw.trim_end_matches('/'))
+                }
+            }
             None => "https://api.anthropic.com/v1/messages".to_string(),
         };
         
