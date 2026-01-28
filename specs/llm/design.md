@@ -42,7 +42,6 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
-    pub cost_usd: Option<f64>,
 }
 ```
 
@@ -157,33 +156,43 @@ impl ModelRegistry {
     pub fn new(config: &LlmConfig, logger: slog::Logger) -> Self {
         let mut services = HashMap::new();
         
-        // Register Anthropic models if API key available
-        if let Some(key) = &config.anthropic_api_key {
-            services.insert(
-                "claude-opus-4.5".to_string(),
-                Arc::new(AnthropicService::new(
-                    key.clone(),
-                    AnthropicModel::Claude45Opus,
-                    config.gateway.as_deref(),
-                )) as Arc<dyn LlmService>,
-            );
-            // ... other Claude models
-        }
-        
-        // Register OpenAI models if API key available
-        if let Some(key) = &config.openai_api_key {
-            services.insert(
-                "gpt-5".to_string(),
-                Arc::new(OpenAiService::new(
-                    key.clone(),
-                    OpenAiModel::Gpt5,
-                    config.gateway.as_deref(),
-                )) as Arc<dyn LlmService>,
-            );
-            // ... other GPT models
+        if config.gateway.is_some() {
+            // Gateway mode: register all models, gateway handles API keys
+            Self::register_all_models(&mut services, config);
+        } else {
+            // Direct mode: register only models with API keys
+            if config.anthropic_api_key.is_some() {
+                Self::register_anthropic_models(&mut services, config);
+            }
+            if config.openai_api_key.is_some() {
+                Self::register_openai_models(&mut services, config);
+            }
+            if config.fireworks_api_key.is_some() {
+                Self::register_fireworks_models(&mut services, config);
+            }
         }
         
         Self { services, logger }
+    }
+    
+    fn register_all_models(services: &mut HashMap<String, Arc<dyn LlmService>>, config: &LlmConfig) {
+        // Gateway handles keys, so register everything
+        Self::register_anthropic_models(services, config);
+        Self::register_openai_models(services, config);
+        Self::register_fireworks_models(services, config);
+    }
+    
+    fn register_anthropic_models(services: &mut HashMap<String, Arc<dyn LlmService>>, config: &LlmConfig) {
+        let key = config.anthropic_api_key.clone().unwrap_or_default();
+        services.insert(
+            "claude-opus-4.5".to_string(),
+            Arc::new(AnthropicService::new(key.clone(), AnthropicModel::Claude45Opus, config.gateway.as_deref())),
+        );
+        services.insert(
+            "claude-sonnet-4.5".to_string(),
+            Arc::new(AnthropicService::new(key.clone(), AnthropicModel::Claude45Sonnet, config.gateway.as_deref())),
+        );
+        // ... other Claude models
     }
     
     pub fn get(&self, model_id: &str) -> Option<Arc<dyn LlmService>> {
@@ -290,7 +299,6 @@ impl AnthropicService {
                 output_tokens: resp.usage.output_tokens,
                 cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
                 cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
-                cost_usd: self.calculate_cost(&resp.usage),
             },
         }
     }
@@ -310,22 +318,6 @@ impl Usage {
         self.input_tokens == 0 && self.output_tokens == 0
     }
 }
-
-// Cost calculation per model
-impl AnthropicService {
-    fn calculate_cost(&self, usage: &AnthropicUsage) -> Option<f64> {
-        let (input_cost, output_cost) = match self.model {
-            AnthropicModel::Claude45Opus => (15.0 / 1_000_000.0, 75.0 / 1_000_000.0),
-            AnthropicModel::Claude45Sonnet => (3.0 / 1_000_000.0, 15.0 / 1_000_000.0),
-            AnthropicModel::Claude45Haiku => (0.25 / 1_000_000.0, 1.25 / 1_000_000.0),
-        };
-        
-        Some(
-            usage.input_tokens as f64 * input_cost +
-            usage.output_tokens as f64 * output_cost
-        )
-    }
-}
 ```
 
 ## Request Logging (REQ-LLM-008)
@@ -335,7 +327,6 @@ pub struct LoggingService {
     inner: Arc<dyn LlmService>,
     logger: slog::Logger,
     model_id: String,
-    history: Option<Arc<RequestHistory>>,
 }
 
 #[async_trait]
@@ -362,16 +353,6 @@ impl LlmService for LoggingService {
                     "retryable" => e.kind.is_retryable(),
                 );
             }
-        }
-        
-        // Record for debug inspection if enabled
-        if let Some(history) = &self.history {
-            history.record(RequestRecord {
-                timestamp: Utc::now(),
-                model_id: self.model_id.clone(),
-                duration,
-                result: result.as_ref().map(|r| r.usage.clone()).err().map(|e| e.message.clone()),
-            });
         }
         
         result

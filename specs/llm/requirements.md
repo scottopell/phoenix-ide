@@ -35,14 +35,18 @@ THE SYSTEM SHALL connect directly to provider APIs
 
 ### REQ-LLM-003: Model Registry
 
-WHEN server starts
+WHEN server starts with direct API access
 THE SYSTEM SHALL enumerate available models based on configured API keys
 AND make unavailable models inaccessible
+
+WHEN server starts with gateway configured
+THE SYSTEM SHALL enumerate all supported models as available
+AND rely on gateway for API key management
 
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
-**Rationale:** Users see only models they can actually use, avoiding confusion about missing API keys.
+**Rationale:** Users see only models they can actually use. Gateway mode delegates key management to exe.dev infrastructure.
 
 ---
 
@@ -98,10 +102,10 @@ THE SYSTEM SHALL include retry-after hint when available
 WHEN LLM response includes token counts
 THE SYSTEM SHALL record input tokens, output tokens, and cache statistics
 
-WHEN cost information is calculable
-THE SYSTEM SHALL estimate cost in USD
+WHEN tracking context window usage
+THE SYSTEM SHALL compute total as input + output + cache tokens
 
-**Rationale:** Users need visibility into resource consumption for cost management.
+**Rationale:** Users need visibility into token consumption for context window management.
 
 ---
 
@@ -110,7 +114,4 @@ THE SYSTEM SHALL estimate cost in USD
 WHEN LLM request completes
 THE SYSTEM SHALL log model, duration, token counts, and any errors
 
-WHEN debug mode is enabled
-THE SYSTEM SHALL retain recent request/response bodies for inspection
-
-**Rationale:** Debugging LLM issues requires visibility into actual API traffic.
+**Rationale:** Operational visibility into LLM requests for monitoring and troubleshooting.
