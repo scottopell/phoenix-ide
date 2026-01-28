@@ -52,21 +52,7 @@ THE SYSTEM SHALL provide process group ID for termination via `kill -9 -<pgid>`
 
 ---
 
-### REQ-BASH-004: Process Isolation
-
-WHEN command is executed
-THE SYSTEM SHALL create a new process group
-AND isolate environment variables containing secrets
-
-WHEN command is terminated (timeout or cancellation)
-THE SYSTEM SHALL kill the entire process group
-AND wait for cleanup with 15-second grace period
-
-**Rationale:** Agents need clean process management to prevent orphaned processes and secret leakage.
-
----
-
-### REQ-BASH-005: No TTY Attached
+### REQ-BASH-004: No TTY Attached
 
 WHEN command is executed
 THE SYSTEM SHALL run without a TTY attached
@@ -75,7 +61,7 @@ THE SYSTEM SHALL run without a TTY attached
 
 ---
 
-### REQ-BASH-006: Tool Schema
+### REQ-BASH-005: Tool Schema
 
 WHEN LLM requests bash tool
 THE SYSTEM SHALL provide schema with:
@@ -92,7 +78,7 @@ THE SYSTEM SHALL include current working directory in description
 
 ---
 
-### REQ-BASH-007: Error Reporting
+### REQ-BASH-006: Error Reporting
 
 WHEN command fails with non-zero exit code
 THE SYSTEM SHALL include exit code in response

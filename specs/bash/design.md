@@ -82,7 +82,7 @@ impl BashTool {
 }
 ```
 
-## Foreground Execution (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005)
+## Foreground Execution (REQ-BASH-001, REQ-BASH-002, REQ-BASH-004)
 
 ```rust
 async fn execute_foreground(&self, command: String, mode: ExecutionMode) -> ToolResult {
@@ -95,28 +95,17 @@ async fn execute_foreground(&self, command: String, mode: ExecutionMode) -> Tool
     let mut cmd = Command::new("bash");
     cmd.args(["-c", &command])
        .current_dir(&self.working_dir)
-       .stdin(Stdio::null())       // REQ-BASH-005: No TTY
+       .stdin(Stdio::null())       // REQ-BASH-004: No TTY
        .stdout(Stdio::piped())
        .stderr(Stdio::piped());
-    
-    // REQ-BASH-004: Process group isolation
-    cmd.process_group(0);
-    
-    // REQ-BASH-004: Environment isolation
-    cmd.env_clear();
-    for (key, value) in std::env::vars() {
-        if !self.is_secret_env(&key) {
-            cmd.env(key, value);
-        }
-    }
     
     let child = cmd.spawn()?;
     
     match tokio::time::timeout(timeout, self.wait_with_output(child)).await {
         Ok(result) => self.format_output(result),
         Err(_) => {
-            // REQ-BASH-002: Kill process group on timeout
-            self.kill_process_group(child.id());
+            // REQ-BASH-002: Kill process on timeout
+            child.kill();
             ToolResult::Error(format!(
                 "[command timed out after {:?}]", timeout
             ))
@@ -141,8 +130,7 @@ async fn execute_background(&self, command: String) -> ToolResult {
        .current_dir(&self.working_dir)
        .stdin(Stdio::null())
        .stdout(output_handle.try_clone()?)
-       .stderr(output_handle)
-       .process_group(0);  // REQ-BASH-004
+       .stderr(output_handle);
     
     let child = cmd.spawn()?;
     let pid = child.id();
@@ -174,7 +162,7 @@ async fn execute_background(&self, command: String) -> ToolResult {
 }
 ```
 
-## Output Formatting (REQ-BASH-001, REQ-BASH-007)
+## Output Formatting (REQ-BASH-001, REQ-BASH-006)
 
 ```rust
 const MAX_OUTPUT_LENGTH: usize = 128 * 1024;  // 128KB
@@ -195,7 +183,7 @@ fn format_output(&self, result: CommandResult) -> ToolResult {
         output
     };
     
-    // REQ-BASH-007: Include exit code for failures
+    // REQ-BASH-006: Include exit code for failures
     if !result.status.success() {
         ToolResult::Error(format!(
             "[command failed: exit code {}]\n{}",
@@ -208,41 +196,16 @@ fn format_output(&self, result: CommandResult) -> ToolResult {
 }
 ```
 
-## Process Group Management (REQ-BASH-004)
-
-```rust
-fn kill_process_group(&self, pid: u32) {
-    // Kill entire process group (negative PID)
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
-
-// Environment variables to filter (secrets)
-fn is_secret_env(&self, key: &str) -> bool {
-    let secret_prefixes = [
-        "ANTHROPIC_",
-        "OPENAI_",
-        "GEMINI_",
-        "AWS_SECRET",
-        "PHOENIX_",  // Internal Phoenix secrets
-    ];
-    secret_prefixes.iter().any(|p| key.starts_with(p))
-}
-```
-
 ## Testing Strategy
 
 ### Unit Tests
 - Output truncation at various sizes
 - Timeout behavior (mocked time)
 - Mode parsing and validation
-- Environment filtering
 
 ### Integration Tests
 - Foreground command execution (default and slow modes)
 - Background process lifecycle
-- Process group cleanup on timeout
 - Exit code handling
 
 ### Property Tests
@@ -251,14 +214,6 @@ fn is_secret_env(&self, key: &str) -> bool {
 fn output_never_exceeds_limit(output: String) {
     let formatted = format_output(output);
     assert!(formatted.len() <= MAX_OUTPUT_LENGTH + 200);  // Allow for metadata
-}
-
-#[proptest]
-fn secrets_never_leaked(env_vars: HashMap<String, String>) {
-    let filtered = filter_environment(&env_vars);
-    for (key, _) in &filtered {
-        assert!(!is_secret_env(key));
-    }
 }
 ```
 
