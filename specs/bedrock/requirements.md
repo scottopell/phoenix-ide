@@ -40,7 +40,7 @@ AND persist the response for display
 
 WHEN LLM responds with tool use requests
 THE SYSTEM SHALL transition to tool executing state
-AND queue all requested tools for execution
+AND queue tools for serial execution in request order
 
 WHEN LLM responds with text only and end_turn=false
 THE SYSTEM SHALL continue awaiting additional LLM content
@@ -52,18 +52,18 @@ THE SYSTEM SHALL continue awaiting additional LLM content
 ### REQ-BED-004: Tool Execution Coordination
 
 WHEN multiple tools are requested in a single LLM response
-THE SYSTEM SHALL execute all tools concurrently
-AND collect results preserving request order
+THE SYSTEM SHALL execute tools serially in the order requested
+AND complete each tool before starting the next
 
-WHEN all tools complete successfully
+WHEN all tools complete
 THE SYSTEM SHALL transition to awaiting LLM response
-AND send tool results to LLM
+AND send all tool results to LLM
 
 WHEN any tool fails
 THE SYSTEM SHALL include the error in results sent to LLM
 AND allow LLM to handle the error
 
-**Rationale:** Users benefit from faster execution through parallelism while maintaining predictable result ordering.
+**Rationale:** Serial execution respects LLM's intended order and prevents resource conflicts between tools.
 
 ---
 
@@ -74,30 +74,38 @@ THE SYSTEM SHALL transition to cancelling state
 AND complete gracefully when LLM responds
 
 WHEN user requests cancellation during tool execution
-THE SYSTEM SHALL attempt to stop running tools
-AND transition to idle after cleanup
+THE SYSTEM SHALL attempt to stop the running tool
+AND record a synthetic tool result indicating cancellation
+AND skip remaining queued tools with synthetic cancelled results
 
 WHEN cancellation completes
-THE SYSTEM SHALL preserve all conversation history
-AND allow user to continue the conversation
+THE SYSTEM SHALL transition to idle
+AND preserve all conversation history including synthetic results
 
-**Rationale:** Users need the ability to interrupt long-running operations without losing their work.
+**Rationale:** Users need the ability to interrupt long-running operations. Synthetic tool results maintain message chain integrity required by LLM APIs.
 
 ---
 
 ### REQ-BED-006: Error Recovery
 
-WHEN LLM request fails with retryable error
-THE SYSTEM SHALL retry up to 3 times with exponential backoff
+WHEN LLM request fails with retryable error (network, rate limit, 5xx)
+THE SYSTEM SHALL retry automatically up to 3 times with exponential backoff
+AND remain in LLM requesting state during retries
+AND display retry status to user
 
-WHEN LLM request fails after all retries
+WHEN LLM request fails after all retries exhausted
 THE SYSTEM SHALL transition to error state
-AND display actionable error message to user
+AND display actionable error message indicating retry failure
 
-WHEN conversation enters error state
-THE SYSTEM SHALL allow user to retry or continue with new message
+WHEN LLM request fails with non-retryable error (auth, 4xx)
+THE SYSTEM SHALL transition to error state immediately
+AND display specific error message
 
-**Rationale:** Users should not lose their conversation due to transient failures.
+WHEN user sends message while in error state
+THE SYSTEM SHALL transition to awaiting LLM
+AND attempt to continue the conversation
+
+**Rationale:** Users should not lose their conversation due to transient failures. Clear error states with specific messages enable recovery.
 
 ---
 
@@ -120,15 +128,19 @@ WHEN LLM requests sub-agent spawn
 THE SYSTEM SHALL create independent sub-agent conversations
 AND execute them in parallel
 
-WHEN all sub-agents complete
+WHEN sub-agent completes its task
+THE SYSTEM SHALL require it to call a dedicated result submission tool
+AND capture the submitted result
+
+WHEN all sub-agents have submitted results
 THE SYSTEM SHALL aggregate results
 AND return them to parent conversation
 
-WHEN any sub-agent fails
+WHEN any sub-agent fails or times out without submitting
 THE SYSTEM SHALL include failure information in aggregated results
 AND allow parent to handle the failure
 
-**Rationale:** Users benefit from parallel task execution for bootstrapping and complex multi-step operations.
+**Rationale:** Users benefit from parallel task execution for bootstrapping and complex operations. Explicit result submission provides clean completion semantics.
 
 ---
 
@@ -137,6 +149,7 @@ AND allow parent to handle the failure
 WHEN sub-agent is executing
 THE SYSTEM SHALL maintain completely independent state from parent
 AND prevent sub-agents from spawning their own sub-agents
+AND provide only the result submission tool plus standard tools
 
 WHEN sub-agent conversation exists
 THE SYSTEM SHALL track it as non-user-initiated
@@ -146,16 +159,15 @@ AND exclude it from normal conversation listings
 
 ---
 
-### REQ-BED-010: Immutable Working Directory
+### REQ-BED-010: Fixed Working Directory
 
 WHEN conversation is created
 THE SYSTEM SHALL assign a fixed working directory
 
 WHEN tools execute
-THE SYSTEM SHALL use the conversation's assigned working directory
-AND reject attempts to change it
+THE SYSTEM SHALL use the conversation's assigned working directory as the starting point
 
-**Rationale:** Users benefit from simplified mental model where each conversation operates in a predictable location.
+**Rationale:** Users benefit from simplified mental model where each conversation operates from a predictable location. Shell cd commands within tool execution follow normal semantics but do not persist across tool calls.
 
 ---
 

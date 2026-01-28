@@ -32,17 +32,18 @@ enum ConvState {
     /// User message received, preparing LLM request
     AwaitingLlm,
     
-    /// LLM request in flight
-    LlmRequesting,
+    /// LLM request in flight, with retry tracking
+    LlmRequesting { attempt: u32 },
     
-    /// Executing one or more tools
+    /// Executing tools serially (REQ-BED-004)
     ToolExecuting {
-        pending_tool_ids: Vec<String>,
+        current_tool_id: String,
+        remaining_tool_ids: Vec<String>,
         completed_results: Vec<ToolResult>,
     },
     
     /// User requested cancellation, waiting for graceful completion
-    Cancelling,
+    Cancelling { pending_tool_id: Option<String> },
     
     /// Waiting for sub-agents to complete (REQ-BED-008)
     AwaitingSubAgents {
@@ -50,11 +51,23 @@ enum ConvState {
         completed_results: Vec<SubAgentResult>,
     },
     
-    /// Unrecoverable error occurred
-    Error { message: String, retryable: bool },
+    /// Error occurred - UI displays this state directly (REQ-BED-006)
+    Error { 
+        message: String, 
+        error_kind: ErrorKind,  // Auth, RateLimit, Network, Unknown
+    },
     
     /// Server restarted, need to resume
     RestartPending,
+}
+
+/// Error classification for UI display (REQ-BED-006)
+enum ErrorKind {
+    Auth,           // 401, 403 - non-retryable
+    RateLimit,      // 429 - was retried, exhausted
+    Network,        // Timeout, connection - was retried, exhausted  
+    InvalidRequest, // 400 - non-retryable
+    Unknown,        // Other errors
 }
 ```
 
@@ -65,24 +78,21 @@ enum Event {
     // User events (REQ-BED-002)
     UserMessage { text: String, images: Vec<Image> },
     UserCancel,  // REQ-BED-005
-    UserRetry,   // REQ-BED-006
     
-    // LLM events (REQ-BED-003)
+    // LLM events (REQ-BED-003, REQ-BED-006)
     LlmResponse { content: Vec<Content>, end_turn: bool, usage: Usage },
     LlmError { error: LlmError, attempt: u32 },
     LlmStreamChunk { content: Content },
+    RetryTimeout,  // Scheduled retry timer fired
     
     // Tool events (REQ-BED-004)
     ToolComplete { tool_use_id: String, result: ToolResult },
-    ToolError { tool_use_id: String, error: String },
     
     // Sub-agent events (REQ-BED-008, REQ-BED-009)
-    SubAgentComplete { agent_id: String, result: SubAgentResult },
-    SubAgentError { agent_id: String, error: String },
+    SubAgentResult { agent_id: String, result: SubAgentResult },
     
     // System events (REQ-BED-007)
     ServerRestart,
-    Timeout { reason: TimeoutReason },
 }
 ```
 
@@ -97,9 +107,8 @@ enum Effect {
     // LLM (REQ-BED-003)
     RequestLlm { messages: Vec<Message>, model: String },
     
-    // Tools (REQ-BED-004)
+    // Tools - serial execution (REQ-BED-004)
     ExecuteTool { tool_use_id: String, name: String, input: Value },
-    CancelTool { tool_use_id: String },
     
     // Sub-agents (REQ-BED-008)
     SpawnSubAgent { agent_id: String, prompt: String, model: String },
@@ -107,9 +116,8 @@ enum Effect {
     // Client notifications (REQ-BED-011)
     NotifyClient { event_type: String, data: Value },
     
-    // Scheduling
-    ScheduleTimeout { delay: Duration, reason: TimeoutReason },
-    CancelTimeout { reason: TimeoutReason },
+    // Scheduling (REQ-BED-006)
+    ScheduleRetry { delay: Duration, attempt: u32 },
 }
 ```
 
@@ -118,7 +126,7 @@ enum Effect {
 ```rust
 fn transition(
     state: &ConvState,
-    context: &ConvContext,  // immutable conversation metadata
+    context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, InvalidTransition>
 
@@ -129,9 +137,161 @@ struct TransitionResult {
 
 struct ConvContext {
     conversation_id: String,
-    working_dir: PathBuf,  // REQ-BED-010
+    working_dir: PathBuf,  // REQ-BED-010: fixed at creation
     model_id: String,
     is_sub_agent: bool,    // REQ-BED-009
+}
+```
+
+## Serial Tool Execution (REQ-BED-004)
+
+Tools execute one at a time in LLM-requested order:
+
+```rust
+// When LLM responds with tool requests
+LlmRequesting { .. } + LlmResponse { tools: [t1, t2, t3], .. } => {
+    ToolExecuting {
+        current_tool_id: t1.id,
+        remaining_tool_ids: vec![t2.id, t3.id],
+        completed_results: vec![],
+    }
+    // Effect: ExecuteTool { t1 }  -- only first tool
+}
+
+// When a tool completes, start next
+ToolExecuting { remaining: [t2, t3], results } + ToolComplete { t1_result } => {
+    ToolExecuting {
+        current_tool_id: t2.id,
+        remaining_tool_ids: vec![t3.id],
+        completed_results: vec![t1_result],
+    }
+    // Effect: ExecuteTool { t2 }
+}
+
+// When last tool completes
+ToolExecuting { remaining: [], results } + ToolComplete { last_result } => {
+    AwaitingLlm
+    // Effect: PersistMessage (all tool results), RequestLlm
+}
+```
+
+## Cancellation with Synthetic Results (REQ-BED-005)
+
+LLM APIs require tool_use to have matching tool_result. On cancellation:
+
+```rust
+// Cancellation during tool execution
+ToolExecuting { current, remaining, completed } + UserCancel => {
+    // Generate synthetic results for current + remaining tools
+    let synthetic_current = ToolResult::Cancelled { 
+        tool_use_id: current,
+        message: "Cancelled by user" 
+    };
+    let synthetic_remaining: Vec<_> = remaining.iter().map(|id| {
+        ToolResult::Cancelled { tool_use_id: id, message: "Skipped due to cancellation" }
+    }).collect();
+    
+    Idle
+    // Effects: 
+    //   PersistMessage(synthetic results for all pending tools)
+    //   NotifyClient
+}
+```
+
+Message chain remains valid:
+```
+[agent: tool_use id=1, tool_use id=2, tool_use id=3]
+[tool: result id=1 (completed)]
+[tool: result id=2 (cancelled)]
+[tool: result id=3 (skipped)]
+```
+
+## Error Handling and Retry (REQ-BED-006)
+
+Retry logic is embedded in state machine, visible to UI:
+
+```rust
+// Retryable error with attempts remaining
+LlmRequesting { attempt: 1 } + LlmError { retryable: true, .. } => {
+    LlmRequesting { attempt: 2 }  // State reflects retry attempt
+    // Effect: ScheduleRetry { delay: 1s, attempt: 2 }
+    // Effect: NotifyClient { "retrying", attempt: 2 }
+}
+
+// Retry timer fires
+LlmRequesting { attempt: 2 } + RetryTimeout => {
+    LlmRequesting { attempt: 2 }  // Same state
+    // Effect: RequestLlm
+}
+
+// Retries exhausted
+LlmRequesting { attempt: 3 } + LlmError { retryable: true, kind } => {
+    Error { message: "Failed after 3 attempts", error_kind: kind }
+    // Effect: NotifyClient { "error", details }
+}
+
+// Non-retryable error - immediate failure
+LlmRequesting { .. } + LlmError { retryable: false, kind: Auth } => {
+    Error { message: "Authentication failed", error_kind: Auth }
+}
+
+// Recovery from error state
+Error { .. } + UserMessage { .. } => {
+    AwaitingLlm
+    // Effect: PersistMessage, RequestLlm
+}
+```
+
+## Sub-Agent Result Submission (REQ-BED-008, REQ-BED-009)
+
+Sub-agents have a special tool to submit their final result:
+
+```rust
+/// Tool only available to sub-agents
+struct SubmitResultTool;
+
+impl Tool for SubmitResultTool {
+    fn name(&self) -> &str { "submit_result" }
+    
+    fn schema(&self) -> Schema {
+        json!({
+            "type": "object",
+            "required": ["result"],
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "description": "Final result to return to parent conversation"
+                },
+                "success": {
+                    "type": "boolean",
+                    "description": "Whether the task completed successfully"
+                }
+            }
+        })
+    }
+    
+    async fn run(&self, input: Value) -> ToolResult {
+        // This tool's execution triggers SubAgentResult event to parent
+        // Sub-agent conversation transitions to Completed
+        ToolResult::SubAgentComplete {
+            result: input["result"].as_str().unwrap().to_string(),
+            success: input["success"].as_bool().unwrap_or(true),
+        }
+    }
+}
+```
+
+Sub-agent tool set:
+```rust
+fn sub_agent_tools() -> Vec<Tool> {
+    vec![
+        bash_tool(),
+        patch_tool(),
+        think_tool(),
+        keyword_search_tool(),
+        submit_result_tool(),  // Sub-agent only
+        // NO spawn_sub_agent tool - prevents nesting
+    ]
 }
 ```
 
@@ -140,21 +300,21 @@ struct ConvContext {
 | Current State | Event | Next State | Effects |
 |--------------|-------|------------|----------|
 | Idle | UserMessage | AwaitingLlm | PersistMessage, PersistState |
-| AwaitingLlm | (internal) | LlmRequesting | RequestLlm |
-| LlmRequesting | LlmResponse(end=true, no tools) | Idle | PersistMessage, PersistState, NotifyClient |
-| LlmRequesting | LlmResponse(tools) | ToolExecuting | PersistMessage, ExecuteTool×N |
-| LlmRequesting | LlmError(retryable, attempt<3) | AwaitingLlm | ScheduleTimeout(retry) |
-| LlmRequesting | LlmError(attempt>=3) | Error | PersistState, NotifyClient |
+| AwaitingLlm | (internal) | LlmRequesting{1} | RequestLlm |
+| LlmRequesting | LlmResponse(end=true, no tools) | Idle | PersistMessage, NotifyClient |
+| LlmRequesting | LlmResponse(tools) | ToolExecuting | PersistMessage, ExecuteTool(first) |
+| LlmRequesting{n<3} | LlmError(retryable) | LlmRequesting{n+1} | ScheduleRetry, NotifyClient |
+| LlmRequesting{n} | RetryTimeout | LlmRequesting{n} | RequestLlm |
+| LlmRequesting{3} | LlmError(retryable) | Error | NotifyClient |
+| LlmRequesting | LlmError(non-retryable) | Error | NotifyClient |
 | LlmRequesting | UserCancel | Cancelling | PersistState |
-| ToolExecuting | ToolComplete(last) | AwaitingLlm | PersistMessage, PersistState |
-| ToolExecuting | ToolComplete(not last) | ToolExecuting | PersistMessage |
-| ToolExecuting | UserCancel | Cancelling | CancelTool×N |
-| Cancelling | LlmResponse/ToolComplete | Idle | PersistState, NotifyClient |
-| Error | UserRetry | AwaitingLlm | PersistState |
+| ToolExecuting(last) | ToolComplete | AwaitingLlm | PersistMessage |
+| ToolExecuting | ToolComplete | ToolExecuting(next) | PersistMessage, ExecuteTool(next) |
+| ToolExecuting | UserCancel | Idle | PersistMessage(synthetic), NotifyClient |
+| Cancelling | LlmResponse | Idle | NotifyClient |
 | Error | UserMessage | AwaitingLlm | PersistMessage, PersistState |
-| * | UserMessage(while busy) | * (unchanged) | QueueFollowup |
 | Idle | SpawnSubAgents | AwaitingSubAgents | SpawnSubAgent×N |
-| AwaitingSubAgents | SubAgentComplete(last) | AwaitingLlm | PersistMessage |
+| AwaitingSubAgents | SubAgentResult(last) | AwaitingLlm | PersistMessage |
 
 ## Database Schema (REQ-BED-007)
 
@@ -162,11 +322,11 @@ struct ConvContext {
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY,
     slug TEXT UNIQUE,
-    cwd TEXT NOT NULL,                    -- REQ-BED-010
+    cwd TEXT NOT NULL,                    -- REQ-BED-010: fixed at creation
     parent_conversation_id TEXT,          -- REQ-BED-009: NULL for user conversations
     user_initiated BOOLEAN NOT NULL,      -- REQ-BED-009: FALSE for sub-agents
     state TEXT NOT NULL DEFAULT 'idle',
-    state_data TEXT,                       -- JSON for state-specific data
+    state_data TEXT,                       -- JSON: retry attempt, pending tools, etc.
     state_updated_at TIMESTAMP NOT NULL,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
@@ -201,52 +361,9 @@ CREATE TABLE pending_followups (
 );
 ```
 
-## Effect Executor
-
-The executor handles all I/O, converting effects into real operations and emitting events back to the state machine.
-
-```rust
-impl EffectExecutor {
-    async fn execute(&self, effect: Effect, event_tx: Sender<Event>) -> Result<()> {
-        match effect {
-            Effect::RequestLlm { messages, model } => {
-                // REQ-BED-003, REQ-BED-006
-                let result = self.llm_client.complete(&messages, &model).await;
-                match result {
-                    Ok(response) => {
-                        event_tx.send(Event::LlmResponse {
-                            content: response.content,
-                            end_turn: response.end_turn,
-                            usage: response.usage,
-                        }).await?;
-                    }
-                    Err(e) => {
-                        event_tx.send(Event::LlmError {
-                            error: e,
-                            attempt: self.retry_count,
-                        }).await?;
-                    }
-                }
-            }
-            Effect::ExecuteTool { tool_use_id, name, input } => {
-                // REQ-BED-004
-                let result = self.tool_registry.execute(&name, input).await;
-                event_tx.send(Event::ToolComplete { tool_use_id, result }).await?;
-            }
-            Effect::SpawnSubAgent { agent_id, prompt, model } => {
-                // REQ-BED-008, REQ-BED-009
-                self.spawn_sub_agent(agent_id, prompt, model, event_tx).await?;
-            }
-            // ... other effects
-        }
-        Ok(())
-    }
-}
-```
-
 ## Runtime Event Loop
 
-One runtime per active conversation, managing the event loop:
+One runtime per active conversation:
 
 ```rust
 impl ConversationRuntime {
@@ -259,13 +376,12 @@ impl ConversationRuntime {
             self.persist_state(&result.new_state).await?;
             self.state = result.new_state;
             
-            // Execute effects (may spawn async tasks)
+            // Execute effects serially (tools are already serial per REQ-BED-004)
             for effect in result.effects {
                 self.executor.execute(effect, self.event_tx.clone()).await?;
             }
             
-            // REQ-BED-011: Notify clients
-            self.notify_state_change().await?;
+            // REQ-BED-011: State is streamed to clients
             
             if self.state.is_terminal() {
                 break;
@@ -276,66 +392,11 @@ impl ConversationRuntime {
 }
 ```
 
-## Sub-Agent Architecture (REQ-BED-008, REQ-BED-009)
-
-Sub-agents are independent conversations with:
-- Own state machine instance
-- Own working directory (inherited from parent or specified)
-- No ability to spawn nested sub-agents (enforced in transition function)
-- Lifecycle tied to parent - if parent cancels, sub-agents are cancelled
-
-```rust
-struct SubAgentConfig {
-    prompt: String,
-    model: String,
-    working_dir: Option<PathBuf>,  // defaults to parent's cwd
-    timeout: Duration,
-}
-
-// State machine enforces no nesting
-fn transition(state: &ConvState, context: &ConvContext, event: Event) -> Result<TransitionResult> {
-    if let Event::SpawnSubAgents { .. } = event {
-        if context.is_sub_agent {
-            return Err(InvalidTransition::SubAgentNestingNotAllowed);
-        }
-    }
-    // ... rest of transition logic
-}
-```
-
-## Error Handling Strategy (REQ-BED-006)
-
-### Retryable Errors
-- Network timeouts
-- Rate limiting (429)
-- Temporary service unavailability (503)
-
-### Non-Retryable Errors  
-- Authentication failures (401, 403)
-- Invalid requests (400)
-- Model not found (404)
-
-### Retry Schedule
-- Attempt 1: Immediate
-- Attempt 2: 1 second delay
-- Attempt 3: 3 seconds delay
-- After 3 failures: Transition to Error state
-
 ## Testing Strategy
 
 ### Property-Based Tests (REQ-BED-001)
 
 ```rust
-#[proptest]
-fn terminal_states_produce_no_async_effects(event: Event) {
-    for terminal in [ConvState::Error { .. }] {
-        let result = transition(&terminal, &test_context(), event.clone());
-        if let Ok(tr) = result {
-            assert!(tr.effects.iter().all(|e| !e.is_async()));
-        }
-    }
-}
-
 #[proptest]
 fn state_transitions_are_deterministic(state: ConvState, event: Event) {
     let ctx = test_context();
@@ -343,13 +404,28 @@ fn state_transitions_are_deterministic(state: ConvState, event: Event) {
     let result2 = transition(&state, &ctx, event);
     assert_eq!(result1, result2);
 }
+
+#[proptest]
+fn cancellation_produces_synthetic_results_for_all_pending_tools(
+    current: String,
+    remaining: Vec<String>,
+) {
+    let state = ConvState::ToolExecuting { current, remaining: remaining.clone(), .. };
+    let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
+    
+    // Should have synthetic result for current + all remaining
+    let persist_effects: Vec<_> = result.effects.iter()
+        .filter(|e| matches!(e, Effect::PersistMessage { .. }))
+        .collect();
+    assert_eq!(persist_effects.len(), 1 + remaining.len());
+}
 ```
 
 ### Integration Tests
-- Full conversation flow: user message → LLM → tools → response
-- Cancellation at each state
-- Error recovery scenarios
-- Sub-agent spawning and completion
+- Full conversation flow: user message → LLM → tools (serial) → response
+- Cancellation at each state with message chain verification
+- Error recovery: retry exhaustion, non-retryable errors
+- Sub-agent spawning, result submission, aggregation
 - Server restart recovery
 
 ## File Organization
@@ -358,7 +434,7 @@ fn state_transitions_are_deterministic(state: ConvState, event: Event) {
 src/
 ├── state_machine/
 │   ├── mod.rs
-│   ├── state.rs          # ConvState, ConvContext
+│   ├── state.rs          # ConvState, ConvContext, ErrorKind
 │   ├── event.rs          # Event enum
 │   ├── effect.rs         # Effect enum
 │   ├── transition.rs     # Pure transition function
@@ -366,7 +442,7 @@ src/
 ├── executor/
 │   ├── mod.rs
 │   ├── llm.rs            # LLM effect handler
-│   ├── tool.rs           # Tool effect handler
+│   ├── tool.rs           # Tool effect handler (serial)
 │   ├── persistence.rs    # DB effect handler
 │   ├── notification.rs   # Client notification handler
 │   └── subagent.rs       # Sub-agent spawning
@@ -374,6 +450,13 @@ src/
 │   ├── mod.rs
 │   ├── loop.rs           # Event loop
 │   └── manager.rs        # Conversation lifecycle
+├── tools/
+│   ├── mod.rs
+│   ├── bash/
+│   ├── patch/
+│   ├── think.rs
+│   ├── keyword_search.rs
+│   └── submit_result.rs  # Sub-agent only
 └── db/
     ├── mod.rs
     ├── schema.rs
