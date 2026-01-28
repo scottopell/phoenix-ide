@@ -248,14 +248,7 @@ fn find_unique_match(
         return Ok(spec);
     }
     
-    // 3. Go-specific: ignore semantically insignificant whitespace
-    if self.is_go_file() {
-        if let Some(spec) = find_unique_go_tokens(original, old_text) {
-            return Ok(spec);
-        }
-    }
-    
-    // 4. Trim first/last lines if safe
+    // 3. Trim first/last lines if safe
     if let Some(spec) = find_unique_trimmed(original, old_text) {
         return Ok(spec);
     }

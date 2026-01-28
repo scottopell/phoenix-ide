@@ -80,7 +80,6 @@ THE SYSTEM SHALL return error indicating strip precondition failed
 WHEN exact oldText match fails
 THE SYSTEM SHALL attempt recovery via whitespace normalization:
 - Adjust leading whitespace prefix (dedent matching)
-- Ignore semantically insignificant whitespace for Go files
 - Trim first/last lines if safe
 
 WHEN fuzzy match succeeds
