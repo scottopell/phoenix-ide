@@ -100,18 +100,8 @@ impl ConversationRuntime {
                 }
             }
             
-            // After processing a tool complete, check if we need to execute the next tool
-            if let ConvState::ToolExecuting { current_tool_id, .. } = &self.state {
-                // Find the tool info for the next tool
-                if let Some((_, name, input)) = self.pending_tools.iter()
-                    .find(|(id, _, _)| id == current_tool_id)
-                    .cloned()
-                {
-                    // Execute the next tool
-                    let tool_event = self.execute_tool_event(current_tool_id.clone(), name, input).await;
-                    events_to_process.push(tool_event);
-                }
-            }
+            // Note: Tool execution is now handled by Effect::ExecuteTool from the state machine,
+            // so we no longer need to check and execute tools here.
         }
 
         Ok(())

@@ -19,10 +19,11 @@ pub enum AnthropicModel {
 impl AnthropicModel {
     pub fn api_name(&self) -> &'static str {
         match self {
-            AnthropicModel::Claude4Opus => "claude-sonnet-4-20250514",
-            AnthropicModel::Claude4Sonnet => "claude-sonnet-4-20250514",
-            AnthropicModel::Claude35Sonnet => "claude-3-5-sonnet-20241022",
-            AnthropicModel::Claude35Haiku => "claude-3-5-haiku-20241022",
+            // Use model names from exe.dev/shelley
+            AnthropicModel::Claude4Opus => "claude-opus-4-5-20251101",
+            AnthropicModel::Claude4Sonnet => "claude-sonnet-4-5-20250929",
+            AnthropicModel::Claude35Sonnet => "claude-sonnet-4-20250514",
+            AnthropicModel::Claude35Haiku => "claude-haiku-4-5-20251001",
         }
     }
 
@@ -58,12 +59,8 @@ impl AnthropicService {
     pub fn new(api_key: String, model: AnthropicModel, gateway: Option<&str>) -> Self {
         let base_url = match gateway {
             Some(gw) => {
-                // Support both exe.dev internal gateway and external gateway
-                if gw.contains("169.254.169.254") || gw.starts_with("http://169") {
-                    format!("{}/gateway/llm/anthropic/v1/messages", gw.trim_end_matches('/'))
-                } else {
-                    format!("{}/_/gateway/anthropic/v1/messages", gw.trim_end_matches('/'))
-                }
+                // exe.dev gateway format: gateway_base + /_/gateway/anthropic/v1/messages
+                format!("{}/_/gateway/anthropic/v1/messages", gw.trim_end_matches('/'))
             }
             None => "https://api.anthropic.com/v1/messages".to_string(),
         };
