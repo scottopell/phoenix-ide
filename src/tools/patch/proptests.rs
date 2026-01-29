@@ -118,10 +118,11 @@ proptest! {
         middle in arb_unique_substring(),
         suffix in arb_unique_substring(),
     ) {
-        // Ensure parts are distinct
+        // Ensure parts are distinct and don't create overlapping substrings
         prop_assume!(prefix != middle && middle != suffix && prefix != suffix);
-
         let original = format!("{}{}{}", prefix, middle, suffix);
+        // middle must appear exactly once in the combined string
+        prop_assume!(original.matches(&middle).count() == 1);
         let mut planner = PatchPlanner::new();
         let mut fs = VirtualFs::with_files([(path.clone(), original.clone())]);
 
