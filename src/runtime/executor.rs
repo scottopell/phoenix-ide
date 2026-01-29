@@ -1,11 +1,11 @@
 //! Conversation runtime executor
 
+use super::SseEvent;
 use crate::db::{Database, MessageType, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
 use crate::tools::ToolRegistry;
-use super::SseEvent;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -34,10 +34,7 @@ impl ConversationRuntime {
         event_tx: mpsc::Sender<Event>,
         broadcast_tx: broadcast::Sender<SseEvent>,
     ) -> Self {
-        let tool_registry = ToolRegistry::new(
-            context.working_dir.clone(),
-            llm_registry.clone(),
-        );
+        let tool_registry = ToolRegistry::new(context.working_dir.clone(), llm_registry.clone());
 
         Self {
             context,
@@ -75,7 +72,7 @@ impl ConversationRuntime {
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         // We need to process events in a loop to handle chained effects
         let mut events_to_process = vec![event];
-        
+
         while let Some(current_event) = events_to_process.pop() {
             // Pure state transition
             let result = match transition(&self.state, &self.context, current_event) {
@@ -98,7 +95,7 @@ impl ConversationRuntime {
                     events_to_process.push(generated_event);
                 }
             }
-            
+
             // Note: Tool execution is now handled by Effect::ExecuteTool from the state machine,
             // so we no longer need to check and execute tools here.
         }
@@ -110,47 +107,62 @@ impl ConversationRuntime {
     #[allow(clippy::too_many_lines)] // Effect handling is inherently complex
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
-            Effect::PersistMessage { msg_type, content, display_data, usage_data } => {
+            Effect::PersistMessage {
+                msg_type,
+                content,
+                display_data,
+                usage_data,
+            } => {
                 let id = uuid::Uuid::new_v4().to_string();
-                let msg = self.db.add_message(
-                    &id,
-                    &self.context.conversation_id,
-                    msg_type,
-                    &content,
-                    display_data.as_ref(),
-                    usage_data.as_ref(),
-                ).map_err(|e| e.to_string())?;
+                let msg = self
+                    .db
+                    .add_message(
+                        &id,
+                        &self.context.conversation_id,
+                        msg_type,
+                        &content,
+                        display_data.as_ref(),
+                        usage_data.as_ref(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 // Broadcast to clients
                 let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
-                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg_json });
+                let _ = self
+                    .broadcast_tx
+                    .send(SseEvent::Message { message: msg_json });
                 Ok(None)
             }
 
             Effect::PersistState => {
                 let state_data = match &self.state {
                     ConvState::LlmRequesting { attempt } => Some(json!({ "attempt": attempt })),
-                    ConvState::ToolExecuting { current_tool, remaining_tools, .. } => {
-                        Some(json!({
-                            "current_tool_id": current_tool.id,
-                            "current_tool_name": current_tool.name(),
-                            "remaining_count": remaining_tools.len()
-                        }))
-                    }
-                    ConvState::Error { message, error_kind } => {
-                        Some(json!({
-                            "message": message,
-                            "error_kind": format!("{:?}", error_kind)
-                        }))
-                    }
+                    ConvState::ToolExecuting {
+                        current_tool,
+                        remaining_tools,
+                        ..
+                    } => Some(json!({
+                        "current_tool_id": current_tool.id,
+                        "current_tool_name": current_tool.name(),
+                        "remaining_count": remaining_tools.len()
+                    })),
+                    ConvState::Error {
+                        message,
+                        error_kind,
+                    } => Some(json!({
+                        "message": message,
+                        "error_kind": format!("{:?}", error_kind)
+                    })),
                     _ => None,
                 };
 
-                self.db.update_conversation_state(
-                    &self.context.conversation_id,
-                    &to_db_state(&self.state),
-                    state_data.as_ref(),
-                ).map_err(|e| e.to_string())?;
+                self.db
+                    .update_conversation_state(
+                        &self.context.conversation_id,
+                        &to_db_state(&self.state),
+                        state_data.as_ref(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 // Broadcast state change
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
@@ -205,17 +217,22 @@ impl ConversationRuntime {
                         "content": result.output,
                         "is_error": result.is_error
                     });
-                    let msg = self.db.add_message(
-                        &id,
-                        &self.context.conversation_id,
-                        MessageType::Tool,
-                        &content,
-                        None,
-                        None,
-                    ).map_err(|e| e.to_string())?;
+                    let msg = self
+                        .db
+                        .add_message(
+                            &id,
+                            &self.context.conversation_id,
+                            MessageType::Tool,
+                            &content,
+                            None,
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
 
                     let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
-                    let _ = self.broadcast_tx.send(SseEvent::Message { message: msg_json });
+                    let _ = self
+                        .broadcast_tx
+                        .send(SseEvent::Message { message: msg_json });
                 }
                 Ok(None)
             }
@@ -243,8 +260,11 @@ impl ConversationRuntime {
         };
 
         // Get LLM service
-        let Some(llm) = self.llm_registry.get(&self.context.model_id)
-            .or_else(|| self.llm_registry.default()) else {
+        let Some(llm) = self
+            .llm_registry
+            .get(&self.context.model_id)
+            .or_else(|| self.llm_registry.default())
+        else {
             return Event::LlmError {
                 message: "No LLM available".to_string(),
                 error_kind: crate::db::ErrorKind::Unknown,
@@ -264,7 +284,8 @@ impl ConversationRuntime {
         match llm.complete(&request).await {
             Ok(response) => {
                 // Extract tool calls from content and convert to typed ToolCall
-                let tool_calls: Vec<ToolCall> = response.tool_uses()
+                let tool_calls: Vec<ToolCall> = response
+                    .tool_uses()
                     .into_iter()
                     .map(|(id, name, input)| {
                         let typed_input = ToolInput::from_name_and_value(name, input.clone());
@@ -296,7 +317,9 @@ impl ConversationRuntime {
     }
 
     fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
-        let db_messages = self.db.get_messages(&self.context.conversation_id)
+        let db_messages = self
+            .db
+            .get_messages(&self.context.conversation_id)
             .map_err(|e| e.to_string())?;
 
         let mut messages = Vec::new();
@@ -305,7 +328,7 @@ impl ConversationRuntime {
             match msg.message_type {
                 MessageType::User => {
                     let mut content = vec![];
-                    
+
                     // Extract text
                     if let Some(text) = msg.content.get("text").and_then(|t| t.as_str()) {
                         content.push(ContentBlock::text(text));
@@ -338,7 +361,7 @@ impl ConversationRuntime {
                     // Parse content blocks from stored JSON
                     let content: Vec<ContentBlock> = serde_json::from_value(msg.content.clone())
                         .unwrap_or_else(|_| vec![ContentBlock::text(msg.content.to_string())]);
-                    
+
                     messages.push(LlmMessage {
                         role: MessageRole::Assistant,
                         content,
@@ -347,13 +370,19 @@ impl ConversationRuntime {
 
                 MessageType::Tool => {
                     // Tool results go in user message
-                    let tool_use_id = msg.content.get("tool_use_id")
+                    let tool_use_id = msg
+                        .content
+                        .get("tool_use_id")
                         .and_then(|t| t.as_str())
                         .unwrap_or("");
-                    let content_str = msg.content.get("content")
+                    let content_str = msg
+                        .content
+                        .get("content")
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
-                    let is_error = msg.content.get("is_error")
+                    let is_error = msg
+                        .content
+                        .get("is_error")
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
 
@@ -379,7 +408,7 @@ impl ConversationRuntime {
         let tool_use_id = tool.id.clone();
         let name = tool.name().to_string();
         let input = tool.input.to_value();
-        
+
         tracing::info!(tool = %name, id = %tool_use_id, "Executing tool");
 
         let output = self.tool_registry.execute(&name, input).await;
@@ -391,10 +420,7 @@ impl ConversationRuntime {
                 output: out.output,
                 is_error: !out.success,
             },
-            None => ToolResult::error(
-                tool_use_id.clone(),
-                format!("Unknown tool: {name}"),
-            ),
+            None => ToolResult::error(tool_use_id.clone(), format!("Unknown tool: {name}")),
         };
 
         Event::ToolComplete {
@@ -408,29 +434,35 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
     match state {
         ConvState::Idle => crate::db::ConversationState::Idle,
         ConvState::AwaitingLlm => crate::db::ConversationState::AwaitingLlm,
-        ConvState::LlmRequesting { attempt } => crate::db::ConversationState::LlmRequesting { attempt: *attempt },
-        ConvState::ToolExecuting { current_tool, remaining_tools, completed_results } => {
-            crate::db::ConversationState::ToolExecuting {
-                current_tool: current_tool.clone(),
-                remaining_tools: remaining_tools.clone(),
-                completed_results: completed_results.clone(),
-            }
+        ConvState::LlmRequesting { attempt } => {
+            crate::db::ConversationState::LlmRequesting { attempt: *attempt }
         }
-        ConvState::Cancelling { pending_tool_id } => {
-            crate::db::ConversationState::Cancelling { pending_tool_id: pending_tool_id.clone() }
-        }
-        ConvState::AwaitingSubAgents { pending_ids, completed_results } => {
-            crate::db::ConversationState::AwaitingSubAgents {
-                pending_ids: pending_ids.clone(),
-                completed_results: completed_results.clone(),
-            }
-        }
-        ConvState::Error { message, error_kind } => {
-            crate::db::ConversationState::Error {
-                message: message.clone(),
-                error_kind: error_kind.clone(),
-            }
-        }
+        ConvState::ToolExecuting {
+            current_tool,
+            remaining_tools,
+            completed_results,
+        } => crate::db::ConversationState::ToolExecuting {
+            current_tool: current_tool.clone(),
+            remaining_tools: remaining_tools.clone(),
+            completed_results: completed_results.clone(),
+        },
+        ConvState::Cancelling { pending_tool_id } => crate::db::ConversationState::Cancelling {
+            pending_tool_id: pending_tool_id.clone(),
+        },
+        ConvState::AwaitingSubAgents {
+            pending_ids,
+            completed_results,
+        } => crate::db::ConversationState::AwaitingSubAgents {
+            pending_ids: pending_ids.clone(),
+            completed_results: completed_results.clone(),
+        },
+        ConvState::Error {
+            message,
+            error_kind,
+        } => crate::db::ConversationState::Error {
+            message: message.clone(),
+            error_kind: error_kind.clone(),
+        },
     }
 }
 

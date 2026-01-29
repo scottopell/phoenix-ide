@@ -55,7 +55,7 @@ pub enum TransitionError {
 }
 
 /// Pure transition function
-/// 
+///
 /// REQ-BED-001: This function is pure - given the same inputs, it always
 /// produces the same outputs, with no I/O side effects.
 #[allow(clippy::too_many_lines)] // State machine is inherently complex
@@ -68,14 +68,16 @@ pub fn transition(
         // ============================================================
         // User Message Handling (REQ-BED-002)
         // ============================================================
-        
+
         // Idle or Error + UserMessage -> LlmRequesting (recovery from Error, REQ-BED-006)
         (ConvState::Idle | ConvState::Error { .. }, Event::UserMessage { text, images }) => {
             let content = build_user_message_content(&text, &images);
-            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::persist_user_message(content))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::RequestLlm))
+            Ok(
+                TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                    .with_effect(Effect::persist_user_message(content))
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::RequestLlm),
+            )
         }
 
         // Busy states + UserMessage -> Reject (REQ-BED-002)
@@ -97,7 +99,15 @@ pub fn transition(
         // This is handled in the runtime, not here
 
         // LlmRequesting + LlmResponse with tools -> ToolExecuting
-        (ConvState::LlmRequesting { .. }, Event::LlmResponse { content, tool_calls, end_turn: _, usage }) => {
+        (
+            ConvState::LlmRequesting { .. },
+            Event::LlmResponse {
+                content,
+                tool_calls,
+                end_turn: _,
+                usage,
+            },
+        ) => {
             if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
                 let usage_data = usage_to_data(&usage);
@@ -113,7 +123,7 @@ pub fn transition(
                 let first = tool_calls[0].clone();
                 let rest = tool_calls[1..].to_vec();
                 let usage_data = usage_to_data(&usage);
-                
+
                 Ok(TransitionResult::new(ConvState::ToolExecuting {
                     current_tool: first.clone(),
                     remaining_tools: rest,
@@ -133,46 +143,74 @@ pub fn transition(
         // ============================================================
 
         // LlmRequesting + LlmError (retryable) -> LlmRequesting with incremented attempt
-        (ConvState::LlmRequesting { attempt }, Event::LlmError { message, error_kind, .. })
-            if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
-        {
+        (
+            ConvState::LlmRequesting { attempt },
+            Event::LlmError {
+                message,
+                error_kind,
+                ..
+            },
+        ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
-            
-            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: new_attempt })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::ScheduleRetry { delay, attempt: new_attempt })
-                .with_effect(Effect::notify_state_change("llm_requesting", json!({
+
+            Ok(TransitionResult::new(ConvState::LlmRequesting {
+                attempt: new_attempt,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::ScheduleRetry {
+                delay,
+                attempt: new_attempt,
+            })
+            .with_effect(Effect::notify_state_change(
+                "llm_requesting",
+                json!({
                     "attempt": new_attempt,
                     "max_attempts": MAX_RETRY_ATTEMPTS,
                     "message": format!("Retrying... (attempt {new_attempt})")
-                }))))
+                }),
+            )))
         }
 
         // LlmRequesting + LlmError (non-retryable or exhausted) -> Error
-        (ConvState::LlmRequesting { attempt }, Event::LlmError { message, error_kind, .. }) => {
+        (
+            ConvState::LlmRequesting { attempt },
+            Event::LlmError {
+                message,
+                error_kind,
+                ..
+            },
+        ) => {
             let error_message = if error_kind.is_retryable() {
                 format!("Failed after {attempt} attempts: {message}")
             } else {
                 message
             };
-            
+
             Ok(TransitionResult::new(ConvState::Error {
                 message: error_message.clone(),
                 error_kind,
             })
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change("error", json!({
-                "message": error_message
-            }))))
+            .with_effect(Effect::notify_state_change(
+                "error",
+                json!({
+                    "message": error_message
+                }),
+            )))
         }
 
         // RetryTimeout -> Make LLM request
-        (ConvState::LlmRequesting { attempt }, Event::RetryTimeout { attempt: retry_attempt })
-            if *attempt == retry_attempt =>
-        {
-            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: *attempt })
-                .with_effect(Effect::RequestLlm))
+        (
+            ConvState::LlmRequesting { attempt },
+            Event::RetryTimeout {
+                attempt: retry_attempt,
+            },
+        ) if *attempt == retry_attempt => {
+            Ok(
+                TransitionResult::new(ConvState::LlmRequesting { attempt: *attempt })
+                    .with_effect(Effect::RequestLlm),
+            )
         }
 
         // ============================================================
@@ -180,16 +218,23 @@ pub fn transition(
         // ============================================================
 
         // ToolExecuting + ToolComplete (more tools remaining) -> ToolExecuting (next tool)
-        (ConvState::ToolExecuting { current_tool, remaining_tools, completed_results }, 
-         Event::ToolComplete { tool_use_id, result })
-            if tool_use_id == current_tool.id && !remaining_tools.is_empty() =>
-        {
+        (
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+            },
+            Event::ToolComplete {
+                tool_use_id,
+                result,
+            },
+        ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result.clone());
-            
+
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
-            
+
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
                 remaining_tools: new_remaining,
@@ -204,20 +249,29 @@ pub fn transition(
         }
 
         // ToolExecuting + ToolComplete (last tool) -> LlmRequesting
-        (ConvState::ToolExecuting { current_tool, remaining_tools, completed_results },
-         Event::ToolComplete { tool_use_id, result })
-            if tool_use_id == current_tool.id && remaining_tools.is_empty() =>
-        {
+        (
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+            },
+            Event::ToolComplete {
+                tool_use_id,
+                result,
+            },
+        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result.clone());
-            
-            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::persist_tool_message(
-                    tool_result_to_json(&result),
-                    result.display_data(),
-                ))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::RequestLlm))
+
+            Ok(
+                TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                    .with_effect(Effect::persist_tool_message(
+                        tool_result_to_json(&result),
+                        result.display_data(),
+                    ))
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::RequestLlm),
+            )
         }
 
         // ============================================================
@@ -226,40 +280,48 @@ pub fn transition(
 
         // LlmRequesting + UserCancel -> Cancelling
         (ConvState::LlmRequesting { .. }, Event::UserCancel) => {
-            Ok(TransitionResult::new(ConvState::Cancelling { pending_tool_id: None })
-                .with_effect(Effect::PersistState))
+            Ok(TransitionResult::new(ConvState::Cancelling {
+                pending_tool_id: None,
+            })
+            .with_effect(Effect::PersistState))
         }
 
         // These arms return to Idle - different state/event combos but same result
         #[allow(clippy::match_same_arms)] // Different triggers, intentionally same outcome
-        (ConvState::Cancelling { .. }, Event::LlmResponse { .. }) |
-        (ConvState::AwaitingLlm | ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
+        (ConvState::Cancelling { .. }, Event::LlmResponse { .. })
+        | (ConvState::AwaitingLlm | ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
 
         // ToolExecuting + UserCancel -> Idle with synthetic results
-        (ConvState::ToolExecuting { current_tool, remaining_tools, completed_results },
-         Event::UserCancel) => {
+        (
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+            },
+            Event::UserCancel,
+        ) => {
             // Generate synthetic cancelled result for current tool
-            let current_result = ToolResult::cancelled(
-                current_tool.id.clone(),
-                "Cancelled by user",
-            );
-            
+            let current_result =
+                ToolResult::cancelled(current_tool.id.clone(), "Cancelled by user");
+
             // Generate synthetic skipped results for remaining tools
             let skipped_results: Vec<ToolResult> = remaining_tools
                 .iter()
                 .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
-            
+
             let mut all_results = completed_results.clone();
             all_results.push(current_result);
             all_results.extend(skipped_results);
-            
+
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: all_results })
+                .with_effect(Effect::PersistToolResults {
+                    results: all_results,
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -269,17 +331,21 @@ pub fn transition(
         // ============================================================
 
         // AwaitingSubAgents + SubAgentResult (more pending) -> AwaitingSubAgents
-        (ConvState::AwaitingSubAgents { pending_ids, completed_results },
-         Event::SubAgentResult { agent_id, result })
-            if pending_ids.contains(&agent_id) && pending_ids.len() > 1 =>
-        {
-            let new_pending: Vec<_> = pending_ids.iter()
+        (
+            ConvState::AwaitingSubAgents {
+                pending_ids,
+                completed_results,
+            },
+            Event::SubAgentResult { agent_id, result },
+        ) if pending_ids.contains(&agent_id) && pending_ids.len() > 1 => {
+            let new_pending: Vec<_> = pending_ids
+                .iter()
                 .filter(|id| *id != &agent_id)
                 .cloned()
                 .collect();
             let mut new_results = completed_results.clone();
             new_results.push(result);
-            
+
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending_ids: new_pending,
                 completed_results: new_results,
@@ -288,37 +354,42 @@ pub fn transition(
         }
 
         // AwaitingSubAgents + SubAgentResult (last one) -> AwaitingLlm
-        (ConvState::AwaitingSubAgents { pending_ids, completed_results },
-         Event::SubAgentResult { agent_id, result })
-            if pending_ids.contains(&agent_id) && pending_ids.len() == 1 =>
-        {
+        (
+            ConvState::AwaitingSubAgents {
+                pending_ids,
+                completed_results,
+            },
+            Event::SubAgentResult { agent_id, result },
+        ) if pending_ids.contains(&agent_id) && pending_ids.len() == 1 => {
             let mut new_results = completed_results.clone();
             new_results.push(result);
-            
+
             // Aggregate results into a message for the LLM
             let aggregated = aggregate_sub_agent_results(&new_results);
-            
-            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::persist_tool_message(aggregated, None))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::RequestLlm))
+
+            Ok(
+                TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                    .with_effect(Effect::persist_tool_message(aggregated, None))
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::RequestLlm),
+            )
         }
 
         // ============================================================
         // Invalid Transitions
         // ============================================================
-        
-        (state, event) => {
-            Err(TransitionError::InvalidTransition(format!(
-                "No transition from {state:?} with event {event:?}"
-            )))
-        }
+        (state, event) => Err(TransitionError::InvalidTransition(format!(
+            "No transition from {state:?} with event {event:?}"
+        ))),
     }
 }
 
 // Helper functions
 
-fn build_user_message_content(text: &str, images: &[crate::state_machine::event::ImageData]) -> Value {
+fn build_user_message_content(
+    text: &str,
+    images: &[crate::state_machine::event::ImageData],
+) -> Value {
     if images.is_empty() {
         json!({ "text": text })
     } else {
@@ -385,13 +456,15 @@ impl ErrorKind {
 fn aggregate_sub_agent_results(results: &[crate::db::SubAgentResult]) -> Value {
     let summaries: Vec<Value> = results
         .iter()
-        .map(|r| json!({
-            "agent_id": r.agent_id,
-            "success": r.success,
-            "result": r.result
-        }))
+        .map(|r| {
+            json!({
+                "agent_id": r.agent_id,
+                "success": r.success,
+                "result": r.result
+            })
+        })
         .collect();
-    
+
     json!({
         "sub_agent_results": summaries
     })
@@ -415,9 +488,13 @@ mod tests {
                 text: "Hello".to_string(),
                 images: vec![],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
         assert!(!result.effects.is_empty());
     }
 
@@ -447,39 +524,56 @@ mod tests {
                 text: "Try again".to_string(),
                 images: vec![],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
     }
 
     #[test]
     fn test_cancellation_produces_synthetic_results() {
-        use crate::state_machine::state::{ToolCall, ToolInput, BashInput, BashMode};
-        
+        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
+
         let result = transition(
             &ConvState::ToolExecuting {
-                current_tool: ToolCall::new("tool-1", ToolInput::Bash(BashInput {
-                    command: "echo 1".to_string(),
-                    mode: BashMode::Default,
-                })),
+                current_tool: ToolCall::new(
+                    "tool-1",
+                    ToolInput::Bash(BashInput {
+                        command: "echo 1".to_string(),
+                        mode: BashMode::Default,
+                    }),
+                ),
                 remaining_tools: vec![
-                    ToolCall::new("tool-2", ToolInput::Bash(BashInput {
-                        command: "echo 2".to_string(),
-                        mode: BashMode::Default,
-                    })),
-                    ToolCall::new("tool-3", ToolInput::Bash(BashInput {
-                        command: "echo 3".to_string(),
-                        mode: BashMode::Default,
-                    })),
+                    ToolCall::new(
+                        "tool-2",
+                        ToolInput::Bash(BashInput {
+                            command: "echo 2".to_string(),
+                            mode: BashMode::Default,
+                        }),
+                    ),
+                    ToolCall::new(
+                        "tool-3",
+                        ToolInput::Bash(BashInput {
+                            command: "echo 3".to_string(),
+                            mode: BashMode::Default,
+                        }),
+                    ),
                 ],
                 completed_results: vec![],
             },
             &test_context(),
             Event::UserCancel,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(result.new_state, ConvState::Idle));
         // Should have effect to persist synthetic results
-        assert!(result.effects.iter().any(|e| matches!(e, Effect::PersistToolResults { .. })));
+        assert!(result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistToolResults { .. })));
     }
 }

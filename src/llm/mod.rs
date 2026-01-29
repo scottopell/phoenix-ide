@@ -20,14 +20,14 @@ use std::sync::Arc;
 pub trait LlmService: Send + Sync {
     /// Make a completion request
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
-    
+
     /// Get the model ID
     fn model_id(&self) -> &str;
-    
+
     /// Get the context window size in tokens
     #[allow(dead_code)] // For future context management
     fn context_window(&self) -> usize;
-    
+
     /// Get max image dimension (for resizing before send)
     #[allow(dead_code)] // For future image resizing
     fn max_image_dimension(&self) -> Option<u32>;
@@ -52,7 +52,7 @@ impl LlmService for LoggingService {
         let start = std::time::Instant::now();
         let result = self.inner.complete(request).await;
         let duration = start.elapsed();
-        
+
         match &result {
             Ok(response) => {
                 tracing::info!(
@@ -73,18 +73,18 @@ impl LlmService for LoggingService {
                 );
             }
         }
-        
+
         result
     }
-    
+
     fn model_id(&self) -> &str {
         &self.model_id
     }
-    
+
     fn context_window(&self) -> usize {
         self.inner.context_window()
     }
-    
+
     fn max_image_dimension(&self) -> Option<u32> {
         self.inner.max_image_dimension()
     }

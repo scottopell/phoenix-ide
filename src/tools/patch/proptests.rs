@@ -47,7 +47,7 @@ fn arb_indent() -> impl Strategy<Value = String> {
 
 // ============================================================================
 // Invariant 1: Overwrite then Replace roundtrip
-// 
+//
 // If we overwrite a file with content X, then replace X with Y,
 // the result should be Y.
 // ============================================================================
@@ -78,7 +78,7 @@ proptest! {
                 reindent: None,
             }],
         ).expect("overwrite should succeed");
-        
+
         fs.interpret(&plan1.effects);
         prop_assert_eq!(fs.get(&path), Some(&content));
 
@@ -188,11 +188,11 @@ proptest! {
         line2 in "[a-zA-Z0-9]{1,20}",
     ) {
         prop_assume!(!indent.is_empty()); // Only test with actual indentation
-        
+
         // Create indented content
         let indented = format!("{}{}\n{}{}", indent, line1, indent, line2);
         let marker = "MARKER";
-        
+
         let mut planner = PatchPlanner::new();
 
         // Replace marker with indented content, but strip then re-add the indent
@@ -394,8 +394,7 @@ proptest! {
 #[test]
 fn test_replace_on_nonexistent_fails() {
     let mut planner = PatchPlanner::new();
-    let result = planner
-            .plan(
+    let result = planner.plan(
         &PathBuf::from("test.txt"),
         None,
         &[PatchRequest {
@@ -413,8 +412,7 @@ fn test_replace_on_nonexistent_fails() {
 #[test]
 fn test_replace_not_found() {
     let mut planner = PatchPlanner::new();
-    let result = planner
-            .plan(
+    let result = planner.plan(
         &PathBuf::from("test.txt"),
         Some("hello world"),
         &[PatchRequest {
@@ -432,8 +430,7 @@ fn test_replace_not_found() {
 #[test]
 fn test_replace_not_unique() {
     let mut planner = PatchPlanner::new();
-    let result = planner
-            .plan(
+    let result = planner.plan(
         &PathBuf::from("test.txt"),
         Some("hello hello"),
         &[PatchRequest {
@@ -451,8 +448,7 @@ fn test_replace_not_unique() {
 #[test]
 fn test_clipboard_not_found() {
     let mut planner = PatchPlanner::new();
-    let result = planner
-            .plan(
+    let result = planner.plan(
         &PathBuf::from("test.txt"),
         Some("hello"),
         &[PatchRequest {
@@ -470,12 +466,7 @@ fn test_clipboard_not_found() {
 #[test]
 fn test_empty_patches_fails() {
     let mut planner = PatchPlanner::new();
-    let result = planner
-            .plan(
-        &PathBuf::from("test.txt"),
-        Some("hello"),
-        &[],
-    );
+    let result = planner.plan(&PathBuf::from("test.txt"), Some("hello"), &[]);
     assert!(matches!(result, Err(PatchError::NoPatches)));
 }
 
@@ -489,67 +480,68 @@ fn test_empty_patches_fails() {
 fn test_overwrite_then_replace_with_filesystem() {
     use super::executor::{execute_effects, read_file_content};
     use std::fs;
-    
+
     let test_dir = std::env::temp_dir();
     let test_file = test_dir.join("test_patch_demo.txt");
-    
+
     // Clean up any existing file
     let _ = fs::remove_file(&test_file);
-    
+
     // Create a fresh planner
     let mut planner = PatchPlanner::new();
-    
+
     // Step 1: Overwrite to create the file with "Hello World"
     let current_content = read_file_content(&test_file).expect("read should succeed");
     assert!(current_content.is_none(), "file should not exist yet");
-    
+
     let plan1 = planner
-            .plan(
-        &test_file,
-        current_content.as_deref(),
-        &[PatchRequest {
-            operation: Operation::Overwrite,
-            old_text: None,
-            new_text: Some("Hello World".to_string()),
-            to_clipboard: None,
-            from_clipboard: None,
-            reindent: None,
-        }],
-    ).expect("overwrite should succeed");
-    
+        .plan(
+            &test_file,
+            current_content.as_deref(),
+            &[PatchRequest {
+                operation: Operation::Overwrite,
+                old_text: None,
+                new_text: Some("Hello World".to_string()),
+                to_clipboard: None,
+                from_clipboard: None,
+                reindent: None,
+            }],
+        )
+        .expect("overwrite should succeed");
+
     execute_effects(&plan1.effects).expect("execute should succeed");
-    
+
     // Verify step 1
-    let content_after_1 = fs::read_to_string(&test_file)
-        .expect("file should exist after overwrite");
+    let content_after_1 =
+        fs::read_to_string(&test_file).expect("file should exist after overwrite");
     assert_eq!(content_after_1, "Hello World");
-    
+
     // Step 2: Replace "Hello World" with "Hello Phoenix IDE"
     // This is where the original bug occurred!
     let current_content = read_file_content(&test_file).expect("read should succeed");
     assert_eq!(current_content.as_deref(), Some("Hello World"));
-    
+
     let plan2 = planner
-            .plan(
-        &test_file,
-        current_content.as_deref(),
-        &[PatchRequest {
-            operation: Operation::Replace,
-            old_text: Some("Hello World".to_string()),
-            new_text: Some("Hello Phoenix IDE".to_string()),
-            to_clipboard: None,
-            from_clipboard: None,
-            reindent: None,
-        }],
-    ).expect("replace should succeed after overwrite - this was the bug!");
-    
+        .plan(
+            &test_file,
+            current_content.as_deref(),
+            &[PatchRequest {
+                operation: Operation::Replace,
+                old_text: Some("Hello World".to_string()),
+                new_text: Some("Hello Phoenix IDE".to_string()),
+                to_clipboard: None,
+                from_clipboard: None,
+                reindent: None,
+            }],
+        )
+        .expect("replace should succeed after overwrite - this was the bug!");
+
     execute_effects(&plan2.effects).expect("execute should succeed");
-    
+
     // Verify step 2
-    let content_after_2 = fs::read_to_string(&test_file)
-        .expect("file should exist after replace");
+    let content_after_2 = fs::read_to_string(&test_file).expect("file should exist after replace");
     assert_eq!(content_after_2, "Hello Phoenix IDE");
-    
+
     // Clean up
     let _ = fs::remove_file(&test_file);
 }

@@ -31,12 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Configuration
-    let db_path = std::env::var("PHOENIX_DB_PATH")
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{home}/.phoenix-ide/phoenix.db")
-        });
-    
+    let db_path = std::env::var("PHOENIX_DB_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{home}/.phoenix-ide/phoenix.db")
+    });
+
     let port: u16 = std::env::var("PHOENIX_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -50,14 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize database
     tracing::info!(path = %db_path, "Opening database");
     let db = Database::open(&db_path)?;
-    
+
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle()?;
 
     // Initialize LLM registry
     let llm_config = LlmConfig::from_env();
     let llm_registry = Arc::new(ModelRegistry::new(&llm_config));
-    
+
     if llm_registry.has_models() {
         tracing::info!(
             models = ?llm_registry.available_models(),
@@ -77,13 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = create_router(state)
-        .layer(cors);
+    let app = create_router(state).layer(cors);
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Phoenix IDE server listening on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 

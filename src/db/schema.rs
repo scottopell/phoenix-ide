@@ -61,7 +61,10 @@ pub struct Conversation {
 impl Conversation {
     /// Check if the agent is currently working
     pub fn is_agent_working(&self) -> bool {
-        !matches!(self.state, ConversationState::Idle | ConversationState::Error { .. })
+        !matches!(
+            self.state,
+            ConversationState::Idle | ConversationState::Error { .. }
+        )
     }
 }
 
@@ -71,13 +74,13 @@ impl Conversation {
 pub enum ConversationState {
     /// Ready for user input, no pending operations
     Idle,
-    
+
     /// User message received, preparing LLM request
     AwaitingLlm,
-    
+
     /// LLM request in flight, with retry tracking
     LlmRequesting { attempt: u32 },
-    
+
     /// Executing tools serially
     ToolExecuting {
         current_tool: crate::state_machine::state::ToolCall,
@@ -85,17 +88,17 @@ pub enum ConversationState {
         #[serde(default)]
         completed_results: Vec<ToolResult>,
     },
-    
+
     /// User requested cancellation, waiting for graceful completion
     Cancelling { pending_tool_id: Option<String> },
-    
+
     /// Waiting for sub-agents to complete
     AwaitingSubAgents {
         pending_ids: Vec<String>,
         #[serde(default)]
         completed_results: Vec<SubAgentResult>,
     },
-    
+
     /// Error occurred
     Error {
         message: String,
@@ -227,7 +230,6 @@ pub struct UsageData {
 
 impl UsageData {
     pub fn context_window_used(&self) -> u64 {
-        self.input_tokens + self.output_tokens + 
-        self.cache_creation_tokens + self.cache_read_tokens
+        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
 }

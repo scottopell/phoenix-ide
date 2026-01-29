@@ -1,14 +1,16 @@
 //! Tool implementations for Phoenix IDE
 
 mod bash;
-pub mod patch;
-mod think;
 mod keyword_search;
+pub mod patch;
+mod read_image;
+mod think;
 
 pub use bash::BashTool;
-pub use patch::PatchTool;
-pub use think::ThinkTool;
 pub use keyword_search::KeywordSearchTool;
+pub use patch::PatchTool;
+pub use read_image::ReadImageTool;
+pub use think::ThinkTool;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -55,13 +57,13 @@ impl ToolOutput {
 pub trait Tool: Send + Sync {
     /// Tool name
     fn name(&self) -> &str;
-    
+
     /// Tool description for LLM
     fn description(&self) -> String;
-    
+
     /// JSON schema for tool input
     fn input_schema(&self) -> Value;
-    
+
     /// Execute the tool
     async fn run(&self, input: Value) -> ToolOutput;
 }
@@ -78,7 +80,8 @@ impl ToolRegistry {
             Arc::new(ThinkTool),
             Arc::new(BashTool::new(working_dir.clone())),
             Arc::new(PatchTool::new(working_dir.clone())),
-            Arc::new(KeywordSearchTool::new(working_dir, llm_registry)),
+            Arc::new(KeywordSearchTool::new(working_dir.clone(), llm_registry)),
+            Arc::new(ReadImageTool::new(working_dir)),
         ];
         Self { tools }
     }

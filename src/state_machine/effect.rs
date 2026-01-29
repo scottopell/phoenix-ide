@@ -15,18 +15,16 @@ pub enum Effect {
         display_data: Option<Value>,
         usage_data: Option<UsageData>,
     },
-    
+
     /// Persist the new state
     PersistState,
-    
+
     /// Make an LLM request
     RequestLlm,
-    
+
     /// Execute a tool
-    ExecuteTool {
-        tool: ToolCall,
-    },
-    
+    ExecuteTool { tool: ToolCall },
+
     /// Spawn a sub-agent
     #[allow(dead_code)] // Reserved for sub-agent feature
     SpawnSubAgent {
@@ -34,23 +32,15 @@ pub enum Effect {
         prompt: String,
         model: String,
     },
-    
+
     /// Notify connected clients
-    NotifyClient {
-        event_type: String,
-        data: Value,
-    },
-    
+    NotifyClient { event_type: String, data: Value },
+
     /// Schedule a retry
-    ScheduleRetry {
-        delay: Duration,
-        attempt: u32,
-    },
-    
+    ScheduleRetry { delay: Duration, attempt: u32 },
+
     /// Persist multiple tool results at once
-    PersistToolResults {
-        results: Vec<ToolResult>,
-    },
+    PersistToolResults { results: Vec<ToolResult> },
 }
 
 impl Effect {

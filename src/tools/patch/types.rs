@@ -58,10 +58,7 @@ pub struct Edit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchEffect {
     /// Write content to a file (creates parent dirs as needed)
-    WriteFile {
-        path: PathBuf,
-        content: String,
-    },
+    WriteFile { path: PathBuf, content: String },
 }
 
 /// Result of planning patches
@@ -83,25 +80,25 @@ pub struct PatchPlan {
 pub enum PatchError {
     #[error("Cannot use replace operation on non-existent file")]
     ReplaceOnNonexistent,
-    
+
     #[error("Replace operation requires oldText")]
     MissingOldText,
-    
+
     #[error("Clipboard '{0}' not found")]
     ClipboardNotFound(String),
-    
+
     #[error("oldText not found in file")]
     OldTextNotFound,
-    
+
     #[error("oldText appears {0} times in file (must be unique)")]
     OldTextNotUnique(usize),
-    
+
     #[error("Edit extends beyond file content")]
     EditOutOfBounds,
-    
+
     #[error("Line does not start with expected prefix '{prefix}':\n{line}")]
     ReindentPrefixMismatch { prefix: String, line: String },
-    
+
     #[error("No patches provided")]
     NoPatches,
 }

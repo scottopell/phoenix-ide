@@ -14,7 +14,7 @@ pub enum Event {
         images: Vec<ImageData>,
     },
     UserCancel,
-    
+
     // LLM events
     LlmResponse {
         content: Vec<ContentBlock>,
@@ -33,13 +33,13 @@ pub enum Event {
     RetryTimeout {
         attempt: u32,
     },
-    
+
     // Tool events
     ToolComplete {
         tool_use_id: String,
         result: ToolResult,
     },
-    
+
     // Sub-agent events
     #[allow(dead_code)] // Reserved for sub-agent feature
     SubAgentResult {

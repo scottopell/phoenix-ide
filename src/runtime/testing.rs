@@ -193,7 +193,7 @@ impl MessageStore for InMemoryStorage {
         let seq_id = msg_num as i64;
         *id_guard += 1;
         drop(id_guard);
-        
+
         let msg = Message {
             id: id.clone(),
             conversation_id: conv_id.to_string(),
@@ -322,8 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_tool_executor() {
-        let executor = MockToolExecutor::new()
-            .with_tool("bash", ToolOutput::success("output"));
+        let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
 
         let result = executor
             .execute("bash", serde_json::json!({ "cmd": "ls" }))
@@ -331,9 +330,7 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().success);
 
-        let result = executor
-            .execute("unknown", serde_json::json!({}))
-            .await;
+        let result = executor.execute("unknown", serde_json::json!({})).await;
         assert!(result.is_none());
     }
 

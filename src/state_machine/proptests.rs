@@ -121,7 +121,9 @@ fn arb_working_state() -> impl Strategy<Value = ConvState> {
 fn arb_busy_state() -> impl Strategy<Value = ConvState> {
     prop_oneof![
         arb_working_state(),
-        Just(ConvState::Cancelling { pending_tool_id: None }),
+        Just(ConvState::Cancelling {
+            pending_tool_id: None
+        }),
     ]
 }
 
@@ -384,7 +386,7 @@ proptest! {
 
         let result = transition(&state, &test_context(), event);
         prop_assert!(result.is_ok());
-        
+
         let new_state = result.unwrap().new_state;
         match new_state {
             ConvState::ToolExecuting { current_tool, remaining_tools, .. } => {
@@ -402,21 +404,27 @@ proptest! {
 
 #[test]
 fn test_tool_completion_advances_to_next_tool() {
-    let tool1 = ToolCall::new("t1", ToolInput::Bash(BashInput {
-        command: "echo 1".to_string(),
-        mode: BashMode::Default,
-    }));
-    let tool2 = ToolCall::new("t2", ToolInput::Bash(BashInput {
-        command: "echo 2".to_string(),
-        mode: BashMode::Default,
-    }));
-    
+    let tool1 = ToolCall::new(
+        "t1",
+        ToolInput::Bash(BashInput {
+            command: "echo 1".to_string(),
+            mode: BashMode::Default,
+        }),
+    );
+    let tool2 = ToolCall::new(
+        "t2",
+        ToolInput::Bash(BashInput {
+            command: "echo 2".to_string(),
+            mode: BashMode::Default,
+        }),
+    );
+
     let state = ConvState::ToolExecuting {
         current_tool: tool1.clone(),
         remaining_tools: vec![tool2.clone()],
         completed_results: vec![],
     };
-    
+
     let result = transition(
         &state,
         &test_context(),
@@ -429,34 +437,45 @@ fn test_tool_completion_advances_to_next_tool() {
                 is_error: false,
             },
         },
-    ).unwrap();
-    
+    )
+    .unwrap();
+
     match result.new_state {
-        ConvState::ToolExecuting { current_tool, remaining_tools, completed_results } => {
+        ConvState::ToolExecuting {
+            current_tool,
+            remaining_tools,
+            completed_results,
+        } => {
             assert_eq!(current_tool.id, "t2");
             assert!(remaining_tools.is_empty());
             assert_eq!(completed_results.len(), 1);
         }
         _ => panic!("Expected ToolExecuting"),
     }
-    
+
     // Should have ExecuteTool effect for next tool
-    assert!(result.effects.iter().any(|e| matches!(e, Effect::ExecuteTool { tool } if tool.id == "t2")));
+    assert!(result
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::ExecuteTool { tool } if tool.id == "t2")));
 }
 
 #[test]
 fn test_last_tool_completion_goes_to_llm_requesting() {
-    let tool1 = ToolCall::new("t1", ToolInput::Bash(BashInput {
-        command: "echo 1".to_string(),
-        mode: BashMode::Default,
-    }));
-    
+    let tool1 = ToolCall::new(
+        "t1",
+        ToolInput::Bash(BashInput {
+            command: "echo 1".to_string(),
+            mode: BashMode::Default,
+        }),
+    );
+
     let state = ConvState::ToolExecuting {
         current_tool: tool1,
         remaining_tools: vec![],
         completed_results: vec![],
     };
-    
+
     let result = transition(
         &state,
         &test_context(),
@@ -469,8 +488,15 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
                 is_error: false,
             },
         },
-    ).unwrap();
-    
-    assert!(matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }));
-    assert!(result.effects.iter().any(|e| matches!(e, Effect::RequestLlm)));
+    )
+    .unwrap();
+
+    assert!(matches!(
+        result.new_state,
+        ConvState::LlmRequesting { attempt: 1 }
+    ));
+    assert!(result
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::RequestLlm)));
 }

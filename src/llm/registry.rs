@@ -1,7 +1,7 @@
 //! Model registry for managing available LLM providers
 
-use super::{AnthropicService, LlmService, LoggingService};
 use super::anthropic::AnthropicModel;
+use super::{AnthropicService, LlmService, LoggingService};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     pub fn new(config: &LlmConfig) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
-        
+
         if config.gateway.is_some() {
             // Gateway mode: register all models, gateway handles API keys
             Self::register_all_models(&mut services, config);
@@ -54,31 +54,42 @@ impl ModelRegistry {
             }
             // OpenAI and Fireworks support can be added later
         }
-        
+
         // Determine default model
-        let default_model = config.default_model.clone()
+        let default_model = config
+            .default_model
+            .clone()
             .or_else(|| services.keys().next().cloned())
             .unwrap_or_else(|| "claude-4-sonnet".to_string());
-        
-        Self { services, default_model }
+
+        Self {
+            services,
+            default_model,
+        }
     }
 
-    fn register_all_models(services: &mut HashMap<String, Arc<dyn LlmService>>, config: &LlmConfig) {
+    fn register_all_models(
+        services: &mut HashMap<String, Arc<dyn LlmService>>,
+        config: &LlmConfig,
+    ) {
         Self::register_anthropic_models(services, config);
         // Additional providers can be registered here
     }
 
-    fn register_anthropic_models(services: &mut HashMap<String, Arc<dyn LlmService>>, config: &LlmConfig) {
+    fn register_anthropic_models(
+        services: &mut HashMap<String, Arc<dyn LlmService>>,
+        config: &LlmConfig,
+    ) {
         let key = config.anthropic_api_key.clone().unwrap_or_default();
         let gateway = config.gateway.as_deref();
-        
+
         let models = [
             ("claude-4-opus", AnthropicModel::Claude4Opus),
             ("claude-4-sonnet", AnthropicModel::Claude4Sonnet),
             ("claude-3.5-sonnet", AnthropicModel::Claude35Sonnet),
             ("claude-3.5-haiku", AnthropicModel::Claude35Haiku),
         ];
-        
+
         for (id, model) in models {
             let service = AnthropicService::new(key.clone(), model, gateway);
             let logged = LoggingService::new(Arc::new(service));

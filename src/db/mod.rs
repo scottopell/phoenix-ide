@@ -1,16 +1,16 @@
 //! Database module for Phoenix IDE
-//! 
+//!
 //! Provides persistence for conversations and messages.
 
 mod schema;
 
 pub use schema::*;
 
-use rusqlite::{Connection, params};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use chrono::{DateTime, Utc};
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -71,13 +71,13 @@ impl Database {
     ) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+
         conn.execute(
             "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived)
              VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?6, ?6, 0)",
             params![id, slug, cwd, parent_id, user_initiated, now.to_rfc3339()],
         )?;
-        
+
         Ok(Conversation {
             id: id.to_string(),
             slug: Some(slug.to_string()),
@@ -100,7 +100,7 @@ impl Database {
             "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_data, state_updated_at, created_at, updated_at, archived
              FROM conversations WHERE id = ?1"
         )?;
-        
+
         stmt.query_row(params![id], |row| {
             Ok(Conversation {
                 id: row.get(0)?,
@@ -109,13 +109,16 @@ impl Database {
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
                 state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                state_data: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
                 state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
                 created_at: parse_datetime(&row.get::<_, String>(8)?),
                 updated_at: parse_datetime(&row.get::<_, String>(9)?),
                 archived: row.get(10)?,
             })
-        }).map_err(|e| match e {
+        })
+        .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => DbError::ConversationNotFound(id.to_string()),
             other => DbError::Sqlite(other),
         })
@@ -128,7 +131,7 @@ impl Database {
             "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_data, state_updated_at, created_at, updated_at, archived
              FROM conversations WHERE slug = ?1"
         )?;
-        
+
         stmt.query_row(params![slug], |row| {
             Ok(Conversation {
                 id: row.get(0)?,
@@ -137,13 +140,16 @@ impl Database {
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
                 state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                state_data: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
                 state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
                 created_at: parse_datetime(&row.get::<_, String>(8)?),
                 updated_at: parse_datetime(&row.get::<_, String>(9)?),
                 archived: row.get(10)?,
             })
-        }).map_err(|e| match e {
+        })
+        .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => DbError::ConversationNotFound(slug.to_string()),
             other => DbError::Sqlite(other),
         })
@@ -158,7 +164,7 @@ impl Database {
              WHERE archived = 0 AND user_initiated = 1
              ORDER BY updated_at DESC"
         )?;
-        
+
         let rows = stmt.query_map([], |row| {
             Ok(Conversation {
                 id: row.get(0)?,
@@ -167,14 +173,16 @@ impl Database {
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
                 state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                state_data: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
                 state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
                 created_at: parse_datetime(&row.get::<_, String>(8)?),
                 updated_at: parse_datetime(&row.get::<_, String>(9)?),
                 archived: row.get(10)?,
             })
         })?;
-        
+
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -187,7 +195,7 @@ impl Database {
              WHERE archived = 1 AND user_initiated = 1
              ORDER BY updated_at DESC"
         )?;
-        
+
         let rows = stmt.query_map([], |row| {
             Ok(Conversation {
                 id: row.get(0)?,
@@ -196,14 +204,16 @@ impl Database {
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
                 state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                state_data: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
                 state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
                 created_at: parse_datetime(&row.get::<_, String>(8)?),
                 updated_at: parse_datetime(&row.get::<_, String>(9)?),
                 archived: row.get(10)?,
             })
         })?;
-        
+
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -218,12 +228,12 @@ impl Database {
         let now = Utc::now();
         let state_str = state.to_string();
         let state_data_str = state_data.map(|v| serde_json::to_string(v).unwrap());
-        
+
         let updated = conn.execute(
             "UPDATE conversations SET state = ?1, state_data = ?2, state_updated_at = ?3, updated_at = ?3 WHERE id = ?4",
             params![state_str, state_data_str, now.to_rfc3339(), id],
         )?;
-        
+
         if updated == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -234,12 +244,12 @@ impl Database {
     pub fn archive_conversation(&self, id: &str) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+
         let updated = conn.execute(
             "UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2",
             params![now.to_rfc3339(), id],
         )?;
-        
+
         if updated == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -250,12 +260,12 @@ impl Database {
     pub fn unarchive_conversation(&self, id: &str) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+
         let updated = conn.execute(
             "UPDATE conversations SET archived = 0, updated_at = ?1 WHERE id = ?2",
             params![now.to_rfc3339(), id],
         )?;
-        
+
         if updated == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -265,13 +275,10 @@ impl Database {
     /// Delete a conversation and all its messages
     pub fn delete_conversation(&self, id: &str) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
-        
+
         // Messages are deleted by CASCADE
-        let deleted = conn.execute(
-            "DELETE FROM conversations WHERE id = ?1",
-            params![id],
-        )?;
-        
+        let deleted = conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+
         if deleted == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -282,23 +289,23 @@ impl Database {
     pub fn rename_conversation(&self, id: &str, new_slug: &str) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+
         // Check if slug already exists
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1 AND id != ?2)",
             params![new_slug, id],
             |row| row.get(0),
         )?;
-        
+
         if exists {
             return Err(DbError::SlugExists(new_slug.to_string()));
         }
-        
+
         let updated = conn.execute(
             "UPDATE conversations SET slug = ?1, updated_at = ?2 WHERE id = ?3",
             params![new_slug, now.to_rfc3339(), id],
         )?;
-        
+
         if updated == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -309,7 +316,7 @@ impl Database {
     pub fn reset_all_to_idle(&self) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+
         conn.execute(
             "UPDATE conversations SET state = 'idle', state_data = NULL, state_updated_at = ?1, updated_at = ?1
              WHERE state != 'idle'",
@@ -332,18 +339,18 @@ impl Database {
     ) -> DbResult<Message> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+
         // Get next sequence ID
         let sequence_id: i64 = conn.query_row(
             "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
             params![conversation_id],
             |row| row.get(0),
         )?;
-        
+
         let content_str = serde_json::to_string(content).unwrap();
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
-        
+
         conn.execute(
             "INSERT INTO messages (id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -358,13 +365,13 @@ impl Database {
                 now.to_rfc3339(),
             ],
         )?;
-        
+
         // Update conversation timestamp
         conn.execute(
             "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
             params![now.to_rfc3339(), conversation_id],
         )?;
-        
+
         Ok(Message {
             id: id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -384,7 +391,7 @@ impl Database {
             "SELECT id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC"
         )?;
-        
+
         let rows = stmt.query_map(params![conversation_id], |row| {
             Ok(Message {
                 id: row.get(0)?,
@@ -392,23 +399,31 @@ impl Database {
                 sequence_id: row.get(2)?,
                 message_type: parse_message_type(&row.get::<_, String>(3)?),
                 content: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                display_data: row.get::<_, Option<String>>(5)?.map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                usage_data: row.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str(&s).ok()),
+                display_data: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                usage_data: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
             })
         })?;
-        
+
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
     /// Get messages after a sequence ID
-    pub fn get_messages_after(&self, conversation_id: &str, after_sequence: i64) -> DbResult<Vec<Message>> {
+    pub fn get_messages_after(
+        &self,
+        conversation_id: &str,
+        after_sequence: i64,
+    ) -> DbResult<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC"
         )?;
-        
+
         let rows = stmt.query_map(params![conversation_id, after_sequence], |row| {
             Ok(Message {
                 id: row.get(0)?,
@@ -416,12 +431,16 @@ impl Database {
                 sequence_id: row.get(2)?,
                 message_type: parse_message_type(&row.get::<_, String>(3)?),
                 content: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                display_data: row.get::<_, Option<String>>(5)?.map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                usage_data: row.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str(&s).ok()),
+                display_data: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                usage_data: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
             })
         })?;
-        
+
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -432,7 +451,8 @@ impl Database {
             "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
             params![conversation_id],
             |row| row.get(0),
-        ).map_err(DbError::from)
+        )
+        .map_err(DbError::from)
     }
 }
 
@@ -451,7 +471,9 @@ fn parse_state(s: &str) -> ConversationState {
             remaining_tools: vec![],
             completed_results: vec![],
         },
-        "cancelling" => ConversationState::Cancelling { pending_tool_id: None },
+        "cancelling" => ConversationState::Cancelling {
+            pending_tool_id: None,
+        },
         "awaiting_sub_agents" => ConversationState::AwaitingSubAgents {
             pending_ids: vec![],
             completed_results: vec![],
@@ -475,8 +497,7 @@ fn parse_message_type(s: &str) -> MessageType {
 }
 
 fn parse_datetime(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -486,20 +507,16 @@ mod tests {
     #[test]
     fn test_create_and_get_conversation() {
         let db = Database::open_in_memory().unwrap();
-        
-        let conv = db.create_conversation(
-            "test-id",
-            "test-slug",
-            "/tmp/test",
-            true,
-            None,
-        ).unwrap();
-        
+
+        let conv = db
+            .create_conversation("test-id", "test-slug", "/tmp/test", true, None)
+            .unwrap();
+
         assert_eq!(conv.id, "test-id");
         assert_eq!(conv.slug, Some("test-slug".to_string()));
         assert_eq!(conv.cwd, "/tmp/test");
         assert!(matches!(conv.state, ConversationState::Idle));
-        
+
         let fetched = db.get_conversation("test-id").unwrap();
         assert_eq!(fetched.id, conv.id);
     }
@@ -507,33 +524,38 @@ mod tests {
     #[test]
     fn test_add_and_get_messages() {
         let db = Database::open_in_memory().unwrap();
-        
-        db.create_conversation("conv-1", "slug-1", "/tmp", true, None).unwrap();
-        
-        let msg1 = db.add_message(
-            "msg-1",
-            "conv-1",
-            MessageType::User,
-            &serde_json::json!({"text": "Hello"}),
-            None,
-            None,
-        ).unwrap();
-        
-        let msg2 = db.add_message(
-            "msg-2",
-            "conv-1",
-            MessageType::Agent,
-            &serde_json::json!([{"type": "text", "text": "Hi there!"}]),
-            None,
-            None,
-        ).unwrap();
-        
+
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None)
+            .unwrap();
+
+        let msg1 = db
+            .add_message(
+                "msg-1",
+                "conv-1",
+                MessageType::User,
+                &serde_json::json!({"text": "Hello"}),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let msg2 = db
+            .add_message(
+                "msg-2",
+                "conv-1",
+                MessageType::Agent,
+                &serde_json::json!([{"type": "text", "text": "Hi there!"}]),
+                None,
+                None,
+            )
+            .unwrap();
+
         assert_eq!(msg1.sequence_id, 1);
         assert_eq!(msg2.sequence_id, 2);
-        
+
         let messages = db.get_messages("conv-1").unwrap();
         assert_eq!(messages.len(), 2);
-        
+
         let after = db.get_messages_after("conv-1", 1).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, "msg-2");

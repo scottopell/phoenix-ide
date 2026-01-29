@@ -5,10 +5,10 @@
 //! for property-based testing.
 
 use super::matching::find_unique_match;
-use std::fmt::Write;
-use super::types::{PatchRequest, PatchPlan, PatchError, Operation, PatchEffect, Edit, Reindent};
+use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::Path;
 
 /// Pure patch planner - no IO operations
@@ -143,10 +143,7 @@ impl PatchPlanner {
                     replacement: new_text,
                 },
                 Operation::Replace => {
-                    let old_text = patch
-                        .old_text
-                        .as_ref()
-                        .ok_or(PatchError::MissingOldText)?;
+                    let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
 
                     let spec = find_unique_match(original, old_text)?;
 
@@ -171,9 +168,9 @@ impl PatchPlanner {
     }
 
     /// Apply edits to content (in reverse order to maintain offsets)
-    fn apply_edits( original: &str, mut edits: Vec<Edit>) -> Result<String, PatchError> {
+    fn apply_edits(original: &str, mut edits: Vec<Edit>) -> Result<String, PatchError> {
         let mut result = original.to_string();
-        
+
         // Sort by offset descending so we can apply without adjusting offsets
         edits.sort_by(|a, b| b.offset.cmp(&a.offset));
 
@@ -369,7 +366,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan1.resulting_content, "hello ");
-        assert_eq!(planner.clipboards().get("clip1"), Some(&"world".to_string()));
+        assert_eq!(
+            planner.clipboards().get("clip1"),
+            Some(&"world".to_string())
+        );
 
         // Paste from clipboard
         let plan2 = planner

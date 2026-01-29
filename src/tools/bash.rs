@@ -22,9 +22,9 @@ use tokio::time::timeout;
 use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT_LENGTH: usize = 128 * 1024; // 128KB
-const SNIP_SIZE: usize = 4 * 1024;           // 4KB each end
+const SNIP_SIZE: usize = 4 * 1024; // 4KB each end
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const SLOW_TIMEOUT: Duration = Duration::from_secs(15 * 60);       // 15 minutes
+const SLOW_TIMEOUT: Duration = Duration::from_secs(15 * 60); // 15 minutes
 #[allow(dead_code)] // For future background task implementation
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
@@ -74,7 +74,8 @@ impl BashTool {
         unsafe {
             cmd.pre_exec(|| {
                 // Create new process group
-                nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).ok();
+                nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+                    .ok();
                 Ok(())
             });
         }
@@ -90,7 +91,7 @@ impl BashTool {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                
+
                 // Combine stdout and stderr
                 let combined = if !stderr.is_empty() && !stdout.is_empty() {
                     format!("{stdout}{stderr}")
@@ -126,18 +127,17 @@ impl BashTool {
                         let _ = pid; // Suppress warning
                     }
                 }
-                ToolOutput::error(format!(
-                    "[command timed out after {timeout_duration:?}]"
-                ))
+                ToolOutput::error(format!("[command timed out after {timeout_duration:?}]"))
             }
         }
     }
 
     fn execute_background(&self, command: &str) -> ToolOutput {
         // Create output file for background process
-        let output_file = std::env::temp_dir().join(format!("phoenix-bg-{}.log", uuid::Uuid::new_v4()));
+        let output_file =
+            std::env::temp_dir().join(format!("phoenix-bg-{}.log", uuid::Uuid::new_v4()));
         let output_path = output_file.clone();
-        
+
         let file = match std::fs::File::create(&output_file) {
             Ok(f) => f,
             Err(e) => return ToolOutput::error(format!("Failed to create output file: {e}")),
@@ -173,7 +173,7 @@ impl BashTool {
             Ok(child) => {
                 let pid = child.id().unwrap_or(0);
                 drop(file); // Close file handle
-                
+
                 ToolOutput::success(format!(
                     "<pid>{}</pid>\n<output_file>{}</output_file>\n<reminder>To stop: kill -9 -{}</reminder>",
                     pid,
@@ -192,7 +192,7 @@ impl BashTool {
 
         let start = &output[..SNIP_SIZE];
         let end = &output[output.len() - SNIP_SIZE..];
-        
+
         format!(
             "[output truncated in middle: got {} bytes, max is {} bytes]\n{}\n\n[snip]\n\n{}",
             output.len(),
@@ -263,8 +263,6 @@ For complex scripts, write them to a file first and then execute the file.
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,10 +295,12 @@ mod tests {
     #[tokio::test]
     async fn test_slow_mode() {
         let tool = BashTool::new(temp_dir());
-        let result = tool.run(json!({
-            "command": "echo slow",
-            "mode": "slow"
-        })).await;
+        let result = tool
+            .run(json!({
+                "command": "echo slow",
+                "mode": "slow"
+            }))
+            .await;
         assert!(result.success);
     }
 }

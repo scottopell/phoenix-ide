@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn test_overwrite_existing() {
         let mut fs = VirtualFs::with_files([(path("test.txt"), "old".to_string())]);
-        
+
         fs.interpret(&[PatchEffect::WriteFile {
             path: path("test.txt"),
             content: "new".to_string(),
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn test_multiple_effects() {
         let initial = HashMap::from([(path("a.txt"), "aaa".to_string())]);
-        
+
         let final_state = interpret_effects(
             initial,
             &[

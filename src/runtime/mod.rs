@@ -82,7 +82,9 @@ impl RuntimeManager {
         }
 
         // Need to start a new runtime
-        let conv = self.db.get_conversation(conversation_id)
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
             .map_err(|e| e.to_string())?;
 
         let context = ConvContext::new(
@@ -131,12 +133,18 @@ impl RuntimeManager {
     /// Send an event to a conversation
     pub async fn send_event(&self, conversation_id: &str, event: Event) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
-        handle.event_tx.send(event).await
+        handle
+            .event_tx
+            .send(event)
+            .await
             .map_err(|e| format!("Failed to send event: {e}"))
     }
 
     /// Subscribe to conversation updates
-    pub async fn subscribe(&self, conversation_id: &str) -> Result<broadcast::Receiver<SseEvent>, String> {
+    pub async fn subscribe(
+        &self,
+        conversation_id: &str,
+    ) -> Result<broadcast::Receiver<SseEvent>, String> {
         let handle = self.get_or_create(conversation_id).await?;
         Ok(handle.broadcast_tx.subscribe())
     }

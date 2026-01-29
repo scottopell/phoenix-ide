@@ -1,7 +1,9 @@
 //! Anthropic Claude provider implementation
 
+use super::types::{
+    ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage,
+};
 use super::{LlmError, LlmService};
-use super::types::{LlmRequest, LlmMessage, MessageRole, ContentBlock, ImageSource, LlmResponse, Usage};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -61,16 +63,19 @@ impl AnthropicService {
         let base_url = match gateway {
             Some(gw) => {
                 // exe.dev gateway format: gateway_base + /_/gateway/anthropic/v1/messages
-                format!("{}/_/gateway/anthropic/v1/messages", gw.trim_end_matches('/'))
+                format!(
+                    "{}/_/gateway/anthropic/v1/messages",
+                    gw.trim_end_matches('/')
+                )
             }
             None => "https://api.anthropic.com/v1/messages".to_string(),
         };
-        
+
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
-        
+
         Self {
             client,
             api_key,
@@ -81,25 +86,30 @@ impl AnthropicService {
     }
 
     fn translate_request(&self, request: &LlmRequest) -> AnthropicRequest {
-        let system: Vec<AnthropicSystemBlock> = request.system
+        let system: Vec<AnthropicSystemBlock> = request
+            .system
             .iter()
             .map(|s| AnthropicSystemBlock {
                 r#type: "text".to_string(),
                 text: s.text.clone(),
                 cache_control: if s.cache {
-                    Some(CacheControl { r#type: "ephemeral".to_string() })
+                    Some(CacheControl {
+                        r#type: "ephemeral".to_string(),
+                    })
                 } else {
                     None
                 },
             })
             .collect();
 
-        let messages: Vec<AnthropicMessage> = request.messages
+        let messages: Vec<AnthropicMessage> = request
+            .messages
             .iter()
             .map(Self::translate_message)
             .collect();
 
-        let tools: Vec<AnthropicTool> = request.tools
+        let tools: Vec<AnthropicTool> = request
+            .tools
             .iter()
             .map(|t| AnthropicTool {
                 name: t.name.clone(),
@@ -117,18 +127,17 @@ impl AnthropicService {
         }
     }
 
-    fn translate_message( msg: &LlmMessage) -> AnthropicMessage {
+    fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
         };
 
-        let content: Vec<AnthropicContentBlock> = msg.content
+        let content: Vec<AnthropicContentBlock> = msg
+            .content
             .iter()
             .map(|block| match block {
-                ContentBlock::Text { text } => AnthropicContentBlock::Text {
-                    text: text.clone(),
-                },
+                ContentBlock::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
                 ContentBlock::Image { source } => {
                     let ImageSource::Base64 { media_type, data } = source;
                     AnthropicContentBlock::Image {
@@ -144,13 +153,15 @@ impl AnthropicService {
                     name: name.clone(),
                     input: input.clone(),
                 },
-                ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                    AnthropicContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: content.clone(),
-                        is_error: *is_error,
-                    }
-                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => AnthropicContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                },
             })
             .collect();
 
@@ -160,8 +171,9 @@ impl AnthropicService {
         }
     }
 
-    fn normalize_response( resp: AnthropicResponse) -> LlmResponse {
-        let content: Vec<ContentBlock> = resp.content
+    fn normalize_response(resp: AnthropicResponse) -> LlmResponse {
+        let content: Vec<ContentBlock> = resp
+            .content
             .into_iter()
             .map(|block| match block {
                 AnthropicContentBlock::Text { text } => ContentBlock::Text { text },
@@ -170,11 +182,15 @@ impl AnthropicService {
                 }
                 AnthropicContentBlock::Image { .. } => {
                     // Images shouldn't appear in responses
-                    ContentBlock::Text { text: "[image]".to_string() }
+                    ContentBlock::Text {
+                        text: "[image]".to_string(),
+                    }
                 }
                 AnthropicContentBlock::ToolResult { .. } => {
                     // Tool results shouldn't appear in responses
-                    ContentBlock::Text { text: "[tool result]".to_string() }
+                    ContentBlock::Text {
+                        text: "[tool result]".to_string(),
+                    }
                 }
             })
             .collect();
@@ -193,7 +209,7 @@ impl AnthropicService {
         }
     }
 
-    fn classify_error( status: reqwest::StatusCode, body: &str) -> LlmError {
+    fn classify_error(status: reqwest::StatusCode, body: &str) -> LlmError {
         let message = body.to_string();
         match status.as_u16() {
             401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
@@ -201,7 +217,8 @@ impl AnthropicService {
                 let mut err = LlmError::rate_limit(format!("Rate limited: {message}"));
                 // Try to parse retry-after from response
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
-                    if let Some(retry_after) = parsed.get("error")
+                    if let Some(retry_after) = parsed
+                        .get("error")
                         .and_then(|e| e.get("retry_after"))
                         .and_then(serde_json::Value::as_f64)
                     {
@@ -221,8 +238,9 @@ impl AnthropicService {
 impl LlmService for AnthropicService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let anthropic_request = self.translate_request(request);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .post(&self.base_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -241,16 +259,18 @@ impl LlmService for AnthropicService {
             })?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            LlmError::network(format!("Failed to read response: {e}"))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
         if !status.is_success() {
             return Err(Self::classify_error(status, &body));
         }
 
-        let anthropic_response: AnthropicResponse = serde_json::from_str(&body)
-            .map_err(|e| LlmError::unknown(format!("Failed to parse response: {e} - body: {body}")))?;
+        let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {
+            LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
+        })?;
 
         Ok(Self::normalize_response(anthropic_response))
     }
@@ -302,8 +322,12 @@ struct AnthropicMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContentBlock {
-    Text { text: String },
-    Image { source: AnthropicImageSource },
+    Text {
+        text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
     ToolUse {
         id: String,
         name: String,

@@ -51,7 +51,7 @@ pub fn find_exact_unique(content: &str, old_text: &str) -> Option<EditSpec> {
 /// Find match with different indentation
 fn find_dedent_match(content: &str, old_text: &str) -> Option<EditSpec> {
     let old_indent = common_leading_whitespace(old_text);
-    
+
     // Try different indent levels found in the content
     for line in content.lines() {
         let line_indent = leading_whitespace(line);
@@ -106,7 +106,7 @@ pub fn leading_whitespace(s: &str) -> &str {
 /// Get common leading whitespace across all non-empty lines
 pub fn common_leading_whitespace(text: &str) -> String {
     let mut common: Option<String> = None;
-    
+
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
@@ -125,7 +125,7 @@ pub fn common_leading_whitespace(text: &str) -> String {
             }
         };
     }
-    
+
     common.unwrap_or_default()
 }
 
@@ -194,7 +194,7 @@ mod tests {
     fn test_common_leading_whitespace() {
         let text = "  line1\n  line2\n  line3";
         assert_eq!(common_leading_whitespace(text), "  ");
-        
+
         let text2 = "    line1\n  line2"; // Mixed
         assert_eq!(common_leading_whitespace(text2), "  ");
     }

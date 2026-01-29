@@ -18,60 +18,67 @@ pub fn sse_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Create stream that starts with init event then broadcasts
     let init = futures::stream::once(async move { Ok(sse_event_to_axum(init_event)) });
-    
-    let broadcasts = BroadcastStream::new(broadcast_rx)
-        .filter_map(|result| match result {
-            Ok(event) => Some(Ok(sse_event_to_axum(event))),
-            Err(_) => None, // Skip lagged messages
-        });
-    
+
+    let broadcasts = BroadcastStream::new(broadcast_rx).filter_map(|result| match result {
+        Ok(event) => Some(Ok(sse_event_to_axum(event))),
+        Err(_) => None, // Skip lagged messages
+    });
+
     let combined = init.chain(broadcasts);
-    
+
     Sse::new(combined).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
-            .text("ping")
+            .text("ping"),
     )
 }
 
 fn sse_event_to_axum(event: SseEvent) -> Event {
     let (event_type, data) = match event {
-        SseEvent::Init { conversation, messages, agent_working, last_sequence_id } => {
-            ("init", json!({
+        SseEvent::Init {
+            conversation,
+            messages,
+            agent_working,
+            last_sequence_id,
+        } => (
+            "init",
+            json!({
                 "type": "init",
                 "conversation": conversation,
                 "messages": messages,
                 "agent_working": agent_working,
                 "last_sequence_id": last_sequence_id
-            }))
-        }
-        SseEvent::Message { message } => {
-            ("message", json!({
+            }),
+        ),
+        SseEvent::Message { message } => (
+            "message",
+            json!({
                 "type": "message",
                 "message": message
-            }))
-        }
-        SseEvent::StateChange { state, state_data } => {
-            ("state_change", json!({
+            }),
+        ),
+        SseEvent::StateChange { state, state_data } => (
+            "state_change",
+            json!({
                 "type": "state_change",
                 "state": state,
                 "state_data": state_data
-            }))
-        }
-        SseEvent::AgentDone => {
-            ("agent_done", json!({
+            }),
+        ),
+        SseEvent::AgentDone => (
+            "agent_done",
+            json!({
                 "type": "agent_done"
-            }))
-        }
-        SseEvent::Error { message } => {
-            ("error", json!({
+            }),
+        ),
+        SseEvent::Error { message } => (
+            "error",
+            json!({
                 "type": "error",
                 "message": message
-            }))
-        }
+            }),
+        ),
     };
-    
-    Event::default()
-        .event(event_type)
-        .data(data.to_string())
+
+    Event::default().event(event_type).data(data.to_string())
 }

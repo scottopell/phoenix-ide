@@ -56,7 +56,9 @@ mod tests {
     #[tokio::test]
     async fn test_think_records() {
         let tool = ThinkTool;
-        let result = tool.run(json!({"thoughts": "Planning my approach..."})).await;
+        let result = tool
+            .run(json!({"thoughts": "Planning my approach..."}))
+            .await;
         assert!(result.success);
         assert_eq!(result.output, "recorded");
     }

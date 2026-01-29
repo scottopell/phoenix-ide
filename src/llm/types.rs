@@ -52,8 +52,10 @@ pub enum MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    Image { 
+    Text {
+        text: String,
+    },
+    Image {
         source: ImageSource,
     },
     ToolUse {
@@ -75,7 +77,11 @@ impl ContentBlock {
     }
 
     #[allow(dead_code)] // Constructor for API completeness
-    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
+    pub fn tool_use(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
         ContentBlock::ToolUse {
             id: id.into(),
             name: name.into(),
@@ -83,7 +89,11 @@ impl ContentBlock {
         }
     }
 
-    pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         ContentBlock::ToolResult {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
@@ -96,10 +106,7 @@ impl ContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
 }
 
 /// Tool definition
@@ -124,7 +131,9 @@ impl LlmResponse {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+                ContentBlock::ToolUse { id, name, input } => {
+                    Some((id.as_str(), name.as_str(), input))
+                }
                 _ => None,
             })
             .collect()
@@ -145,7 +154,9 @@ impl LlmResponse {
     /// Check if response contains any tool use requests
     #[allow(dead_code)] // Utility method for API completeness
     pub fn has_tool_use(&self) -> bool {
-        self.content.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        self.content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
     }
 }
 
@@ -162,10 +173,9 @@ pub struct Usage {
 impl Usage {
     #[allow(dead_code)] // For future context tracking
     pub fn context_window_used(&self) -> u64 {
-        self.input_tokens + self.output_tokens + 
-        self.cache_creation_tokens + self.cache_read_tokens
+        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
-    
+
     #[allow(dead_code)] // Utility method
     pub fn is_zero(&self) -> bool {
         self.input_tokens == 0 && self.output_tokens == 0

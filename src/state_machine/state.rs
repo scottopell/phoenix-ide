@@ -57,7 +57,10 @@ pub enum ToolInput {
     KeywordSearch(KeywordSearchInput),
     ReadImage(ReadImageInput),
     /// Fallback for unknown tools or parsing failures
-    Unknown { name: String, input: Value },
+    Unknown {
+        name: String,
+        input: Value,
+    },
 }
 
 impl ToolInput {
@@ -88,17 +91,45 @@ impl ToolInput {
     /// Parse from tool name and JSON value
     pub fn from_name_and_value(name: &str, value: Value) -> Self {
         match name {
-            "bash" => serde_json::from_value(value.clone())
-                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::Bash),
-            "think" => serde_json::from_value(value.clone())
-                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::Think),
-            "patch" => serde_json::from_value(value.clone())
-                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::Patch),
-            "keyword_search" => serde_json::from_value(value.clone())
-                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::KeywordSearch),
-            "read_image" => serde_json::from_value(value.clone())
-                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::ReadImage),
-            _ => ToolInput::Unknown { name: name.to_string(), input: value },
+            "bash" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::Bash,
+            ),
+            "think" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::Think,
+            ),
+            "patch" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::Patch,
+            ),
+            "keyword_search" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::KeywordSearch,
+            ),
+            "read_image" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::ReadImage,
+            ),
+            _ => ToolInput::Unknown {
+                name: name.to_string(),
+                input: value,
+            },
         }
     }
 }
@@ -140,13 +171,13 @@ pub enum ConvState {
     /// Ready for user input, no pending operations
     #[default]
     Idle,
-    
+
     /// User message received, preparing LLM request
     AwaitingLlm,
-    
+
     /// LLM request in flight, with retry tracking
     LlmRequesting { attempt: u32 },
-    
+
     /// Executing tools serially
     ToolExecuting {
         /// The current tool being executed
@@ -157,17 +188,17 @@ pub enum ConvState {
         #[serde(default)]
         completed_results: Vec<ToolResult>,
     },
-    
+
     /// User requested cancellation, waiting for graceful completion
     Cancelling { pending_tool_id: Option<String> },
-    
+
     /// Waiting for sub-agents to complete
     AwaitingSubAgents {
         pending_ids: Vec<String>,
         #[serde(default)]
         completed_results: Vec<SubAgentResult>,
     },
-    
+
     /// Error occurred - UI displays this state directly
     Error {
         message: String,
@@ -201,7 +232,6 @@ impl ConvState {
         }
     }
 }
-
 
 /// Context for a conversation (immutable configuration)
 #[derive(Debug, Clone)]

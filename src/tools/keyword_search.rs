@@ -8,24 +8,20 @@
 
 use super::{Tool, ToolOutput};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
-use std::path::Path;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 
-const MAX_TERM_RESULTS: usize = 64 * 1024;     // 64KB per term
+const MAX_TERM_RESULTS: usize = 64 * 1024; // 64KB per term
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
 
 /// Preferred models for filtering (fast and cheap)
-const PREFERRED_MODELS: &[&str] = &[
-    "claude-3.5-haiku",
-    "claude-3.5-sonnet",
-    "claude-4-sonnet",
-];
+const PREFERRED_MODELS: &[&str] = &["claude-3.5-haiku", "claude-3.5-sonnet", "claude-4-sonnet"];
 
 const FILTER_SYSTEM_PROMPT: &str = r#"You are a code search relevance evaluator. Your task is to analyze ripgrep results and determine which files are most relevant to the user's query.
 
@@ -93,21 +89,23 @@ impl KeywordSearchTool {
     /// Run ripgrep with given terms
     async fn ripgrep(&self, dir: &PathBuf, terms: &[String]) -> Result<String, String> {
         let mut cmd = Command::new("rg");
-        cmd.args(["-C", "10"])  // 10 lines context
-            .arg("-i")           // Case insensitive
+        cmd.args(["-C", "10"]) // 10 lines context
+            .arg("-i") // Case insensitive
             .arg("--line-number")
             .arg("--with-filename");
-        
+
         for term in terms {
             cmd.args(["-e", term]);
         }
-        
+
         cmd.current_dir(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
 
         // Exit code 1 = no matches (not an error)
@@ -142,7 +140,8 @@ impl KeywordSearchTool {
         search_root: &Path,
         results: &str,
     ) -> Result<String, String> {
-        let llm = self.select_filter_llm()
+        let llm = self
+            .select_filter_llm()
             .ok_or("No LLM available for filtering")?;
 
         let user_content = format!(
@@ -162,7 +161,9 @@ impl KeywordSearchTool {
             max_tokens: Some(4096),
         };
 
-        let response = llm.complete(&request).await
+        let response = llm
+            .complete(&request)
+            .await
             .map_err(|e| format!("LLM filtering failed: {e}"))?;
 
         Ok(response.text())
@@ -237,7 +238,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
 
         if usable_terms.is_empty() {
             return ToolOutput::error(
-                "Each of those search terms yielded too many results. Try more specific terms."
+                "Each of those search terms yielded too many results. Try more specific terms.",
             );
         }
 
@@ -262,7 +263,10 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         }
 
         // Filter with LLM
-        match self.filter_with_llm(&input.query, &search_root, &results).await {
+        match self
+            .filter_with_llm(&input.query, &search_root, &results)
+            .await
+        {
             Ok(filtered) => ToolOutput::success(filtered),
             Err(e) => {
                 // If LLM fails, return raw results (truncated)
