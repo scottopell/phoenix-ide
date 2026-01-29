@@ -7,6 +7,9 @@ pub mod event;
 pub mod state;
 mod transition;
 
+#[cfg(test)]
+mod proptests;
+
 pub use effect::Effect;
 pub use event::Event;
 pub use state::{ConvContext, ConvState, ToolCall, ToolInput};
