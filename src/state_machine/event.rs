@@ -20,12 +20,14 @@ pub enum Event {
         content: Vec<ContentBlock>,
         /// Tool calls extracted from the content
         tool_calls: Vec<ToolCall>,
+        #[allow(dead_code)] // Reserved for conversation flow control
         end_turn: bool,
         usage: Usage,
     },
     LlmError {
         message: String,
         error_kind: ErrorKind,
+        #[allow(dead_code)] // Reserved for retry tracking
         attempt: u32,
     },
     RetryTimeout {
@@ -39,6 +41,7 @@ pub enum Event {
     },
     
     // Sub-agent events
+    #[allow(dead_code)] // Reserved for sub-agent feature
     SubAgentResult {
         agent_id: String,
         result: SubAgentResult,
@@ -53,6 +56,7 @@ pub struct ImageData {
 }
 
 impl ImageData {
+    #[allow(dead_code)] // Conversion utility
     pub fn to_image_source(&self) -> ImageSource {
         ImageSource::Base64 {
             media_type: self.media_type.clone(),

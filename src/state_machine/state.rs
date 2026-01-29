@@ -180,11 +180,13 @@ pub enum ConvState {
 
 impl ConvState {
     /// Check if this is a terminal state (conversation should stop processing)
+    #[allow(dead_code)] // State query utility
     pub fn is_terminal(&self) -> bool {
         false // Conversations can always be continued from any state
     }
 
     /// Check if agent is currently working
+    #[allow(dead_code)] // State query utility
     pub fn is_working(&self) -> bool {
         !matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
@@ -215,6 +217,7 @@ pub struct ConvContext {
     pub conversation_id: String,
     pub working_dir: PathBuf,
     pub model_id: String,
+    #[allow(dead_code)] // Reserved for sub-agent feature
     pub is_sub_agent: bool,
 }
 
@@ -232,6 +235,7 @@ impl ConvContext {
         }
     }
 
+    #[allow(dead_code)] // Reserved for sub-agent feature
     pub fn as_sub_agent(mut self) -> Self {
         self.is_sub_agent = true;
         self

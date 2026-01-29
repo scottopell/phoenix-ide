@@ -4,6 +4,8 @@
 //! operations in memory, enabling property-based testing without
 //! actual IO.
 
+#![allow(dead_code)] // Used in tests via proptests module
+
 use super::types::PatchEffect;
 use std::collections::HashMap;
 use std::path::PathBuf;

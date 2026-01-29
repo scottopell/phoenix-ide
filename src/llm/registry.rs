@@ -9,8 +9,11 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
+    #[allow(dead_code)] // Reserved for OpenAI provider
     pub openai_api_key: Option<String>,
+    #[allow(dead_code)] // Reserved for Fireworks provider
     pub fireworks_api_key: Option<String>,
+    #[allow(dead_code)] // Reserved for Gemini provider
     pub gemini_api_key: Option<String>,
     /// exe.dev gateway URL (e.g., "https://meteor-rain.exe.xyz")
     pub gateway: Option<String>,

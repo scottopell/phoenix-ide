@@ -84,6 +84,7 @@ impl ToolRegistry {
     }
 
     /// Create tool registry for sub-agents (limited tools)
+    #[allow(dead_code)] // Reserved for sub-agent feature
     pub fn new_for_subagent(working_dir: PathBuf, llm_registry: Arc<ModelRegistry>) -> Self {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ThinkTool),

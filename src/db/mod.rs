@@ -42,6 +42,7 @@ impl Database {
     }
 
     /// Open an in-memory database (for testing)
+    #[allow(dead_code)] // Used in tests
     pub fn open_in_memory() -> DbResult<Self> {
         let conn = Connection::open_in_memory()?;
         let db = Self {

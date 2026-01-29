@@ -437,6 +437,7 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
 }
 
 // Extension trait to get sender from receiver
+#[allow(dead_code)] // Utility trait for future use
 trait ReceiverExt<T> {
     fn sender(&self) -> mpsc::Sender<T>;
 }

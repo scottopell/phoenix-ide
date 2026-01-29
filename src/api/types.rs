@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
     pub cwd: String,
+    #[allow(dead_code)] // Reserved for model selection
     pub model: Option<String>,
 }
 

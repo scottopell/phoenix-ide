@@ -13,6 +13,7 @@ pub struct ThinkTool;
 
 #[derive(Debug, Deserialize)]
 struct ThinkInput {
+    #[allow(dead_code)] // Deserialized for validation, content echoed via input json
     thoughts: String,
 }
 

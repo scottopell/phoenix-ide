@@ -1,6 +1,6 @@
 //! Anthropic Claude provider implementation
 
-use super::{LlmError, LlmErrorKind, LlmService};
+use super::{LlmError, LlmService};
 use super::types::*;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -27,6 +27,7 @@ impl AnthropicModel {
         }
     }
 
+    #[allow(dead_code)] // For future context management
     pub fn context_window(&self) -> usize {
         match self {
             AnthropicModel::Claude4Opus => 200_000,

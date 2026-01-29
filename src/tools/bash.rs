@@ -18,12 +18,14 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 #[cfg(unix)]
+#[allow(unused_imports)]
 use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT_LENGTH: usize = 128 * 1024; // 128KB
 const SNIP_SIZE: usize = 4 * 1024;           // 4KB each end
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOW_TIMEOUT: Duration = Duration::from_secs(15 * 60);       // 15 minutes
+#[allow(dead_code)] // For future background task implementation
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// Execution mode for bash commands

@@ -7,6 +7,7 @@ mod sse;
 mod types;
 
 pub use handlers::create_router;
+#[allow(unused_imports)] // Public API re-exports
 pub use types::*;
 
 use crate::db::Database;

@@ -1,8 +1,11 @@
 //! Trait abstractions for runtime I/O
 //!
 //! These traits enable testing the executor with mock implementations.
+//! These traits are defined for the future executor refactor (task 001).
 
-use crate::db::{Message, MessageType, ToolResult, UsageData};
+#![allow(dead_code)]
+
+use crate::db::{Message, MessageType, UsageData};
 use crate::llm::{LlmError, LlmRequest, LlmResponse};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;

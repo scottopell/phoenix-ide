@@ -12,6 +12,8 @@ pub mod traits;
 pub mod testing;
 
 pub use executor::ConversationRuntime;
+// Traits exported for future use when executor is refactored
+#[allow(unused_imports)]
 pub use traits::*;
 
 use crate::db::Database;
@@ -145,6 +147,7 @@ impl RuntimeManager {
     }
 
     /// Get the LLM registry
+    #[allow(dead_code)] // For future API use
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
         &self.llm_registry
     }

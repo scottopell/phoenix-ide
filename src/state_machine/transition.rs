@@ -36,6 +36,7 @@ impl TransitionResult {
         self
     }
 
+    #[allow(dead_code)] // Builder method
     pub fn with_effects(mut self, effects: impl IntoIterator<Item = Effect>) -> Self {
         self.effects.extend(effects);
         self
@@ -384,6 +385,7 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(1 << (attempt - 1))
 }
 
+#[allow(dead_code)] // Conversion utility
 pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
     match kind {
         crate::llm::LlmErrorKind::Auth => ErrorKind::Auth,

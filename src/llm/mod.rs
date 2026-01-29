@@ -25,9 +25,11 @@ pub trait LlmService: Send + Sync {
     fn model_id(&self) -> &str;
     
     /// Get the context window size in tokens
+    #[allow(dead_code)] // For future context management
     fn context_window(&self) -> usize;
     
     /// Get max image dimension (for resizing before send)
+    #[allow(dead_code)] // For future image resizing
     fn max_image_dimension(&self) -> Option<u32>;
 }
 

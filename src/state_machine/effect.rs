@@ -28,6 +28,7 @@ pub enum Effect {
     },
     
     /// Spawn a sub-agent
+    #[allow(dead_code)] // Reserved for sub-agent feature
     SpawnSubAgent {
         agent_id: String,
         prompt: String,
@@ -90,6 +91,7 @@ impl Effect {
         }
     }
 
+    #[allow(dead_code)] // Constructor for API completeness
     pub fn notify_message(message: Value) -> Self {
         Effect::NotifyClient {
             event_type: "message".to_string(),

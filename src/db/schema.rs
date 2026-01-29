@@ -140,6 +140,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    #[allow(dead_code)] // Constructor for API completeness
     pub fn success(tool_use_id: String, output: String) -> Self {
         Self {
             tool_use_id,

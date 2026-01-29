@@ -74,6 +74,7 @@ impl ContentBlock {
         ContentBlock::Text { text: s.into() }
     }
 
+    #[allow(dead_code)] // Constructor for API completeness
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
         ContentBlock::ToolUse {
             id: id.into(),
@@ -142,6 +143,7 @@ impl LlmResponse {
     }
 
     /// Check if response contains any tool use requests
+    #[allow(dead_code)] // Utility method for API completeness
     pub fn has_tool_use(&self) -> bool {
         self.content.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
     }
@@ -157,11 +159,13 @@ pub struct Usage {
 }
 
 impl Usage {
+    #[allow(dead_code)] // For future context tracking
     pub fn context_window_used(&self) -> u64 {
         self.input_tokens + self.output_tokens + 
         self.cache_creation_tokens + self.cache_read_tokens
     }
     
+    #[allow(dead_code)] // Utility method
     pub fn is_zero(&self) -> bool {
         self.input_tokens == 0 && self.output_tokens == 0
     }

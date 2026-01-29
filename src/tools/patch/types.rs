@@ -70,6 +70,7 @@ pub struct PatchPlan {
     /// The effects to execute
     pub effects: Vec<PatchEffect>,
     /// The resulting content after patches
+    #[allow(dead_code)] // Used in tests
     pub resulting_content: String,
     /// Generated diff for display
     pub diff: String,

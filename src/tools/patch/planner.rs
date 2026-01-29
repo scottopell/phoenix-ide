@@ -4,7 +4,7 @@
 //! operating on string content without any IO. This makes it ideal
 //! for property-based testing.
 
-use super::matching::{find_unique_match, reindent_text};
+use super::matching::find_unique_match;
 use super::types::*;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
@@ -25,11 +25,13 @@ impl PatchPlanner {
     }
 
     /// Create a planner with pre-populated clipboards (useful for testing)
+    #[allow(dead_code)] // For testing
     pub fn with_clipboards(clipboards: HashMap<String, String>) -> Self {
         Self { clipboards }
     }
 
     /// Get current clipboard contents (for testing)
+    #[allow(dead_code)] // For testing
     pub fn clipboards(&self) -> &HashMap<String, String> {
         &self.clipboards
     }
