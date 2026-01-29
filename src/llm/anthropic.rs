@@ -62,9 +62,9 @@ impl AnthropicService {
     pub fn new(api_key: String, model: AnthropicModel, gateway: Option<&str>) -> Self {
         let base_url = match gateway {
             Some(gw) => {
-                // exe.dev gateway format: gateway_base + /_/gateway/anthropic/v1/messages
+                // exe.dev gateway format: gateway_base + /anthropic/v1/messages
                 format!(
-                    "{}/_/gateway/anthropic/v1/messages",
+                    "{}/anthropic/v1/messages",
                     gw.trim_end_matches('/')
                 )
             }
