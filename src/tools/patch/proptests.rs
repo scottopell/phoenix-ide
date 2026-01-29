@@ -228,8 +228,11 @@ proptest! {
         repl1 in arb_unique_substring(),
         repl3 in arb_unique_substring(),
     ) {
-        // Ensure all parts are distinct
+        // Ensure all parts are distinct and no part is a substring of another
         prop_assume!(part1 != part2 && part2 != part3 && part1 != part3);
+        prop_assume!(!part1.contains(&*part2) && !part2.contains(&*part1));
+        prop_assume!(!part2.contains(&*part3) && !part3.contains(&*part2));
+        prop_assume!(!part1.contains(&*part3) && !part3.contains(&*part1));
         prop_assume!(repl1 != part2 && repl3 != part2);
         prop_assume!(repl1 != part1 && repl3 != part3); // Replacements differ from originals
 
