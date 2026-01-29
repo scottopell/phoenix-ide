@@ -6,8 +6,13 @@
 //! REQ-BED-012: Context Window Tracking
 
 mod executor;
+pub mod traits;
+
+#[cfg(test)]
+pub mod testing;
 
 pub use executor::ConversationRuntime;
+pub use traits::*;
 
 use crate::db::Database;
 use crate::llm::ModelRegistry;
