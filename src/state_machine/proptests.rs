@@ -2,13 +2,15 @@
 //!
 //! These tests verify key invariants hold across all possible inputs.
 
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::single_match_else)]
+
 use super::state::*;
 use super::transition::*;
 use super::*;
 use crate::db::{ErrorKind, ToolResult};
 use crate::llm::{ContentBlock, Usage};
 use proptest::prelude::*;
-use serde_json::json;
 use std::path::PathBuf;
 
 // ============================================================================

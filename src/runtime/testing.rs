@@ -17,6 +17,7 @@ use std::sync::Mutex;
 // ============================================================================
 
 /// Mock LLM client that returns queued responses
+#[allow(dead_code)]
 pub struct MockLlmClient {
     responses: Mutex<VecDeque<Result<LlmResponse, LlmError>>>,
     model_id: String,
@@ -24,6 +25,7 @@ pub struct MockLlmClient {
     pub requests: Mutex<Vec<LlmRequest>>,
 }
 
+#[allow(dead_code)]
 impl MockLlmClient {
     pub fn new(model_id: impl Into<String>) -> Self {
         Self {
@@ -70,6 +72,7 @@ impl LlmClient for MockLlmClient {
 // ============================================================================
 
 /// Mock tool executor with predefined outputs
+#[allow(dead_code)]
 pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
@@ -77,6 +80,7 @@ pub struct MockToolExecutor {
     pub executions: Mutex<Vec<(String, Value)>>,
 }
 
+#[allow(dead_code)]
 impl MockToolExecutor {
     pub fn new() -> Self {
         Self {
@@ -91,7 +95,7 @@ impl MockToolExecutor {
         let name = name.into();
         self.definitions.push(ToolDefinition {
             name: name.clone(),
-            description: format!("Mock {}", name),
+            description: format!("Mock {name}"),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
         });
         self.outputs.insert(name, output);
@@ -130,12 +134,14 @@ impl ToolExecutor for MockToolExecutor {
 // ============================================================================
 
 /// In-memory storage for testing
+#[allow(dead_code)]
 pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, (crate::db::ConversationState, Option<Value>)>>,
     next_msg_id: Mutex<u64>,
 }
 
+#[allow(dead_code)]
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
@@ -182,7 +188,8 @@ impl MessageStore for InMemoryStorage {
     ) -> Result<Message, String> {
         let mut id_guard = self.next_msg_id.lock().unwrap();
         let msg_num = *id_guard;
-        let id = format!("msg-{}", msg_num);
+        let id = format!("msg-{msg_num}");
+        #[allow(clippy::cast_possible_wrap)]
         let seq_id = msg_num as i64;
         *id_guard += 1;
         drop(id_guard);
@@ -242,6 +249,7 @@ impl StateStore for InMemoryStorage {
     }
 }
 
+#[allow(dead_code)]
 fn db_state_to_conv_state(db_state: &crate::db::ConversationState) -> ConvState {
     match db_state {
         crate::db::ConversationState::Idle => ConvState::Idle,

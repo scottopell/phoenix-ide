@@ -360,7 +360,7 @@ mod tests {
                 &[PatchRequest {
                     operation: Operation::Replace,
                     old_text: Some("world".to_string()),
-                    new_text: Some("".to_string()),
+                    new_text: Some(String::new()),
                     to_clipboard: Some("clip1".to_string()),
                     from_clipboard: None,
                     reindent: None,

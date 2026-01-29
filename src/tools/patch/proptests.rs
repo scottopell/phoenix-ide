@@ -1,13 +1,16 @@
 //! Property-based tests for the patch tool
 //!
 //! These tests verify key invariants of the patch system using
-//! the pure PatchPlanner and VirtualFs interpreter.
+//! the pure `PatchPlanner` and `VirtualFs` interpreter.
+
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::manual_string_new)]
+#![allow(clippy::redundant_closure_for_method_calls)]
 
 use super::interpreter::VirtualFs;
 use super::planner::PatchPlanner;
 use super::types::*;
 use proptest::prelude::*;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ============================================================================

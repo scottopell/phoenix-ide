@@ -35,7 +35,6 @@ pub fn read_file_content(path: &Path) -> Result<Option<String>, io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
