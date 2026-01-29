@@ -29,11 +29,16 @@ def cmd_tasks_ready():
     for task_file in sorted(TASKS_DIR.glob("[0-9]*.md")):
         content = task_file.read_text()
         if "status: ready" in content:
-            # Extract title from first h1
+            # Extract priority and title
+            priority = "p?"
+            title = task_file.stem
             for line in content.splitlines():
-                if line.startswith("# "):
-                    print(f"{task_file.stem}: {line[2:]}")
+                if line.startswith("priority:"):
+                    priority = line.split(":", 1)[1].strip()
+                elif line.startswith("# "):
+                    title = line[2:]
                     break
+            print(f"[{priority}] {task_file.stem}: {title}")
 
 
 def cmd_tasks_close(task_id: str, wont_do: bool = False):
