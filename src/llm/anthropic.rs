@@ -1,7 +1,7 @@
 //! Anthropic Claude provider implementation
 
 use super::{LlmError, LlmService};
-use super::types::*;
+use super::types::{LlmRequest, LlmMessage, MessageRole, ContentBlock, ImageSource, LlmResponse, Usage};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ pub enum AnthropicModel {
 }
 
 impl AnthropicModel {
-    pub fn api_name(&self) -> &'static str {
+    pub fn api_name(self) -> &'static str {
         match self {
             // Use model names from exe.dev/shelley
             AnthropicModel::Claude4Opus => "claude-opus-4-5-20251101",
@@ -28,16 +28,16 @@ impl AnthropicModel {
     }
 
     #[allow(dead_code)] // For future context management
-    pub fn context_window(&self) -> usize {
+    pub fn context_window(self) -> usize {
         match self {
-            AnthropicModel::Claude4Opus => 200_000,
-            AnthropicModel::Claude4Sonnet => 200_000,
-            AnthropicModel::Claude35Sonnet => 200_000,
-            AnthropicModel::Claude35Haiku => 200_000,
+            AnthropicModel::Claude4Opus
+            | AnthropicModel::Claude4Sonnet
+            | AnthropicModel::Claude35Sonnet
+            | AnthropicModel::Claude35Haiku => 200_000,
         }
     }
 
-    pub fn model_id(&self) -> &'static str {
+    pub fn model_id(self) -> &'static str {
         match self {
             AnthropicModel::Claude4Opus => "claude-4-opus",
             AnthropicModel::Claude4Sonnet => "claude-4-sonnet",
@@ -96,7 +96,7 @@ impl AnthropicService {
 
         let messages: Vec<AnthropicMessage> = request.messages
             .iter()
-            .map(|m| self.translate_message(m))
+            .map(Self::translate_message)
             .collect();
 
         let tools: Vec<AnthropicTool> = request.tools
@@ -117,7 +117,7 @@ impl AnthropicService {
         }
     }
 
-    fn translate_message(&self, msg: &LlmMessage) -> AnthropicMessage {
+    fn translate_message( msg: &LlmMessage) -> AnthropicMessage {
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
@@ -160,7 +160,7 @@ impl AnthropicService {
         }
     }
 
-    fn normalize_response(&self, resp: AnthropicResponse) -> LlmResponse {
+    fn normalize_response( resp: AnthropicResponse) -> LlmResponse {
         let content: Vec<ContentBlock> = resp.content
             .into_iter()
             .map(|block| match block {
@@ -193,26 +193,26 @@ impl AnthropicService {
         }
     }
 
-    fn classify_error(&self, status: reqwest::StatusCode, body: &str) -> LlmError {
+    fn classify_error( status: reqwest::StatusCode, body: &str) -> LlmError {
         let message = body.to_string();
         match status.as_u16() {
-            401 | 403 => LlmError::auth(format!("Authentication failed: {}", message)),
+            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
             429 => {
-                let mut err = LlmError::rate_limit(format!("Rate limited: {}", message));
+                let mut err = LlmError::rate_limit(format!("Rate limited: {message}"));
                 // Try to parse retry-after from response
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
                     if let Some(retry_after) = parsed.get("error")
                         .and_then(|e| e.get("retry_after"))
-                        .and_then(|r| r.as_f64())
+                        .and_then(serde_json::Value::as_f64)
                     {
                         err = err.with_retry_after(Duration::from_secs_f64(retry_after));
                     }
                 }
                 err
             }
-            400 => LlmError::invalid_request(format!("Invalid request: {}", message)),
-            500..=599 => LlmError::server_error(format!("Server error: {}", message)),
-            _ => LlmError::unknown(format!("HTTP {}: {}", status, message)),
+            400 => LlmError::invalid_request(format!("Invalid request: {message}")),
+            500..=599 => LlmError::server_error(format!("Server error: {message}")),
+            _ => LlmError::unknown(format!("HTTP {status}: {message}")),
         }
     }
 }
@@ -232,27 +232,27 @@ impl LlmService for AnthropicService {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    LlmError::network(format!("Request timeout: {}", e))
+                    LlmError::network(format!("Request timeout: {e}"))
                 } else if e.is_connect() {
-                    LlmError::network(format!("Connection failed: {}", e))
+                    LlmError::network(format!("Connection failed: {e}"))
                 } else {
-                    LlmError::unknown(format!("Request failed: {}", e))
+                    LlmError::unknown(format!("Request failed: {e}"))
                 }
             })?;
 
         let status = response.status();
         let body = response.text().await.map_err(|e| {
-            LlmError::network(format!("Failed to read response: {}", e))
+            LlmError::network(format!("Failed to read response: {e}"))
         })?;
 
         if !status.is_success() {
-            return Err(self.classify_error(status, &body));
+            return Err(Self::classify_error(status, &body));
         }
 
         let anthropic_response: AnthropicResponse = serde_json::from_str(&body)
-            .map_err(|e| LlmError::unknown(format!("Failed to parse response: {} - body: {}", e, body)))?;
+            .map_err(|e| LlmError::unknown(format!("Failed to parse response: {e} - body: {body}")))?;
 
-        Ok(self.normalize_response(anthropic_response))
+        Ok(Self::normalize_response(anthropic_response))
     }
 
     fn model_id(&self) -> &str {
@@ -339,6 +339,7 @@ struct AnthropicResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)] // matches Anthropic API
 struct AnthropicUsage {
     input_tokens: u64,
     output_tokens: u64,

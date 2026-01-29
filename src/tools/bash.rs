@@ -81,7 +81,7 @@ impl BashTool {
 
         let child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return ToolOutput::error(format!("Failed to spawn process: {}", e)),
+            Err(e) => return ToolOutput::error(format!("Failed to spawn process: {e}")),
         };
 
         let pid = child.id();
@@ -93,7 +93,7 @@ impl BashTool {
                 
                 // Combine stdout and stderr
                 let combined = if !stderr.is_empty() && !stdout.is_empty() {
-                    format!("{}{}", stdout, stderr)
+                    format!("{stdout}{stderr}")
                 } else if !stderr.is_empty() {
                     stderr.to_string()
                 } else {
@@ -107,12 +107,11 @@ impl BashTool {
                 } else {
                     let exit_code = output.status.code().unwrap_or(-1);
                     ToolOutput::error(format!(
-                        "[command failed: exit code {}]\n{}",
-                        exit_code, formatted
+                        "[command failed: exit code {exit_code}]\n{formatted}"
                     ))
                 }
             }
-            Ok(Err(e)) => ToolOutput::error(format!("Command execution failed: {}", e)),
+            Ok(Err(e)) => ToolOutput::error(format!("Command execution failed: {e}")),
             Err(_) => {
                 // Timeout - kill the process group
                 if let Some(pid) = pid {
@@ -120,7 +119,7 @@ impl BashTool {
                     {
                         use nix::sys::signal::{killpg, Signal};
                         use nix::unistd::Pid;
-                        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                        let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
                     }
                     #[cfg(not(unix))]
                     {
@@ -128,21 +127,20 @@ impl BashTool {
                     }
                 }
                 ToolOutput::error(format!(
-                    "[command timed out after {:?}]",
-                    timeout_duration
+                    "[command timed out after {timeout_duration:?}]"
                 ))
             }
         }
     }
 
-    async fn execute_background(&self, command: &str) -> ToolOutput {
+    fn execute_background(&self, command: &str) -> ToolOutput {
         // Create output file for background process
         let output_file = std::env::temp_dir().join(format!("phoenix-bg-{}.log", uuid::Uuid::new_v4()));
         let output_path = output_file.clone();
         
         let file = match std::fs::File::create(&output_file) {
             Ok(f) => f,
-            Err(e) => return ToolOutput::error(format!("Failed to create output file: {}", e)),
+            Err(e) => return ToolOutput::error(format!("Failed to create output file: {e}")),
         };
 
         // Wrap command to append completion status
@@ -183,7 +181,7 @@ impl BashTool {
                     pid
                 ))
             }
-            Err(e) => ToolOutput::error(format!("Failed to start background process: {}", e)),
+            Err(e) => ToolOutput::error(format!("Failed to start background process: {e}")),
         }
     }
 
@@ -207,7 +205,7 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "bash"
     }
 
@@ -251,7 +249,7 @@ For complex scripts, write them to a file first and then execute the file.
     async fn run(&self, input: Value) -> ToolOutput {
         let input: BashInput = match serde_json::from_value(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
         if input.command.is_empty() {
@@ -259,7 +257,7 @@ For complex scripts, write them to a file first and then execute the file.
         }
 
         match input.mode {
-            ExecutionMode::Background => self.execute_background(&input.command).await,
+            ExecutionMode::Background => self.execute_background(&input.command),
             mode => self.execute_foreground(&input.command, mode).await,
         }
     }

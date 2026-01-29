@@ -8,6 +8,7 @@
 
 use super::{Tool, ToolOutput};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
+use std::path::Path;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -107,7 +108,7 @@ impl KeywordSearchTool {
             .stderr(Stdio::piped());
 
         let output = cmd.output().await
-            .map_err(|e| format!("Failed to run ripgrep: {}", e))?;
+            .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
 
         // Exit code 1 = no matches (not an error)
         if output.status.code() == Some(1) {
@@ -116,7 +117,7 @@ impl KeywordSearchTool {
 
         if !output.status.success() && output.status.code() != Some(1) {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("ripgrep failed: {}", stderr));
+            return Err(format!("ripgrep failed: {stderr}"));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -138,7 +139,7 @@ impl KeywordSearchTool {
     async fn filter_with_llm(
         &self,
         query: &str,
-        search_root: &PathBuf,
+        search_root: &Path,
         results: &str,
     ) -> Result<String, String> {
         let llm = self.select_filter_llm()
@@ -162,7 +163,7 @@ impl KeywordSearchTool {
         };
 
         let response = llm.complete(&request).await
-            .map_err(|e| format!("LLM filtering failed: {}", e))?;
+            .map_err(|e| format!("LLM filtering failed: {e}"))?;
 
         Ok(response.text())
     }
@@ -170,12 +171,12 @@ impl KeywordSearchTool {
 
 #[async_trait]
 impl Tool for KeywordSearchTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "keyword_search"
     }
 
     fn description(&self) -> String {
-        r#"keyword_search locates files with a search-and-filter approach.
+        r"keyword_search locates files with a search-and-filter approach.
 Use when navigating unfamiliar codebases with only conceptual understanding or vague user questions.
 
 Effective use:
@@ -184,7 +185,7 @@ Effective use:
 - Order search terms by importance (most important first)
 - Supports regex search terms for flexible matching
 
-IMPORTANT: Do NOT use this tool if you have precise information like log lines, error messages, stack traces, filenames, or symbols. Use direct approaches (rg, cat, etc.) instead."#.to_string()
+IMPORTANT: Do NOT use this tool if you have precise information like log lines, error messages, stack traces, filenames, or symbols. Use direct approaches (rg, cat, etc.) instead.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -208,7 +209,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
     async fn run(&self, input: Value) -> ToolOutput {
         let input: KeywordSearchInput = match serde_json::from_value(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
         if input.search_terms.is_empty() {
@@ -220,7 +221,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         // Filter out overly broad terms
         let mut usable_terms = Vec::new();
         for term in &input.search_terms {
-            match self.ripgrep(&search_root, &[term.clone()]).await {
+            match self.ripgrep(&search_root, std::slice::from_ref(term)).await {
                 Ok(result) => {
                     if result.len() <= MAX_TERM_RESULTS {
                         usable_terms.push(term.clone());

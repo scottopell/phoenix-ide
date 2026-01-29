@@ -17,11 +17,11 @@ pub fn sse_stream(
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Create stream that starts with init event then broadcasts
-    let init = futures::stream::once(async move { sse_event_to_axum(init_event) });
+    let init = futures::stream::once(async move { Ok(sse_event_to_axum(init_event)) });
     
     let broadcasts = BroadcastStream::new(broadcast_rx)
         .filter_map(|result| match result {
-            Ok(event) => Some(sse_event_to_axum(event)),
+            Ok(event) => Some(Ok(sse_event_to_axum(event))),
             Err(_) => None, // Skip lagged messages
         });
     
@@ -34,7 +34,7 @@ pub fn sse_stream(
     )
 }
 
-fn sse_event_to_axum(event: SseEvent) -> Result<Event, Infallible> {
+fn sse_event_to_axum(event: SseEvent) -> Event {
     let (event_type, data) = match event {
         SseEvent::Init { conversation, messages, agent_working, last_sequence_id } => {
             ("init", json!({
@@ -71,7 +71,7 @@ fn sse_event_to_axum(event: SseEvent) -> Result<Event, Infallible> {
         }
     };
     
-    Ok(Event::default()
+    Event::default()
         .event(event_type)
-        .data(data.to_string()))
+        .data(data.to_string())
 }

@@ -62,8 +62,9 @@ proptest! {
         let mut fs = VirtualFs::new();
 
         // Step 1: Overwrite with content
-        let plan1 = planner.plan(
-            path.clone(),
+        let plan1 = planner
+            .plan(
+            &path,
             None,
             &[PatchRequest {
                 operation: Operation::Overwrite,
@@ -79,8 +80,9 @@ proptest! {
         prop_assert_eq!(fs.get(&path), Some(&content));
 
         // Step 2: Replace content with replacement
-        let plan2 = planner.plan(
-            path.clone(),
+        let plan2 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Replace,
@@ -121,8 +123,9 @@ proptest! {
         let mut fs = VirtualFs::with_files([(path.clone(), original.clone())]);
 
         // Cut middle to clipboard
-        let plan1 = planner.plan(
-            path.clone(),
+        let plan1 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Replace,
@@ -145,8 +148,9 @@ proptest! {
         // Paste back at the junction
         // We need a unique marker - use the junction point
         let junction = format!("{}{}", prefix, suffix);
-        let plan2 = planner.plan(
-            path.clone(),
+        let plan2 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Replace,
@@ -189,8 +193,9 @@ proptest! {
         let mut planner = PatchPlanner::new();
 
         // Replace marker with indented content, but strip then re-add the indent
-        let plan = planner.plan(
-            path.clone(),
+        let plan = planner
+            .plan(
+            &path,
             Some(marker),
             &[PatchRequest {
                 operation: Operation::Replace,
@@ -240,8 +245,9 @@ proptest! {
         let expected = format!("{}|{}|{}", repl1, part2, repl3);
 
         let mut planner = PatchPlanner::new();
-        let plan = planner.plan(
-            path.clone(),
+        let plan = planner
+            .plan(
+            &path,
             Some(&original),
             &[
                 PatchRequest {
@@ -285,8 +291,9 @@ proptest! {
         let mut fs = VirtualFs::with_files([(path.clone(), initial.clone())]);
 
         // Append suffix
-        let plan1 = planner.plan(
-            path.clone(),
+        let plan1 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::AppendEof,
@@ -300,8 +307,9 @@ proptest! {
         fs.interpret(&plan1.effects);
 
         // Prepend prefix
-        let plan2 = planner.plan(
-            path.clone(),
+        let plan2 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::PrependBof,
@@ -338,8 +346,9 @@ proptest! {
         let mut fs = VirtualFs::with_files([(path.clone(), initial)]);
 
         // First overwrite
-        let plan1 = planner.plan(
-            path.clone(),
+        let plan1 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Overwrite,
@@ -354,8 +363,9 @@ proptest! {
         let after_first = fs.get(&path).cloned();
 
         // Second overwrite with same content
-        let plan2 = planner.plan(
-            path.clone(),
+        let plan2 = planner
+            .plan(
+            &path,
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Overwrite,
@@ -381,8 +391,9 @@ proptest! {
 #[test]
 fn test_replace_on_nonexistent_fails() {
     let mut planner = PatchPlanner::new();
-    let result = planner.plan(
-        PathBuf::from("test.txt"),
+    let result = planner
+            .plan(
+        &PathBuf::from("test.txt"),
         None,
         &[PatchRequest {
             operation: Operation::Replace,
@@ -399,8 +410,9 @@ fn test_replace_on_nonexistent_fails() {
 #[test]
 fn test_replace_not_found() {
     let mut planner = PatchPlanner::new();
-    let result = planner.plan(
-        PathBuf::from("test.txt"),
+    let result = planner
+            .plan(
+        &PathBuf::from("test.txt"),
         Some("hello world"),
         &[PatchRequest {
             operation: Operation::Replace,
@@ -417,8 +429,9 @@ fn test_replace_not_found() {
 #[test]
 fn test_replace_not_unique() {
     let mut planner = PatchPlanner::new();
-    let result = planner.plan(
-        PathBuf::from("test.txt"),
+    let result = planner
+            .plan(
+        &PathBuf::from("test.txt"),
         Some("hello hello"),
         &[PatchRequest {
             operation: Operation::Replace,
@@ -435,8 +448,9 @@ fn test_replace_not_unique() {
 #[test]
 fn test_clipboard_not_found() {
     let mut planner = PatchPlanner::new();
-    let result = planner.plan(
-        PathBuf::from("test.txt"),
+    let result = planner
+            .plan(
+        &PathBuf::from("test.txt"),
         Some("hello"),
         &[PatchRequest {
             operation: Operation::AppendEof,
@@ -453,8 +467,9 @@ fn test_clipboard_not_found() {
 #[test]
 fn test_empty_patches_fails() {
     let mut planner = PatchPlanner::new();
-    let result = planner.plan(
-        PathBuf::from("test.txt"),
+    let result = planner
+            .plan(
+        &PathBuf::from("test.txt"),
         Some("hello"),
         &[],
     );
@@ -485,8 +500,9 @@ fn test_overwrite_then_replace_with_filesystem() {
     let current_content = read_file_content(&test_file).expect("read should succeed");
     assert!(current_content.is_none(), "file should not exist yet");
     
-    let plan1 = planner.plan(
-        test_file.clone(),
+    let plan1 = planner
+            .plan(
+        &test_file,
         current_content.as_deref(),
         &[PatchRequest {
             operation: Operation::Overwrite,
@@ -510,8 +526,9 @@ fn test_overwrite_then_replace_with_filesystem() {
     let current_content = read_file_content(&test_file).expect("read should succeed");
     assert_eq!(current_content.as_deref(), Some("Hello World"));
     
-    let plan2 = planner.plan(
-        test_file.clone(),
+    let plan2 = planner
+            .plan(
+        &test_file,
         current_content.as_deref(),
         &[PatchRequest {
             operation: Operation::Replace,

@@ -38,7 +38,7 @@ const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 
 /// Patch tool for file editing
 ///
-/// This is the Tool implementation that wraps the pure PatchPlanner
+/// This is the Tool implementation that wraps the pure `PatchPlanner`
 /// with actual filesystem IO.
 pub struct PatchTool {
     working_dir: PathBuf,
@@ -65,12 +65,12 @@ impl PatchTool {
 
 #[async_trait]
 impl Tool for PatchTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "patch"
     }
 
     fn description(&self) -> String {
-        r#"File modification tool for precise text edits.
+        r"File modification tool for precise text edits.
 
 Operations:
 - replace: Substitute unique text with new content
@@ -102,7 +102,7 @@ Usage notes:
 
 IMPORTANT: Each patch call must be less than 60k tokens total. For large file
 changes, break them into multiple smaller patch operations rather than one
-large overwrite. Prefer incremental replace operations over full file overwrites."#.to_string()
+large overwrite. Prefer incremental replace operations over full file overwrites.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -177,7 +177,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         // Parse input
         let patch_input: PatchInput = match serde_json::from_value(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
         if patch_input.patches.is_empty() {
@@ -190,13 +190,13 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         // Read current content
         let current_content = match read_file_content(&path) {
             Ok(content) => content,
-            Err(e) => return ToolOutput::error(format!("Failed to read file: {}", e)),
+            Err(e) => return ToolOutput::error(format!("Failed to read file: {e}")),
         };
 
         // Plan patches
         let plan = {
             let mut planner = self.planner.lock().unwrap();
-            match planner.plan(path.clone(), current_content.as_deref(), &patch_input.patches) {
+            match planner.plan(&path, current_content.as_deref(), &patch_input.patches) {
                 Ok(plan) => plan,
                 Err(e) => return ToolOutput::error(e.to_string()),
             }
@@ -204,7 +204,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
 
         // Execute effects
         if let Err(e) = execute_effects(&plan.effects) {
-            return ToolOutput::error(format!("Failed to write file: {}", e));
+            return ToolOutput::error(format!("Failed to write file: {e}"));
         }
 
         // Build output

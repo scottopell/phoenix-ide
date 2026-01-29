@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = std::env::var("PHOENIX_DB_PATH")
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{}/.phoenix-ide/phoenix.db", home)
+            format!("{home}/.phoenix-ide/phoenix.db")
         });
     
     let port: u16 = std::env::var("PHOENIX_PORT")
@@ -58,14 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm_config = LlmConfig::from_env();
     let llm_registry = Arc::new(ModelRegistry::new(&llm_config));
     
-    if !llm_registry.has_models() {
-        tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY or LLM_GATEWAY.");
-    } else {
+    if llm_registry.has_models() {
         tracing::info!(
             models = ?llm_registry.available_models(),
             default = %llm_registry.default_model_id(),
             "LLM registry initialized"
         );
+    } else {
+        tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY or LLM_GATEWAY.");
     }
 
     // Create application state

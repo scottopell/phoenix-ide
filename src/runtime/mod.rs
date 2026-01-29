@@ -132,7 +132,7 @@ impl RuntimeManager {
     pub async fn send_event(&self, conversation_id: &str, event: Event) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
         handle.event_tx.send(event).await
-            .map_err(|e| format!("Failed to send event: {}", e))
+            .map_err(|e| format!("Failed to send event: {e}"))
     }
 
     /// Subscribe to conversation updates

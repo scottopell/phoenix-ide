@@ -34,14 +34,14 @@ pub struct ThinkInput {
     pub thoughts: String,
 }
 
-/// Input for the keyword_search tool
+/// Input for the `keyword_search` tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeywordSearchInput {
     pub query: String,
     pub search_terms: Vec<String>,
 }
 
-/// Input for the read_image tool
+/// Input for the `read_image` tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadImageInput {
     pub path: String,
@@ -89,20 +89,15 @@ impl ToolInput {
     pub fn from_name_and_value(name: &str, value: Value) -> Self {
         match name {
             "bash" => serde_json::from_value(value.clone())
-                .map(ToolInput::Bash)
-                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::Bash),
             "think" => serde_json::from_value(value.clone())
-                .map(ToolInput::Think)
-                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::Think),
             "patch" => serde_json::from_value(value.clone())
-                .map(ToolInput::Patch)
-                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::Patch),
             "keyword_search" => serde_json::from_value(value.clone())
-                .map(ToolInput::KeywordSearch)
-                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::KeywordSearch),
             "read_image" => serde_json::from_value(value.clone())
-                .map(ToolInput::ReadImage)
-                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+                .map_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }, ToolInput::ReadImage),
             _ => ToolInput::Unknown { name: name.to_string(), input: value },
         }
     }
@@ -140,8 +135,10 @@ impl ToolCall {
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConvState {
     /// Ready for user input, no pending operations
+    #[default]
     Idle,
     
     /// User message received, preparing LLM request
@@ -180,13 +177,13 @@ pub enum ConvState {
 
 impl ConvState {
     /// Check if this is a terminal state (conversation should stop processing)
-    #[allow(dead_code)] // State query utility
+    #[allow(dead_code, clippy::unused_self)] // State query utility
     pub fn is_terminal(&self) -> bool {
         false // Conversations can always be continued from any state
     }
 
     /// Check if agent is currently working
-    #[allow(dead_code)] // State query utility
+    #[allow(dead_code, clippy::unused_self)] // State query utility
     pub fn is_working(&self) -> bool {
         !matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
@@ -205,11 +202,6 @@ impl ConvState {
     }
 }
 
-impl Default for ConvState {
-    fn default() -> Self {
-        ConvState::Idle
-    }
-}
 
 /// Context for a conversation (immutable configuration)
 #[derive(Debug, Clone)]
@@ -236,7 +228,7 @@ impl ConvContext {
     }
 
     #[allow(dead_code)] // Reserved for sub-agent feature
-    pub fn as_sub_agent(mut self) -> Self {
+    pub fn into_sub_agent(mut self) -> Self {
         self.is_sub_agent = true;
         self
     }

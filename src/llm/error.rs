@@ -69,7 +69,7 @@ pub enum LlmErrorKind {
 }
 
 impl LlmErrorKind {
-    pub fn is_retryable(&self) -> bool {
+    pub fn is_retryable(self) -> bool {
         matches!(self, Self::Network | Self::RateLimit | Self::ServerError)
     }
 }

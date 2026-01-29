@@ -15,7 +15,7 @@ pub struct LlmConfig {
     pub fireworks_api_key: Option<String>,
     #[allow(dead_code)] // Reserved for Gemini provider
     pub gemini_api_key: Option<String>,
-    /// exe.dev gateway URL (e.g., "https://meteor-rain.exe.xyz")
+    /// exe.dev gateway URL (e.g., `<https://meteor-rain.exe.xyz>`)
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,

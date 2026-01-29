@@ -81,6 +81,7 @@ impl Effect {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)] // data is consumed by json! macro
     pub fn notify_state_change(state: &str, data: Value) -> Self {
         Effect::NotifyClient {
             event_type: "state_change".to_string(),

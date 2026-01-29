@@ -151,6 +151,7 @@ impl LlmResponse {
 
 /// Usage statistics
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_field_names)] // tokens suffix is meaningful
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,

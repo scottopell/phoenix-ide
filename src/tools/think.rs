@@ -19,7 +19,7 @@ struct ThinkInput {
 
 #[async_trait]
 impl Tool for ThinkTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "think"
     }
 
@@ -44,7 +44,7 @@ impl Tool for ThinkTool {
         // Parse input (mainly for validation)
         match serde_json::from_value::<ThinkInput>(input) {
             Ok(_) => ToolOutput::success("recorded"),
-            Err(e) => ToolOutput::error(format!("Invalid input: {}", e)),
+            Err(e) => ToolOutput::error(format!("Invalid input: {e}")),
         }
     }
 }

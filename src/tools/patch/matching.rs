@@ -136,7 +136,7 @@ pub fn reindent_text(text: &str, old_indent: &str, new_indent: &str) -> String {
             if line.trim().is_empty() {
                 line.to_string()
             } else if let Some(rest) = line.strip_prefix(old_indent) {
-                format!("{}{}", new_indent, rest)
+                format!("{new_indent}{rest}")
             } else {
                 line.to_string()
             }

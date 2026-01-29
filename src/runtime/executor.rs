@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 /// System prompt for conversations
-const SYSTEM_PROMPT: &str = r#"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks."#;
+const SYSTEM_PROMPT: &str = r"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks.";
 
 pub struct ConversationRuntime {
     context: ConvContext,
@@ -61,7 +61,7 @@ impl ConversationRuntime {
                     if let Err(e) = self.process_event(event).await {
                         tracing::error!(error = %e, "Error handling event");
                         let _ = self.broadcast_tx.send(SseEvent::Error {
-                            message: e.to_string(),
+                            message: e.clone(),
                         });
                     }
                 }
@@ -107,6 +107,7 @@ impl ConversationRuntime {
     }
 
     /// Execute an effect and optionally return a generated event
+    #[allow(clippy::too_many_lines)] // Effect handling is inherently complex
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
             Effect::PersistMessage { msg_type, content, display_data, usage_data } => {
@@ -230,7 +231,7 @@ impl ConversationRuntime {
     /// Make LLM request and return the resulting event
     async fn make_llm_request_event(&mut self) -> Event {
         // Build messages from history
-        let messages = match self.build_llm_messages().await {
+        let messages = match self.build_llm_messages() {
             Ok(m) => m,
             Err(e) => {
                 return Event::LlmError {
@@ -242,16 +243,13 @@ impl ConversationRuntime {
         };
 
         // Get LLM service
-        let llm = match self.llm_registry.get(&self.context.model_id)
-            .or_else(|| self.llm_registry.default()) {
-            Some(l) => l,
-            None => {
-                return Event::LlmError {
-                    message: "No LLM available".to_string(),
-                    error_kind: crate::db::ErrorKind::Unknown,
-                    attempt: 1,
-                };
-            }
+        let Some(llm) = self.llm_registry.get(&self.context.model_id)
+            .or_else(|| self.llm_registry.default()) else {
+            return Event::LlmError {
+                message: "No LLM available".to_string(),
+                error_kind: crate::db::ErrorKind::Unknown,
+                attempt: 1,
+            };
         };
 
         // Build request
@@ -297,7 +295,7 @@ impl ConversationRuntime {
         }
     }
 
-    async fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
+    fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
         let db_messages = self.db.get_messages(&self.context.conversation_id)
             .map_err(|e| e.to_string())?;
 
@@ -356,7 +354,7 @@ impl ConversationRuntime {
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
                     let is_error = msg.content.get("is_error")
-                        .and_then(|e| e.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
 
                     messages.push(LlmMessage {
@@ -395,7 +393,7 @@ impl ConversationRuntime {
             },
             None => ToolResult::error(
                 tool_use_id.clone(),
-                format!("Unknown tool: {}", name),
+                format!("Unknown tool: {name}"),
             ),
         };
 

@@ -3,7 +3,7 @@
 //! REQ-API-001 through REQ-API-010
 
 use super::sse::sse_stream;
-use super::types::*;
+use super::types::{ConversationListResponse, CreateConversationRequest, ConversationResponse, ConversationWithMessagesResponse, ChatRequest, ChatResponse, CancelResponse, SuccessResponse, RenameRequest, ValidateCwdResponse, ListDirectoryResponse, DirectoryEntry, ModelsResponse, ErrorResponse};
 use super::AppState;
 use crate::runtime::SseEvent;
 use crate::state_machine::{Event, event::ImageData};
@@ -152,9 +152,8 @@ async fn get_conversation(
     // Calculate context window from last usage
     let context_window_size = messages.iter()
         .filter_map(|m| m.usage_data.as_ref())
-        .last()
-        .map(|u| u.context_window_used())
-        .unwrap_or(0);
+        .next_back()
+        .map_or(0, crate::db::UsageData::context_window_used);
     
     Ok(Json(ConversationWithMessagesResponse {
         conversation: serde_json::to_value(&conversation).unwrap_or(Value::Null),
@@ -198,7 +197,7 @@ async fn stream_conversation(
     
     // Subscribe to updates
     let broadcast_rx = state.runtime.subscribe(&id).await
-        .map_err(|e| AppError::Internal(e))?;
+        .map_err(AppError::Internal)?;
     
     // Create init event
     let init_event = SseEvent::Init {
@@ -236,7 +235,7 @@ async fn send_chat(
     };
     
     state.runtime.send_event(&id, event).await
-        .map_err(|e| AppError::BadRequest(e))?;
+        .map_err(AppError::BadRequest)?;
     
     Ok(Json(ChatResponse { queued: true }))
 }
@@ -246,7 +245,7 @@ async fn cancel_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<CancelResponse>, AppError> {
     state.runtime.send_event(&id, Event::UserCancel).await
-        .map_err(|e| AppError::BadRequest(e))?;
+        .map_err(AppError::BadRequest)?;
     
     Ok(Json(CancelResponse { ok: true }))
 }
@@ -325,9 +324,8 @@ async fn get_by_slug(
     
     let context_window_size = messages.iter()
         .filter_map(|m| m.usage_data.as_ref())
-        .last()
-        .map(|u| u.context_window_used())
-        .unwrap_or(0);
+        .next_back()
+        .map_or(0, crate::db::UsageData::context_window_used);
     
     Ok(Json(ConversationWithMessagesResponse {
         conversation: serde_json::to_value(&conversation).unwrap_or(Value::Null),
@@ -377,10 +375,10 @@ async fn list_directory(
     let path = PathBuf::from(&query.path);
     
     let entries = fs::read_dir(&path)
-        .map_err(|e| AppError::BadRequest(format!("Cannot read directory: {}", e)))?;
+        .map_err(|e| AppError::BadRequest(format!("Cannot read directory: {e}")))?;
     
     let mut result: Vec<DirectoryEntry> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -457,10 +455,10 @@ fn generate_slug() -> String {
     ];
     
     let mut rng = rand::thread_rng();
-    let word1 = words.choose(&mut rng).unwrap_or(&"blue");
-    let word2 = words.choose(&mut rng).unwrap_or(&"sky");
+    let adjective = words.choose(&mut rng).unwrap_or(&"blue");
+    let noun = words.choose(&mut rng).unwrap_or(&"sky");
     
-    format!("{}-{}-{}-{}", day, time, word1, word2)
+    format!("{day}-{time}-{adjective}-{noun}")
 }
 
 // ============================================================

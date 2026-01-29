@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// SQL schema for initialization
-pub const SCHEMA: &str = r#"
+pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     slug TEXT UNIQUE,
@@ -40,8 +40,7 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
-"#;
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);";
 
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +178,7 @@ pub struct SubAgentResult {
 
 /// Message record
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)] // message_type is clear
 pub struct Message {
     pub id: String,
     pub conversation_id: String,
@@ -215,6 +215,7 @@ impl fmt::Display for MessageType {
 
 /// Usage statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)] // tokens suffix is meaningful
 pub struct UsageData {
     pub input_tokens: u64,
     pub output_tokens: u64,

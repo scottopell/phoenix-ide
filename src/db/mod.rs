@@ -438,7 +438,6 @@ impl Database {
 
 fn parse_state(s: &str) -> ConversationState {
     match s {
-        "idle" => ConversationState::Idle,
         "awaiting_llm" => ConversationState::AwaitingLlm,
         "llm_requesting" => ConversationState::LlmRequesting { attempt: 1 },
         "tool_executing" => ConversationState::ToolExecuting {
@@ -470,7 +469,6 @@ fn parse_message_type(s: &str) -> MessageType {
         "user" => MessageType::User,
         "agent" => MessageType::Agent,
         "tool" => MessageType::Tool,
-        "system" => MessageType::System,
         "error" => MessageType::Error,
         _ => MessageType::System,
     }
@@ -478,8 +476,7 @@ fn parse_message_type(s: &str) -> MessageType {
 
 fn parse_datetime(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]

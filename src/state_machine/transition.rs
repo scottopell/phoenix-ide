@@ -58,6 +58,7 @@ pub enum TransitionError {
 /// 
 /// REQ-BED-001: This function is pure - given the same inputs, it always
 /// produces the same outputs, with no I/O side effects.
+#[allow(clippy::too_many_lines)] // State machine is inherently complex
 pub fn transition(
     state: &ConvState,
     _context: &ConvContext,
@@ -68,17 +69,8 @@ pub fn transition(
         // User Message Handling (REQ-BED-002)
         // ============================================================
         
-        // Idle + UserMessage -> LlmRequesting
-        (ConvState::Idle, Event::UserMessage { text, images }) => {
-            let content = build_user_message_content(&text, &images);
-            Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::persist_user_message(content))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::RequestLlm))
-        }
-
-        // Error + UserMessage -> LlmRequesting (recovery, REQ-BED-006)
-        (ConvState::Error { .. }, Event::UserMessage { text, images }) => {
+        // Idle or Error + UserMessage -> LlmRequesting (recovery from Error, REQ-BED-006)
+        (ConvState::Idle | ConvState::Error { .. }, Event::UserMessage { text, images }) => {
             let content = build_user_message_content(&text, &images);
             Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::persist_user_message(content))
@@ -153,21 +145,21 @@ pub fn transition(
                 .with_effect(Effect::notify_state_change("llm_requesting", json!({
                     "attempt": new_attempt,
                     "max_attempts": MAX_RETRY_ATTEMPTS,
-                    "message": format!("Retrying... (attempt {})", new_attempt)
+                    "message": format!("Retrying... (attempt {new_attempt})")
                 }))))
         }
 
         // LlmRequesting + LlmError (non-retryable or exhausted) -> Error
         (ConvState::LlmRequesting { attempt }, Event::LlmError { message, error_kind, .. }) => {
             let error_message = if error_kind.is_retryable() {
-                format!("Failed after {} attempts: {}", attempt, message)
+                format!("Failed after {attempt} attempts: {message}")
             } else {
                 message
             };
             
             Ok(TransitionResult::new(ConvState::Error {
                 message: error_message.clone(),
-                error_kind: error_kind.into(),
+                error_kind,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change("error", json!({
@@ -238,8 +230,10 @@ pub fn transition(
                 .with_effect(Effect::PersistState))
         }
 
-        // Cancelling + LlmResponse -> Idle (ignore response)
-        (ConvState::Cancelling { .. }, Event::LlmResponse { .. }) => {
+        // These arms return to Idle - different state/event combos but same result
+        #[allow(clippy::match_same_arms)] // Different triggers, intentionally same outcome
+        (ConvState::Cancelling { .. }, Event::LlmResponse { .. }) |
+        (ConvState::AwaitingLlm | ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -266,20 +260,6 @@ pub fn transition(
             
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistToolResults { results: all_results })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
-        }
-
-        // AwaitingLlm + UserCancel -> Idle
-        (ConvState::AwaitingLlm, Event::UserCancel) => {
-            Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
-        }
-
-        // AwaitingSubAgents + UserCancel -> Idle (sub-agents will be terminated)
-        (ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
-            Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -330,8 +310,7 @@ pub fn transition(
         
         (state, event) => {
             Err(TransitionError::InvalidTransition(format!(
-                "No transition from {:?} with event {:?}",
-                state, event
+                "No transition from {state:?} with event {event:?}"
             )))
         }
     }
@@ -366,6 +345,7 @@ fn tool_result_to_json(result: &ToolResult) -> Value {
 }
 
 impl ToolResult {
+    #[allow(clippy::unused_self)] // Method signature for future extension
     fn display_data(&self) -> Option<Value> {
         None // Tool results don't have special display data by default
     }
