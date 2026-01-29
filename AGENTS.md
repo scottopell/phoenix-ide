@@ -48,9 +48,32 @@ Good:
 
 ## Development Commands
 
+**Always use `./dev.py` for development tasks.** It handles configuration automatically.
+
 ```bash
+# Server management
+./dev.py start         # Start server (release build, port 8000)
+./dev.py start --debug # Start with debug build
+./dev.py start --port 9000  # Use different port
+./dev.py stop          # Stop server
+./dev.py status        # Check if server is running
+./dev.py restart       # Restart server
+
+# Build & lint
 ./dev.py lint          # Run clippy + fmt check
 ./dev.py build         # Build project
+
+# Task management
 ./dev.py tasks ready   # List tasks ready for implementation
 ./dev.py tasks close <id> [--wont-do]  # Close a task
 ```
+
+### ⚠️ Do NOT start the server manually
+
+Do NOT use `cargo run` directly. The server requires the LLM gateway configuration
+which `./dev.py start` provides automatically from `/exe.dev/shelley.json`.
+
+If you need to test with a running server:
+1. `./dev.py status` - Check if already running
+2. `./dev.py start` - Start if needed
+3. `./dev.py restart` - Restart after code changes
