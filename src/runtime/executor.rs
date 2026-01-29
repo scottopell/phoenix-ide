@@ -247,6 +247,14 @@ where
                 tracing::warn!("Sub-agent spawning not implemented");
                 Ok(None)
             }
+
+            Effect::AbortTool { tool_use_id } => {
+                // Signal abort to running tool and return ToolAborted event
+                tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
+                // TODO: Actually abort the running task when we implement spawned execution
+                // For now, just return the aborted event
+                Ok(Some(Event::ToolAborted { tool_use_id }))
+            }
         }
     }
 
@@ -438,8 +446,15 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
             remaining_tools: remaining_tools.clone(),
             completed_results: completed_results.clone(),
         },
-        ConvState::Cancelling { pending_tool_id } => crate::db::ConversationState::Cancelling {
-            pending_tool_id: pending_tool_id.clone(),
+        ConvState::CancellingLlm => crate::db::ConversationState::CancellingLlm,
+        ConvState::CancellingTool {
+            tool_use_id,
+            skipped_tools,
+            completed_results,
+        } => crate::db::ConversationState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: skipped_tools.clone(),
+            completed_results: completed_results.clone(),
         },
         ConvState::AwaitingSubAgents {
             pending_ids,

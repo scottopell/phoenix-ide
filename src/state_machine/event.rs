@@ -39,6 +39,10 @@ pub enum Event {
         tool_use_id: String,
         result: ToolResult,
     },
+    /// Tool was aborted due to cancellation
+    ToolAborted {
+        tool_use_id: String,
+    },
 
     // Sub-agent events
     #[allow(dead_code)] // Reserved for sub-agent feature

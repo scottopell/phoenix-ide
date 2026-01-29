@@ -261,8 +261,15 @@ fn db_state_to_conv_state(db_state: &crate::db::ConversationState) -> ConvState 
             remaining_tools: remaining_tools.clone(),
             completed_results: completed_results.clone(),
         },
-        crate::db::ConversationState::Cancelling { pending_tool_id } => ConvState::Cancelling {
-            pending_tool_id: pending_tool_id.clone(),
+        crate::db::ConversationState::CancellingLlm => ConvState::CancellingLlm,
+        crate::db::ConversationState::CancellingTool {
+            tool_use_id,
+            skipped_tools,
+            completed_results,
+        } => ConvState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: skipped_tools.clone(),
+            completed_results: completed_results.clone(),
         },
         crate::db::ConversationState::AwaitingSubAgents {
             pending_ids,

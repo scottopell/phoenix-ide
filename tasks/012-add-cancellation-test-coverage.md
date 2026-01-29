@@ -1,7 +1,7 @@
 ---
 created: 2026-01-29
 priority: p2
-status: ready
+status: done
 ---
 
 # Add cancellation test coverage (REQ-BED-005)

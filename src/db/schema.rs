@@ -89,8 +89,16 @@ pub enum ConversationState {
         completed_results: Vec<ToolResult>,
     },
 
-    /// User requested cancellation, waiting for graceful completion
-    Cancelling { pending_tool_id: Option<String> },
+    /// User requested cancellation of LLM request
+    CancellingLlm,
+
+    /// User requested cancellation of tool execution
+    CancellingTool {
+        tool_use_id: String,
+        skipped_tools: Vec<crate::state_machine::state::ToolCall>,
+        #[serde(default)]
+        completed_results: Vec<ToolResult>,
+    },
 
     /// Waiting for sub-agents to complete
     AwaitingSubAgents {
@@ -113,7 +121,8 @@ impl fmt::Display for ConversationState {
             ConversationState::AwaitingLlm => write!(f, "awaiting_llm"),
             ConversationState::LlmRequesting { .. } => write!(f, "llm_requesting"),
             ConversationState::ToolExecuting { .. } => write!(f, "tool_executing"),
-            ConversationState::Cancelling { .. } => write!(f, "cancelling"),
+            ConversationState::CancellingLlm => write!(f, "cancelling"),
+            ConversationState::CancellingTool { .. } => write!(f, "cancelling"),
             ConversationState::AwaitingSubAgents { .. } => write!(f, "awaiting_sub_agents"),
             ConversationState::Error { .. } => write!(f, "error"),
         }

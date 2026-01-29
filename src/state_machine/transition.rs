@@ -87,7 +87,8 @@ pub fn transition(
             Err(TransitionError::AgentBusy)
         }
 
-        (ConvState::Cancelling { .. }, Event::UserMessage { .. }) => {
+        (ConvState::CancellingLlm, Event::UserMessage { .. })
+        | (ConvState::CancellingTool { .. }, Event::UserMessage { .. }) => {
             Err(TransitionError::CancellationInProgress)
         }
 
@@ -278,24 +279,27 @@ pub fn transition(
         // Cancellation (REQ-BED-005)
         // ============================================================
 
-        // LlmRequesting + UserCancel -> Cancelling
+        // LlmRequesting + UserCancel -> CancellingLlm
         (ConvState::LlmRequesting { .. }, Event::UserCancel) => {
-            Ok(TransitionResult::new(ConvState::Cancelling {
-                pending_tool_id: None,
-            })
-            .with_effect(Effect::PersistState))
+            Ok(TransitionResult::new(ConvState::CancellingLlm)
+                .with_effect(Effect::PersistState))
         }
 
-        // These arms return to Idle - different state/event combos but same result
-        #[allow(clippy::match_same_arms)] // Different triggers, intentionally same outcome
-        (ConvState::Cancelling { .. }, Event::LlmResponse { .. })
-        | (ConvState::AwaitingLlm | ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
+        // CancellingLlm + LlmResponse -> Idle (discard response)
+        (ConvState::CancellingLlm, Event::LlmResponse { .. }) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
 
-        // ToolExecuting + UserCancel -> Idle with synthetic results
+        // AwaitingLlm/AwaitingSubAgents + UserCancel -> Idle
+        (ConvState::AwaitingLlm | ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
+            Ok(TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()))
+        }
+
+        // ToolExecuting + UserCancel -> CancellingTool (request abort)
         (
             ConvState::ToolExecuting {
                 current_tool,
@@ -304,24 +308,70 @@ pub fn transition(
             },
             Event::UserCancel,
         ) => {
-            // Generate synthetic cancelled result for current tool
-            let current_result =
-                ToolResult::cancelled(current_tool.id.clone(), "Cancelled by user");
+            Ok(TransitionResult::new(ConvState::CancellingTool {
+                tool_use_id: current_tool.id.clone(),
+                skipped_tools: remaining_tools.clone(),
+                completed_results: completed_results.clone(),
+            })
+            .with_effect(Effect::AbortTool {
+                tool_use_id: current_tool.id.clone(),
+            })
+            .with_effect(Effect::PersistState))
+        }
 
-            // Generate synthetic skipped results for remaining tools
-            let skipped_results: Vec<ToolResult> = remaining_tools
+        // CancellingTool + ToolAborted -> Idle with synthetic results
+        (
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+            },
+            Event::ToolAborted {
+                tool_use_id: aborted_id,
+            },
+        ) if *tool_use_id == aborted_id => {
+            // Generate synthetic results for aborted and skipped tools
+            let aborted_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
+            let skipped_results: Vec<ToolResult> = skipped_tools
                 .iter()
                 .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
 
             let mut all_results = completed_results.clone();
-            all_results.push(current_result);
+            all_results.push(aborted_result);
             all_results.extend(skipped_results);
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults {
-                    results: all_results,
-                })
+                .with_effect(Effect::PersistToolResults { results: all_results })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()))
+        }
+
+        // CancellingTool + ToolComplete -> Idle (tool finished before abort, use synthetic anyway)
+        (
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+            },
+            Event::ToolComplete {
+                tool_use_id: completed_id,
+                result: _,  // Discard actual result, use synthetic
+            },
+        ) if *tool_use_id == completed_id => {
+            // Tool finished before we could abort it - still use synthetic result
+            let cancelled_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
+            let skipped_results: Vec<ToolResult> = skipped_tools
+                .iter()
+                .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
+                .collect();
+
+            let mut all_results = completed_results.clone();
+            all_results.push(cancelled_result);
+            all_results.extend(skipped_results);
+
+            Ok(TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistToolResults { results: all_results })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -569,9 +619,31 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(result.new_state, ConvState::Idle));
-        // Should have effect to persist synthetic results
-        assert!(result
+        // Phase 1: Should go to CancellingTool with AbortTool effect
+        assert!(
+            matches!(result.new_state, ConvState::CancellingTool { .. }),
+            "Should transition to CancellingTool"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortTool { .. })),
+            "Should have AbortTool effect"
+        );
+
+        // Phase 2: ToolAborted -> Idle with synthetic results
+        let result2 = transition(
+            &result.new_state,
+            &test_context(),
+            Event::ToolAborted {
+                tool_use_id: "tool-1".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result2.new_state, ConvState::Idle));
+        assert!(result2
             .effects
             .iter()
             .any(|e| matches!(e, Effect::PersistToolResults { .. })));

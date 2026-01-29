@@ -471,9 +471,7 @@ fn parse_state(s: &str) -> ConversationState {
             remaining_tools: vec![],
             completed_results: vec![],
         },
-        "cancelling" => ConversationState::Cancelling {
-            pending_tool_id: None,
-        },
+        "cancelling" => ConversationState::CancellingLlm,  // Default to LLM cancel
         "awaiting_sub_agents" => ConversationState::AwaitingSubAgents {
             pending_ids: vec![],
             completed_results: vec![],

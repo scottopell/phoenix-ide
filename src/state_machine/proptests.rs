@@ -101,10 +101,23 @@ fn arb_error_state() -> impl Strategy<Value = ConvState> {
     })
 }
 
-fn arb_cancelling_state() -> impl Strategy<Value = ConvState> {
-    proptest::option::of("[a-z]{8}").prop_map(|pending_tool_id| ConvState::Cancelling {
-        pending_tool_id,
-    })
+fn arb_cancelling_llm_state() -> impl Strategy<Value = ConvState> {
+    Just(ConvState::CancellingLlm)
+}
+
+fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
+    (
+        "[a-z]{8}",
+        proptest::collection::vec(arb_tool_call(), 0..3),
+        proptest::collection::vec(arb_tool_result(), 0..3),
+    )
+        .prop_map(|(tool_use_id, skipped_tools, completed_results)| {
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+            }
+        })
 }
 
 fn arb_awaiting_llm_state() -> impl Strategy<Value = ConvState> {
@@ -117,7 +130,8 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_llm_requesting_state(),
         arb_tool_executing_state(),
         arb_error_state(),
-        arb_cancelling_state(),
+        arb_cancelling_llm_state(),
+        arb_cancelling_tool_state(),
         arb_awaiting_llm_state(),
     ]
 }
@@ -133,9 +147,8 @@ fn arb_working_state() -> impl Strategy<Value = ConvState> {
 fn arb_busy_state() -> impl Strategy<Value = ConvState> {
     prop_oneof![
         arb_working_state(),
-        Just(ConvState::Cancelling {
-            pending_tool_id: None
-        }),
+        Just(ConvState::CancellingLlm),
+        arb_cancelling_tool_state(),
     ]
 }
 
@@ -290,15 +303,18 @@ proptest! {
         );
     }
 
-    // Invariant 3: Cancel from any working state reaches Idle or Cancelling
+    // Invariant 3: Cancel from any working state reaches a cancelling state
     #[test]
     fn prop_cancel_stops_work(state in arb_working_state()) {
         let result = transition(&state, &test_context(), Event::UserCancel);
         prop_assert!(result.is_ok(), "Cancel failed: {:?}", result);
         let new_state = result.unwrap().new_state;
         prop_assert!(
-            matches!(new_state, ConvState::Idle | ConvState::Cancelling { .. }),
-            "Should reach Idle or Cancelling, got {:?}",
+            matches!(
+                new_state,
+                ConvState::Idle | ConvState::CancellingLlm | ConvState::CancellingTool { .. }
+            ),
+            "Should reach Idle or a cancelling state, got {:?}",
             new_state
         );
     }
@@ -515,12 +531,10 @@ proptest! {
         );
     }
 
-    // Invariant 14: Cancelling + LlmResponse goes to Idle
+    // Invariant 14: CancellingLlm + LlmResponse goes to Idle (dummy param for proptest)
     #[test]
-    fn prop_cancelling_plus_response_goes_idle(
-        pending_tool_id in proptest::option::of("[a-z]{8}")
-    ) {
-        let state = ConvState::Cancelling { pending_tool_id };
+    fn prop_cancelling_llm_plus_response_goes_idle(_dummy in Just(())) {
+        let state = ConvState::CancellingLlm;
         let event = Event::LlmResponse {
             content: vec![ContentBlock::text("response")],
             tool_calls: vec![],
@@ -536,7 +550,124 @@ proptest! {
         );
     }
 
-    // Invariant 15: Tool completion with wrong ID is invalid
+    // Invariant 15: ToolExecuting + UserCancel -> CancellingTool with AbortTool effect
+    #[test]
+    fn prop_tool_cancel_goes_to_cancelling(
+        current in arb_tool_call(),
+        remaining in proptest::collection::vec(arb_tool_call(), 0..3),
+        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+    ) {
+        let state = ConvState::ToolExecuting {
+            current_tool: current.clone(),
+            remaining_tools: remaining.clone(),
+            completed_results: completed,
+        };
+
+        let result = transition(&state, &test_context(), Event::UserCancel);
+        prop_assert!(result.is_ok());
+
+        let tr = result.unwrap();
+
+        // Should go to CancellingTool
+        match &tr.new_state {
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                ..
+            } => {
+                prop_assert_eq!(tool_use_id, &current.id);
+                prop_assert_eq!(skipped_tools.len(), remaining.len());
+            }
+            s => prop_assert!(false, "Expected CancellingTool, got {:?}", s),
+        }
+
+        // Should have AbortTool effect
+        prop_assert!(
+            tr.effects.iter().any(|e| matches!(e, Effect::AbortTool { tool_use_id } if tool_use_id == &current.id)),
+            "Should have AbortTool effect for current tool"
+        );
+    }
+
+    // Invariant 16: CancellingTool + ToolAborted -> Idle with synthetic results
+    #[test]
+    fn prop_cancelling_tool_aborted_goes_idle(
+        tool_use_id in "[a-z]{8}",
+        skipped in proptest::collection::vec(arb_tool_call(), 0..3),
+        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+    ) {
+        let state = ConvState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: skipped.clone(),
+            completed_results: completed.clone(),
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ToolAborted {
+                tool_use_id: tool_use_id.clone(),
+            },
+        );
+        prop_assert!(result.is_ok());
+
+        let tr = result.unwrap();
+        prop_assert!(matches!(tr.new_state, ConvState::Idle));
+
+        // Should have PersistToolResults with correct count
+        let persist = tr.effects.iter().find(|e| matches!(e, Effect::PersistToolResults { .. }));
+        prop_assert!(persist.is_some());
+
+        if let Some(Effect::PersistToolResults { results }) = persist {
+            // completed + aborted(1) + skipped
+            let expected_len = completed.len() + 1 + skipped.len();
+            prop_assert_eq!(results.len(), expected_len);
+        }
+    }
+
+    // Invariant 17: CancellingTool + ToolComplete (racing) -> Idle with synthetic (not actual) results
+    #[test]
+    fn prop_cancelling_tool_complete_uses_synthetic(
+        tool_use_id in "[a-z]{8}",
+        skipped in proptest::collection::vec(arb_tool_call(), 0..3),
+        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+    ) {
+        let state = ConvState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: skipped.clone(),
+            completed_results: completed.clone(),
+        };
+
+        // Tool completes naturally before abort takes effect
+        let actual_result = ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            success: true,
+            output: "actual output that should be discarded".to_string(),
+            is_error: false,
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: tool_use_id.clone(),
+                result: actual_result,
+            },
+        );
+        prop_assert!(result.is_ok());
+
+        let tr = result.unwrap();
+        prop_assert!(matches!(tr.new_state, ConvState::Idle));
+
+        // Should still use synthetic results (all failed), not the actual success
+        if let Some(Effect::PersistToolResults { results }) = tr.effects.iter().find(|e| matches!(e, Effect::PersistToolResults { .. })) {
+            // Find the result for our tool - it should be marked as cancelled, not successful
+            let our_result = results.iter().find(|r| r.tool_use_id == tool_use_id);
+            prop_assert!(our_result.is_some());
+            prop_assert!(!our_result.unwrap().success, "Cancelled tool should not show as successful");
+        }
+    }
+
+    // Invariant 18: Tool completion with wrong ID is invalid
     #[test]
     fn prop_tool_complete_wrong_id_fails(
         current in arb_tool_call(),
@@ -874,20 +1005,44 @@ fn test_cancel_mid_tool_chain() {
         }],
     };
 
+    // Phase 1: UserCancel -> CancellingTool + AbortTool effect
     let result = transition(&state, &ctx, Event::UserCancel).unwrap();
 
-    assert!(matches!(result.new_state, ConvState::Idle));
+    assert!(
+        matches!(result.new_state, ConvState::CancellingTool { .. }),
+        "Should transition to CancellingTool, got {:?}",
+        result.new_state
+    );
 
-    // Should have PersistToolResults with synthetic results for t2, t3, t4
-    let persist_effect = result
+    // Should have AbortTool effect
+    let abort_effect = result
+        .effects
+        .iter()
+        .find(|e| matches!(e, Effect::AbortTool { .. }));
+    assert!(abort_effect.is_some(), "Should have AbortTool effect");
+
+    // Phase 2: ToolAborted -> Idle with synthetic results
+    let result2 = transition(
+        &result.new_state,
+        &ctx,
+        Event::ToolAborted {
+            tool_use_id: "t2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(result2.new_state, ConvState::Idle));
+
+    // Should have PersistToolResults with synthetic results
+    let persist_effect = result2
         .effects
         .iter()
         .find(|e| matches!(e, Effect::PersistToolResults { .. }));
-    assert!(persist_effect.is_some());
+    assert!(persist_effect.is_some(), "Should have PersistToolResults");
 
     if let Some(Effect::PersistToolResults { results }) = persist_effect {
-        // Should have results for completed (t1) + current (t2) + remaining (t3, t4) = 4 total
-        assert_eq!(results.len(), 4);
+        // Should have results for completed (t1) + aborted (t2) + skipped (t3, t4) = 4 total
+        assert_eq!(results.len(), 4, "Should have 4 results");
         // First one (t1) was completed successfully, rest are cancelled/skipped
         assert!(results[0].success);
         assert!(results[1..].iter().all(|r| !r.success));

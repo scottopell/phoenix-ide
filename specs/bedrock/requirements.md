@@ -84,19 +84,25 @@ AND allow LLM to handle the error
 ### REQ-BED-005: Cancellation Handling
 
 WHEN user requests cancellation during LLM request
-THE SYSTEM SHALL transition to cancelling state
-AND complete gracefully when LLM responds
+THE SYSTEM SHALL abort the in-flight HTTP request immediately
+AND transition to idle state
+AND NOT persist any partial LLM response
 
 WHEN user requests cancellation during tool execution
-THE SYSTEM SHALL attempt to stop the running tool
+THE SYSTEM SHALL interrupt the running tool immediately (within 100ms)
+AND terminate any spawned subprocesses
 AND record a synthetic tool result indicating cancellation
 AND skip remaining queued tools with synthetic cancelled results
+AND transition to idle state
+
+WHEN cancellation is requested
+THE SYSTEM SHALL NOT queue the cancel behind completion of current operation
+AND SHALL process cancel with higher priority than operation completion
 
 WHEN cancellation completes
-THE SYSTEM SHALL transition to idle
-AND preserve all conversation history including synthetic results
+THE SYSTEM SHALL preserve all conversation history including synthetic results
 
-**Rationale:** Users need the ability to interrupt long-running operations. Synthetic tool results maintain message chain integrity required by LLM APIs.
+**Rationale:** Users need the ability to interrupt long-running operations immediately, not after they complete. CPU-intensive tools or stuck processes must be killable. Synthetic tool results maintain message chain integrity required by LLM APIs.
 
 ---
 

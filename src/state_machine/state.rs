@@ -189,8 +189,18 @@ pub enum ConvState {
         completed_results: Vec<ToolResult>,
     },
 
-    /// User requested cancellation, waiting for graceful completion
-    Cancelling { pending_tool_id: Option<String> },
+    /// User requested cancellation of LLM request, waiting for response to discard
+    CancellingLlm,
+
+    /// User requested cancellation of tool execution, waiting for abort confirmation
+    CancellingTool {
+        /// The tool being aborted
+        tool_use_id: String,
+        /// Tools that were skipped
+        skipped_tools: Vec<ToolCall>,
+        /// Results from tools that completed before cancel
+        completed_results: Vec<ToolResult>,
+    },
 
     /// Waiting for sub-agents to complete
     AwaitingSubAgents {
@@ -226,7 +236,8 @@ impl ConvState {
             ConvState::AwaitingLlm => "awaiting_llm",
             ConvState::LlmRequesting { .. } => "llm_requesting",
             ConvState::ToolExecuting { .. } => "tool_executing",
-            ConvState::Cancelling { .. } => "cancelling",
+            ConvState::CancellingLlm => "cancelling",
+            ConvState::CancellingTool { .. } => "cancelling",
             ConvState::AwaitingSubAgents { .. } => "awaiting_sub_agents",
             ConvState::Error { .. } => "error",
         }

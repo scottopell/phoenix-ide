@@ -22,8 +22,11 @@ pub enum Effect {
     /// Make an LLM request
     RequestLlm,
 
-    /// Execute a tool
+    /// Execute a tool (spawns as background task)
     ExecuteTool { tool: ToolCall },
+
+    /// Abort the currently running tool
+    AbortTool { tool_use_id: String },
 
     /// Spawn a sub-agent
     #[allow(dead_code)] // Reserved for sub-agent feature
