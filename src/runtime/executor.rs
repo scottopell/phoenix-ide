@@ -1,47 +1,56 @@
 //! Conversation runtime executor
 
+use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::SseEvent;
-use crate::db::{Database, MessageType, ToolResult};
-use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
+use crate::db::{MessageType, ToolResult};
+use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
-use crate::tools::ToolRegistry;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 /// System prompt for conversations
 const SYSTEM_PROMPT: &str = r"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks.";
 
-pub struct ConversationRuntime {
+/// Generic conversation runtime that can work with any storage, LLM, and tool implementations
+pub struct ConversationRuntime<S, L, T>
+where
+    S: Storage,
+    L: LlmClient,
+    T: ToolExecutor,
+{
     context: ConvContext,
     state: ConvState,
-    db: Database,
-    llm_registry: Arc<ModelRegistry>,
-    tool_registry: ToolRegistry,
+    storage: S,
+    llm_client: L,
+    tool_executor: T,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: broadcast::Sender<SseEvent>,
 }
 
-impl ConversationRuntime {
+impl<S, L, T> ConversationRuntime<S, L, T>
+where
+    S: Storage,
+    L: LlmClient,
+    T: ToolExecutor,
+{
     pub fn new(
         context: ConvContext,
         state: ConvState,
-        db: Database,
-        llm_registry: Arc<ModelRegistry>,
+        storage: S,
+        llm_client: L,
+        tool_executor: T,
         event_rx: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
         broadcast_tx: broadcast::Sender<SseEvent>,
     ) -> Self {
-        let tool_registry = ToolRegistry::new(context.working_dir.clone(), llm_registry.clone());
-
         Self {
             context,
             state,
-            db,
-            llm_registry,
-            tool_registry,
+            storage,
+            llm_client,
+            tool_executor,
             event_rx,
             event_tx,
             broadcast_tx,
@@ -113,18 +122,16 @@ impl ConversationRuntime {
                 display_data,
                 usage_data,
             } => {
-                let id = uuid::Uuid::new_v4().to_string();
                 let msg = self
-                    .db
+                    .storage
                     .add_message(
-                        &id,
                         &self.context.conversation_id,
                         msg_type,
                         &content,
                         display_data.as_ref(),
                         usage_data.as_ref(),
                     )
-                    .map_err(|e| e.to_string())?;
+                    .await?;
 
                 // Broadcast to clients
                 let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
@@ -156,13 +163,13 @@ impl ConversationRuntime {
                     _ => None,
                 };
 
-                self.db
-                    .update_conversation_state(
+                self.storage
+                    .update_state(
                         &self.context.conversation_id,
                         &to_db_state(&self.state),
                         state_data.as_ref(),
                     )
-                    .map_err(|e| e.to_string())?;
+                    .await?;
 
                 // Broadcast state change
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
@@ -211,23 +218,21 @@ impl ConversationRuntime {
 
             Effect::PersistToolResults { results } => {
                 for result in results {
-                    let id = uuid::Uuid::new_v4().to_string();
                     let content = json!({
                         "tool_use_id": result.tool_use_id,
                         "content": result.output,
                         "is_error": result.is_error
                     });
                     let msg = self
-                        .db
+                        .storage
                         .add_message(
-                            &id,
                             &self.context.conversation_id,
                             MessageType::Tool,
                             &content,
                             None,
                             None,
                         )
-                        .map_err(|e| e.to_string())?;
+                        .await?;
 
                     let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
                     let _ = self
@@ -248,7 +253,7 @@ impl ConversationRuntime {
     /// Make LLM request and return the resulting event
     async fn make_llm_request_event(&mut self) -> Event {
         // Build messages from history
-        let messages = match self.build_llm_messages() {
+        let messages = match self.build_llm_messages().await {
             Ok(m) => m,
             Err(e) => {
                 return Event::LlmError {
@@ -259,29 +264,16 @@ impl ConversationRuntime {
             }
         };
 
-        // Get LLM service
-        let Some(llm) = self
-            .llm_registry
-            .get(&self.context.model_id)
-            .or_else(|| self.llm_registry.default())
-        else {
-            return Event::LlmError {
-                message: "No LLM available".to_string(),
-                error_kind: crate::db::ErrorKind::Unknown,
-                attempt: 1,
-            };
-        };
-
         // Build request
         let request = LlmRequest {
             system: vec![SystemContent::cached(SYSTEM_PROMPT)],
             messages,
-            tools: self.tool_registry.definitions(),
+            tools: self.tool_executor.definitions(),
             max_tokens: Some(8192),
         };
 
         // Make request
-        match llm.complete(&request).await {
+        match self.llm_client.complete(&request).await {
             Ok(response) => {
                 // Extract tool calls from content and convert to typed ToolCall
                 let tool_calls: Vec<ToolCall> = response
@@ -316,11 +308,11 @@ impl ConversationRuntime {
         }
     }
 
-    fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
+    async fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
         let db_messages = self
-            .db
+            .storage
             .get_messages(&self.context.conversation_id)
-            .map_err(|e| e.to_string())?;
+            .await?;
 
         let mut messages = Vec::new();
 
@@ -404,14 +396,14 @@ impl ConversationRuntime {
     }
 
     /// Execute tool and return the resulting event
-    async fn execute_tool_event(&mut self, tool: ToolCall) -> Event {
+    async fn execute_tool_event(&self, tool: ToolCall) -> Event {
         let tool_use_id = tool.id.clone();
         let name = tool.name().to_string();
         let input = tool.input.to_value();
 
         tracing::info!(tool = %name, id = %tool_use_id, "Executing tool");
 
-        let output = self.tool_registry.execute(&name, input).await;
+        let output = self.tool_executor.execute(&name, input).await;
 
         let result = match output {
             Some(out) => ToolResult {
@@ -463,21 +455,6 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
             message: message.clone(),
             error_kind: error_kind.clone(),
         },
-    }
-}
-
-// Extension trait to get sender from receiver
-#[allow(dead_code)] // Utility trait for future use
-trait ReceiverExt<T> {
-    fn sender(&self) -> mpsc::Sender<T>;
-}
-
-impl<T> ReceiverExt<T> for mpsc::Receiver<T> {
-    fn sender(&self) -> mpsc::Sender<T> {
-        // This is a workaround - in real code we'd store the sender separately
-        // For now, we'll create a dummy channel
-        let (tx, _) = mpsc::channel(1);
-        tx
     }
 }
 

@@ -355,4 +355,85 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content["text"], "hello");
     }
+
+    /// Integration test: run a full conversation cycle with mocks
+    #[tokio::test]
+    async fn test_runtime_with_mocks() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::{ConvContext, ConvState, Event};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tokio::sync::{broadcast, mpsc};
+
+        // Create mock components (wrapped in Arc for sharing)
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let tools = Arc::new(MockToolExecutor::new());
+
+        // Queue a simple text response
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("Hello! I'm here to help.")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
+
+        // Create runtime
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+
+        let storage_for_runtime = storage.clone();
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage_for_runtime,
+            llm,
+            tools,
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        );
+
+        // Start runtime
+        tokio::spawn(async move {
+            runtime.run().await;
+        });
+
+        // Send user message
+        event_tx
+            .send(Event::UserMessage {
+                text: "Hello".to_string(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Wait for agent done with timeout
+        let mut agent_done = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                broadcast_rx.recv(),
+            )
+            .await
+            {
+                Ok(Ok(SseEvent::AgentDone)) => {
+                    agent_done = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+
+        // Verify
+        assert!(agent_done, "Should receive AgentDone event");
+
+        // Check messages were persisted
+        let messages = storage.get_all_messages("test-conv");
+        assert_eq!(messages.len(), 2, "Should have User + Agent messages");
+        assert_eq!(messages[0].message_type, MessageType::User);
+        assert_eq!(messages[1].message_type, MessageType::Agent);
+    }
 }

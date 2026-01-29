@@ -238,6 +238,7 @@ impl ConvState {
 pub struct ConvContext {
     pub conversation_id: String,
     pub working_dir: PathBuf,
+    #[allow(dead_code)] // Used by LLM client selection
     pub model_id: String,
     #[allow(dead_code)] // Reserved for sub-agent feature
     pub is_sub_agent: bool,

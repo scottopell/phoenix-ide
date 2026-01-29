@@ -12,9 +12,13 @@ pub mod traits;
 pub mod testing;
 
 pub use executor::ConversationRuntime;
-// Traits exported for future use when executor is refactored
-#[allow(unused_imports)]
 pub use traits::*;
+
+use crate::tools::ToolRegistry;
+
+/// Type alias for production runtime with concrete implementations
+pub type ProductionRuntime =
+    ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
 use crate::db::Database;
 use crate::llm::ModelRegistry;
@@ -96,11 +100,23 @@ impl RuntimeManager {
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, _) = broadcast::channel(128);
 
-        let runtime = ConversationRuntime::new(
+        // Create production adapters
+        let storage = DatabaseStorage::new(self.db.clone());
+        let llm_client = RegistryLlmClient::new(
+            self.llm_registry.clone(),
+            self.llm_registry.default_model_id().to_string(),
+        );
+        let tool_executor = ToolRegistryExecutor::new(ToolRegistry::new(
+            context.working_dir.clone(),
+            self.llm_registry.clone(),
+        ));
+
+        let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
             ConvState::Idle, // Always resume from idle (REQ-BED-007)
-            self.db.clone(),
-            self.llm_registry.clone(),
+            storage,
+            llm_client,
+            tool_executor,
             event_rx,
             event_tx.clone(),
             broadcast_tx.clone(),
