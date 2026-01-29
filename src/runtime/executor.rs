@@ -7,7 +7,9 @@ use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemConten
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
 /// System prompt for conversations
 const SYSTEM_PROMPT: &str = r"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks.";
@@ -17,23 +19,25 @@ pub struct ConversationRuntime<S, L, T>
 where
     S: Storage,
     L: LlmClient,
-    T: ToolExecutor,
+    T: ToolExecutor + 'static,
 {
     context: ConvContext,
     state: ConvState,
     storage: S,
     llm_client: L,
-    tool_executor: T,
+    tool_executor: Arc<T>,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: broadcast::Sender<SseEvent>,
+    /// Token to cancel running tool/LLM operations
+    tool_cancel_token: Option<CancellationToken>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
     S: Storage,
     L: LlmClient,
-    T: ToolExecutor,
+    T: ToolExecutor + 'static,
 {
     pub fn new(
         context: ConvContext,
@@ -50,10 +54,11 @@ where
             state,
             storage,
             llm_client,
-            tool_executor,
+            tool_executor: Arc::new(tool_executor),
             event_rx,
             event_tx,
             broadcast_tx,
+            tool_cancel_token: None,
         }
     }
 
@@ -185,8 +190,46 @@ where
             }
 
             Effect::ExecuteTool { tool } => {
-                // Execute tool and return generated event
-                Ok(Some(self.execute_tool_event(tool).await))
+                // Create cancellation token for this tool execution
+                let cancel_token = CancellationToken::new();
+                self.tool_cancel_token = Some(cancel_token.clone());
+
+                // Spawn tool execution as background task
+                let tool_executor = self.tool_executor.clone();
+                let event_tx = self.event_tx.clone();
+                let tool_use_id = tool.id.clone();
+                let tool_name = tool.name().to_string();
+                let tool_input = tool.input.to_value();
+
+                tokio::spawn(async move {
+                    tracing::info!(tool = %tool_name, id = %tool_use_id, "Executing tool (background)");
+
+                    // Race tool execution against cancellation
+                    tokio::select! {
+                        biased;
+
+                        _ = cancel_token.cancelled() => {
+                            tracing::info!(tool_id = %tool_use_id, "Tool cancelled");
+                            let _ = event_tx.send(Event::ToolAborted { tool_use_id }).await;
+                        }
+
+                        output = tool_executor.execute(&tool_name, tool_input) => {
+                            let result = match output {
+                                Some(out) => ToolResult {
+                                    tool_use_id: tool_use_id.clone(),
+                                    success: out.success,
+                                    output: out.output,
+                                    is_error: !out.success,
+                                },
+                                None => ToolResult::error(tool_use_id.clone(), format!("Unknown tool: {tool_name}")),
+                            };
+                            let _ = event_tx.send(Event::ToolComplete { tool_use_id, result }).await;
+                        }
+                    }
+                });
+
+                // Return None - the event will come from the spawned task
+                Ok(None)
             }
 
             Effect::ScheduleRetry { delay, attempt } => {
@@ -249,11 +292,13 @@ where
             }
 
             Effect::AbortTool { tool_use_id } => {
-                // Signal abort to running tool and return ToolAborted event
+                // Signal abort to running tool
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
-                // TODO: Actually abort the running task when we implement spawned execution
-                // For now, just return the aborted event
-                Ok(Some(Event::ToolAborted { tool_use_id }))
+                if let Some(token) = self.tool_cancel_token.take() {
+                    token.cancel();
+                }
+                // The spawned task will send ToolAborted event when it sees cancellation
+                Ok(None)
             }
         }
     }
@@ -403,31 +448,6 @@ where
         Ok(messages)
     }
 
-    /// Execute tool and return the resulting event
-    async fn execute_tool_event(&self, tool: ToolCall) -> Event {
-        let tool_use_id = tool.id.clone();
-        let name = tool.name().to_string();
-        let input = tool.input.to_value();
-
-        tracing::info!(tool = %name, id = %tool_use_id, "Executing tool");
-
-        let output = self.tool_executor.execute(&name, input).await;
-
-        let result = match output {
-            Some(out) => ToolResult {
-                tool_use_id: tool_use_id.clone(),
-                success: out.success,
-                output: out.output,
-                is_error: !out.success,
-            },
-            None => ToolResult::error(tool_use_id.clone(), format!("Unknown tool: {name}")),
-        };
-
-        Event::ToolComplete {
-            tool_use_id,
-            result,
-        }
-    }
 }
 
 fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
