@@ -441,8 +441,14 @@ fn parse_state(s: &str) -> ConversationState {
         "awaiting_llm" => ConversationState::AwaitingLlm,
         "llm_requesting" => ConversationState::LlmRequesting { attempt: 1 },
         "tool_executing" => ConversationState::ToolExecuting {
-            current_tool_id: String::new(),
-            remaining_tool_ids: vec![],
+            current_tool: crate::state_machine::state::ToolCall::new(
+                "",
+                crate::state_machine::state::ToolInput::Unknown {
+                    name: String::new(),
+                    input: serde_json::Value::Null,
+                },
+            ),
+            remaining_tools: vec![],
             completed_results: vec![],
         },
         "cancelling" => ConversationState::Cancelling { pending_tool_id: None },

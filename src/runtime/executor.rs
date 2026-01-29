@@ -2,6 +2,7 @@
 
 use crate::db::{Database, MessageType, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
+use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
 use crate::tools::ToolRegistry;
 use super::SseEvent;
@@ -21,7 +22,6 @@ pub struct ConversationRuntime {
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: broadcast::Sender<SseEvent>,
-    pending_tools: Vec<(String, String, Value)>, // (id, name, input) for tools from current LLM response
 }
 
 impl ConversationRuntime {
@@ -48,7 +48,6 @@ impl ConversationRuntime {
             event_rx,
             event_tx,
             broadcast_tx,
-            pending_tools: vec![],
         }
     }
 
@@ -130,10 +129,11 @@ impl ConversationRuntime {
             Effect::PersistState => {
                 let state_data = match &self.state {
                     ConvState::LlmRequesting { attempt } => Some(json!({ "attempt": attempt })),
-                    ConvState::ToolExecuting { current_tool_id, remaining_tool_ids, .. } => {
+                    ConvState::ToolExecuting { current_tool, remaining_tools, .. } => {
                         Some(json!({
-                            "current_tool_id": current_tool_id,
-                            "remaining_count": remaining_tool_ids.len()
+                            "current_tool_id": current_tool.id,
+                            "current_tool_name": current_tool.name(),
+                            "remaining_count": remaining_tools.len()
                         }))
                     }
                     ConvState::Error { message, error_kind } => {
@@ -164,9 +164,9 @@ impl ConversationRuntime {
                 Ok(Some(self.make_llm_request_event().await))
             }
 
-            Effect::ExecuteTool { tool_use_id, name, input } => {
+            Effect::ExecuteTool { tool } => {
                 // Execute tool and return generated event
-                Ok(Some(self.execute_tool_event(tool_use_id, name, input).await))
+                Ok(Some(self.execute_tool_event(tool).await))
             }
 
             Effect::ScheduleRetry { delay, attempt } => {
@@ -265,14 +265,18 @@ impl ConversationRuntime {
         // Make request
         match llm.complete(&request).await {
             Ok(response) => {
-                // Store pending tools for execution
-                self.pending_tools = response.tool_uses()
+                // Extract tool calls from content and convert to typed ToolCall
+                let tool_calls: Vec<ToolCall> = response.tool_uses()
                     .into_iter()
-                    .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
+                    .map(|(id, name, input)| {
+                        let typed_input = ToolInput::from_name_and_value(name, input.clone());
+                        ToolCall::new(id.to_string(), typed_input)
+                    })
                     .collect();
 
                 Event::LlmResponse {
                     content: response.content,
+                    tool_calls,
                     end_turn: response.end_turn,
                     usage: response.usage,
                 }
@@ -373,7 +377,11 @@ impl ConversationRuntime {
     }
 
     /// Execute tool and return the resulting event
-    async fn execute_tool_event(&mut self, tool_use_id: String, name: String, input: Value) -> Event {
+    async fn execute_tool_event(&mut self, tool: ToolCall) -> Event {
+        let tool_use_id = tool.id.clone();
+        let name = tool.name().to_string();
+        let input = tool.input.to_value();
+        
         tracing::info!(tool = %name, id = %tool_use_id, "Executing tool");
 
         let output = self.tool_registry.execute(&name, input).await;
@@ -403,10 +411,10 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
         ConvState::Idle => crate::db::ConversationState::Idle,
         ConvState::AwaitingLlm => crate::db::ConversationState::AwaitingLlm,
         ConvState::LlmRequesting { attempt } => crate::db::ConversationState::LlmRequesting { attempt: *attempt },
-        ConvState::ToolExecuting { current_tool_id, remaining_tool_ids, completed_results } => {
+        ConvState::ToolExecuting { current_tool, remaining_tools, completed_results } => {
             crate::db::ConversationState::ToolExecuting {
-                current_tool_id: current_tool_id.clone(),
-                remaining_tool_ids: remaining_tool_ids.clone(),
+                current_tool: current_tool.clone(),
+                remaining_tools: remaining_tools.clone(),
                 completed_results: completed_results.clone(),
             }
         }

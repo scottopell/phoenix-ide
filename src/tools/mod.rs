@@ -1,7 +1,7 @@
 //! Tool implementations for Phoenix IDE
 
 mod bash;
-mod patch;
+pub mod patch;
 mod think;
 mod keyword_search;
 

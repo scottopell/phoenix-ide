@@ -1,8 +1,141 @@
 //! Conversation state types
 
 use crate::db::{ErrorKind, SubAgentResult, ToolResult};
+use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
+
+// ============================================================================
+// Tool Input Types - Strongly typed inputs for each tool
+// ============================================================================
+
+/// Execution mode for bash commands
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BashMode {
+    #[default]
+    Default,
+    Slow,
+    Background,
+}
+
+/// Input for the bash tool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BashInput {
+    pub command: String,
+    #[serde(default)]
+    pub mode: BashMode,
+}
+
+/// Input for the think tool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkInput {
+    pub thoughts: String,
+}
+
+/// Input for the keyword_search tool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeywordSearchInput {
+    pub query: String,
+    pub search_terms: Vec<String>,
+}
+
+/// Input for the read_image tool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadImageInput {
+    pub path: String,
+}
+
+/// Strongly typed tool input enum
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tool", rename_all = "snake_case")]
+pub enum ToolInput {
+    Bash(BashInput),
+    Think(ThinkInput),
+    Patch(PatchInput),
+    KeywordSearch(KeywordSearchInput),
+    ReadImage(ReadImageInput),
+    /// Fallback for unknown tools or parsing failures
+    Unknown { name: String, input: Value },
+}
+
+impl ToolInput {
+    /// Get the tool name
+    pub fn tool_name(&self) -> &str {
+        match self {
+            ToolInput::Bash(_) => "bash",
+            ToolInput::Think(_) => "think",
+            ToolInput::Patch(_) => "patch",
+            ToolInput::KeywordSearch(_) => "keyword_search",
+            ToolInput::ReadImage(_) => "read_image",
+            ToolInput::Unknown { name, .. } => name,
+        }
+    }
+
+    /// Convert to JSON Value for tool execution
+    pub fn to_value(&self) -> Value {
+        match self {
+            ToolInput::Bash(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::Think(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::Patch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::KeywordSearch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::ReadImage(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::Unknown { input, .. } => input.clone(),
+        }
+    }
+
+    /// Parse from tool name and JSON value
+    pub fn from_name_and_value(name: &str, value: Value) -> Self {
+        match name {
+            "bash" => serde_json::from_value(value.clone())
+                .map(ToolInput::Bash)
+                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+            "think" => serde_json::from_value(value.clone())
+                .map(ToolInput::Think)
+                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+            "patch" => serde_json::from_value(value.clone())
+                .map(ToolInput::Patch)
+                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+            "keyword_search" => serde_json::from_value(value.clone())
+                .map(ToolInput::KeywordSearch)
+                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+            "read_image" => serde_json::from_value(value.clone())
+                .map(ToolInput::ReadImage)
+                .unwrap_or_else(|_| ToolInput::Unknown { name: name.to_string(), input: value }),
+            _ => ToolInput::Unknown { name: name.to_string(), input: value },
+        }
+    }
+}
+
+// ============================================================================
+// Tool Call - A tool invocation with ID and typed input
+// ============================================================================
+
+/// A tool call from the LLM with typed input
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub input: ToolInput,
+}
+
+impl ToolCall {
+    pub fn new(id: impl Into<String>, input: ToolInput) -> Self {
+        Self {
+            id: id.into(),
+            input,
+        }
+    }
+
+    /// Get the tool name
+    pub fn name(&self) -> &str {
+        self.input.tool_name()
+    }
+}
+
+// ============================================================================
+// Conversation State
+// ============================================================================
 
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -19,8 +152,11 @@ pub enum ConvState {
     
     /// Executing tools serially
     ToolExecuting {
-        current_tool_id: String,
-        remaining_tool_ids: Vec<String>,
+        /// The current tool being executed
+        current_tool: ToolCall,
+        /// Remaining tools to execute after current completes
+        remaining_tools: Vec<ToolCall>,
+        /// Results from completed tools
         #[serde(default)]
         completed_results: Vec<ToolResult>,
     },

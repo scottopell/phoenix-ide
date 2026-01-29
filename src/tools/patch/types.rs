@@ -21,7 +21,7 @@ pub struct Reindent {
 }
 
 /// A single patch request
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchRequest {
     pub operation: Operation,
@@ -33,7 +33,7 @@ pub struct PatchRequest {
 }
 
 /// Input for a patch operation
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct PatchInput {
     pub path: String,
     pub patches: Vec<PatchRequest>,

@@ -104,10 +104,8 @@ pub fn transition(
         // This is handled in the runtime, not here
 
         // LlmRequesting + LlmResponse with tools -> ToolExecuting
-        (ConvState::LlmRequesting { .. }, Event::LlmResponse { content, end_turn: _, usage }) => {
-            let tool_uses = extract_tool_uses(&content);
-            
-            if tool_uses.is_empty() {
+        (ConvState::LlmRequesting { .. }, Event::LlmResponse { content, tool_calls, end_turn: _, usage }) => {
+            if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
                 let usage_data = usage_to_data(&usage);
                 Ok(TransitionResult::new(ConvState::Idle)
@@ -119,12 +117,13 @@ pub fn transition(
                     .with_effect(Effect::notify_agent_done()))
             } else {
                 // Has tools -> ToolExecuting
-                let (first, rest) = (tool_uses[0].clone(), tool_uses[1..].to_vec());
+                let first = tool_calls[0].clone();
+                let rest = tool_calls[1..].to_vec();
                 let usage_data = usage_to_data(&usage);
                 
                 Ok(TransitionResult::new(ConvState::ToolExecuting {
-                    current_tool_id: first.0.clone(),
-                    remaining_tool_ids: rest.iter().map(|(id, _, _)| id.clone()).collect(),
+                    current_tool: first.clone(),
+                    remaining_tools: rest,
                     completed_results: vec![],
                 })
                 .with_effect(Effect::persist_agent_message(
@@ -132,11 +131,7 @@ pub fn transition(
                     Some(usage_data),
                 ))
                 .with_effect(Effect::PersistState)
-                .with_effect(Effect::ExecuteTool {
-                    tool_use_id: first.0,
-                    name: first.1,
-                    input: first.2,
-                }))
+                .with_effect(Effect::execute_tool(first)))
             }
         }
 
@@ -192,34 +187,33 @@ pub fn transition(
         // ============================================================
 
         // ToolExecuting + ToolComplete (more tools remaining) -> ToolExecuting (next tool)
-        (ConvState::ToolExecuting { current_tool_id, remaining_tool_ids, completed_results }, 
+        (ConvState::ToolExecuting { current_tool, remaining_tools, completed_results }, 
          Event::ToolComplete { tool_use_id, result })
-            if &tool_use_id == current_tool_id && !remaining_tool_ids.is_empty() =>
+            if tool_use_id == current_tool.id && !remaining_tools.is_empty() =>
         {
             let mut new_results = completed_results.clone();
             new_results.push(result.clone());
             
-            let next_tool_id = remaining_tool_ids[0].clone();
-            let new_remaining = remaining_tool_ids[1..].to_vec();
+            let next_tool = remaining_tools[0].clone();
+            let new_remaining = remaining_tools[1..].to_vec();
             
-            // We need tool info from the pending tools - this is stored when we receive the LLM response
-            // For now, we just track IDs; the executor will look up the actual tool info
             Ok(TransitionResult::new(ConvState::ToolExecuting {
-                current_tool_id: next_tool_id.clone(),
-                remaining_tool_ids: new_remaining,
+                current_tool: next_tool.clone(),
+                remaining_tools: new_remaining,
                 completed_results: new_results,
             })
             .with_effect(Effect::persist_tool_message(
                 tool_result_to_json(&result),
                 result.display_data(),
             ))
-            .with_effect(Effect::PersistState))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::execute_tool(next_tool)))
         }
 
-        // ToolExecuting + ToolComplete (last tool) -> AwaitingLlm
-        (ConvState::ToolExecuting { current_tool_id, remaining_tool_ids, completed_results },
+        // ToolExecuting + ToolComplete (last tool) -> LlmRequesting
+        (ConvState::ToolExecuting { current_tool, remaining_tools, completed_results },
          Event::ToolComplete { tool_use_id, result })
-            if &tool_use_id == current_tool_id && remaining_tool_ids.is_empty() =>
+            if tool_use_id == current_tool.id && remaining_tools.is_empty() =>
         {
             let mut new_results = completed_results.clone();
             new_results.push(result.clone());
@@ -251,18 +245,18 @@ pub fn transition(
         }
 
         // ToolExecuting + UserCancel -> Idle with synthetic results
-        (ConvState::ToolExecuting { current_tool_id, remaining_tool_ids, completed_results },
+        (ConvState::ToolExecuting { current_tool, remaining_tools, completed_results },
          Event::UserCancel) => {
             // Generate synthetic cancelled result for current tool
             let current_result = ToolResult::cancelled(
-                current_tool_id.clone(),
+                current_tool.id.clone(),
                 "Cancelled by user",
             );
             
             // Generate synthetic skipped results for remaining tools
-            let skipped_results: Vec<ToolResult> = remaining_tool_ids
+            let skipped_results: Vec<ToolResult> = remaining_tools
                 .iter()
-                .map(|id| ToolResult::cancelled(id.clone(), "Skipped due to cancellation"))
+                .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
             
             let mut all_results = completed_results.clone();
@@ -356,18 +350,6 @@ fn build_user_message_content(text: &str, images: &[crate::state_machine::event:
             })).collect::<Vec<_>>()
         })
     }
-}
-
-fn extract_tool_uses(content: &[ContentBlock]) -> Vec<(String, String, Value)> {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => {
-                Some((id.clone(), name.clone(), input.clone()))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn content_to_json(content: &[ContentBlock]) -> Value {
@@ -490,10 +472,24 @@ mod tests {
 
     #[test]
     fn test_cancellation_produces_synthetic_results() {
+        use crate::state_machine::state::{ToolCall, ToolInput, BashInput, BashMode};
+        
         let result = transition(
             &ConvState::ToolExecuting {
-                current_tool_id: "tool-1".to_string(),
-                remaining_tool_ids: vec!["tool-2".to_string(), "tool-3".to_string()],
+                current_tool: ToolCall::new("tool-1", ToolInput::Bash(BashInput {
+                    command: "echo 1".to_string(),
+                    mode: BashMode::Default,
+                })),
+                remaining_tools: vec![
+                    ToolCall::new("tool-2", ToolInput::Bash(BashInput {
+                        command: "echo 2".to_string(),
+                        mode: BashMode::Default,
+                    })),
+                    ToolCall::new("tool-3", ToolInput::Bash(BashInput {
+                        command: "echo 3".to_string(),
+                        mode: BashMode::Default,
+                    })),
+                ],
                 completed_results: vec![],
             },
             &test_context(),

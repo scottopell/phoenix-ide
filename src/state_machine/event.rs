@@ -2,6 +2,7 @@
 
 use crate::db::{ErrorKind, SubAgentResult, ToolResult};
 use crate::llm::{ContentBlock, ImageSource, Usage};
+use crate::state_machine::state::ToolCall;
 use serde::{Deserialize, Serialize};
 
 /// Events that trigger state transitions
@@ -17,6 +18,8 @@ pub enum Event {
     // LLM events
     LlmResponse {
         content: Vec<ContentBlock>,
+        /// Tool calls extracted from the content
+        tool_calls: Vec<ToolCall>,
         end_turn: bool,
         usage: Usage,
     },

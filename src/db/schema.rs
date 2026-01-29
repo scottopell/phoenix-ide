@@ -81,8 +81,8 @@ pub enum ConversationState {
     
     /// Executing tools serially
     ToolExecuting {
-        current_tool_id: String,
-        remaining_tool_ids: Vec<String>,
+        current_tool: crate::state_machine::state::ToolCall,
+        remaining_tools: Vec<crate::state_machine::state::ToolCall>,
         #[serde(default)]
         completed_results: Vec<ToolResult>,
     },

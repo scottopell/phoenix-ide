@@ -1,6 +1,7 @@
 //! Effects produced by state transitions
 
 use crate::db::{MessageType, ToolResult, UsageData};
+use crate::state_machine::state::ToolCall;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -23,9 +24,7 @@ pub enum Effect {
     
     /// Execute a tool
     ExecuteTool {
-        tool_use_id: String,
-        name: String,
-        input: Value,
+        tool: ToolCall,
     },
     
     /// Spawn a sub-agent
@@ -103,5 +102,9 @@ impl Effect {
             event_type: "agent_done".to_string(),
             data: Value::Null,
         }
+    }
+
+    pub fn execute_tool(tool: ToolCall) -> Self {
+        Effect::ExecuteTool { tool }
     }
 }
