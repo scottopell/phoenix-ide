@@ -1,7 +1,7 @@
 ---
 created: 2026-01-29
 priority: p3
-status: ready
+status: done
 ---
 
 # Fix rename API field name inconsistency
@@ -17,14 +17,11 @@ Discovered during QA validation (REQ-API-006). The rename endpoint rejects `{"na
 Failed to deserialize the JSON body into the target type: missing field `slug`
 ```
 
-Either the API should accept `name` (more intuitive) or documentation should clarify the expected field.
+## Resolution
 
-## Acceptance Criteria
+Changed field name from `slug` to `name` for better user experience.
 
-- [ ] Decide on field name: `name` (user-friendly) or `slug` (current)
-- [ ] Update API or documentation accordingly
-- [ ] Add test coverage for rename endpoint
+## Changes
 
-## Notes
-
-Current implementation in `src/api/handlers.rs` uses `RenameRequest` struct expecting `slug` field.
+- `src/api/types.rs`: `RenameRequest.slug` → `RenameRequest.name`
+- `src/api/handlers.rs`: Updated to use `req.name`

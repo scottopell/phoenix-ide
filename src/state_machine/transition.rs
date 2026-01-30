@@ -81,7 +81,8 @@ pub fn transition(
         }
 
         // Busy states + UserMessage -> Reject (REQ-BED-002)
-        (ConvState::LlmRequesting { .. }, Event::UserMessage { .. })
+        (ConvState::AwaitingLlm, Event::UserMessage { .. })
+        | (ConvState::LlmRequesting { .. }, Event::UserMessage { .. })
         | (ConvState::ToolExecuting { .. }, Event::UserMessage { .. })
         | (ConvState::AwaitingSubAgents { .. }, Event::UserMessage { .. }) => {
             Err(TransitionError::AgentBusy)

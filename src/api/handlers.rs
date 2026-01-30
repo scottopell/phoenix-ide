@@ -340,7 +340,7 @@ async fn rename_conversation(
     state
         .runtime
         .db()
-        .rename_conversation(&id, &req.slug)
+        .rename_conversation(&id, &req.name)
         .map_err(|e| match e {
             crate::db::DbError::SlugExists(_) => {
                 AppError::BadRequest("Slug already exists".to_string())

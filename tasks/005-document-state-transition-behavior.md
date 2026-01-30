@@ -1,7 +1,7 @@
 ---
 created: 2026-01-29
 priority: p3
-status: ready
+status: done
 ---
 
 # Document State Transition Behavior Inconsistencies
@@ -15,19 +15,15 @@ Document or fix the inconsistent error types returned when user messages are rej
 During property testing, we found:
 - `LlmRequesting` + `UserMessage` → `Err(AgentBusy)`
 - `ToolExecuting` + `UserMessage` → `Err(AgentBusy)`
-- `AwaitingLlm` + `UserMessage` → `Err(InvalidTransition)`
+- `AwaitingLlm` + `UserMessage` → `Err(InvalidTransition)` ← inconsistent!
 - `Cancelling` + `UserMessage` → `Err(CancellationInProgress)`
 
-The `AwaitingLlm` case returns a different error type than other busy states. This may be intentional (AwaitingLlm is a transient internal state) but should be documented.
+## Resolution
 
-## Acceptance Criteria
+Fixed by adding `AwaitingLlm` to the list of busy states that return `AgentBusy`.
 
-- [ ] Either: Add explicit handling for `AwaitingLlm` + `UserMessage` → `AgentBusy`
-- [ ] Or: Document in code comments why `AwaitingLlm` uses `InvalidTransition`
-- [ ] Update property test `prop_busy_rejects_messages` to reflect intended behavior
+Now all "busy" states consistently return `AgentBusy`, while cancelling states return `CancellationInProgress`.
 
-## Notes
+## Changes
 
-Location: `src/state_machine/transition.rs`
-
-The current proptest just checks `result.is_err()` which works but doesn't verify the specific error type is appropriate.
+- `src/state_machine/transition.rs`: Added `AwaitingLlm` to the busy states pattern match

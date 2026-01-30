@@ -28,7 +28,7 @@ pub struct ImageAttachment {
 /// Request to rename a conversation
 #[derive(Debug, Deserialize)]
 pub struct RenameRequest {
-    pub slug: String,
+    pub name: String,
 }
 
 /// Response with a list of conversations
