@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx",
+#     "httpx-sse",
 #     "click",
 # ]
 # ///
@@ -12,12 +13,13 @@ REQ-CLI-001: Single-Shot Execution
 REQ-CLI-002: Conversation Management
 REQ-CLI-003: Image Support
 REQ-CLI-004: Output Format
-REQ-CLI-005: Polling Behavior
+REQ-CLI-005: SSE Streaming with Polling Fallback
 REQ-CLI-006: Configuration
 REQ-CLI-007: Single File Distribution
 """
 
 import base64
+import json
 import os
 import sys
 import time
@@ -25,6 +27,13 @@ from pathlib import Path
 
 import click
 import httpx
+
+# Optional SSE support
+try:
+    from httpx_sse import connect_sse
+    HAS_SSE = True
+except ImportError:
+    HAS_SSE = False
 
 
 class PhoenixError(Exception):
@@ -81,6 +90,48 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()
 
+    def stream_until_complete(self, conv_id: str, timeout: float) -> dict:
+        """Stream SSE events until conversation is idle or error."""
+        url = f"{self.base_url}/api/conversation/{conv_id}/stream"
+        messages = []
+        conversation = None
+        
+        with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
+            with connect_sse(client, "GET", url) as event_source:
+                for event in event_source.iter_sse():
+                    if event.event == "init":
+                        data = json.loads(event.data)
+                        messages = data.get('messages', [])
+                        conversation = data.get('conversation')
+                        
+                    elif event.event == "message":
+                        data = json.loads(event.data)
+                        msg = data.get('message')
+                        if msg:
+                            messages.append(msg)
+                            
+                    elif event.event == "state_change":
+                        data = json.loads(event.data)
+                        state = data.get('state')
+                        if state == 'error':
+                            state_data = data.get('state_data', {})
+                            error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
+                            raise PhoenixError(error_msg)
+                            
+                    elif event.event == "agent_done":
+                        # Agent finished, return collected data
+                        return {
+                            'conversation': conversation,
+                            'messages': messages
+                        }
+                        
+                    elif event.event == "error":
+                        data = json.loads(event.data)
+                        raise PhoenixError(data.get('message', 'Unknown error'))
+        
+        # If we exit the loop without agent_done, fetch final state
+        return self.get_messages(conv_id)
+
     def poll_until_complete(self, conv_id: str, timeout: float, interval: float) -> dict:
         """Poll until conversation is idle or error."""
         start = time.time()
@@ -109,6 +160,18 @@ class PhoenixClient:
             time.sleep(interval)
 
         raise PhoenixError(f"Timeout after {timeout} seconds")
+
+    def wait_for_response(self, conv_id: str, timeout: float, interval: float, use_sse: bool) -> dict:
+        """Wait for response using SSE or polling."""
+        if use_sse and HAS_SSE:
+            try:
+                return self.stream_until_complete(conv_id, timeout)
+            except Exception as e:
+                # SSE failed, fall back to polling
+                click.echo(f"SSE unavailable ({e}), falling back to polling...", err=True)
+                return self.poll_until_complete(conv_id, timeout, interval)
+        else:
+            return self.poll_until_complete(conv_id, timeout, interval)
 
 
 def encode_image(path: str) -> dict:
@@ -191,10 +254,14 @@ def format_response(data: dict) -> str:
               help='Image file to attach (can be repeated)')
 @click.option('--api-url', envvar='PHOENIX_API_URL', default='http://localhost:8000',
               help='API endpoint URL')
-@click.option('--timeout', default=600, help='Polling timeout in seconds')
-@click.option('--poll-interval', default=1.0, help='Polling interval in seconds')
-def main(message, conversation, directory, images, api_url, timeout, poll_interval):
+@click.option('--timeout', default=600, help='Timeout in seconds')
+@click.option('--poll-interval', default=1.0, help='Polling interval in seconds (when not using SSE)')
+@click.option('--no-sse', is_flag=True, help='Disable SSE, use polling only')
+def main(message, conversation, directory, images, api_url, timeout, poll_interval, no_sse):
     """Send a message to Phoenix IDE and wait for response.
+    
+    Uses SSE (Server-Sent Events) for real-time streaming by default,
+    with automatic fallback to polling if SSE is unavailable.
     
     Examples:
     
@@ -206,6 +273,9 @@ def main(message, conversation, directory, images, api_url, timeout, poll_interv
         
         # With image
         phoenix-client.py -i screenshot.png "What's this error?"
+        
+        # Force polling mode
+        phoenix-client.py --no-sse "Hello"
     """
     client = PhoenixClient(api_url)
 
@@ -225,9 +295,14 @@ def main(message, conversation, directory, images, api_url, timeout, poll_interv
     click.echo("Sending message...", err=True)
     client.send_message(conv['id'], message, image_data)
 
-    # Poll for completion
-    click.echo("Waiting for response...", err=True)
-    result = client.poll_until_complete(conv['id'], timeout, poll_interval)
+    # Wait for completion (SSE or polling)
+    use_sse = not no_sse
+    if use_sse and HAS_SSE:
+        click.echo("Streaming response...", err=True)
+    else:
+        click.echo("Waiting for response...", err=True)
+    
+    result = client.wait_for_response(conv['id'], timeout, poll_interval, use_sse)
 
     # Format and print output
     print(format_response(result))
