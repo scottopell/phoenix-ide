@@ -27,11 +27,18 @@ The modern style is preferred because:
 - [ ] Migrate any existing `mod.rs` files to named files
 - [ ] Document the convention in AGENT.md or similar
 
-## Implementation Options
+## Implementation
 
-1. **Clippy**: No built-in lint for this, but could use `#![forbid(clippy::mod_module_files)]` if it exists
-2. **Custom script**: `find src -name 'mod.rs' | grep -q . && exit 1`
-3. **CI check**: Add to GitHub Actions or pre-commit hook
+Add to `Cargo.toml`:
+
+```toml
+[lints.clippy]
+mod_module_files = "deny"
+```
+
+Or in `[workspace.lints.clippy]` if using workspace lints.
+
+Ref: `/home/exedev/RUST_BEST_PRACTICES.md` (from Datadog/lading)
 
 ## Notes
 
