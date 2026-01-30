@@ -1,7 +1,9 @@
 //! Database schema and types
 
+use crate::llm::ContentBlock;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 
 /// SQL schema for initialization
@@ -188,16 +190,207 @@ pub struct SubAgentResult {
     pub result: String,
 }
 
+// ============================================================
+// Message Content Types
+// ============================================================
+
+/// User message content
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserContent {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageData>,
+}
+
+impl UserContent {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn with_images(text: impl Into<String>, images: Vec<ImageData>) -> Self {
+        Self {
+            text: text.into(),
+            images,
+        }
+    }
+}
+
+/// Image attachment in a message
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageData {
+    pub data: String,
+    pub media_type: String,
+}
+
+impl ImageData {
+    /// Convert to LLM ImageSource format
+    pub fn to_image_source(&self) -> crate::llm::ImageSource {
+        crate::llm::ImageSource::Base64 {
+            media_type: self.media_type.clone(),
+            data: self.data.clone(),
+        }
+    }
+}
+
+/// Tool result message content
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolContent {
+    pub tool_use_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+impl ToolContent {
+    pub fn new(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error,
+        }
+    }
+}
+
+/// System message content
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SystemContent {
+    pub text: String,
+}
+
+/// Error message content
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ErrorContent {
+    pub message: String,
+}
+
+/// Typed message content
+/// 
+/// This enum provides type safety for message content while maintaining
+/// backward compatibility with the database schema where `message_type`
+/// and `content` are stored as separate columns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageContent {
+    User(UserContent),
+    Agent(Vec<ContentBlock>),
+    Tool(ToolContent),
+    System(SystemContent),
+    Error(ErrorContent),
+}
+
+impl MessageContent {
+    /// Get the message type for this content
+    pub fn message_type(&self) -> MessageType {
+        match self {
+            Self::User(_) => MessageType::User,
+            Self::Agent(_) => MessageType::Agent,
+            Self::Tool(_) => MessageType::Tool,
+            Self::System(_) => MessageType::System,
+            Self::Error(_) => MessageType::Error,
+        }
+    }
+
+    /// Serialize content to JSON value (without type tag)
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::User(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+            Self::Agent(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+            Self::Tool(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+            Self::System(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+            Self::Error(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+        }
+    }
+
+    /// Deserialize content from JSON value using the message type as discriminator
+    pub fn from_json(msg_type: MessageType, value: Value) -> Result<Self, String> {
+        match msg_type {
+            MessageType::User => {
+                serde_json::from_value(value)
+                    .map(Self::User)
+                    .map_err(|e| format!("Invalid user content: {e}"))
+            }
+            MessageType::Agent => {
+                serde_json::from_value(value)
+                    .map(Self::Agent)
+                    .map_err(|e| format!("Invalid agent content: {e}"))
+            }
+            MessageType::Tool => {
+                serde_json::from_value(value)
+                    .map(Self::Tool)
+                    .map_err(|e| format!("Invalid tool content: {e}"))
+            }
+            MessageType::System => {
+                serde_json::from_value(value)
+                    .map(Self::System)
+                    .map_err(|e| format!("Invalid system content: {e}"))
+            }
+            MessageType::Error => {
+                serde_json::from_value(value)
+                    .map(Self::Error)
+                    .map_err(|e| format!("Invalid error content: {e}"))
+            }
+        }
+    }
+
+    /// Create user content
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User(UserContent::new(text))
+    }
+
+    /// Create user content with images
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageData>) -> Self {
+        Self::User(UserContent::with_images(text, images))
+    }
+
+    /// Create agent content
+    pub fn agent(blocks: Vec<ContentBlock>) -> Self {
+        Self::Agent(blocks)
+    }
+
+    /// Create tool content
+    pub fn tool(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+        Self::Tool(ToolContent::new(tool_use_id, content, is_error))
+    }
+
+    /// Create system content
+    #[allow(dead_code)] // Constructor for API completeness
+    pub fn system(text: impl Into<String>) -> Self {
+        Self::System(SystemContent { text: text.into() })
+    }
+
+    /// Create error content
+    #[allow(dead_code)] // Used as fallback for parse errors
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error(ErrorContent { message: message.into() })
+    }
+}
+
+// Custom Serialize for MessageContent - just serializes the inner value
+impl Serialize for MessageContent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::User(c) => c.serialize(serializer),
+            Self::Agent(c) => c.serialize(serializer),
+            Self::Tool(c) => c.serialize(serializer),
+            Self::System(c) => c.serialize(serializer),
+            Self::Error(c) => c.serialize(serializer),
+        }
+    }
+}
+
 /// Message record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::struct_field_names)] // message_type is clear
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub id: String,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,
-    pub content: serde_json::Value,
-    pub display_data: Option<serde_json::Value>,
+    pub content: MessageContent,
+    pub display_data: Option<Value>,
     pub usage_data: Option<UsageData>,
     pub created_at: DateTime<Utc>,
 }

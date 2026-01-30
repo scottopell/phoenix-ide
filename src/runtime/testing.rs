@@ -3,7 +3,7 @@
 //! These mocks enable integration testing without real I/O.
 
 use super::traits::*;
-use crate::db::{Message, MessageType, UsageData};
+use crate::db::{Message, MessageContent, MessageType, UsageData};
 use crate::llm::{LlmError, LlmRequest, LlmResponse, ToolDefinition};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
@@ -294,8 +294,7 @@ impl MessageStore for InMemoryStorage {
     async fn add_message(
         &self,
         conv_id: &str,
-        msg_type: MessageType,
-        content: &Value,
+        content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
@@ -311,7 +310,7 @@ impl MessageStore for InMemoryStorage {
             id: id.clone(),
             conversation_id: conv_id.to_string(),
             sequence_id: seq_id,
-            message_type: msg_type,
+            message_type: content.message_type(),
             content: content.clone(),
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
@@ -620,8 +619,7 @@ mod tests {
         let msg = storage
             .add_message(
                 "conv-1",
-                MessageType::User,
-                &serde_json::json!({ "text": "hello" }),
+                &MessageContent::user("hello"),
                 None,
                 None,
             )
@@ -629,10 +627,16 @@ mod tests {
             .unwrap();
 
         assert!(msg.id.starts_with("msg-"));
+        assert_eq!(msg.message_type, MessageType::User);
 
         let messages = storage.get_messages("conv-1").await.unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content["text"], "hello");
+        
+        // Verify typed content
+        match &messages[0].content {
+            MessageContent::User(u) => assert_eq!(u.text, "hello"),
+            _ => panic!("Expected User content"),
+        }
     }
 
     /// Integration test: simple text response using builder

@@ -2,7 +2,7 @@
 //!
 //! These traits enable testing the executor with mock implementations.
 
-use crate::db::{Message, MessageType, UsageData};
+use crate::db::{Message, MessageContent, UsageData};
 use crate::llm::{LlmError, LlmRequest, LlmResponse};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
@@ -17,8 +17,7 @@ pub trait MessageStore: Send + Sync {
     async fn add_message(
         &self,
         conv_id: &str,
-        msg_type: MessageType,
-        content: &Value,
+        content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String>;
@@ -82,12 +81,11 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     async fn add_message(
         &self,
         conv_id: &str,
-        msg_type: MessageType,
-        content: &Value,
+        content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
-        (**self).add_message(conv_id, msg_type, content, display_data, usage_data).await
+        (**self).add_message(conv_id, content, display_data, usage_data).await
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
@@ -169,14 +167,13 @@ impl MessageStore for DatabaseStorage {
     async fn add_message(
         &self,
         conv_id: &str,
-        msg_type: MessageType,
-        content: &Value,
+        content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
         let id = uuid::Uuid::new_v4().to_string();
         self.db
-            .add_message(&id, conv_id, msg_type, content, display_data, usage_data)
+            .add_message(&id, conv_id, content, display_data, usage_data)
             .map_err(|e| e.to_string())
     }
 

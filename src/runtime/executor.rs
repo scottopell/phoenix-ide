@@ -2,7 +2,7 @@
 
 use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::SseEvent;
-use crate::db::{MessageType, ToolResult};
+use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
@@ -125,7 +125,6 @@ where
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
             Effect::PersistMessage {
-                msg_type,
                 content,
                 display_data,
                 usage_data,
@@ -134,7 +133,6 @@ where
                     .storage
                     .add_message(
                         &self.context.conversation_id,
-                        msg_type,
                         &content,
                         display_data.as_ref(),
                         usage_data.as_ref(),
@@ -351,16 +349,15 @@ where
 
             Effect::PersistToolResults { results } => {
                 for result in results {
-                    let content = json!({
-                        "tool_use_id": result.tool_use_id,
-                        "content": result.output,
-                        "is_error": result.is_error
-                    });
+                    let content = MessageContent::tool(
+                        &result.tool_use_id,
+                        &result.output,
+                        result.is_error,
+                    );
                     let msg = self
                         .storage
                         .add_message(
                             &self.context.conversation_id,
-                            MessageType::Tool,
                             &content,
                             None,
                             None,
@@ -413,35 +410,22 @@ where
         storage: &S,
         conv_id: &str,
     ) -> Result<Vec<LlmMessage>, String> {
+        use crate::db::{MessageContent, UserContent, ToolContent};
+        
         let db_messages = storage.get_messages(conv_id).await?;
 
         let mut messages = Vec::new();
 
         for msg in db_messages {
-            match msg.message_type {
-                MessageType::User => {
-                    let mut content = vec![];
-
-                    // Extract text
-                    if let Some(text) = msg.content.get("text").and_then(|t| t.as_str()) {
-                        content.push(ContentBlock::text(text));
-                    }
-
-                    // Extract images (REQ-BED-013)
-                    if let Some(images) = msg.content.get("images").and_then(|i| i.as_array()) {
-                        for img in images {
-                            if let (Some(data), Some(media_type)) = (
-                                img.get("data").and_then(|d| d.as_str()),
-                                img.get("media_type").and_then(|m| m.as_str()),
-                            ) {
-                                content.push(ContentBlock::Image {
-                                    source: crate::llm::ImageSource::Base64 {
-                                        media_type: media_type.to_string(),
-                                        data: data.to_string(),
-                                    },
-                                });
-                            }
-                        }
+            match &msg.content {
+                MessageContent::User(UserContent { text, images }) => {
+                    let mut content = vec![ContentBlock::text(text)];
+                    
+                    // Add images (REQ-BED-013)
+                    for img in images {
+                        content.push(ContentBlock::Image {
+                            source: img.to_image_source(),
+                        });
                     }
 
                     messages.push(LlmMessage {
@@ -450,46 +434,27 @@ where
                     });
                 }
 
-                MessageType::Agent => {
-                    // Parse content blocks from stored JSON
-                    let content: Vec<ContentBlock> = serde_json::from_value(msg.content.clone())
-                        .unwrap_or_else(|_| vec![ContentBlock::text(msg.content.to_string())]);
-
+                MessageContent::Agent(blocks) => {
                     messages.push(LlmMessage {
                         role: MessageRole::Assistant,
-                        content,
+                        content: blocks.clone(),
                     });
                 }
 
-                MessageType::Tool => {
+                MessageContent::Tool(ToolContent { tool_use_id, content, is_error }) => {
                     // Tool results go in user message
-                    let tool_use_id = msg
-                        .content
-                        .get("tool_use_id")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    let content_str = msg
-                        .content
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    let is_error = msg
-                        .content
-                        .get("is_error")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-
                     messages.push(LlmMessage {
                         role: MessageRole::User,
                         content: vec![ContentBlock::tool_result(
                             tool_use_id,
-                            content_str,
-                            is_error,
+                            content,
+                            *is_error,
                         )],
                     });
                 }
 
-                _ => {} // Ignore system and error messages
+                // Ignore system and error messages
+                MessageContent::System(_) | MessageContent::Error(_) => {}
             }
         }
 

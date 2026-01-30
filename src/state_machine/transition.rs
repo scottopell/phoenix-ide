@@ -9,7 +9,6 @@
 
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
-use crate::llm::ContentBlock;
 use serde_json::{json, Value};
 use std::time::Duration;
 use thiserror::Error;
@@ -71,10 +70,9 @@ pub fn transition(
 
         // Idle or Error + UserMessage -> LlmRequesting (recovery from Error, REQ-BED-006)
         (ConvState::Idle | ConvState::Error { .. }, Event::UserMessage { text, images }) => {
-            let content = build_user_message_content(&text, &images);
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_user_message(content))
+                    .with_effect(Effect::persist_user_message(text, images))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::RequestLlm),
             )
@@ -114,10 +112,7 @@ pub fn transition(
                 // No tools, just text response -> Idle
                 let usage_data = usage_to_data(&usage);
                 Ok(TransitionResult::new(ConvState::Idle)
-                    .with_effect(Effect::persist_agent_message(
-                        content_to_json(&content),
-                        Some(usage_data),
-                    ))
+                    .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_agent_done()))
             } else {
@@ -131,10 +126,7 @@ pub fn transition(
                     remaining_tools: rest,
                     completed_results: vec![],
                 })
-                .with_effect(Effect::persist_agent_message(
-                    content_to_json(&content),
-                    Some(usage_data),
-                ))
+                .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::execute_tool(first)))
             }
@@ -243,7 +235,9 @@ pub fn transition(
                 completed_results: new_results,
             })
             .with_effect(Effect::persist_tool_message(
-                tool_result_to_json(&result),
+                &result.tool_use_id,
+                &result.output,
+                result.is_error,
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
@@ -268,7 +262,9 @@ pub fn transition(
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::persist_tool_message(
-                        tool_result_to_json(&result),
+                        &result.tool_use_id,
+                        &result.output,
+                        result.is_error,
                         result.display_data(),
                     ))
                     .with_effect(Effect::PersistState)
@@ -417,11 +413,20 @@ pub fn transition(
             new_results.push(result);
 
             // Aggregate results into a message for the LLM
-            let aggregated = aggregate_sub_agent_results(&new_results);
+            // Note: Sub-agent results are stored as a system message for now
+            // This will need refinement when sub-agents are implemented
+            let aggregated_json = aggregate_sub_agent_results(&new_results);
+            let aggregated_text = serde_json::to_string_pretty(&aggregated_json)
+                .unwrap_or_else(|_| "Failed to serialize sub-agent results".to_string());
 
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_tool_message(aggregated, None))
+                    .with_effect(Effect::persist_tool_message(
+                        "sub-agents",
+                        aggregated_text,
+                        false,
+                        None,
+                    ))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::RequestLlm),
             )
@@ -438,34 +443,6 @@ pub fn transition(
 
 // Helper functions
 
-fn build_user_message_content(
-    text: &str,
-    images: &[crate::state_machine::event::ImageData],
-) -> Value {
-    if images.is_empty() {
-        json!({ "text": text })
-    } else {
-        json!({
-            "text": text,
-            "images": images.iter().map(|img| json!({
-                "data": img.data,
-                "media_type": img.media_type
-            })).collect::<Vec<_>>()
-        })
-    }
-}
-
-fn content_to_json(content: &[ContentBlock]) -> Value {
-    serde_json::to_value(content).unwrap_or(Value::Null)
-}
-
-fn tool_result_to_json(result: &ToolResult) -> Value {
-    json!({
-        "tool_use_id": result.tool_use_id,
-        "content": result.output,
-        "is_error": result.is_error
-    })
-}
 
 impl ToolResult {
     #[allow(clippy::unused_self)] // Method signature for future extension

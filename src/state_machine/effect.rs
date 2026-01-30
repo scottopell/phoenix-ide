@@ -1,6 +1,7 @@
 //! Effects produced by state transitions
 
-use crate::db::{MessageType, ToolResult, UsageData};
+use crate::db::{ImageData, MessageContent, ToolResult, UsageData};
+use crate::llm::ContentBlock;
 use crate::state_machine::state::ToolCall;
 use serde_json::Value;
 use std::time::Duration;
@@ -10,8 +11,7 @@ use std::time::Duration;
 pub enum Effect {
     /// Persist a message to the database
     PersistMessage {
-        msg_type: MessageType,
-        content: Value,
+        content: MessageContent,
         display_data: Option<Value>,
         usage_data: Option<UsageData>,
     },
@@ -50,28 +50,35 @@ pub enum Effect {
 }
 
 impl Effect {
-    pub fn persist_user_message(content: Value) -> Self {
+    pub fn persist_user_message(text: impl Into<String>, images: Vec<ImageData>) -> Self {
+        let content = if images.is_empty() {
+            MessageContent::user(text)
+        } else {
+            MessageContent::user_with_images(text, images)
+        };
         Effect::PersistMessage {
-            msg_type: MessageType::User,
             content,
             display_data: None,
             usage_data: None,
         }
     }
 
-    pub fn persist_agent_message(content: Value, usage: Option<UsageData>) -> Self {
+    pub fn persist_agent_message(blocks: Vec<ContentBlock>, usage: Option<UsageData>) -> Self {
         Effect::PersistMessage {
-            msg_type: MessageType::Agent,
-            content,
+            content: MessageContent::agent(blocks),
             display_data: None,
             usage_data: usage,
         }
     }
 
-    pub fn persist_tool_message(content: Value, display_data: Option<Value>) -> Self {
+    pub fn persist_tool_message(
+        tool_use_id: impl Into<String>,
+        output: impl Into<String>,
+        is_error: bool,
+        display_data: Option<Value>,
+    ) -> Self {
         Effect::PersistMessage {
-            msg_type: MessageType::Tool,
-            content,
+            content: MessageContent::tool(tool_use_id, output, is_error),
             display_data,
             usage_data: None,
         }

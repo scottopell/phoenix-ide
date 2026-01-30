@@ -332,13 +332,13 @@ impl Database {
         &self,
         id: &str,
         conversation_id: &str,
-        msg_type: MessageType,
-        content: &serde_json::Value,
+        content: &MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
+        let msg_type = content.message_type();
 
         // Get next sequence ID
         let sequence_id: i64 = conn.query_row(
@@ -347,7 +347,7 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        let content_str = serde_json::to_string(content).unwrap();
+        let content_str = serde_json::to_string(&content.to_json()).unwrap();
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
@@ -392,23 +392,7 @@ impl Database {
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC"
         )?;
 
-        let rows = stmt.query_map(params![conversation_id], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                sequence_id: row.get(2)?,
-                message_type: parse_message_type(&row.get::<_, String>(3)?),
-                content: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                display_data: row
-                    .get::<_, Option<String>>(5)?
-                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                usage_data: row
-                    .get::<_, Option<String>>(6)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: parse_datetime(&row.get::<_, String>(7)?),
-            })
-        })?;
-
+        let rows = stmt.query_map(params![conversation_id], parse_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -424,23 +408,7 @@ impl Database {
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC"
         )?;
 
-        let rows = stmt.query_map(params![conversation_id, after_sequence], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                sequence_id: row.get(2)?,
-                message_type: parse_message_type(&row.get::<_, String>(3)?),
-                content: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                display_data: row
-                    .get::<_, Option<String>>(5)?
-                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                usage_data: row
-                    .get::<_, Option<String>>(6)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: parse_datetime(&row.get::<_, String>(7)?),
-            })
-        })?;
-
+        let rows = stmt.query_map(params![conversation_id, after_sequence], parse_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -454,6 +422,32 @@ impl Database {
         )
         .map_err(DbError::from)
     }
+}
+
+/// Parse a message row from the database
+fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    let msg_type = parse_message_type(&row.get::<_, String>(3)?);
+    let content_str: String = row.get(4)?;
+    let content_value: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
+    
+    // Parse content using the message type as discriminator
+    let content = MessageContent::from_json(msg_type, content_value)
+        .unwrap_or_else(|_| MessageContent::error(format!("Failed to parse {msg_type} message")));
+    
+    Ok(Message {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        sequence_id: row.get(2)?,
+        message_type: msg_type,
+        content,
+        display_data: row
+            .get::<_, Option<String>>(5)?
+            .map(|s| serde_json::from_str(&s).unwrap_or_default()),
+        usage_data: row
+            .get::<_, Option<String>>(6)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        created_at: parse_datetime(&row.get::<_, String>(7)?),
+    })
 }
 
 fn parse_state(s: &str) -> ConversationState {
@@ -521,6 +515,8 @@ mod tests {
 
     #[test]
     fn test_add_and_get_messages() {
+        use crate::llm::ContentBlock;
+        
         let db = Database::open_in_memory().unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None)
@@ -530,8 +526,7 @@ mod tests {
             .add_message(
                 "msg-1",
                 "conv-1",
-                MessageType::User,
-                &serde_json::json!({"text": "Hello"}),
+                &MessageContent::user("Hello"),
                 None,
                 None,
             )
@@ -541,8 +536,7 @@ mod tests {
             .add_message(
                 "msg-2",
                 "conv-1",
-                MessageType::Agent,
-                &serde_json::json!([{"type": "text", "text": "Hi there!"}]),
+                &MessageContent::agent(vec![ContentBlock::text("Hi there!")]),
                 None,
                 None,
             )
@@ -550,9 +544,17 @@ mod tests {
 
         assert_eq!(msg1.sequence_id, 1);
         assert_eq!(msg2.sequence_id, 2);
+        assert_eq!(msg1.message_type, MessageType::User);
+        assert_eq!(msg2.message_type, MessageType::Agent);
 
         let messages = db.get_messages("conv-1").unwrap();
         assert_eq!(messages.len(), 2);
+
+        // Verify content is properly typed
+        match &messages[0].content {
+            MessageContent::User(u) => assert_eq!(u.text, "Hello"),
+            _ => panic!("Expected User content"),
+        }
 
         let after = db.get_messages_after("conv-1", 1).unwrap();
         assert_eq!(after.len(), 1);

@@ -10,7 +10,8 @@ use super::types::{
 };
 use super::AppState;
 use crate::runtime::SseEvent;
-use crate::state_machine::{event::ImageData, Event};
+use crate::db::ImageData;
+use crate::state_machine::Event;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
