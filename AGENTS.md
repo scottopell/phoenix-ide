@@ -46,6 +46,38 @@ Good:
 
 ---
 
+## Code Conventions
+
+### Module Organization
+
+Use named module files (e.g., `foo.rs` + `foo/` subdirectory) instead of `foo/mod.rs`. This is enforced by the `mod_module_files` clippy lint.
+
+✅ Correct:
+```
+src/
+  tools.rs           # Module entry point
+  tools/
+    bash.rs          # Submodule
+    patch.rs         # Submodule with its own children
+    patch/
+      planner.rs     # Nested submodule
+```
+
+❌ Wrong:
+```
+src/
+  tools/
+    mod.rs           # Legacy style - forbidden
+    bash.rs
+```
+
+The modern style is preferred because:
+- File names are more descriptive in editor tabs
+- Easier to navigate in file trees
+- Rust 2018 edition recommendation
+
+---
+
 ## Development Commands
 
 **Always use `./dev.py` for development tasks.** It handles configuration automatically.

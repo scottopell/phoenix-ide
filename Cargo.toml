@@ -54,6 +54,7 @@ redundant_allocation = "deny"
 rc_buffer = "deny"
 unnecessary_to_owned = "deny"
 dbg_macro = "deny"
+mod_module_files = "deny"
 
 [lints.rust]
 unused_extern_crates = "deny"
