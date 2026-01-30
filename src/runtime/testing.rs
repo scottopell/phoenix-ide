@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Mock LLM Client
@@ -116,7 +117,12 @@ impl Default for MockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for MockToolExecutor {
-    async fn execute(&self, name: &str, input: Value) -> Option<ToolOutput> {
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        _cancel: CancellationToken,
+    ) -> Option<ToolOutput> {
         self.executions
             .lock()
             .unwrap()
@@ -207,15 +213,28 @@ impl DelayedMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DelayedMockToolExecutor {
-    async fn execute(&self, name: &str, input: Value) -> Option<ToolOutput> {
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Option<ToolOutput> {
         self.inner
             .executions
             .lock()
             .unwrap()
             .push((name.to_string(), input));
         self.execution_started.notify_waiters();
-        tokio::time::sleep(self.delay).await;
-        self.inner.outputs.get(name).cloned()
+
+        // Race between delay and cancellation
+        tokio::select! {
+            _ = tokio::time::sleep(self.delay) => {
+                self.inner.outputs.get(name).cloned()
+            }
+            _ = cancel.cancelled() => {
+                Some(ToolOutput::error("[command cancelled]"))
+            }
+        }
     }
 
     fn definitions(&self) -> Vec<ToolDefinition> {
@@ -579,12 +598,18 @@ mod tests {
         let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
 
         let result = executor
-            .execute("bash", serde_json::json!({ "cmd": "ls" }))
+            .execute(
+                "bash",
+                serde_json::json!({ "cmd": "ls" }),
+                CancellationToken::new(),
+            )
             .await;
         assert!(result.is_some());
         assert!(result.unwrap().success);
 
-        let result = executor.execute("unknown", serde_json::json!({})).await;
+        let result = executor
+            .execute("unknown", serde_json::json!({}), CancellationToken::new())
+            .await;
         assert!(result.is_none());
     }
 

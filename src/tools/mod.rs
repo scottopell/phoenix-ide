@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::llm::ModelRegistry;
 
@@ -64,8 +65,11 @@ pub trait Tool: Send + Sync {
     /// JSON schema for tool input
     fn input_schema(&self) -> Value;
 
-    /// Execute the tool
-    async fn run(&self, input: Value) -> ToolOutput;
+    /// Execute the tool with optional cancellation support
+    ///
+    /// Tools that spawn long-running subprocesses should monitor the
+    /// cancellation token and terminate gracefully when cancelled.
+    async fn run(&self, input: Value, cancel: CancellationToken) -> ToolOutput;
 }
 
 /// Collection of tools available to a conversation
@@ -111,11 +115,16 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Execute a tool by name
-    pub async fn execute(&self, name: &str, input: Value) -> Option<ToolOutput> {
+    /// Execute a tool by name with cancellation support
+    pub async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Option<ToolOutput> {
         for tool in &self.tools {
             if tool.name() == name {
-                return Some(tool.run(input).await);
+                return Some(tool.run(input, cancel).await);
             }
         }
         None

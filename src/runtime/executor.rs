@@ -204,28 +204,34 @@ where
                 tokio::spawn(async move {
                     tracing::info!(tool = %tool_name, id = %tool_use_id, "Executing tool (background)");
 
-                    // Race tool execution against cancellation
-                    tokio::select! {
-                        biased;
+                    // Pass cancellation token to tool for subprocess management
+                    let output = tool_executor
+                        .execute(&tool_name, tool_input, cancel_token)
+                        .await;
 
-                        _ = cancel_token.cancelled() => {
-                            tracing::info!(tool_id = %tool_use_id, "Tool cancelled");
-                            let _ = event_tx.send(Event::ToolAborted { tool_use_id }).await;
+                    let result = match output {
+                        Some(out) => {
+                            // Check if the tool was cancelled
+                            if out.output.contains("[command cancelled]") {
+                                tracing::info!(tool_id = %tool_use_id, "Tool cancelled");
+                                let _ = event_tx.send(Event::ToolAborted { tool_use_id }).await;
+                                return;
+                            }
+                            ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                success: out.success,
+                                output: out.output,
+                                is_error: !out.success,
+                            }
                         }
-
-                        output = tool_executor.execute(&tool_name, tool_input) => {
-                            let result = match output {
-                                Some(out) => ToolResult {
-                                    tool_use_id: tool_use_id.clone(),
-                                    success: out.success,
-                                    output: out.output,
-                                    is_error: !out.success,
-                                },
-                                None => ToolResult::error(tool_use_id.clone(), format!("Unknown tool: {tool_name}")),
-                            };
-                            let _ = event_tx.send(Event::ToolComplete { tool_use_id, result }).await;
-                        }
-                    }
+                        None => ToolResult::error(
+                            tool_use_id.clone(),
+                            format!("Unknown tool: {tool_name}"),
+                        ),
+                    };
+                    let _ = event_tx
+                        .send(Event::ToolComplete { tool_use_id, result })
+                        .await;
                 });
 
                 // Return None - the event will come from the spawned task

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const MAX_TERM_RESULTS: usize = 64 * 1024; // 64KB per term
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
@@ -207,7 +208,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         })
     }
 
-    async fn run(&self, input: Value) -> ToolOutput {
+    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
         let input: KeywordSearchInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),

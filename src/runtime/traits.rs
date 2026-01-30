@@ -8,6 +8,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// Storage for conversation messages
 #[async_trait]
@@ -56,8 +57,13 @@ pub trait LlmClient: Send + Sync {
 /// Executor for tools
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    /// Execute a tool by name
-    async fn execute(&self, name: &str, input: Value) -> Option<ToolOutput>;
+    /// Execute a tool by name with cancellation support
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Option<ToolOutput>;
 
     /// Get tool definitions for LLM
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
@@ -118,8 +124,13 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
 #[async_trait]
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
-    async fn execute(&self, name: &str, input: Value) -> Option<ToolOutput> {
-        (**self).execute(name, input).await
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Option<ToolOutput> {
+        (**self).execute(name, input, cancel).await
     }
 
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
@@ -234,8 +245,13 @@ impl ToolRegistryExecutor {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
-    async fn execute(&self, name: &str, input: Value) -> Option<ToolOutput> {
-        self.registry.execute(name, input).await
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Option<ToolOutput> {
+        self.registry.execute(name, input, cancel).await
     }
 
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {

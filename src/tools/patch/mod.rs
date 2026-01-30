@@ -33,6 +33,7 @@ use executor::{execute_effects, read_file_content};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 
@@ -163,7 +164,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         })
     }
 
-    async fn run(&self, input: Value) -> ToolOutput {
+    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
         // Check input size
         let input_str = input.to_string();
         if input_str.len() > MAX_INPUT_SIZE {
@@ -247,7 +248,7 @@ mod tests {
                     "oldText": "World",
                     "newText": "Rust"
                 }]
-            }))
+            }), CancellationToken::new())
             .await;
 
         assert!(result.success, "Error: {}", result.output);
@@ -266,7 +267,7 @@ mod tests {
                     "operation": "overwrite",
                     "newText": "New content"
                 }]
-            }))
+            }), CancellationToken::new())
             .await;
 
         assert!(result.success);
@@ -291,7 +292,7 @@ mod tests {
                 "newText": "",
                 "toClipboard": "clip1"
             }]
-        }))
+        }), CancellationToken::new())
         .await;
 
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "AAA  CCC");
@@ -304,7 +305,7 @@ mod tests {
                 "oldText": "CCC",
                 "fromClipboard": "clip1"
             }]
-        }))
+        }), CancellationToken::new())
         .await;
 
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "AAA  BBB");

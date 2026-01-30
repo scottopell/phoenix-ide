@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum image size (5MB)
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
@@ -85,7 +86,7 @@ impl Tool for ReadImageTool {
         })
     }
 
-    async fn run(&self, input: Value) -> ToolOutput {
+    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
         let input: ReadImageInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -173,7 +174,7 @@ mod tests {
         let tool = ReadImageTool::new(dir.path().to_path_buf());
         create_test_image(dir.path(), "test.png", MINIMAL_PNG);
 
-        let result = tool.run(json!({"path": "test.png"})).await;
+        let result = tool.run(json!({"path": "test.png"}), CancellationToken::new()).await;
         assert!(result.success, "Failed: {}", result.output);
 
         let output: Value = serde_json::from_str(&result.output).unwrap();
@@ -188,7 +189,7 @@ mod tests {
         let tool = ReadImageTool::new(PathBuf::from("/tmp"));
         let img_path = create_test_image(dir.path(), "abs.png", MINIMAL_PNG);
 
-        let result = tool.run(json!({"path": img_path.to_str().unwrap()})).await;
+        let result = tool.run(json!({"path": img_path.to_str().unwrap()}), CancellationToken::new()).await;
         assert!(result.success, "Failed: {}", result.output);
     }
 
@@ -197,7 +198,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadImageTool::new(dir.path().to_path_buf());
 
-        let result = tool.run(json!({"path": "nonexistent.png"})).await;
+        let result = tool.run(json!({"path": "nonexistent.png"}), CancellationToken::new()).await;
         assert!(!result.success);
         assert!(result.output.contains("not found"));
     }
@@ -208,7 +209,7 @@ mod tests {
         let tool = ReadImageTool::new(dir.path().to_path_buf());
         create_test_image(dir.path(), "test.bmp", b"fake bmp data");
 
-        let result = tool.run(json!({"path": "test.bmp"})).await;
+        let result = tool.run(json!({"path": "test.bmp"}), CancellationToken::new()).await;
         assert!(!result.success);
         assert!(result.output.contains("Unsupported"));
     }
@@ -219,7 +220,7 @@ mod tests {
         let tool = ReadImageTool::new(dir.path().to_path_buf());
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
-        let result = tool.run(json!({"path": "subdir"})).await;
+        let result = tool.run(json!({"path": "subdir"}), CancellationToken::new()).await;
         assert!(!result.success);
         assert!(result.output.contains("Not a file"));
     }
@@ -233,7 +234,7 @@ mod tests {
             let filename = format!("test.{}", ext);
             create_test_image(dir.path(), &filename, b"fake image data");
 
-            let result = tool.run(json!({"path": filename})).await;
+            let result = tool.run(json!({"path": filename}), CancellationToken::new()).await;
             assert!(result.success, "Failed for {}: {}", ext, result.output);
 
             let output: Value = serde_json::from_str(&result.output).unwrap();

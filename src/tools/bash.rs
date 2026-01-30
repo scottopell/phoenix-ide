@@ -6,6 +6,7 @@
 //! REQ-BASH-004: No TTY Attached
 //! REQ-BASH-005: Tool Schema
 //! REQ-BASH-006: Error Reporting
+//! REQ-BASH-007: Subprocess Termination on Cancellation
 
 use super::{Tool, ToolOutput};
 use async_trait::async_trait;
@@ -15,11 +16,16 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 #[allow(unused_imports)]
 use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+use nix::sys::signal::{killpg, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
 
 const MAX_OUTPUT_LENGTH: usize = 128 * 1024; // 128KB
 const SNIP_SIZE: usize = 4 * 1024; // 4KB each end
@@ -27,6 +33,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOW_TIMEOUT: Duration = Duration::from_secs(15 * 60); // 15 minutes
 #[allow(dead_code)] // For future background task implementation
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Execution mode for bash commands
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
@@ -55,7 +62,12 @@ impl BashTool {
         Self { working_dir }
     }
 
-    async fn execute_foreground(&self, command: &str, mode: ExecutionMode) -> ToolOutput {
+    async fn execute_foreground(
+        &self,
+        command: &str,
+        mode: ExecutionMode,
+        cancel: CancellationToken,
+    ) -> ToolOutput {
         let timeout_duration = match mode {
             ExecutionMode::Default => DEFAULT_TIMEOUT,
             ExecutionMode::Slow => SLOW_TIMEOUT,
@@ -73,7 +85,8 @@ impl BashTool {
         #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
-                // Create new process group
+                // Create new process group with this process as leader
+                // This allows us to kill all descendants with kill(-pgid, sig)
                 nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
                     .ok();
                 Ok(())
@@ -87,49 +100,90 @@ impl BashTool {
 
         let pid = child.id();
 
-        match timeout(timeout_duration, child.wait_with_output()).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+        // Race between: command completion, timeout, and cancellation
+        tokio::select! {
+            biased;
 
-                // Combine stdout and stderr
-                let combined = if !stderr.is_empty() && !stdout.is_empty() {
-                    format!("{stdout}{stderr}")
-                } else if !stderr.is_empty() {
-                    stderr.to_string()
-                } else {
-                    stdout.to_string()
-                };
-
-                let formatted = Self::truncate_output(&combined);
-
-                if output.status.success() {
-                    ToolOutput::success(formatted)
-                } else {
-                    let exit_code = output.status.code().unwrap_or(-1);
-                    ToolOutput::error(format!(
-                        "[command failed: exit code {exit_code}]\n{formatted}"
-                    ))
-                }
+            // Cancellation requested
+            () = cancel.cancelled() => {
+                Self::kill_process_group(pid, true).await;
+                ToolOutput::error("[command cancelled]")
             }
-            Ok(Err(e)) => ToolOutput::error(format!("Command execution failed: {e}")),
-            Err(_) => {
-                // Timeout - kill the process group
-                if let Some(pid) = pid {
-                    #[cfg(unix)]
-                    {
-                        use nix::sys::signal::{killpg, Signal};
-                        use nix::unistd::Pid;
-                        let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = pid; // Suppress warning
-                    }
-                }
+
+            // Timeout fired
+            () = tokio::time::sleep(timeout_duration) => {
+                Self::kill_process_group(pid, false).await;
                 ToolOutput::error(format!("[command timed out after {timeout_duration:?}]"))
             }
+
+            // Command completed
+            result = child.wait_with_output() => {
+                match result {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+
+                        // Combine stdout and stderr
+                        let combined = if !stderr.is_empty() && !stdout.is_empty() {
+                            format!("{stdout}{stderr}")
+                        } else if !stderr.is_empty() {
+                            stderr.to_string()
+                        } else {
+                            stdout.to_string()
+                        };
+
+                        let formatted = Self::truncate_output(&combined);
+
+                        if output.status.success() {
+                            ToolOutput::success(formatted)
+                        } else {
+                            let exit_code = output.status.code().unwrap_or(-1);
+                            ToolOutput::error(format!(
+                                "[command failed: exit code {exit_code}]\n{formatted}"
+                            ))
+                        }
+                    }
+                    Err(e) => ToolOutput::error(format!("Command execution failed: {e}")),
+                }
+            }
         }
+    }
+
+    /// Kill a process group, optionally with graceful shutdown.
+    ///
+    /// If `graceful` is true:
+    /// 1. Send SIGTERM to process group (allows graceful shutdown)
+    /// 2. Wait up to 1 second for processes to exit
+    /// 3. Send SIGKILL if processes still running
+    ///
+    /// If `graceful` is false, send SIGKILL immediately.
+    #[cfg(unix)]
+    async fn kill_process_group(pid: Option<u32>, graceful: bool) {
+        let Some(pid) = pid else { return };
+
+        let pgid = Pid::from_raw(pid.cast_signed());
+
+        if graceful {
+            // Step 1: SIGTERM - allow graceful shutdown
+            tracing::debug!(pgid = pid, "Sending SIGTERM to process group");
+            let _ = killpg(pgid, Signal::SIGTERM);
+
+            // Step 2: Wait for graceful shutdown
+            tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
+
+            // Step 3: SIGKILL if still alive (ESRCH means already dead, which is fine)
+            tracing::debug!(pgid = pid, "Sending SIGKILL to process group");
+            let _ = killpg(pgid, Signal::SIGKILL);
+        } else {
+            // Immediate kill (timeout case)
+            tracing::debug!(pgid = pid, "Sending SIGKILL to process group (immediate)");
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn kill_process_group(_pid: Option<u32>, _graceful: bool) {
+        // No-op on non-Unix platforms
     }
 
     fn execute_background(&self, command: &str) -> ToolOutput {
@@ -145,7 +199,7 @@ impl BashTool {
 
         // Wrap command to append completion status
         let wrapper_script = format!(
-            r#"{{ {}; }} > "{}" 2>&1; echo "" >> "{}"; echo "[background process completed with exit code $?]" >> "{}";"#,
+            r#"{{ {}; }} > "{}" 2>&1; echo "" >> "{}"; echo "[background process completed with exit code $?]" >> "{}""#,
             command,
             output_file.display(),
             output_file.display(),
@@ -246,7 +300,7 @@ For complex scripts, write them to a file first and then execute the file.
         })
     }
 
-    async fn run(&self, input: Value) -> ToolOutput {
+    async fn run(&self, input: Value, cancel: CancellationToken) -> ToolOutput {
         let input: BashInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -258,7 +312,7 @@ For complex scripts, write them to a file first and then execute the file.
 
         match input.mode {
             ExecutionMode::Background => self.execute_background(&input.command),
-            mode => self.execute_foreground(&input.command, mode).await,
+            mode => self.execute_foreground(&input.command, mode, cancel).await,
         }
     }
 }
@@ -271,7 +325,9 @@ mod tests {
     #[tokio::test]
     async fn test_simple_command() {
         let tool = BashTool::new(temp_dir());
-        let result = tool.run(json!({"command": "echo hello"})).await;
+        let result = tool
+            .run(json!({"command": "echo hello"}), CancellationToken::new())
+            .await;
         assert!(result.success);
         assert!(result.output.contains("hello"));
     }
@@ -279,7 +335,9 @@ mod tests {
     #[tokio::test]
     async fn test_failed_command() {
         let tool = BashTool::new(temp_dir());
-        let result = tool.run(json!({"command": "exit 1"})).await;
+        let result = tool
+            .run(json!({"command": "exit 1"}), CancellationToken::new())
+            .await;
         assert!(!result.success);
         assert!(result.output.contains("exit code 1"));
     }
@@ -296,11 +354,87 @@ mod tests {
     async fn test_slow_mode() {
         let tool = BashTool::new(temp_dir());
         let result = tool
-            .run(json!({
-                "command": "echo slow",
-                "mode": "slow"
-            }))
+            .run(
+                json!({
+                    "command": "echo slow",
+                    "mode": "slow"
+                }),
+                CancellationToken::new(),
+            )
             .await;
         assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_kills_subprocess() {
+        let tool = BashTool::new(temp_dir());
+        let cancel = CancellationToken::new();
+
+        // Start a long-running command
+        let tool_future = tool.run(
+            json!({"command": "sleep 1000"}),
+            cancel.clone(),
+        );
+
+        // Cancel after a short delay
+        let cancel_task = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        };
+
+        // Run both concurrently
+        let (result, _) = tokio::join!(tool_future, cancel_task);
+
+        // Should be cancelled, not timeout
+        assert!(!result.success);
+        assert!(
+            result.output.contains("cancelled"),
+            "Expected 'cancelled' in output, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_cancellation_kills_subprocess_tree() {
+        use std::process::Command as StdCommand;
+
+        let tool = BashTool::new(temp_dir());
+        let cancel = CancellationToken::new();
+
+        // Use a unique marker so we can search for it
+        let marker = format!("phoenix_test_{}", std::process::id());
+
+        // Command that spawns a subprocess: bash spawns another bash which runs sleep
+        let cmd = format!(
+            "bash -c 'echo {}; sleep 1000' & wait",
+            marker
+        );
+
+        let tool_future = tool.run(json!({"command": cmd}), cancel.clone());
+
+        // Give the subprocess tree time to start
+        let cancel_task = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.cancel();
+        };
+
+        let (result, _) = tokio::join!(tool_future, cancel_task);
+        assert!(result.output.contains("cancelled"));
+
+        // Give processes time to be killed
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify no orphaned sleep processes with our marker
+        let ps_output = StdCommand::new("pgrep")
+            .args(["-f", &marker])
+            .output()
+            .expect("pgrep should work");
+
+        assert!(
+            ps_output.stdout.is_empty(),
+            "Found orphaned process! pgrep output: {}",
+            String::from_utf8_lossy(&ps_output.stdout)
+        );
     }
 }
