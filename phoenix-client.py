@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -13,9 +13,9 @@ REQ-CLI-001: Single-Shot Execution
 REQ-CLI-002: Conversation Management
 REQ-CLI-003: Image Support
 REQ-CLI-004: Output Format
-REQ-CLI-005: SSE Streaming with Polling Fallback
+REQ-CLI-005: SSE Streaming (--poll for fallback)
 REQ-CLI-006: Configuration
-REQ-CLI-007: Single File Distribution
+REQ-CLI-007: Single File Distribution (uv run)
 """
 
 import base64
@@ -27,13 +27,7 @@ from pathlib import Path
 
 import click
 import httpx
-
-# Optional SSE support
-try:
-    from httpx_sse import connect_sse
-    HAS_SSE = True
-except ImportError:
-    HAS_SSE = False
+from httpx_sse import connect_sse
 
 
 class PhoenixError(Exception):
@@ -161,17 +155,12 @@ class PhoenixClient:
 
         raise PhoenixError(f"Timeout after {timeout} seconds")
 
-    def wait_for_response(self, conv_id: str, timeout: float, interval: float, use_sse: bool) -> dict:
-        """Wait for response using SSE or polling."""
-        if use_sse and HAS_SSE:
-            try:
-                return self.stream_until_complete(conv_id, timeout)
-            except Exception as e:
-                # SSE failed, fall back to polling
-                click.echo(f"SSE unavailable ({e}), falling back to polling...", err=True)
-                return self.poll_until_complete(conv_id, timeout, interval)
-        else:
+    def wait_for_response(self, conv_id: str, timeout: float, interval: float, use_polling: bool) -> dict:
+        """Wait for response using SSE (default) or polling."""
+        if use_polling:
             return self.poll_until_complete(conv_id, timeout, interval)
+        else:
+            return self.stream_until_complete(conv_id, timeout)
 
 
 def encode_image(path: str) -> dict:
@@ -255,13 +244,13 @@ def format_response(data: dict) -> str:
 @click.option('--api-url', envvar='PHOENIX_API_URL', default='http://localhost:8000',
               help='API endpoint URL')
 @click.option('--timeout', default=600, help='Timeout in seconds')
-@click.option('--poll-interval', default=1.0, help='Polling interval in seconds (when not using SSE)')
-@click.option('--no-sse', is_flag=True, help='Disable SSE, use polling only')
-def main(message, conversation, directory, images, api_url, timeout, poll_interval, no_sse):
+@click.option('--poll-interval', default=1.0, help='Polling interval in seconds (with --poll)')
+@click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
+def main(message, conversation, directory, images, api_url, timeout, poll_interval, poll):
     """Send a message to Phoenix IDE and wait for response.
     
-    Uses SSE (Server-Sent Events) for real-time streaming by default,
-    with automatic fallback to polling if SSE is unavailable.
+    Uses SSE (Server-Sent Events) for real-time streaming by default.
+    Use --poll for polling fallback mode.
     
     Examples:
     
@@ -274,8 +263,8 @@ def main(message, conversation, directory, images, api_url, timeout, poll_interv
         # With image
         phoenix-client.py -i screenshot.png "What's this error?"
         
-        # Force polling mode
-        phoenix-client.py --no-sse "Hello"
+        # Use polling instead of SSE
+        phoenix-client.py --poll "Hello"
     """
     client = PhoenixClient(api_url)
 
@@ -296,13 +285,12 @@ def main(message, conversation, directory, images, api_url, timeout, poll_interv
     client.send_message(conv['id'], message, image_data)
 
     # Wait for completion (SSE or polling)
-    use_sse = not no_sse
-    if use_sse and HAS_SSE:
-        click.echo("Streaming response...", err=True)
+    if poll:
+        click.echo("Waiting for response (polling)...", err=True)
     else:
-        click.echo("Waiting for response...", err=True)
+        click.echo("Streaming response...", err=True)
     
-    result = client.wait_for_response(conv['id'], timeout, poll_interval, use_sse)
+    result = client.wait_for_response(conv['id'], timeout, poll_interval, poll)
 
     # Format and print output
     print(format_response(result))
