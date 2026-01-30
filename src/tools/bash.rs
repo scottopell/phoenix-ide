@@ -33,7 +33,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOW_TIMEOUT: Duration = Duration::from_secs(15 * 60); // 15 minutes
 #[allow(dead_code)] // For future background task implementation
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
 
 /// Execution mode for bash commands
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
@@ -106,13 +106,13 @@ impl BashTool {
 
             // Cancellation requested
             () = cancel.cancelled() => {
-                Self::kill_process_group(pid, true).await;
+                Self::kill_process_group(pid);
                 ToolOutput::error("[command cancelled]")
             }
 
             // Timeout fired
             () = tokio::time::sleep(timeout_duration) => {
-                Self::kill_process_group(pid, false).await;
+                Self::kill_process_group(pid);
                 ToolOutput::error(format!("[command timed out after {timeout_duration:?}]"))
             }
 
@@ -149,40 +149,17 @@ impl BashTool {
         }
     }
 
-    /// Kill a process group, optionally with graceful shutdown.
-    ///
-    /// If `graceful` is true:
-    /// 1. Send SIGTERM to process group (allows graceful shutdown)
-    /// 2. Wait up to 1 second for processes to exit
-    /// 3. Send SIGKILL if processes still running
-    ///
-    /// If `graceful` is false, send SIGKILL immediately.
+    /// Kill a process group immediately with SIGKILL.
     #[cfg(unix)]
-    async fn kill_process_group(pid: Option<u32>, graceful: bool) {
+    fn kill_process_group(pid: Option<u32>) {
         let Some(pid) = pid else { return };
-
         let pgid = Pid::from_raw(pid.cast_signed());
-
-        if graceful {
-            // Step 1: SIGTERM - allow graceful shutdown
-            tracing::debug!(pgid = pid, "Sending SIGTERM to process group");
-            let _ = killpg(pgid, Signal::SIGTERM);
-
-            // Step 2: Wait for graceful shutdown
-            tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
-
-            // Step 3: SIGKILL if still alive (ESRCH means already dead, which is fine)
-            tracing::debug!(pgid = pid, "Sending SIGKILL to process group");
-            let _ = killpg(pgid, Signal::SIGKILL);
-        } else {
-            // Immediate kill (timeout case)
-            tracing::debug!(pgid = pid, "Sending SIGKILL to process group (immediate)");
-            let _ = killpg(pgid, Signal::SIGKILL);
-        }
+        tracing::debug!(pgid = pid, "Sending SIGKILL to process group");
+        let _ = killpg(pgid, Signal::SIGKILL);
     }
 
     #[cfg(not(unix))]
-    async fn kill_process_group(_pid: Option<u32>, _graceful: bool) {
+    fn kill_process_group(_pid: Option<u32>) {
         // No-op on non-Unix platforms
     }
 
