@@ -44,14 +44,14 @@ class PhoenixClient:
         """Get conversation by ID or slug."""
         # Try as slug first
         try:
-            resp = self.http.get(f"{self.base_url}/api/conversation-by-slug/{id_or_slug}")
+            resp = self.http.get(f"{self.base_url}/api/conversations/by-slug/{id_or_slug}")
             if resp.status_code == 200:
                 return resp.json()['conversation']
         except Exception:
             pass
 
         # Try as ID
-        resp = self.http.get(f"{self.base_url}/api/conversation/{id_or_slug}")
+        resp = self.http.get(f"{self.base_url}/api/conversations/{id_or_slug}")
         resp.raise_for_status()
         return resp.json()['conversation']
 
@@ -67,7 +67,7 @@ class PhoenixClient:
     def send_message(self, conv_id: str, text: str, images: list[dict]) -> None:
         """Send chat message."""
         resp = self.http.post(
-            f"{self.base_url}/api/conversation/{conv_id}/chat",
+            f"{self.base_url}/api/conversations/{conv_id}/chat",
             json={"text": text, "images": images}
         )
         resp.raise_for_status()
@@ -78,7 +78,7 @@ class PhoenixClient:
         if after_sequence:
             params["after_sequence"] = after_sequence
         resp = self.http.get(
-            f"{self.base_url}/api/conversation/{conv_id}",
+            f"{self.base_url}/api/conversations/{conv_id}",
             params=params
         )
         resp.raise_for_status()
@@ -86,7 +86,7 @@ class PhoenixClient:
 
     def stream_until_complete(self, conv_id: str, timeout: float) -> dict:
         """Stream SSE events until conversation is idle or error."""
-        url = f"{self.base_url}/api/conversation/{conv_id}/stream"
+        url = f"{self.base_url}/api/conversations/{conv_id}/stream"
         messages = []
         conversation = None
         

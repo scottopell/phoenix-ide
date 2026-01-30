@@ -1,7 +1,8 @@
 ---
 created: 2026-01-29
 priority: p3
-status: ready
+status: blocked
+blocked_by: 019-mvp-ui
 ---
 
 # Implement static asset serving (REQ-API-010)
