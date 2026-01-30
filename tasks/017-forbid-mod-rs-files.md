@@ -1,7 +1,7 @@
 ---
 created: 2026-01-30
 priority: p3
-status: ready
+status: done
 ---
 
 # Add linter rule to forbid mod.rs files

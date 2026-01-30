@@ -1,7 +1,7 @@
 ---
 created: 2026-01-29
 priority: p3
-status: ready
+status: done
 ---
 
 # Stronger Typing for Message Content (Phase 4)
