@@ -17,26 +17,28 @@ const SYSTEM_PROMPT: &str = r"You are a helpful AI assistant with access to tool
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
-    S: Storage,
-    L: LlmClient,
+    S: Storage + Clone + 'static,
+    L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
     context: ConvContext,
     state: ConvState,
     storage: S,
-    llm_client: L,
+    llm_client: Arc<L>,
     tool_executor: Arc<T>,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: broadcast::Sender<SseEvent>,
-    /// Token to cancel running tool/LLM operations
+    /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
+    /// Token to cancel running LLM request
+    llm_cancel_token: Option<CancellationToken>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
-    S: Storage,
-    L: LlmClient,
+    S: Storage + Clone + 'static,
+    L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
     pub fn new(
@@ -53,12 +55,13 @@ where
             context,
             state,
             storage,
-            llm_client,
+            llm_client: Arc::new(llm_client),
             tool_executor: Arc::new(tool_executor),
             event_rx,
             event_tx,
             broadcast_tx,
             tool_cancel_token: None,
+            llm_cancel_token: None,
         }
     }
 
@@ -185,8 +188,89 @@ where
             }
 
             Effect::RequestLlm => {
-                // Make LLM request and return generated event
-                Ok(Some(self.make_llm_request_event().await))
+                // Create cancellation token for this LLM request
+                let cancel_token = CancellationToken::new();
+                self.llm_cancel_token = Some(cancel_token.clone());
+
+                // Spawn LLM request as background task
+                let llm_client = self.llm_client.clone();
+                let tool_executor = self.tool_executor.clone();
+                let storage = self.storage.clone();
+                let event_tx = self.event_tx.clone();
+                let conv_id = self.context.conversation_id.clone();
+                let current_attempt = match &self.state {
+                    ConvState::LlmRequesting { attempt } => *attempt,
+                    _ => 1,
+                };
+
+                tokio::spawn(async move {
+                    tracing::info!("Making LLM request (background)");
+
+                    // Build messages from history
+                    let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(Event::LlmError {
+                                    message: e,
+                                    error_kind: crate::db::ErrorKind::Unknown,
+                                    attempt: current_attempt,
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+
+                    // Build request
+                    let request = LlmRequest {
+                        system: vec![SystemContent::cached(SYSTEM_PROMPT)],
+                        messages,
+                        tools: tool_executor.definitions(),
+                        max_tokens: Some(8192),
+                    };
+
+                    // Race LLM request against cancellation
+                    tokio::select! {
+                        biased;
+
+                        () = cancel_token.cancelled() => {
+                            tracing::info!("LLM request cancelled");
+                            let _ = event_tx.send(Event::LlmAborted).await;
+                        }
+
+                        result = llm_client.complete(&request) => {
+                            let event = match result {
+                                Ok(response) => {
+                                    // Extract tool calls from content and convert to typed ToolCall
+                                    let tool_calls: Vec<ToolCall> = response
+                                        .tool_uses()
+                                        .into_iter()
+                                        .map(|(id, name, input)| {
+                                            let typed_input = ToolInput::from_name_and_value(name, input.clone());
+                                            ToolCall::new(id.to_string(), typed_input)
+                                        })
+                                        .collect();
+
+                                    Event::LlmResponse {
+                                        content: response.content,
+                                        tool_calls,
+                                        end_turn: response.end_turn,
+                                        usage: response.usage,
+                                    }
+                                }
+                                Err(e) => Event::LlmError {
+                                    message: e.message.clone(),
+                                    error_kind: llm_error_to_db_error(e.kind),
+                                    attempt: current_attempt,
+                                },
+                            };
+                            let _ = event_tx.send(event).await;
+                        }
+                    }
+                });
+
+                // Return None - the event will come from the spawned task
+                Ok(None)
             }
 
             Effect::ExecuteTool { tool } => {
@@ -306,72 +390,30 @@ where
                 // The spawned task will send ToolAborted event when it sees cancellation
                 Ok(None)
             }
-        }
-    }
 
-    /// Make LLM request and return the resulting event
-    async fn make_llm_request_event(&mut self) -> Event {
-        // Build messages from history
-        let messages = match self.build_llm_messages().await {
-            Ok(m) => m,
-            Err(e) => {
-                return Event::LlmError {
-                    message: e,
-                    error_kind: crate::db::ErrorKind::Unknown,
-                    attempt: 1,
-                };
-            }
-        };
-
-        // Build request
-        let request = LlmRequest {
-            system: vec![SystemContent::cached(SYSTEM_PROMPT)],
-            messages,
-            tools: self.tool_executor.definitions(),
-            max_tokens: Some(8192),
-        };
-
-        // Make request
-        match self.llm_client.complete(&request).await {
-            Ok(response) => {
-                // Extract tool calls from content and convert to typed ToolCall
-                let tool_calls: Vec<ToolCall> = response
-                    .tool_uses()
-                    .into_iter()
-                    .map(|(id, name, input)| {
-                        let typed_input = ToolInput::from_name_and_value(name, input.clone());
-                        ToolCall::new(id.to_string(), typed_input)
-                    })
-                    .collect();
-
-                Event::LlmResponse {
-                    content: response.content,
-                    tool_calls,
-                    end_turn: response.end_turn,
-                    usage: response.usage,
+            Effect::AbortLlm => {
+                // Signal abort to running LLM request
+                tracing::info!("Aborting LLM request");
+                if let Some(token) = self.llm_cancel_token.take() {
+                    token.cancel();
                 }
-            }
-            Err(e) => {
-                // Determine attempt from current state
-                let attempt = match &self.state {
-                    ConvState::LlmRequesting { attempt } => *attempt,
-                    _ => 1,
-                };
-
-                Event::LlmError {
-                    message: e.message.clone(),
-                    error_kind: llm_error_to_db_error(e.kind),
-                    attempt,
-                }
+                // The spawned task will send LlmAborted event when it sees cancellation
+                Ok(None)
             }
         }
     }
-
+    /// Build LLM messages from conversation history (instance method)
+    #[allow(dead_code)] // May be useful for non-spawned code paths
     async fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
-        let db_messages = self
-            .storage
-            .get_messages(&self.context.conversation_id)
-            .await?;
+        Self::build_llm_messages_static(&self.storage, &self.context.conversation_id).await
+    }
+
+    /// Build LLM messages from conversation history (static, for spawned tasks)
+    async fn build_llm_messages_static(
+        storage: &S,
+        conv_id: &str,
+    ) -> Result<Vec<LlmMessage>, String> {
+        let db_messages = storage.get_messages(conv_id).await?;
 
         let mut messages = Vec::new();
 
@@ -453,7 +495,6 @@ where
 
         Ok(messages)
     }
-
 }
 
 fn to_db_state(state: &ConvState) -> crate::db::ConversationState {

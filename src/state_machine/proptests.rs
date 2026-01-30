@@ -531,7 +531,7 @@ proptest! {
         );
     }
 
-    // Invariant 14: CancellingLlm + LlmResponse goes to Idle (dummy param for proptest)
+    // Invariant 14: CancellingLlm + LlmResponse/LlmAborted goes to Idle
     #[test]
     fn prop_cancelling_llm_plus_response_goes_idle(_dummy in Just(())) {
         let state = ConvState::CancellingLlm;
@@ -546,11 +546,41 @@ proptest! {
         prop_assert!(result.is_ok());
         prop_assert!(
             matches!(result.unwrap().new_state, ConvState::Idle),
-            "Should go to Idle when cancelled"
+            "Should go to Idle when response arrives after cancel"
         );
     }
 
-    // Invariant 15: ToolExecuting + UserCancel -> CancellingTool with AbortTool effect
+    // Invariant 14b: CancellingLlm + LlmAborted goes to Idle
+    #[test]
+    fn prop_cancelling_llm_plus_aborted_goes_idle(_dummy in Just(())) {
+        let state = ConvState::CancellingLlm;
+        let result = transition(&state, &test_context(), Event::LlmAborted);
+        prop_assert!(result.is_ok());
+        prop_assert!(
+            matches!(result.unwrap().new_state, ConvState::Idle),
+            "Should go to Idle when LLM request is aborted"
+        );
+    }
+
+    // Invariant 15: LlmRequesting + UserCancel -> CancellingLlm with AbortLlm effect
+    #[test]
+    fn prop_llm_cancel_goes_to_cancelling(_dummy in Just(())) {
+        let state = ConvState::LlmRequesting { attempt: 1 };
+        let result = transition(&state, &test_context(), Event::UserCancel);
+        prop_assert!(result.is_ok());
+
+        let tr = result.unwrap();
+        prop_assert!(
+            matches!(tr.new_state, ConvState::CancellingLlm),
+            "Should go to CancellingLlm"
+        );
+        prop_assert!(
+            tr.effects.iter().any(|e| matches!(e, Effect::AbortLlm)),
+            "Should have AbortLlm effect"
+        );
+    }
+
+    // Invariant 16: ToolExecuting + UserCancel -> CancellingTool with AbortTool effect
     #[test]
     fn prop_tool_cancel_goes_to_cancelling(
         current in arb_tool_call(),

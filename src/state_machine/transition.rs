@@ -279,14 +279,15 @@ pub fn transition(
         // Cancellation (REQ-BED-005)
         // ============================================================
 
-        // LlmRequesting + UserCancel -> CancellingLlm
+        // LlmRequesting + UserCancel -> CancellingLlm (abort request)
         (ConvState::LlmRequesting { .. }, Event::UserCancel) => {
             Ok(TransitionResult::new(ConvState::CancellingLlm)
-                .with_effect(Effect::PersistState))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::AbortLlm))
         }
 
-        // CancellingLlm + LlmResponse -> Idle (discard response)
-        (ConvState::CancellingLlm, Event::LlmResponse { .. }) => {
+        // CancellingLlm + LlmResponse/LlmAborted -> Idle (discard response)
+        (ConvState::CancellingLlm, Event::LlmResponse { .. } | Event::LlmAborted) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))

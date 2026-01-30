@@ -28,6 +28,9 @@ pub enum Effect {
     /// Abort the currently running tool
     AbortTool { tool_use_id: String },
 
+    /// Abort the currently running LLM request
+    AbortLlm,
+
     /// Spawn a sub-agent
     #[allow(dead_code)] // Reserved for sub-agent feature
     SpawnSubAgent {

@@ -705,10 +705,9 @@ mod tests {
     }
 
     /// Integration test: cancel during LLM request (REQ-BED-005)
-    /// 
-    /// Note: Current architecture awaits LLM requests inline, so cancel only
-    /// takes effect after the request completes. This test verifies that
-    /// the response is discarded when cancel arrives.
+    ///
+    /// LLM requests are spawned as background tasks and can be cancelled
+    /// immediately via CancellationToken.
     #[tokio::test]
     async fn test_cancel_during_llm_request() {
         use crate::runtime::{ConversationRuntime, SseEvent};
@@ -716,10 +715,13 @@ mod tests {
         use std::path::PathBuf;
         use tokio::sync::{broadcast, mpsc};
 
-        // Use a short delay so test completes quickly
-        let llm = Arc::new(DelayedMockLlmClient::new("test-model", Duration::from_millis(200)));
+        // Use a longer delay - we'll cancel before it completes
+        let llm = Arc::new(DelayedMockLlmClient::new(
+            "test-model",
+            Duration::from_secs(5),
+        ));
         llm.queue_response(LlmResponse {
-            content: vec![ContentBlock::text("Response after cancel")],
+            content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
         });
@@ -745,6 +747,8 @@ mod tests {
 
         tokio::spawn(async move { runtime.run().await });
 
+        let start = tokio::time::Instant::now();
+
         // Send user message
         event_tx
             .send(Event::UserMessage {
@@ -759,10 +763,10 @@ mod tests {
             .await
             .expect("LLM request should start");
 
-        // Queue cancel - will be processed after LLM completes
+        // Cancel immediately after request starts
         event_tx.send(Event::UserCancel).await.unwrap();
 
-        // Wait for completion - LLM finishes, then cancel is processed
+        // Wait for idle state (cancellation complete)
         let mut done = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
@@ -779,20 +783,25 @@ mod tests {
             }
         }
 
-        assert!(done, "Should complete");
+        let elapsed = start.elapsed();
 
-        // Note: With current architecture, LLM response is processed before cancel,
-        // so we'll have both user and agent messages. The cancel arrives too late.
-        // This documents current behavior - a future improvement would make
-        // LLM requests cancellable via tokio::select.
+        assert!(done, "Should complete");
+        // Should complete in < 1 second, not wait for the 5 second LLM delay
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Cancellation should be fast, took {:?}",
+            elapsed
+        );
+
+        // Should only have user message - LLM response was discarded
         let msgs = storage.get_all_messages("test-conv");
-        assert!(!msgs.is_empty(), "Should have messages");
+        assert_eq!(msgs.len(), 1, "Should only have user message, got {:?}", msgs);
+        assert_eq!(msgs[0].message_type, MessageType::User);
     }
 
     /// Integration test: cancel during tool execution (REQ-BED-005)
     ///
-    /// Note: Like LLM requests, tool execution is awaited inline. Cancel
-    /// is queued and processed after tool completes.
+    /// Tools are spawned as background tasks and can be cancelled immediately.
     #[tokio::test]
     async fn test_cancel_during_tool_execution() {
         use crate::runtime::{ConversationRuntime, SseEvent};
@@ -800,7 +809,7 @@ mod tests {
         use std::path::PathBuf;
         use tokio::sync::{broadcast, mpsc};
 
-        // Fast LLM, short tool delay
+        // Fast LLM, long tool delay that we'll cancel
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::tool_use(
@@ -811,7 +820,7 @@ mod tests {
             end_turn: false,
             usage: Usage::default(),
         });
-        // Response after tool completes
+        // This response won't be used since tool is cancelled
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
@@ -819,7 +828,7 @@ mod tests {
         });
 
         let tools = Arc::new(
-            DelayedMockToolExecutor::new(Duration::from_millis(200))
+            DelayedMockToolExecutor::new(Duration::from_secs(5))
                 .with_tool("bash", ToolOutput::success("hi")),
         );
         let execution_started = tools.execution_started.clone();
@@ -842,6 +851,8 @@ mod tests {
 
         tokio::spawn(async move { runtime.run().await });
 
+        let start = tokio::time::Instant::now();
+
         // Send user message
         event_tx
             .send(Event::UserMessage {
@@ -856,10 +867,10 @@ mod tests {
             .await
             .expect("Tool execution should start");
 
-        // Queue cancel
+        // Cancel immediately
         event_tx.send(Event::UserCancel).await.unwrap();
 
-        // Wait for completion
+        // Wait for AgentDone
         let mut done = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
@@ -872,11 +883,108 @@ mod tests {
             }
         }
 
-        assert!(done, "Should complete");
+        let elapsed = start.elapsed();
 
-        // Verify messages exist
-        let msgs = storage.get_all_messages("test-conv");
-        assert!(msgs.len() >= 2, "Should have at least user and agent messages");
+        assert!(done, "Should complete");
+        // Should complete in < 1 second, not wait for the 5 second tool delay
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Cancellation should be fast, took {:?}",
+            elapsed
+        );
+    }
+
+    /// Integration test: Tool cancellation timing (Task 016)
+    ///
+    /// Verifies that tool cancellation happens quickly (< 200ms) as required
+    /// by REQ-BED-005.
+    #[tokio::test]
+    async fn test_tool_cancellation_timing() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::{broadcast, mpsc};
+
+        // 5 second tool delay - we should NOT wait for this
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"command": "sleep 100"}),
+            )],
+            end_turn: false,
+            usage: Usage::default(),
+        });
+
+        let tools = Arc::new(
+            DelayedMockToolExecutor::new(Duration::from_secs(5))
+                .with_tool("bash", ToolOutput::success("done")),
+        );
+        let execution_started = tools.execution_started.clone();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm,
+            tools,
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        );
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // Send user message to trigger tool execution
+        event_tx
+            .send(Event::UserMessage {
+                text: "Run slow command".to_string(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Wait for tool execution to start
+        tokio::time::timeout(Duration::from_secs(2), execution_started.notified())
+            .await
+            .expect("Tool execution should start");
+
+        // Small delay to ensure tool is running
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Record time before cancel
+        let cancel_start = tokio::time::Instant::now();
+
+        // Send cancel
+        event_tx.send(Event::UserCancel).await.unwrap();
+
+        // Wait for AgentDone event
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut agent_done = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(10), broadcast_rx.recv()).await {
+                Ok(Ok(SseEvent::AgentDone)) => {
+                    agent_done = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        let cancel_elapsed = cancel_start.elapsed();
+
+        assert!(agent_done, "Should receive AgentDone event");
+        assert!(
+            cancel_elapsed < Duration::from_millis(200),
+            "Cancellation should complete in < 200ms, took {:?}",
+            cancel_elapsed
+        );
     }
 
     /// Test that state machine cancel logic produces synthetic results
