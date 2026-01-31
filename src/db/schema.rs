@@ -1,6 +1,7 @@
 //! Database schema and types
 
 use crate::llm::ContentBlock;
+use crate::state_machine::state::SubAgentResult;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,6 +90,8 @@ pub enum ConversationState {
         remaining_tools: Vec<crate::state_machine::state::ToolCall>,
         #[serde(default)]
         completed_results: Vec<ToolResult>,
+        #[serde(default)]
+        pending_sub_agents: Vec<String>,
     },
 
     /// User requested cancellation of LLM request
@@ -109,6 +112,22 @@ pub enum ConversationState {
         completed_results: Vec<SubAgentResult>,
     },
 
+    /// User requested cancellation while waiting for sub-agents
+    CancellingSubAgents {
+        pending_ids: Vec<String>,
+        #[serde(default)]
+        completed_results: Vec<SubAgentResult>,
+    },
+
+    /// Sub-agent completed successfully (terminal state, sub-agent only)
+    Completed { result: String },
+
+    /// Sub-agent failed (terminal state, sub-agent only)
+    Failed {
+        error: String,
+        error_kind: ErrorKind,
+    },
+
     /// Error occurred
     Error {
         message: String,
@@ -126,6 +145,9 @@ impl fmt::Display for ConversationState {
             ConversationState::CancellingLlm => write!(f, "cancelling"),
             ConversationState::CancellingTool { .. } => write!(f, "cancelling"),
             ConversationState::AwaitingSubAgents { .. } => write!(f, "awaiting_sub_agents"),
+            ConversationState::CancellingSubAgents { .. } => write!(f, "cancelling_sub_agents"),
+            ConversationState::Completed { .. } => write!(f, "completed"),
+            ConversationState::Failed { .. } => write!(f, "failed"),
             ConversationState::Error { .. } => write!(f, "error"),
         }
     }
@@ -139,6 +161,9 @@ pub enum ErrorKind {
     RateLimit,
     Network,
     InvalidRequest,
+    TimedOut,
+    Cancelled,
+    SubAgentError,
     Unknown,
 }
 
@@ -182,13 +207,7 @@ impl ToolResult {
     }
 }
 
-/// Sub-agent result
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SubAgentResult {
-    pub agent_id: String,
-    pub success: bool,
-    pub result: String,
-}
+// SubAgentResult is now in state_machine::state
 
 // ============================================================
 // Message Content Types

@@ -90,6 +90,7 @@ fn arb_tool_executing_state() -> impl Strategy<Value = ConvState> {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                pending_sub_agents: vec![],
             }
         })
 }
@@ -332,6 +333,7 @@ proptest! {
             current_tool: current.clone(),
             remaining_tools: remaining,
             completed_results: completed,
+            pending_sub_agents: vec![],
         };
         let event = Event::ToolComplete {
             tool_use_id: current.id.clone(),
@@ -591,6 +593,7 @@ proptest! {
             current_tool: current.clone(),
             remaining_tools: remaining.clone(),
             completed_results: completed,
+            pending_sub_agents: vec![],
         };
 
         let result = transition(&state, &test_context(), Event::UserCancel);
@@ -708,6 +711,7 @@ proptest! {
             current_tool: current.clone(),
             remaining_tools: remaining,
             completed_results: completed,
+            pending_sub_agents: vec![],
         };
         let event = Event::ToolComplete {
             tool_use_id: "wrong-id".to_string(),
@@ -936,6 +940,7 @@ fn test_multi_tool_chain() {
             current_tool,
             remaining_tools,
             completed_results,
+            ..
         } => {
             assert_eq!(current_tool.id, "t2");
             assert_eq!(remaining_tools.len(), 1);
@@ -967,6 +972,7 @@ fn test_multi_tool_chain() {
             current_tool,
             remaining_tools,
             completed_results,
+            ..
         } => {
             assert_eq!(current_tool.id, "t3");
             assert!(remaining_tools.is_empty());
@@ -1033,6 +1039,7 @@ fn test_cancel_mid_tool_chain() {
             output: "1".to_string(),
             is_error: false,
         }],
+        pending_sub_agents: vec![],
     };
 
     // Phase 1: UserCancel -> CancellingTool + AbortTool effect
@@ -1104,6 +1111,7 @@ fn test_tool_completion_advances_to_next_tool() {
         current_tool: tool1.clone(),
         remaining_tools: vec![tool2.clone()],
         completed_results: vec![],
+        pending_sub_agents: vec![],
     };
 
     let result = transition(
@@ -1126,6 +1134,7 @@ fn test_tool_completion_advances_to_next_tool() {
             current_tool,
             remaining_tools,
             completed_results,
+            ..
         } => {
             assert_eq!(current_tool.id, "t2");
             assert!(remaining_tools.is_empty());
@@ -1155,6 +1164,7 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
         current_tool: tool1,
         remaining_tools: vec![],
         completed_results: vec![],
+        pending_sub_agents: vec![],
     };
 
     let result = transition(

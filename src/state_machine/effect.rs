@@ -2,7 +2,7 @@
 
 use crate::db::{ImageData, MessageContent, ToolResult, UsageData};
 use crate::llm::ContentBlock;
-use crate::state_machine::state::ToolCall;
+use crate::state_machine::state::{SubAgentOutcome, SubAgentResult, SubAgentSpec, ToolCall};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -31,13 +31,14 @@ pub enum Effect {
     /// Abort the currently running LLM request
     AbortLlm,
 
-    /// Spawn a sub-agent
-    #[allow(dead_code)] // Reserved for sub-agent feature
-    SpawnSubAgent {
-        agent_id: String,
-        prompt: String,
-        model: String,
-    },
+    /// Spawn a sub-agent conversation
+    SpawnSubAgent(SubAgentSpec),
+
+    /// Cancel all pending sub-agents
+    CancelSubAgents { ids: Vec<String> },
+
+    /// Notify parent of sub-agent completion (sub-agent only)
+    NotifyParent { outcome: SubAgentOutcome },
 
     /// Notify connected clients
     NotifyClient { event_type: String, data: Value },
@@ -47,6 +48,9 @@ pub enum Effect {
 
     /// Persist multiple tool results at once
     PersistToolResults { results: Vec<ToolResult> },
+
+    /// Persist aggregated sub-agent results as a message
+    PersistSubAgentResults { results: Vec<SubAgentResult> },
 }
 
 impl Effect {

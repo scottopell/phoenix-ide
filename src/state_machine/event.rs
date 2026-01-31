@@ -1,8 +1,8 @@
 //! Events that can occur in a conversation
 
-use crate::db::{ErrorKind, ImageData, SubAgentResult, ToolResult};
+use crate::db::{ErrorKind, ImageData, ToolResult};
 use crate::llm::{ContentBlock, Usage};
-use crate::state_machine::state::ToolCall;
+use crate::state_machine::state::{SubAgentOutcome, ToolCall};
 
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
@@ -46,10 +46,18 @@ pub enum Event {
     },
 
     // Sub-agent events
-    #[allow(dead_code)] // Reserved for sub-agent feature
+    /// spawn_agents tool completed, sub-agents are now running
+    SpawnAgentsComplete {
+        tool_use_id: String,
+        /// Normal tool result for LLM context
+        result: ToolResult,
+        /// IDs of spawned sub-agent conversations
+        agent_ids: Vec<String>,
+    },
+    /// A sub-agent has completed (success or failure)
     SubAgentResult {
         agent_id: String,
-        result: SubAgentResult,
+        outcome: SubAgentOutcome,
     },
 }
 

@@ -464,11 +464,23 @@ fn parse_state(s: &str) -> ConversationState {
             ),
             remaining_tools: vec![],
             completed_results: vec![],
+            pending_sub_agents: vec![],
         },
         "cancelling" => ConversationState::CancellingLlm,  // Default to LLM cancel
         "awaiting_sub_agents" => ConversationState::AwaitingSubAgents {
             pending_ids: vec![],
             completed_results: vec![],
+        },
+        "cancelling_sub_agents" => ConversationState::CancellingSubAgents {
+            pending_ids: vec![],
+            completed_results: vec![],
+        },
+        "completed" => ConversationState::Completed {
+            result: String::new(),
+        },
+        "failed" => ConversationState::Failed {
+            error: String::new(),
+            error_kind: ErrorKind::Unknown,
         },
         "error" => ConversationState::Error {
             message: String::new(),

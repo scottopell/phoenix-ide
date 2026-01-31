@@ -373,10 +373,12 @@ fn db_state_to_conv_state(db_state: &crate::db::ConversationState) -> ConvState 
             current_tool,
             remaining_tools,
             completed_results,
+            pending_sub_agents,
         } => ConvState::ToolExecuting {
             current_tool: current_tool.clone(),
             remaining_tools: remaining_tools.clone(),
             completed_results: completed_results.clone(),
+            pending_sub_agents: pending_sub_agents.clone(),
         },
         crate::db::ConversationState::CancellingLlm => ConvState::CancellingLlm,
         crate::db::ConversationState::CancellingTool {
@@ -394,6 +396,20 @@ fn db_state_to_conv_state(db_state: &crate::db::ConversationState) -> ConvState 
         } => ConvState::AwaitingSubAgents {
             pending_ids: pending_ids.clone(),
             completed_results: completed_results.clone(),
+        },
+        crate::db::ConversationState::CancellingSubAgents {
+            pending_ids,
+            completed_results,
+        } => ConvState::CancellingSubAgents {
+            pending_ids: pending_ids.clone(),
+            completed_results: completed_results.clone(),
+        },
+        crate::db::ConversationState::Completed { result } => ConvState::Completed {
+            result: result.clone(),
+        },
+        crate::db::ConversationState::Failed { error, error_kind } => ConvState::Failed {
+            error: error.clone(),
+            error_kind: error_kind.clone(),
         },
         crate::db::ConversationState::Error {
             message,
@@ -1027,6 +1043,7 @@ mod tests {
                 ),
             ],
             completed_results: vec![],
+            pending_sub_agents: vec![],
         };
 
         // Phase 1: UserCancel -> CancellingTool with AbortTool

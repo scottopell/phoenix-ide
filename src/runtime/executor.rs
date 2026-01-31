@@ -372,12 +372,6 @@ where
                 Ok(None)
             }
 
-            Effect::SpawnSubAgent { .. } => {
-                // Sub-agent spawning is not implemented in MVP
-                tracing::warn!("Sub-agent spawning not implemented");
-                Ok(None)
-            }
-
             Effect::AbortTool { tool_use_id } => {
                 // Signal abort to running tool
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
@@ -395,6 +389,46 @@ where
                     token.cancel();
                 }
                 // The spawned task will send LlmAborted event when it sees cancellation
+                Ok(None)
+            }
+
+            Effect::SpawnSubAgent(spec) => {
+                // TODO: Implement sub-agent spawning
+                tracing::info!(agent_id = %spec.agent_id, task = %spec.task, "Spawning sub-agent");
+                // For now, just log - full implementation requires runtime manager
+                Ok(None)
+            }
+
+            Effect::CancelSubAgents { ids } => {
+                // TODO: Implement sub-agent cancellation
+                tracing::info!(?ids, "Cancelling sub-agents");
+                // For now, just log - full implementation requires runtime manager
+                Ok(None)
+            }
+
+            Effect::NotifyParent { outcome } => {
+                // TODO: Implement parent notification
+                tracing::info!(?outcome, "Notifying parent of sub-agent completion");
+                // For now, just log - full implementation requires parent event channel
+                Ok(None)
+            }
+
+            Effect::PersistSubAgentResults { results } => {
+                // Persist aggregated sub-agent results as a system message
+                let aggregated = serde_json::json!({
+                    "sub_agent_results": results
+                });
+                let content = crate::db::MessageContent::system(
+                    serde_json::to_string_pretty(&aggregated).unwrap_or_default()
+                );
+                self.storage
+                    .add_message(
+                        &self.context.conversation_id,
+                        &content,
+                        None,
+                        None,
+                    )
+                    .await?;
                 Ok(None)
             }
         }
@@ -473,10 +507,12 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
             current_tool,
             remaining_tools,
             completed_results,
+            pending_sub_agents,
         } => crate::db::ConversationState::ToolExecuting {
             current_tool: current_tool.clone(),
             remaining_tools: remaining_tools.clone(),
             completed_results: completed_results.clone(),
+            pending_sub_agents: pending_sub_agents.clone(),
         },
         ConvState::CancellingLlm => crate::db::ConversationState::CancellingLlm,
         ConvState::CancellingTool {
@@ -494,6 +530,20 @@ fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
         } => crate::db::ConversationState::AwaitingSubAgents {
             pending_ids: pending_ids.clone(),
             completed_results: completed_results.clone(),
+        },
+        ConvState::CancellingSubAgents {
+            pending_ids,
+            completed_results,
+        } => crate::db::ConversationState::CancellingSubAgents {
+            pending_ids: pending_ids.clone(),
+            completed_results: completed_results.clone(),
+        },
+        ConvState::Completed { result } => crate::db::ConversationState::Completed {
+            result: result.clone(),
+        },
+        ConvState::Failed { error, error_kind } => crate::db::ConversationState::Failed {
+            error: error.clone(),
+            error_kind: error_kind.clone(),
         },
         ConvState::Error {
             message,

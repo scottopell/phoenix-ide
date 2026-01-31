@@ -1,6 +1,7 @@
 //! Conversation state types
 
-use crate::db::{ErrorKind, SubAgentResult, ToolResult};
+use crate::db::{ErrorKind, ToolResult};
+use std::time::Duration;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,6 +48,32 @@ pub struct ReadImageInput {
     pub path: String,
 }
 
+/// Task specification for spawn_agents tool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubAgentTask {
+    pub task: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// Input for the spawn_agents tool (parent only)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnAgentsInput {
+    pub tasks: Vec<SubAgentTask>,
+}
+
+/// Input for the submit_result tool (sub-agent only)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitResultInput {
+    pub result: String,
+}
+
+/// Input for the submit_error tool (sub-agent only)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitErrorInput {
+    pub error: String,
+}
+
 /// Strongly typed tool input enum
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
@@ -56,6 +83,9 @@ pub enum ToolInput {
     Patch(PatchInput),
     KeywordSearch(KeywordSearchInput),
     ReadImage(ReadImageInput),
+    SpawnAgents(SpawnAgentsInput),
+    SubmitResult(SubmitResultInput),
+    SubmitError(SubmitErrorInput),
     /// Fallback for unknown tools or parsing failures
     Unknown {
         name: String,
@@ -72,8 +102,16 @@ impl ToolInput {
             ToolInput::Patch(_) => "patch",
             ToolInput::KeywordSearch(_) => "keyword_search",
             ToolInput::ReadImage(_) => "read_image",
+            ToolInput::SpawnAgents(_) => "spawn_agents",
+            ToolInput::SubmitResult(_) => "submit_result",
+            ToolInput::SubmitError(_) => "submit_error",
             ToolInput::Unknown { name, .. } => name,
         }
+    }
+
+    /// Check if this is a sub-agent terminal tool
+    pub fn is_terminal_tool(&self) -> bool {
+        matches!(self, ToolInput::SubmitResult(_) | ToolInput::SubmitError(_))
     }
 
     /// Convert to JSON Value for tool execution
@@ -84,6 +122,9 @@ impl ToolInput {
             ToolInput::Patch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::KeywordSearch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::ReadImage(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } => input.clone(),
         }
     }
@@ -125,6 +166,27 @@ impl ToolInput {
                     input: value,
                 },
                 ToolInput::ReadImage,
+            ),
+            "spawn_agents" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::SpawnAgents,
+            ),
+            "submit_result" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::SubmitResult,
+            ),
+            "submit_error" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::SubmitError,
             ),
             _ => ToolInput::Unknown {
                 name: name.to_string(),
@@ -187,6 +249,9 @@ pub enum ConvState {
         /// Results from completed tools
         #[serde(default)]
         completed_results: Vec<ToolResult>,
+        /// Sub-agents spawned during this tool execution phase
+        #[serde(default)]
+        pending_sub_agents: Vec<String>,
     },
 
     /// User requested cancellation of LLM request, waiting for response to discard
@@ -209,6 +274,22 @@ pub enum ConvState {
         completed_results: Vec<SubAgentResult>,
     },
 
+    /// User requested cancellation while waiting for sub-agents
+    CancellingSubAgents {
+        pending_ids: Vec<String>,
+        #[serde(default)]
+        completed_results: Vec<SubAgentResult>,
+    },
+
+    /// Sub-agent completed successfully (terminal state, sub-agent only)
+    Completed { result: String },
+
+    /// Sub-agent failed (terminal state, sub-agent only)
+    Failed {
+        error: String,
+        error_kind: ErrorKind,
+    },
+
     /// Error occurred - UI displays this state directly
     Error {
         message: String,
@@ -217,10 +298,9 @@ pub enum ConvState {
 }
 
 impl ConvState {
-    /// Check if this is a terminal state (conversation should stop processing)
-    #[allow(dead_code, clippy::unused_self)] // State query utility
+    /// Check if this is a terminal state (sub-agent only - cannot transition out)
     pub fn is_terminal(&self) -> bool {
-        false // Conversations can always be continued from any state
+        matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
     }
 
     /// Check if agent is currently working
@@ -239,9 +319,41 @@ impl ConvState {
             ConvState::CancellingLlm => "cancelling",
             ConvState::CancellingTool { .. } => "cancelling",
             ConvState::AwaitingSubAgents { .. } => "awaiting_sub_agents",
+            ConvState::CancellingSubAgents { .. } => "cancelling_sub_agents",
+            ConvState::Completed { .. } => "completed",
+            ConvState::Failed { .. } => "failed",
             ConvState::Error { .. } => "error",
         }
     }
+}
+
+// ============================================================================
+// Sub-Agent Types
+// ============================================================================
+
+/// Outcome of a sub-agent execution - pit of success design
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SubAgentOutcome {
+    Success { result: String },
+    Failure { error: String, error_kind: ErrorKind },
+}
+
+/// Result from a completed sub-agent
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubAgentResult {
+    pub agent_id: String,
+    pub task: String,
+    pub outcome: SubAgentOutcome,
+}
+
+/// Specification for spawning a sub-agent (used in effects)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubAgentSpec {
+    pub agent_id: String,
+    pub task: String,
+    pub cwd: String,
+    pub timeout: Option<Duration>,
 }
 
 /// Context for a conversation (immutable configuration)

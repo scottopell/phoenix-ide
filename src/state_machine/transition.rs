@@ -8,6 +8,7 @@
 //! REQ-BED-006: Error Recovery
 
 use super::{ConvContext, ConvState, Effect, Event};
+use super::state::SubAgentResult;
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -125,6 +126,7 @@ pub fn transition(
                     current_tool: first.clone(),
                     remaining_tools: rest,
                     completed_results: vec![],
+                    pending_sub_agents: vec![],
                 })
                 .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                 .with_effect(Effect::PersistState)
@@ -217,6 +219,7 @@ pub fn transition(
                 current_tool,
                 remaining_tools,
                 completed_results,
+                pending_sub_agents,
             },
             Event::ToolComplete {
                 tool_use_id,
@@ -233,6 +236,7 @@ pub fn transition(
                 current_tool: next_tool.clone(),
                 remaining_tools: new_remaining,
                 completed_results: new_results,
+                pending_sub_agents: pending_sub_agents.clone(),
             })
             .with_effect(Effect::persist_tool_message(
                 &result.tool_use_id,
@@ -244,21 +248,19 @@ pub fn transition(
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
-        // ToolExecuting + ToolComplete (last tool) -> LlmRequesting
+        // ToolExecuting + ToolComplete (last tool, no sub-agents) -> LlmRequesting
         (
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                completed_results,
+                pending_sub_agents,
+                ..
             },
             Event::ToolComplete {
                 tool_use_id,
                 result,
             },
-        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
-            let mut new_results = completed_results.clone();
-            new_results.push(result.clone());
-
+        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && pending_sub_agents.is_empty() => {
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::persist_tool_message(
@@ -269,6 +271,105 @@ pub fn transition(
                     ))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::RequestLlm),
+            )
+        }
+
+        // ToolExecuting + ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
+        (
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                pending_sub_agents,
+                ..
+            },
+            Event::ToolComplete {
+                tool_use_id,
+                result,
+            },
+        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && !pending_sub_agents.is_empty() => {
+            Ok(
+                TransitionResult::new(ConvState::AwaitingSubAgents {
+                    pending_ids: pending_sub_agents.clone(),
+                    completed_results: vec![],
+                })
+                    .with_effect(Effect::persist_tool_message(
+                        &result.tool_use_id,
+                        &result.output,
+                        result.is_error,
+                        result.display_data(),
+                    ))
+                    .with_effect(Effect::PersistState),
+            )
+        }
+
+        // ToolExecuting + SpawnAgentsComplete (more tools) -> ToolExecuting (accumulate agents)
+        (
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+            },
+            Event::SpawnAgentsComplete {
+                tool_use_id,
+                result,
+                agent_ids,
+            },
+        ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
+            let mut new_results = completed_results.clone();
+            new_results.push(result.clone());
+
+            let mut new_pending = pending_sub_agents.clone();
+            new_pending.extend(agent_ids);
+
+            let next_tool = remaining_tools[0].clone();
+            let new_remaining = remaining_tools[1..].to_vec();
+
+            Ok(TransitionResult::new(ConvState::ToolExecuting {
+                current_tool: next_tool.clone(),
+                remaining_tools: new_remaining,
+                completed_results: new_results,
+                pending_sub_agents: new_pending,
+            })
+            .with_effect(Effect::persist_tool_message(
+                &result.tool_use_id,
+                &result.output,
+                result.is_error,
+                result.display_data(),
+            ))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::execute_tool(next_tool)))
+        }
+
+        // ToolExecuting + SpawnAgentsComplete (last tool) -> AwaitingSubAgents
+        (
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                pending_sub_agents,
+                ..
+            },
+            Event::SpawnAgentsComplete {
+                tool_use_id,
+                result,
+                agent_ids,
+            },
+        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
+            let mut all_pending = pending_sub_agents.clone();
+            all_pending.extend(agent_ids);
+
+            Ok(
+                TransitionResult::new(ConvState::AwaitingSubAgents {
+                    pending_ids: all_pending,
+                    completed_results: vec![],
+                })
+                    .with_effect(Effect::persist_tool_message(
+                        &result.tool_use_id,
+                        &result.output,
+                        result.is_error,
+                        result.display_data(),
+                    ))
+                    .with_effect(Effect::PersistState),
             )
         }
 
@@ -290,11 +391,27 @@ pub fn transition(
                 .with_effect(Effect::notify_agent_done()))
         }
 
-        // AwaitingLlm/AwaitingSubAgents + UserCancel -> Idle
-        (ConvState::AwaitingLlm | ConvState::AwaitingSubAgents { .. }, Event::UserCancel) => {
+        // AwaitingLlm + UserCancel -> Idle
+        (ConvState::AwaitingLlm, Event::UserCancel) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
+        }
+
+        // AwaitingSubAgents + UserCancel -> CancellingSubAgents
+        (
+            ConvState::AwaitingSubAgents {
+                pending_ids,
+                completed_results,
+            },
+            Event::UserCancel,
+        ) => {
+            Ok(TransitionResult::new(ConvState::CancellingSubAgents {
+                pending_ids: pending_ids.clone(),
+                completed_results: completed_results.clone(),
+            })
+            .with_effect(Effect::CancelSubAgents { ids: pending_ids.clone() })
+            .with_effect(Effect::PersistState))
         }
 
         // ToolExecuting + UserCancel -> CancellingTool (request abort)
@@ -303,10 +420,11 @@ pub fn transition(
                 current_tool,
                 remaining_tools,
                 completed_results,
+                pending_sub_agents,
             },
             Event::UserCancel,
         ) => {
-            Ok(TransitionResult::new(ConvState::CancellingTool {
+            let mut result = TransitionResult::new(ConvState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
                 skipped_tools: remaining_tools.clone(),
                 completed_results: completed_results.clone(),
@@ -314,7 +432,14 @@ pub fn transition(
             .with_effect(Effect::AbortTool {
                 tool_use_id: current_tool.id.clone(),
             })
-            .with_effect(Effect::PersistState))
+            .with_effect(Effect::PersistState);
+
+            // Also cancel any already-spawned sub-agents
+            if !pending_sub_agents.is_empty() {
+                result = result.with_effect(Effect::CancelSubAgents { ids: pending_sub_agents.clone() });
+            }
+
+            Ok(result)
         }
 
         // CancellingTool + ToolAborted -> Idle with synthetic results
@@ -384,7 +509,7 @@ pub fn transition(
                 pending_ids,
                 completed_results,
             },
-            Event::SubAgentResult { agent_id, result },
+            Event::SubAgentResult { agent_id, outcome },
         ) if pending_ids.contains(&agent_id) && pending_ids.len() > 1 => {
             let new_pending: Vec<_> = pending_ids
                 .iter()
@@ -392,7 +517,11 @@ pub fn transition(
                 .cloned()
                 .collect();
             let mut new_results = completed_results.clone();
-            new_results.push(result);
+            new_results.push(SubAgentResult {
+                agent_id,
+                task: String::new(), // Task is stored elsewhere
+                outcome,
+            });
 
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending_ids: new_pending,
@@ -401,35 +530,67 @@ pub fn transition(
             .with_effect(Effect::PersistState))
         }
 
-        // AwaitingSubAgents + SubAgentResult (last one) -> AwaitingLlm
+        // AwaitingSubAgents + SubAgentResult (last one) -> LlmRequesting
         (
             ConvState::AwaitingSubAgents {
                 pending_ids,
                 completed_results,
             },
-            Event::SubAgentResult { agent_id, result },
+            Event::SubAgentResult { agent_id, outcome },
         ) if pending_ids.contains(&agent_id) && pending_ids.len() == 1 => {
             let mut new_results = completed_results.clone();
-            new_results.push(result);
-
-            // Aggregate results into a message for the LLM
-            // Note: Sub-agent results are stored as a system message for now
-            // This will need refinement when sub-agents are implemented
-            let aggregated_json = aggregate_sub_agent_results(&new_results);
-            let aggregated_text = serde_json::to_string_pretty(&aggregated_json)
-                .unwrap_or_else(|_| "Failed to serialize sub-agent results".to_string());
+            new_results.push(SubAgentResult {
+                agent_id,
+                task: String::new(),
+                outcome,
+            });
 
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_tool_message(
-                        "sub-agents",
-                        aggregated_text,
-                        false,
-                        None,
-                    ))
+                    .with_effect(Effect::PersistSubAgentResults { results: new_results })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::RequestLlm),
             )
+        }
+
+        // CancellingSubAgents + SubAgentResult (more pending) -> CancellingSubAgents
+        (
+            ConvState::CancellingSubAgents {
+                pending_ids,
+                completed_results,
+            },
+            Event::SubAgentResult { agent_id, outcome },
+        ) if pending_ids.contains(&agent_id) && pending_ids.len() > 1 => {
+            let new_pending: Vec<_> = pending_ids
+                .iter()
+                .filter(|id| *id != &agent_id)
+                .cloned()
+                .collect();
+            let mut new_results = completed_results.clone();
+            new_results.push(SubAgentResult {
+                agent_id,
+                task: String::new(),
+                outcome,
+            });
+
+            Ok(TransitionResult::new(ConvState::CancellingSubAgents {
+                pending_ids: new_pending,
+                completed_results: new_results,
+            })
+            .with_effect(Effect::PersistState))
+        }
+
+        // CancellingSubAgents + SubAgentResult (last one) -> Idle
+        (
+            ConvState::CancellingSubAgents {
+                pending_ids,
+                ..
+            },
+            Event::SubAgentResult { agent_id, .. },
+        ) if pending_ids.contains(&agent_id) && pending_ids.len() == 1 => {
+            Ok(TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()))
         }
 
         // ============================================================
@@ -482,22 +643,7 @@ impl ErrorKind {
     }
 }
 
-fn aggregate_sub_agent_results(results: &[crate::db::SubAgentResult]) -> Value {
-    let summaries: Vec<Value> = results
-        .iter()
-        .map(|r| {
-            json!({
-                "agent_id": r.agent_id,
-                "success": r.success,
-                "result": r.result
-            })
-        })
-        .collect();
 
-    json!({
-        "sub_agent_results": summaries
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -592,6 +738,7 @@ mod tests {
                     ),
                 ],
                 completed_results: vec![],
+                pending_sub_agents: vec![],
             },
             &test_context(),
             Event::UserCancel,
