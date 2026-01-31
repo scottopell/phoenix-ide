@@ -4,12 +4,14 @@ mod bash;
 mod keyword_search;
 pub mod patch;
 mod read_image;
+mod subagent;
 mod think;
 
 pub use bash::BashTool;
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
 pub use read_image::ReadImageTool;
+pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use think::ThinkTool;
 
 use async_trait::async_trait;
@@ -78,28 +80,39 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Create standard tool registry for a conversation
+    /// Create standard tool registry for a conversation (parent)
     pub fn new(working_dir: PathBuf, llm_registry: Arc<ModelRegistry>) -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
+        Self::new_with_options(working_dir, llm_registry, false)
+    }
+
+    /// Create tool registry for sub-agents (different tool set)
+    pub fn new_for_subagent(working_dir: PathBuf, llm_registry: Arc<ModelRegistry>) -> Self {
+        Self::new_with_options(working_dir, llm_registry, true)
+    }
+
+    /// Create tool registry with options
+    fn new_with_options(
+        working_dir: PathBuf,
+        llm_registry: Arc<ModelRegistry>,
+        is_sub_agent: bool,
+    ) -> Self {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ThinkTool),
             Arc::new(BashTool::new(working_dir.clone())),
             Arc::new(PatchTool::new(working_dir.clone())),
             Arc::new(KeywordSearchTool::new(working_dir.clone(), llm_registry)),
             Arc::new(ReadImageTool::new(working_dir)),
         ];
-        Self { tools }
-    }
 
-    /// Create tool registry for sub-agents (limited tools)
-    #[allow(dead_code)] // Reserved for sub-agent feature
-    pub fn new_for_subagent(working_dir: PathBuf, llm_registry: Arc<ModelRegistry>) -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ThinkTool),
-            Arc::new(BashTool::new(working_dir.clone())),
-            Arc::new(PatchTool::new(working_dir.clone())),
-            Arc::new(KeywordSearchTool::new(working_dir, llm_registry)),
-            // Note: sub-agents would get submit_result tool here
-        ];
+        if is_sub_agent {
+            // Sub-agents get completion tools, no spawning
+            tools.push(Arc::new(SubmitResultTool));
+            tools.push(Arc::new(SubmitErrorTool));
+        } else {
+            // Parent conversations can spawn sub-agents
+            tools.push(Arc::new(SpawnAgentsTool));
+        }
+
         Self { tools }
     }
 
