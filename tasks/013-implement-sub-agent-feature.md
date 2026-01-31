@@ -1,7 +1,7 @@
 ---
 created: 2025-01-29
 priority: p2
-status: ready
+status: in-progress
 ---
 
 # Implement sub-agent spawning (REQ-BED-008, REQ-BED-009)
@@ -55,11 +55,11 @@ See `specs/subagents/design.md` for full design document.
 
 ## Acceptance Criteria
 
-- [ ] State machine: new states, events, transitions
-- [ ] Property tests for all invariants
-- [ ] `spawn_agents` tool (parent only)
-- [ ] `submit_result` / `submit_error` tools (sub-agent only)
-- [ ] Tool filtering by ConvContext.is_sub_agent
+- [x] State machine: new states, events, transitions
+- [x] Property tests for all invariants
+- [x] `spawn_agents` tool (parent only)
+- [x] `submit_result` / `submit_error` tools (sub-agent only)
+- [x] Tool filtering by ConvContext.is_sub_agent
 - [ ] Effect handlers: SpawnSubAgent, CancelSubAgents, NotifyParent
 - [ ] Timeout support
 - [ ] Integration tests
