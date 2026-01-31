@@ -308,7 +308,7 @@ fn test_subagent_tools_exclude_spawn_agents() {
 ```json
 {
   "name": "spawn_agents",
-  "description": "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Use for parallelizable work like implementing multiple features, running independent analyses, or processing multiple files.",
+  "description": "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.",
   "input_schema": {
     "type": "object",
     "required": ["tasks"],
@@ -529,8 +529,8 @@ This triggers the normal flow: `Idle → LlmRequesting → ...`
 
 The sub-agent's LLM sees:
 ```
-[User]: Implement feature X with full test coverage
-[Assistant]: I'll start by examining the codebase...
+[User]: Review the error handling in src/api/ and identify potential issues
+[Assistant]: I'll examine the error handling patterns...
 ```
 
 ## Aggregated Results Format
@@ -542,25 +542,113 @@ When all sub-agents complete, parent's LLM receives:
   "sub_agent_results": [
     {
       "agent_id": "uuid-1",
-      "task": "Implement feature X",
+      "task": "Review error handling from a security perspective",
       "outcome": {
         "success": {
-          "result": "Implemented feature X in src/feature.rs with 15 tests..."
+          "result": "Found 3 issues: 1) Auth errors leak internal details in src/api/handlers.rs:45, 2) ..."
         }
       }
     },
     {
       "agent_id": "uuid-2", 
-      "task": "Write documentation",
+      "task": "Review error handling from a performance perspective",
       "outcome": {
         "failure": {
-          "error": "Could not find API to document",
+          "error": "Codebase too large to analyze within time limit",
           "error_kind": "sub_agent_error"
         }
       }
     }
   ]
 }
+```
+
+## Example Use Cases
+
+### Multi-Perspective Code Review
+
+```
+User: Review the authentication module for potential issues
+
+Agent calls spawn_agents with:
+{
+  "tasks": [
+    { "task": "Review src/auth/ from a security perspective. Look for vulnerabilities, credential handling issues, and attack vectors." },
+    { "task": "Review src/auth/ from a maintainability perspective. Assess code clarity, test coverage, and documentation." },
+    { "task": "Review src/auth/ from a performance perspective. Identify bottlenecks, unnecessary allocations, or N+1 patterns." }
+  ]
+}
+
+Three sub-agents analyze the same code with different lenses,
+parent aggregates findings into comprehensive review.
+```
+
+### Codebase Exploration
+
+```
+User: I'm new to this project. Help me understand the architecture.
+
+Agent calls spawn_agents with:
+{
+  "tasks": [
+    { "task": "Explore the database layer. Document the schema, key queries, and data access patterns." },
+    { "task": "Explore the API layer. Document the endpoints, request/response formats, and middleware." },
+    { "task": "Explore the core business logic. Document the main abstractions and how they interact." }
+  ]
+}
+
+Sub-agents explore different areas in parallel,
+parent synthesizes into architectural overview.
+```
+
+### Focused Deep-Dive (Single Sub-Agent)
+
+```
+User: How does error handling work in this codebase?
+
+Agent calls spawn_agents with:
+{
+  "tasks": [
+    { "task": "Thoroughly investigate error handling patterns in this codebase. Trace how errors propagate from tools through the state machine to the API. Document the error types, conversion points, and user-facing messages." }
+  ]
+}
+
+Single sub-agent does focused research without polluting
+parent's context with exploration details.
+```
+
+### Comparative Analysis
+
+```
+User: Should we use approach A or B for the new feature?
+
+Agent calls spawn_agents with:
+{
+  "tasks": [
+    { "task": "Analyze approach A: [description]. Evaluate pros, cons, implementation complexity, and how it fits with existing patterns in this codebase." },
+    { "task": "Analyze approach B: [description]. Evaluate pros, cons, implementation complexity, and how it fits with existing patterns in this codebase." }
+  ]
+}
+
+Sub-agents research independently without biasing each other,
+parent makes informed recommendation based on both analyses.
+```
+
+### Persona-Based Review
+
+```
+User: Get feedback on this API design from different stakeholders
+
+Agent calls spawn_agents with:
+{
+  "tasks": [
+    { "task": "Review the API design as a frontend developer. Is it easy to consume? Are the response shapes convenient? Is error handling clear?" },
+    { "task": "Review the API design as a DevOps engineer. Is it easy to monitor? Are there health checks? How's the logging?" },
+    { "task": "Review the API design as a new team member. Is it well documented? Are the conventions consistent? Can you understand it without tribal knowledge?" }
+  ]
+}
+
+Different perspectives surface different issues.
 ```
 
 ## Implementation Order
