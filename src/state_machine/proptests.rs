@@ -1191,3 +1191,304 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
         .iter()
         .any(|e| matches!(e, Effect::RequestLlm)));
 }
+
+// ============================================================================
+// Sub-Agent Property Tests
+// ============================================================================
+
+use super::state::SubAgentOutcome;
+
+/// Generator for sub-agent outcome
+fn arb_sub_agent_outcome() -> impl Strategy<Value = SubAgentOutcome> {
+    prop_oneof![
+        "[a-zA-Z ]{1,50}".prop_map(|result| SubAgentOutcome::Success { result }),
+        ("[a-zA-Z ]{1,30}", arb_error_kind()).prop_map(|(error, error_kind)| {
+            SubAgentOutcome::Failure { error, error_kind }
+        }),
+    ]
+}
+
+/// Fan-in conservation: pending + completed = constant
+proptest! {
+    #[test]
+    fn prop_subagent_count_conserved(
+        initial_ids in proptest::collection::vec("[a-z]{8}", 1..5),
+    ) {
+    let n = initial_ids.len();
+    let mut state = ConvState::AwaitingSubAgents {
+        pending_ids: initial_ids.clone(),
+        completed_results: vec![],
+    };
+
+    for agent_id in initial_ids {
+        let event = Event::SubAgentResult {
+            agent_id: agent_id.clone(),
+            outcome: SubAgentOutcome::Success {
+                result: "done".to_string(),
+            },
+        };
+
+        let result = transition(&state, &test_context(), event);
+        prop_assert!(result.is_ok());
+        state = result.unwrap().new_state;
+
+        // Check conservation at each step
+        match &state {
+            ConvState::AwaitingSubAgents {
+                pending_ids,
+                completed_results,
+            } => {
+                prop_assert_eq!(pending_ids.len() + completed_results.len(), n);
+            }
+            ConvState::LlmRequesting { .. } => {
+                // Terminal - all collected
+            }
+            other => {
+                let msg = format!("Unexpected state: {other:?}");
+                prop_assert!(false, "{}", msg);
+            }
+        }
+    }
+    }
+}
+
+/// Pending IDs decrease monotonically
+proptest! {
+    #[test]
+    fn prop_pending_decreases_monotonically(
+        initial_ids in proptest::collection::vec("[a-z]{8}", 2..5),
+    ) {
+    let mut state = ConvState::AwaitingSubAgents {
+        pending_ids: initial_ids.clone(),
+        completed_results: vec![],
+    };
+    let mut prev_pending = initial_ids.len();
+
+    for agent_id in initial_ids {
+        let event = Event::SubAgentResult {
+            agent_id,
+            outcome: SubAgentOutcome::Success {
+                result: "done".to_string(),
+            },
+        };
+
+        state = transition(&state, &test_context(), event).unwrap().new_state;
+
+        if let ConvState::AwaitingSubAgents { pending_ids, .. } = &state {
+            prop_assert!(pending_ids.len() < prev_pending);
+            prev_pending = pending_ids.len();
+        }
+    }
+    }
+}
+
+/// Unknown agent_id is rejected
+proptest! {
+    #[test]
+    fn prop_unknown_agent_rejected(
+        pending_ids in proptest::collection::vec("[a-z]{8}", 1..3),
+        unknown_id in "[A-Z]{8}", // Different pattern to ensure no overlap
+    ) {
+    let state = ConvState::AwaitingSubAgents {
+        pending_ids,
+        completed_results: vec![],
+    };
+
+    let event = Event::SubAgentResult {
+        agent_id: unknown_id,
+        outcome: SubAgentOutcome::Success {
+            result: "done".to_string(),
+        },
+    };
+
+    let result = transition(&state, &test_context(), event);
+    prop_assert!(result.is_err());
+    }
+}
+
+/// Last completion exits AwaitingSubAgents
+proptest! {
+    #[test]
+    fn prop_last_completion_exits_awaiting(
+        agent_ids in proptest::collection::vec("[a-z]{8}", 1..4),
+        outcome in arb_sub_agent_outcome(),
+    ) {
+    let mut state = ConvState::AwaitingSubAgents {
+        pending_ids: agent_ids.clone(),
+        completed_results: vec![],
+    };
+
+    for (i, agent_id) in agent_ids.iter().enumerate() {
+        let event = Event::SubAgentResult {
+            agent_id: agent_id.clone(),
+            outcome: outcome.clone(),
+        };
+
+        let result = transition(&state, &test_context(), event).unwrap();
+
+        if i < agent_ids.len() - 1 {
+            let is_awaiting = matches!(result.new_state, ConvState::AwaitingSubAgents { .. });
+            prop_assert!(is_awaiting);
+        } else {
+            // Last one should exit to LlmRequesting
+            let is_llm_requesting = matches!(result.new_state, ConvState::LlmRequesting { .. });
+            prop_assert!(is_llm_requesting);
+        }
+        state = result.new_state;
+    }
+    }
+}
+
+/// AwaitingSubAgents + UserCancel -> CancellingSubAgents
+proptest! {
+    #[test]
+    fn prop_awaiting_cancel_goes_to_cancelling(
+        pending_ids in proptest::collection::vec("[a-z]{8}", 1..4),
+    ) {
+    let state = ConvState::AwaitingSubAgents {
+        pending_ids: pending_ids.clone(),
+        completed_results: vec![],
+    };
+
+    let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
+
+    match result.new_state {
+        ConvState::CancellingSubAgents {
+            pending_ids: new_pending,
+            ..
+        } => {
+            prop_assert_eq!(new_pending, pending_ids);
+        }
+        _ => prop_assert!(false, "Expected CancellingSubAgents"),
+    }
+
+    // Should have CancelSubAgents effect
+    let has_cancel_effect = result
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::CancelSubAgents { .. }));
+    prop_assert!(has_cancel_effect);
+    }
+}
+
+/// CancellingSubAgents collects results until all done
+proptest! {
+    #[test]
+    fn prop_cancelling_collects_until_done(
+        initial_ids in proptest::collection::vec("[a-z]{8}", 2..4),
+    ) {
+    let mut state = ConvState::CancellingSubAgents {
+        pending_ids: initial_ids.clone(),
+        completed_results: vec![],
+    };
+
+    for (i, agent_id) in initial_ids.iter().enumerate() {
+        let event = Event::SubAgentResult {
+            agent_id: agent_id.clone(),
+            outcome: SubAgentOutcome::Failure {
+                error: "Cancelled".to_string(),
+                error_kind: ErrorKind::Cancelled,
+            },
+        };
+
+        let result = transition(&state, &test_context(), event).unwrap();
+
+        if i < initial_ids.len() - 1 {
+            let is_cancelling = matches!(result.new_state, ConvState::CancellingSubAgents { .. });
+            prop_assert!(is_cancelling);
+        } else {
+            // Last one goes to Idle
+            let is_idle = matches!(result.new_state, ConvState::Idle);
+            prop_assert!(is_idle);
+        }
+        state = result.new_state;
+    }
+    }
+}
+
+/// ToolExecuting with pending_sub_agents goes to AwaitingSubAgents on last tool
+#[test]
+fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
+    let state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            "t1",
+            ToolInput::Bash(BashInput {
+                command: "echo".to_string(),
+                mode: BashMode::Default,
+            }),
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec!["agent-1".to_string(), "agent-2".to_string()],
+    };
+
+    let event = Event::ToolComplete {
+        tool_use_id: "t1".to_string(),
+        result: ToolResult {
+            tool_use_id: "t1".to_string(),
+            success: true,
+            output: "done".to_string(),
+            is_error: false,
+        },
+    };
+
+    let result = transition(&state, &test_context(), event).unwrap();
+
+    match result.new_state {
+        ConvState::AwaitingSubAgents { pending_ids, .. } => {
+            assert_eq!(pending_ids, vec!["agent-1", "agent-2"]);
+        }
+        _ => panic!("Expected AwaitingSubAgents, got {:?}", result.new_state),
+    }
+}
+
+/// SpawnAgentsComplete accumulates agent IDs
+#[test]
+fn test_spawn_agents_complete_accumulates_ids() {
+    let state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            "spawn-1",
+            ToolInput::Unknown {
+                name: "spawn_agents".to_string(),
+                input: serde_json::json!({}),
+            },
+        ),
+        remaining_tools: vec![ToolCall::new(
+            "t2",
+            ToolInput::Bash(BashInput {
+                command: "echo".to_string(),
+                mode: BashMode::Default,
+            }),
+        )],
+        completed_results: vec![],
+        pending_sub_agents: vec!["existing-agent".to_string()],
+    };
+
+    let event = Event::SpawnAgentsComplete {
+        tool_use_id: "spawn-1".to_string(),
+        result: ToolResult {
+            tool_use_id: "spawn-1".to_string(),
+            success: true,
+            output: "Spawned 2 agents".to_string(),
+            is_error: false,
+        },
+        agent_ids: vec!["new-agent-1".to_string(), "new-agent-2".to_string()],
+    };
+
+    let result = transition(&state, &test_context(), event).unwrap();
+
+    match result.new_state {
+        ConvState::ToolExecuting {
+            pending_sub_agents,
+            current_tool,
+            ..
+        } => {
+            assert_eq!(current_tool.id, "t2");
+            assert_eq!(
+                pending_sub_agents,
+                vec!["existing-agent", "new-agent-1", "new-agent-2"]
+            );
+        }
+        _ => panic!("Expected ToolExecuting, got {:?}", result.new_state),
+    }
+}
