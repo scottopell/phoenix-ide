@@ -315,11 +315,11 @@ html, body {
   border-radius: 4px;
 }
 
-/* Tool Blocks */
-.tool-block {
-  margin: 8px 0;
+/* Tool Groups - visually pairs tool call with result */
+.tool-group {
+  margin: 12px 0;
   border: 1px solid var(--border-color);
-  border-radius: 6px;
+  border-radius: 8px;
   overflow: hidden;
 }
 
@@ -327,7 +327,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
+  padding: 10px 12px;
   background: var(--bg-tertiary);
   cursor: pointer;
   font-size: 13px;
@@ -339,7 +339,7 @@ html, body {
 
 .tool-name {
   color: var(--accent-purple);
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .tool-chevron {
@@ -348,32 +348,73 @@ html, body {
   transition: transform 0.15s;
 }
 
-.tool-block.expanded .tool-chevron {
+.tool-group.expanded .tool-chevron {
   transform: rotate(90deg);
 }
 
-.tool-content {
+.tool-body {
   display: none;
-  padding: 12px;
-  background: var(--bg-primary);
-  font-family: monospace;
-  font-size: 13px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 300px;
-  overflow-y: auto;
 }
 
-.tool-block.expanded .tool-content {
+.tool-group.expanded .tool-body {
   display: block;
 }
 
-.tool-result {
+.tool-input {
+  padding: 12px;
+  background: var(--bg-primary);
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.tool-result-section {
+  padding: 10px 12px;
+  background: var(--bg-secondary);
   border-left: 3px solid var(--accent-green);
 }
 
-.tool-result.error {
+.tool-result-section.error {
   border-left-color: var(--accent-red);
+}
+
+.tool-result-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent-green);
+  margin-bottom: 6px;
+}
+
+.tool-result-section.error .tool-result-label {
+  color: var(--accent-red);
+}
+
+.tool-truncated {
+  color: var(--text-muted);
+  font-weight: normal;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.tool-result-content {
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+  color: var(--text-secondary);
+}
+
+.tool-empty {
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 /* Input Area */

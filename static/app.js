@@ -250,24 +250,35 @@
       return;
     }
 
-    els.messages.innerHTML = messages.map(renderMessage).join('');
+    // Build a map of tool_use_id -> tool result for pairing
+    const toolResults = new Map();
+    for (const msg of messages) {
+      const type = msg.message_type || msg.type;
+      if (type === 'tool') {
+        const toolUseId = msg.content?.tool_use_id;
+        if (toolUseId) {
+          toolResults.set(toolUseId, msg);
+        }
+      }
+    }
+
+    // Render messages, skipping standalone tool results (they'll be inlined)
+    const html = messages.map(msg => {
+      const type = msg.message_type || msg.type;
+      if (type === 'user') {
+        return renderUserMessage(msg);
+      } else if (type === 'agent') {
+        return renderAgentMessage(msg, toolResults);
+      }
+      // Skip tool messages - they're rendered inline with their tool_use
+      return '';
+    }).join('');
+
+    els.messages.innerHTML = html;
     
     // Scroll to bottom
     const main = $('#main-area');
     main.scrollTop = main.scrollHeight;
-  }
-
-  function renderMessage(msg) {
-    const type = msg.message_type || msg.type;
-    
-    if (type === 'user') {
-      return renderUserMessage(msg);
-    } else if (type === 'agent') {
-      return renderAgentMessage(msg);
-    } else if (type === 'tool') {
-      return renderToolResult(msg);
-    }
-    return '';
   }
 
   function renderUserMessage(msg) {
@@ -288,7 +299,7 @@
     `;
   }
 
-  function renderAgentMessage(msg) {
+  function renderAgentMessage(msg, toolResults) {
     const content = msg.content;
     const blocks = Array.isArray(content) ? content : [];
     
@@ -298,7 +309,7 @@
       if (block.type === 'text') {
         html += renderMarkdown(block.text);
       } else if (block.type === 'tool_use') {
-        html += renderToolUse(block);
+        html += renderToolUse(block, toolResults);
       }
     }
 
@@ -306,9 +317,10 @@
     return html;
   }
 
-  function renderToolUse(block) {
+  function renderToolUse(block, toolResults) {
     const name = block.name;
     const input = block.input;
+    const toolId = block.id;
     let inputStr;
     
     // Special handling for common tools
@@ -320,37 +332,39 @@
       inputStr = JSON.stringify(input, null, 2);
     }
 
+    // Get the paired result if available
+    const resultMsg = toolResults?.get(toolId);
+    let resultHtml = '';
+    
+    if (resultMsg) {
+      const resultContent = resultMsg.content;
+      const result = resultContent.content || resultContent.result || resultContent.error || '';
+      const isError = resultContent.is_error || !!resultContent.error;
+      
+      // Truncate long results
+      const maxLen = 500;
+      const truncated = result.length > maxLen;
+      const displayResult = truncated ? result.slice(0, maxLen) + '...' : result;
+      const truncatedLabel = truncated ? ' <span class="tool-truncated">(truncated)</span>' : '';
+      
+      resultHtml = `
+        <div class="tool-result-section ${isError ? 'error' : ''}">
+          <div class="tool-result-label">${isError ? '✗ error' : '✓ result'}${truncatedLabel}</div>
+          <div class="tool-result-content">${escapeHtml(displayResult) || '<span class="tool-empty">(empty)</span>'}</div>
+        </div>
+      `;
+    }
+
     return `
-      <div class="tool-block" data-tool-id="${escapeHtml(block.id)}">
+      <div class="tool-group" data-tool-id="${escapeHtml(toolId)}">
         <div class="tool-header" onclick="toggleToolBlock(this)">
           <span class="tool-name">${escapeHtml(name)}</span>
           <span class="tool-chevron">▶</span>
         </div>
-        <div class="tool-content">${escapeHtml(inputStr)}</div>
-      </div>
-    `;
-  }
-
-  function renderToolResult(msg) {
-    const content = msg.content;
-    // Backend uses 'content' field, not 'result'
-    const result = content.content || content.result || content.error || '';
-    const isError = content.is_error || !!content.error;
-    const toolUseId = content.tool_use_id;
-    
-    // Truncate long results
-    const maxLen = 500;
-    const truncated = result.length > maxLen;
-    const displayResult = truncated ? result.slice(0, maxLen) + '...' : result;
-
-    return `
-      <div class="tool-block tool-result ${isError ? 'error' : ''}" data-tool-use-id="${escapeHtml(toolUseId)}">
-        <div class="tool-header" onclick="toggleToolBlock(this)">
-          <span class="tool-name">result${isError ? ' (error)' : ''}</span>
-          ${truncated ? '<span style="color: var(--text-muted); font-size: 11px; margin-left: 8px;">(truncated)</span>' : ''}
-          <span class="tool-chevron">▶</span>
+        <div class="tool-body">
+          <div class="tool-input">${escapeHtml(inputStr)}</div>
+          ${resultHtml}
         </div>
-        <div class="tool-content">${escapeHtml(displayResult)}</div>
       </div>
     `;
   }
@@ -615,8 +629,8 @@
   // ==========================================================================
 
   window.toggleToolBlock = function(headerEl) {
-    const block = headerEl.parentElement;
-    block.classList.toggle('expanded');
+    const group = headerEl.parentElement;
+    group.classList.toggle('expanded');
   };
 
   // ==========================================================================
