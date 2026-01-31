@@ -93,6 +93,31 @@ THE SYSTEM SHALL broadcast updates to all connected clients
 
 ---
 
+### REQ-API-011: Granular State Change Events
+
+WHEN conversation transitions to any new state
+THE SYSTEM SHALL emit a state_change SSE event
+AND include the state name and relevant state_data
+
+WHEN state is `tool_executing`
+THE SYSTEM SHALL include in state_data:
+- current_tool: {name, id} of the tool being executed
+- remaining_count: number of tools queued after current
+- completed_count: number of tools already completed this turn
+
+WHEN state is `llm_requesting`
+THE SYSTEM SHALL include in state_data:
+- attempt: current retry attempt number (1 for first try)
+
+WHEN state is `awaiting_sub_agents`
+THE SYSTEM SHALL include in state_data:
+- pending_count: number of sub-agents still running
+- completed_count: number of sub-agents finished
+
+**Rationale:** Mobile UI displays state machine visualization as primary feedback mechanism. Users need to see exactly which tool is executing and queue depth to have confidence the system is progressing.
+
+---
+
 ### REQ-API-006: Conversation Lifecycle
 
 WHEN client requests archive
