@@ -145,6 +145,8 @@ struct SubAgentResultBuffer {
 
 **Rule:** `submit_result` and `submit_error` MUST be the sole tool in the response.
 
+**Note:** This restriction applies ONLY to sub-agent terminal tools. `spawn_agents` can appear alongside other tools (e.g., `[bash, spawn_agents, patch]`) - that's the whole point of `pending_sub_agents` accumulation in `ToolExecuting`.
+
 **Detection:** Transition function inspects tool_calls BEFORE entering ToolExecuting:
 
 ```rust
