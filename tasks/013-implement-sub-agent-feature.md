@@ -44,6 +44,15 @@ See `specs/subagents/design.md` for full design document.
 - Unknown/duplicate agent_id rejected
 - No nested sub-agents (tool filtering)
 
+### Edge Cases (see design doc)
+
+- Early SubAgentResult: buffered in executor until AwaitingSubAgents
+- Terminal tools (submit_result/submit_error): must be sole tool, checked before ToolExecuting
+- Cancel during ToolExecuting with pending sub-agents: emit CancelSubAgents
+- Partial spawn failure: all-or-nothing, return error
+- Missing runtime during cancel: synthesize failure result
+- Timeout: None means no timeout; executor enforces via cancellation
+
 ## Acceptance Criteria
 
 - [ ] State machine: new states, events, transitions

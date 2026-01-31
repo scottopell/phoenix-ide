@@ -108,14 +108,183 @@ enum Effect {
 
     // NEW: cancel all pending sub-agents
     CancelSubAgents { ids: Vec<String> },
+
+    // NEW: notify parent of sub-agent completion (sub-agent only)
+    NotifyParent { outcome: SubAgentOutcome },
 }
 
 // Extended error kinds
 enum ErrorKind {
     // ... existing ...
-    TimedOut,  // NEW: sub-agent exceeded time limit
+    TimedOut,   // NEW: sub-agent exceeded time limit
+    Cancelled,  // NEW: explicit cancellation
 }
 ```
+
+## Edge Cases and Clarifications
+
+### Early SubAgentResult (Race Condition)
+
+**Problem:** Sub-agent completes while parent still in `ToolExecuting`.
+
+**Solution:** Executor buffers `SubAgentResult` events until parent reaches `AwaitingSubAgents`. This keeps the state machine simple and avoids adding SubAgentResult handling to ToolExecuting.
+
+```rust
+// In executor/runtime
+struct SubAgentResultBuffer {
+    results: Vec<SubAgentResult>,
+}
+
+// When SubAgentResult arrives and parent not in AwaitingSubAgents:
+//   buffer.push(result)
+// When parent transitions to AwaitingSubAgents:
+//   for result in buffer.drain() { send_event(result) }
+```
+
+### Terminal Tool Handling (submit_result / submit_error)
+
+**Rule:** `submit_result` and `submit_error` MUST be the sole tool in the response.
+
+**Detection:** Transition function inspects tool_calls BEFORE entering ToolExecuting:
+
+```rust
+// In transition, when is_sub_agent:
+(LlmRequesting, LlmResponse { tool_calls, .. }) => {
+    let terminal_tool = tool_calls.iter().find(|t| 
+        t.name() == "submit_result" || t.name() == "submit_error"
+    );
+    
+    if let Some(tool) = terminal_tool {
+        if tool_calls.len() > 1 {
+            // Error: terminal tool must be alone
+            return Err(TransitionError::InvalidToolCombination(
+                "submit_result/submit_error must be the only tool in response"
+            ));
+        }
+        // Transition directly to terminal state
+        match tool.name() {
+            "submit_result" => Completed { result: tool.input.result },
+            "submit_error" => Failed { error: tool.input.error, error_kind: SubAgentError },
+        }
+    } else {
+        // Normal tool execution
+        ToolExecuting { ... }
+    }
+}
+```
+
+### Cancellation During ToolExecuting with Pending Sub-Agents
+
+**Problem:** Parent cancelled while sub-agents already spawned but more tools remain.
+
+**Solution:** Transition to CancellingTool (existing) AND emit CancelSubAgents:
+
+```
+ToolExecuting { pending_sub_agents: [ids...] } + UserCancel
+    → CancellingTool { ... }
+    + Effect::AbortTool { current_tool }
+    + Effect::CancelSubAgents { ids }  // NEW: also cancel spawned sub-agents
+```
+
+The CancellingTool flow continues normally. Buffered SubAgentResults are discarded since parent won't reach AwaitingSubAgents.
+
+### agent_id Generation
+
+**Responsibility:** Tool executor generates UUIDs when processing spawn_agents tool.
+
+```rust
+// In spawn_agents tool executor
+fn execute_spawn_agents(input: SpawnAgentsInput, ctx: &ConvContext) -> SpawnAgentsResult {
+    let agent_ids: Vec<String> = input.tasks.iter()
+        .map(|_| Uuid::new_v4().to_string())
+        .collect();
+    
+    // Return immediately with IDs; effects will spawn the actual agents
+    SpawnAgentsResult {
+        agent_ids: agent_ids.clone(),
+        output: format!("Spawning {} sub-agents: {:?}", agent_ids.len(), agent_ids),
+    }
+}
+
+// Executor then sends SpawnAgentsComplete event with these IDs
+// AND emits SpawnSubAgent effects with the same IDs
+```
+
+### Partial Spawn Failure
+
+**Policy:** All-or-nothing. If any spawn fails:
+1. Cancel already-spawned agents
+2. Return error to parent LLM
+3. Parent remains in ToolExecuting (or transitions to next tool)
+
+```rust
+// SpawnAgentsComplete indicates success
+// On failure, send ToolComplete with error result instead
+Event::ToolComplete {
+    tool_use_id,
+    result: ToolResult {
+        output: "Failed to spawn sub-agents: DB error",
+        is_error: true,
+    }
+}
+```
+
+### Missing Runtime During Cancel
+
+**Problem:** Sub-agent runtime crashed; CancelSubAgents can't reach it.
+
+**Solution:** Synthesize failure result immediately:
+
+```rust
+async fn handle_cancel_sub_agents(ids: Vec<String>, runtime_manager: &RuntimeManager, parent_tx: &EventSender) {
+    for id in ids {
+        if let Some(runtime) = runtime_manager.get(&id) {
+            runtime.send_event(Event::UserCancel).await;
+        } else {
+            // Runtime gone - synthesize result
+            parent_tx.send(Event::SubAgentResult {
+                agent_id: id,
+                outcome: SubAgentOutcome::Failure {
+                    error: "Sub-agent runtime not found".into(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+            }).await;
+        }
+    }
+}
+```
+
+### Timeout Behavior
+
+**Default:** No timeout if `None`. Sub-agent runs until:
+- It calls submit_result/submit_error
+- Parent is cancelled (propagates to sub-agents)
+- Sub-agent hits unrecoverable error
+
+**Recommendation:** Callers should specify reasonable timeouts. Future: system-wide default configurable via settings.
+
+### Terminal State Exclusion from Wildcard Cancel
+
+**Clarification:** The wildcard `* + UserCancel → Failed` explicitly excludes terminal states:
+
+```rust
+// This does NOT apply to Completed or Failed states
+(state, Event::UserCancel) if ctx.is_sub_agent && !state.is_terminal() => {
+    Failed { error: "Cancelled", error_kind: Cancelled }
+}
+
+impl ConvState {
+    fn is_terminal(&self) -> bool {
+        matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
+    }
+}
+```
+
+### NotifyParent Failure Handling
+
+**If parent_event_tx is None:** Programming error - sub-agent created without parent link. Log error, sub-agent still transitions to terminal state.
+
+**If send() fails:** Parent terminated. Sub-agent transitions to terminal state anyway; result is lost but that's acceptable (parent is gone).
 
 ## State Transitions
 
@@ -561,6 +730,120 @@ When all sub-agents complete, parent's LLM receives:
     }
   ]
 }
+```
+
+## Complete Lifecycle Trace
+
+This section traces a complete sub-agent flow from spawn to completion.
+
+### Happy Path: Two Sub-Agents Complete Successfully
+
+```
+1. Parent in LlmRequesting, LLM returns spawn_agents tool
+   State: LlmRequesting { attempt: 1 }
+   Event: LlmResponse { tool_calls: [spawn_agents { tasks: [A, B] }] }
+   
+2. Transition to ToolExecuting
+   State: ToolExecuting { current: spawn_agents, remaining: [], pending_sub_agents: [] }
+   Effect: ExecuteTool { spawn_agents }
+
+3. Executor runs spawn_agents tool, generates IDs ["sa-1", "sa-2"]
+   Executor sends: SpawnAgentsComplete { agent_ids: ["sa-1", "sa-2"], result: "Spawned 2 agents" }
+   Executor emits: SpawnSubAgent { agent_id: "sa-1", task: A }
+   Executor emits: SpawnSubAgent { agent_id: "sa-2", task: B }
+
+4. Transition to AwaitingSubAgents (last tool, has pending)
+   State: AwaitingSubAgents { pending_ids: ["sa-1", "sa-2"], completed_results: [] }
+   Effect: PersistMessage { "Spawned 2 agents" }
+
+5. SpawnSubAgent effects execute:
+   - Create conversation sa-1 (user_initiated=false, parent_id=parent)
+   - Insert synthetic UserMessage with task A
+   - Start sa-1 runtime
+   - (same for sa-2)
+
+6. Sub-agent sa-1 runs its own state machine:
+   Idle → LlmRequesting → ToolExecuting → ... → LlmRequesting
+   LLM returns: submit_result { result: "Completed task A" }
+   Transition: Completed { result: "Completed task A" }
+   Effect: NotifyParent { Success { result: "Completed task A" } }
+
+7. NotifyParent effect sends to parent:
+   Event: SubAgentResult { agent_id: "sa-1", outcome: Success { "Completed task A" } }
+
+8. Parent receives first result:
+   State: AwaitingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
+   Event: SubAgentResult { agent_id: "sa-1", ... }
+   State: AwaitingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
+
+9. Sub-agent sa-2 completes similarly, parent receives:
+   State: AwaitingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
+   Event: SubAgentResult { agent_id: "sa-2", ... }
+   State: LlmRequesting { attempt: 1 }  // Last result triggers exit
+   Effect: PersistMessage { aggregated results }
+   Effect: RequestLlm
+
+10. Parent LLM receives aggregated results, continues conversation.
+```
+
+### Cancellation Path: User Cancels During AwaitingSubAgents
+
+```
+1. Parent in AwaitingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
+   Event: UserCancel
+
+2. Transition to CancellingSubAgents
+   State: CancellingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
+   Effect: CancelSubAgents { ids: ["sa-1", "sa-2"] }
+
+3. Executor sends UserCancel to each sub-agent runtime
+
+4. Sub-agent sa-1 receives cancel:
+   State: (whatever it was)
+   Event: UserCancel
+   State: Failed { error: "Cancelled", error_kind: Cancelled }
+   Effect: NotifyParent { Failure { error: "Cancelled", error_kind: Cancelled } }
+
+5. Parent receives cancellation acknowledgment:
+   State: CancellingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
+   Event: SubAgentResult { agent_id: "sa-1", outcome: Failure { Cancelled } }
+   State: CancellingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
+
+6. Sub-agent sa-2 similarly cancelled and reports
+
+7. Last cancellation result:
+   State: CancellingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
+   Event: SubAgentResult { agent_id: "sa-2", ... }
+   State: Idle
+   Effect: NotifyAgentDone
+```
+
+### Early Completion Race: Sub-Agent Finishes During Parent ToolExecuting
+
+```
+1. Parent calls [spawn_agents, bash]
+   State: ToolExecuting { current: spawn_agents, remaining: [bash], pending_sub_agents: [] }
+
+2. spawn_agents completes:
+   Event: SpawnAgentsComplete { agent_ids: ["sa-1"] }
+   State: ToolExecuting { current: bash, remaining: [], pending_sub_agents: ["sa-1"] }
+   Effect: ExecuteTool { bash }
+   Effect: SpawnSubAgent { "sa-1" }
+
+3. Sub-agent sa-1 spawned and runs FAST, completes before bash:
+   sa-1: Completed { result }
+   sa-1: Effect::NotifyParent
+   
+4. Executor receives SubAgentResult but parent still in ToolExecuting:
+   Executor: buffer.push(SubAgentResult { "sa-1" })
+
+5. bash completes:
+   Event: ToolComplete { bash result }
+   State: AwaitingSubAgents { pending: ["sa-1"], completed: [] }  // has pending_sub_agents
+   
+6. Executor sees transition to AwaitingSubAgents, drains buffer:
+   Event: SubAgentResult { "sa-1" } (from buffer)
+   State: LlmRequesting  // immediate transition, sa-1 already done
 ```
 
 ## Example Use Cases
