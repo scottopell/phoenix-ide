@@ -99,7 +99,7 @@ pub fn transition(
         // AwaitingLlm is an intermediate state - immediately transition to LlmRequesting
         // This is handled in the runtime, not here
 
-        // LlmRequesting + LlmResponse with tools -> ToolExecuting
+        // LlmRequesting + LlmResponse with tools -> ToolExecuting (or terminal for sub-agents)
         (
             ConvState::LlmRequesting { .. },
             Event::LlmResponse {
@@ -109,18 +109,77 @@ pub fn transition(
                 usage,
             },
         ) => {
+            let usage_data = usage_to_data(&usage);
+
             if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
-                let usage_data = usage_to_data(&usage);
                 Ok(TransitionResult::new(ConvState::Idle)
                     .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_agent_done()))
+            } else if _context.is_sub_agent {
+                // Check for terminal tools (submit_result/submit_error)
+                let terminal_tool = tool_calls.iter().find(|t| t.input.is_terminal_tool());
+                
+                if let Some(tool) = terminal_tool {
+                    // Terminal tool must be the only tool
+                    if tool_calls.len() > 1 {
+                        return Err(TransitionError::InvalidTransition(
+                            "submit_result/submit_error must be the only tool in response".to_string()
+                        ));
+                    }
+                    
+                    // Transition directly to terminal state
+                    match &tool.input {
+                        crate::state_machine::state::ToolInput::SubmitResult(input) => {
+                            use crate::state_machine::state::SubAgentOutcome;
+                            Ok(TransitionResult::new(ConvState::Completed {
+                                result: input.result.clone(),
+                            })
+                            .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                            .with_effect(Effect::PersistState)
+                            .with_effect(Effect::NotifyParent {
+                                outcome: SubAgentOutcome::Success {
+                                    result: input.result.clone(),
+                                },
+                            }))
+                        }
+                        crate::state_machine::state::ToolInput::SubmitError(input) => {
+                            use crate::state_machine::state::SubAgentOutcome;
+                            Ok(TransitionResult::new(ConvState::Failed {
+                                error: input.error.clone(),
+                                error_kind: ErrorKind::SubAgentError,
+                            })
+                            .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                            .with_effect(Effect::PersistState)
+                            .with_effect(Effect::NotifyParent {
+                                outcome: SubAgentOutcome::Failure {
+                                    error: input.error.clone(),
+                                    error_kind: ErrorKind::SubAgentError,
+                                },
+                            }))
+                        }
+                        _ => unreachable!("is_terminal_tool returned true for non-terminal tool"),
+                    }
+                } else {
+                    // Normal tool execution for sub-agent
+                    let first = tool_calls[0].clone();
+                    let rest = tool_calls[1..].to_vec();
+
+                    Ok(TransitionResult::new(ConvState::ToolExecuting {
+                        current_tool: first.clone(),
+                        remaining_tools: rest,
+                        completed_results: vec![],
+                        pending_sub_agents: vec![],
+                    })
+                    .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::execute_tool(first)))
+                }
             } else {
                 // Has tools -> ToolExecuting
                 let first = tool_calls[0].clone();
                 let rest = tool_calls[1..].to_vec();
-                let usage_data = usage_to_data(&usage);
 
                 Ok(TransitionResult::new(ConvState::ToolExecuting {
                     current_tool: first.clone(),
@@ -377,8 +436,8 @@ pub fn transition(
         // Cancellation (REQ-BED-005)
         // ============================================================
 
-        // LlmRequesting + UserCancel -> CancellingLlm (abort request)
-        (ConvState::LlmRequesting { .. }, Event::UserCancel) => {
+        // LlmRequesting + UserCancel -> CancellingLlm (parent) or Failed (sub-agent)
+        (ConvState::LlmRequesting { .. }, Event::UserCancel) if !_context.is_sub_agent => {
             Ok(TransitionResult::new(ConvState::CancellingLlm)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::AbortLlm))
@@ -391,8 +450,8 @@ pub fn transition(
                 .with_effect(Effect::notify_agent_done()))
         }
 
-        // AwaitingLlm + UserCancel -> Idle
-        (ConvState::AwaitingLlm, Event::UserCancel) => {
+        // AwaitingLlm + UserCancel -> Idle (parent) or Failed (sub-agent)
+        (ConvState::AwaitingLlm, Event::UserCancel) if !_context.is_sub_agent => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -414,7 +473,7 @@ pub fn transition(
             .with_effect(Effect::PersistState))
         }
 
-        // ToolExecuting + UserCancel -> CancellingTool (request abort)
+        // ToolExecuting + UserCancel -> CancellingTool (parent) or Failed (sub-agent)
         (
             ConvState::ToolExecuting {
                 current_tool,
@@ -423,7 +482,7 @@ pub fn transition(
                 pending_sub_agents,
             },
             Event::UserCancel,
-        ) => {
+        ) if !_context.is_sub_agent => {
             let mut result = TransitionResult::new(ConvState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
                 skipped_tools: remaining_tools.clone(),
@@ -591,6 +650,24 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
+        }
+
+        // ============================================================
+        // Sub-Agent Cancellation (wildcard for non-terminal states)
+        // ============================================================
+        (state, Event::UserCancel) if _context.is_sub_agent && !state.is_terminal() => {
+            use crate::state_machine::state::SubAgentOutcome;
+            Ok(TransitionResult::new(ConvState::Failed {
+                error: "Cancelled by parent".to_string(),
+                error_kind: ErrorKind::Cancelled,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyParent {
+                outcome: SubAgentOutcome::Failure {
+                    error: "Cancelled by parent".to_string(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+            }))
         }
 
         // ============================================================

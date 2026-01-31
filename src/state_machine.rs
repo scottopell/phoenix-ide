@@ -14,4 +14,4 @@ pub use effect::Effect;
 pub use event::Event;
 #[allow(unused_imports)]
 pub use state::{ConvContext, ConvState, ToolCall, ToolInput};
-pub use transition::transition;
+pub use transition::{transition, TransitionError};

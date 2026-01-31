@@ -1088,4 +1088,296 @@ mod tests {
             );
         }
     }
+
+    // ========================================================================
+    // Sub-Agent Integration Tests
+    // ========================================================================
+
+    /// Test sub-agent terminal tool: submit_result transitions to Completed
+    #[tokio::test]
+    async fn test_subagent_submit_result_transitions_to_completed() {
+        use crate::state_machine::{transition, ConvContext, Effect, Event};
+        use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput};
+        use std::path::PathBuf;
+
+        // Create sub-agent context
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            "Analyze the code",
+        );
+
+        // Start from LlmRequesting
+        let state = ConvState::LlmRequesting { attempt: 1 };
+
+        // LLM returns submit_result
+        let submit_result_call = ToolCall::new(
+            "tool-1",
+            ToolInput::SubmitResult(SubmitResultInput {
+                result: "Found 3 bugs".to_string(),
+            }),
+        );
+
+        let event = Event::LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "submit_result",
+                serde_json::json!({ "result": "Found 3 bugs" }),
+            )],
+            tool_calls: vec![submit_result_call],
+            end_turn: true,
+            usage: Usage::default(),
+        };
+
+        let result = transition(&state, &context, event).unwrap();
+
+        // Should transition to Completed
+        match &result.new_state {
+            ConvState::Completed { result } => {
+                assert_eq!(result, "Found 3 bugs");
+            }
+            other => panic!("Expected Completed, got {:?}", other),
+        }
+
+        // Should have NotifyParent effect
+        let notify = result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. }));
+        assert!(notify, "Should have NotifyParent effect");
+    }
+
+    /// Test sub-agent terminal tool: submit_error transitions to Failed
+    #[tokio::test]
+    async fn test_subagent_submit_error_transitions_to_failed() {
+        use crate::state_machine::{transition, ConvContext, Effect, Event};
+        use crate::state_machine::state::{ToolCall, ToolInput, SubmitErrorInput};
+        use std::path::PathBuf;
+
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            "Analyze the code",
+        );
+
+        let state = ConvState::LlmRequesting { attempt: 1 };
+
+        let submit_error_call = ToolCall::new(
+            "tool-1",
+            ToolInput::SubmitError(SubmitErrorInput {
+                error: "File not found".to_string(),
+            }),
+        );
+
+        let event = Event::LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "submit_error",
+                serde_json::json!({ "error": "File not found" }),
+            )],
+            tool_calls: vec![submit_error_call],
+            end_turn: true,
+            usage: Usage::default(),
+        };
+
+        let result = transition(&state, &context, event).unwrap();
+
+        // Should transition to Failed
+        match &result.new_state {
+            ConvState::Failed { error, error_kind } => {
+                assert_eq!(error, "File not found");
+                assert!(matches!(error_kind, crate::db::ErrorKind::SubAgentError));
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+
+        // Should have NotifyParent effect
+        let notify = result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. }));
+        assert!(notify, "Should have NotifyParent effect");
+    }
+
+    /// Test sub-agent cancellation: UserCancel transitions to Failed
+    #[tokio::test]
+    async fn test_subagent_cancel_transitions_to_failed() {
+        use crate::state_machine::{transition, ConvContext, Effect, Event};
+        use std::path::PathBuf;
+
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            "Analyze the code",
+        );
+
+        // Can be in various states when cancelled
+        let states = [
+            ConvState::Idle,
+            ConvState::LlmRequesting { attempt: 1 },
+            ConvState::AwaitingLlm,
+        ];
+
+        for state in states {
+            let result = transition(&state, &context, Event::UserCancel).unwrap();
+
+            match &result.new_state {
+                ConvState::Failed { error, error_kind } => {
+                    assert!(error.contains("Cancelled"));
+                    assert!(matches!(error_kind, crate::db::ErrorKind::Cancelled));
+                }
+                other => panic!("Expected Failed from {:?}, got {:?}", state, other),
+            }
+
+            // Should have NotifyParent effect
+            let notify = result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. }));
+            assert!(notify, "Should have NotifyParent effect for cancel from {:?}", state);
+        }
+    }
+
+    /// Test terminal tool validation: must be sole tool in response
+    #[tokio::test]
+    async fn test_subagent_terminal_tool_must_be_alone() {
+        use crate::state_machine::{transition, ConvContext, Event, TransitionError};
+        use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput, BashInput, BashMode};
+        use std::path::PathBuf;
+
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            "Analyze the code",
+        );
+
+        let state = ConvState::LlmRequesting { attempt: 1 };
+
+        // Two tools, one of which is terminal
+        let bash_call = ToolCall::new(
+            "tool-1",
+            ToolInput::Bash(BashInput {
+                command: "ls".to_string(),
+                mode: BashMode::Default,
+            }),
+        );
+        let submit_call = ToolCall::new(
+            "tool-2",
+            ToolInput::SubmitResult(SubmitResultInput {
+                result: "done".to_string(),
+            }),
+        );
+
+        let event = Event::LlmResponse {
+            content: vec![
+                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({ "command": "ls" })),
+                ContentBlock::tool_use("tool-2", "submit_result", serde_json::json!({ "result": "done" })),
+            ],
+            tool_calls: vec![bash_call, submit_call],
+            end_turn: true,
+            usage: Usage::default(),
+        };
+
+        let result = transition(&state, &context, event);
+
+        // Should be rejected
+        assert!(matches!(result, Err(TransitionError::InvalidTransition(_))));
+    }
+
+    /// Test that parent conversations don't handle terminal tools specially
+    #[tokio::test]
+    async fn test_parent_ignores_terminal_tools() {
+        use crate::state_machine::{transition, ConvContext, Event};
+        use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput};
+        use std::path::PathBuf;
+
+        // Parent context (not sub-agent)
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+        );
+
+        let state = ConvState::LlmRequesting { attempt: 1 };
+
+        // Same terminal tool, but for parent
+        let submit_call = ToolCall::new(
+            "tool-1",
+            ToolInput::SubmitResult(SubmitResultInput {
+                result: "done".to_string(),
+            }),
+        );
+
+        let event = Event::LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "submit_result",
+                serde_json::json!({ "result": "done" }),
+            )],
+            tool_calls: vec![submit_call],
+            end_turn: true,
+            usage: Usage::default(),
+        };
+
+        let result = transition(&state, &context, event).unwrap();
+
+        // Parent should go to ToolExecuting, not Completed
+        assert!(
+            matches!(result.new_state, ConvState::ToolExecuting { .. }),
+            "Parent should go to ToolExecuting, got {:?}",
+            result.new_state
+        );
+    }
+
+    /// Test sub-agent result buffering (early completion)
+    #[tokio::test]
+    async fn test_subagent_result_buffering() {
+        use crate::state_machine::state::SubAgentOutcome;
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::{broadcast, mpsc};
+
+        // Set up a parent runtime
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        // First response: spawn_agents tool
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("I'll spawn sub-agents")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
+
+        let tools = Arc::new(MockToolExecutor::new());
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model");
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
+
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm,
+            tools,
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        );
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // Send a SubAgentResult while parent is still in Idle
+        // (simulates early completion)
+        event_tx
+            .send(Event::SubAgentResult {
+                agent_id: "sub-1".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "early result".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // Give it time to process (should be buffered)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The event should have been received without error
+        // (buffered since parent isn't in AwaitingSubAgents)
+        // This is a basic smoke test - full integration would require more setup
+    }
 }

@@ -363,8 +363,10 @@ pub struct ConvContext {
     pub working_dir: PathBuf,
     #[allow(dead_code)] // Used by LLM client selection
     pub model_id: String,
-    #[allow(dead_code)] // Reserved for sub-agent feature
+    /// Whether this is a sub-agent conversation
     pub is_sub_agent: bool,
+    /// The task description (set for sub-agents)
+    pub task: Option<String>,
 }
 
 impl ConvContext {
@@ -378,12 +380,23 @@ impl ConvContext {
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: false,
+            task: None,
         }
     }
 
-    #[allow(dead_code)] // Reserved for sub-agent feature
-    pub fn into_sub_agent(mut self) -> Self {
-        self.is_sub_agent = true;
-        self
+    /// Create a sub-agent context
+    pub fn sub_agent(
+        conversation_id: impl Into<String>,
+        working_dir: PathBuf,
+        model_id: impl Into<String>,
+        task: impl Into<String>,
+    ) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            working_dir,
+            model_id: model_id.into(),
+            is_sub_agent: true,
+            task: Some(task.into()),
+        }
     }
 }

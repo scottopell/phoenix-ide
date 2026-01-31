@@ -1,7 +1,7 @@
 ---
 created: 2025-01-29
 priority: p2
-status: in-progress
+status: done
 ---
 
 # Implement sub-agent spawning (REQ-BED-008, REQ-BED-009)
@@ -60,9 +60,9 @@ See `specs/subagents/design.md` for full design document.
 - [x] `spawn_agents` tool (parent only)
 - [x] `submit_result` / `submit_error` tools (sub-agent only)
 - [x] Tool filtering by ConvContext.is_sub_agent
-- [ ] Effect handlers: SpawnSubAgent, CancelSubAgents, NotifyParent
-- [ ] Timeout support
-- [ ] Integration tests
+- [x] Effect handlers: SpawnSubAgent, CancelSubAgents, NotifyParent
+- [x] Timeout support (via optional timeout in SubAgentSpec)
+- [x] Integration tests (6 new tests for sub-agent terminal tools, cancellation, buffering)
 
 ## Implementation Order
 

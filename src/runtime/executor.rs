@@ -1,7 +1,7 @@
 //! Conversation runtime executor
 
 use super::traits::{LlmClient, Storage, ToolExecutor};
-use super::SseEvent;
+use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
@@ -13,6 +13,11 @@ use tokio_util::sync::CancellationToken;
 
 /// System prompt for conversations
 const SYSTEM_PROMPT: &str = r"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks.";
+
+/// System prompt suffix for sub-agents
+const SUB_AGENT_PROMPT_SUFFIX: &str = r"
+
+You are a sub-agent working on a specific task. When you complete your task, call submit_result with your findings. If you encounter an unrecoverable error, call submit_error. Your conversation will end after calling either tool.";
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
@@ -33,6 +38,14 @@ where
     tool_cancel_token: Option<CancellationToken>,
     /// Token to cancel running LLM request
     llm_cancel_token: Option<CancellationToken>,
+    /// Channel to notify parent of sub-agent completion (sub-agent only)
+    parent_event_tx: Option<mpsc::Sender<Event>>,
+    /// Channel to request sub-agent spawning (parent only)
+    spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
+    /// Channel to request sub-agent cancellation (parent only)
+    cancel_tx: Option<mpsc::Sender<SubAgentCancelRequest>>,
+    /// Buffer for SubAgentResult events received before entering AwaitingSubAgents
+    sub_agent_result_buffer: Vec<Event>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -62,7 +75,28 @@ where
             broadcast_tx,
             tool_cancel_token: None,
             llm_cancel_token: None,
+            parent_event_tx: None,
+            spawn_tx: None,
+            cancel_tx: None,
+            sub_agent_result_buffer: Vec::new(),
         }
+    }
+
+    /// Set the parent event channel (for sub-agents)
+    pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
+        self.parent_event_tx = Some(parent_tx);
+        self
+    }
+
+    /// Set the spawn/cancel channels (for parent conversations)
+    pub fn with_spawn_channels(
+        mut self,
+        spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
+        cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
+    ) -> Self {
+        self.spawn_tx = Some(spawn_tx);
+        self.cancel_tx = Some(cancel_tx);
+        self
     }
 
     pub async fn run(mut self) {
@@ -87,6 +121,15 @@ where
     }
 
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        // Check if this is a SubAgentResult that needs buffering
+        if let Event::SubAgentResult { .. } = &event {
+            if !self.can_handle_sub_agent_result() {
+                tracing::debug!("Buffering SubAgentResult, parent not in AwaitingSubAgents");
+                self.sub_agent_result_buffer.push(event);
+                return Ok(());
+            }
+        }
+
         // We need to process events in a loop to handle chained effects
         let mut events_to_process = vec![event];
 
@@ -104,7 +147,20 @@ where
             };
 
             // Update state
-            self.state = result.new_state.clone();
+            let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+
+            // Check if we just entered AwaitingSubAgents - drain the buffer
+            if !matches!(old_state, ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. })
+                && matches!(self.state, ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. })
+            {
+                // Just entered a state that can handle SubAgentResult events
+                // Drain the buffer and add to events to process
+                let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
+                if !buffered.is_empty() {
+                    tracing::debug!(count = buffered.len(), "Draining buffered SubAgentResults");
+                    events_to_process.extend(buffered);
+                }
+            }
 
             // Execute effects and collect generated events
             for effect in result.effects {
@@ -118,6 +174,96 @@ where
         }
 
         Ok(())
+    }
+
+    /// Check if the current state can handle SubAgentResult events
+    fn can_handle_sub_agent_result(&self) -> bool {
+        matches!(
+            self.state,
+            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+        )
+    }
+
+    /// Handle the spawn_agents tool specially:
+    /// 1. Parse tasks and generate agent IDs
+    /// 2. Send SpawnSubAgent effects for each task
+    /// 3. Send SpawnAgentsComplete event
+    async fn handle_spawn_agents_tool(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+        use crate::state_machine::state::{SpawnAgentsInput, SubAgentSpec};
+
+        let tool_use_id = tool.id.clone();
+        let input_value = tool.input.to_value();
+        
+        // Parse the spawn_agents input
+        let input: SpawnAgentsInput = match serde_json::from_value(input_value) {
+            Ok(i) => i,
+            Err(e) => {
+                // Return error as regular tool completion
+                let result = ToolResult::error(tool_use_id.clone(), format!("Invalid input: {e}"));
+                return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+            }
+        };
+
+        if input.tasks.is_empty() {
+            let result = ToolResult::error(tool_use_id.clone(), "At least one task is required".to_string());
+            return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+        }
+
+        // Generate agent IDs and prepare spawn specs
+        let mut agent_ids = Vec::new();
+        let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
+
+        for task in &input.tasks {
+            let agent_id = uuid::Uuid::new_v4().to_string();
+            let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
+            
+            agent_ids.push(agent_id.clone());
+
+            // Send spawn request to RuntimeManager
+            if let Some(spawn_tx) = &self.spawn_tx {
+                let spec = SubAgentSpec {
+                    agent_id,
+                    task: task.task.clone(),
+                    cwd,
+                    timeout: None, // TODO: Add timeout parameter to spawn_agents
+                };
+                let request = SubAgentSpawnRequest {
+                    spec,
+                    parent_conversation_id: self.context.conversation_id.clone(),
+                    parent_event_tx: self.event_tx.clone(),
+                    model_id: self.context.model_id.clone(),
+                };
+                if let Err(e) = spawn_tx.send(request).await {
+                    tracing::error!(error = %e, "Failed to send spawn request");
+                    let result = ToolResult::error(tool_use_id.clone(), format!("Failed to spawn sub-agents: {e}"));
+                    return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+                }
+            } else {
+                tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
+                let result = ToolResult::error(tool_use_id.clone(), "Sub-agent spawning not configured".to_string());
+                return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+            }
+        }
+
+        // Build success result
+        let output = format!(
+            "Spawning {} sub-agent(s): {}",
+            agent_ids.len(),
+            agent_ids.join(", ")
+        );
+        let result = ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            success: true,
+            output,
+            is_error: false,
+        };
+
+        // Send SpawnAgentsComplete event (synchronously returned, not async)
+        Ok(Some(Event::SpawnAgentsComplete {
+            tool_use_id,
+            result,
+            agent_ids,
+        }))
     }
 
     /// Execute an effect and optionally return a generated event
@@ -196,13 +342,14 @@ where
                 let storage = self.storage.clone();
                 let event_tx = self.event_tx.clone();
                 let conv_id = self.context.conversation_id.clone();
+                let is_sub_agent = self.context.is_sub_agent;
                 let current_attempt = match &self.state {
                     ConvState::LlmRequesting { attempt } => *attempt,
                     _ => 1,
                 };
 
                 tokio::spawn(async move {
-                    tracing::info!("Making LLM request (background)");
+                    tracing::info!(is_sub_agent = is_sub_agent, "Making LLM request (background)");
 
                     // Build messages from history
                     let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
@@ -219,9 +366,16 @@ where
                         }
                     };
 
+                    // Build system prompt (with sub-agent suffix if applicable)
+                    let system_prompt = if is_sub_agent {
+                        format!("{}{}", SYSTEM_PROMPT, SUB_AGENT_PROMPT_SUFFIX)
+                    } else {
+                        SYSTEM_PROMPT.to_string()
+                    };
+
                     // Build request
                     let request = LlmRequest {
-                        system: vec![SystemContent::cached(SYSTEM_PROMPT)],
+                        system: vec![SystemContent::cached(&system_prompt)],
                         messages,
                         tools: tool_executor.definitions(),
                         max_tokens: Some(8192),
@@ -272,6 +426,11 @@ where
             }
 
             Effect::ExecuteTool { tool } => {
+                // Special handling for spawn_agents tool
+                if tool.name() == "spawn_agents" {
+                    return self.handle_spawn_agents_tool(tool).await;
+                }
+
                 // Create cancellation token for this tool execution
                 let cancel_token = CancellationToken::new();
                 self.tool_cancel_token = Some(cancel_token.clone());
@@ -393,23 +552,58 @@ where
             }
 
             Effect::SpawnSubAgent(spec) => {
-                // TODO: Implement sub-agent spawning
                 tracing::info!(agent_id = %spec.agent_id, task = %spec.task, "Spawning sub-agent");
-                // For now, just log - full implementation requires runtime manager
+                
+                if let Some(spawn_tx) = &self.spawn_tx {
+                    let request = SubAgentSpawnRequest {
+                        spec,
+                        parent_conversation_id: self.context.conversation_id.clone(),
+                        parent_event_tx: self.event_tx.clone(),
+                        model_id: self.context.model_id.clone(),
+                    };
+                    if let Err(e) = spawn_tx.send(request).await {
+                        tracing::error!(error = %e, "Failed to send spawn request");
+                        // TODO: Consider sending a failure event back
+                    }
+                } else {
+                    tracing::warn!("No spawn channel configured, cannot spawn sub-agent");
+                }
                 Ok(None)
             }
 
             Effect::CancelSubAgents { ids } => {
-                // TODO: Implement sub-agent cancellation
                 tracing::info!(?ids, "Cancelling sub-agents");
-                // For now, just log - full implementation requires runtime manager
+                
+                if let Some(cancel_tx) = &self.cancel_tx {
+                    let request = SubAgentCancelRequest {
+                        ids,
+                        parent_conversation_id: self.context.conversation_id.clone(),
+                        parent_event_tx: self.event_tx.clone(),
+                    };
+                    if let Err(e) = cancel_tx.send(request).await {
+                        tracing::error!(error = %e, "Failed to send cancel request");
+                    }
+                } else {
+                    tracing::warn!("No cancel channel configured, cannot cancel sub-agents");
+                }
                 Ok(None)
             }
 
             Effect::NotifyParent { outcome } => {
-                // TODO: Implement parent notification
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
-                // For now, just log - full implementation requires parent event channel
+                
+                if let Some(parent_tx) = &self.parent_event_tx {
+                    let event = Event::SubAgentResult {
+                        agent_id: self.context.conversation_id.clone(),
+                        outcome,
+                    };
+                    if let Err(e) = parent_tx.send(event).await {
+                        // Parent may have terminated - that's OK
+                        tracing::warn!(error = %e, "Failed to notify parent (may have terminated)");
+                    }
+                } else {
+                    tracing::warn!("No parent channel configured for sub-agent");
+                }
                 Ok(None)
             }
 

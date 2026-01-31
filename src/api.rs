@@ -23,9 +23,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
+    /// Create new application state and start the sub-agent handler
+    pub async fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
+        let runtime = Arc::new(RuntimeManager::new(db, llm_registry.clone()));
+        
+        // Start the sub-agent spawn/cancel handler
+        runtime.start_sub_agent_handler().await;
+        
         Self {
-            runtime: Arc::new(RuntimeManager::new(db, llm_registry.clone())),
+            runtime,
             llm_registry,
         }
     }

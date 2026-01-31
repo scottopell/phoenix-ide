@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create application state
-    let state = AppState::new(db, llm_registry);
+    let state = AppState::new(db, llm_registry).await;
 
     // Create router
     let cors = CorsLayer::new()
