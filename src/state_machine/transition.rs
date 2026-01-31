@@ -88,7 +88,8 @@ pub fn transition(
         }
 
         (ConvState::CancellingLlm, Event::UserMessage { .. })
-        | (ConvState::CancellingTool { .. }, Event::UserMessage { .. }) => {
+        | (ConvState::CancellingTool { .. }, Event::UserMessage { .. })
+        | (ConvState::CancellingSubAgents { .. }, Event::UserMessage { .. }) => {
             Err(TransitionError::CancellationInProgress)
         }
 
