@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Phoenix</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- State Bar (fixed top) -->
+    <header id="state-bar">
+      <div id="state-indicator">
+        <span id="state-dot" class="dot idle"></span>
+        <span id="state-text">connecting...</span>
+      </div>
+      <div id="conversation-info">
+        <span id="conv-slug">—</span>
+      </div>
+    </header>
+
+    <!-- Breadcrumb Trail -->
+    <nav id="breadcrumb-bar">
+      <div id="breadcrumb-trail"></div>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main id="main-area">
+      <!-- Conversation List View -->
+      <section id="conversation-list" class="view active">
+        <div class="view-header">
+          <h2>Conversations</h2>
+          <button id="new-conv-btn" class="btn-primary">+ New</button>
+        </div>
+        <ul id="conv-list"></ul>
+      </section>
+
+      <!-- Chat View -->
+      <section id="chat-view" class="view">
+        <div id="messages"></div>
+      </section>
+    </main>
+
+    <!-- Input Area (fixed bottom) -->
+    <footer id="input-area">
+      <div id="input-container">
+        <textarea id="message-input" placeholder="Type a message..." rows="1" disabled></textarea>
+        <button id="send-btn" disabled>Send</button>
+      </div>
+    </footer>
+
+    <!-- New Conversation Modal -->
+    <div id="modal-overlay" class="hidden">
+      <div id="new-conv-modal" class="modal">
+        <h3>New Conversation</h3>
+        <label for="cwd-input">Working Directory</label>
+        <input type="text" id="cwd-input" placeholder="/home/exedev" value="/home/exedev">
+        <div id="cwd-error" class="error hidden"></div>
+        <div class="modal-actions">
+          <button id="modal-cancel" class="btn-secondary">Cancel</button>
+          <button id="modal-create" class="btn-primary">Create</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

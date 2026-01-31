@@ -15,10 +15,11 @@ use crate::state_machine::Event;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    response::{IntoResponse, Redirect, Response},
+    routing::{get, get_service, post},
     Json, Router,
 };
+use tower_http::services::ServeDir;
 use chrono::Datelike;
 use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
@@ -29,7 +30,16 @@ use std::path::PathBuf;
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
+    // Get the static directory path (relative to where server is run)
+    let static_dir = std::env::current_dir()
+        .unwrap_or_default()
+        .join("static");
+
     Router::new()
+        // Root redirect to static index
+        .route("/", get(|| async { Redirect::permanent("/static/index.html") }))
+        // Static files
+        .nest_service("/static", get_service(ServeDir::new(static_dir)))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
         .route(
