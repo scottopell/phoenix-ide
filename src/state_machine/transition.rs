@@ -75,6 +75,7 @@ pub fn transition(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::persist_user_message(text, images))
                     .with_effect(Effect::PersistState)
+                    .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
             )
         }
@@ -166,6 +167,7 @@ pub fn transition(
                     // Normal tool execution for sub-agent
                     let first = tool_calls[0].clone();
                     let rest = tool_calls[1..].to_vec();
+                    let remaining_count = rest.len();
 
                     Ok(TransitionResult::new(ConvState::ToolExecuting {
                         current_tool: first.clone(),
@@ -175,12 +177,14 @@ pub fn transition(
                     })
                     .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
+                    .with_effect(notify_tool_executing(first.name(), &first.id, remaining_count, 0))
                     .with_effect(Effect::execute_tool(first)))
                 }
             } else {
                 // Has tools -> ToolExecuting
                 let first = tool_calls[0].clone();
                 let rest = tool_calls[1..].to_vec();
+                let remaining_count = rest.len();
 
                 Ok(TransitionResult::new(ConvState::ToolExecuting {
                     current_tool: first.clone(),
@@ -190,6 +194,7 @@ pub fn transition(
                 })
                 .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                 .with_effect(Effect::PersistState)
+                .with_effect(notify_tool_executing(first.name(), &first.id, remaining_count, 0))
                 .with_effect(Effect::execute_tool(first)))
             }
         }
@@ -288,9 +293,11 @@ pub fn transition(
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result.clone());
+            let completed_count = new_results.len();
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
+            let remaining_count = new_remaining.len();
 
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
@@ -305,6 +312,7 @@ pub fn transition(
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
+            .with_effect(notify_tool_executing(next_tool.name(), &next_tool.id, remaining_count, completed_count))
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
@@ -330,6 +338,7 @@ pub fn transition(
                         result.display_data(),
                     ))
                     .with_effect(Effect::PersistState)
+                    .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
             )
         }
@@ -347,6 +356,7 @@ pub fn transition(
                 result,
             },
         ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && !pending_sub_agents.is_empty() => {
+            let pending_count = pending_sub_agents.len();
             Ok(
                 TransitionResult::new(ConvState::AwaitingSubAgents {
                     pending_ids: pending_sub_agents.clone(),
@@ -358,7 +368,8 @@ pub fn transition(
                         result.is_error,
                         result.display_data(),
                     ))
-                    .with_effect(Effect::PersistState),
+                    .with_effect(Effect::PersistState)
+                    .with_effect(notify_awaiting_sub_agents(pending_count, 0)),
             )
         }
 
@@ -378,12 +389,14 @@ pub fn transition(
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result.clone());
+            let completed_count = new_results.len();
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(agent_ids);
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
+            let remaining_count = new_remaining.len();
 
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
@@ -398,6 +411,7 @@ pub fn transition(
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
+            .with_effect(notify_tool_executing(next_tool.name(), &next_tool.id, remaining_count, completed_count))
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
@@ -417,6 +431,7 @@ pub fn transition(
         ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(agent_ids);
+            let pending_count = all_pending.len();
 
             Ok(
                 TransitionResult::new(ConvState::AwaitingSubAgents {
@@ -429,7 +444,8 @@ pub fn transition(
                         result.is_error,
                         result.display_data(),
                     ))
-                    .with_effect(Effect::PersistState),
+                    .with_effect(Effect::PersistState)
+                    .with_effect(notify_awaiting_sub_agents(pending_count, 0)),
             )
         }
 
@@ -582,12 +598,15 @@ pub fn transition(
                 task: String::new(), // Task is stored elsewhere
                 outcome,
             });
+            let pending_count = new_pending.len();
+            let completed_count = new_results.len();
 
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending_ids: new_pending,
                 completed_results: new_results,
             })
-            .with_effect(Effect::PersistState))
+            .with_effect(Effect::PersistState)
+            .with_effect(notify_awaiting_sub_agents(pending_count, completed_count)))
         }
 
         // AwaitingSubAgents + SubAgentResult (last one) -> LlmRequesting
@@ -609,6 +628,7 @@ pub fn transition(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::PersistSubAgentResults { results: new_results })
                     .with_effect(Effect::PersistState)
+                    .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
             )
         }
@@ -702,6 +722,47 @@ fn usage_to_data(usage: &crate::llm::Usage) -> UsageData {
 fn retry_delay(attempt: u32) -> Duration {
     // Exponential backoff: 1s, 2s, 4s
     Duration::from_secs(1 << (attempt - 1))
+}
+
+/// Helper to create state_change notification for LlmRequesting
+fn notify_llm_requesting(attempt: u32) -> Effect {
+    Effect::notify_state_change(
+        "llm_requesting",
+        json!({
+            "attempt": attempt
+        }),
+    )
+}
+
+/// Helper to create state_change notification for ToolExecuting
+fn notify_tool_executing(
+    tool_name: &str,
+    tool_id: &str,
+    remaining_count: usize,
+    completed_count: usize,
+) -> Effect {
+    Effect::notify_state_change(
+        "tool_executing",
+        json!({
+            "current_tool": {
+                "name": tool_name,
+                "id": tool_id
+            },
+            "remaining_count": remaining_count,
+            "completed_count": completed_count
+        }),
+    )
+}
+
+/// Helper to create state_change notification for AwaitingSubAgents
+fn notify_awaiting_sub_agents(pending_count: usize, completed_count: usize) -> Effect {
+    Effect::notify_state_change(
+        "awaiting_sub_agents",
+        json!({
+            "pending_count": pending_count,
+            "completed_count": completed_count
+        }),
+    )
 }
 
 #[allow(dead_code)] // Conversion utility

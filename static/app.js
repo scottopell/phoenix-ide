@@ -19,6 +19,9 @@
     agentWorking: false,
   };
 
+  // Expose for debugging
+  window.__phoenixState = state;
+
   // ==========================================================================
   // DOM Elements
   // ==========================================================================
@@ -158,16 +161,23 @@
     switch (convState) {
       case 'awaiting_llm':
         return 'preparing request...';
-      case 'llm_requesting':
+      case 'llm_requesting': {
         const attempt = stateData?.attempt || 1;
         return attempt > 1 ? `thinking (retry ${attempt})...` : 'thinking...';
-      case 'tool_executing':
-        const tool = stateData?.current_tool?.input?._tool || 'tool';
-        const remaining = stateData?.remaining_tools?.length || 0;
+      }
+      case 'tool_executing': {
+        const tool = stateData?.current_tool?.name || 'tool';
+        const remaining = stateData?.remaining_count || 0;
         return remaining > 0 ? `${tool} (+${remaining} queued)` : tool;
-      case 'awaiting_sub_agents':
-        const pending = stateData?.pending_ids?.length || 0;
+      }
+      case 'awaiting_sub_agents': {
+        const pending = stateData?.pending_count || 0;
+        const completed = stateData?.completed_count || 0;
+        if (completed > 0) {
+          return `sub-agents (${completed}/${pending + completed} done)`;
+        }
         return `waiting for ${pending} sub-agent${pending !== 1 ? 's' : ''}`;
+      }
       case 'cancelling':
       case 'cancelling_llm':
       case 'cancelling_tool':
@@ -274,11 +284,60 @@
       return '';
     }).join('');
 
+    // Add sub-agent status if awaiting
+    if (state.convState === 'awaiting_sub_agents' && state.stateData) {
+      html += renderSubAgentStatus(state.stateData);
+    }
+
     els.messages.innerHTML = html;
     
     // Scroll to bottom
     const main = $('#main-area');
     main.scrollTop = main.scrollHeight;
+  }
+
+  function renderSubAgentStatus(stateData) {
+    // Handle both formats: {pending_count, completed_count} from state_change events
+    // and {pending_ids, completed_results} from init/state object
+    const pending = stateData.pending_count ?? stateData.pending_ids?.length ?? 0;
+    const completed = stateData.completed_count ?? stateData.completed_results?.length ?? 0;
+    const total = pending + completed;
+    
+    let statusItems = '';
+    
+    // Show completed sub-agents
+    for (let i = 0; i < completed; i++) {
+      statusItems += `
+        <div class="subagent-item completed">
+          <span class="subagent-icon">✓</span>
+          <span class="subagent-label">Sub-agent ${i + 1}</span>
+          <span class="subagent-status">completed</span>
+        </div>
+      `;
+    }
+    
+    // Show pending sub-agents
+    for (let i = 0; i < pending; i++) {
+      statusItems += `
+        <div class="subagent-item pending">
+          <span class="subagent-icon"><span class="spinner"></span></span>
+          <span class="subagent-label">Sub-agent ${completed + i + 1}</span>
+          <span class="subagent-status">running...</span>
+        </div>
+      `;
+    }
+    
+    return `
+      <div class="subagent-status-block">
+        <div class="subagent-header">
+          <span class="subagent-title">Sub-agents</span>
+          <span class="subagent-count">${completed}/${total}</span>
+        </div>
+        <div class="subagent-list">
+          ${statusItems}
+        </div>
+      </div>
+    `;
   }
 
   function renderUserMessage(msg) {
@@ -492,9 +551,16 @@
       case 'init':
         state.messages = data.messages || [];
         // state can be {type: "idle"} object or just "idle" string
-        const convState = data.conversation?.state;
-        state.convState = (typeof convState === 'object' ? convState?.type : convState) || 'idle';
-        state.stateData = data.conversation?.state_data || null;
+        const initConvState = data.conversation?.state;
+        if (typeof initConvState === 'object') {
+          state.convState = initConvState?.type || 'idle';
+          // Extract state data from the state object itself
+          const { type, ...stateData } = initConvState;
+          state.stateData = Object.keys(stateData).length > 0 ? stateData : null;
+        } else {
+          state.convState = initConvState || 'idle';
+          state.stateData = data.conversation?.state_data || null;
+        }
         state.agentWorking = data.agent_working || false;
         updateBreadcrumbsFromState();
         break;
@@ -541,16 +607,40 @@
     }
 
     // Add state-based breadcrumb if not already present
-    if (convState === 'awaiting_llm' || convState === 'llm_requesting') {
-      if (!state.breadcrumbs.some(b => b.type === 'llm')) {
-        state.breadcrumbs.push({ type: 'llm', label: 'LLM' });
-      }
+    if (convState === 'llm_requesting') {
+      // Remove any existing LLM breadcrumb and add fresh one
+      state.breadcrumbs = state.breadcrumbs.filter(b => b.type !== 'llm');
+      const attempt = stateData?.attempt || 1;
+      const label = attempt > 1 ? `LLM (retry ${attempt})` : 'LLM';
+      state.breadcrumbs.push({ type: 'llm', label });
     }
 
     if (convState === 'tool_executing' && stateData?.current_tool) {
-      const toolName = stateData.current_tool.input?._tool || 'tool';
-      if (!state.breadcrumbs.some(b => b.type === 'tool' && b.label === toolName)) {
-        state.breadcrumbs.push({ type: 'tool', label: toolName });
+      const toolName = stateData.current_tool.name || 'tool';
+      const toolId = stateData.current_tool.id;
+      const remaining = stateData.remaining_count || 0;
+      const completed = stateData.completed_count || 0;
+      
+      // Add tool breadcrumb with queue info
+      const label = remaining > 0 ? `${toolName} (+${remaining})` : toolName;
+      
+      // Only add if this specific tool isn't already shown
+      if (!state.breadcrumbs.some(b => b.type === 'tool' && b.toolId === toolId)) {
+        state.breadcrumbs.push({ type: 'tool', label, toolId });
+      }
+    }
+
+    if (convState === 'awaiting_sub_agents') {
+      const pending = stateData?.pending_count || 0;
+      const completed = stateData?.completed_count || 0;
+      const label = `sub-agents (${completed}/${pending + completed})`;
+      
+      // Update or add sub-agents breadcrumb
+      const existing = state.breadcrumbs.find(b => b.type === 'subagents');
+      if (existing) {
+        existing.label = label;
+      } else {
+        state.breadcrumbs.push({ type: 'subagents', label });
       }
     }
   }
