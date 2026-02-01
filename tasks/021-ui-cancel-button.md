@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p2
-status: ready
+status: done
 ---
 
 # Add Cancel Button to Web UI
