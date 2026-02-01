@@ -2,7 +2,7 @@
 
 use crate::db::{ImageData, MessageContent, ToolResult, UsageData};
 use crate::llm::ContentBlock;
-use crate::state_machine::state::{SubAgentOutcome, SubAgentResult, SubAgentSpec, ToolCall};
+use crate::state_machine::state::{SubAgentOutcome, SubAgentResult, ToolCall};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -30,9 +30,6 @@ pub enum Effect {
 
     /// Abort the currently running LLM request
     AbortLlm,
-
-    /// Spawn a sub-agent conversation
-    SpawnSubAgent(SubAgentSpec),
 
     /// Cancel all pending sub-agents
     CancelSubAgents { ids: Vec<String> },

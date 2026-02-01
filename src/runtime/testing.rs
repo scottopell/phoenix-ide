@@ -1046,7 +1046,6 @@ mod tests {
             "sub-agent-1",
             PathBuf::from("/tmp"),
             "test-model",
-            "Analyze the code",
         );
 
         // Start from LlmRequesting
@@ -1097,7 +1096,6 @@ mod tests {
             "sub-agent-1",
             PathBuf::from("/tmp"),
             "test-model",
-            "Analyze the code",
         );
 
         let state = ConvState::LlmRequesting { attempt: 1 };
@@ -1146,7 +1144,6 @@ mod tests {
             "sub-agent-1",
             PathBuf::from("/tmp"),
             "test-model",
-            "Analyze the code",
         );
 
         // Can be in various states when cancelled
@@ -1176,7 +1173,8 @@ mod tests {
     /// Test terminal tool validation: must be sole tool in response
     #[tokio::test]
     async fn test_subagent_terminal_tool_must_be_alone() {
-        use crate::state_machine::{transition, ConvContext, Event, TransitionError};
+        use crate::state_machine::{transition, ConvContext, Event};
+        use crate::state_machine::transition::TransitionError;
         use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput, BashInput, BashMode};
         use std::path::PathBuf;
 
@@ -1184,7 +1182,6 @@ mod tests {
             "sub-agent-1",
             PathBuf::from("/tmp"),
             "test-model",
-            "Analyze the code",
         );
 
         let state = ConvState::LlmRequesting { attempt: 1 };

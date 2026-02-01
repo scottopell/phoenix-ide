@@ -349,8 +349,6 @@ pub struct ConvContext {
     pub model_id: String,
     /// Whether this is a sub-agent conversation
     pub is_sub_agent: bool,
-    /// The task description (set for sub-agents)
-    pub task: Option<String>,
 }
 
 impl ConvContext {
@@ -364,7 +362,6 @@ impl ConvContext {
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: false,
-            task: None,
         }
     }
 
@@ -373,14 +370,12 @@ impl ConvContext {
         conversation_id: impl Into<String>,
         working_dir: PathBuf,
         model_id: impl Into<String>,
-        task: impl Into<String>,
     ) -> Self {
         Self {
             conversation_id: conversation_id.into(),
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: true,
-            task: Some(task.into()),
         }
     }
 }

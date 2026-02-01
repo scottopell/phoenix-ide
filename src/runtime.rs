@@ -208,7 +208,6 @@ impl RuntimeManager {
             &conv.id,
             PathBuf::from(&conv.cwd),
             &model_id,
-            &spec.task,
         );
 
         // 4. Create channels for the sub-agent runtime
@@ -338,7 +337,6 @@ impl RuntimeManager {
                 &conv.id,
                 PathBuf::from(&conv.cwd),
                 self.llm_registry.default_model_id(),
-                "(resumed)",
             )
         } else {
             ConvContext::new(

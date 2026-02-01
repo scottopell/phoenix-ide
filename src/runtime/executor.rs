@@ -186,8 +186,8 @@ where
 
     /// Handle the spawn_agents tool specially:
     /// 1. Parse tasks and generate agent IDs
-    /// 2. Send SpawnSubAgent effects for each task
-    /// 3. Send SpawnAgentsComplete event
+    /// 2. Send spawn requests to RuntimeManager for each task
+    /// 3. Return SpawnAgentsComplete event
     async fn handle_spawn_agents_tool(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         use crate::state_machine::state::{SpawnAgentsInput, SubAgentSpec};
 
@@ -524,26 +524,6 @@ where
                     token.cancel();
                 }
                 // The spawned task will send LlmAborted event when it sees cancellation
-                Ok(None)
-            }
-
-            Effect::SpawnSubAgent(spec) => {
-                tracing::info!(agent_id = %spec.agent_id, task = %spec.task, "Spawning sub-agent");
-                
-                if let Some(spawn_tx) = &self.spawn_tx {
-                    let request = SubAgentSpawnRequest {
-                        spec,
-                        parent_conversation_id: self.context.conversation_id.clone(),
-                        parent_event_tx: self.event_tx.clone(),
-                        model_id: self.context.model_id.clone(),
-                    };
-                    if let Err(e) = spawn_tx.send(request).await {
-                        tracing::error!(error = %e, "Failed to send spawn request");
-                        // TODO: Consider sending a failure event back
-                    }
-                } else {
-                    tracing::warn!("No spawn channel configured, cannot spawn sub-agent");
-                }
                 Ok(None)
             }
 
