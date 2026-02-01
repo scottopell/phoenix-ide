@@ -1,8 +1,7 @@
 ---
 created: 2026-01-31
 priority: p3
-status: blocked
-blocked_by: 020
+status: done
 ---
 
 # Sub-agent Tree Visualization
