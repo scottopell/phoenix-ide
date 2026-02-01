@@ -57,12 +57,11 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 "message": message
             }),
         ),
-        SseEvent::StateChange { state, state_data } => (
+        SseEvent::StateChange { state } => (
             "state_change",
             json!({
                 "type": "state_change",
-                "state": state,
-                "state_data": state_data
+                "state": state
             }),
         ),
         SseEvent::AgentDone => (

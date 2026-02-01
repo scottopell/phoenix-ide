@@ -5,6 +5,7 @@
 mod schema;
 
 pub use schema::*;
+use schema::MIGRATION_TYPED_STATE;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
@@ -55,6 +56,8 @@ impl Database {
     fn run_migrations(&self) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)?;
+        // Run typed state migration (idempotent - only affects non-JSON states)
+        conn.execute_batch(MIGRATION_TYPED_STATE)?;
         Ok(())
     }
 
@@ -71,11 +74,12 @@ impl Database {
     ) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
+        let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
         conn.execute(
             "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?6, ?6, 0)",
-            params![id, slug, cwd, parent_id, user_initiated, now.to_rfc3339()],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0)",
+            params![id, slug, cwd, parent_id, user_initiated, idle_state, now.to_rfc3339()],
         )?;
 
         Ok(Conversation {
@@ -84,8 +88,7 @@ impl Database {
             cwd: cwd.to_string(),
             parent_conversation_id: parent_id.map(String::from),
             user_initiated,
-            state: ConversationState::Idle,
-            state_data: None,
+            state: ConvState::Idle,
             state_updated_at: now,
             created_at: now,
             updated_at: now,
@@ -97,25 +100,24 @@ impl Database {
     pub fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_data, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
              FROM conversations WHERE id = ?1"
         )?;
 
         stmt.query_row(params![id], |row| {
+            let state_json: String = row.get(5)?;
+            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
             Ok(Conversation {
                 id: row.get(0)?,
                 slug: row.get(1)?,
                 cwd: row.get(2)?,
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
-                state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row
-                    .get::<_, Option<String>>(6)?
-                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
-                created_at: parse_datetime(&row.get::<_, String>(8)?),
-                updated_at: parse_datetime(&row.get::<_, String>(9)?),
-                archived: row.get(10)?,
+                state,
+                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
+                created_at: parse_datetime(&row.get::<_, String>(7)?),
+                updated_at: parse_datetime(&row.get::<_, String>(8)?),
+                archived: row.get(9)?,
             })
         })
         .map_err(|e| match e {
@@ -128,25 +130,24 @@ impl Database {
     pub fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_data, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
              FROM conversations WHERE slug = ?1"
         )?;
 
         stmt.query_row(params![slug], |row| {
+            let state_json: String = row.get(5)?;
+            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
             Ok(Conversation {
                 id: row.get(0)?,
                 slug: row.get(1)?,
                 cwd: row.get(2)?,
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
-                state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row
-                    .get::<_, Option<String>>(6)?
-                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
-                created_at: parse_datetime(&row.get::<_, String>(8)?),
-                updated_at: parse_datetime(&row.get::<_, String>(9)?),
-                archived: row.get(10)?,
+                state,
+                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
+                created_at: parse_datetime(&row.get::<_, String>(7)?),
+                updated_at: parse_datetime(&row.get::<_, String>(8)?),
+                archived: row.get(9)?,
             })
         })
         .map_err(|e| match e {
@@ -159,27 +160,26 @@ impl Database {
     pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_data, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
              FROM conversations 
              WHERE archived = 0 AND user_initiated = 1
              ORDER BY updated_at DESC"
         )?;
 
         let rows = stmt.query_map([], |row| {
+            let state_json: String = row.get(5)?;
+            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
             Ok(Conversation {
                 id: row.get(0)?,
                 slug: row.get(1)?,
                 cwd: row.get(2)?,
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
-                state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row
-                    .get::<_, Option<String>>(6)?
-                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
-                created_at: parse_datetime(&row.get::<_, String>(8)?),
-                updated_at: parse_datetime(&row.get::<_, String>(9)?),
-                archived: row.get(10)?,
+                state,
+                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
+                created_at: parse_datetime(&row.get::<_, String>(7)?),
+                updated_at: parse_datetime(&row.get::<_, String>(8)?),
+                archived: row.get(9)?,
             })
         })?;
 
@@ -190,27 +190,26 @@ impl Database {
     pub fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_data, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
              FROM conversations 
              WHERE archived = 1 AND user_initiated = 1
              ORDER BY updated_at DESC"
         )?;
 
         let rows = stmt.query_map([], |row| {
+            let state_json: String = row.get(5)?;
+            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
             Ok(Conversation {
                 id: row.get(0)?,
                 slug: row.get(1)?,
                 cwd: row.get(2)?,
                 parent_conversation_id: row.get(3)?,
                 user_initiated: row.get(4)?,
-                state: parse_state(row.get::<_, String>(5)?.as_str()),
-                state_data: row
-                    .get::<_, Option<String>>(6)?
-                    .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                state_updated_at: parse_datetime(&row.get::<_, String>(7)?),
-                created_at: parse_datetime(&row.get::<_, String>(8)?),
-                updated_at: parse_datetime(&row.get::<_, String>(9)?),
-                archived: row.get(10)?,
+                state,
+                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
+                created_at: parse_datetime(&row.get::<_, String>(7)?),
+                updated_at: parse_datetime(&row.get::<_, String>(8)?),
+                archived: row.get(9)?,
             })
         })?;
 
@@ -221,17 +220,15 @@ impl Database {
     pub fn update_conversation_state(
         &self,
         id: &str,
-        state: &ConversationState,
-        state_data: Option<&serde_json::Value>,
+        state: &ConvState,
     ) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        let state_str = state.to_string();
-        let state_data_str = state_data.map(|v| serde_json::to_string(v).unwrap());
+        let state_json = serde_json::to_string(state).unwrap();
 
         let updated = conn.execute(
-            "UPDATE conversations SET state = ?1, state_data = ?2, state_updated_at = ?3, updated_at = ?3 WHERE id = ?4",
-            params![state_str, state_data_str, now.to_rfc3339(), id],
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+            params![state_json, now.to_rfc3339(), id],
         )?;
 
         if updated == 0 {
@@ -316,11 +313,12 @@ impl Database {
     pub fn reset_all_to_idle(&self) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
+        let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
         conn.execute(
-            "UPDATE conversations SET state = 'idle', state_data = NULL, state_updated_at = ?1, updated_at = ?1
-             WHERE state != 'idle'",
-            params![now.to_rfc3339()],
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
+             WHERE json_extract(state, '$.type') != 'idle'",
+            params![idle_state, now.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -450,46 +448,6 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
-fn parse_state(s: &str) -> ConversationState {
-    match s {
-        "awaiting_llm" => ConversationState::AwaitingLlm,
-        "llm_requesting" => ConversationState::LlmRequesting { attempt: 1 },
-        "tool_executing" => ConversationState::ToolExecuting {
-            current_tool: crate::state_machine::state::ToolCall::new(
-                "",
-                crate::state_machine::state::ToolInput::Unknown {
-                    name: String::new(),
-                    input: serde_json::Value::Null,
-                },
-            ),
-            remaining_tools: vec![],
-            completed_results: vec![],
-            pending_sub_agents: vec![],
-        },
-        "cancelling" => ConversationState::CancellingLlm,  // Default to LLM cancel
-        "awaiting_sub_agents" => ConversationState::AwaitingSubAgents {
-            pending_ids: vec![],
-            completed_results: vec![],
-        },
-        "cancelling_sub_agents" => ConversationState::CancellingSubAgents {
-            pending_ids: vec![],
-            completed_results: vec![],
-        },
-        "completed" => ConversationState::Completed {
-            result: String::new(),
-        },
-        "failed" => ConversationState::Failed {
-            error: String::new(),
-            error_kind: ErrorKind::Unknown,
-        },
-        "error" => ConversationState::Error {
-            message: String::new(),
-            error_kind: ErrorKind::Unknown,
-        },
-        _ => ConversationState::Idle,
-    }
-}
-
 fn parse_message_type(s: &str) -> MessageType {
     match s {
         "user" => MessageType::User,
@@ -519,7 +477,7 @@ mod tests {
         assert_eq!(conv.id, "test-id");
         assert_eq!(conv.slug, Some("test-slug".to_string()));
         assert_eq!(conv.cwd, "/tmp/test");
-        assert!(matches!(conv.state, ConversationState::Idle));
+        assert!(matches!(conv.state, ConvState::Idle));
 
         let fetched = db.get_conversation("test-id").unwrap();
         assert_eq!(fetched.id, conv.id);

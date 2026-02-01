@@ -250,7 +250,7 @@ impl ToolExecutor for DelayedMockToolExecutor {
 #[allow(dead_code)]
 pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
-    states: Mutex<HashMap<String, (crate::db::ConversationState, Option<Value>)>>,
+    states: Mutex<HashMap<String, ConvState>>,
     next_msg_id: Mutex<u64>,
 }
 
@@ -275,10 +275,7 @@ impl InMemoryStorage {
     }
 
     /// Get current state for a conversation
-    pub fn get_current_state(
-        &self,
-        conv_id: &str,
-    ) -> Option<(crate::db::ConversationState, Option<Value>)> {
+    pub fn get_current_state(&self, conv_id: &str) -> Option<ConvState> {
         self.states.lock().unwrap().get(conv_id).cloned()
     }
 }
@@ -337,87 +334,23 @@ impl StateStore for InMemoryStorage {
     async fn update_state(
         &self,
         conv_id: &str,
-        state: &crate::db::ConversationState,
-        state_data: Option<&Value>,
+        state: &ConvState,
     ) -> Result<(), String> {
         self.states
             .lock()
             .unwrap()
-            .insert(conv_id.to_string(), (state.clone(), state_data.cloned()));
+            .insert(conv_id.to_string(), state.clone());
         Ok(())
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
-        // Convert db state to state machine state
-        let (db_state, _) = self
+        Ok(self
             .states
             .lock()
             .unwrap()
             .get(conv_id)
             .cloned()
-            .unwrap_or((crate::db::ConversationState::Idle, None));
-
-        Ok(db_state_to_conv_state(&db_state))
-    }
-}
-
-#[allow(dead_code)]
-fn db_state_to_conv_state(db_state: &crate::db::ConversationState) -> ConvState {
-    match db_state {
-        crate::db::ConversationState::Idle => ConvState::Idle,
-        crate::db::ConversationState::AwaitingLlm => ConvState::AwaitingLlm,
-        crate::db::ConversationState::LlmRequesting { attempt } => {
-            ConvState::LlmRequesting { attempt: *attempt }
-        }
-        crate::db::ConversationState::ToolExecuting {
-            current_tool,
-            remaining_tools,
-            completed_results,
-            pending_sub_agents,
-        } => ConvState::ToolExecuting {
-            current_tool: current_tool.clone(),
-            remaining_tools: remaining_tools.clone(),
-            completed_results: completed_results.clone(),
-            pending_sub_agents: pending_sub_agents.clone(),
-        },
-        crate::db::ConversationState::CancellingLlm => ConvState::CancellingLlm,
-        crate::db::ConversationState::CancellingTool {
-            tool_use_id,
-            skipped_tools,
-            completed_results,
-        } => ConvState::CancellingTool {
-            tool_use_id: tool_use_id.clone(),
-            skipped_tools: skipped_tools.clone(),
-            completed_results: completed_results.clone(),
-        },
-        crate::db::ConversationState::AwaitingSubAgents {
-            pending_ids,
-            completed_results,
-        } => ConvState::AwaitingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        },
-        crate::db::ConversationState::CancellingSubAgents {
-            pending_ids,
-            completed_results,
-        } => ConvState::CancellingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        },
-        crate::db::ConversationState::Completed { result } => ConvState::Completed {
-            result: result.clone(),
-        },
-        crate::db::ConversationState::Failed { error, error_kind } => ConvState::Failed {
-            error: error.clone(),
-            error_kind: error_kind.clone(),
-        },
-        crate::db::ConversationState::Error {
-            message,
-            error_kind,
-        } => ConvState::Error {
-            message: message.clone(),
-            error_kind: error_kind.clone(),
-        },
+            .unwrap_or_default())
     }
 }
 
@@ -555,12 +488,18 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
         false
     }
 
-    /// Wait for a specific state with timeout
-    pub async fn wait_for_state(&mut self, expected: &str, timeout: Duration) -> bool {
+    /// Wait for a specific state type with timeout
+    pub async fn wait_for_state(&mut self, expected_type: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::StateChange { state, .. })) if state == expected => return true,
+                Ok(Ok(SseEvent::StateChange { state })) => {
+                    if let Some(state_type) = state.get("type").and_then(|v| v.as_str()) {
+                        if state_type == expected_type {
+                            return true;
+                        }
+                    }
+                }
                 Ok(Ok(_)) => continue,
                 _ => continue,
             }
@@ -795,9 +734,11 @@ mod tests {
                     done = true;
                     break;
                 }
-                Ok(Ok(SseEvent::StateChange { state, .. })) if state == "idle" => {
-                    done = true;
-                    break;
+                Ok(Ok(SseEvent::StateChange { state })) => {
+                    if state.get("type").and_then(|v| v.as_str()) == Some("idle") {
+                        done = true;
+                        break;
+                    }
                 }
                 _ => continue,
             }

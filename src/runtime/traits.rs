@@ -29,12 +29,11 @@ pub trait MessageStore: Send + Sync {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
-    /// Update the conversation state
+    /// Update the conversation state (full state as JSON)
     async fn update_state(
         &self,
         conv_id: &str,
-        state: &crate::db::ConversationState,
-        state_data: Option<&Value>,
+        state: &ConvState,
     ) -> Result<(), String>;
 
     /// Get the current conversation state
@@ -98,10 +97,9 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     async fn update_state(
         &self,
         conv_id: &str,
-        state: &crate::db::ConversationState,
-        state_data: Option<&Value>,
+        state: &ConvState,
     ) -> Result<(), String> {
-        (**self).update_state(conv_id, state, state_data).await
+        (**self).update_state(conv_id, state).await
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
@@ -187,17 +185,16 @@ impl StateStore for DatabaseStorage {
     async fn update_state(
         &self,
         conv_id: &str,
-        state: &crate::db::ConversationState,
-        state_data: Option<&Value>,
+        state: &ConvState,
     ) -> Result<(), String> {
         self.db
-            .update_conversation_state(conv_id, state, state_data)
+            .update_conversation_state(conv_id, state)
             .map_err(|e| e.to_string())
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         let conv = self.db.get_conversation(conv_id).map_err(|e| e.to_string())?;
-        Ok(db_state_to_conv_state(&conv.state))
+        Ok(conv.state)
     }
 }
 
@@ -256,63 +253,4 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 }
 
-// Helper to convert DB state to ConvState
-#[allow(dead_code)] // Used by get_state
-fn db_state_to_conv_state(db_state: &crate::db::ConversationState) -> ConvState {
-    match db_state {
-        crate::db::ConversationState::Idle => ConvState::Idle,
-        crate::db::ConversationState::AwaitingLlm => ConvState::AwaitingLlm,
-        crate::db::ConversationState::LlmRequesting { attempt } => {
-            ConvState::LlmRequesting { attempt: *attempt }
-        }
-        crate::db::ConversationState::ToolExecuting {
-            current_tool,
-            remaining_tools,
-            completed_results,
-            pending_sub_agents,
-        } => ConvState::ToolExecuting {
-            current_tool: current_tool.clone(),
-            remaining_tools: remaining_tools.clone(),
-            completed_results: completed_results.clone(),
-            pending_sub_agents: pending_sub_agents.clone(),
-        },
-        crate::db::ConversationState::CancellingLlm => ConvState::CancellingLlm,
-        crate::db::ConversationState::CancellingTool {
-            tool_use_id,
-            skipped_tools,
-            completed_results,
-        } => ConvState::CancellingTool {
-            tool_use_id: tool_use_id.clone(),
-            skipped_tools: skipped_tools.clone(),
-            completed_results: completed_results.clone(),
-        },
-        crate::db::ConversationState::AwaitingSubAgents {
-            pending_ids,
-            completed_results,
-        } => ConvState::AwaitingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        },
-        crate::db::ConversationState::CancellingSubAgents {
-            pending_ids,
-            completed_results,
-        } => ConvState::CancellingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        },
-        crate::db::ConversationState::Completed { result } => ConvState::Completed {
-            result: result.clone(),
-        },
-        crate::db::ConversationState::Failed { error, error_kind } => ConvState::Failed {
-            error: error.clone(),
-            error_kind: error_kind.clone(),
-        },
-        crate::db::ConversationState::Error {
-            message,
-            error_kind,
-        } => ConvState::Error {
-            message: message.clone(),
-            error_kind: error_kind.clone(),
-        },
-    }
-}
+

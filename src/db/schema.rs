@@ -1,21 +1,21 @@
 //! Database schema and types
 
 use crate::llm::ContentBlock;
-use crate::state_machine::state::SubAgentResult;
+pub use crate::state_machine::state::ConvState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
 /// SQL schema for initialization
-pub const SCHEMA: &str = r"
+pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     slug TEXT UNIQUE,
     cwd TEXT NOT NULL,
     parent_conversation_id TEXT,
     user_initiated BOOLEAN NOT NULL,
-    state TEXT NOT NULL DEFAULT 'idle',
+    state TEXT NOT NULL DEFAULT '{"type":"idle"}',
     state_data TEXT,
     state_updated_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -43,7 +43,23 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);";
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
+"#;
+
+/// Migration SQL to convert old state format to typed JSON
+/// Runs at startup to ensure all state values are valid JSON
+pub const MIGRATION_TYPED_STATE: &str = r#"
+-- Migrate old string-based state to JSON format
+-- Only runs if there are non-JSON state values
+
+-- Convert 'idle' string to JSON
+UPDATE conversations SET state = '{"type":"idle"}' WHERE state = 'idle';
+
+-- Convert all other non-JSON states to idle (they would be reset on startup anyway)
+-- This handles: awaiting_llm, llm_requesting, tool_executing, etc.
+UPDATE conversations SET state = '{"type":"idle"}', state_data = NULL 
+WHERE state NOT LIKE '{%}';
+"#;
 
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,8 +69,7 @@ pub struct Conversation {
     pub cwd: String,
     pub parent_conversation_id: Option<String>,
     pub user_initiated: bool,
-    pub state: ConversationState,
-    pub state_data: Option<serde_json::Value>,
+    pub state: ConvState,
     pub state_updated_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -66,90 +81,8 @@ impl Conversation {
     pub fn is_agent_working(&self) -> bool {
         !matches!(
             self.state,
-            ConversationState::Idle | ConversationState::Error { .. }
+            ConvState::Idle | ConvState::Error { .. }
         )
-    }
-}
-
-/// Conversation state machine states
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ConversationState {
-    /// Ready for user input, no pending operations
-    Idle,
-
-    /// User message received, preparing LLM request
-    AwaitingLlm,
-
-    /// LLM request in flight, with retry tracking
-    LlmRequesting { attempt: u32 },
-
-    /// Executing tools serially
-    ToolExecuting {
-        current_tool: crate::state_machine::state::ToolCall,
-        remaining_tools: Vec<crate::state_machine::state::ToolCall>,
-        #[serde(default)]
-        completed_results: Vec<ToolResult>,
-        #[serde(default)]
-        pending_sub_agents: Vec<String>,
-    },
-
-    /// User requested cancellation of LLM request
-    CancellingLlm,
-
-    /// User requested cancellation of tool execution
-    CancellingTool {
-        tool_use_id: String,
-        skipped_tools: Vec<crate::state_machine::state::ToolCall>,
-        #[serde(default)]
-        completed_results: Vec<ToolResult>,
-    },
-
-    /// Waiting for sub-agents to complete
-    AwaitingSubAgents {
-        pending_ids: Vec<String>,
-        #[serde(default)]
-        completed_results: Vec<SubAgentResult>,
-    },
-
-    /// User requested cancellation while waiting for sub-agents
-    CancellingSubAgents {
-        pending_ids: Vec<String>,
-        #[serde(default)]
-        completed_results: Vec<SubAgentResult>,
-    },
-
-    /// Sub-agent completed successfully (terminal state, sub-agent only)
-    Completed { result: String },
-
-    /// Sub-agent failed (terminal state, sub-agent only)
-    Failed {
-        error: String,
-        error_kind: ErrorKind,
-    },
-
-    /// Error occurred
-    Error {
-        message: String,
-        error_kind: ErrorKind,
-    },
-}
-
-impl fmt::Display for ConversationState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConversationState::Idle => write!(f, "idle"),
-            ConversationState::AwaitingLlm => write!(f, "awaiting_llm"),
-            ConversationState::LlmRequesting { .. } => write!(f, "llm_requesting"),
-            ConversationState::ToolExecuting { .. } => write!(f, "tool_executing"),
-            ConversationState::CancellingLlm => write!(f, "cancelling"),
-            ConversationState::CancellingTool { .. } => write!(f, "cancelling"),
-            ConversationState::AwaitingSubAgents { .. } => write!(f, "awaiting_sub_agents"),
-            ConversationState::CancellingSubAgents { .. } => write!(f, "cancelling_sub_agents"),
-            ConversationState::Completed { .. } => write!(f, "completed"),
-            ConversationState::Failed { .. } => write!(f, "failed"),
-            ConversationState::Error { .. } => write!(f, "error"),
-        }
     }
 }
 

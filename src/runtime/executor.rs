@@ -6,7 +6,7 @@ use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -294,39 +294,15 @@ where
             }
 
             Effect::PersistState => {
-                let state_data = match &self.state {
-                    ConvState::LlmRequesting { attempt } => Some(json!({ "attempt": attempt })),
-                    ConvState::ToolExecuting {
-                        current_tool,
-                        remaining_tools,
-                        ..
-                    } => Some(json!({
-                        "current_tool_id": current_tool.id,
-                        "current_tool_name": current_tool.name(),
-                        "remaining_count": remaining_tools.len()
-                    })),
-                    ConvState::Error {
-                        message,
-                        error_kind,
-                    } => Some(json!({
-                        "message": message,
-                        "error_kind": format!("{:?}", error_kind)
-                    })),
-                    _ => None,
-                };
-
+                // Persist the full state as JSON
                 self.storage
-                    .update_state(
-                        &self.context.conversation_id,
-                        &to_db_state(&self.state),
-                        state_data.as_ref(),
-                    )
+                    .update_state(&self.context.conversation_id, &self.state)
                     .await?;
 
-                // Broadcast state change
+                // Broadcast state change with full state data
+                let state_json = serde_json::to_value(&self.state).unwrap_or(Value::Null);
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                    state: self.state.to_db_state().to_string(),
-                    state_data: state_data.unwrap_or(Value::Null),
+                    state: state_json,
                 });
                 Ok(None)
             }
@@ -494,10 +470,10 @@ where
                         let _ = self.broadcast_tx.send(SseEvent::AgentDone);
                     }
                     "state_change" => {
-                        if let Some(state) = data.get("state").and_then(|s| s.as_str()) {
+                        // data should contain the full state object
+                        if let Some(state) = data.get("state") {
                             let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                                state: state.to_string(),
-                                state_data: data.get("state_data").cloned().unwrap_or(Value::Null),
+                                state: state.clone(),
                             });
                         }
                     }
@@ -687,65 +663,6 @@ where
         }
 
         Ok(messages)
-    }
-}
-
-fn to_db_state(state: &ConvState) -> crate::db::ConversationState {
-    match state {
-        ConvState::Idle => crate::db::ConversationState::Idle,
-        ConvState::AwaitingLlm => crate::db::ConversationState::AwaitingLlm,
-        ConvState::LlmRequesting { attempt } => {
-            crate::db::ConversationState::LlmRequesting { attempt: *attempt }
-        }
-        ConvState::ToolExecuting {
-            current_tool,
-            remaining_tools,
-            completed_results,
-            pending_sub_agents,
-        } => crate::db::ConversationState::ToolExecuting {
-            current_tool: current_tool.clone(),
-            remaining_tools: remaining_tools.clone(),
-            completed_results: completed_results.clone(),
-            pending_sub_agents: pending_sub_agents.clone(),
-        },
-        ConvState::CancellingLlm => crate::db::ConversationState::CancellingLlm,
-        ConvState::CancellingTool {
-            tool_use_id,
-            skipped_tools,
-            completed_results,
-        } => crate::db::ConversationState::CancellingTool {
-            tool_use_id: tool_use_id.clone(),
-            skipped_tools: skipped_tools.clone(),
-            completed_results: completed_results.clone(),
-        },
-        ConvState::AwaitingSubAgents {
-            pending_ids,
-            completed_results,
-        } => crate::db::ConversationState::AwaitingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        },
-        ConvState::CancellingSubAgents {
-            pending_ids,
-            completed_results,
-        } => crate::db::ConversationState::CancellingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        },
-        ConvState::Completed { result } => crate::db::ConversationState::Completed {
-            result: result.clone(),
-        },
-        ConvState::Failed { error, error_kind } => crate::db::ConversationState::Failed {
-            error: error.clone(),
-            error_kind: error_kind.clone(),
-        },
-        ConvState::Error {
-            message,
-            error_kind,
-        } => crate::db::ConversationState::Error {
-            message: message.clone(),
-            error_kind: error_kind.clone(),
-        },
     }
 }
 

@@ -166,15 +166,19 @@
         return attempt > 1 ? `thinking (retry ${attempt})...` : 'thinking...';
       }
       case 'tool_executing': {
-        const tool = stateData?.current_tool?.name || 'tool';
-        const remaining = stateData?.remaining_count || 0;
+        // Handle both old format (current_tool.name) and direct access (current_tool.input._tool)
+        const tool = stateData?.current_tool?.input?._tool || stateData?.current_tool?.name || 'tool';
+        // Support both remaining_count (old) and remaining_tools.length (new)
+        const remaining = stateData?.remaining_count ?? stateData?.remaining_tools?.length ?? 0;
         return remaining > 0 ? `${tool} (+${remaining} queued)` : tool;
       }
       case 'awaiting_sub_agents': {
-        const pending = stateData?.pending_count || 0;
-        const completed = stateData?.completed_count || 0;
+        // Support both old format (pending_count/completed_count) and new format (pending_ids/completed_results arrays)
+        const pending = stateData?.pending_count ?? stateData?.pending_ids?.length ?? 0;
+        const completed = stateData?.completed_count ?? stateData?.completed_results?.length ?? 0;
+        const total = pending + completed;
         if (completed > 0) {
-          return `sub-agents (${completed}/${pending + completed} done)`;
+          return `sub-agents (${completed}/${total} done)`;
         }
         return `waiting for ${pending} sub-agent${pending !== 1 ? 's' : ''}`;
       }
@@ -574,8 +578,16 @@
         break;
 
       case 'state_change':
-        state.convState = data.state || 'idle';
-        state.stateData = data.state_data || null;
+        // data.state is now a full state object like {type: "awaiting_sub_agents", pending_ids: [...], ...}
+        if (typeof data.state === 'object') {
+          state.convState = data.state?.type || 'idle';
+          const { type, ...stateData } = data.state;
+          state.stateData = Object.keys(stateData).length > 0 ? stateData : null;
+        } else {
+          // Legacy fallback for string state
+          state.convState = data.state || 'idle';
+          state.stateData = data.state_data || null;
+        }
         state.agentWorking = !['idle', 'error', 'completed', 'failed'].includes(state.convState);
         updateBreadcrumbsFromState();
         break;
@@ -616,10 +628,11 @@
     }
 
     if (convState === 'tool_executing' && stateData?.current_tool) {
-      const toolName = stateData.current_tool.name || 'tool';
+      // Handle both old format (name) and new format (input._tool)
+      const toolName = stateData.current_tool.input?._tool || stateData.current_tool.name || 'tool';
       const toolId = stateData.current_tool.id;
-      const remaining = stateData.remaining_count || 0;
-      const completed = stateData.completed_count || 0;
+      // Support both remaining_count (old) and remaining_tools.length (new)
+      const remaining = stateData.remaining_count ?? stateData.remaining_tools?.length ?? 0;
       
       // Add tool breadcrumb with queue info
       const label = remaining > 0 ? `${toolName} (+${remaining})` : toolName;
@@ -631,9 +644,11 @@
     }
 
     if (convState === 'awaiting_sub_agents') {
-      const pending = stateData?.pending_count || 0;
-      const completed = stateData?.completed_count || 0;
-      const label = `sub-agents (${completed}/${pending + completed})`;
+      // Support both old format (pending_count/completed_count) and new format (pending_ids/completed_results arrays)
+      const pending = stateData?.pending_count ?? stateData?.pending_ids?.length ?? 0;
+      const completed = stateData?.completed_count ?? stateData?.completed_results?.length ?? 0;
+      const total = pending + completed;
+      const label = `sub-agents (${completed}/${total})`;
       
       // Update or add sub-agents breadcrumb
       const existing = state.breadcrumbs.find(b => b.type === 'subagents');

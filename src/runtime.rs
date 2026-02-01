@@ -81,8 +81,8 @@ pub enum SseEvent {
         message: serde_json::Value,
     },
     StateChange {
-        state: String,
-        state_data: serde_json::Value,
+        /// Full state as JSON object (e.g., {"type":"awaiting_sub_agents","pending_ids":[...]})
+        state: serde_json::Value,
     },
     AgentDone,
     Error {

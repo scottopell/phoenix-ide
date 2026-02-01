@@ -88,13 +88,18 @@ impl Effect {
         }
     }
 
+    /// Create a state_change notification with the state as an object
+    /// This merges the state type with the additional data into a single object
     #[allow(clippy::needless_pass_by_value)] // data is consumed by json! macro
-    pub fn notify_state_change(state: &str, data: Value) -> Self {
+    pub fn notify_state_change(state_type: &str, mut data: Value) -> Self {
+        // Merge type into the data object to create a state-like structure
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("type".to_string(), serde_json::json!(state_type));
+        }
         Effect::NotifyClient {
             event_type: "state_change".to_string(),
             data: serde_json::json!({
-                "state": state,
-                "state_data": data
+                "state": data
             }),
         }
     }
