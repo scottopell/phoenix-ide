@@ -309,22 +309,6 @@ impl ConvState {
         !matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
 
-    /// Convert to database state string
-    pub fn to_db_state(&self) -> &'static str {
-        match self {
-            ConvState::Idle => "idle",
-            ConvState::AwaitingLlm => "awaiting_llm",
-            ConvState::LlmRequesting { .. } => "llm_requesting",
-            ConvState::ToolExecuting { .. } => "tool_executing",
-            ConvState::CancellingLlm => "cancelling",
-            ConvState::CancellingTool { .. } => "cancelling",
-            ConvState::AwaitingSubAgents { .. } => "awaiting_sub_agents",
-            ConvState::CancellingSubAgents { .. } => "cancelling_sub_agents",
-            ConvState::Completed { .. } => "completed",
-            ConvState::Failed { .. } => "failed",
-            ConvState::Error { .. } => "error",
-        }
-    }
 }
 
 // ============================================================================
