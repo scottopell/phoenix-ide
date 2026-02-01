@@ -144,7 +144,11 @@
     
     // State dot
     els.stateDot.className = 'dot';
-    if (!state.eventSource || state.eventSource.readyState !== EventSource.OPEN) {
+    if (!currentConversation) {
+      // On list view - no connection needed, hide status indicator
+      els.stateDot.classList.add('hidden');
+      els.stateText.textContent = '';
+    } else if (!state.eventSource || state.eventSource.readyState !== EventSource.OPEN) {
       els.stateDot.classList.add('connecting');
       els.stateText.textContent = 'connecting...';
     } else if (convState === 'idle') {
