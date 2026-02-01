@@ -523,25 +523,26 @@ pub fn transition(
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                completed_results,
+                completed_results: _, // Already persisted, don't re-persist
             },
             Event::ToolAborted {
                 tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
-            // Generate synthetic results for aborted and skipped tools
+            // Generate synthetic results for aborted and skipped tools only.
+            // Note: completed_results were already persisted via PersistMessage
+            // when each tool completed, so we don't include them here.
             let aborted_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
             let skipped_results: Vec<ToolResult> = skipped_tools
                 .iter()
                 .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
 
-            let mut all_results = completed_results.clone();
-            all_results.push(aborted_result);
-            all_results.extend(skipped_results);
+            let mut new_results = vec![aborted_result];
+            new_results.extend(skipped_results);
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: all_results })
+                .with_effect(Effect::PersistToolResults { results: new_results })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -551,26 +552,27 @@ pub fn transition(
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                completed_results,
+                completed_results: _, // Already persisted, don't re-persist
             },
             Event::ToolComplete {
                 tool_use_id: completed_id,
                 result: _,  // Discard actual result, use synthetic
             },
         ) if *tool_use_id == completed_id => {
-            // Tool finished before we could abort it - still use synthetic result
+            // Tool finished before we could abort it - still use synthetic result.
+            // Note: completed_results were already persisted via PersistMessage
+            // when each tool completed, so we don't include them here.
             let cancelled_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
             let skipped_results: Vec<ToolResult> = skipped_tools
                 .iter()
                 .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
 
-            let mut all_results = completed_results.clone();
-            all_results.push(cancelled_result);
-            all_results.extend(skipped_results);
+            let mut new_results = vec![cancelled_result];
+            new_results.extend(skipped_results);
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: all_results })
+                .with_effect(Effect::PersistToolResults { results: new_results })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }

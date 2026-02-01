@@ -651,8 +651,8 @@ proptest! {
         prop_assert!(persist.is_some());
 
         if let Some(Effect::PersistToolResults { results }) = persist {
-            // completed + aborted(1) + skipped
-            let expected_len = completed.len() + 1 + skipped.len();
+            // aborted(1) + skipped (completed_results already persisted separately)
+            let expected_len = 1 + skipped.len();
             prop_assert_eq!(results.len(), expected_len);
         }
     }
@@ -1078,11 +1078,11 @@ fn test_cancel_mid_tool_chain() {
     assert!(persist_effect.is_some(), "Should have PersistToolResults");
 
     if let Some(Effect::PersistToolResults { results }) = persist_effect {
-        // Should have results for completed (t1) + aborted (t2) + skipped (t3, t4) = 4 total
-        assert_eq!(results.len(), 4, "Should have 4 results");
-        // First one (t1) was completed successfully, rest are cancelled/skipped
-        assert!(results[0].success);
-        assert!(results[1..].iter().all(|r| !r.success));
+        // Should have results for aborted (t2) + skipped (t3, t4) = 3 total
+        // Note: completed (t1) was already persisted via PersistMessage
+        assert_eq!(results.len(), 3, "Should have 3 results (aborted + skipped)");
+        // All should be cancelled/skipped (no success)
+        assert!(results.iter().all(|r| !r.success));
     }
 }
 
