@@ -16,6 +16,8 @@ Currently the DB stores conversation state as:
 - `state`: A string like `"awaiting_sub_agents"`
 - `state_data`: An optional JSON blob with some (but not all) state details
 
+**Known bug:** Sub-agent status shows 0/0 on page reload during `AwaitingSubAgents` state because `pending_ids` and `completed_results` are never persisted. This task fixes that directly.
+
 This causes problems:
 1. **Data loss** - `AwaitingSubAgents.pending_ids` and `completed_results` are never persisted, so page reload shows 0/0 sub-agents
 2. **Inconsistent** - Only some states (`LlmRequesting`, `ToolExecuting`, `Error`) extract data; others fall through to `None`
