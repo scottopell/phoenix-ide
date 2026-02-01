@@ -40,6 +40,7 @@
     messages: $('#messages'),
     messageInput: $('#message-input'),
     sendBtn: $('#send-btn'),
+    cancelBtn: $('#cancel-btn'),
     newConvBtn: $('#new-conv-btn'),
     modalOverlay: $('#modal-overlay'),
     cwdInput: $('#cwd-input'),
@@ -84,6 +85,14 @@
 
     async validateCwd(path) {
       const resp = await fetch(`/api/validate-cwd?path=${encodeURIComponent(path)}`);
+      return resp.json();
+    },
+
+    async cancelConversation(convId) {
+      const resp = await fetch(`/api/conversations/${convId}/cancel`, {
+        method: 'POST',
+      });
+      if (!resp.ok) throw new Error('Failed to cancel');
       return resp.json();
     },
 
@@ -428,16 +437,24 @@
   }
 
   function renderInputState() {
-    const { view, agentWorking, currentConversation } = state;
+    const { view, agentWorking, currentConversation, convState } = state;
     const canSend = view === 'chat' && !agentWorking && currentConversation;
+    const isCancelling = convState.startsWith('cancelling');
     
     els.messageInput.disabled = !canSend;
-    els.sendBtn.disabled = !canSend;
     
-    if (agentWorking) {
-      els.sendBtn.innerHTML = '<span class="spinner"></span>';
+    if (agentWorking && currentConversation) {
+      // Show cancel button, hide send button
+      els.sendBtn.classList.add('hidden');
+      els.cancelBtn.classList.remove('hidden');
+      els.cancelBtn.disabled = isCancelling;
+      els.cancelBtn.textContent = isCancelling ? 'Cancelling...' : 'Cancel';
     } else {
+      // Show send button, hide cancel button
+      els.sendBtn.classList.remove('hidden');
+      els.sendBtn.disabled = !canSend;
       els.sendBtn.textContent = 'Send';
+      els.cancelBtn.classList.add('hidden');
     }
   }
 
@@ -659,6 +676,18 @@
     }
   }
 
+  async function cancelCurrentOperation() {
+    if (!state.currentConversation || !state.agentWorking) return;
+    if (state.convState.startsWith('cancelling')) return; // Already cancelling
+
+    try {
+      await api.cancelConversation(state.currentConversation.id);
+      // State will update via SSE events
+    } catch (err) {
+      console.error('Failed to cancel:', err);
+    }
+  }
+
   function showNewConvModal() {
     els.modalOverlay.classList.remove('hidden');
     els.cwdInput.focus();
@@ -740,6 +769,9 @@
       }
     });
     els.messageInput.addEventListener('input', autoResizeTextarea);
+
+    // Cancel button
+    els.cancelBtn.addEventListener('click', cancelCurrentOperation);
 
     // New conversation modal
     els.newConvBtn.addEventListener('click', showNewConvModal);
