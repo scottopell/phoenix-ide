@@ -9,7 +9,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -983,7 +983,7 @@ mod tests {
                     }),
                 ),
             ],
-            completed_results: vec![],
+            persisted_tool_ids: HashSet::new(),
             pending_sub_agents: vec![],
         };
 

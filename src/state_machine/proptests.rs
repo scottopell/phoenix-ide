@@ -11,6 +11,7 @@ use super::*;
 use crate::db::{ErrorKind, ToolResult};
 use crate::llm::{ContentBlock, Usage};
 use proptest::prelude::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 // ============================================================================
@@ -83,13 +84,13 @@ fn arb_tool_executing_state() -> impl Strategy<Value = ConvState> {
     (
         arb_tool_call(),
         proptest::collection::vec(arb_tool_call(), 0..3),
-        proptest::collection::vec(arb_tool_result(), 0..3),
+        proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3),
     )
-        .prop_map(|(current_tool, remaining_tools, completed_results)| {
+        .prop_map(|(current_tool, remaining_tools, persisted_ids)| {
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                completed_results,
+                persisted_tool_ids: persisted_ids.into_iter().collect(),
                 pending_sub_agents: vec![],
             }
         })
@@ -110,13 +111,13 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
     (
         "[a-z]{8}",
         proptest::collection::vec(arb_tool_call(), 0..3),
-        proptest::collection::vec(arb_tool_result(), 0..3),
+        proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3),
     )
-        .prop_map(|(tool_use_id, skipped_tools, completed_results)| {
+        .prop_map(|(tool_use_id, skipped_tools, persisted_ids)| {
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                completed_results,
+                persisted_tool_ids: persisted_ids.into_iter().collect(),
             }
         })
 }
@@ -325,14 +326,14 @@ proptest! {
     fn prop_tool_complete_with_matching_id_succeeds(
         current in arb_tool_call(),
         remaining in proptest::collection::vec(arb_tool_call(), 0..3),
-        completed in proptest::collection::vec(arb_tool_result(), 0..3),
+        persisted_ids in proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3),
         result_output in "[a-zA-Z0-9 ]{0,50}",
         result_success in any::<bool>()
     ) {
         let state = ConvState::ToolExecuting {
             current_tool: current.clone(),
             remaining_tools: remaining,
-            completed_results: completed,
+            persisted_tool_ids: persisted_ids.into_iter().collect(),
             pending_sub_agents: vec![],
         };
         let event = Event::ToolComplete {
@@ -587,12 +588,12 @@ proptest! {
     fn prop_tool_cancel_goes_to_cancelling(
         current in arb_tool_call(),
         remaining in proptest::collection::vec(arb_tool_call(), 0..3),
-        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+        persisted_ids in proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3)
     ) {
         let state = ConvState::ToolExecuting {
             current_tool: current.clone(),
             remaining_tools: remaining.clone(),
-            completed_results: completed,
+            persisted_tool_ids: persisted_ids.into_iter().collect(),
             pending_sub_agents: vec![],
         };
 
@@ -622,16 +623,17 @@ proptest! {
     }
 
     // Invariant 16: CancellingTool + ToolAborted -> Idle with synthetic results
+    // Note: persisted_tool_ids must NOT contain the tool_use_id or any skipped tool IDs
     #[test]
     fn prop_cancelling_tool_aborted_goes_idle(
         tool_use_id in "[a-z]{8}",
         skipped in proptest::collection::vec(arb_tool_call(), 0..3),
-        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+        other_persisted in proptest::collection::vec("[A-Z]{8}".prop_map(String::from), 0..3) // Use uppercase to avoid collisions
     ) {
         let state = ConvState::CancellingTool {
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped.clone(),
-            completed_results: completed.clone(),
+            persisted_tool_ids: other_persisted.into_iter().collect(),
         };
 
         let result = transition(
@@ -651,23 +653,24 @@ proptest! {
         prop_assert!(persist.is_some());
 
         if let Some(Effect::PersistToolResults { results }) = persist {
-            // aborted(1) + skipped (completed_results already persisted separately)
+            // aborted(1) + skipped (persisted_tool_ids were already persisted separately)
             let expected_len = 1 + skipped.len();
             prop_assert_eq!(results.len(), expected_len);
         }
     }
 
     // Invariant 17: CancellingTool + ToolComplete (racing) -> Idle with synthetic (not actual) results
+    // Note: persisted_tool_ids must NOT contain the tool_use_id or any skipped tool IDs
     #[test]
     fn prop_cancelling_tool_complete_uses_synthetic(
         tool_use_id in "[a-z]{8}",
         skipped in proptest::collection::vec(arb_tool_call(), 0..3),
-        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+        other_persisted in proptest::collection::vec("[A-Z]{8}".prop_map(String::from), 0..3) // Use uppercase to avoid collisions
     ) {
         let state = ConvState::CancellingTool {
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped.clone(),
-            completed_results: completed.clone(),
+            persisted_tool_ids: other_persisted.into_iter().collect(),
         };
 
         // Tool completes naturally before abort takes effect
@@ -705,12 +708,12 @@ proptest! {
     fn prop_tool_complete_wrong_id_fails(
         current in arb_tool_call(),
         remaining in proptest::collection::vec(arb_tool_call(), 0..3),
-        completed in proptest::collection::vec(arb_tool_result(), 0..3)
+        persisted_ids in proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3)
     ) {
         let state = ConvState::ToolExecuting {
             current_tool: current.clone(),
             remaining_tools: remaining,
-            completed_results: completed,
+            persisted_tool_ids: persisted_ids.into_iter().collect(),
             pending_sub_agents: vec![],
         };
         let event = Event::ToolComplete {
@@ -939,12 +942,12 @@ fn test_multi_tool_chain() {
         ConvState::ToolExecuting {
             current_tool,
             remaining_tools,
-            completed_results,
+            persisted_tool_ids,
             ..
         } => {
             assert_eq!(current_tool.id, "t2");
             assert_eq!(remaining_tools.len(), 1);
-            assert_eq!(completed_results.len(), 1);
+            assert_eq!(persisted_tool_ids.len(), 1);
         }
         _ => panic!("Expected ToolExecuting"),
     }
@@ -971,12 +974,12 @@ fn test_multi_tool_chain() {
         ConvState::ToolExecuting {
             current_tool,
             remaining_tools,
-            completed_results,
+            persisted_tool_ids,
             ..
         } => {
             assert_eq!(current_tool.id, "t3");
             assert!(remaining_tools.is_empty());
-            assert_eq!(completed_results.len(), 2);
+            assert_eq!(persisted_tool_ids.len(), 2);
         }
         _ => panic!("Expected ToolExecuting"),
     }
@@ -1009,6 +1012,10 @@ fn test_multi_tool_chain() {
 fn test_cancel_mid_tool_chain() {
     let ctx = test_context();
 
+    // t1 already completed and was persisted
+    let mut persisted = HashSet::new();
+    persisted.insert("t1".to_string());
+
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t2",
@@ -1033,12 +1040,7 @@ fn test_cancel_mid_tool_chain() {
                 }),
             ),
         ],
-        completed_results: vec![ToolResult {
-            tool_use_id: "t1".to_string(),
-            success: true,
-            output: "1".to_string(),
-            is_error: false,
-        }],
+        persisted_tool_ids: persisted,
         pending_sub_agents: vec![],
     };
 
@@ -1110,7 +1112,7 @@ fn test_tool_completion_advances_to_next_tool() {
     let state = ConvState::ToolExecuting {
         current_tool: tool1.clone(),
         remaining_tools: vec![tool2.clone()],
-        completed_results: vec![],
+        persisted_tool_ids: HashSet::new(),
         pending_sub_agents: vec![],
     };
 
@@ -1133,12 +1135,12 @@ fn test_tool_completion_advances_to_next_tool() {
         ConvState::ToolExecuting {
             current_tool,
             remaining_tools,
-            completed_results,
+            persisted_tool_ids,
             ..
         } => {
             assert_eq!(current_tool.id, "t2");
             assert!(remaining_tools.is_empty());
-            assert_eq!(completed_results.len(), 1);
+            assert_eq!(persisted_tool_ids.len(), 1);
         }
         _ => panic!("Expected ToolExecuting"),
     }
@@ -1163,7 +1165,7 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
     let state = ConvState::ToolExecuting {
         current_tool: tool1,
         remaining_tools: vec![],
-        completed_results: vec![],
+        persisted_tool_ids: HashSet::new(),
         pending_sub_agents: vec![],
     };
 
@@ -1418,7 +1420,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
             }),
         ),
         remaining_tools: vec![],
-        completed_results: vec![],
+        persisted_tool_ids: HashSet::new(),
         pending_sub_agents: vec!["agent-1".to_string(), "agent-2".to_string()],
     };
 
@@ -1460,7 +1462,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
                 mode: BashMode::Default,
             }),
         )],
-        completed_results: vec![],
+        persisted_tool_ids: HashSet::new(),
         pending_sub_agents: vec!["existing-agent".to_string()],
     };
 
@@ -1490,5 +1492,80 @@ fn test_spawn_agents_complete_accumulates_ids() {
             );
         }
         _ => panic!("Expected ToolExecuting, got {:?}", result.new_state),
+    }
+}
+
+// ============================================================================
+// Invariant: No Duplicate Tool Persists
+// ============================================================================
+
+/// Property: Cancellation should fail if it would produce duplicate persists
+/// This tests that our validation logic correctly catches the bug scenario.
+proptest! {
+    #[test]
+    fn prop_duplicate_persist_detected(
+        tool_use_id in "[a-z]{8}",
+        skipped in proptest::collection::vec(arb_tool_call(), 0..3)
+    ) {
+        // Create a state where tool_use_id is ALREADY in persisted_tool_ids
+        // This simulates the bug scenario where we would try to persist it again
+        let mut persisted = HashSet::new();
+        persisted.insert(tool_use_id.clone());
+        
+        let state = ConvState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: skipped,
+            persisted_tool_ids: persisted,
+        };
+
+        // This should fail because tool_use_id is already persisted
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ToolAborted {
+                tool_use_id: tool_use_id.clone(),
+            },
+        );
+
+        prop_assert!(
+            result.is_err(),
+            "Should fail when tool_use_id is already in persisted_tool_ids"
+        );
+    }
+
+    /// Property: Cancellation should succeed when no duplicates would occur
+    #[test]
+    fn prop_no_duplicate_persist_succeeds(
+        tool_use_id in "[a-z]{8}",
+        skipped in proptest::collection::vec(arb_tool_call(), 0..3),
+        other_persisted in proptest::collection::vec("[A-Z]{8}".prop_map(String::from), 0..3)
+    ) {
+        // Ensure tool_use_id is NOT in persisted_tool_ids (use uppercase for others)
+        let persisted: HashSet<String> = other_persisted.into_iter().collect();
+        
+        // Also ensure skipped tool IDs don't collide with persisted
+        let skipped_filtered: Vec<_> = skipped.into_iter()
+            .filter(|t| !persisted.contains(&t.id))
+            .collect();
+        
+        let state = ConvState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: skipped_filtered,
+            persisted_tool_ids: persisted,
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ToolAborted {
+                tool_use_id: tool_use_id.clone(),
+            },
+        );
+
+        prop_assert!(
+            result.is_ok(),
+            "Should succeed when no duplicate persists would occur: {:?}",
+            result
+        );
     }
 }

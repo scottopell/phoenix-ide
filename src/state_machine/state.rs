@@ -1,6 +1,7 @@
 //! Conversation state types
 
-use crate::db::{ErrorKind, ToolResult};
+use crate::db::ErrorKind;
+use std::collections::HashSet;
 use std::time::Duration;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
@@ -246,9 +247,9 @@ pub enum ConvState {
         current_tool: ToolCall,
         /// Remaining tools to execute after current completes
         remaining_tools: Vec<ToolCall>,
-        /// Results from completed tools
+        /// IDs of tools whose results have been persisted
         #[serde(default)]
-        completed_results: Vec<ToolResult>,
+        persisted_tool_ids: HashSet<String>,
         /// Sub-agents spawned during this tool execution phase
         #[serde(default)]
         pending_sub_agents: Vec<String>,
@@ -263,8 +264,8 @@ pub enum ConvState {
         tool_use_id: String,
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
-        /// Results from tools that completed before cancel
-        completed_results: Vec<ToolResult>,
+        /// IDs of tools whose results have been persisted (for validation)
+        persisted_tool_ids: HashSet<String>,
     },
 
     /// Waiting for sub-agents to complete
