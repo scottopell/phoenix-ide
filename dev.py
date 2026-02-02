@@ -26,7 +26,7 @@ LOG_FILE = ROOT / "phoenix.log"
 PROD_SERVICE_NAME = "phoenix-ide"
 PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
-PROD_PORT = 8000
+PROD_PORT = 7331
 
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
