@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p2
-status: ready
+status: done
 ---
 
 # Offline and Reconnection Handling
@@ -22,35 +22,35 @@ Implement robust offline handling with clear UI feedback, message persistence, a
 ## Acceptance Criteria
 
 ### Draft Persistence (REQ-UI-003)
-- [ ] Draft text saved to localStorage on every keystroke (debounced)
-- [ ] Draft restored on page load / navigation to conversation
-- [ ] Draft cleared when message is sent
-- [ ] Key format: `phoenix:draft:{conversationId}`
+- [x] Draft text saved to localStorage on every keystroke (debounced)
+- [x] Draft restored on page load / navigation to conversation
+- [x] Draft cleared when message is sent
+- [x] Key format: `phoenix:draft:{conversationId}`
 
 ### Message Delivery States (REQ-UI-004)
-- [ ] Optimistic UI: message appears immediately with ⏳ "sending" indicator
-- [ ] ✓ "Sent" indicator shown when API returns `{queued: true}`
-- [ ] ⚠️ "Failed" state shown on network error with tap-to-retry
-- [ ] Messages queued in localStorage (same "sending" state whether online or offline)
-- [ ] Queued messages auto-sent when connection restored
-- [ ] Key format: `phoenix:queue:{conversationId}`
+- [x] Optimistic UI: message appears immediately with ⏳ "sending" indicator
+- [x] ✓ "Sent" indicator shown when API returns `{queued: true}`
+- [x] ⚠️ "Failed" state shown on network error with tap-to-retry
+- [x] Messages queued in localStorage (same "sending" state whether online or offline)
+- [x] Queued messages auto-sent when connection restored
+- [x] Key format: `phoenix:queue:{conversationId}`
 
 Three states only: **sending** (⏳) → **sent** (✓) or **failed** (⚠️)
 
 ### Connection Status UI (REQ-UI-005)
-- [ ] Distinct "reconnecting" state with attempt count
-- [ ] Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
-- [ ] "Offline" banner after 3+ failed reconnect attempts
-- [ ] Countdown timer to next retry in offline banner
-- [ ] `navigator.onLine` integration for immediate offline detection
-- [ ] Brief "reconnected" confirmation on recovery
+- [x] Distinct "reconnecting" state with attempt count
+- [x] Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+- [x] "Offline" banner after 3+ failed reconnect attempts
+- [x] Countdown timer to next retry in offline banner
+- [x] `navigator.onLine` integration for immediate offline detection
+- [x] Brief "reconnected" confirmation on recovery
 
 ### Data Integrity (REQ-UI-006)
-- [ ] Track `last_sequence_id` from init and message events
-- [ ] Store `last_sequence_id` in localStorage for page refresh recovery
-- [ ] Reconnect with `?after={lastSequenceId}` parameter
-- [ ] Deduplicate messages by `sequence_id` as safety net
-- [ ] Key format: `phoenix:lastSeq:{conversationId}`
+- [x] Track `last_sequence_id` from init and message events
+- [x] Store `last_sequence_id` in localStorage for page refresh recovery
+- [x] Reconnect with `?after={lastSequenceId}` parameter
+- [x] Deduplicate messages by `sequence_id` as safety net
+- [x] Key format: `phoenix:lastSeq:{conversationId}`
 
 ## Implementation Notes
 
