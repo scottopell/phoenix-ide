@@ -131,6 +131,12 @@ export const api = {
     return resp.json();
   },
 
+  async listDirectory(path: string): Promise<{ entries: { name: string; is_dir: boolean }[] }> {
+    const resp = await fetch(`/api/list-directory?path=${encodeURIComponent(path)}`);
+    if (!resp.ok) throw new Error('Failed to list directory');
+    return resp.json();
+  },
+
   async cancelConversation(convId: string): Promise<{ ok: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/cancel`, {
       method: 'POST',

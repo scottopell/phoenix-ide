@@ -1,5 +1,6 @@
-import { useState, KeyboardEvent } from 'react';
+import { useState, useEffect } from 'react';
 import { api } from '../api';
+import { DirectoryPicker } from './DirectoryPicker';
 
 interface NewConversationModalProps {
   visible: boolean;
@@ -11,13 +12,51 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
   const [cwd, setCwd] = useState('/home/exedev');
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [pathValid, setPathValid] = useState(true);
+
+  // Reset state when modal opens
+  useEffect(() => {
+    if (visible) {
+      setCwd('/home/exedev');
+      setError(null);
+      setCreating(false);
+    }
+  }, [visible]);
+
+  // Validate path whenever it changes
+  useEffect(() => {
+    const validate = async () => {
+      const trimmed = cwd.trim();
+      if (!trimmed) {
+        setPathValid(false);
+        return;
+      }
+      
+      // Check if path exists or parent exists (can create)
+      const validation = await api.validateCwd(trimmed);
+      if (validation.valid) {
+        setPathValid(true);
+        setError(null);
+        return;
+      }
+      
+      // Check if parent exists (we can create this directory)
+      const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
+      const parentValidation = await api.validateCwd(parentPath);
+      setPathValid(parentValidation.valid);
+      // Don't set error here - DirectoryPicker shows status
+      setError(null);
+    };
+    
+    validate();
+  }, [cwd]);
 
   if (!visible) return null;
 
   const handleCreate = async () => {
     const trimmed = cwd.trim();
-    if (!trimmed) {
-      setError('Please enter a directory');
+    if (!trimmed || !pathValid) {
+      setError('Please select a valid directory');
       return;
     }
 
@@ -25,27 +64,24 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
     setCreating(true);
 
     try {
-      // Validate
+      // Check if we need to create the directory
       const validation = await api.validateCwd(trimmed);
       if (!validation.valid) {
-        setError(validation.error || 'Invalid directory');
+        // Directory doesn't exist - try to create it
+        // For now, we'll let the backend handle this or show an error
+        // In a full implementation, we'd call a mkdir API
+        setError('Directory does not exist. Please create it first or select an existing one.');
         setCreating(false);
         return;
       }
 
-      // Create
+      // Create conversation
       const conv = await api.createConversation(trimmed);
       onCreated(conv);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
     } finally {
       setCreating(false);
-    }
-  };
-
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      handleCreate();
     }
   };
 
@@ -57,18 +93,12 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
 
   return (
     <div id="modal-overlay" onClick={handleOverlayClick}>
-      <div id="new-conv-modal" className="modal">
+      <div id="new-conv-modal" className="modal modal-large">
         <h3>New Conversation</h3>
-        <label htmlFor="cwd-input">Working Directory</label>
-        <input
-          type="text"
-          id="cwd-input"
-          placeholder="/home/exedev"
-          value={cwd}
-          onChange={(e) => setCwd(e.target.value)}
-          onKeyDown={handleKeyDown}
-          autoFocus
-        />
+        <label>Working Directory</label>
+        
+        <DirectoryPicker value={cwd} onChange={setCwd} />
+        
         {error && (
           <div id="cwd-error" className="error">
             {error}
@@ -78,7 +108,12 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
           <button id="modal-cancel" className="btn-secondary" onClick={onClose} disabled={creating}>
             Cancel
           </button>
-          <button id="modal-create" className="btn-primary" onClick={handleCreate} disabled={creating}>
+          <button 
+            id="modal-create" 
+            className="btn-primary" 
+            onClick={handleCreate} 
+            disabled={creating || !pathValid}
+          >
             {creating ? 'Creating...' : 'Create'}
           </button>
         </div>
