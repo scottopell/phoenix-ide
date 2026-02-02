@@ -107,6 +107,9 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 #conv-slug:hover {
@@ -933,12 +936,22 @@ html, body {
   background: #d64545;
 }
 
-/* Context Window Indicator */
+/* State bar layout */
+#state-bar-left {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+}
+
 #state-bar-right {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-shrink: 0;
 }
+
+/* Context Window Indicator */
 
 .context-indicator {
   display: flex;

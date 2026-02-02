@@ -105,11 +105,21 @@ export function StateBar({
   return (
     <>
       <header id="state-bar">
-        <div id="state-indicator">
-          <span id="state-dot" className={dotClass}></span>
-          <span id="state-text">{stateText}</span>
+        <div id="state-bar-left">
+          {conversation ? (
+            <Link to="/" id="conv-slug" title="Back to conversations">
+              <span className="back-arrow">←</span>
+              {conversation.slug}
+            </Link>
+          ) : (
+            <span id="conv-slug">—</span>
+          )}
         </div>
         <div id="state-bar-right">
+          <div id="state-indicator">
+            <span id="state-dot" className={dotClass}></span>
+            <span id="state-text">{stateText}</span>
+          </div>
           {conversation && contextWindowUsed > 0 && (
             <div className={contextClass} title={tooltipText}>
               <div className="context-bar">
@@ -121,16 +131,6 @@ export function StateBar({
               <span className="context-label">{formatTokens(contextWindowUsed)}</span>
             </div>
           )}
-          <div id="conversation-info">
-            {conversation ? (
-              <Link to="/" id="conv-slug" title="Back to conversations">
-                <span className="back-arrow">←</span>
-                {conversation.slug}
-              </Link>
-            ) : (
-              <span id="conv-slug">—</span>
-            )}
-          </div>
         </div>
       </header>
       {showOfflineBanner && (
