@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { api } from '../api';
+import { api, ModelsResponse } from '../api';
 import { DirectoryPicker } from './DirectoryPicker';
 
 interface NewConversationModalProps {
@@ -13,6 +13,11 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [pathValid, setPathValid] = useState(true);
+  const [models, setModels] = useState<ModelsResponse | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+
+  // Debug logging
+  console.log('NewConversationModal render, visible:', visible);
 
   // Reset state when modal opens
   useEffect(() => {
@@ -20,6 +25,15 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       setCwd('/home/exedev');
       setError(null);
       setCreating(false);
+      
+      // Load available models
+      api.listModels().then(modelsData => {
+        setModels(modelsData);
+        setSelectedModel(modelsData.default);
+      }).catch(err => {
+        console.error('Failed to load models:', err);
+        setError('Failed to load available models');
+      });
     }
   }, [visible]);
 
@@ -76,7 +90,7 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       }
 
       // Create conversation
-      const conv = await api.createConversation(trimmed);
+      const conv = await api.createConversation(trimmed, selectedModel || undefined);
       onCreated(conv);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
@@ -98,6 +112,24 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
         <label>Working Directory</label>
         
         <DirectoryPicker value={cwd} onChange={setCwd} />
+        
+        <label>Model</label>
+        <select 
+          value={selectedModel || ''}
+          onChange={(e) => setSelectedModel(e.target.value)}
+          className="model-select"
+          disabled={!models || creating}
+        >
+          {!models ? (
+            <option>Loading models...</option>
+          ) : (
+            models.models.map(model => (
+              <option key={model} value={model}>
+                {model}
+              </option>
+            ))
+          )}
+        </select>
         
         {error && (
           <div id="cwd-error" className="error">

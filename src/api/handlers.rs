@@ -158,6 +158,7 @@ async fn create_conversation(
         .create_conversation(
             &id, &slug, &req.cwd, true, // user_initiated
             None, // no parent
+            req.model.as_deref(), // selected model
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     archived BOOLEAN NOT NULL DEFAULT 0,
+    model TEXT,
     
     FOREIGN KEY (parent_conversation_id) 
         REFERENCES conversations(id) ON DELETE CASCADE
@@ -61,6 +62,12 @@ UPDATE conversations SET state = '{"type":"idle"}', state_data = NULL
 WHERE state NOT LIKE '{%}';
 "#;
 
+/// Migration SQL to add model column
+pub const MIGRATION_ADD_MODEL: &str = r#"
+-- This is a no-op if the column already exists
+-- SQLite will return an error which we'll ignore
+"#;
+
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -74,6 +81,7 @@ pub struct Conversation {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
+    pub model: Option<String>,
 }
 
 impl Conversation {

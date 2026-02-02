@@ -43,7 +43,10 @@ export function ConversationListPage() {
         ) : (
           <ConversationList
             conversations={conversations}
-            onNewConversation={() => setShowModal(true)}
+            onNewConversation={() => {
+              console.log('onNewConversation called, setting showModal to true');
+              setShowModal(true);
+            }}
           />
         )}
       </main>

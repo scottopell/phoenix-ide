@@ -87,6 +87,11 @@ export interface SseStateChangeData {
 export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'disconnected';
 export type SseEventData = SseInitData | SseMessageData | SseStateChangeData | Record<string, never>;
 
+export interface ModelsResponse {
+  models: string[];
+  default: string;
+}
+
 export const api = {
   async listConversations(): Promise<Conversation[]> {
     const resp = await fetch('/api/conversations');
@@ -94,11 +99,11 @@ export const api = {
     return (await resp.json()).conversations;
   },
 
-  async createConversation(cwd: string): Promise<Conversation> {
+  async createConversation(cwd: string, model?: string): Promise<Conversation> {
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cwd }),
+      body: JSON.stringify({ cwd, model }),
     });
     if (!resp.ok) {
       const err = await resp.json();
@@ -142,6 +147,12 @@ export const api = {
       method: 'POST',
     });
     if (!resp.ok) throw new Error('Failed to cancel');
+    return resp.json();
+  },
+
+  async listModels(): Promise<ModelsResponse> {
+    const resp = await fetch('/api/models');
+    if (!resp.ok) throw new Error('Failed to list models');
     return resp.json();
   },
 

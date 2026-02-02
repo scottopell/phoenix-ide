@@ -58,6 +58,10 @@ impl Database {
         conn.execute_batch(SCHEMA)?;
         // Run typed state migration (idempotent - only affects non-JSON states)
         conn.execute_batch(MIGRATION_TYPED_STATE)?;
+        
+        // Try to add model column - ignore error if it already exists
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN model TEXT", []);
+        
         Ok(())
     }
 
@@ -71,15 +75,16 @@ impl Database {
         cwd: &str,
         user_initiated: bool,
         parent_id: Option<&str>,
+        model: Option<&str>,
     ) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
         conn.execute(
-            "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0)",
-            params![id, slug, cwd, parent_id, user_initiated, idle_state, now.to_rfc3339()],
+            "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8)",
+            params![id, slug, cwd, parent_id, user_initiated, idle_state, now.to_rfc3339(), model],
         )?;
 
         Ok(Conversation {
@@ -93,6 +98,7 @@ impl Database {
             created_at: now,
             updated_at: now,
             archived: false,
+            model: model.map(String::from),
         })
     }
 
@@ -100,7 +106,7 @@ impl Database {
     pub fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
              FROM conversations WHERE id = ?1"
         )?;
 
@@ -118,6 +124,7 @@ impl Database {
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
+                model: row.get(10)?,
             })
         })
         .map_err(|e| match e {
@@ -130,7 +137,7 @@ impl Database {
     pub fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
              FROM conversations WHERE slug = ?1"
         )?;
 
@@ -148,6 +155,7 @@ impl Database {
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
+                model: row.get(10)?,
             })
         })
         .map_err(|e| match e {
@@ -160,7 +168,7 @@ impl Database {
     pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
              FROM conversations 
              WHERE archived = 0 AND user_initiated = 1
              ORDER BY updated_at DESC"
@@ -180,6 +188,7 @@ impl Database {
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
+                model: row.get(10)?,
             })
         })?;
 
@@ -190,7 +199,7 @@ impl Database {
     pub fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived
+            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
              FROM conversations 
              WHERE archived = 1 AND user_initiated = 1
              ORDER BY updated_at DESC"
@@ -210,6 +219,7 @@ impl Database {
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
+                model: row.get(10)?,
             })
         })?;
 
@@ -471,7 +481,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         let conv = db
-            .create_conversation("test-id", "test-slug", "/tmp/test", true, None)
+            .create_conversation("test-id", "test-slug", "/tmp/test", true, None, None)
             .unwrap();
 
         assert_eq!(conv.id, "test-id");
@@ -489,7 +499,7 @@ mod tests {
         
         let db = Database::open_in_memory().unwrap();
 
-        db.create_conversation("conv-1", "slug-1", "/tmp", true, None)
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
             .unwrap();
 
         let msg1 = db

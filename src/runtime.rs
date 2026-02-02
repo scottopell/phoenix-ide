@@ -169,6 +169,7 @@ impl RuntimeManager {
             &spec.cwd,
             false, // user_initiated = false
             Some(&parent_conversation_id),
+            Some(&model_id), // inherit parent's model
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -337,13 +338,13 @@ impl RuntimeManager {
             ConvContext::sub_agent(
                 &conv.id,
                 PathBuf::from(&conv.cwd),
-                self.llm_registry.default_model_id(),
+                conv.model.as_deref().unwrap_or(self.llm_registry.default_model_id()),
             )
         } else {
             ConvContext::new(
                 &conv.id,
                 PathBuf::from(&conv.cwd),
-                self.llm_registry.default_model_id(),
+                conv.model.as_deref().unwrap_or(self.llm_registry.default_model_id()),
             )
         };
 
@@ -354,7 +355,7 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(
             self.llm_registry.clone(),
-            self.llm_registry.default_model_id().to_string(),
+            conv.model.clone().unwrap_or_else(|| self.llm_registry.default_model_id().to_string()),
         );
         
         // Use appropriate tool registry based on whether this is a sub-agent
