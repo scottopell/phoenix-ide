@@ -28,12 +28,14 @@ Implement robust offline handling with clear UI feedback, message persistence, a
 - [ ] Key format: `phoenix:draft:{conversationId}`
 
 ### Message Delivery States (REQ-UI-004)
-- [ ] Optimistic UI: message appears immediately with "sending" indicator
-- [ ] "Sent" indicator (✓) shown when API returns `{queued: true}`
-- [ ] "Failed" state shown on network error with tap-to-retry
-- [ ] Pending messages queued in localStorage when offline
-- [ ] Pending messages auto-sent when connection restored
-- [ ] Key format: `phoenix:pending:{conversationId}`
+- [ ] Optimistic UI: message appears immediately with ⏳ "sending" indicator
+- [ ] ✓ "Sent" indicator shown when API returns `{queued: true}`
+- [ ] ⚠️ "Failed" state shown on network error with tap-to-retry
+- [ ] Messages queued in localStorage (same "sending" state whether online or offline)
+- [ ] Queued messages auto-sent when connection restored
+- [ ] Key format: `phoenix:queue:{conversationId}`
+
+Three states only: **sending** (⏳) → **sent** (✓) or **failed** (⚠️)
 
 ### Connection Status UI (REQ-UI-005)
 - [ ] Distinct "reconnecting" state with attempt count

@@ -37,24 +37,22 @@ ui/
 ## Message Delivery State Machine (REQ-UI-004)
 
 ```
-                    +---> [sent] ✓
-                    |
-[draft] --send--> [sending] --success--+
-                    |                   
-                    +--error--> [failed] --retry--> [sending]
-                    
-[offline] --type--> [pending] --online--> [sending] ---> ...
+[draft] --send--> [sending] --success--> [sent] ✓
+                      |
+                      +--error--> [failed] --retry--> [sending]
 ```
+
+When offline, messages are queued internally but still show as "sending" to the user.
+The queue is persisted to localStorage and flushed when connection is restored.
 
 ### States
 
 | State | Visual | Stored In | Behavior |
 |-------|--------|-----------|----------|
-| draft | (none) | localStorage | Persisted per conversation |
-| sending | spinner | memory | Request in flight |
+| draft | (none) | localStorage | Persisted per conversation, restored on load |
+| sending | ⏳ spinner | localStorage (queue) | Waiting for server confirmation |
 | sent | ✓ checkmark | server | Confirmed by API |
-| failed | ⚠️ tap to retry | memory | Retryable |
-| pending | clock icon | localStorage | Queued for when online |
+| failed | ⚠️ tap to retry | localStorage (queue) | Retryable, persists across refresh |
 
 ### localStorage Schema (REQ-UI-011)
 
@@ -62,10 +60,10 @@ ui/
 // Draft message (one per conversation)
 localStorage.setItem(`phoenix:draft:${convId}`, "partial message text");
 
-// Pending messages (queued while offline)
-localStorage.setItem(`phoenix:pending:${convId}`, JSON.stringify([
-  { id: "local-uuid", text: "message 1", timestamp: 1234567890 },
-  { id: "local-uuid", text: "message 2", timestamp: 1234567891 }
+// Message queue (unsent messages - sending or failed)
+localStorage.setItem(`phoenix:queue:${convId}`, JSON.stringify([
+  { localId: "uuid", text: "message 1", status: "sending", timestamp: 1234567890 },
+  { localId: "uuid", text: "message 2", status: "failed", timestamp: 1234567891 }
 ]));
 
 // Last sequence ID (for reconnection)
@@ -142,66 +140,87 @@ function handleMessage(msg: Message) {
 }
 ```
 
-## Offline Message Queue (REQ-UI-004)
+## Message Queue (REQ-UI-004)
 
 ```typescript
-interface PendingMessage {
+type MessageStatus = 'sending' | 'failed';
+
+interface QueuedMessage {
   localId: string;      // UUID generated client-side
   text: string;
   images: ImageData[];
   timestamp: number;
-  retryCount: number;
+  status: MessageStatus;
 }
 
 class MessageQueue {
-  private pending: PendingMessage[] = [];
+  private messages: QueuedMessage[] = [];
   private storageKey: string;
   
   constructor(conversationId: string) {
-    this.storageKey = `phoenix:pending:${conversationId}`;
+    this.storageKey = `phoenix:queue:${conversationId}`;
     this.load();
   }
   
   private load() {
     const stored = localStorage.getItem(this.storageKey);
-    this.pending = stored ? JSON.parse(stored) : [];
+    this.messages = stored ? JSON.parse(stored) : [];
   }
   
   private save() {
-    localStorage.setItem(this.storageKey, JSON.stringify(this.pending));
+    if (this.messages.length === 0) {
+      localStorage.removeItem(this.storageKey);
+    } else {
+      localStorage.setItem(this.storageKey, JSON.stringify(this.messages));
+    }
   }
   
-  enqueue(text: string, images: ImageData[] = []) {
-    this.pending.push({
+  /** Add a new message to the queue */
+  enqueue(text: string, images: ImageData[] = []): QueuedMessage {
+    const msg: QueuedMessage = {
       localId: crypto.randomUUID(),
       text,
       images,
       timestamp: Date.now(),
-      retryCount: 0
-    });
+      status: 'sending'
+    };
+    this.messages.push(msg);
+    this.save();
+    return msg;
+  }
+  
+  /** Remove a message (on successful send) */
+  remove(localId: string) {
+    this.messages = this.messages.filter(m => m.localId !== localId);
     this.save();
   }
   
-  dequeue(localId: string) {
-    this.pending = this.pending.filter(m => m.localId !== localId);
-    this.save();
-  }
-  
-  getAll(): PendingMessage[] {
-    return [...this.pending];
-  }
-  
-  async flush(sendFn: (msg: PendingMessage) => Promise<void>) {
-    for (const msg of this.pending) {
-      try {
-        await sendFn(msg);
-        this.dequeue(msg.localId);
-      } catch (e) {
-        msg.retryCount++;
-        this.save();
-        throw e; // Stop flush on first failure
-      }
+  /** Mark a message as failed */
+  markFailed(localId: string) {
+    const msg = this.messages.find(m => m.localId === localId);
+    if (msg) {
+      msg.status = 'failed';
+      this.save();
     }
+  }
+  
+  /** Mark a failed message as sending (retry) */
+  markSending(localId: string) {
+    const msg = this.messages.find(m => m.localId === localId);
+    if (msg) {
+      msg.status = 'sending';
+      this.save();
+    }
+  }
+  
+  /** Get all queued messages */
+  getAll(): QueuedMessage[] {
+    return [...this.messages];
+  }
+  
+  /** Get messages that need to be sent */
+  getPending(): QueuedMessage[] {
+    return this.messages.filter(m => m.status === 'sending');
   }
 }
 ```
@@ -253,8 +272,7 @@ Manages offline message queue:
 
 | State | Icon | Interactive |
 |-------|------|-------------|
-| draft | (none) | editable |
-| pending | 🕐 | shows in list |
+| draft | (none) | editable in input |
 | sending | ⏳ | non-interactive |
 | sent | ✓ | normal message |
 | failed | ⚠️ | tap to retry |

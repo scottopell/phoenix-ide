@@ -66,11 +66,16 @@ AND allow user to tap to retry sending
 
 WHEN user sends message while offline
 THE SYSTEM SHALL queue the message locally
-AND display "pending" state
+AND display "sending" state (same as online send)
 AND automatically send when connection is restored
-AND persist pending messages to localStorage
+AND persist queued messages to localStorage
 
-**Rationale:** Users on unreliable networks need confidence their messages won't be lost. Clear delivery states reduce anxiety about whether input was received.
+Message states:
+- **sending** (⏳): Not yet confirmed by server (queued offline or request in flight)
+- **sent** (✓): Server returned `{queued: true}`
+- **failed** (⚠️): Request failed, tap to retry
+
+**Rationale:** Users on unreliable networks need confidence their messages won't be lost. Three simple states (sending/sent/failed) are easy to understand without exposing internal queue mechanics.
 
 ---
 
@@ -177,9 +182,9 @@ AND support keyboard navigation
 
 WHEN persisting data to localStorage
 THE SYSTEM SHALL use keys namespaced by conversation ID:
-- `phoenix:draft:{conversationId}` - draft message text
-- `phoenix:pending:{conversationId}` - array of pending messages
-- `phoenix:lastSeq:{conversationId}` - last seen sequence_id
+- `phoenix:draft:{conversationId}` - draft message text in input
+- `phoenix:queue:{conversationId}` - array of unsent messages (sending or failed)
+- `phoenix:lastSeq:{conversationId}` - last seen sequence_id for reconnection
 
 WHEN localStorage is unavailable or full
 THE SYSTEM SHALL degrade gracefully without crashing
