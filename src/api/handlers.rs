@@ -15,7 +15,7 @@ use crate::state_machine::Event;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response, Html},
     routing::{get, get_service, post},
     Json, Router,
 };
@@ -34,11 +34,16 @@ pub fn create_router(state: AppState) -> Router {
     let static_dir = std::env::current_dir()
         .unwrap_or_default()
         .join("static");
+    let dist_dir = static_dir.join("dist");
 
     Router::new()
-        // Root redirect to static index
-        .route("/", get(|| async { Redirect::permanent("/static/index.html") }))
-        // Static files
+        // Root serves the SPA
+        .route("/", get(serve_spa))
+        // Deep links to conversations
+        .route("/c/:slug", get(serve_spa))
+        // Static files from dist (the built React app)
+        .nest_service("/assets", get_service(ServeDir::new(dist_dir.join("assets"))))
+        // Legacy static files (for backwards compat)
         .nest_service("/static", get_service(ServeDir::new(static_dir)))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
@@ -73,6 +78,35 @@ pub fn create_router(state: AppState) -> Router {
         // Version
         .route("/version", get(get_version))
         .with_state(state)
+}
+
+// ============================================================
+// SPA Handler
+// ============================================================
+
+/// Serve the SPA index.html for all client-side routes
+async fn serve_spa() -> impl IntoResponse {
+    let index_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("static/dist/index.html");
+    
+    match fs::read_to_string(&index_path) {
+        Ok(content) => Html(content).into_response(),
+        Err(_) => {
+            // Fallback to legacy index.html
+            let legacy_path = std::env::current_dir()
+                .unwrap_or_default()
+                .join("static/index.html");
+            match fs::read_to_string(&legacy_path) {
+                Ok(content) => Html(content).into_response(),
+                Err(_) => (
+                    StatusCode::NOT_FOUND,
+                    Html("<h1>404 - Not Found</h1>".to_string()),
+                )
+                    .into_response(),
+            }
+        }
+    }
 }
 
 // ============================================================

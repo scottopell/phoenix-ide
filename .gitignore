@@ -1,3 +1,7 @@
 /target
 .phoenix.pid
 phoenix.log
+
+# UI
+ui/node_modules
+ui/dist

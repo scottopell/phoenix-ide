@@ -1,0 +1,216 @@
+import { useEffect, useRef, useState } from 'react';
+import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
+import { escapeHtml, renderMarkdown } from '../utils';
+
+interface MessageListProps {
+  messages: Message[];
+  convState: string;
+  stateData: ConversationState | null;
+}
+
+export function MessageList({ messages, convState, stateData }: MessageListProps) {
+  const mainRef = useRef<HTMLElement>(null);
+
+  // Scroll to bottom when messages change
+  useEffect(() => {
+    if (mainRef.current) {
+      mainRef.current.scrollTop = mainRef.current.scrollHeight;
+    }
+  }, [messages, convState]);
+
+  // Build a map of tool_use_id -> tool result for pairing
+  const toolResults = new Map<string, Message>();
+  for (const msg of messages) {
+    const type = msg.message_type || msg.type;
+    if (type === 'tool') {
+      const content = msg.content as ToolResultContent;
+      const toolUseId = content?.tool_use_id;
+      if (toolUseId) {
+        toolResults.set(toolUseId, msg);
+      }
+    }
+  }
+
+  return (
+    <main id="main-area" ref={mainRef}>
+      <section id="chat-view" className="view active">
+        <div id="messages">
+          {messages.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-state-icon">✨</div>
+              <p>Start a conversation</p>
+            </div>
+          ) : (
+            <>
+              {messages.map((msg) => {
+                const type = msg.message_type || msg.type;
+                if (type === 'user') {
+                  return <UserMessage key={msg.sequence_id} message={msg} />;
+                } else if (type === 'agent') {
+                  return (
+                    <AgentMessage
+                      key={msg.sequence_id}
+                      message={msg}
+                      toolResults={toolResults}
+                    />
+                  );
+                }
+                // Skip tool messages - they're rendered inline with their tool_use
+                return null;
+              })}
+              {convState === 'awaiting_sub_agents' && stateData && (
+                <SubAgentStatus stateData={stateData} />
+              )}
+            </>
+          )}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function UserMessage({ message }: { message: Message }) {
+  const content = message.content as { text?: string; images?: { data: string; media_type: string }[] };
+  const text = content.text || (typeof message.content === 'string' ? message.content : '');
+  const images = content.images || [];
+
+  return (
+    <div className="message user">
+      <div className="message-header">You</div>
+      <div className="message-content">
+        {escapeHtml(text)}
+        {images.length > 0 && (
+          <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
+            [{images.length} image(s)]
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AgentMessage({
+  message,
+  toolResults,
+}: {
+  message: Message;
+  toolResults: Map<string, Message>;
+}) {
+  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+
+  return (
+    <div className="message agent">
+      <div className="message-header">Phoenix</div>
+      <div className="message-content">
+        {blocks.map((block, i) => {
+          if (block.type === 'text') {
+            return (
+              <div
+                key={i}
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(block.text || '') }}
+              />
+            );
+          } else if (block.type === 'tool_use') {
+            return (
+              <ToolUseBlock
+                key={block.id || i}
+                block={block}
+                result={toolResults.get(block.id || '')}
+              />
+            );
+          }
+          return null;
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ToolUseBlock({ block, result }: { block: ContentBlock; result?: Message }) {
+  const [expanded, setExpanded] = useState(false);
+  const name = block.name || 'tool';
+  const input = block.input || {};
+  const toolId = block.id || '';
+
+  // Special handling for common tools
+  let inputStr: string;
+  if (name === 'bash' && input.command) {
+    inputStr = String(input.command);
+  } else if (name === 'think' && input.thoughts) {
+    inputStr = String(input.thoughts);
+  } else {
+    inputStr = JSON.stringify(input, null, 2);
+  }
+
+  // Get the paired result if available
+  let resultContent: ToolResultContent | null = null;
+  if (result) {
+    resultContent = result.content as ToolResultContent;
+  }
+
+  const resultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
+  const isError = resultContent?.is_error || !!resultContent?.error;
+
+  // Truncate long results
+  const maxLen = 500;
+  const truncated = resultText.length > maxLen;
+  const displayResult = truncated ? resultText.slice(0, maxLen) + '...' : resultText;
+
+  return (
+    <div className={`tool-group${expanded ? ' expanded' : ''}`} data-tool-id={toolId}>
+      <div className="tool-header" onClick={() => setExpanded(!expanded)}>
+        <span className="tool-name">{name}</span>
+        <span className="tool-chevron">▶</span>
+      </div>
+      <div className="tool-body">
+        <div className="tool-input">{inputStr}</div>
+        {resultContent && (
+          <div className={`tool-result-section${isError ? ' error' : ''}`}>
+            <div className="tool-result-label">
+              {isError ? '✗ error' : '✓ result'}
+              {truncated && <span className="tool-truncated"> (truncated)</span>}
+            </div>
+            <div className="tool-result-content">
+              {displayResult || <span className="tool-empty">(empty)</span>}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SubAgentStatus({ stateData }: { stateData: ConversationState }) {
+  const pending = stateData.pending_ids?.length ?? 0;
+  const completed = stateData.completed_results?.length ?? 0;
+  const total = pending + completed;
+
+  return (
+    <div className="subagent-status-block">
+      <div className="subagent-header">
+        <span className="subagent-title">Sub-agents</span>
+        <span className="subagent-count">
+          {completed}/{total}
+        </span>
+      </div>
+      <div className="subagent-list">
+        {Array.from({ length: completed }).map((_, i) => (
+          <div key={`completed-${i}`} className="subagent-item completed">
+            <span className="subagent-icon">✓</span>
+            <span className="subagent-label">Sub-agent {i + 1}</span>
+            <span className="subagent-status">completed</span>
+          </div>
+        ))}
+        {Array.from({ length: pending }).map((_, i) => (
+          <div key={`pending-${i}`} className="subagent-item pending">
+            <span className="subagent-icon">
+              <span className="spinner"></span>
+            </span>
+            <span className="subagent-label">Sub-agent {completed + i + 1}</span>
+            <span className="subagent-status">running...</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
