@@ -43,6 +43,7 @@ export function ConversationListPage() {
         connectionState="connected"
         connectionAttempt={0}
         nextRetryIn={null}
+        contextWindowUsed={0}
       />
       <BreadcrumbBar breadcrumbs={[]} visible={false} />
       <main id="main-area">

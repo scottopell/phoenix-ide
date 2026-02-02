@@ -40,6 +40,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             messages,
             agent_working,
             last_sequence_id,
+            context_window_size,
         } => (
             "init",
             json!({
@@ -47,7 +48,8 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 "conversation": conversation,
                 "messages": messages,
                 "agent_working": agent_working,
-                "last_sequence_id": last_sequence_id
+                "last_sequence_id": last_sequence_id,
+                "context_window_size": context_window_size
             }),
         ),
         SseEvent::Message { message } => (

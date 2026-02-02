@@ -73,6 +73,7 @@ export interface SseInitData {
   messages: Message[];
   agent_working: boolean;
   last_sequence_id: number;
+  context_window_size?: number;
 }
 
 export interface SseMessageData {
@@ -106,7 +107,7 @@ export const api = {
     return (await resp.json()).conversation;
   },
 
-  async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean }> {
+  async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; context_window_size: number }> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');

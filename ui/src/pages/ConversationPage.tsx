@@ -20,6 +20,7 @@ export function ConversationPage() {
   const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
   const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [contextWindowUsed, setContextWindowUsed] = useState(0);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set()); // Track localIds being sent
 
@@ -90,6 +91,9 @@ export function ConversationPage() {
           const { type: _, ...initStateData } = initState;
           setStateData(Object.keys(initStateData).length > 0 ? initStateData as ConversationState : null);
           setAgentWorking(initData.agent_working || false);
+          if (initData.context_window_size !== undefined) {
+            setContextWindowUsed(initData.context_window_size);
+          }
           updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
           break;
         }
@@ -105,6 +109,15 @@ export function ConversationPage() {
               }
               return [...prev, msg];
             });
+            // Update context window usage from message usage data
+            if (msg.usage_data) {
+              const usage = msg.usage_data;
+              const msgTokens = (usage.input_tokens || 0) + (usage.output_tokens || 0) +
+                (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
+              if (msgTokens > 0) {
+                setContextWindowUsed(prev => prev + msgTokens);
+              }
+            }
             // New user message = new turn, reset breadcrumbs
             if (msg.message_type === 'user' || msg.type === 'user') {
               setBreadcrumbs([{ type: 'user', label: 'User' }]);
@@ -171,6 +184,7 @@ export function ConversationPage() {
         setConversation(result.conversation);
         setMessages(result.messages);
         setAgentWorking(result.agent_working);
+        setContextWindowUsed(result.context_window_size || 0);
         
         // Set conversation ID for hooks - this triggers the SSE connection
         setConversationId(result.conversation.id);
@@ -282,6 +296,7 @@ export function ConversationPage() {
           connectionState="disconnected"
           connectionAttempt={0}
           nextRetryIn={null}
+          contextWindowUsed={0}
         />
         <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
@@ -307,6 +322,7 @@ export function ConversationPage() {
           connectionState="connecting"
           connectionAttempt={0}
           nextRetryIn={null}
+          contextWindowUsed={0}
         />
         <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
@@ -331,6 +347,7 @@ export function ConversationPage() {
         connectionState={connectionInfo.state}
         connectionAttempt={connectionInfo.attempt}
         nextRetryIn={connectionInfo.nextRetryIn}
+        contextWindowUsed={contextWindowUsed}
       />
       <BreadcrumbBar breadcrumbs={breadcrumbs} visible={true} />
       <MessageList

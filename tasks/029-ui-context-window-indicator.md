@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p3
-status: ready
+status: done
 ---
 
 # Context Window Usage Indicator
@@ -16,12 +16,12 @@ The backend tracks token usage per message (REQ-API-003 returns `context_window_
 
 ## Acceptance Criteria
 
-- [ ] Visual indicator showing context usage (progress bar or percentage)
-- [ ] Display in conversation header or status bar
-- [ ] Warning state when approaching limit (e.g., >80%)
-- [ ] Critical state near limit (e.g., >95%)
-- [ ] Tooltip showing exact token counts
-- [ ] Update after each message
+- [x] Visual indicator showing context usage (progress bar or percentage)
+- [x] Display in conversation header or status bar
+- [x] Warning state when approaching limit (e.g., >80%)
+- [x] Critical state near limit (e.g., >95%)
+- [x] Tooltip showing exact token counts
+- [x] Update after each message
 
 ## Notes
 

@@ -913,3 +913,54 @@ html, body {
 .failed-message-retry:hover {
   background: #d64545;
 }
+
+/* Context Window Indicator */
+#state-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.context-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: help;
+}
+
+.context-bar {
+  width: 40px;
+  height: 6px;
+  background: var(--bg-primary);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.context-fill {
+  height: 100%;
+  background: var(--accent-green);
+  border-radius: 3px;
+  transition: width 0.3s ease, background-color 0.3s ease;
+}
+
+.context-indicator.warning .context-fill {
+  background: var(--accent-yellow);
+}
+
+.context-indicator.critical .context-fill {
+  background: var(--accent-red);
+}
+
+.context-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.context-indicator.warning .context-label {
+  color: var(--accent-yellow);
+}
+
+.context-indicator.critical .context-label {
+  color: var(--accent-red);
+}

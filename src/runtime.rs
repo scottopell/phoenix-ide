@@ -76,6 +76,7 @@ pub enum SseEvent {
         messages: Vec<serde_json::Value>,
         agent_working: bool,
         last_sequence_id: i64,
+        context_window_size: u64,
     },
     Message {
         message: serde_json::Value,

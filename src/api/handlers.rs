@@ -264,6 +264,12 @@ async fn stream_conversation(
 
     let last_sequence_id = state.runtime.db().get_last_sequence_id(&id).unwrap_or(0);
 
+    let context_window_size = messages
+        .iter()
+        .filter_map(|m| m.usage_data.as_ref())
+        .next_back()
+        .map_or(0, crate::db::UsageData::context_window_used);
+
     let json_msgs: Vec<Value> = messages
         .iter()
         .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
@@ -282,6 +288,7 @@ async fn stream_conversation(
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
         last_sequence_id,
+        context_window_size,
     };
 
     Ok(sse_stream(init_event, broadcast_rx))
