@@ -134,3 +134,38 @@ Do NOT use `cargo run` or start the binary directly. The server requires the LLM
 configuration which `./dev.py up` provides automatically from `/exe.dev/shelley.json`.
 
 If you see API key errors, you're not using dev.py.
+
+---
+
+## Production Deployment
+
+```bash
+# Build and deploy
+./dev.py prod build [version]   # Build from git tag or HEAD
+./dev.py prod deploy [version]  # Build + install systemd service + start
+./dev.py prod status            # Show production service status  
+./dev.py prod stop              # Stop production service
+```
+
+### How it works
+
+- **Embedded UI**: React UI is embedded in the binary using `rust-embed`
+- **Static binary**: Uses musl target for fully static ~9MB binary
+- **Git worktree**: Builds in `~/.phoenix-ide-build` to avoid disturbing main worktree
+- **Systemd service**: `phoenix-ide` runs on port 7331, database at `~/.phoenix-ide/prod.db`
+
+### Example workflows
+
+```bash
+# Deploy current HEAD
+./dev.py prod deploy
+
+# Tag and deploy a release
+git tag v0.1.0
+./dev.py prod deploy v0.1.0
+
+# Roll back
+./dev.py prod deploy v0.0.9
+```
+
+Binaries are built on-demand from git tags—no need to store release artifacts.
