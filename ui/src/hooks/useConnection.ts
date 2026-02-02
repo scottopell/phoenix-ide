@@ -54,36 +54,10 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
     conversationIdRef.current = conversationId;
   }, [conversationId]);
 
-  // Load last sequence ID from localStorage on mount
-  useEffect(() => {
-    if (conversationId) {
-      try {
-        const stored = localStorage.getItem(`phoenix:lastSeq:${conversationId}`);
-        if (stored) {
-          const id = parseInt(stored, 10);
-          if (!isNaN(id)) {
-            lastSequenceIdRef.current = id;
-            setLastSequenceId(id);
-          }
-        }
-      } catch (error) {
-        console.warn('Error reading lastSeq from localStorage:', error);
-      }
-    }
-  }, [conversationId]);
-
-  // Track sequence ID from messages
+  // Track sequence ID from messages (for reconnection within same session)
   const updateSequenceId = useCallback((seqId: number) => {
     lastSequenceIdRef.current = seqId;
     setLastSequenceId(seqId);
-    const convId = conversationIdRef.current;
-    if (convId) {
-      try {
-        localStorage.setItem(`phoenix:lastSeq:${convId}`, String(seqId));
-      } catch (error) {
-        console.warn('Error saving lastSeq to localStorage:', error);
-      }
-    }
   }, []);
 
   // Get current context for state machine
