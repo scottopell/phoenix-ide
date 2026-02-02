@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
+import type { QueuedMessage } from '../hooks';
 import { escapeHtml, renderMarkdown } from '../utils';
 
 interface MessageListProps {
   messages: Message[];
+  queuedMessages: QueuedMessage[];
   convState: string;
   stateData: ConversationState | null;
+  onRetry: (localId: string) => void;
 }
 
-export function MessageList({ messages, convState, stateData }: MessageListProps) {
+export function MessageList({ messages, queuedMessages, convState, stateData, onRetry }: MessageListProps) {
   const mainRef = useRef<HTMLElement>(null);
 
   // Scroll to bottom when messages change
@@ -16,7 +19,7 @@ export function MessageList({ messages, convState, stateData }: MessageListProps
     if (mainRef.current) {
       mainRef.current.scrollTop = mainRef.current.scrollHeight;
     }
-  }, [messages, convState]);
+  }, [messages, queuedMessages, convState]);
 
   // Build a map of tool_use_id -> tool result for pairing
   const toolResults = new Map<string, Message>();
@@ -31,11 +34,14 @@ export function MessageList({ messages, convState, stateData }: MessageListProps
     }
   }
 
+  // Get queued messages that are in "sending" state (not failed - those show in InputArea)
+  const sendingMessages = queuedMessages.filter(m => m.status === 'sending');
+
   return (
     <main id="main-area" ref={mainRef}>
       <section id="chat-view" className="view active">
         <div id="messages">
-          {messages.length === 0 ? (
+          {messages.length === 0 && sendingMessages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-state-icon">✨</div>
               <p>Start a conversation</p>
@@ -58,6 +64,10 @@ export function MessageList({ messages, convState, stateData }: MessageListProps
                 // Skip tool messages - they're rendered inline with their tool_use
                 return null;
               })}
+              {/* Render queued messages (sending state) */}
+              {sendingMessages.map((msg) => (
+                <QueuedUserMessage key={msg.localId} message={msg} onRetry={onRetry} />
+              ))}
               {convState === 'awaiting_sub_agents' && stateData && (
                 <SubAgentStatus stateData={stateData} />
               )}
@@ -76,12 +86,51 @@ function UserMessage({ message }: { message: Message }) {
 
   return (
     <div className="message user">
-      <div className="message-header">You</div>
+      <div className="message-header">
+        <span>You</span>
+        <span className="message-status sent" title="Sent">✓</span>
+      </div>
       <div className="message-content">
         {escapeHtml(text)}
         {images.length > 0 && (
           <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
             [{images.length} image(s)]
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
+  const isFailed = message.status === 'failed';
+  const isSending = message.status === 'sending';
+
+  return (
+    <div className={`message user ${isFailed ? 'failed' : ''}`}>
+      <div className="message-header">
+        <span>You</span>
+        {isSending && (
+          <span className="message-status sending" title="Sending...">
+            <span className="sending-spinner">⏳</span>
+          </span>
+        )}
+        {isFailed && (
+          <span 
+            className="message-status failed" 
+            title="Failed - tap to retry"
+            onClick={() => onRetry(message.localId)}
+            style={{ cursor: 'pointer' }}
+          >
+            ⚠️
+          </span>
+        )}
+      </div>
+      <div className="message-content">
+        {escapeHtml(message.text)}
+        {message.images.length > 0 && (
+          <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
+            [{message.images.length} image(s)]
           </div>
         )}
       </div>

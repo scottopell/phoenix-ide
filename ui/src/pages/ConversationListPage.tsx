@@ -40,7 +40,9 @@ export function ConversationListPage() {
         conversation={null}
         convState="idle"
         stateData={null}
-        eventSourceReady={true}
+        connectionState="connected"
+        connectionAttempt={0}
+        nextRetryIn={null}
       />
       <BreadcrumbBar breadcrumbs={[]} visible={false} />
       <main id="main-area">

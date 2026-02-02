@@ -23,6 +23,7 @@
   --state-bar-height: 44px;
   --breadcrumb-height: 36px;
   --input-area-height: 60px;
+  --offline-banner-height: 36px;
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
 }
 
@@ -751,4 +752,164 @@ html, body {
 
 .subagent-item.pending .subagent-status {
   color: var(--accent-yellow);
+}
+
+/* Connection States */
+.dot.reconnecting {
+  background: var(--accent-yellow);
+  animation: pulse 1s infinite;
+}
+
+.dot.offline {
+  background: var(--accent-red);
+}
+
+.dot.reconnected {
+  background: var(--accent-green);
+  animation: pulse-fast 0.5s ease-out;
+}
+
+@keyframes pulse-fast {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.3); }
+  100% { transform: scale(1); }
+}
+
+/* Offline Banner */
+.offline-banner {
+  position: fixed;
+  top: var(--state-bar-height);
+  left: 0;
+  right: 0;
+  height: var(--offline-banner-height, 36px);
+  background: var(--accent-red);
+  color: white;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  z-index: 100;
+  animation: slide-down 0.2s ease-out;
+}
+
+/* Adjust breadcrumb position when offline banner is visible */
+.offline-banner + #breadcrumb-bar,
+#app:has(.offline-banner) #breadcrumb-bar {
+  top: calc(var(--state-bar-height) + var(--offline-banner-height, 36px));
+}
+
+/* Adjust main area when offline banner is visible */
+#app:has(.offline-banner) #main-area {
+  margin-top: calc(var(--state-bar-height) + var(--breadcrumb-height) + var(--offline-banner-height, 36px));
+}
+
+@keyframes slide-down {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.offline-banner-icon {
+  font-size: 16px;
+}
+
+.offline-banner-text {
+  flex: 1;
+}
+
+/* Message Status Indicators */
+.message-header {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.message-status {
+  font-size: 14px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.message-status.sent {
+  color: var(--accent-green);
+}
+
+.message-status.sending {
+  color: var(--text-muted);
+}
+
+.message-status.failed {
+  color: var(--accent-red);
+}
+
+.sending-spinner {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+/* Failed message in message list */
+.message.user.failed {
+  border-color: var(--accent-red);
+  opacity: 0.8;
+}
+
+/* Failed Messages Section in Input Area */
+.failed-messages {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 8px;
+}
+
+.failed-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(248, 81, 73, 0.1);
+  border: 1px solid var(--accent-red);
+  border-radius: 6px;
+  margin-bottom: 4px;
+}
+
+.failed-message:last-child {
+  margin-bottom: 0;
+}
+
+.failed-message-icon {
+  font-size: 14px;
+}
+
+.failed-message-text {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failed-message-retry {
+  padding: 4px 8px;
+  background: var(--accent-red);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.failed-message-retry:hover {
+  background: #d64545;
 }

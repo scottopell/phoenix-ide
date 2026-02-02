@@ -5,23 +5,29 @@ import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
+import { useDraft, useMessageQueue, useConnection } from '../hooks';
 import type { Breadcrumb } from '../types';
 
 export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
 
+  const [conversationId, setConversationId] = useState<string | undefined>(undefined);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [convState, setConvState] = useState('idle');
   const [stateData, setStateData] = useState<ConversationState | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
   const [agentWorking, setAgentWorking] = useState(false);
-  const [eventSourceReady, setEventSourceReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const conversationIdRef = useRef<string | null>(null);
+  const sendingMessagesRef = useRef<Set<string>>(new Set()); // Track localIds being sent
+
+  // Draft management
+  const [draft, setDraft, clearDraft] = useDraft(conversationId);
+
+  // Message queue management
+  const { queuedMessages, enqueue, markSent, markFailed, retry } = useMessageQueue(conversationId);
 
   // Update breadcrumbs from state
   const updateBreadcrumbsFromState = useCallback((state: string, data: ConversationState | null) => {
@@ -71,7 +77,7 @@ export function ConversationPage() {
     });
   }, []);
 
-  // Handle SSE events - stable callback using refs
+  // Handle SSE events
   const handleSseEvent = useCallback(
     (eventType: SseEventType, data: SseEventData) => {
       switch (eventType) {
@@ -84,7 +90,6 @@ export function ConversationPage() {
           const { type: _, ...initStateData } = initState;
           setStateData(Object.keys(initStateData).length > 0 ? initStateData as ConversationState : null);
           setAgentWorking(initData.agent_working || false);
-          setEventSourceReady(true);
           updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
           break;
         }
@@ -93,7 +98,13 @@ export function ConversationPage() {
           const msgData = data as SseMessageData;
           const msg = msgData.message;
           if (msg) {
-            setMessages((prev) => [...prev, msg]);
+            setMessages((prev) => {
+              // Deduplicate by sequence_id
+              if (prev.some(m => m.sequence_id === msg.sequence_id)) {
+                return prev;
+              }
+              return [...prev, msg];
+            });
             // New user message = new turn, reset breadcrumbs
             if (msg.message_type === 'user' || msg.type === 'user') {
               setBreadcrumbs([{ type: 'user', label: 'User' }]);
@@ -120,43 +131,34 @@ export function ConversationPage() {
           break;
 
         case 'disconnected':
-          setEventSourceReady(false);
-          // Try to reconnect after a delay
-          setTimeout(() => {
-            const convId = conversationIdRef.current;
-            if (convId) {
-              connectToConversation(convId);
-            }
-          }, 2000);
+          // Connection hook handles reconnection, no action needed here
           break;
       }
     },
     [updateBreadcrumbsFromState]
   );
 
-  // Connect to SSE stream - stable callback
-  const connectToConversation = useCallback(
-    (convId: string) => {
-      // Close existing connection
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
-      
-      conversationIdRef.current = convId;
-      setEventSourceReady(false);
+  // Connection management with automatic reconnection
+  const connectionInfo = useConnection({
+    conversationId,
+    onEvent: handleSseEvent,
+  });
 
-      const es = api.streamConversation(convId, handleSseEvent);
-      eventSourceRef.current = es;
-    },
-    [handleSseEvent]
-  );
+  const isOffline = connectionInfo.state === 'offline' || connectionInfo.state === 'reconnecting';
+  const isConnected = connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
 
-  // Load conversation by slug
+  // Load conversation by slug (just to get the ID)
   useEffect(() => {
     if (!slug) {
       navigate('/');
       return;
     }
+
+    // Reset state for new conversation
+    setConversationId(undefined);
+    setConversation(null);
+    setMessages([]);
+    setError(null);
 
     let cancelled = false;
 
@@ -165,13 +167,13 @@ export function ConversationPage() {
         const result = await api.getConversationBySlug(slug);
         if (cancelled) return;
         
-        // Set initial data from REST API while SSE connects
+        // Set initial data from REST API
         setConversation(result.conversation);
         setMessages(result.messages);
         setAgentWorking(result.agent_working);
         
-        // Connect to SSE for live updates
-        connectToConversation(result.conversation.id);
+        // Set conversation ID for hooks - this triggers the SSE connection
+        setConversationId(result.conversation.id);
       } catch (err) {
         if (cancelled) return;
         console.error('Failed to load conversation:', err);
@@ -181,37 +183,80 @@ export function ConversationPage() {
 
     loadConversation();
 
-    // Cleanup on unmount
     return () => {
       cancelled = true;
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
     };
-  }, [slug, navigate, connectToConversation]);
+  }, [slug, navigate]);
 
-  // Send message
-  const handleSend = async (text: string) => {
-    if (!conversation || agentWorking) return;
+  // Send a message (either new or retry)
+  const sendMessage = useCallback(async (localId: string, text: string, images: { data: string; media_type: string }[] = []) => {
+    if (!conversationId) return;
 
-    setAgentWorking(true);
-    setBreadcrumbs([{ type: 'user', label: 'User' }]);
+    // Mark as being sent
+    sendingMessagesRef.current.add(localId);
 
     try {
-      await api.sendMessage(conversation.id, text);
+      await api.sendMessage(conversationId, text, images);
+      markSent(localId);
+      setAgentWorking(true);
+      setBreadcrumbs([{ type: 'user', label: 'User' }]);
     } catch (err) {
       console.error('Failed to send message:', err);
-      setAgentWorking(false);
+      markFailed(localId);
+    } finally {
+      sendingMessagesRef.current.delete(localId);
+    }
+  }, [conversationId, markSent, markFailed]);
+
+  // Send queued messages when connection is restored
+  useEffect(() => {
+    if (!isConnected || !conversationId) return;
+
+    const pending = queuedMessages.filter(
+      m => m.status === 'sending' && !sendingMessagesRef.current.has(m.localId)
+    );
+
+    for (const msg of pending) {
+      sendMessage(msg.localId, msg.text, msg.images);
+    }
+  }, [isConnected, conversationId, queuedMessages, sendMessage]);
+
+  // Handle send from input
+  const handleSend = (text: string) => {
+    if (!conversationId) return;
+
+    // Clear draft
+    clearDraft();
+
+    // Enqueue the message (shows immediately with sending state)
+    const msg = enqueue(text);
+
+    // If we're connected, send immediately
+    if (isConnected) {
+      sendMessage(msg.localId, text);
+    }
+    // If offline, message will be sent when connection is restored (via useEffect above)
+  };
+
+  // Handle retry
+  const handleRetry = (localId: string) => {
+    const msg = queuedMessages.find(m => m.localId === localId);
+    if (!msg) return;
+
+    retry(localId);
+    
+    if (isConnected) {
+      sendMessage(localId, msg.text, msg.images);
     }
   };
 
   // Cancel operation
   const handleCancel = async () => {
-    if (!conversation || !agentWorking) return;
+    if (!conversationId || !agentWorking) return;
     if (convState.startsWith('cancelling')) return;
 
     try {
-      await api.cancelConversation(conversation.id);
+      await api.cancelConversation(conversationId);
     } catch (err) {
       console.error('Failed to cancel:', err);
     }
@@ -220,7 +265,14 @@ export function ConversationPage() {
   if (error) {
     return (
       <div id="app">
-        <StateBar conversation={null} convState="error" stateData={null} eventSourceReady={false} />
+        <StateBar
+          conversation={null}
+          convState="error"
+          stateData={null}
+          connectionState="disconnected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+        />
         <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
           <div className="empty-state">
@@ -238,7 +290,14 @@ export function ConversationPage() {
   if (!conversation) {
     return (
       <div id="app">
-        <StateBar conversation={null} convState="idle" stateData={null} eventSourceReady={false} />
+        <StateBar
+          conversation={null}
+          convState="idle"
+          stateData={null}
+          connectionState="connecting"
+          connectionAttempt={0}
+          nextRetryIn={null}
+        />
         <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
           <div className="empty-state">
@@ -259,16 +318,29 @@ export function ConversationPage() {
         conversation={conversation}
         convState={convState}
         stateData={stateData}
-        eventSourceReady={eventSourceReady}
+        connectionState={connectionInfo.state}
+        connectionAttempt={connectionInfo.attempt}
+        nextRetryIn={connectionInfo.nextRetryIn}
       />
       <BreadcrumbBar breadcrumbs={breadcrumbs} visible={true} />
-      <MessageList messages={messages} convState={convState} stateData={stateData} />
+      <MessageList
+        messages={messages}
+        queuedMessages={queuedMessages}
+        convState={convState}
+        stateData={stateData}
+        onRetry={handleRetry}
+      />
       <InputArea
+        draft={draft}
+        setDraft={setDraft}
         canSend={canSend}
         agentWorking={agentWorking}
         isCancelling={isCancelling}
+        isOffline={isOffline}
+        queuedMessages={queuedMessages}
         onSend={handleSend}
         onCancel={handleCancel}
+        onRetry={handleRetry}
       />
     </div>
   );
