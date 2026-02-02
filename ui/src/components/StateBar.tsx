@@ -123,7 +123,10 @@ export function StateBar({
           )}
           <div id="conversation-info">
             {conversation ? (
-              <Link to="/" id="conv-slug">{conversation.slug}</Link>
+              <Link to="/" id="conv-slug" title="Back to conversations">
+                <span className="back-arrow">←</span>
+                {conversation.slug}
+              </Link>
             ) : (
               <span id="conv-slug">—</span>
             )}

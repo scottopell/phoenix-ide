@@ -103,10 +103,23 @@ html, body {
   font-size: 13px;
   color: var(--text-secondary);
   cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 #conv-slug:hover {
   color: var(--accent-blue);
+}
+
+#conv-slug .back-arrow {
+  font-size: 16px;
+  opacity: 0.7;
+}
+
+#conv-slug:hover .back-arrow {
+  opacity: 1;
 }
 
 /* Breadcrumb Bar */
