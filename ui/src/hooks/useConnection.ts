@@ -34,6 +34,7 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
   const [lastSequenceId, setLastSequenceId] = useState<number | null>(null);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
 
+  // Refs for values that shouldn't trigger effect re-runs
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
@@ -43,11 +44,12 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
   const onEventRef = useRef(onEvent);
   const conversationIdRef = useRef(conversationId);
 
-  // Keep refs up to date
+  // Keep onEvent ref up to date
   useEffect(() => {
     onEventRef.current = onEvent;
   }, [onEvent]);
 
+  // Keep conversationId ref up to date
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
@@ -83,6 +85,31 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
       }
     }
   }, []);
+
+  // Get current context for state machine
+  const getContext = useCallback((): TransitionContext => ({
+    browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+  }), []);
+
+  // Dispatch function - we'll keep a ref to avoid effect re-runs
+  const dispatchImpl = useCallback((input: ConnectionInput) => {
+    const ctx = getContext();
+    setMachineState((current) => {
+      const result = transition(current, input, ctx);
+      // Execute effects after state update
+      // Using setTimeout to avoid state update during render
+      if (result.effects.length > 0) {
+        setTimeout(() => executeEffectsRef.current(result.effects), 0);
+      }
+      return result.state;
+    });
+  }, [getContext]);
+
+  // Stable ref to dispatch - use this in effects that shouldn't re-run on callback changes
+  const dispatchRef = useRef(dispatchImpl);
+  useEffect(() => {
+    dispatchRef.current = dispatchImpl;
+  }, [dispatchImpl]);
 
   // Execute effects from state machine transitions
   const executeEffects = useCallback((effects: ConnectionEffect[]) => {
@@ -123,7 +150,7 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
             }
 
             // Signal successful connection to state machine
-            dispatch({ type: 'SSE_OPEN' });
+            dispatchRef.current({ type: 'SSE_OPEN' });
             onEventRef.current('init', data);
           });
 
@@ -153,7 +180,7 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
           });
 
           es.addEventListener('error', () => {
-            dispatch({ type: 'SSE_ERROR' });
+            dispatchRef.current({ type: 'SSE_ERROR' });
             onEventRef.current('disconnected', {});
           });
           break;
@@ -193,7 +220,7 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
           // Schedule retry
           retryTimeoutRef.current = window.setTimeout(() => {
             retryTimeoutRef.current = null;
-            dispatch({ type: 'RETRY_TIMER_FIRED' });
+            dispatchRef.current({ type: 'RETRY_TIMER_FIRED' });
           }, effect.delayMs);
           break;
         }
@@ -204,7 +231,7 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
           }
           reconnectedTimeoutRef.current = window.setTimeout(() => {
             reconnectedTimeoutRef.current = null;
-            dispatch({ type: 'RECONNECTED_DISPLAY_DONE' });
+            dispatchRef.current({ type: 'RECONNECTED_DISPLAY_DONE' });
           }, RECONNECTED_DISPLAY_MS);
           break;
         }
@@ -229,29 +256,16 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
     }
   }, [updateSequenceId]);
 
-  // Get current context for state machine
-  const getContext = useCallback((): TransitionContext => ({
-    browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
-  }), []);
-
-  // Dispatch an input to the state machine
-  const dispatch = useCallback((input: ConnectionInput) => {
-    const ctx = getContext();
-    setMachineState((current) => {
-      const result = transition(current, input, ctx);
-      // Execute effects after state update
-      // Using setTimeout to avoid state update during render
-      if (result.effects.length > 0) {
-        setTimeout(() => executeEffects(result.effects), 0);
-      }
-      return result.state;
-    });
-  }, [executeEffects, getContext]);
+  // Stable ref to executeEffects
+  const executeEffectsRef = useRef(executeEffects);
+  useEffect(() => {
+    executeEffectsRef.current = executeEffects;
+  }, [executeEffects]);
 
   // Handle online/offline events
   useEffect(() => {
-    const handleOnline = () => dispatch({ type: 'BROWSER_ONLINE' });
-    const handleOffline = () => dispatch({ type: 'BROWSER_OFFLINE' });
+    const handleOnline = () => dispatchRef.current({ type: 'BROWSER_ONLINE' });
+    const handleOffline = () => dispatchRef.current({ type: 'BROWSER_OFFLINE' });
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -260,22 +274,22 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, [dispatch]);
+  }, []); // No dependencies - handlers use refs
 
   // Connect when conversationId changes
   useEffect(() => {
     if (conversationId) {
       // Reset for new conversation
       seenIdsRef.current.clear();
-      dispatch({ type: 'CONNECT' });
+      dispatchRef.current({ type: 'CONNECT' });
     } else {
-      dispatch({ type: 'DISCONNECT' });
+      dispatchRef.current({ type: 'DISCONNECT' });
     }
 
     return () => {
-      dispatch({ type: 'DISCONNECT' });
+      dispatchRef.current({ type: 'DISCONNECT' });
     };
-  }, [conversationId, dispatch]);
+  }, [conversationId]); // Only depends on conversationId - dispatch accessed via ref
 
   return {
     state: machineState.state,

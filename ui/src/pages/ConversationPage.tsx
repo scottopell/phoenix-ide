@@ -188,6 +188,12 @@ export function ConversationPage() {
     };
   }, [slug, navigate]);
 
+  // Refs for queue callbacks to avoid effect re-runs
+  const markSentRef = useRef(markSent);
+  const markFailedRef = useRef(markFailed);
+  useEffect(() => { markSentRef.current = markSent; }, [markSent]);
+  useEffect(() => { markFailedRef.current = markFailed; }, [markFailed]);
+
   // Send a message (either new or retry)
   const sendMessage = useCallback(async (localId: string, text: string, images: { data: string; media_type: string }[] = []) => {
     if (!conversationId) return;
@@ -197,16 +203,20 @@ export function ConversationPage() {
 
     try {
       await api.sendMessage(conversationId, text, images);
-      markSent(localId);
+      markSentRef.current(localId);
       setAgentWorking(true);
       setBreadcrumbs([{ type: 'user', label: 'User' }]);
     } catch (err) {
       console.error('Failed to send message:', err);
-      markFailed(localId);
+      markFailedRef.current(localId);
     } finally {
       sendingMessagesRef.current.delete(localId);
     }
-  }, [conversationId, markSent, markFailed]);
+  }, [conversationId]); // Only depends on conversationId - callbacks accessed via refs
+
+  // Stable ref to sendMessage for effect
+  const sendMessageRef = useRef(sendMessage);
+  useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
   // Send queued messages when connection is restored
   useEffect(() => {
@@ -217,9 +227,9 @@ export function ConversationPage() {
     );
 
     for (const msg of pending) {
-      sendMessage(msg.localId, msg.text, msg.images);
+      sendMessageRef.current(msg.localId, msg.text, msg.images);
     }
-  }, [isConnected, conversationId, queuedMessages, sendMessage]);
+  }, [isConnected, conversationId, queuedMessages]); // sendMessage accessed via ref
 
   // Handle send from input
   const handleSend = (text: string) => {

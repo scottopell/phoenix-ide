@@ -1,7 +1,7 @@
 ---
 created: 2026-02-02
 priority: p3
-status: ready
+status: done
 ---
 
 # Clean Up useEffect Dependency Patterns
@@ -67,9 +67,9 @@ useEffect(() => {
 
 ## Acceptance Criteria
 
-- [ ] No ESLint warnings about missing dependencies
-- [ ] Callbacks don't cause unnecessary re-execution of effects
-- [ ] Pattern is consistent across hooks
+- [x] No ESLint warnings about missing dependencies
+- [x] Callbacks don't cause unnecessary re-execution of effects
+- [x] Pattern is consistent across hooks
 
 ## Affected Files
 
