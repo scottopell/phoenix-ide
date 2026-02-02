@@ -1,18 +1,17 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { SseEventType, SseEventData, SseInitData, SseMessageData } from '../api';
+import {
+  ConnectionState,
+  ConnectionMachineState,
+  ConnectionInput,
+  ConnectionEffect,
+  TransitionContext,
+  transition,
+  initialState,
+  RECONNECTED_DISPLAY_MS,
+} from './connectionMachine';
 
-const BACKOFF_BASE = 1000;      // 1 second
-const BACKOFF_MAX = 30000;      // 30 seconds
-const OFFLINE_THRESHOLD = 3;   // Show "offline" after N failures
-const RECONNECTED_DISPLAY_MS = 2000;  // How long to show "reconnected" banner
-
-export type ConnectionState = 
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'reconnecting'
-  | 'offline'
-  | 'reconnected';  // Brief state after recovery
+export type { ConnectionState } from './connectionMachine';
 
 export interface ConnectionInfo {
   state: ConnectionState;
@@ -26,36 +25,32 @@ interface UseConnectionOptions {
   onEvent: (eventType: SseEventType, data: SseEventData) => void;
 }
 
-function getBackoffDelay(attempt: number): number {
-  return Math.min(BACKOFF_BASE * Math.pow(2, attempt - 1), BACKOFF_MAX);
-}
-
 /**
  * Hook for managing SSE connection lifecycle with reconnection handling.
- * Features:
- * - Exponential backoff (1s, 2s, 4s, ... max 30s)
- * - Sequence tracking for reconnection
- * - navigator.onLine integration
- * - Countdown timer for next retry
+ * Uses a pure state machine (connectionMachine.ts) for testable state transitions.
  */
 export function useConnection({ conversationId, onEvent }: UseConnectionOptions): ConnectionInfo {
-  const [state, setState] = useState<ConnectionState>('disconnected');
-  const [attempt, setAttempt] = useState(0);
-  const [nextRetryIn, setNextRetryIn] = useState<number | null>(null);
+  const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [lastSequenceId, setLastSequenceId] = useState<number | null>(null);
+  const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
+  const reconnectedTimeoutRef = useRef<number | null>(null);
   const lastSequenceIdRef = useRef<number | null>(null);
   const seenIdsRef = useRef<Set<number>>(new Set());
-  const reconnectedTimeoutRef = useRef<number | null>(null);
   const onEventRef = useRef(onEvent);
+  const conversationIdRef = useRef(conversationId);
 
-  // Keep onEvent ref up to date
+  // Keep refs up to date
   useEffect(() => {
     onEventRef.current = onEvent;
   }, [onEvent]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
 
   // Load last sequence ID from localStorage on mount
   useEffect(() => {
@@ -79,190 +74,184 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
   const updateSequenceId = useCallback((seqId: number) => {
     lastSequenceIdRef.current = seqId;
     setLastSequenceId(seqId);
-    if (conversationId) {
+    const convId = conversationIdRef.current;
+    if (convId) {
       try {
-        localStorage.setItem(`phoenix:lastSeq:${conversationId}`, String(seqId));
+        localStorage.setItem(`phoenix:lastSeq:${convId}`, String(seqId));
       } catch (error) {
         console.warn('Error saving lastSeq to localStorage:', error);
       }
     }
-  }, [conversationId]);
-
-  // Clear timers helper
-  const clearTimers = useCallback(() => {
-    if (retryTimeoutRef.current !== null) {
-      clearTimeout(retryTimeoutRef.current);
-      retryTimeoutRef.current = null;
-    }
-    if (countdownIntervalRef.current !== null) {
-      clearInterval(countdownIntervalRef.current);
-      countdownIntervalRef.current = null;
-    }
-    if (reconnectedTimeoutRef.current !== null) {
-      clearTimeout(reconnectedTimeoutRef.current);
-      reconnectedTimeoutRef.current = null;
-    }
-    setNextRetryIn(null);
   }, []);
 
-  // Close connection helper
-  const closeConnection = useCallback(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+  // Execute effects from state machine transitions
+  const executeEffects = useCallback((effects: ConnectionEffect[]) => {
+    for (const effect of effects) {
+      switch (effect.type) {
+        case 'OPEN_SSE': {
+          const convId = conversationIdRef.current;
+          if (!convId) break;
+
+          // Close existing connection first
+          if (eventSourceRef.current) {
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+          }
+
+          // Build URL with after parameter if we have a sequence ID
+          let url = `/api/conversations/${convId}/stream`;
+          if (lastSequenceIdRef.current !== null) {
+            url += `?after=${lastSequenceIdRef.current}`;
+          }
+
+          const es = new EventSource(url);
+          eventSourceRef.current = es;
+
+          es.addEventListener('init', (e) => {
+            const data = JSON.parse((e as MessageEvent).data) as SseInitData;
+
+            // Track sequence ID from init
+            if (data.last_sequence_id !== undefined) {
+              updateSequenceId(data.last_sequence_id);
+            }
+
+            // Track sequence IDs from messages to dedupe
+            if (data.messages) {
+              for (const msg of data.messages) {
+                seenIdsRef.current.add(msg.sequence_id);
+              }
+            }
+
+            // Signal successful connection to state machine
+            dispatch({ type: 'SSE_OPEN' });
+            onEventRef.current('init', data);
+          });
+
+          es.addEventListener('message', (e) => {
+            const data = JSON.parse((e as MessageEvent).data) as SseMessageData;
+            const msg = data.message;
+
+            if (msg) {
+              // Deduplicate by sequence_id
+              if (seenIdsRef.current.has(msg.sequence_id)) {
+                return;
+              }
+              seenIdsRef.current.add(msg.sequence_id);
+              updateSequenceId(msg.sequence_id);
+            }
+
+            onEventRef.current('message', data);
+          });
+
+          es.addEventListener('state_change', (e) => {
+            const data = JSON.parse((e as MessageEvent).data);
+            onEventRef.current('state_change', data);
+          });
+
+          es.addEventListener('agent_done', () => {
+            onEventRef.current('agent_done', {});
+          });
+
+          es.addEventListener('error', () => {
+            dispatch({ type: 'SSE_ERROR' });
+            onEventRef.current('disconnected', {});
+          });
+          break;
+        }
+
+        case 'CLOSE_SSE': {
+          if (eventSourceRef.current) {
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+          }
+          break;
+        }
+
+        case 'SCHEDULE_RETRY': {
+          // Clear existing timers
+          if (retryTimeoutRef.current !== null) {
+            clearTimeout(retryTimeoutRef.current);
+          }
+          if (countdownIntervalRef.current !== null) {
+            clearInterval(countdownIntervalRef.current);
+          }
+
+          // Start countdown
+          const seconds = Math.ceil(effect.delayMs / 1000);
+          setCountdownSeconds(seconds);
+
+          let remaining = seconds;
+          countdownIntervalRef.current = window.setInterval(() => {
+            remaining--;
+            setCountdownSeconds(remaining > 0 ? remaining : null);
+            if (remaining <= 0 && countdownIntervalRef.current !== null) {
+              clearInterval(countdownIntervalRef.current);
+              countdownIntervalRef.current = null;
+            }
+          }, 1000);
+
+          // Schedule retry
+          retryTimeoutRef.current = window.setTimeout(() => {
+            retryTimeoutRef.current = null;
+            dispatch({ type: 'RETRY_TIMER_FIRED' });
+          }, effect.delayMs);
+          break;
+        }
+
+        case 'SCHEDULE_RECONNECTED_DISPLAY': {
+          if (reconnectedTimeoutRef.current !== null) {
+            clearTimeout(reconnectedTimeoutRef.current);
+          }
+          reconnectedTimeoutRef.current = window.setTimeout(() => {
+            reconnectedTimeoutRef.current = null;
+            dispatch({ type: 'RECONNECTED_DISPLAY_DONE' });
+          }, RECONNECTED_DISPLAY_MS);
+          break;
+        }
+
+        case 'CANCEL_TIMERS': {
+          if (retryTimeoutRef.current !== null) {
+            clearTimeout(retryTimeoutRef.current);
+            retryTimeoutRef.current = null;
+          }
+          if (countdownIntervalRef.current !== null) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+          }
+          if (reconnectedTimeoutRef.current !== null) {
+            clearTimeout(reconnectedTimeoutRef.current);
+            reconnectedTimeoutRef.current = null;
+          }
+          setCountdownSeconds(null);
+          break;
+        }
+      }
     }
-  }, []);
+  }, [updateSequenceId]);
 
-  // Schedule reconnection with backoff
-  const scheduleReconnect = useCallback((attemptNum: number) => {
-    clearTimers();
-    
-    const delay = getBackoffDelay(attemptNum);
-    const delaySeconds = Math.ceil(delay / 1000);
-    setNextRetryIn(delaySeconds);
+  // Get current context for state machine
+  const getContext = useCallback((): TransitionContext => ({
+    browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+  }), []);
 
-    // Countdown timer
-    let remaining = delaySeconds;
-    countdownIntervalRef.current = window.setInterval(() => {
-      remaining--;
-      setNextRetryIn(remaining > 0 ? remaining : null);
-      if (remaining <= 0 && countdownIntervalRef.current !== null) {
-        clearInterval(countdownIntervalRef.current);
-        countdownIntervalRef.current = null;
+  // Dispatch an input to the state machine
+  const dispatch = useCallback((input: ConnectionInput) => {
+    const ctx = getContext();
+    setMachineState((current) => {
+      const result = transition(current, input, ctx);
+      // Execute effects after state update
+      // Using setTimeout to avoid state update during render
+      if (result.effects.length > 0) {
+        setTimeout(() => executeEffects(result.effects), 0);
       }
-    }, 1000);
-
-    // Actual reconnect timeout - will be set up by the connect function
-    return delay;
-  }, [clearTimers]);
-
-  // Connect to SSE stream
-  const connect = useCallback(() => {
-    if (!conversationId) return;
-
-    closeConnection();
-    clearTimers();
-    
-    const isReconnecting = attempt > 0;
-    setState(isReconnecting ? 'reconnecting' : 'connecting');
-
-    // Build URL with after parameter if we have a sequence ID
-    let url = `/api/conversations/${conversationId}/stream`;
-    if (lastSequenceIdRef.current !== null) {
-      url += `?after=${lastSequenceIdRef.current}`;
-    }
-
-    const es = new EventSource(url);
-    eventSourceRef.current = es;
-
-    es.addEventListener('init', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as SseInitData;
-      
-      // Track sequence ID from init
-      if (data.last_sequence_id !== undefined) {
-        updateSequenceId(data.last_sequence_id);
-      }
-      
-      // Track sequence IDs from messages to dedupe
-      if (data.messages) {
-        for (const msg of data.messages) {
-          seenIdsRef.current.add(msg.sequence_id);
-        }
-      }
-
-      // If we were reconnecting, show brief "reconnected" state
-      if (isReconnecting) {
-        setState('reconnected');
-        reconnectedTimeoutRef.current = window.setTimeout(() => {
-          setState('connected');
-          reconnectedTimeoutRef.current = null;
-        }, RECONNECTED_DISPLAY_MS);
-      } else {
-        setState('connected');
-      }
-      
-      setAttempt(0);
-      clearTimers();
-      onEventRef.current('init', data);
+      return result.state;
     });
-
-    es.addEventListener('message', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as SseMessageData;
-      const msg = data.message;
-      
-      if (msg) {
-        // Deduplicate by sequence_id
-        if (seenIdsRef.current.has(msg.sequence_id)) {
-          return; // Already have this message
-        }
-        seenIdsRef.current.add(msg.sequence_id);
-        updateSequenceId(msg.sequence_id);
-      }
-      
-      onEventRef.current('message', data);
-    });
-
-    es.addEventListener('state_change', (e) => {
-      const data = JSON.parse((e as MessageEvent).data);
-      onEventRef.current('state_change', data);
-    });
-
-    es.addEventListener('agent_done', () => {
-      onEventRef.current('agent_done', {});
-    });
-
-    es.addEventListener('error', () => {
-      if (es.readyState === EventSource.CLOSED || es.readyState === EventSource.CONNECTING) {
-        closeConnection();
-        
-        const nextAttempt = attempt + 1;
-        setAttempt(nextAttempt);
-        
-        // Update state based on attempt count
-        if (nextAttempt >= OFFLINE_THRESHOLD) {
-          setState('offline');
-        } else {
-          setState('reconnecting');
-        }
-
-        // Check if browser is online
-        if (!navigator.onLine) {
-          setState('offline');
-          // Don't schedule reconnect, wait for online event
-          return;
-        }
-
-        // Schedule reconnection
-        const delay = scheduleReconnect(nextAttempt);
-        retryTimeoutRef.current = window.setTimeout(() => {
-          retryTimeoutRef.current = null;
-          connect();
-        }, delay);
-
-        onEventRef.current('disconnected', {});
-      }
-    });
-
-    es.addEventListener('open', () => {
-      // Connection opened, waiting for init event
-    });
-  }, [conversationId, attempt, closeConnection, clearTimers, scheduleReconnect, updateSequenceId]);
+  }, [executeEffects, getContext]);
 
   // Handle online/offline events
   useEffect(() => {
-    const handleOnline = () => {
-      // Browser came back online, try to reconnect immediately
-      if (state === 'offline' || state === 'reconnecting') {
-        clearTimers();
-        connect();
-      }
-    };
-
-    const handleOffline = () => {
-      // Browser went offline
-      clearTimers();
-      setState('offline');
-    };
+    const handleOnline = () => dispatch({ type: 'BROWSER_ONLINE' });
+    const handleOffline = () => dispatch({ type: 'BROWSER_OFFLINE' });
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -271,31 +260,27 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, [state, clearTimers, connect]);
+  }, [dispatch]);
 
-  // Initial connection when conversationId changes
+  // Connect when conversationId changes
   useEffect(() => {
     if (conversationId) {
-      // Reset state for new conversation
-      setAttempt(0);
+      // Reset for new conversation
       seenIdsRef.current.clear();
-      connect();
+      dispatch({ type: 'CONNECT' });
     } else {
-      closeConnection();
-      clearTimers();
-      setState('disconnected');
+      dispatch({ type: 'DISCONNECT' });
     }
 
     return () => {
-      closeConnection();
-      clearTimers();
+      dispatch({ type: 'DISCONNECT' });
     };
-  }, [conversationId]); // Intentionally not including connect to avoid loops
+  }, [conversationId, dispatch]);
 
   return {
-    state,
-    attempt,
-    nextRetryIn,
+    state: machineState.state,
+    attempt: machineState.attempt,
+    nextRetryIn: countdownSeconds,
     lastSequenceId,
   };
 }
