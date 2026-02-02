@@ -80,32 +80,45 @@ The modern style is preferred because:
 
 ## Development Commands
 
-**Always use `./dev.py` for development tasks.** It handles configuration automatically.
+**Always use `./dev.py` for development tasks.** It handles LLM gateway configuration automatically.
 
 ```bash
 # Server management
-./dev.py start         # Start server (release build, port 8000)
-./dev.py start --debug # Start with debug build
-./dev.py start --port 9000  # Use different port
-./dev.py stop          # Stop server
-./dev.py status        # Check if server is running
-./dev.py restart       # Restart server
+./dev.py up            # Build and start Phoenix + Vite dev servers
+./dev.py down          # Stop all servers
+./dev.py restart       # Rebuild Rust and restart Phoenix (Vite stays for hot reload)
+./dev.py status        # Check what's running
 
-# Build & lint
-./dev.py lint          # Run clippy + fmt check
-./dev.py build         # Build project
+# Code quality
+./dev.py check         # Run clippy + fmt check + tests
 
 # Task management
 ./dev.py tasks ready   # List tasks ready for implementation
 ./dev.py tasks close <id> [--wont-do]  # Close a task
 ```
 
+### Development Workflow
+
+1. **Start development:** `./dev.py up`
+   - Builds Rust backend
+   - Starts Phoenix server (port 8000)
+   - Starts Vite dev server (port 5173) with hot reload
+   - Access UI at http://localhost:5173
+
+2. **After Rust changes:** `./dev.py restart`
+   - Rebuilds and restarts Phoenix
+   - Vite keeps running (UI hot reloads automatically)
+
+3. **After UI changes:** Nothing needed!
+   - Vite hot reloads automatically
+
+4. **Before committing:** `./dev.py check`
+
+5. **When done:** `./dev.py down`
+
 ### ⚠️ Do NOT start the server manually
 
-Do NOT use `cargo run` directly. The server requires the LLM gateway configuration
-which `./dev.py start` provides automatically from `/exe.dev/shelley.json`.
+Do NOT use `cargo run` or start the binary directly. The server requires the LLM gateway
+configuration which `./dev.py up` provides automatically from `/exe.dev/shelley.json`.
 
-If you need to test with a running server:
-1. `./dev.py status` - Check if already running
-2. `./dev.py start` - Start if needed
-3. `./dev.py restart` - Restart after code changes
+If you see API key errors, you're not using dev.py.

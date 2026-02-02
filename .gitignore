@@ -1,5 +1,6 @@
 /target
 .phoenix.pid
+.vite.pid
 phoenix.log
 
 # UI

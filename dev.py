@@ -15,7 +15,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 TASKS_DIR = ROOT / "tasks"
-PID_FILE = ROOT / ".phoenix.pid"
+UI_DIR = ROOT / "ui"
+PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
+VITE_PID_FILE = ROOT / ".vite.pid"
+LOG_FILE = ROOT / "phoenix.log"
 
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
@@ -33,49 +36,81 @@ def get_llm_gateway() -> str:
     return DEFAULT_GATEWAY
 
 
-def cmd_lint():
-    """Run clippy and fmt check."""
-    subprocess.run(["cargo", "clippy", "--", "-D", "warnings"], check=True)
-    subprocess.run(["cargo", "fmt", "--check"], check=True)
+def is_process_running(pid: int) -> bool:
+    """Check if a process is running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
-def cmd_build():
-    """Build the project."""
-    subprocess.run(["cargo", "build"], check=True)
+def get_pid(pid_file: Path) -> int | None:
+    """Get PID from file if process is still running."""
+    if not pid_file.exists():
+        return None
+    pid = int(pid_file.read_text().strip())
+    if is_process_running(pid):
+        return pid
+    pid_file.unlink()  # Clean up stale PID file
+    return None
 
 
-def cmd_start(release: bool = True, port: int = 8000):
-    """Start the Phoenix server."""
-    # Check if already running
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        try:
-            os.kill(pid, 0)  # Check if process exists
-            print(f"Server already running (PID {pid})")
-            return
-        except OSError:
-            PID_FILE.unlink()  # Stale PID file
+def stop_process(pid_file: Path, name: str) -> bool:
+    """Stop a process by PID file. Returns True if was running."""
+    pid = get_pid(pid_file)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Wait briefly for graceful shutdown
+        for _ in range(10):
+            if not is_process_running(pid):
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        print(f"Stopped {name} (PID {pid})")
+    except OSError as e:
+        print(f"Could not stop {name}: {e}")
+    finally:
+        if pid_file.exists():
+            pid_file.unlink()
+    return True
 
-    # Build first
-    build_args = ["cargo", "build"]
+
+def ensure_ui_deps():
+    """Ensure UI dependencies are installed."""
+    if not (UI_DIR / "node_modules").exists():
+        print("Installing UI dependencies...")
+        subprocess.run(["npm", "install"], cwd=UI_DIR, check=True)
+
+
+def build_rust(release: bool = True):
+    """Build the Rust backend."""
+    args = ["cargo", "build"]
     if release:
-        build_args.append("--release")
-    subprocess.run(build_args, check=True, cwd=ROOT)
+        args.append("--release")
+    print("Building Rust backend...")
+    subprocess.run(args, check=True, cwd=ROOT)
 
-    # Determine binary path
+
+def start_phoenix(port: int = 8000, release: bool = True):
+    """Start the Phoenix server."""
+    if get_pid(PHOENIX_PID_FILE):
+        print("Phoenix server already running")
+        return
+
     binary = ROOT / "target" / ("release" if release else "debug") / "phoenix_ide"
     if not binary.exists():
         print(f"Binary not found: {binary}", file=sys.stderr)
         sys.exit(1)
 
-    # Set up environment
     env = os.environ.copy()
     env["LLM_GATEWAY"] = get_llm_gateway()
     env["PHOENIX_PORT"] = str(port)
 
-    # Start server in background
-    log_file = ROOT / "phoenix.log"
-    with open(log_file, "w") as log:
+    with open(LOG_FILE, "w") as log:
         proc = subprocess.Popen(
             [str(binary)],
             env=env,
@@ -83,67 +118,126 @@ def cmd_start(release: bool = True, port: int = 8000):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        PID_FILE.write_text(str(proc.pid))
-        print(f"Started Phoenix server (PID {proc.pid})")
-        print(f"  Port: {port}")
-        print(f"  Gateway: {env['LLM_GATEWAY']}")
-        print(f"  Log: {log_file}")
+        PHOENIX_PID_FILE.write_text(str(proc.pid))
 
-    # Wait briefly and check it started
-    time.sleep(1)
-    try:
-        os.kill(proc.pid, 0)
-    except OSError:
-        print("Server failed to start. Check phoenix.log", file=sys.stderr)
-        PID_FILE.unlink()
+    # Verify it started
+    time.sleep(0.5)
+    if not is_process_running(proc.pid):
+        print("Phoenix failed to start. Check phoenix.log", file=sys.stderr)
+        PHOENIX_PID_FILE.unlink()
         sys.exit(1)
 
+    print(f"Started Phoenix server (PID {proc.pid}, port {port})")
 
-def cmd_stop():
-    """Stop the Phoenix server."""
-    if not PID_FILE.exists():
-        print("Server not running (no PID file)")
+
+def start_vite(port: int = 5173, phoenix_port: int = 8000):
+    """Start the Vite dev server."""
+    if get_pid(VITE_PID_FILE):
+        print("Vite dev server already running")
         return
 
-    pid = int(PID_FILE.read_text().strip())
-    try:
-        os.kill(pid, signal.SIGTERM)
-        print(f"Stopped server (PID {pid})")
-    except OSError as e:
-        print(f"Could not stop server: {e}")
-    finally:
-        PID_FILE.unlink()
+    ensure_ui_deps()
+
+    # Update vite config proxy target dynamically would be complex,
+    # so we rely on the default proxy config pointing to 8000
+    env = os.environ.copy()
+    
+    # Start Vite in background
+    proc = subprocess.Popen(
+        ["npm", "run", "dev", "--", "--port", str(port)],
+        cwd=UI_DIR,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    VITE_PID_FILE.write_text(str(proc.pid))
+
+    time.sleep(1)
+    if not is_process_running(proc.pid):
+        print("Vite failed to start", file=sys.stderr)
+        VITE_PID_FILE.unlink()
+        sys.exit(1)
+
+    print(f"Started Vite dev server (PID {proc.pid}, port {port})")
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_up(phoenix_port: int = 8000, vite_port: int = 5173):
+    """Build and start Phoenix + Vite dev servers."""
+    build_rust(release=True)
+    start_phoenix(port=phoenix_port)
+    start_vite(port=vite_port, phoenix_port=phoenix_port)
+    print()
+    print(f"Ready! UI: http://localhost:{vite_port}")
+    print(f"        API: http://localhost:{phoenix_port}")
+    print(f"        Log: {LOG_FILE}")
+
+
+def cmd_down():
+    """Stop all servers."""
+    stopped_any = False
+    stopped_any |= stop_process(VITE_PID_FILE, "Vite")
+    stopped_any |= stop_process(PHOENIX_PID_FILE, "Phoenix")
+    if not stopped_any:
+        print("Nothing running")
+
+
+def cmd_restart(phoenix_port: int = 8000):
+    """Rebuild Rust and restart Phoenix (Vite stays for hot reload)."""
+    build_rust(release=True)
+    stop_process(PHOENIX_PID_FILE, "Phoenix")
+    time.sleep(0.5)
+    start_phoenix(port=phoenix_port)
+    print("Phoenix restarted. Vite still running for UI hot reload.")
 
 
 def cmd_status():
-    """Check Phoenix server status."""
-    if not PID_FILE.exists():
-        print("Server not running (no PID file)")
-        return
+    """Check what's running."""
+    phoenix_pid = get_pid(PHOENIX_PID_FILE)
+    vite_pid = get_pid(VITE_PID_FILE)
 
-    pid = int(PID_FILE.read_text().strip())
-    try:
-        os.kill(pid, 0)
-        print(f"Server running (PID {pid})")
-        # Try to get more info
+    if phoenix_pid:
+        print(f"Phoenix: running (PID {phoenix_pid})")
+    else:
+        print("Phoenix: stopped")
+
+    if vite_pid:
+        print(f"Vite:    running (PID {vite_pid})")
+    else:
+        print("Vite:    stopped")
+
+    if phoenix_pid:
         try:
             import urllib.request
             with urllib.request.urlopen("http://localhost:8000/api/models", timeout=2) as resp:
                 data = json.loads(resp.read())
-                print(f"  Models: {', '.join(data.get('models', []))}")
-                print(f"  Default: {data.get('default', 'N/A')}")
+                print(f"Models:  {', '.join(data.get('models', []))}")
         except Exception:
-            print("  (Could not fetch API status)")
-    except OSError:
-        print(f"Server not running (stale PID {pid})")
-        PID_FILE.unlink()
+            pass
 
 
-def cmd_restart(release: bool = True, port: int = 8000):
-    """Restart the Phoenix server."""
-    cmd_stop()
-    time.sleep(1)
-    cmd_start(release=release, port=port)
+def cmd_check():
+    """Run lint, format check, and tests."""
+    print("Running clippy...")
+    result = subprocess.run(["cargo", "clippy", "--", "-D", "warnings"], cwd=ROOT)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+    print("\nChecking format...")
+    result = subprocess.run(["cargo", "fmt", "--check"], cwd=ROOT)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+    print("\nRunning tests...")
+    result = subprocess.run(["cargo", "test"], cwd=ROOT)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+    print("\n✓ All checks passed")
 
 
 def cmd_tasks_ready():
@@ -151,7 +245,6 @@ def cmd_tasks_ready():
     for task_file in sorted(TASKS_DIR.glob("[0-9]*.md")):
         content = task_file.read_text()
         if "status: ready" in content:
-            # Extract priority and title
             priority = "p?"
             title = task_file.stem
             for line in content.splitlines():
@@ -172,63 +265,66 @@ def cmd_tasks_close(task_id: str, wont_do: bool = False):
     if len(matches) > 1:
         print(f"Ambiguous task id '{task_id}': {[m.name for m in matches]}", file=sys.stderr)
         sys.exit(1)
-    
+
     task_file = matches[0]
     content = task_file.read_text()
     new_status = "wont-do" if wont_do else "done"
     new_content = content.replace("status: ready", f"status: {new_status}")
-    
+
     if new_content == content:
         print(f"Task {task_file.name} not in 'ready' status", file=sys.stderr)
         sys.exit(1)
-    
+
     task_file.write_text(new_content)
     print(f"Closed {task_file.name} as {new_status}")
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
 def main():
-    parser = argparse.ArgumentParser(prog="dev.py", description="Development tasks")
+    parser = argparse.ArgumentParser(prog="dev.py", description="Phoenix development tasks")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("lint", help="Run linting")
-    sub.add_parser("build", help="Build project")
+    # up
+    up_parser = sub.add_parser("up", help="Build and start servers")
+    up_parser.add_argument("--port", type=int, default=8000, help="Phoenix port (default: 8000)")
+    up_parser.add_argument("--vite-port", type=int, default=5173, help="Vite port (default: 5173)")
 
-    # Server commands
-    start_parser = sub.add_parser("start", help="Start Phoenix server")
-    start_parser.add_argument("--debug", action="store_true", help="Use debug build")
-    start_parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
+    # down
+    sub.add_parser("down", help="Stop all servers")
 
-    sub.add_parser("stop", help="Stop Phoenix server")
-    sub.add_parser("status", help="Check server status")
+    # restart
+    restart_parser = sub.add_parser("restart", help="Rebuild Rust and restart Phoenix")
+    restart_parser.add_argument("--port", type=int, default=8000, help="Phoenix port (default: 8000)")
 
-    restart_parser = sub.add_parser("restart", help="Restart Phoenix server")
-    restart_parser.add_argument("--debug", action="store_true", help="Use debug build")
-    restart_parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
+    # status
+    sub.add_parser("status", help="Check what's running")
 
-    # Task commands
+    # check
+    sub.add_parser("check", help="Run lint, fmt check, and tests")
+
+    # tasks
     tasks_parser = sub.add_parser("tasks", help="Task management")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
-
     tasks_sub.add_parser("ready", help="List ready tasks")
-
     close_parser = tasks_sub.add_parser("close", help="Close a task")
     close_parser.add_argument("task_id", help="Task ID (e.g., 001)")
-    close_parser.add_argument("--wont-do", action="store_true", help="Mark as won't-do instead of done")
+    close_parser.add_argument("--wont-do", action="store_true", help="Mark as won't-do")
 
     args = parser.parse_args()
 
-    if args.command == "lint":
-        cmd_lint()
-    elif args.command == "build":
-        cmd_build()
-    elif args.command == "start":
-        cmd_start(release=not args.debug, port=args.port)
-    elif args.command == "stop":
-        cmd_stop()
+    if args.command == "up":
+        cmd_up(phoenix_port=args.port, vite_port=args.vite_port)
+    elif args.command == "down":
+        cmd_down()
+    elif args.command == "restart":
+        cmd_restart(phoenix_port=args.port)
     elif args.command == "status":
         cmd_status()
-    elif args.command == "restart":
-        cmd_restart(release=not args.debug, port=args.port)
+    elif args.command == "check":
+        cmd_check()
     elif args.command == "tasks":
         if args.tasks_command == "ready":
             cmd_tasks_ready()
