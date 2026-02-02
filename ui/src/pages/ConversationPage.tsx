@@ -85,7 +85,21 @@ export function ConversationPage() {
         case 'init': {
           const initData = data as SseInitData;
           setConversation(initData.conversation);
-          setMessages(initData.messages || []);
+          
+          // On reconnection, we request ?after=lastSeqId and get only NEW messages.
+          // If we already have messages, append new ones; otherwise replace.
+          const newMessages = initData.messages || [];
+          setMessages((prev) => {
+            if (prev.length === 0) {
+              // First connection - use server's full list
+              return newMessages;
+            }
+            // Reconnection - append new messages, deduplicating by sequence_id
+            const existingIds = new Set(prev.map(m => m.sequence_id));
+            const toAdd = newMessages.filter(m => !existingIds.has(m.sequence_id));
+            return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+          });
+          
           const initState = initData.conversation?.state || { type: 'idle' };
           setConvState(initState.type || 'idle');
           const { type: _, ...initStateData } = initState;
