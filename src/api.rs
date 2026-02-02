@@ -2,6 +2,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+mod assets;
 mod handlers;
 mod sse;
 mod types;

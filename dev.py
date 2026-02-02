@@ -22,6 +22,12 @@ PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
 VITE_PID_FILE = ROOT / ".vite.pid"
 LOG_FILE = ROOT / "phoenix.log"
 
+# Production paths
+PROD_SERVICE_NAME = "phoenix-ide"
+PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
+PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
+PROD_PORT = 8000
+
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
@@ -426,6 +432,221 @@ def cmd_tasks_close(task_id: str, wont_do: bool = False):
 
 
 # =============================================================================
+# Production Commands
+# =============================================================================
+
+def prod_build(version: str | None = None) -> Path:
+    """Build a production binary from a git tag or HEAD.
+    
+    Returns path to the built binary.
+    """
+    # Determine what to build
+    if version:
+        # Check if tag exists
+        result = subprocess.run(
+            ["git", "rev-parse", f"refs/tags/{version}"],
+            cwd=ROOT, capture_output=True
+        )
+        if result.returncode != 0:
+            print(f"Tag '{version}' not found", file=sys.stderr)
+            sys.exit(1)
+        ref = f"refs/tags/{version}"
+        print(f"Building from tag: {version}")
+    else:
+        # Use HEAD
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT, capture_output=True, text=True
+        )
+        version = f"dev-{result.stdout.strip()}"
+        ref = "HEAD"
+        print(f"Building from HEAD: {version}")
+    
+    # Save current state
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT, capture_output=True, text=True
+    )
+    original_head = result.stdout.strip()
+    
+    # Check for uncommitted changes
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT, capture_output=True, text=True
+    )
+    has_changes = bool(result.stdout.strip())
+    if has_changes:
+        print("Stashing uncommitted changes...")
+        subprocess.run(["git", "stash", "push", "-m", "dev.py prod build"], cwd=ROOT, check=True)
+    
+    try:
+        # Checkout the version
+        if ref != "HEAD":
+            print(f"Checking out {ref}...")
+            subprocess.run(["git", "checkout", ref], cwd=ROOT, check=True, capture_output=True)
+        
+        # Build UI
+        print("Building UI...")
+        ensure_ui_deps()
+        subprocess.run(["npm", "run", "build"], cwd=UI_DIR, check=True)
+        
+        # Build Rust with musl target
+        print("Building Rust (musl, release, stripped)...")
+        subprocess.run(
+            ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
+            cwd=ROOT, check=True
+        )
+        
+        # Strip the binary
+        binary = ROOT / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
+        subprocess.run(["strip", str(binary)], check=True)
+        
+        size_mb = binary.stat().st_size / (1024 * 1024)
+        print(f"Built: {binary} ({size_mb:.1f} MB)")
+        
+        return binary
+        
+    finally:
+        # Restore original state
+        if ref != "HEAD":
+            print(f"Restoring to {original_head[:8]}...")
+            subprocess.run(["git", "checkout", original_head], cwd=ROOT, capture_output=True)
+        
+        if has_changes:
+            print("Restoring stashed changes...")
+            subprocess.run(["git", "stash", "pop"], cwd=ROOT, capture_output=True)
+
+
+def prod_get_systemd_unit(version: str) -> str:
+    """Generate systemd unit file content."""
+    return f"""[Unit]
+Description=Phoenix IDE
+After=network.target
+
+[Service]
+Type=simple
+User=exedev
+Environment=PHOENIX_PORT={PROD_PORT}
+Environment=PHOENIX_DB_PATH={PROD_DB_PATH}
+Environment=LLM_GATEWAY={get_llm_gateway()}
+Environment=PHOENIX_VERSION={version}
+ExecStart={PROD_INSTALL_DIR}/phoenix-ide
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cmd_prod_build(version: str | None = None):
+    """Build production binary from git tag."""
+    prod_build(version)
+
+
+def cmd_prod_deploy(version: str | None = None):
+    """Build and deploy to production."""
+    # Build
+    binary = prod_build(version)
+    
+    # Determine version string for display
+    if version is None:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT, capture_output=True, text=True
+        )
+        version = f"dev-{result.stdout.strip()}"
+    
+    # Create install directory
+    print(f"Installing to {PROD_INSTALL_DIR}...")
+    subprocess.run(["sudo", "mkdir", "-p", str(PROD_INSTALL_DIR)], check=True)
+    
+    # Copy binary
+    dest = PROD_INSTALL_DIR / "phoenix-ide"
+    subprocess.run(["sudo", "cp", str(binary), str(dest)], check=True)
+    subprocess.run(["sudo", "chmod", "+x", str(dest)], check=True)
+    
+    # Ensure database directory exists
+    PROD_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Install systemd service
+    print("Installing systemd service...")
+    unit_content = prod_get_systemd_unit(version)
+    unit_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
+    
+    # Write via sudo
+    proc = subprocess.run(
+        ["sudo", "tee", str(unit_file)],
+        input=unit_content.encode(),
+        capture_output=True
+    )
+    if proc.returncode != 0:
+        print(f"Failed to write systemd unit: {proc.stderr.decode()}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Reload and restart
+    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    subprocess.run(["sudo", "systemctl", "enable", PROD_SERVICE_NAME], check=True)
+    subprocess.run(["sudo", "systemctl", "restart", PROD_SERVICE_NAME], check=True)
+    
+    time.sleep(1)
+    
+    # Check status
+    result = subprocess.run(
+        ["systemctl", "is-active", PROD_SERVICE_NAME],
+        capture_output=True, text=True
+    )
+    if result.stdout.strip() == "active":
+        print(f"\n✓ Deployed {version} to production")
+        print(f"  Service: {PROD_SERVICE_NAME}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Database: {PROD_DB_PATH}")
+    else:
+        print(f"\n✗ Service failed to start", file=sys.stderr)
+        subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
+        sys.exit(1)
+
+
+def cmd_prod_status():
+    """Show production service status."""
+    # Check if service exists
+    result = subprocess.run(
+        ["systemctl", "is-active", PROD_SERVICE_NAME],
+        capture_output=True, text=True
+    )
+    status = result.stdout.strip()
+    
+    if status == "active":
+        print(f"Production: running")
+        # Get version from environment
+        result = subprocess.run(
+            ["systemctl", "show", PROD_SERVICE_NAME, "--property=Environment"],
+            capture_output=True, text=True
+        )
+        for part in result.stdout.split():
+            if part.startswith("PHOENIX_VERSION="):
+                print(f"  Version: {part.split('=', 1)[1]}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Database: {PROD_DB_PATH}")
+        
+        # Check if responding
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
+                print(f"  Health: {resp.read().decode().strip()}")
+        except Exception:
+            print(f"  Health: not responding")
+    else:
+        print(f"Production: {status}")
+
+
+def cmd_prod_stop():
+    """Stop production service."""
+    subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME])
+    print(f"Stopped {PROD_SERVICE_NAME}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -459,6 +680,16 @@ def main():
     close_parser.add_argument("task_id", help="Task ID (e.g., 001)")
     close_parser.add_argument("--wont-do", action="store_true", help="Mark as won't-do")
 
+    # prod
+    prod_parser = sub.add_parser("prod", help="Production deployment")
+    prod_sub = prod_parser.add_subparsers(dest="prod_command", required=True)
+    build_parser = prod_sub.add_parser("build", help="Build production binary from git tag")
+    build_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
+    deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
+    deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
+    prod_sub.add_parser("status", help="Show production status")
+    prod_sub.add_parser("stop", help="Stop production service")
+
     args = parser.parse_args()
 
     if args.command == "up":
@@ -476,6 +707,15 @@ def main():
             cmd_tasks_ready()
         elif args.tasks_command == "close":
             cmd_tasks_close(args.task_id, args.wont_do)
+    elif args.command == "prod":
+        if args.prod_command == "build":
+            cmd_prod_build(args.version)
+        elif args.prod_command == "deploy":
+            cmd_prod_deploy(args.version)
+        elif args.prod_command == "status":
+            cmd_prod_status()
+        elif args.prod_command == "stop":
+            cmd_prod_stop()
 
 
 if __name__ == "__main__":

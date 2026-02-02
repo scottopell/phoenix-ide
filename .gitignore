@@ -6,3 +6,5 @@ phoenix.log
 # UI
 ui/node_modules
 ui/dist
+static/dist/
+static/dist/
