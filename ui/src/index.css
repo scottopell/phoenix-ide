@@ -178,6 +178,12 @@ html, body {
   -webkit-overflow-scrolling: touch;
 }
 
+/* List page has no bars */
+.list-page #main-area {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
 /* Views */
 .view {
   display: none;

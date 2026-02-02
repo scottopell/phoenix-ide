@@ -1,8 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, Conversation } from '../api';
-import { StateBar } from '../components/StateBar';
-import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ConversationList } from '../components/ConversationList';
 import { NewConversationModal } from '../components/NewConversationModal';
 
@@ -35,17 +33,7 @@ export function ConversationListPage() {
   };
 
   return (
-    <div id="app">
-      <StateBar
-        conversation={null}
-        convState="idle"
-        stateData={null}
-        connectionState="connected"
-        connectionAttempt={0}
-        nextRetryIn={null}
-        contextWindowUsed={0}
-      />
-      <BreadcrumbBar breadcrumbs={[]} visible={false} />
+    <div id="app" className="list-page">
       <main id="main-area">
         {loading ? (
           <div className="empty-state">
@@ -59,12 +47,6 @@ export function ConversationListPage() {
           />
         )}
       </main>
-      <footer id="input-area">
-        <div id="input-container">
-          <textarea id="message-input" placeholder="Type a message..." rows={1} disabled />
-          <button id="send-btn" disabled>Send</button>
-        </div>
-      </footer>
       <NewConversationModal
         visible={showModal}
         onClose={() => setShowModal(false)}
