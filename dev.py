@@ -435,9 +435,14 @@ def cmd_tasks_close(task_id: str, wont_do: bool = False):
 # Production Commands
 # =============================================================================
 
+# Production build worktree location
+PROD_BUILD_WORKTREE = ROOT.parent / ".phoenix-ide-build"
+
+
 def prod_build(version: str | None = None) -> Path:
     """Build a production binary from a git tag or HEAD.
     
+    Uses a separate git worktree to avoid disturbing the main working directory.
     Returns path to the built binary.
     """
     # Determine what to build
@@ -450,71 +455,59 @@ def prod_build(version: str | None = None) -> Path:
         if result.returncode != 0:
             print(f"Tag '{version}' not found", file=sys.stderr)
             sys.exit(1)
-        ref = f"refs/tags/{version}"
+        ref = version
         print(f"Building from tag: {version}")
     else:
-        # Use HEAD
+        # Use current HEAD commit
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=ROOT, capture_output=True, text=True
         )
-        version = f"dev-{result.stdout.strip()}"
-        ref = "HEAD"
+        commit = result.stdout.strip()
+        version = f"dev-{commit[:8]}"
+        ref = commit
         print(f"Building from HEAD: {version}")
     
-    # Save current state
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT, capture_output=True, text=True
-    )
-    original_head = result.stdout.strip()
+    # Set up or update the build worktree
+    worktree = PROD_BUILD_WORKTREE
     
-    # Check for uncommitted changes
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=ROOT, capture_output=True, text=True
-    )
-    has_changes = bool(result.stdout.strip())
-    if has_changes:
-        print("Stashing uncommitted changes...")
-        subprocess.run(["git", "stash", "push", "-m", "dev.py prod build"], cwd=ROOT, check=True)
-    
-    try:
-        # Checkout the version
-        if ref != "HEAD":
-            print(f"Checking out {ref}...")
-            subprocess.run(["git", "checkout", ref], cwd=ROOT, check=True, capture_output=True)
-        
-        # Build UI
-        print("Building UI...")
-        ensure_ui_deps()
-        subprocess.run(["npm", "run", "build"], cwd=UI_DIR, check=True)
-        
-        # Build Rust with musl target
-        print("Building Rust (musl, release, stripped)...")
+    if worktree.exists():
+        # Update existing worktree to the target ref
+        print(f"Updating build worktree to {ref}...")
+        subprocess.run(["git", "checkout", ref], cwd=worktree, check=True, capture_output=True)
+    else:
+        # Create new worktree
+        print(f"Creating build worktree at {worktree}...")
         subprocess.run(
-            ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
+            ["git", "worktree", "add", "--detach", str(worktree), ref],
             cwd=ROOT, check=True
         )
-        
-        # Strip the binary
-        binary = ROOT / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
-        subprocess.run(["strip", str(binary)], check=True)
-        
-        size_mb = binary.stat().st_size / (1024 * 1024)
-        print(f"Built: {binary} ({size_mb:.1f} MB)")
-        
-        return binary
-        
-    finally:
-        # Restore original state
-        if ref != "HEAD":
-            print(f"Restoring to {original_head[:8]}...")
-            subprocess.run(["git", "checkout", original_head], cwd=ROOT, capture_output=True)
-        
-        if has_changes:
-            print("Restoring stashed changes...")
-            subprocess.run(["git", "stash", "pop"], cwd=ROOT, capture_output=True)
+    
+    ui_dir = worktree / "ui"
+    
+    # Build UI
+    print("Installing UI dependencies...")
+    subprocess.run(["npm", "install"], cwd=ui_dir, check=True, capture_output=True)
+    
+    print("Building UI...")
+    subprocess.run(["npm", "run", "build"], cwd=ui_dir, check=True)
+    
+    # Build Rust with musl target
+    print("Building Rust (musl, release)...")
+    subprocess.run(
+        ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
+        cwd=worktree, check=True
+    )
+    
+    # Strip the binary
+    binary = worktree / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
+    print("Stripping binary...")
+    subprocess.run(["strip", str(binary)], check=True)
+    
+    size_mb = binary.stat().st_size / (1024 * 1024)
+    print(f"Built: {binary} ({size_mb:.1f} MB)")
+    
+    return binary
 
 
 def prod_get_systemd_unit(version: str) -> str:
