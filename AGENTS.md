@@ -101,9 +101,9 @@ The modern style is preferred because:
 
 1. **Start development:** `./dev.py up`
    - Builds Rust backend
-   - Starts Phoenix server (port 8000)
-   - Starts Vite dev server (port 5173) with hot reload
-   - Access UI at http://localhost:5173
+   - Starts Phoenix server and Vite dev server
+   - Ports are auto-assigned based on worktree path (supports multiple worktrees)
+   - Each worktree gets its own database
 
 2. **After Rust changes:** `./dev.py restart`
    - Rebuilds and restarts Phoenix
@@ -115,6 +115,18 @@ The modern style is preferred because:
 4. **Before committing:** `./dev.py check`
 
 5. **When done:** `./dev.py down`
+
+6. **Check configuration:** `./dev.py status`
+   - Shows worktree hash, ports, database path
+
+### Multi-Worktree Support
+
+Each git worktree automatically gets:
+- Unique ports (based on path hash)
+- Separate database file
+- Lock file to prevent conflicts
+
+You can run multiple instances in different worktrees simultaneously.
 
 ### ⚠️ Do NOT start the server manually
 

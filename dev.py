@@ -5,6 +5,8 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -13,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.resolve()
 TASKS_DIR = ROOT / "tasks"
 UI_DIR = ROOT / "ui"
 PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
@@ -23,6 +25,14 @@ LOG_FILE = ROOT / "phoenix.log"
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
+
+# Base ports - offset added based on worktree path hash
+BASE_PHOENIX_PORT = 8000
+BASE_VITE_PORT = 5173
+PORT_RANGE = 1000  # Ports will be base + (0 to 999)
+
+# Database directory
+DB_DIR = Path.home() / ".phoenix-ide"
 
 
 def get_llm_gateway() -> str:
@@ -34,6 +44,93 @@ def get_llm_gateway() -> str:
         except (json.JSONDecodeError, KeyError):
             pass
     return DEFAULT_GATEWAY
+
+
+def get_worktree_hash() -> str:
+    """Get a short hash of the worktree path for unique identification."""
+    return hashlib.md5(str(ROOT).encode()).hexdigest()[:8]
+
+
+def get_port_offset() -> int:
+    """Get deterministic port offset from worktree path hash."""
+    h = hashlib.md5(str(ROOT).encode()).hexdigest()
+    return int(h[:4], 16) % PORT_RANGE
+
+
+def get_default_ports() -> tuple[int, int]:
+    """Get default Phoenix and Vite ports for this worktree."""
+    offset = get_port_offset()
+    return (BASE_PHOENIX_PORT + offset, BASE_VITE_PORT + offset)
+
+
+def get_db_path() -> Path:
+    """Get database path unique to this worktree."""
+    worktree_hash = get_worktree_hash()
+    return DB_DIR / f"phoenix-{worktree_hash}.db"
+
+
+def get_lock_path() -> Path:
+    """Get lock file path for this worktree's database."""
+    worktree_hash = get_worktree_hash()
+    return DB_DIR / f"phoenix-{worktree_hash}.lock"
+
+
+class DatabaseLock:
+    """Context manager for exclusive database access."""
+    
+    def __init__(self):
+        self.lock_path = get_lock_path()
+        self.lock_file = None
+        self.fd = None
+    
+    def acquire(self) -> bool:
+        """Acquire exclusive lock. Returns False if already locked."""
+        # Ensure directory exists
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Open lock file
+        self.fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT)
+        
+        try:
+            # Try to acquire exclusive lock (non-blocking)
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Write PID to lock file for debugging
+            os.ftruncate(self.fd, 0)
+            os.write(self.fd, f"{os.getpid()}\n".encode())
+            return True
+        except OSError:
+            # Lock is held by another process
+            os.close(self.fd)
+            self.fd = None
+            return False
+    
+    def release(self):
+        """Release the lock."""
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+            # Clean up lock file
+            try:
+                self.lock_path.unlink()
+            except OSError:
+                pass
+    
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(
+                f"Database is locked by another process.\n"
+                f"Lock file: {self.lock_path}\n"
+                f"Run './dev.py down' in the other instance first."
+            )
+        return self
+    
+    def __exit__(self, *args):
+        self.release()
+
+
+# Global lock instance - held while Phoenix is running
+_db_lock: DatabaseLock | None = None
 
 
 def is_process_running(pid: int) -> bool:
@@ -58,6 +155,8 @@ def get_pid(pid_file: Path) -> int | None:
 
 def stop_process(pid_file: Path, name: str) -> bool:
     """Stop a process by PID file. Returns True if was running."""
+    global _db_lock
+    
     pid = get_pid(pid_file)
     if pid is None:
         return False
@@ -76,6 +175,10 @@ def stop_process(pid_file: Path, name: str) -> bool:
     finally:
         if pid_file.exists():
             pid_file.unlink()
+        # Release database lock if stopping Phoenix
+        if name == "Phoenix" and _db_lock is not None:
+            _db_lock.release()
+            _db_lock = None
     return True
 
 
@@ -95,8 +198,10 @@ def build_rust(release: bool = True):
     subprocess.run(args, check=True, cwd=ROOT)
 
 
-def start_phoenix(port: int = 8000, release: bool = True):
+def start_phoenix(port: int, release: bool = True):
     """Start the Phoenix server."""
+    global _db_lock
+    
     if get_pid(PHOENIX_PID_FILE):
         print("Phoenix server already running")
         return
@@ -106,9 +211,19 @@ def start_phoenix(port: int = 8000, release: bool = True):
         print(f"Binary not found: {binary}", file=sys.stderr)
         sys.exit(1)
 
+    # Acquire database lock
+    db_path = get_db_path()
+    _db_lock = DatabaseLock()
+    if not _db_lock.acquire():
+        print(f"ERROR: Database is locked by another process.", file=sys.stderr)
+        print(f"  Lock file: {get_lock_path()}", file=sys.stderr)
+        print(f"  Run './dev.py down' in the other instance first.", file=sys.stderr)
+        sys.exit(1)
+
     env = os.environ.copy()
     env["LLM_GATEWAY"] = get_llm_gateway()
     env["PHOENIX_PORT"] = str(port)
+    env["PHOENIX_DB_PATH"] = str(db_path)
 
     with open(LOG_FILE, "w") as log:
         proc = subprocess.Popen(
@@ -125,12 +240,15 @@ def start_phoenix(port: int = 8000, release: bool = True):
     if not is_process_running(proc.pid):
         print("Phoenix failed to start. Check phoenix.log", file=sys.stderr)
         PHOENIX_PID_FILE.unlink()
+        _db_lock.release()
+        _db_lock = None
         sys.exit(1)
 
     print(f"Started Phoenix server (PID {proc.pid}, port {port})")
+    print(f"  Database: {db_path}")
 
 
-def start_vite(port: int = 5173, phoenix_port: int = 8000):
+def start_vite(port: int, phoenix_port: int):
     """Start the Vite dev server."""
     if get_pid(VITE_PID_FILE):
         print("Vite dev server already running")
@@ -138,9 +256,9 @@ def start_vite(port: int = 5173, phoenix_port: int = 8000):
 
     ensure_ui_deps()
 
-    # Update vite config proxy target dynamically would be complex,
-    # so we rely on the default proxy config pointing to 8000
     env = os.environ.copy()
+    # Pass Phoenix port to Vite for proxy configuration
+    env["VITE_API_PORT"] = str(phoenix_port)
     
     # Start Vite in background
     proc = subprocess.Popen(
@@ -160,14 +278,23 @@ def start_vite(port: int = 5173, phoenix_port: int = 8000):
         sys.exit(1)
 
     print(f"Started Vite dev server (PID {proc.pid}, port {port})")
+    print(f"  Proxying /api to Phoenix on port {phoenix_port}")
 
 
 # =============================================================================
 # Commands
 # =============================================================================
 
-def cmd_up(phoenix_port: int = 8000, vite_port: int = 5173):
+def cmd_up(phoenix_port: int | None = None, vite_port: int | None = None):
     """Build and start Phoenix + Vite dev servers."""
+    default_phoenix, default_vite = get_default_ports()
+    phoenix_port = phoenix_port or default_phoenix
+    vite_port = vite_port or default_vite
+    
+    print(f"Worktree: {ROOT}")
+    print(f"  Hash: {get_worktree_hash()}, Port offset: +{get_port_offset()}")
+    print()
+    
     build_rust(release=True)
     start_phoenix(port=phoenix_port)
     start_vite(port=vite_port, phoenix_port=phoenix_port)
@@ -182,12 +309,24 @@ def cmd_down():
     stopped_any = False
     stopped_any |= stop_process(VITE_PID_FILE, "Vite")
     stopped_any |= stop_process(PHOENIX_PID_FILE, "Phoenix")
+    
+    # Clean up lock file if it exists and process is gone
+    lock_path = get_lock_path()
+    if lock_path.exists():
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+    
     if not stopped_any:
         print("Nothing running")
 
 
-def cmd_restart(phoenix_port: int = 8000):
+def cmd_restart(phoenix_port: int | None = None):
     """Rebuild Rust and restart Phoenix (Vite stays for hot reload)."""
+    default_phoenix, _ = get_default_ports()
+    phoenix_port = phoenix_port or default_phoenix
+    
     build_rust(release=True)
     stop_process(PHOENIX_PID_FILE, "Phoenix")
     time.sleep(0.5)
@@ -199,6 +338,13 @@ def cmd_status():
     """Check what's running."""
     phoenix_pid = get_pid(PHOENIX_PID_FILE)
     vite_pid = get_pid(VITE_PID_FILE)
+    default_phoenix, default_vite = get_default_ports()
+    
+    print(f"Worktree: {ROOT}")
+    print(f"  Hash: {get_worktree_hash()}")
+    print(f"  Default ports: Phoenix={default_phoenix}, Vite={default_vite}")
+    print(f"  Database: {get_db_path()}")
+    print()
 
     if phoenix_pid:
         print(f"Phoenix: running (PID {phoenix_pid})")
@@ -213,7 +359,7 @@ def cmd_status():
     if phoenix_pid:
         try:
             import urllib.request
-            with urllib.request.urlopen("http://localhost:8000/api/models", timeout=2) as resp:
+            with urllib.request.urlopen(f"http://localhost:{default_phoenix}/api/models", timeout=2) as resp:
                 data = json.loads(resp.read())
                 print(f"Models:  {', '.join(data.get('models', []))}")
         except Exception:
@@ -289,15 +435,15 @@ def main():
 
     # up
     up_parser = sub.add_parser("up", help="Build and start servers")
-    up_parser.add_argument("--port", type=int, default=8000, help="Phoenix port (default: 8000)")
-    up_parser.add_argument("--vite-port", type=int, default=5173, help="Vite port (default: 5173)")
+    up_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
+    up_parser.add_argument("--vite-port", type=int, default=None, help="Vite port (default: auto from worktree hash)")
 
     # down
     sub.add_parser("down", help="Stop all servers")
 
     # restart
     restart_parser = sub.add_parser("restart", help="Rebuild Rust and restart Phoenix")
-    restart_parser.add_argument("--port", type=int, default=8000, help="Phoenix port (default: 8000)")
+    restart_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
 
     # status
     sub.add_parser("status", help="Check what's running")
