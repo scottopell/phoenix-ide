@@ -3,10 +3,11 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
-use super::{AnthropicService, LlmService, LlmError};
+use super::{AnthropicService, GeminiService, OpenAIService, LlmService};
 use super::anthropic::AnthropicModel;
+use super::gemini::GeminiModel;
+use super::openai::OpenAIModel;
 use std::sync::Arc;
-use async_trait::async_trait;
 
 /// LLM provider enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -151,15 +152,11 @@ pub fn all_models() -> &'static [ModelDef] {
                 if api_key.is_empty() {
                     return Err("gpt-5.2-codex requires OPENAI_API_KEY or gateway".to_string());
                 }
-                // In gateway mode, return placeholder that gateway will handle
-                if gateway.is_some() {
-                    Ok(Arc::new(PlaceholderService {
-                        model_id: "gpt-5.2-codex".to_string(),
-                        provider: Provider::OpenAI,
-                    }))
-                } else {
-                    Err("OpenAI provider not yet implemented for direct mode".to_string())
-                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT52Codex,
+                    gateway,
+                )))
             },
         },
         
@@ -174,14 +171,11 @@ pub fn all_models() -> &'static [ModelDef] {
                 if api_key.is_empty() {
                     return Err("glm-4.7-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
                 }
-                if gateway.is_some() {
-                    Ok(Arc::new(PlaceholderService {
-                        model_id: "glm-4.7-fireworks".to_string(),
-                        provider: Provider::Fireworks,
-                    }))
-                } else {
-                    Err("Fireworks provider not yet implemented for direct mode".to_string())
-                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GLM47Fireworks,
+                    gateway,
+                )))
             },
         },
         ModelDef {
@@ -194,14 +188,11 @@ pub fn all_models() -> &'static [ModelDef] {
                 if api_key.is_empty() {
                     return Err("qwen3-coder-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
                 }
-                if gateway.is_some() {
-                    Ok(Arc::new(PlaceholderService {
-                        model_id: "qwen3-coder-fireworks".to_string(),
-                        provider: Provider::Fireworks,
-                    }))
-                } else {
-                    Err("Fireworks provider not yet implemented for direct mode".to_string())
-                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::QwenCoderFireworks,
+                    gateway,
+                )))
             },
         },
         ModelDef {
@@ -214,14 +205,11 @@ pub fn all_models() -> &'static [ModelDef] {
                 if api_key.is_empty() {
                     return Err("glm-4p6-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
                 }
-                if gateway.is_some() {
-                    Ok(Arc::new(PlaceholderService {
-                        model_id: "glm-4p6-fireworks".to_string(),
-                        provider: Provider::Fireworks,
-                    }))
-                } else {
-                    Err("Fireworks provider not yet implemented for direct mode".to_string())
-                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GLM4P6Fireworks,
+                    gateway,
+                )))
             },
         },
         
@@ -236,14 +224,11 @@ pub fn all_models() -> &'static [ModelDef] {
                 if api_key.is_empty() {
                     return Err("gemini-3-pro requires GEMINI_API_KEY or gateway".to_string());
                 }
-                if gateway.is_some() {
-                    Ok(Arc::new(PlaceholderService {
-                        model_id: "gemini-3-pro".to_string(),
-                        provider: Provider::Gemini,
-                    }))
-                } else {
-                    Err("Gemini provider not yet implemented for direct mode".to_string())
-                }
+                Ok(Arc::new(GeminiService::new(
+                    api_key.to_string(),
+                    GeminiModel::Gemini3Pro,
+                    gateway,
+                )))
             },
         },
         ModelDef {
@@ -256,14 +241,11 @@ pub fn all_models() -> &'static [ModelDef] {
                 if api_key.is_empty() {
                     return Err("gemini-3-flash requires GEMINI_API_KEY or gateway".to_string());
                 }
-                if gateway.is_some() {
-                    Ok(Arc::new(PlaceholderService {
-                        model_id: "gemini-3-flash".to_string(),
-                        provider: Provider::Gemini,
-                    }))
-                } else {
-                    Err("Gemini provider not yet implemented for direct mode".to_string())
-                }
+                Ok(Arc::new(GeminiService::new(
+                    api_key.to_string(),
+                    GeminiModel::Gemini3Flash,
+                    gateway,
+                )))
             },
         },
     ]
@@ -273,34 +255,4 @@ pub fn all_models() -> &'static [ModelDef] {
 #[allow(dead_code)] // Public API
 pub fn default_model() -> &'static ModelDef {
     &all_models()[1] // claude-4.5-sonnet as default
-}
-
-/// Placeholder service for providers not yet implemented
-/// This allows models to be registered in gateway mode where the gateway handles the actual API calls
-struct PlaceholderService {
-    model_id: String,
-    provider: Provider,
-}
-
-#[async_trait]
-impl LlmService for PlaceholderService {
-    async fn complete(&self, _request: &crate::llm::LlmRequest) -> Result<crate::llm::LlmResponse, LlmError> {
-        Err(LlmError::unknown(format!(
-            "{} provider not yet implemented for model {}",
-            self.provider.display_name(),
-            self.model_id
-        )))
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn context_window(&self) -> usize {
-        0 // Will be provided by model definition
-    }
-
-    fn max_image_dimension(&self) -> Option<u32> {
-        None
-    }
 }

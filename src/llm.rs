@@ -4,13 +4,17 @@
 
 mod anthropic;
 mod error;
+mod gemini;
 mod models;
+mod openai;
 mod registry;
 mod types;
 
 pub use anthropic::AnthropicService;
 pub use error::{LlmError, LlmErrorKind};
+pub use gemini::GeminiService;
 pub use models::{Provider, ModelDef, all_models};
+pub use openai::OpenAIService;
 pub use registry::{LlmConfig, ModelRegistry};
 pub use types::*;
 
