@@ -7,6 +7,17 @@
 }
 
 :root {
+  /* Layout constants */
+  --state-bar-height: 44px;
+  --breadcrumb-height: 36px;
+  --input-area-height: 60px;
+  --offline-banner-height: 36px;
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Dark theme (default) */
+:root,
+[data-theme="dark"] {
   --bg-primary: #0d1117;
   --bg-secondary: #161b22;
   --bg-tertiary: #21262d;
@@ -19,12 +30,24 @@
   --accent-yellow: #d29922;
   --accent-red: #f85149;
   --accent-purple: #a371f7;
-  
-  --state-bar-height: 44px;
-  --breadcrumb-height: 36px;
-  --input-area-height: 60px;
-  --offline-banner-height: 36px;
-  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --code-bg: #161b22;
+}
+
+/* Light theme */
+[data-theme="light"] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f6f8fa;
+  --bg-tertiary: #eaeef2;
+  --text-primary: #1f2328;
+  --text-secondary: #656d76;
+  --text-muted: #8c959f;
+  --border-color: #d0d7de;
+  --accent-blue: #0969da;
+  --accent-green: #1a7f37;
+  --accent-yellow: #9a6700;
+  --accent-red: #cf222e;
+  --accent-purple: #8250df;
+  --code-bg: #f6f8fa;
 }
 
 html, body {
@@ -221,6 +244,12 @@ html, body {
   font-weight: 600;
 }
 
+.view-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 #conv-list {
   list-style: none;
 }
@@ -313,12 +342,13 @@ html, body {
 }
 
 .message-content pre {
-  background: var(--bg-primary);
+  background: var(--code-bg);
   padding: 12px;
   border-radius: 6px;
   overflow-x: auto;
   font-size: 13px;
   margin: 8px 0;
+  border: 1px solid var(--border-color);
 }
 
 .message-content code {
@@ -379,7 +409,7 @@ html, body {
 
 .tool-input {
   padding: 12px;
-  background: var(--bg-primary);
+  background: var(--code-bg);
   font-family: 'SF Mono', Monaco, Consolas, monospace;
   font-size: 13px;
   white-space: pre-wrap;
@@ -1226,4 +1256,29 @@ html, body {
 .model-select:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* Theme Toggle */
+.theme-toggle {
+  background: transparent;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: background 0.15s;
+  line-height: 1;
+}
+
+.theme-toggle:hover {
+  background: var(--bg-tertiary);
+}
+
+/* Smooth theme transition */
+html {
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+html * {
+  transition: background-color 0.2s ease, border-color 0.2s ease;
 }

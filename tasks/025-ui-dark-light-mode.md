@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p4
-status: ready
+status: done
 ---
 
 # Dark/Light Mode Toggle
@@ -16,11 +16,11 @@ The UI currently ships dark mode only. Some users prefer light mode, especially 
 
 ## Acceptance Criteria
 
-- [ ] Toggle button/switch in UI (header or settings)
-- [ ] Light mode color scheme defined in CSS
-- [ ] Preference persisted in localStorage
-- [ ] Respect system preference as default (`prefers-color-scheme`)
-- [ ] Smooth transition between modes (no flash)
+- [x] Toggle button/switch in UI (header or settings)
+- [x] Light mode color scheme defined in CSS
+- [x] Preference persisted in localStorage
+- [x] Respect system preference as default (`prefers-color-scheme`)
+- [x] Smooth transition between modes (no flash)
 
 ## Notes
 

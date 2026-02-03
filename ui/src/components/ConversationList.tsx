@@ -1,6 +1,8 @@
 import { useNavigate } from 'react-router-dom';
 import type { Conversation } from '../api';
 import { formatRelativeTime } from '../utils';
+import { ThemeToggle } from './ThemeToggle';
+import { useTheme } from '../hooks/useTheme';
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -9,6 +11,7 @@ interface ConversationListProps {
 
 export function ConversationList({ conversations, onNewConversation }: ConversationListProps) {
   const navigate = useNavigate();
+  const { theme, toggleTheme } = useTheme();
 
   const handleClick = (conv: Conversation) => {
     navigate(`/c/${conv.slug}`);
@@ -18,9 +21,12 @@ export function ConversationList({ conversations, onNewConversation }: Conversat
     <section id="conversation-list" className="view active">
       <div className="view-header">
         <h2>Conversations</h2>
-        <button id="new-conv-btn" className="btn-primary" onClick={onNewConversation}>
-          + New
-        </button>
+        <div className="view-header-actions">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <button id="new-conv-btn" className="btn-primary" onClick={onNewConversation}>
+            + New
+          </button>
+        </div>
       </div>
       <ul id="conv-list">
         {conversations.length === 0 ? (
