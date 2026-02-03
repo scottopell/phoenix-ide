@@ -6,18 +6,11 @@ use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
+use crate::system_prompt::build_system_prompt;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-
-/// System prompt for conversations
-const SYSTEM_PROMPT: &str = r"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks.";
-
-/// System prompt suffix for sub-agents
-const SUB_AGENT_PROMPT_SUFFIX: &str = r"
-
-You are a sub-agent working on a specific task. When you complete your task, call submit_result with your findings. If you encounter an unrecoverable error, call submit_error. Your conversation will end after calling either tool.";
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
@@ -318,6 +311,7 @@ where
                 let storage = self.storage.clone();
                 let event_tx = self.event_tx.clone();
                 let conv_id = self.context.conversation_id.clone();
+                let working_dir = self.context.working_dir.clone();
                 let is_sub_agent = self.context.is_sub_agent;
                 let current_attempt = match &self.state {
                     ConvState::LlmRequesting { attempt } => *attempt,
@@ -342,12 +336,8 @@ where
                         }
                     };
 
-                    // Build system prompt (with sub-agent suffix if applicable)
-                    let system_prompt = if is_sub_agent {
-                        format!("{}{}", SYSTEM_PROMPT, SUB_AGENT_PROMPT_SUFFIX)
-                    } else {
-                        SYSTEM_PROMPT.to_string()
-                    };
+                    // Build system prompt with AGENTS.md content
+                    let system_prompt = build_system_prompt(&working_dir, is_sub_agent);
 
                     // Build request
                     let request = LlmRequest {

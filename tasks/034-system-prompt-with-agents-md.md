@@ -1,7 +1,7 @@
 ---
 created: 2025-02-02
 priority: p2
-status: ready
+status: done
 ---
 
 # Add system prompt that includes AGENTS.md content
@@ -22,11 +22,19 @@ This mirrors Shelley's approach where guidance files (AGENT.md, dear_llm.md, etc
 
 ## Acceptance Criteria
 
-- [ ] System prompt includes agent role/identity
-- [ ] AGENTS.md files are discovered from cwd up to filesystem root
-- [ ] More deeply nested AGENTS.md files take precedence over parent ones
-- [ ] System prompt includes information about available tools
-- [ ] System prompt is constructed at conversation start and cached appropriately
+- [x] System prompt includes agent role/identity
+- [x] AGENTS.md files are discovered from cwd up to filesystem root
+- [x] More deeply nested AGENTS.md files take precedence over parent ones
+- [x] System prompt includes information about available tools (via tool definitions in LlmRequest)
+- [x] System prompt is constructed at conversation start and cached appropriately
+
+## Implementation Notes
+
+- Created `src/system_prompt.rs` module
+- Supports both `AGENTS.md` and `AGENT.md` file names
+- Files discovered from cwd up to root, ordered root-first so more specific (nested) files appear last
+- Content wrapped in `<project_guidance>` XML tags with path comments
+- Tool information provided via LlmRequest.tools (standard Claude API pattern)
 
 ## Notes
 
