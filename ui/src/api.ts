@@ -157,6 +157,49 @@ export const api = {
     return resp.json();
   },
 
+  async archiveConversation(convId: string): Promise<{ ok: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/archive`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to archive');
+    return resp.json();
+  },
+
+  async unarchiveConversation(convId: string): Promise<{ ok: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/unarchive`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to unarchive');
+    return resp.json();
+  },
+
+  async deleteConversation(convId: string): Promise<{ ok: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/delete`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to delete');
+    return resp.json();
+  },
+
+  async renameConversation(convId: string, name: string): Promise<{ ok: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.error || 'Failed to rename');
+    }
+    return resp.json();
+  },
+
+  async listArchivedConversations(): Promise<Conversation[]> {
+    const resp = await fetch('/api/conversations/archived');
+    if (!resp.ok) throw new Error('Failed to list archived conversations');
+    return (await resp.json()).conversations;
+  },
+
   async listModels(): Promise<ModelsResponse> {
     const resp = await fetch('/api/models');
     if (!resp.ok) throw new Error('Failed to list models');
