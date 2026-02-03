@@ -5,26 +5,25 @@ status: not_started
 tags: [llm, architecture]
 ---
 
-# Refactor Model Registry for Dynamic Discovery
+# Refactor Model Registry for Centralized Model Definition
 
 ## Summary
 
-Refactor Phoenix's hard-coded model registry to use a dynamic, provider-agnostic system similar to Shelley's approach. This will enable proper multi-provider support, correct model discovery, and better gateway integration.
+Refactor Phoenix's hard-coded model registry to use a centralized, provider-agnostic system similar to Shelley's approach. This will enable proper multi-provider support, maintainable model definitions, and better gateway integration.
 
 ## Context
 
 Current issues with Phoenix's model registry:
-1. Models are hard-coded in `register_anthropic_models()`
+1. Models are hard-coded in `register_anthropic_models()` with no central registry
 2. Gateway mode incorrectly assumes all models work without API keys
-3. Model API names appear to be incorrect (e.g., Claude4Sonnet → claude-sonnet-4-20250514)
-4. No way to add new providers without modifying registry code
-5. No model metadata (descriptions, provider info)
-6. Confusing model IDs (using `claude-4-opus` for Claude 4.5 Opus)
+3. No way to add new providers without modifying registry code
+4. No model metadata (descriptions, provider info)
+5. Confusing model IDs (using `claude-4-opus` for Claude 4.5 Opus)
 
 ## Acceptance Criteria
 
 - [ ] Create `Model` struct with id, provider, description, api_name fields
-- [ ] Create `all_models()` function returning all possible models
+- [ ] Create `all_models()` function returning all possible models (centralized definition)
 - [ ] Implement factory pattern for model creation
 - [ ] Validate models work before registering (even in gateway mode)
 - [ ] Fix model API name mappings to match actual provider APIs
@@ -34,6 +33,14 @@ Current issues with Phoenix's model registry:
 - [ ] Add tests for multi-provider scenarios
 
 ## Implementation Notes
+
+### Note on "Dynamic" Discovery
+
+This task uses "centralized" rather than truly dynamic discovery because:
+- LLM providers don't expose model listing endpoints
+- The exe.dev gateway doesn't provide a discovery API
+- Models must be defined in code with their API names and metadata
+- The improvement is having all models defined in one place rather than scattered
 
 ### Proposed Model Structure
 
