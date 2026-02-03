@@ -19,6 +19,7 @@ Current issues with Phoenix's model registry:
 3. Model API names appear to be incorrect (e.g., Claude4Sonnet → claude-sonnet-4-20250514)
 4. No way to add new providers without modifying registry code
 5. No model metadata (descriptions, provider info)
+6. Confusing model IDs (using `claude-4-opus` for Claude 4.5 Opus)
 
 ## Acceptance Criteria
 
@@ -29,7 +30,7 @@ Current issues with Phoenix's model registry:
 - [ ] Fix model API name mappings to match actual provider APIs
 - [ ] Support provider enumeration (Anthropic, OpenAI, Fireworks, etc.)
 - [ ] Add model metadata to `/api/models` response
-- [ ] Maintain backward compatibility with existing conversations
+- [ ] Provide deployment instructions for database migration/purge
 - [ ] Add tests for multi-provider scenarios
 
 ## Implementation Notes
@@ -39,7 +40,7 @@ Current issues with Phoenix's model registry:
 ```rust
 #[derive(Debug, Clone)]
 pub struct ModelDef {
-    pub id: &'static str,           // "claude-4-opus"
+    pub id: &'static str,           // "claude-4.5-opus"
     pub provider: Provider,         // Provider::Anthropic
     pub api_name: &'static str,     // "claude-opus-4.5-20251101"
     pub description: &'static str,  // "Claude Opus 4.5 (most capable)"
@@ -57,7 +58,7 @@ pub enum Provider {
 pub fn all_models() -> &'static [ModelDef] {
     &[
         ModelDef {
-            id: "claude-4-opus",
+            id: "claude-4.5-opus",
             provider: Provider::Anthropic,
             api_name: "claude-opus-4.5-20251101",
             description: "Claude Opus 4.5 (most capable)",
@@ -136,3 +137,27 @@ From Shelley's implementation:
 4. Gateway mode with keys → only validated models
 5. Invalid API key → model not registered
 6. Model selection for existing conversations → uses stored model
+
+## Deployment Instructions
+
+This change modifies how models are identified and stored. To deploy safely:
+
+1. **Option A: Clean deployment (recommended)**
+   ```bash
+   # Stop the service
+   systemctl stop phoenix-ide
+   
+   # Remove existing database
+   rm ~/.phoenix-ide/phoenix.db
+   
+   # Deploy new version
+   # ... deployment steps ...
+   
+   # Start service - will create fresh database
+   systemctl start phoenix-ide
+   ```
+
+2. **Option B: Migrate existing data**
+   - Model IDs will change (e.g., `claude-4-opus` → `claude-4.5-opus`)
+   - Run migration script: `./scripts/migrate_model_ids.sql`
+   - Or just purge if data isn't critical
