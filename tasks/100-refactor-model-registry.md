@@ -1,7 +1,7 @@
 ---
 created: 2026-02-02
 priority: p1
-status: not_started
+status: ready
 tags: [llm, architecture]
 ---
 
