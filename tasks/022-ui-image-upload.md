@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p3
-status: ready
+status: done
 ---
 
 # Add Image Upload to Web UI
@@ -16,13 +16,13 @@ The backend accepts base64-encoded images in chat messages (REQ-API-004). The `r
 
 ## Acceptance Criteria
 
-- [ ] File picker button to select images
-- [ ] Paste support (Cmd/Ctrl+V) for clipboard images
-- [ ] Preview thumbnails of attached images before sending
-- [ ] Remove button on each thumbnail
-- [ ] Images encoded as base64 with correct media_type
-- [ ] Mobile: camera capture option via `capture="environment"` attribute
-- [ ] Supported formats: PNG, JPEG, GIF, WebP
+- [x] File picker button to select images
+- [x] Paste support (Cmd/Ctrl+V) for clipboard images
+- [x] Preview thumbnails of attached images before sending
+- [x] Remove button on each thumbnail
+- [x] Images encoded as base64 with correct media_type
+- [ ] Mobile: camera capture option via `capture="environment"` attribute (deferred)
+- [x] Supported formats: PNG, JPEG, GIF, WebP
 
 ## Notes
 

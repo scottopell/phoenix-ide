@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData } from '../api';
+import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { MessageList } from '../components/MessageList';
@@ -26,6 +26,9 @@ export function ConversationPage() {
 
   // Draft management
   const [draft, setDraft, clearDraft] = useDraft(conversationId);
+  
+  // Image attachments (not persisted - cleared on page refresh)
+  const [images, setImages] = useState<ImageData[]>([]);
 
   // Message queue management
   const { queuedMessages, enqueue, markSent, markFailed, retry } = useMessageQueue(conversationId);
@@ -260,18 +263,19 @@ export function ConversationPage() {
   }, [isConnected, conversationId, queuedMessages]); // sendMessage accessed via ref
 
   // Handle send from input
-  const handleSend = (text: string) => {
+  const handleSend = (text: string, attachedImages: ImageData[]) => {
     if (!conversationId) return;
 
-    // Clear draft
+    // Clear draft and images
     clearDraft();
+    setImages([]);
 
     // Enqueue the message (shows immediately with sending state)
-    const msg = enqueue(text);
+    const msg = enqueue(text, attachedImages);
 
     // If we're connected, send immediately
     if (isConnected) {
-      sendMessage(msg.localId, text);
+      sendMessage(msg.localId, text, attachedImages);
     }
     // If offline, message will be sent when connection is restored (via useEffect above)
   };
@@ -374,6 +378,8 @@ export function ConversationPage() {
       <InputArea
         draft={draft}
         setDraft={setDraft}
+        images={images}
+        setImages={setImages}
         canSend={canSend}
         agentWorking={agentWorking}
         isCancelling={isCancelling}
