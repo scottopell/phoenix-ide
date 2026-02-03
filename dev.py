@@ -550,6 +550,9 @@ def cmd_prod_deploy(version: str | None = None):
         )
         version = f"dev-{result.stdout.strip()}"
     
+    # Stop service if running (binary may be in use)
+    subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME], capture_output=True)
+    
     # Create install directory
     print(f"Installing to {PROD_INSTALL_DIR}...")
     subprocess.run(["sudo", "mkdir", "-p", str(PROD_INSTALL_DIR)], check=True)

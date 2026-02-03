@@ -1,7 +1,7 @@
 ---
 created: 2025-02-02
 priority: p2
-status: ready
+status: done
 ---
 
 # Auto-stop service during prod deploy
@@ -22,10 +22,10 @@ The workaround is to manually run `./dev.py prod stop` first, but this should be
 
 ## Acceptance Criteria
 
-- [ ] `prod deploy` stops the service before copying the binary (if running)
-- [ ] Service is restarted after successful copy
-- [ ] If copy fails, provide clear error message
-- [ ] If service wasn't running before, don't start it (or do start it? decide on behavior)
+- [x] `prod deploy` stops the service before copying the binary (if running)
+- [x] Service is restarted after successful copy
+- [x] If copy fails, provide clear error message
+- [x] If service wasn't running before, start it anyway (deploy implies wanting it running)
 
 ## Notes
 
