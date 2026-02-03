@@ -76,22 +76,28 @@ impl ModelRegistry {
         model_def: &super::ModelDef,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
-        // Get the API key for this provider
-        let api_key = match model_def.provider {
-            Provider::Anthropic => config.anthropic_api_key.as_ref()?,
-            Provider::OpenAI => config.openai_api_key.as_ref()?,
-            Provider::Fireworks => config.fireworks_api_key.as_ref()?,
-            Provider::Gemini => config.gemini_api_key.as_ref()?,
+        // In gateway mode, use "implicit" as the API key
+        // The gateway will handle the actual authentication
+        let api_key = if config.gateway.is_some() {
+            "implicit".to_string()
+        } else {
+            // Direct mode: require actual API key
+            match model_def.provider {
+                Provider::Anthropic => config.anthropic_api_key.as_ref()?,
+                Provider::OpenAI => config.openai_api_key.as_ref()?,
+                Provider::Fireworks => config.fireworks_api_key.as_ref()?,
+                Provider::Gemini => config.gemini_api_key.as_ref()?,
+            }
+            .clone()
         };
 
-        // Even in gateway mode, we need an API key
-        // The gateway is a proxy, not a key manager
-        if api_key.is_empty() {
+        // In direct mode, don't allow empty keys
+        if config.gateway.is_none() && api_key.is_empty() {
             return None;
         }
 
         // Try to create the service using the factory
-        match (model_def.factory)(api_key, config.gateway.as_deref()) {
+        match (model_def.factory)(&api_key, config.gateway.as_deref()) {
             Ok(service) => {
                 // Wrap with logging
                 Some(Arc::new(LoggingService::new(service)))

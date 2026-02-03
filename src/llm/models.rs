@@ -71,8 +71,9 @@ pub fn all_models() -> &'static [ModelDef] {
             description: "Claude Opus 4.5 (most capable, slower)",
             context_window: 200_000,
             factory: |api_key, gateway| {
+                // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-4.5-opus requires ANTHROPIC_API_KEY".to_string());
+                    return Err("claude-4.5-opus requires ANTHROPIC_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
@@ -88,8 +89,9 @@ pub fn all_models() -> &'static [ModelDef] {
             description: "Claude Sonnet 4.5 (balanced performance)",
             context_window: 200_000,
             factory: |api_key, gateway| {
+                // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-4.5-sonnet requires ANTHROPIC_API_KEY".to_string());
+                    return Err("claude-4.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
@@ -105,8 +107,9 @@ pub fn all_models() -> &'static [ModelDef] {
             description: "Claude 3.5 Sonnet (legacy)",
             context_window: 200_000,
             factory: |api_key, gateway| {
+                // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-3.5-sonnet requires ANTHROPIC_API_KEY".to_string());
+                    return Err("claude-3.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
@@ -122,8 +125,9 @@ pub fn all_models() -> &'static [ModelDef] {
             description: "Claude Haiku 4.5 (fast, efficient)",
             context_window: 200_000,
             factory: |api_key, gateway| {
+                // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-4.5-haiku requires ANTHROPIC_API_KEY".to_string());
+                    return Err("claude-4.5-haiku requires ANTHROPIC_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
