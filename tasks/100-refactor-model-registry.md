@@ -16,7 +16,7 @@ Refactor Phoenix's hard-coded model registry to use a centralized, provider-agno
 Current issues with Phoenix's model registry:
 1. Models are hard-coded in `register_anthropic_models()` with no central registry
 2. Gateway mode incorrectly assumes all models work without API keys
-3. No way to add new providers without modifying registry code
+3. Adding new providers requires modifying multiple places in registry code
 4. No model metadata (descriptions, provider info)
 5. Confusing model IDs (using `claude-4-opus` for Claude 4.5 Opus)
 
@@ -25,7 +25,7 @@ Current issues with Phoenix's model registry:
 - [ ] Create `Model` struct with id, provider, description, api_name fields
 - [ ] Create `all_models()` function returning all possible models (centralized definition)
 - [ ] Implement factory pattern for model creation
-- [ ] Validate models work before registering (even in gateway mode)
+- [ ] Validate model prerequisites before registering (check API key exists)
 - [ ] Fix model API name mappings to match actual provider APIs
 - [ ] Support provider enumeration (Anthropic, OpenAI, Fireworks, etc.)
 - [ ] Add model metadata to `/api/models` response
@@ -41,6 +41,32 @@ This task uses "centralized" rather than truly dynamic discovery because:
 - The exe.dev gateway doesn't provide a discovery API
 - Models must be defined in code with their API names and metadata
 - The improvement is having all models defined in one place rather than scattered
+
+### What "No way to add providers" means
+
+Currently, adding a new provider (e.g., OpenAI) requires:
+1. Creating new provider-specific types (`OpenAIModel`, `OpenAIService`)
+2. Adding a new `register_openai_models()` function
+3. Modifying `ModelRegistry::new()` to call it
+4. Updating multiple places for gateway URL construction
+
+With centralized definitions, adding a provider only requires:
+1. Adding entries to `all_models()` array
+2. Adding a match arm in `try_create_model()`
+
+The code changes are still required, but they're localized and systematic.
+
+### What "Validate model prerequisites" means
+
+Looking at Shelley's code, validation simply checks if the required API key exists:
+```go
+if config.AnthropicAPIKey == "" {
+    return nil, fmt.Errorf("claude-opus-4.5 requires ANTHROPIC_API_KEY")
+}
+```
+
+This is NOT about making test API calls. The validation happens during factory function execution.
+If the factory returns an error, the model is not registered as available.
 
 ### Proposed Model Structure
 
@@ -135,6 +161,28 @@ From Shelley's implementation:
 - Gateway URL construction: `gateway + "/_/gateway/{provider}/..."` 
 - Even with gateway, API keys are validated
 - Rich error messages when models unavailable
+
+### Shelley Model Reference
+
+**Source file**: `/home/exedev/shelley/models/models.go`
+
+Current models in Shelley (latest as of git pull):
+- `claude-opus-4.5` - Claude Opus 4.5 (default)
+- `claude-sonnet-4.5` - Claude Sonnet 4.5  
+- `claude-haiku-4.5` - Claude Haiku 4.5
+- `glm-4.7-fireworks` - GLM-4.7 on Fireworks
+- `gpt-5.2-codex` - GPT-5.2 Codex
+- `qwen3-coder-fireworks` - Qwen3 Coder 480B on Fireworks
+- `glm-4p6-fireworks` - GLM-4P6 on Fireworks  
+- `gemini-3-pro` - Gemini 3 Pro
+- `gemini-3-flash` - Gemini 3 Flash
+- `predictable` - Deterministic test model (no API key)
+
+Each model definition includes:
+- Provider (Anthropic, OpenAI, Fireworks, Gemini)
+- Required environment variables
+- Description
+- Factory function for creation
 
 ## Testing Scenarios
 
