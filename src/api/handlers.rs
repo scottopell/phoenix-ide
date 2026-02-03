@@ -494,8 +494,11 @@ async fn list_directory(
 // ============================================================
 
 async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
+    // Get model metadata from registry
+    let models = state.llm_registry.available_model_info();
+    
     Json(ModelsResponse {
-        models: state.llm_registry.available_models(),
+        models,
         default: state.llm_registry.default_model_id().to_string(),
     })
 }

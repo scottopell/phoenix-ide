@@ -124,8 +124,8 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
             <option>Loading models...</option>
           ) : (
             models.models.map(model => (
-              <option key={model} value={model}>
-                {model}
+              <option key={model.id} value={model.id}>
+                {model.id} - {model.description}
               </option>
             ))
           )}

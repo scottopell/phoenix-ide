@@ -87,8 +87,15 @@ export interface SseStateChangeData {
 export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'disconnected';
 export type SseEventData = SseInitData | SseMessageData | SseStateChangeData | Record<string, never>;
 
+export interface ModelInfo {
+  id: string;
+  provider: string;
+  description: string;
+  context_window: number;
+}
+
 export interface ModelsResponse {
-  models: string[];
+  models: ModelInfo[];
   default: string;
 }
 

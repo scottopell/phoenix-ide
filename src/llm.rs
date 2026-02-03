@@ -4,11 +4,13 @@
 
 mod anthropic;
 mod error;
+mod models;
 mod registry;
 mod types;
 
 pub use anthropic::AnthropicService;
 pub use error::{LlmError, LlmErrorKind};
+pub use models::{Provider, ModelDef, all_models};
 pub use registry::{LlmConfig, ModelRegistry};
 pub use types::*;
 

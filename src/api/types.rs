@@ -91,10 +91,19 @@ pub struct DirectoryEntry {
     pub is_dir: bool,
 }
 
+/// Model information with metadata
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub provider: String,
+    pub description: String,
+    pub context_window: usize,
+}
+
 /// Response for model list
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
-    pub models: Vec<String>,
+    pub models: Vec<ModelInfo>,
     pub default: String,
 }
 

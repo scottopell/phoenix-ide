@@ -1,7 +1,6 @@
 //! Model registry for managing available LLM providers
 
-use super::anthropic::AnthropicModel;
-use super::{AnthropicService, LlmService, LoggingService};
+use super::{LlmService, LoggingService, all_models, Provider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -44,23 +43,27 @@ impl ModelRegistry {
     pub fn new(config: &LlmConfig) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
 
-        if config.gateway.is_some() {
-            // Gateway mode: register all models, gateway handles API keys
-            Self::register_all_models(&mut services, config);
-        } else {
-            // Direct mode: register only models with API keys
-            if config.anthropic_api_key.is_some() {
-                Self::register_anthropic_models(&mut services, config);
+        // Try to create each model from the centralized definitions
+        for model_def in all_models() {
+            if let Some(service) = Self::try_create_model(model_def, config) {
+                services.insert(model_def.id.to_string(), service);
             }
-            // OpenAI and Fireworks support can be added later
         }
 
         // Determine default model
         let default_model = config
             .default_model
             .clone()
-            .or_else(|| services.keys().next().cloned())
-            .unwrap_or_else(|| "claude-4-sonnet".to_string());
+            .or_else(|| {
+                // Try claude-4.5-sonnet first (our preferred default)
+                if services.contains_key("claude-4.5-sonnet") {
+                    Some("claude-4.5-sonnet".to_string())
+                } else {
+                    // Fall back to first available model
+                    services.keys().next().cloned()
+                }
+            })
+            .unwrap_or_else(|| "claude-4.5-sonnet".to_string());
 
         Self {
             services,
@@ -68,32 +71,32 @@ impl ModelRegistry {
         }
     }
 
-    fn register_all_models(
-        services: &mut HashMap<String, Arc<dyn LlmService>>,
+    /// Try to create a model service, validating prerequisites
+    fn try_create_model(
+        model_def: &super::ModelDef,
         config: &LlmConfig,
-    ) {
-        Self::register_anthropic_models(services, config);
-        // Additional providers can be registered here
-    }
+    ) -> Option<Arc<dyn LlmService>> {
+        // Get the API key for this provider
+        let api_key = match model_def.provider {
+            Provider::Anthropic => config.anthropic_api_key.as_ref()?,
+            Provider::OpenAI => config.openai_api_key.as_ref()?,
+            Provider::Fireworks => config.fireworks_api_key.as_ref()?,
+            Provider::Gemini => config.gemini_api_key.as_ref()?,
+        };
 
-    fn register_anthropic_models(
-        services: &mut HashMap<String, Arc<dyn LlmService>>,
-        config: &LlmConfig,
-    ) {
-        let key = config.anthropic_api_key.clone().unwrap_or_default();
-        let gateway = config.gateway.as_deref();
+        // Even in gateway mode, we need an API key
+        // The gateway is a proxy, not a key manager
+        if api_key.is_empty() {
+            return None;
+        }
 
-        let models = [
-            ("claude-4-opus", AnthropicModel::Claude4Opus),
-            ("claude-4-sonnet", AnthropicModel::Claude4Sonnet),
-            ("claude-3.5-sonnet", AnthropicModel::Claude35Sonnet),
-            ("claude-3.5-haiku", AnthropicModel::Claude35Haiku),
-        ];
-
-        for (id, model) in models {
-            let service = AnthropicService::new(key.clone(), model, gateway);
-            let logged = LoggingService::new(Arc::new(service));
-            services.insert(id.to_string(), Arc::new(logged));
+        // Try to create the service using the factory
+        match (model_def.factory)(api_key, config.gateway.as_deref()) {
+            Ok(service) => {
+                // Wrap with logging
+                Some(Arc::new(LoggingService::new(service)))
+            }
+            Err(_) => None,
         }
     }
 
@@ -119,8 +122,138 @@ impl ModelRegistry {
         models
     }
 
+    /// Get detailed information about available models
+    pub fn available_model_info(&self) -> Vec<crate::api::ModelInfo> {
+        let mut model_infos = Vec::new();
+        
+        // Get info for each registered model
+        for model_def in super::all_models() {
+            if self.services.contains_key(model_def.id) {
+                model_infos.push(crate::api::ModelInfo {
+                    id: model_def.id.to_string(),
+                    provider: model_def.provider.display_name().to_string(),
+                    description: model_def.description.to_string(),
+                    context_window: model_def.context_window,
+                });
+            }
+        }
+        
+        model_infos
+    }
+
     /// Check if any models are available
     pub fn has_models(&self) -> bool {
         !self.services.is_empty()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_api_keys_no_models() {
+        let config = LlmConfig::default();
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.available_models().is_empty());
+    }
+
+    #[test]
+    fn test_anthropic_key_only_anthropic_models() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        
+        let models = registry.available_models();
+        assert!(!models.is_empty());
+        
+        // All models should be Anthropic models
+        for model_id in &models {
+            assert!(
+                model_id.contains("claude"),
+                "Expected claude model, got {}",
+                model_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_gateway_with_no_keys_no_models() {
+        // Even with gateway, we need API keys
+        let config = LlmConfig {
+            gateway: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.available_models().is_empty());
+    }
+
+    #[test]
+    fn test_gateway_with_anthropic_key() {
+        let config = LlmConfig {
+            gateway: Some("https://example.com".to_string()),
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        
+        let models = registry.available_models();
+        assert!(!models.is_empty());
+        assert!(models.contains(&"claude-4.5-opus".to_string()));
+    }
+
+    #[test]
+    fn test_default_model_selection() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        
+        // Should default to claude-4.5-sonnet
+        assert_eq!(registry.default_model_id(), "claude-4.5-sonnet");
+    }
+
+    #[test]
+    fn test_custom_default_model() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            default_model: Some("claude-4.5-opus".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        
+        assert_eq!(registry.default_model_id(), "claude-4.5-opus");
+    }
+
+    #[test]
+    fn test_model_info_metadata() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        
+        let model_infos = registry.available_model_info();
+        assert!(!model_infos.is_empty());
+        
+        // Check that all models have proper metadata
+        for info in &model_infos {
+            assert!(!info.id.is_empty());
+            assert!(!info.provider.is_empty());
+            assert!(!info.description.is_empty());
+            assert!(info.context_window > 0);
+        }
+        
+        // Check specific model
+        let opus = model_infos.iter().find(|m| m.id == "claude-4.5-opus");
+        assert!(opus.is_some());
+        let opus = opus.unwrap();
+        assert_eq!(opus.provider, "Anthropic");
+        assert!(opus.description.contains("most capable"));
+        assert_eq!(opus.context_window, 200_000);
     }
 }

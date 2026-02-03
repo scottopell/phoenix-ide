@@ -41,10 +41,10 @@ impl AnthropicModel {
 
     pub fn model_id(self) -> &'static str {
         match self {
-            AnthropicModel::Claude4Opus => "claude-4-opus",
-            AnthropicModel::Claude4Sonnet => "claude-4-sonnet",
+            AnthropicModel::Claude4Opus => "claude-4.5-opus",
+            AnthropicModel::Claude4Sonnet => "claude-4.5-sonnet",
             AnthropicModel::Claude35Sonnet => "claude-3.5-sonnet",
-            AnthropicModel::Claude35Haiku => "claude-3.5-haiku",
+            AnthropicModel::Claude35Haiku => "claude-4.5-haiku",
         }
     }
 }
