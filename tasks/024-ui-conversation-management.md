@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p3
-status: ready
+status: done
 ---
 
 # Conversation Management UI
