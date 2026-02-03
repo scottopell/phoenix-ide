@@ -1,7 +1,7 @@
 ---
 created: 2026-02-02
 priority: p1
-status: ready
+status: done
 tags: [llm, architecture]
 ---
 
@@ -22,15 +22,15 @@ Current issues with Phoenix's model registry:
 
 ## Acceptance Criteria
 
-- [ ] Create `Model` struct with id, provider, description, api_name fields
-- [ ] Create `all_models()` function returning all possible models (centralized definition)
-- [ ] Implement factory pattern for model creation
-- [ ] Validate model prerequisites before registering (check API key exists)
-- [ ] Fix model API name mappings to match actual provider APIs
-- [ ] Support provider enumeration (Anthropic, OpenAI, Fireworks, etc.)
-- [ ] Add model metadata to `/api/models` response
-- [ ] Provide deployment instructions for database migration/purge
-- [ ] Add tests for multi-provider scenarios
+- [x] Create `Model` struct with id, provider, description, api_name fields
+- [x] Create `all_models()` function returning all possible models (centralized definition)
+- [x] Implement factory pattern for model creation
+- [x] Validate model prerequisites before registering (check API key exists)
+- [x] Fix model API name mappings to match actual provider APIs
+- [x] Support provider enumeration (Anthropic, OpenAI, Fireworks, etc.)
+- [x] Add model metadata to `/api/models` response
+- [x] Provide deployment instructions for database migration/purge
+- [x] Add tests for multi-provider scenarios
 
 ## Implementation Notes
 
