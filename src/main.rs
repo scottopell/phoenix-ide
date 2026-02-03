@@ -28,7 +28,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "phoenix_ide=info,tower_http=debug".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(false)
+                .with_span_list(false)
+        )
         .init();
 
     // Configuration

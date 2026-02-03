@@ -13,37 +13,48 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy)]
 pub enum OpenAIModel {
     // OpenAI models
-    GPT52Codex,
+    GPT4o,
+    GPT4oMini,
+    O4Mini,
     // Fireworks models (use OpenAI API)
-    GLM47Fireworks,
+    GLM4P7Fireworks,
     QwenCoderFireworks,
-    GLM4P6Fireworks,
+    DeepseekV3Fireworks,
 }
 
 impl OpenAIModel {
     pub fn api_name(self) -> &'static str {
         match self {
-            OpenAIModel::GPT52Codex => "gpt-5.2-codex",
-            OpenAIModel::GLM47Fireworks => "accounts/fireworks/models/glm-4-7b-chat",
-            OpenAIModel::QwenCoderFireworks => "accounts/fireworks/models/qwen3-coder-480b-instruct",
-            OpenAIModel::GLM4P6Fireworks => "accounts/fireworks/models/glm-4p6-chat",
+            OpenAIModel::GPT4o => "gpt-4o",
+            OpenAIModel::GPT4oMini => "gpt-4o-mini",
+            OpenAIModel::O4Mini => "o4-mini",
+            OpenAIModel::GLM4P7Fireworks => "accounts/fireworks/models/glm-4p7",
+            OpenAIModel::QwenCoderFireworks => "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
+            OpenAIModel::DeepseekV3Fireworks => "accounts/fireworks/models/deepseek-v3p1",
         }
     }
 
     pub fn model_id(self) -> &'static str {
         match self {
-            OpenAIModel::GPT52Codex => "gpt-5.2-codex",
-            OpenAIModel::GLM47Fireworks => "glm-4.7-fireworks",
+            OpenAIModel::GPT4o => "gpt-4o",
+            OpenAIModel::GPT4oMini => "gpt-4o-mini",
+            OpenAIModel::O4Mini => "o4-mini",
+            OpenAIModel::GLM4P7Fireworks => "glm-4p7-fireworks",
             OpenAIModel::QwenCoderFireworks => "qwen3-coder-fireworks",
-            OpenAIModel::GLM4P6Fireworks => "glm-4p6-fireworks",
+            OpenAIModel::DeepseekV3Fireworks => "deepseek-v3-fireworks",
         }
     }
 
     pub fn is_fireworks(self) -> bool {
         matches!(
             self,
-            OpenAIModel::GLM47Fireworks | OpenAIModel::QwenCoderFireworks | OpenAIModel::GLM4P6Fireworks
+            OpenAIModel::GLM4P7Fireworks | OpenAIModel::QwenCoderFireworks | OpenAIModel::DeepseekV3Fireworks
         )
+    }
+
+    /// O-series models use max_completion_tokens instead of max_tokens
+    pub fn uses_max_completion_tokens(self) -> bool {
+        matches!(self, OpenAIModel::O4Mini)
     }
 }
 
@@ -136,11 +147,19 @@ impl OpenAIService {
             )
         };
 
+        // O-series models use max_completion_tokens, others use max_tokens
+        let (max_tokens, max_completion_tokens) = if self.model.uses_max_completion_tokens() {
+            (None, request.max_tokens)
+        } else {
+            (request.max_tokens, None)
+        };
+
         OpenAIRequest {
             model: self.model.api_name().to_string(),
             messages,
             tools,
-            max_tokens: request.max_tokens,
+            max_tokens,
+            max_completion_tokens,
             temperature: None,
             stream: false,
         }
@@ -335,10 +354,12 @@ impl LlmService for OpenAIService {
 
     fn context_window(&self) -> usize {
         match self.model {
-            OpenAIModel::GPT52Codex => 128_000,
-            OpenAIModel::GLM47Fireworks => 128_000,
-            OpenAIModel::QwenCoderFireworks => 32_768,
-            OpenAIModel::GLM4P6Fireworks => 128_000,
+            OpenAIModel::GPT4o => 128_000,
+            OpenAIModel::GPT4oMini => 128_000,
+            OpenAIModel::O4Mini => 200_000,
+            OpenAIModel::GLM4P7Fireworks => 128_000,
+            OpenAIModel::QwenCoderFireworks => 128_000,
+            OpenAIModel::DeepseekV3Fireworks => 128_000,
         }
     }
 
@@ -357,6 +378,8 @@ struct OpenAIRequest {
     tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,

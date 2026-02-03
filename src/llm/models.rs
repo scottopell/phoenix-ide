@@ -3,9 +3,8 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
-use super::{AnthropicService, GeminiService, OpenAIService, LlmService};
+use super::{AnthropicService, OpenAIService, LlmService};
 use super::anthropic::AnthropicModel;
-use super::gemini::GeminiModel;
 use super::openai::OpenAIModel;
 use std::sync::Arc;
 
@@ -13,12 +12,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     Anthropic,
-    #[allow(dead_code)] // Future providers
     OpenAI,
-    #[allow(dead_code)]
     Fireworks,
-    #[allow(dead_code)]
-    Gemini,
 }
 
 impl Provider {
@@ -28,7 +23,6 @@ impl Provider {
             Provider::Anthropic => "Anthropic",
             Provider::OpenAI => "OpenAI",
             Provider::Fireworks => "Fireworks",
-            Provider::Gemini => "Gemini",
         }
     }
     
@@ -39,7 +33,6 @@ impl Provider {
             Provider::Anthropic => "ANTHROPIC_API_KEY",
             Provider::OpenAI => "OPENAI_API_KEY",
             Provider::Fireworks => "FIREWORKS_API_KEY",
-            Provider::Gemini => "GEMINI_API_KEY",
         }
     }
 }
@@ -143,18 +136,52 @@ pub fn all_models() -> &'static [ModelDef] {
         
         // OpenAI models
         ModelDef {
-            id: "gpt-5.2-codex",
+            id: "gpt-4o",
             provider: Provider::OpenAI,
-            api_name: "gpt-5.2-codex",
-            description: "GPT-5.2 Codex (advanced coding)",
+            api_name: "gpt-4o",
+            description: "GPT-4o (balanced, multimodal)",
             context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
-                    return Err("gpt-5.2-codex requires OPENAI_API_KEY or gateway".to_string());
+                    return Err("gpt-4o requires OPENAI_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(OpenAIService::new(
                     api_key.to_string(),
-                    OpenAIModel::GPT52Codex,
+                    OpenAIModel::GPT4o,
+                    gateway,
+                )))
+            },
+        },
+        ModelDef {
+            id: "gpt-4o-mini",
+            provider: Provider::OpenAI,
+            api_name: "gpt-4o-mini",
+            description: "GPT-4o Mini (fast, efficient)",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-4o-mini requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT4oMini,
+                    gateway,
+                )))
+            },
+        },
+        ModelDef {
+            id: "o4-mini",
+            provider: Provider::OpenAI,
+            api_name: "o4-mini",
+            description: "O4-Mini (reasoning model)",
+            context_window: 200_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("o4-mini requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::O4Mini,
                     gateway,
                 )))
             },
@@ -162,18 +189,18 @@ pub fn all_models() -> &'static [ModelDef] {
         
         // Fireworks models
         ModelDef {
-            id: "glm-4.7-fireworks",
+            id: "glm-4p7-fireworks",
             provider: Provider::Fireworks,
-            api_name: "accounts/fireworks/models/glm-4-7b-chat",
-            description: "GLM-4.7 on Fireworks",
+            api_name: "accounts/fireworks/models/glm-4p7",
+            description: "GLM-4P7 on Fireworks",
             context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
-                    return Err("glm-4.7-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                    return Err("glm-4p7-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(OpenAIService::new(
                     api_key.to_string(),
-                    OpenAIModel::GLM47Fireworks,
+                    OpenAIModel::GLM4P7Fireworks,
                     gateway,
                 )))
             },
@@ -181,9 +208,9 @@ pub fn all_models() -> &'static [ModelDef] {
         ModelDef {
             id: "qwen3-coder-fireworks",
             provider: Provider::Fireworks,
-            api_name: "accounts/fireworks/models/qwen3-coder-480b-instruct",
+            api_name: "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
             description: "Qwen3 Coder 480B on Fireworks",
-            context_window: 32_768,
+            context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("qwen3-coder-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
@@ -196,54 +223,18 @@ pub fn all_models() -> &'static [ModelDef] {
             },
         },
         ModelDef {
-            id: "glm-4p6-fireworks",
+            id: "deepseek-v3-fireworks",
             provider: Provider::Fireworks,
-            api_name: "accounts/fireworks/models/glm-4p6-chat",
-            description: "GLM-4P6 on Fireworks",
+            api_name: "accounts/fireworks/models/deepseek-v3p1",
+            description: "DeepSeek V3 on Fireworks",
             context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
-                    return Err("glm-4p6-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                    return Err("deepseek-v3-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
                 }
                 Ok(Arc::new(OpenAIService::new(
                     api_key.to_string(),
-                    OpenAIModel::GLM4P6Fireworks,
-                    gateway,
-                )))
-            },
-        },
-        
-        // Gemini models
-        ModelDef {
-            id: "gemini-3-pro",
-            provider: Provider::Gemini,
-            api_name: "gemini-3.0-pro",
-            description: "Gemini 3 Pro",
-            context_window: 2_097_152, // 2M context
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gemini-3-pro requires GEMINI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(GeminiService::new(
-                    api_key.to_string(),
-                    GeminiModel::Gemini3Pro,
-                    gateway,
-                )))
-            },
-        },
-        ModelDef {
-            id: "gemini-3-flash",
-            provider: Provider::Gemini,
-            api_name: "gemini-3.0-flash",
-            description: "Gemini 3 Flash",
-            context_window: 1_048_576, // 1M context
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gemini-3-flash requires GEMINI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(GeminiService::new(
-                    api_key.to_string(),
-                    GeminiModel::Gemini3Flash,
+                    OpenAIModel::DeepseekV3Fireworks,
                     gateway,
                 )))
             },

@@ -8,13 +8,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
-    #[allow(dead_code)] // Reserved for OpenAI provider
     pub openai_api_key: Option<String>,
-    #[allow(dead_code)] // Reserved for Fireworks provider
     pub fireworks_api_key: Option<String>,
-    #[allow(dead_code)] // Reserved for Gemini provider
-    pub gemini_api_key: Option<String>,
-    /// exe.dev gateway URL (e.g., `<https://meteor-rain.exe.xyz>`)
+    /// exe.dev gateway URL (e.g., `http://169.254.169.254/gateway/llm`)
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
@@ -26,7 +22,6 @@ impl LlmConfig {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             fireworks_api_key: std::env::var("FIREWORKS_API_KEY").ok(),
-            gemini_api_key: std::env::var("GEMINI_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
         }
@@ -86,7 +81,6 @@ impl ModelRegistry {
                 Provider::Anthropic => config.anthropic_api_key.as_ref()?,
                 Provider::OpenAI => config.openai_api_key.as_ref()?,
                 Provider::Fireworks => config.fireworks_api_key.as_ref()?,
-                Provider::Gemini => config.gemini_api_key.as_ref()?,
             }
             .clone()
         };
