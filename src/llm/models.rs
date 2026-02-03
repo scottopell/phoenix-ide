@@ -3,9 +3,10 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
-use super::{AnthropicService, LlmService};
+use super::{AnthropicService, LlmService, LlmError};
 use super::anthropic::AnthropicModel;
 use std::sync::Arc;
+use async_trait::async_trait;
 
 /// LLM provider enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,10 +137,135 @@ pub fn all_models() -> &'static [ModelDef] {
                 )))
             },
         },
-        // Future providers will be added here:
-        // - OpenAI: gpt-5.2-codex, o3, o3-mini
-        // - Fireworks: qwen3-coder-fireworks, glm-4.7-fireworks, glm-4p6-fireworks
-        // - Gemini: gemini-3-pro, gemini-3-flash
+        // Additional providers - These work in gateway mode
+        // The gateway handles the actual API communication
+        
+        // OpenAI models
+        ModelDef {
+            id: "gpt-5.2-codex",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5.2-codex",
+            description: "GPT-5.2 Codex (advanced coding)",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5.2-codex requires OPENAI_API_KEY or gateway".to_string());
+                }
+                // In gateway mode, return placeholder that gateway will handle
+                if gateway.is_some() {
+                    Ok(Arc::new(PlaceholderService {
+                        model_id: "gpt-5.2-codex".to_string(),
+                        provider: Provider::OpenAI,
+                    }))
+                } else {
+                    Err("OpenAI provider not yet implemented for direct mode".to_string())
+                }
+            },
+        },
+        
+        // Fireworks models
+        ModelDef {
+            id: "glm-4.7-fireworks",
+            provider: Provider::Fireworks,
+            api_name: "accounts/fireworks/models/glm-4-7b-chat",
+            description: "GLM-4.7 on Fireworks",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("glm-4.7-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                }
+                if gateway.is_some() {
+                    Ok(Arc::new(PlaceholderService {
+                        model_id: "glm-4.7-fireworks".to_string(),
+                        provider: Provider::Fireworks,
+                    }))
+                } else {
+                    Err("Fireworks provider not yet implemented for direct mode".to_string())
+                }
+            },
+        },
+        ModelDef {
+            id: "qwen3-coder-fireworks",
+            provider: Provider::Fireworks,
+            api_name: "accounts/fireworks/models/qwen3-coder-480b-instruct",
+            description: "Qwen3 Coder 480B on Fireworks",
+            context_window: 32_768,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("qwen3-coder-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                }
+                if gateway.is_some() {
+                    Ok(Arc::new(PlaceholderService {
+                        model_id: "qwen3-coder-fireworks".to_string(),
+                        provider: Provider::Fireworks,
+                    }))
+                } else {
+                    Err("Fireworks provider not yet implemented for direct mode".to_string())
+                }
+            },
+        },
+        ModelDef {
+            id: "glm-4p6-fireworks",
+            provider: Provider::Fireworks,
+            api_name: "accounts/fireworks/models/glm-4p6-chat",
+            description: "GLM-4P6 on Fireworks",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("glm-4p6-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                }
+                if gateway.is_some() {
+                    Ok(Arc::new(PlaceholderService {
+                        model_id: "glm-4p6-fireworks".to_string(),
+                        provider: Provider::Fireworks,
+                    }))
+                } else {
+                    Err("Fireworks provider not yet implemented for direct mode".to_string())
+                }
+            },
+        },
+        
+        // Gemini models
+        ModelDef {
+            id: "gemini-3-pro",
+            provider: Provider::Gemini,
+            api_name: "gemini-3.0-pro",
+            description: "Gemini 3 Pro",
+            context_window: 2_097_152, // 2M context
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gemini-3-pro requires GEMINI_API_KEY or gateway".to_string());
+                }
+                if gateway.is_some() {
+                    Ok(Arc::new(PlaceholderService {
+                        model_id: "gemini-3-pro".to_string(),
+                        provider: Provider::Gemini,
+                    }))
+                } else {
+                    Err("Gemini provider not yet implemented for direct mode".to_string())
+                }
+            },
+        },
+        ModelDef {
+            id: "gemini-3-flash",
+            provider: Provider::Gemini,
+            api_name: "gemini-3.0-flash",
+            description: "Gemini 3 Flash",
+            context_window: 1_048_576, // 1M context
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gemini-3-flash requires GEMINI_API_KEY or gateway".to_string());
+                }
+                if gateway.is_some() {
+                    Ok(Arc::new(PlaceholderService {
+                        model_id: "gemini-3-flash".to_string(),
+                        provider: Provider::Gemini,
+                    }))
+                } else {
+                    Err("Gemini provider not yet implemented for direct mode".to_string())
+                }
+            },
+        },
     ]
 }
 
@@ -147,4 +273,34 @@ pub fn all_models() -> &'static [ModelDef] {
 #[allow(dead_code)] // Public API
 pub fn default_model() -> &'static ModelDef {
     &all_models()[1] // claude-4.5-sonnet as default
+}
+
+/// Placeholder service for providers not yet implemented
+/// This allows models to be registered in gateway mode where the gateway handles the actual API calls
+struct PlaceholderService {
+    model_id: String,
+    provider: Provider,
+}
+
+#[async_trait]
+impl LlmService for PlaceholderService {
+    async fn complete(&self, _request: &crate::llm::LlmRequest) -> Result<crate::llm::LlmResponse, LlmError> {
+        Err(LlmError::unknown(format!(
+            "{} provider not yet implemented for model {}",
+            self.provider.display_name(),
+            self.model_id
+        )))
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn context_window(&self) -> usize {
+        0 // Will be provided by model definition
+    }
+
+    fn max_image_dimension(&self) -> Option<u32> {
+        None
+    }
 }
