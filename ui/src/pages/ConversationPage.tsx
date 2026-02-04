@@ -15,6 +15,7 @@ export function ConversationPage() {
   const navigate = useNavigate();
 
   const [conversationId, setConversationId] = useState<string | undefined>(undefined);
+  const [conversationIdForSSE, setConversationIdForSSE] = useState<string | undefined>(undefined);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [convState, setConvState] = useState('idle');
@@ -177,9 +178,25 @@ export function ConversationPage() {
 
   // Connection management with automatic reconnection
   const connectionInfo = useConnection({
-    conversationId,
+    conversationId: conversationIdForSSE,
     onEvent: handleSseEvent,
   });
+  
+  // Defer SSE connection to not block initial render
+  useEffect(() => {
+    if (!conversationId) return;
+    
+    console.log('[ConversationPage] Deferring SSE connection...');
+    const timer = setTimeout(() => {
+      console.log('[ConversationPage] Starting SSE connection');
+      setConversationIdForSSE(conversationId);
+    }, 100); // Small delay to let UI render first
+    
+    return () => {
+      clearTimeout(timer);
+      setConversationIdForSSE(undefined);
+    };
+  }, [conversationId]);
 
   const isOffline = connectionInfo.state === 'offline' || connectionInfo.state === 'reconnecting';
   const isConnected = connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';

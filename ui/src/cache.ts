@@ -155,32 +155,32 @@ export class CacheDB {
   }
 
   // Messages
-  // Get messages with timing
+  // Messages - Optimized with getAll instead of cursor
   async getMessages(conversationId: string, afterSequence?: number): Promise<Message[]> {
     const start = performance.now();
     await this.init();
     const tx = this.db!.transaction(['messages'], 'readonly');
     const store = tx.objectStore('messages');
     const index = store.index('by-conversation');
+    const range = IDBKeyRange.only(conversationId);
     
     return new Promise((resolve) => {
-      const messages: Message[] = [];
-      const range = IDBKeyRange.only(conversationId);
-      const request = index.openCursor(range);
+      const request = index.getAll(range);
       
       request.onsuccess = () => {
-        const cursor = request.result;
-        if (cursor) {
-          const msg = cursor.value as Message;
-          if (!afterSequence || msg.sequence_id > afterSequence) {
-            messages.push(msg);
-          }
-          cursor.continue();
-        } else {
-          const duration = performance.now() - start;
-          console.log(`[IndexedDB] getMessages took ${duration.toFixed(1)}ms for ${messages.length} messages`);
-          resolve(messages.sort((a, b) => a.sequence_id - b.sequence_id));
+        let messages = request.result || [];
+        
+        // Filter by sequence if needed
+        if (afterSequence) {
+          messages = messages.filter((msg: Message) => msg.sequence_id > afterSequence);
         }
+        
+        // Sort by sequence
+        messages.sort((a: Message, b: Message) => a.sequence_id - b.sequence_id);
+        
+        const duration = performance.now() - start;
+        console.log(`[IndexedDB] getMessages (optimized) took ${duration.toFixed(1)}ms for ${messages.length} messages`);
+        resolve(messages);
       };
       
       request.onerror = () => {
