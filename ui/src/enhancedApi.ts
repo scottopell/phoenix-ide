@@ -58,6 +58,10 @@ class EnhancedAPI {
         
         if (isQuotaError) {
           console.warn('IndexedDB quota exceeded, attempting cleanup...');
+          // Emit event for UI notification
+          window.dispatchEvent(new CustomEvent('storage-quota-exceeded', {
+            detail: { error }
+          }));
           
           // Try to purge old data
           try {

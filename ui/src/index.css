@@ -1756,3 +1756,23 @@ html * {
 .reset-btn:hover {
   background: rgba(255, 255, 255, 0.2);
 }
+/* Status header improvements */
+.status-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  min-height: 48px;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}

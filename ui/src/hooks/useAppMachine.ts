@@ -147,7 +147,10 @@ export function useAppMachine() {
       
       if (usageMB > 100) {
         console.warn(`Storage usage high: ${usageMB.toFixed(1)}MB / ${quotaMB.toFixed(1)}MB`);
-        // TODO: Show user warning
+        // Emit custom event for toast notification
+        window.dispatchEvent(new CustomEvent('storage-warning', {
+          detail: { usageMB, quotaMB }
+        }));
       }
     };
     

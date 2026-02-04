@@ -6,7 +6,10 @@ import { ConversationList } from '../components/ConversationList';
 import { NewConversationModal } from '../components/NewConversationModal';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
+import { StorageStatus } from '../components/StorageStatus';
+import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
+import { useToast } from '../hooks/useToast';
 
 export function ConversationListPage() {
   const navigate = useNavigate();
@@ -20,6 +23,7 @@ export function ConversationListPage() {
 
   // App state for offline/sync status
   const { isOnline, isReady, showSyncStatus, syncProgress, pendingOpsCount } = useAppMachine();
+  const { toasts, dismissToast, showWarning, showError } = useToast();
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
@@ -27,6 +31,26 @@ export function ConversationListPage() {
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+
+  // Listen for storage warnings
+  useEffect(() => {
+    const handleStorageWarning = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const { usageMB } = customEvent.detail;
+      showWarning(`Storage usage is high: ${usageMB.toFixed(1)}MB. Consider clearing old data.`, 10000);
+    };
+
+    const handleQuotaExceeded = () => {
+      showError('Storage quota exceeded! Old conversations are being cleaned up automatically.', 8000);
+    };
+
+    window.addEventListener('storage-warning', handleStorageWarning);
+    window.addEventListener('storage-quota-exceeded', handleQuotaExceeded);
+    return () => {
+      window.removeEventListener('storage-warning', handleStorageWarning);
+      window.removeEventListener('storage-quota-exceeded', handleQuotaExceeded);
+    };
+  }, [showWarning, showError]);
 
   const loadConversations = useCallback(async (forceFresh = false) => {
     try {
@@ -174,20 +198,26 @@ export function ConversationListPage() {
 
   return (
     <div id="app" className="list-page">
+      <Toast messages={toasts} onDismiss={dismissToast} />
       <header className="status-header">
-        {!isOnline && (
-          <div className="offline-banner">
-            <span className="offline-icon">⚡</span>
-            Offline Mode
-            {pendingOpsCount > 0 && ` (${pendingOpsCount} pending)`}
-          </div>
-        )}
-        {showSyncStatus && syncProgress !== null && (
-          <div className="sync-banner">
-            <span className="sync-icon">🔄</span>
-            Syncing... {syncProgress}%
-          </div>
-        )}
+        <div className="header-left">
+          {!isOnline && (
+            <div className="offline-banner">
+              <span className="offline-icon">⚡</span>
+              Offline Mode
+              {pendingOpsCount > 0 && ` (${pendingOpsCount} pending)`}
+            </div>
+          )}
+          {showSyncStatus && syncProgress !== null && (
+            <div className="sync-banner">
+              <span className="sync-icon">🔄</span>
+              Syncing... {syncProgress}%
+            </div>
+          )}
+        </div>
+        <div className="header-right">
+          <StorageStatus />
+        </div>
       </header>
       <main id="main-area">
         {loading ? (
