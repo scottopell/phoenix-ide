@@ -209,6 +209,7 @@ class EnhancedAPI {
       
       if (convResult && messages) {
         // We have cached data
+        console.log(`getConversationBySlug: Cache hit from memory (age: ${convResult.age}ms, stale: ${convResult.stale})`);
         if (convResult.stale) {
           // Trigger background refresh
           this.getConversationBySlug(slug, { ...options, forceFresh: true }).catch(console.error);
@@ -236,6 +237,8 @@ class EnhancedAPI {
         const age = Date.now() - cachedConv._meta.timestamp;
         const stale = age > (options.maxAge || 5 * 60 * 1000);
         
+        console.log(`getConversationBySlug: Cache hit from IndexedDB (age: ${age}ms, stale: ${stale})`);
+        
         // Update memory cache
         memoryCache.setConversation(cachedConv);
         memoryCache.setMessages(cachedConv.id, messages);
@@ -259,8 +262,14 @@ class EnhancedAPI {
     }
     
     // Fetch from network
+    console.log(`getConversationBySlug: Cache miss, fetching from network`);
     return this.dedupe(cacheKey, async () => {
+      const startTime = Date.now();
       const result = await baseApi.getConversationBySlug(slug);
+      const duration = Date.now() - startTime;
+      
+      console.log(`getConversationBySlug: Network fetch completed in ${duration}ms`);
+      performanceMonitor.recordNetworkRequest(duration);
       
       // Update caches
       if (!options.skipCache) {

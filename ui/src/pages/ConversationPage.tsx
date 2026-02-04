@@ -200,9 +200,15 @@ export function ConversationPage() {
     let cancelled = false;
 
     const loadConversation = async () => {
+      console.log(`[ConversationPage] Starting to load conversation: ${slug}`);
+      const loadStart = Date.now();
+      
       try {
         // First, try to load from cache for instant display
         const cachedResult = await enhancedApi.getConversationBySlug(slug, { forceFresh: false });
+        const loadDuration = Date.now() - loadStart;
+        console.log(`[ConversationPage] Load completed in ${loadDuration}ms from ${cachedResult.source}`);
+        
         if (!cancelled && cachedResult.data) {
           setConversation(cachedResult.data.conversation);
           setMessages(cachedResult.data.messages);
