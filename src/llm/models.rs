@@ -186,6 +186,110 @@ pub fn all_models() -> &'static [ModelDef] {
                 )))
             },
         },
+        // GPT-5 models (chat endpoint)
+        ModelDef {
+            id: "gpt-5",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5",
+            description: "GPT-5 (reasoning model)",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5 requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT5,
+                    gateway,
+                )))
+            },
+        },
+        ModelDef {
+            id: "gpt-5-mini",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5-mini",
+            description: "GPT-5 Mini (fast reasoning)",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5-mini requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT5Mini,
+                    gateway,
+                )))
+            },
+        },
+        ModelDef {
+            id: "gpt-5.1",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5.1",
+            description: "GPT-5.1 (latest GPT-5)",
+            context_window: 128_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5.1 requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT51,
+                    gateway,
+                )))
+            },
+        },
+        // GPT-5 Codex models (responses API)
+        ModelDef {
+            id: "gpt-5-codex",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5-codex",
+            description: "GPT-5 Codex (code generation)",
+            context_window: 200_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5-codex requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT5Codex,
+                    gateway,
+                )))
+            },
+        },
+        ModelDef {
+            id: "gpt-5.1-codex",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5.1-codex",
+            description: "GPT-5.1 Codex (advanced code)",
+            context_window: 200_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5.1-codex requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT51Codex,
+                    gateway,
+                )))
+            },
+        },
+        ModelDef {
+            id: "gpt-5.2-codex",
+            provider: Provider::OpenAI,
+            api_name: "gpt-5.2-codex",
+            description: "GPT-5.2 Codex (latest code model)",
+            context_window: 200_000,
+            factory: |api_key, gateway| {
+                if api_key.is_empty() {
+                    return Err("gpt-5.2-codex requires OPENAI_API_KEY or gateway".to_string());
+                }
+                Ok(Arc::new(OpenAIService::new(
+                    api_key.to_string(),
+                    OpenAIModel::GPT52Codex,
+                    gateway,
+                )))
+            },
+        },
         
         // Fireworks models
         ModelDef {

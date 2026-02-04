@@ -12,10 +12,18 @@ use std::time::Duration;
 /// OpenAI-compatible models (OpenAI and Fireworks)
 #[derive(Debug, Clone, Copy)]
 pub enum OpenAIModel {
-    // OpenAI models
+    // OpenAI GPT-4 models
     GPT4o,
     GPT4oMini,
     O4Mini,
+    // OpenAI GPT-5 models (chat endpoint)
+    GPT5,
+    GPT5Mini,
+    GPT51,
+    // OpenAI GPT-5 Codex models (responses endpoint)
+    GPT5Codex,
+    GPT51Codex,
+    GPT52Codex,
     // Fireworks models (use OpenAI API)
     GLM4P7Fireworks,
     QwenCoderFireworks,
@@ -28,6 +36,12 @@ impl OpenAIModel {
             OpenAIModel::GPT4o => "gpt-4o",
             OpenAIModel::GPT4oMini => "gpt-4o-mini",
             OpenAIModel::O4Mini => "o4-mini",
+            OpenAIModel::GPT5 => "gpt-5",
+            OpenAIModel::GPT5Mini => "gpt-5-mini",
+            OpenAIModel::GPT51 => "gpt-5.1",
+            OpenAIModel::GPT5Codex => "gpt-5-codex",
+            OpenAIModel::GPT51Codex => "gpt-5.1-codex",
+            OpenAIModel::GPT52Codex => "gpt-5.2-codex",
             OpenAIModel::GLM4P7Fireworks => "accounts/fireworks/models/glm-4p7",
             OpenAIModel::QwenCoderFireworks => "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
             OpenAIModel::DeepseekV3Fireworks => "accounts/fireworks/models/deepseek-v3p1",
@@ -39,6 +53,12 @@ impl OpenAIModel {
             OpenAIModel::GPT4o => "gpt-4o",
             OpenAIModel::GPT4oMini => "gpt-4o-mini",
             OpenAIModel::O4Mini => "o4-mini",
+            OpenAIModel::GPT5 => "gpt-5",
+            OpenAIModel::GPT5Mini => "gpt-5-mini",
+            OpenAIModel::GPT51 => "gpt-5.1",
+            OpenAIModel::GPT5Codex => "gpt-5-codex",
+            OpenAIModel::GPT51Codex => "gpt-5.1-codex",
+            OpenAIModel::GPT52Codex => "gpt-5.2-codex",
             OpenAIModel::GLM4P7Fireworks => "glm-4p7-fireworks",
             OpenAIModel::QwenCoderFireworks => "qwen3-coder-fireworks",
             OpenAIModel::DeepseekV3Fireworks => "deepseek-v3-fireworks",
@@ -52,9 +72,20 @@ impl OpenAIModel {
         )
     }
 
-    /// O-series models use max_completion_tokens instead of max_tokens
+    /// Models that use max_completion_tokens instead of max_tokens
     pub fn uses_max_completion_tokens(self) -> bool {
-        matches!(self, OpenAIModel::O4Mini)
+        matches!(
+            self,
+            OpenAIModel::O4Mini | OpenAIModel::GPT5 | OpenAIModel::GPT5Mini | OpenAIModel::GPT51
+        )
+    }
+
+    /// Codex models use the v1/responses endpoint instead of chat/completions
+    pub fn uses_responses_api(self) -> bool {
+        matches!(
+            self,
+            OpenAIModel::GPT5Codex | OpenAIModel::GPT51Codex | OpenAIModel::GPT52Codex
+        )
     }
 }
 
@@ -69,21 +100,29 @@ pub struct OpenAIService {
 
 impl OpenAIService {
     pub fn new(api_key: String, model: OpenAIModel, gateway: Option<&str>) -> Self {
-        let base_url = match (gateway, model.is_fireworks()) {
-            (Some(gw), true) => {
+        let base_url = match (gateway, model.is_fireworks(), model.uses_responses_api()) {
+            (Some(gw), true, _) => {
                 // Fireworks via gateway
                 format!("{}/fireworks/inference/v1/chat/completions", gw.trim_end_matches('/'))
             }
-            (Some(gw), false) => {
-                // OpenAI via gateway
+            (Some(gw), false, true) => {
+                // OpenAI responses API via gateway (for codex models)
+                format!("{}/openai/v1/responses", gw.trim_end_matches('/'))
+            }
+            (Some(gw), false, false) => {
+                // OpenAI chat API via gateway
                 format!("{}/openai/v1/chat/completions", gw.trim_end_matches('/'))
             }
-            (None, true) => {
+            (None, true, _) => {
                 // Direct Fireworks
                 "https://api.fireworks.ai/inference/v1/chat/completions".to_string()
             }
-            (None, false) => {
-                // Direct OpenAI
+            (None, false, true) => {
+                // Direct OpenAI responses API
+                "https://api.openai.com/v1/responses".to_string()
+            }
+            (None, false, false) => {
+                // Direct OpenAI chat API
                 "https://api.openai.com/v1/chat/completions".to_string()
             }
         };
@@ -295,8 +334,46 @@ impl OpenAIService {
 }
 
 #[async_trait]
+#[async_trait]
 impl LlmService for OpenAIService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        // Route to appropriate API based on model type
+        if self.model.uses_responses_api() {
+            self.complete_responses_api(request).await
+        } else {
+            self.complete_chat_api(request).await
+        }
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn context_window(&self) -> usize {
+        match self.model {
+            OpenAIModel::GPT4o => 128_000,
+            OpenAIModel::GPT4oMini => 128_000,
+            OpenAIModel::O4Mini => 200_000,
+            OpenAIModel::GPT5 => 128_000,
+            OpenAIModel::GPT5Mini => 128_000,
+            OpenAIModel::GPT51 => 128_000,
+            OpenAIModel::GPT5Codex => 200_000,
+            OpenAIModel::GPT51Codex => 200_000,
+            OpenAIModel::GPT52Codex => 200_000,
+            OpenAIModel::GLM4P7Fireworks => 128_000,
+            OpenAIModel::QwenCoderFireworks => 128_000,
+            OpenAIModel::DeepseekV3Fireworks => 128_000,
+        }
+    }
+
+    fn max_image_dimension(&self) -> Option<u32> {
+        None // Basic implementation doesn't support images
+    }
+}
+
+impl OpenAIService {
+    /// Complete using the chat/completions API
+    async fn complete_chat_api(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let openai_request = self.translate_request(request);
 
         let response = self
@@ -348,23 +425,151 @@ impl LlmService for OpenAIService {
         Self::normalize_response(openai_response)
     }
 
-    fn model_id(&self) -> &str {
-        &self.model_id
+    /// Complete using the v1/responses API (for codex models)
+    async fn complete_responses_api(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let responses_request = self.translate_to_responses_request(request);
+
+        let response = self
+            .client
+            .post(&self.base_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&responses_request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    LlmError::network(format!("Request timeout: {}", e))
+                } else if e.is_connect() {
+                    LlmError::network(format!("Connection failed: {}", e))
+                } else {
+                    LlmError::unknown(format!("Request failed: {}", e))
+                }
+            })?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
+                let message = error_resp.error.message;
+                return Err(match status.as_u16() {
+                    401 => LlmError::auth(format!("Authentication failed: {}", message)),
+                    429 => LlmError::rate_limit(format!("Rate limit exceeded: {}", message)),
+                    400 => LlmError::invalid_request(format!("Invalid request: {}", message)),
+                    500..=599 => LlmError::server_error(format!("Server error: {}", message)),
+                    _ => LlmError::unknown(format!("HTTP {}: {}", status, message)),
+                });
+            }
+            return Err(LlmError::unknown(format!(
+                "HTTP {} error: {}",
+                status, body
+            )));
+        }
+
+        let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
+            LlmError::unknown(format!("Failed to parse response: {} - body: {}", e, body))
+        })?;
+
+        Self::normalize_responses_api_response(responses_response)
     }
 
-    fn context_window(&self) -> usize {
-        match self.model {
-            OpenAIModel::GPT4o => 128_000,
-            OpenAIModel::GPT4oMini => 128_000,
-            OpenAIModel::O4Mini => 200_000,
-            OpenAIModel::GLM4P7Fireworks => 128_000,
-            OpenAIModel::QwenCoderFireworks => 128_000,
-            OpenAIModel::DeepseekV3Fireworks => 128_000,
+    /// Translate LlmRequest to ResponsesApiRequest
+    fn translate_to_responses_request(&self, request: &LlmRequest) -> ResponsesApiRequest {
+        // Build input from system prompt and messages
+        let mut input_parts = Vec::new();
+        
+        // Add system prompt
+        if !request.system.is_empty() {
+            let system_text = request
+                .system
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            input_parts.push(format!("System: {}\n", system_text));
+        }
+        
+        // Add messages
+        for msg in &request.messages {
+            let role = match msg.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+            };
+            for block in &msg.content {
+                if let ContentBlock::Text { text } = block {
+                    input_parts.push(format!("{}: {}", role, text));
+                }
+            }
+        }
+        
+        // Convert tools to responses API format
+        let tools: Option<Vec<ResponsesApiTool>> = if request.tools.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .tools
+                    .iter()
+                    .map(|t| ResponsesApiTool {
+                        r#type: "function".to_string(),
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.input_schema.clone(),
+                    })
+                    .collect(),
+            )
+        };
+        
+        ResponsesApiRequest {
+            model: self.model.api_name().to_string(),
+            input: input_parts.join("\n"),
+            tools,
+            max_output_tokens: request.max_tokens,
         }
     }
 
-    fn max_image_dimension(&self) -> Option<u32> {
-        None // Basic implementation doesn't support images
+    /// Normalize ResponsesApiResponse to LlmResponse
+    fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
+        let mut content = Vec::new();
+        
+        // Find message output and extract content
+        for output in resp.output {
+            if output.r#type == "message" {
+                if let Some(output_content) = output.content {
+                    for item in output_content {
+                        if item.r#type == "output_text" {
+                            if let Some(text) = item.text {
+                                if !text.is_empty() {
+                                    content.push(ContentBlock::Text { text });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If no content found, return empty
+        if content.is_empty() {
+            content.push(ContentBlock::Text { text: String::new() });
+        }
+        
+        let end_turn = resp.status == "completed";
+        
+        Ok(LlmResponse {
+            content,
+            end_turn,
+            usage: Usage {
+                input_tokens: resp.usage.input_tokens as u64,
+                output_tokens: resp.usage.output_tokens as u64,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        })
     }
 }
 
@@ -453,4 +658,51 @@ struct OpenAIError {
     r#type: Option<String>,
     #[allow(dead_code)]
     code: Option<String>,
+}
+
+// Responses API types (for codex models)
+
+#[derive(Debug, Serialize)]
+struct ResponsesApiRequest {
+    model: String,
+    input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesApiTool {
+    r#type: String,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiResponse {
+    status: String,
+    output: Vec<ResponsesApiOutput>,
+    usage: ResponsesApiUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiOutput {
+    r#type: String,
+    #[serde(default)]
+    content: Option<Vec<ResponsesApiContent>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiContent {
+    r#type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiUsage {
+    input_tokens: u32,
+    output_tokens: u32,
 }
