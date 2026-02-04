@@ -3,6 +3,7 @@
 import { api as baseApi, Conversation, Message, ModelsResponse } from './api';
 import { cacheDB } from './cache';
 import { memoryCache } from './memoryCache';
+import { performanceMonitor } from './performance';
 import type { ImageData } from './api';
 
 export interface FetchOptions {
@@ -42,6 +43,42 @@ class EnhancedAPI {
     return promise;
   }
   
+  // Safe cache write with quota handling
+  private async safeCacheWrite<T>(
+    writer: () => Promise<T>,
+    fallback?: () => void
+  ): Promise<void> {
+    try {
+      await writer();
+    } catch (error) {
+      if (error instanceof Error) {
+        const isQuotaError = 
+          error.name === 'QuotaExceededError' ||
+          error.message.toLowerCase().includes('quota');
+        
+        if (isQuotaError) {
+          console.warn('IndexedDB quota exceeded, attempting cleanup...');
+          
+          // Try to purge old data
+          try {
+            const purged = await cacheDB.purgeOldConversations(7); // 7 days
+            console.log(`Purged ${purged} old conversations`);
+            
+            // Retry write after cleanup
+            await writer();
+          } catch (retryError) {
+            console.error('Failed to write to cache after cleanup:', retryError);
+            if (fallback) fallback();
+          }
+        } else {
+          // Non-quota error
+          console.error('Cache write failed:', error);
+          if (fallback) fallback();
+        }
+      }
+    }
+  }
+  
   // Conversations
   async listConversations(options: FetchOptions = {}): Promise<CachedResponse<Conversation[]>> {
     const cacheKey = 'conversations:active';
@@ -50,6 +87,7 @@ class EnhancedAPI {
     if (!options.forceFresh) {
       const memResult = memoryCache.getAllConversations(false);
       if (memResult) {
+        performanceMonitor.recordCacheHit('memory');
         // Return immediately, but trigger background refresh if stale
         if (memResult.stale) {
           this.listConversations({ ...options, forceFresh: true }).catch(console.error);
@@ -71,6 +109,8 @@ class EnhancedAPI {
         const age = Math.min(...active.map(c => Date.now() - c._meta.timestamp));
         const stale = age > (options.maxAge || 5 * 60 * 1000);
         
+        performanceMonitor.recordCacheHit('indexeddb');
+        
         // Update memory cache
         memoryCache.setAllConversations(active, false);
         
@@ -88,16 +128,25 @@ class EnhancedAPI {
       }
     }
     
+    // Cache miss - fetch from network
+    performanceMonitor.recordCacheMiss();
+    
     // Fetch from network
     return this.dedupe(cacheKey, async () => {
+      const startTime = Date.now();
       const conversations = await baseApi.listConversations();
+      const duration = Date.now() - startTime;
+      
+      performanceMonitor.recordNetworkRequest(duration);
       
       // Update caches
       if (!options.skipCache) {
         memoryCache.setAllConversations(conversations, false);
-        for (const conv of conversations) {
-          await cacheDB.putConversation(conv);
-        }
+        await this.safeCacheWrite(async () => {
+          for (const conv of conversations) {
+            await cacheDB.putConversation(conv);
+          }
+        });
       }
       
       return {
