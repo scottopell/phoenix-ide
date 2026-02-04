@@ -14,7 +14,9 @@
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.3"
+    "react-router-dom": "^6.30.3",
+    "react-window": "^1.8.11",
+    "react-window-infinite-loader": "^2.0.1"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",

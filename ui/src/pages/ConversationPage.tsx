@@ -5,6 +5,7 @@ import { Conversation, Message, ConversationState, SseEventType, SseEventData, S
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { MessageList } from '../components/MessageList';
+import { VirtualizedMessageList } from '../components/VirtualizedMessageList';
 import { InputArea } from '../components/InputArea';
 import { useDraft, useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -437,13 +438,24 @@ export function ConversationPage() {
           Loaded from: {lastDataSource}
         </div>
       )}
-      <MessageList
-        messages={messages}
-        queuedMessages={queuedMessages}
-        convState={convState}
-        stateData={stateData}
-        onRetry={handleRetry}
-      />
+      {/* Use virtualized list for large conversations */}
+      {messages.length > 50 ? (
+        <VirtualizedMessageList
+          messages={messages}
+          queuedMessages={queuedMessages}
+          convState={convState}
+          stateData={stateData}
+          onRetry={handleRetry}
+        />
+      ) : (
+        <MessageList
+          messages={messages}
+          queuedMessages={queuedMessages}
+          convState={convState}
+          stateData={stateData}
+          onRetry={handleRetry}
+        />
+      )}
       <InputArea
         draft={draft}
         setDraft={setDraft}
