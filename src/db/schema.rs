@@ -83,6 +83,8 @@ pub struct Conversation {
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
     pub model: Option<String>,
+    #[serde(default)]
+    pub message_count: i64,
 }
 
 impl Conversation {

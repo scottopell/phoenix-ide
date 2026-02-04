@@ -27,6 +27,28 @@ export function formatRelativeTime(isoStr: string): string {
   return date.toLocaleDateString();
 }
 
+export function formatShortDate(isoStr: string): string {
+  if (!isoStr) return '';
+  const date = new Date(isoStr);
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const isYesterday = date.toDateString() === yesterday.toDateString();
+  
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  if (isYesterday) {
+    return 'yesterday';
+  }
+  // Show month/day for this year, full date for older
+  if (date.getFullYear() === now.getFullYear()) {
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' });
+}
+
 export function getStateDescription(convState: string, stateData: ConversationState | null): string {
   switch (convState) {
     case 'awaiting_llm':

@@ -99,6 +99,7 @@ impl Database {
             updated_at: now,
             archived: false,
             model: model.map(String::from),
+            message_count: 0,
         })
     }
 
@@ -106,8 +107,10 @@ impl Database {
     pub fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
-             FROM conversations WHERE id = ?1"
+            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c WHERE c.id = ?1"
         )?;
 
         stmt.query_row(params![id], |row| {
@@ -125,6 +128,7 @@ impl Database {
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
                 model: row.get(10)?,
+                message_count: row.get(11)?,
             })
         })
         .map_err(|e| match e {
@@ -137,8 +141,10 @@ impl Database {
     pub fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
-             FROM conversations WHERE slug = ?1"
+            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c WHERE c.slug = ?1"
         )?;
 
         stmt.query_row(params![slug], |row| {
@@ -156,6 +162,7 @@ impl Database {
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
                 model: row.get(10)?,
+                message_count: row.get(11)?,
             })
         })
         .map_err(|e| match e {
@@ -168,10 +175,12 @@ impl Database {
     pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
-             FROM conversations 
-             WHERE archived = 0 AND user_initiated = 1
-             ORDER BY updated_at DESC"
+            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state, 
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.archived = 0 AND c.user_initiated = 1
+             ORDER BY c.updated_at DESC"
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -189,6 +198,7 @@ impl Database {
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
                 model: row.get(10)?,
+                message_count: row.get(11)?,
             })
         })?;
 
@@ -199,10 +209,12 @@ impl Database {
     pub fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model
-             FROM conversations 
-             WHERE archived = 1 AND user_initiated = 1
-             ORDER BY updated_at DESC"
+            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.archived = 1 AND c.user_initiated = 1
+             ORDER BY c.updated_at DESC"
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -220,6 +232,7 @@ impl Database {
                 updated_at: parse_datetime(&row.get::<_, String>(8)?),
                 archived: row.get(9)?,
                 model: row.get(10)?,
+                message_count: row.get(11)?,
             })
         })?;
 

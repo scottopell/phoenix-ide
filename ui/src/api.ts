@@ -7,6 +7,7 @@ export interface Conversation {
   cwd: string;
   created_at: string;
   updated_at: string;
+  message_count: number;
   state?: ConversationState;
 }
 

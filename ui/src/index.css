@@ -285,10 +285,22 @@ html, body {
   gap: 12px;
 }
 
-.conv-item-model {
-  color: var(--accent-blue);
+.conv-item-meta.secondary {
+  margin-top: 2px;
+}
+
+.conv-item-time {
+  cursor: help;
+}
+
+.conv-item-messages {
+  color: var(--text-muted);
   font-size: 12px;
-  font-weight: 500;
+}
+
+.conv-item-model {
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .conv-item-cwd {
@@ -992,8 +1004,7 @@ html, body {
 }
 
 .conv-model {
-  color: var(--accent-blue);
-  font-weight: 500;
+  color: var(--text-secondary);
 }
 
 .conv-separator {
