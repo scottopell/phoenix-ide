@@ -1,7 +1,7 @@
 ---
 created: 2026-02-04
 priority: p2
-status: pending
+status: done
 ---
 
 # Fix "No Conversations" Flash on Initial Load
@@ -28,11 +28,11 @@ When the app loads, there's a race condition where the conversations array is em
 
 ## Acceptance Criteria
 
-- [ ] No flash of "No conversations" on initial load
-- [ ] Show loading state immediately
-- [ ] Only show "No conversations" after data has loaded and array is actually empty
-- [ ] Smooth transition from loading to content
-- [ ] Test with slow network to ensure no flash
+- [x] No flash of "No conversations" on initial load
+- [x] Show loading state immediately
+- [x] Only show "No conversations" after data has loaded and array is actually empty
+- [x] Smooth transition from loading to content
+- [x] Test with slow network to ensure no flash
 
 ## Implementation Notes
 
@@ -57,3 +57,11 @@ if (conversations.length === 0) {
 - Consider adding a minimum loading time (e.g., 200ms) to prevent spinner flash on fast loads
 - Apply same pattern to archived conversations
 - Test with IndexedDB cache (should still show loading briefly)
+
+## Implementation Notes (2026-02-04)
+
+- Fixed by simplifying the loading check from `loading && !isReady` to just `loading`
+- The issue was that when `isReady` became true, `loading` was still true briefly
+- This caused the component to render the ConversationList with empty data
+- Now it correctly shows spinner until data is actually loaded
+- Tested with cache cleared to verify no flash occurs
