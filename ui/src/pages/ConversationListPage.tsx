@@ -190,7 +190,7 @@ export function ConversationListPage() {
         )}
       </header>
       <main id="main-area">
-        {loading && !isReady ? (
+        {loading ? (
           <div className="empty-state">
             <div className="spinner"></div>
             <p>Loading...</p>
