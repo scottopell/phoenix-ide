@@ -442,3 +442,67 @@ test('subway scenario: queue messages while offline', async () => {
 4. **Message Pagination**: Should we implement message windowing now or defer? It would help with memory usage in long conversations.
 
 5. **Progressive Enhancement**: Should the app work without IndexedDB (falls back to memory-only cache)? Some browsers/modes restrict it.
+
+## Implementation Progress
+
+### Phase 2a: Foundation ✅ COMPLETE
+
+1. **Compression Added** ✅
+   - Backend now supports Brotli, gzip, deflate, and zstd
+   - Test results: 85% reduction in payload size (39KB → 6KB)
+   - No frontend changes needed - browsers handle automatically
+
+2. **IndexedDB Cache Layer** ✅
+   - Created `cache.ts` with full IndexedDB implementation
+   - Stores conversations, messages, and pending operations
+   - Includes storage management (purge after 30 days)
+   - Tracks metadata (timestamp, etag, scroll position)
+
+3. **AppMachine State Machine** ✅
+   - Created `appMachine.ts` for global state management
+   - Handles online/offline transitions
+   - Manages sync queue with exponential backoff
+   - Provides honest UI states (no optimistic updates)
+
+4. **Additional Foundation Work** ✅
+   - Memory cache with 5-minute TTL
+   - Sync queue for offline operations
+   - Enhanced API client with caching integration
+   - Request deduplication
+
+### Next Steps: Phase 2b - Navigation Performance
+
+The foundation is now in place. The next phase involves:
+
+1. **Update ConversationListPage** to use enhancedApi
+   - Show cached data immediately
+   - Background refresh if stale
+   - Restore scroll position
+
+2. **Update ConversationPage** to use cached data
+   - Instant load from cache
+   - Integrate with existing SSE connection logic
+
+3. **Add UI indicators**
+   - Offline badge when network is down
+   - Sync progress indicator
+   - "Updated X minutes ago" timestamps
+
+4. **Testing**
+   - Verify instant navigation
+   - Test offline message queueing
+   - Ensure cache invalidation works correctly
+
+### Code Structure
+
+```
+ui/src/
+├── cache.ts              # IndexedDB persistence
+├── memoryCache.ts        # Fast in-memory cache
+├── enhancedApi.ts        # API wrapper with caching
+├── syncQueue.ts          # Offline operation handling
+├── machines/
+│   └── appMachine.ts     # Global state machine
+└── hooks/
+    └── useAppMachine.ts  # React hook for app state
+```
