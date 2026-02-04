@@ -3,6 +3,7 @@
 export interface Conversation {
   id: string;
   slug: string;
+  model: string;
   cwd: string;
   created_at: string;
   updated_at: string;

@@ -87,6 +87,7 @@ export function ConversationList({
                 <div className="conv-item-slug">{conv.slug}</div>
                 <div className="conv-item-meta">
                   <span>{formatRelativeTime(conv.updated_at)}</span>
+                  <span className="conv-item-model">{conv.model}</span>
                   <span className="conv-item-cwd">{conv.cwd}</span>
                 </div>
               </div>

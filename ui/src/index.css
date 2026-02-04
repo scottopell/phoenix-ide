@@ -8,7 +8,7 @@
 
 :root {
   /* Layout constants */
-  --state-bar-height: 44px;
+  --state-bar-height: 52px;
   --breadcrumb-height: 36px;
   --input-area-height: 60px;
   --offline-banner-height: 36px;
@@ -283,6 +283,12 @@ html, body {
   color: var(--text-secondary);
   display: flex;
   gap: 12px;
+}
+
+.conv-item-model {
+  color: var(--accent-blue);
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .conv-item-cwd {
@@ -968,9 +974,38 @@ html, body {
 /* State bar layout */
 #state-bar-left {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
   min-width: 0;
   overflow: hidden;
+  gap: 2px;
+}
+
+.conv-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding-left: 22px; /* Align with slug text after arrow */
+}
+
+.conv-model {
+  color: var(--accent-blue);
+  font-weight: 500;
+}
+
+.conv-separator {
+  opacity: 0.5;
+}
+
+.conv-cwd {
+  opacity: 0.8;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 #state-bar-right {

@@ -102,15 +102,33 @@ export function StateBar({
 
   const tooltipText = `${formatTokens(contextWindowUsed)} / ${formatTokens(MAX_CONTEXT_TOKENS)} tokens (${contextPercent.toFixed(1)}%)`;
 
+  // Format cwd for display - show last 2 path components
+  const formatCwd = (cwd: string): string => {
+    const parts = cwd.split('/').filter(Boolean);
+    if (parts.length <= 2) return cwd;
+    return '.../' + parts.slice(-2).join('/');
+  };
+
   return (
     <>
       <header id="state-bar">
         <div id="state-bar-left">
           {conversation ? (
-            <Link to="/" id="conv-slug" title="Back to conversations">
-              <span className="back-arrow">←</span>
-              {conversation.slug}
-            </Link>
+            <>
+              <Link to="/" id="conv-slug" title="Back to conversations">
+                <span className="back-arrow">←</span>
+                {conversation.slug}
+              </Link>
+              <div className="conv-meta">
+                <span className="conv-model" title={`Model: ${conversation.model}`}>
+                  {conversation.model}
+                </span>
+                <span className="conv-separator">•</span>
+                <span className="conv-cwd" title={conversation.cwd}>
+                  {formatCwd(conversation.cwd)}
+                </span>
+              </div>
+            </>
           ) : (
             <span id="conv-slug">—</span>
           )}
