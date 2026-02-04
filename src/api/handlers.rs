@@ -19,7 +19,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use super::assets::{get_index_html, serve_static};
+use super::assets::{get_index_html, serve_static, serve_service_worker};
 use chrono::Datelike;
 use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
@@ -35,6 +35,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(serve_spa))
         // Deep links to conversations
         .route("/c/:slug", get(serve_spa))
+        // Service worker
+        .route("/service-worker.js", get(serve_service_worker))
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
         // Conversation listing (REQ-API-001)

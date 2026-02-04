@@ -14,6 +14,8 @@ export function StorageStatus() {
   const [isClearing, setIsClearing] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
 
+  console.log('[StorageStatus] Render - showDetails:', showDetails);
+
   const checkStorage = async () => {
     try {
       const { usage, quota } = await cacheDB.getStorageInfo();
@@ -59,7 +61,10 @@ export function StorageStatus() {
     <div className="storage-status">
       <button 
         className="storage-status-button"
-        onClick={() => setShowDetails(!showDetails)}
+        onClick={() => {
+          console.log('[StorageStatus] Button clicked, toggling from', showDetails, 'to', !showDetails);
+          setShowDetails(!showDetails);
+        }}
         title="Storage usage"
       >
         <span className={`storage-indicator storage-indicator-${getStatusColor()}`}>💾</span>

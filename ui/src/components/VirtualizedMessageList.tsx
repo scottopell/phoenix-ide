@@ -1,10 +1,16 @@
 // VirtualizedMessageList.tsx
 import { useEffect, useRef, useState, useCallback, useMemo, CSSProperties } from 'react';
-// @ts-ignore
 import { VariableSizeList } from 'react-window';
 import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import { escapeHtml, renderMarkdown } from '../utils';
+
+// Define proper types for react-window
+interface ListChildComponentProps {
+  index: number;
+  style: CSSProperties;
+  data: RowData;
+}
 
 interface MessageListProps {
   messages: Message[];
@@ -27,7 +33,7 @@ interface RowData {
 
 export function VirtualizedMessageList({ messages, queuedMessages, convState, stateData, onRetry }: MessageListProps) {
   const mainRef = useRef<HTMLElement>(null);
-  const listRef = useRef<any>(null);
+  const listRef = useRef<VariableSizeList>(null);
   const [mainHeight, setMainHeight] = useState(600);
   const itemHeights = useRef<Map<number, number>>(new Map());
   const scrollPositionRef = useRef<number>(0);
@@ -144,7 +150,7 @@ export function VirtualizedMessageList({ messages, queuedMessages, convState, st
   }, []);
 
   // Row renderer
-  const Row = ({ index, style, data }: { index: number; style: CSSProperties; data: RowData }) => {
+  const Row = ({ index, style, data }: ListChildComponentProps) => {
     const item = items[index];
     if (!item) return null;
 

@@ -47,6 +47,37 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
         .unwrap()
 }
 
+/// Serve the service worker file
+pub async fn serve_service_worker() -> impl IntoResponse {
+    // Try embedded asset first
+    if let Some(content) = Assets::get("service-worker.js") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/javascript")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(content.data.to_vec()))
+            .unwrap();
+    }
+    
+    // Fallback to filesystem in development
+    let fs_path = PathBuf::from("ui/dist/service-worker.js");
+    if fs_path.exists() {
+        if let Ok(content) = std::fs::read(&fs_path) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/javascript")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(content))
+                .unwrap();
+        }
+    }
+    
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("Service worker not found"))
+        .unwrap()
+}
+
 /// Get the index.html content (embedded or from filesystem)
 pub fn get_index_html() -> Option<String> {
     // Try embedded first
