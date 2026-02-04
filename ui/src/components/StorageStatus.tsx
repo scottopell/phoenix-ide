@@ -14,8 +14,6 @@ export function StorageStatus() {
   const [isClearing, setIsClearing] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
 
-  console.log('[StorageStatus] Render - showDetails:', showDetails);
-
   const checkStorage = async () => {
     try {
       const { usage, quota } = await cacheDB.getStorageInfo();
@@ -30,7 +28,6 @@ export function StorageStatus() {
 
   useEffect(() => {
     checkStorage();
-    // Check every minute
     const interval = setInterval(checkStorage, 60000);
     return () => clearInterval(interval);
   }, []);
@@ -38,7 +35,7 @@ export function StorageStatus() {
   const handleClearOldData = async () => {
     setIsClearing(true);
     try {
-      const purged = await cacheDB.purgeOldConversations(7); // 7 days
+      const purged = await cacheDB.purgeOldConversations(7);
       alert(`Cleared ${purged} old conversations`);
       await checkStorage();
     } catch (err) {
@@ -47,6 +44,10 @@ export function StorageStatus() {
     } finally {
       setIsClearing(false);
     }
+  };
+
+  const toggleDetails = () => {
+    setShowDetails(prev => !prev);
   };
 
   if (!storageInfo) return null;
@@ -58,48 +59,59 @@ export function StorageStatus() {
   };
 
   return (
-    <div className="storage-status">
+    <div className="storage-status" style={{ position: 'relative' }}>
       <button 
         className="storage-status-button"
-        onClick={() => {
-          console.log('[StorageStatus] Button clicked, toggling from', showDetails, 'to', !showDetails);
-          setShowDetails(!showDetails);
-        }}
+        onClick={toggleDetails}
         title="Storage usage"
       >
         <span className={`storage-indicator storage-indicator-${getStatusColor()}`}>💾</span>
         {storageInfo.usageMB.toFixed(1)}MB
       </button>
 
-      {showDetails && (
-        <div className="storage-details">
-          <h3>Storage Usage</h3>
-          <div className="storage-bar">
-            <div 
-              className="storage-bar-fill"
-              style={{ 
-                width: `${Math.min(storageInfo.percentage, 100)}%`,
-                backgroundColor: getStatusColor() === 'red' ? '#ef4444' : getStatusColor() === 'orange' ? '#f59e0b' : '#10b981'
-              }}
-            />
-          </div>
-          <p className="storage-text">
-            {storageInfo.usageMB.toFixed(1)}MB / {storageInfo.quotaMB.toFixed(0)}MB ({storageInfo.percentage.toFixed(1)}%)
-          </p>
-          {storageInfo.usageMB > 75 && (
-            <div className="storage-warning">
-              ⚠️ Storage usage is high. Consider clearing old conversations.
-            </div>
-          )}
-          <button 
-            className="btn btn-secondary"
-            onClick={handleClearOldData}
-            disabled={isClearing}
-          >
-            {isClearing ? 'Clearing...' : 'Clear Old Data (>7 days)'}
-          </button>
+      <div 
+        className="storage-details" 
+        style={{ 
+          display: showDetails ? 'block' : 'none',
+          position: 'absolute',
+          top: '100%',
+          right: 0,
+          marginTop: '8px',
+          background: 'white',
+          border: '1px solid var(--border-color)',
+          borderRadius: '8px',
+          padding: '16px',
+          boxShadow: '0 4px 12px rgba(0, 0, 0, 0.1)',
+          minWidth: '300px',
+          zIndex: 1000
+        }}
+      >
+        <h3>Storage Usage</h3>
+        <div className="storage-bar">
+          <div 
+            className="storage-bar-fill"
+            style={{ 
+              width: `${Math.min(storageInfo.percentage, 100)}%`,
+              backgroundColor: getStatusColor() === 'red' ? '#ef4444' : getStatusColor() === 'orange' ? '#f59e0b' : '#10b981'
+            }}
+          />
         </div>
-      )}
+        <p className="storage-text">
+          {storageInfo.usageMB.toFixed(1)}MB / {storageInfo.quotaMB.toFixed(0)}MB ({storageInfo.percentage.toFixed(1)}%)
+        </p>
+        {storageInfo.usageMB > 75 && (
+          <div className="storage-warning">
+            ⚠️ Storage usage is high. Consider clearing old conversations.
+          </div>
+        )}
+        <button 
+          className="btn btn-secondary"
+          onClick={handleClearOldData}
+          disabled={isClearing}
+        >
+          {isClearing ? 'Clearing...' : 'Clear Old Data (>7 days)'}
+        </button>
+      </div>
     </div>
   );
 }
