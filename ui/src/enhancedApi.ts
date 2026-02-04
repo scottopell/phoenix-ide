@@ -215,7 +215,8 @@ class EnhancedAPI {
       
       // Update caches
       if (!options.skipCache) {
-        const scrollPos = memoryCache.getConversationBySlug(slug)?.data._meta?.scrollPosition;
+        const cachedData = await cacheDB.getConversationBySlug(slug);
+        const scrollPos = cachedData?._meta?.scrollPosition;
         memoryCache.setConversation(result.conversation, { scrollPosition: scrollPos });
         memoryCache.setMessages(result.conversation.id, result.messages);
         

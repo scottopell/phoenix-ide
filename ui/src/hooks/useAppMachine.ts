@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import type { PendingOperation } from '../cache';import { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   AppState, 
   AppEvent, 

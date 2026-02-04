@@ -9,6 +9,7 @@ export interface Conversation {
   updated_at: string;
   message_count: number;
   state?: ConversationState;
+  archived?: boolean;
 }
 
 export interface ConversationState {

@@ -408,6 +408,12 @@ export function ConversationPage() {
         contextWindowUsed={contextWindowUsed}
       />
       <BreadcrumbBar breadcrumbs={breadcrumbs} visible={true} />
+      {/* Data source indicator for debugging */}
+      {lastDataSource && initialLoadComplete && (
+        <div className="data-source-indicator">
+          Loaded from: {lastDataSource}
+        </div>
+      )}
       <MessageList
         messages={messages}
         queuedMessages={queuedMessages}
@@ -423,7 +429,7 @@ export function ConversationPage() {
         canSend={canSend}
         agentWorking={agentWorking}
         isCancelling={isCancelling}
-        isOffline={!isOnline}
+        isOffline={isOffline}
         queuedMessages={queuedMessages}
         onSend={handleSend}
         onCancel={handleCancel}
