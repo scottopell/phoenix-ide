@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Phoenix Cache Test</title>
+</head>
+<body>
+<h1>Phoenix IDE Cache Test</h1>
+<button id="test-btn">Run Navigation Test</button>
+<pre id="output"></pre>
+
+<script>
+const output = document.getElementById('output');
+const log = (msg) => {
+  const time = new Date().toISOString().split('T')[1].slice(0, -1);
+  output.textContent += `[${time}] ${msg}\n`;
+};
+
+document.getElementById('test-btn').onclick = async () => {
+  output.textContent = '';
+  log('Starting navigation test...');
+  
+  // 1. Load conversation list
+  log('1. Loading conversation list...');
+  const start1 = performance.now();
+  const resp1 = await fetch('/api/conversations');
+  const data1 = await resp1.json();
+  const time1 = performance.now() - start1;
+  log(`   Loaded ${data1.conversations.length} conversations in ${time1.toFixed(1)}ms`);
+  
+  if (data1.conversations.length === 0) {
+    log('No conversations found!');
+    return;
+  }
+  
+  const conv = data1.conversations[0];
+  const slug = conv.slug;
+  
+  // 2. Load conversation details
+  log(`\n2. Loading conversation: ${slug}`);
+  const start2 = performance.now();
+  const resp2 = await fetch(`/api/conversations/by-slug/${slug}`);
+  const data2 = await resp2.json();
+  const time2 = performance.now() - start2;
+  log(`   Loaded ${data2.messages.length} messages in ${time2.toFixed(1)}ms`);
+  
+  // 3. Simulate SSE connection
+  log('\n3. Opening SSE connection...');
+  const start3 = performance.now();
+  const eventSource = new EventSource(`/api/conversations/${conv.id}/stream`);
+  
+  let initReceived = false;
+  eventSource.addEventListener('init', (e) => {
+    if (!initReceived) {
+      initReceived = true;
+      const time3 = performance.now() - start3;
+      log(`   SSE init received in ${time3.toFixed(1)}ms`);
+      eventSource.close();
+      
+      // 4. Simulate going back and forth
+      setTimeout(() => {
+        log('\n4. Simulating back navigation (cached in frontend)');
+        log('   (In real app, this would be instant from memory/IndexedDB)');
+        
+        log('\n5. Re-loading same conversation...');
+        const start4 = performance.now();
+        fetch(`/api/conversations/by-slug/${slug}`).then(r => r.json()).then(data => {
+          const time4 = performance.now() - start4;
+          log(`   Backend re-fetch took ${time4.toFixed(1)}ms`);
+          log('\n✅ Test complete!');
+          log('\nNOTE: Frontend caching would eliminate steps 4-5 delays.');
+        });
+      }, 100);
+    }
+  });
+  
+  eventSource.onerror = () => {
+    const time3 = performance.now() - start3;
+    log(`   SSE error after ${time3.toFixed(1)}ms`);
+    eventSource.close();
+  };
+};
+</script>
+</body>
+</html>

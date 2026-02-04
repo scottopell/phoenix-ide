@@ -155,7 +155,9 @@ export class CacheDB {
   }
 
   // Messages
+  // Get messages with timing
   async getMessages(conversationId: string, afterSequence?: number): Promise<Message[]> {
+    const start = performance.now();
     await this.init();
     const tx = this.db!.transaction(['messages'], 'readonly');
     const store = tx.objectStore('messages');
@@ -175,11 +177,16 @@ export class CacheDB {
           }
           cursor.continue();
         } else {
+          const duration = performance.now() - start;
+          console.log(`[IndexedDB] getMessages took ${duration.toFixed(1)}ms for ${messages.length} messages`);
           resolve(messages.sort((a, b) => a.sequence_id - b.sequence_id));
         }
       };
       
-      request.onerror = () => resolve([]);
+      request.onerror = () => {
+        console.error('[IndexedDB] getMessages error');
+        resolve([]);
+      };
     });
   }
 
