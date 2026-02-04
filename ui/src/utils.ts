@@ -27,26 +27,21 @@ export function formatRelativeTime(isoStr: string): string {
   return date.toLocaleDateString();
 }
 
-export function formatShortDate(isoStr: string): string {
+export function formatShortDateTime(isoStr: string): string {
   if (!isoStr) return '';
   const date = new Date(isoStr);
   const now = new Date();
-  const isToday = date.toDateString() === now.toDateString();
-  const yesterday = new Date(now);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const isYesterday = date.toDateString() === yesterday.toDateString();
   
-  if (isToday) {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-  if (isYesterday) {
-    return 'yesterday';
-  }
-  // Show month/day for this year, full date for older
+  const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  
+  // Same year: "Jan 5, 10:30 AM"
+  // Different year: "Jan 5 '24, 10:30 AM"
   if (date.getFullYear() === now.getFullYear()) {
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const dateStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return `${dateStr}, ${timeStr}`;
   }
-  return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' });
+  const dateStr = date.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' });
+  return `${dateStr}, ${timeStr}`;
 }
 
 export function getStateDescription(convState: string, stateData: ConversationState | null): string {

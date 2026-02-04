@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { Conversation } from '../api';
-import { formatRelativeTime, formatShortDate } from '../utils';
+import { formatRelativeTime, formatShortDateTime } from '../utils';
 import { ThemeToggle } from './ThemeToggle';
 import { useTheme } from '../hooks/useTheme';
 
@@ -86,8 +86,8 @@ export function ConversationList({
               <div className="conv-item-main" onClick={() => handleClick(conv)}>
                 <div className="conv-item-slug">{conv.slug}</div>
                 <div className="conv-item-meta">
-                  <span className="conv-item-time" title={`Created: ${formatShortDate(conv.created_at)}\nLast message: ${formatRelativeTime(conv.updated_at)}`}>
-                    {formatShortDate(conv.created_at)} → {formatRelativeTime(conv.updated_at)}
+                  <span className="conv-item-time" title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}>
+                    {formatShortDateTime(conv.created_at)} → {formatRelativeTime(conv.updated_at)}
                   </span>
                   <span className="conv-item-messages">{conv.message_count} {conv.message_count === 1 ? 'msg' : 'msgs'}</span>
                 </div>
