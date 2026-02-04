@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { enhancedApi } from '../enhancedApi';
-import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
+import { Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { MessageList } from '../components/MessageList';
@@ -271,7 +271,7 @@ export function ConversationPage() {
 
     try {
       if (isOnline) {
-        await api.sendMessage(conversationId, text, images);
+        await enhancedApi.sendMessage(conversationId, text, images);
         markSentRef.current(localId);
         setAgentWorking(true);
         setBreadcrumbs([{ type: 'user', label: 'User' }]);
@@ -350,7 +350,7 @@ export function ConversationPage() {
     if (convState.startsWith('cancelling')) return;
 
     try {
-      await api.cancelConversation(conversationId);
+      await enhancedApi.cancelConversation(conversationId);
     } catch (err) {
       console.error('Failed to cancel:', err);
     }

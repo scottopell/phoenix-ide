@@ -1,13 +1,13 @@
 // Sync queue for handling offline operations
 
-import { api } from './api';
+import { enhancedApi } from './enhancedApi';
 import type { PendingOperation } from './cache';
 
 export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
     switch (op.type) {
       case 'send_message':
-        await api.sendMessage(
+        await enhancedApi.sendMessage(
           op.conversationId,
           op.payload.text,
           op.payload.images || []
@@ -15,19 +15,19 @@ export class SyncQueue {
         break;
       
       case 'archive':
-        await api.archiveConversation(op.conversationId);
+        await enhancedApi.archiveConversation(op.conversationId);
         break;
       
       case 'unarchive':
-        await api.unarchiveConversation(op.conversationId);
+        await enhancedApi.unarchiveConversation(op.conversationId);
         break;
       
       case 'delete':
-        await api.deleteConversation(op.conversationId);
+        await enhancedApi.deleteConversation(op.conversationId);
         break;
       
       case 'rename':
-        await api.renameConversation(
+        await enhancedApi.renameConversation(
           op.conversationId,
           op.payload.name
         );

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { api, ModelsResponse } from '../api';
+import { ModelsResponse } from '../api';
 import { enhancedApi } from '../enhancedApi';
 import { DirectoryPicker } from './DirectoryPicker';
 
@@ -28,7 +28,7 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       setCreating(false);
       
       // Load available models
-      api.listModels().then(modelsData => {
+      enhancedApi.listModels().then(modelsData => {
         setModels(modelsData);
         setSelectedModel(modelsData.default);
       }).catch(err => {
@@ -48,7 +48,7 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       }
       
       // Check if path exists or parent exists (can create)
-      const validation = await api.validateCwd(trimmed);
+      const validation = await enhancedApi.validateCwd(trimmed);
       if (validation.valid) {
         setPathValid(true);
         setError(null);
@@ -57,7 +57,7 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       
       // Check if parent exists (we can create this directory)
       const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-      const parentValidation = await api.validateCwd(parentPath);
+      const parentValidation = await enhancedApi.validateCwd(parentPath);
       setPathValid(parentValidation.valid);
       // Don't set error here - DirectoryPicker shows status
       setError(null);
@@ -80,7 +80,7 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
 
     try {
       // Check if we need to create the directory
-      const validation = await api.validateCwd(trimmed);
+      const validation = await enhancedApi.validateCwd(trimmed);
       if (!validation.valid) {
         // Directory doesn't exist - try to create it
         // For now, we'll let the backend handle this or show an error

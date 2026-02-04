@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { api } from '../api';
+import { enhancedApi } from '../enhancedApi';
 
 interface DirectoryEntry {
   name: string;
@@ -33,7 +33,7 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
     const checkPath = async () => {
       setPathStatus({ type: 'checking' });
       
-      const validation = await api.validateCwd(value);
+      const validation = await enhancedApi.validateCwd(value);
       
       if (validation.valid) {
         setPathStatus({ type: 'exists' });
@@ -43,7 +43,7 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
       
       // Path doesn't exist - check if parent exists (would create)
       const parentPath = value.substring(0, value.lastIndexOf('/')) || '/';
-      const parentValidation = await api.validateCwd(parentPath);
+      const parentValidation = await enhancedApi.validateCwd(parentPath);
       
       if (parentValidation.valid) {
         setPathStatus({ type: 'will_create', parent: parentPath });
@@ -54,7 +54,7 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
         let ancestor = parentPath;
         while (ancestor !== '/') {
           const ancestorParent = ancestor.substring(0, ancestor.lastIndexOf('/')) || '/';
-          const ancestorCheck = await api.validateCwd(ancestorParent);
+          const ancestorCheck = await enhancedApi.validateCwd(ancestorParent);
           if (ancestorCheck.valid) {
             setListingPath(ancestorParent);
             return;
@@ -72,7 +72,7 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
   useEffect(() => {
     const loadEntries = async () => {
       try {
-        const resp = await api.listDirectory(listingPath);
+        const resp = await enhancedApi.listDirectory(listingPath);
         setEntries(resp.entries.filter(e => e.is_dir));
         setListError(null);
       } catch (err) {
