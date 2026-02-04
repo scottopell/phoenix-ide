@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { enhancedApi } from '../enhancedApi';
 import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
 import { useDraft, useMessageQueue, useConnection } from '../hooks';
+import { useAppMachine } from '../hooks/useAppMachine';
 import type { Breadcrumb } from '../types';
 
 export function ConversationPage() {
@@ -21,8 +23,13 @@ export function ConversationPage() {
   const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [contextWindowUsed, setContextWindowUsed] = useState(0);
+  const [initialLoadComplete, setInitialLoadComplete] = useState(false);
+  const [lastDataSource, setLastDataSource] = useState<'memory' | 'indexeddb' | 'network' | null>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set()); // Track localIds being sent
+
+  // App state for offline support
+  const { isOnline, queueOperation, showSyncStatus } = useAppMachine();
 
   // Draft management
   const [draft, setDraft, clearDraft] = useDraft(conversationId);
@@ -194,17 +201,24 @@ export function ConversationPage() {
 
     const loadConversation = async () => {
       try {
-        const result = await api.getConversationBySlug(slug);
-        if (cancelled) return;
-        
-        // Set initial data from REST API
-        setConversation(result.conversation);
-        setMessages(result.messages);
-        setAgentWorking(result.agent_working);
-        setContextWindowUsed(result.context_window_size || 0);
-        
-        // Set conversation ID for hooks - this triggers the SSE connection
-        setConversationId(result.conversation.id);
+        // First, try to load from cache for instant display
+        const cachedResult = await enhancedApi.getConversationBySlug(slug, { forceFresh: false });
+        if (!cancelled && cachedResult.data) {
+          setConversation(cachedResult.data.conversation);
+          setMessages(cachedResult.data.messages);
+          setAgentWorking(cachedResult.data.agent_working);
+          setContextWindowUsed(cachedResult.data.context_window_size || 0);
+          setLastDataSource(cachedResult.source);
+          setInitialLoadComplete(true);
+          
+          // Set conversation ID for hooks - this triggers the SSE connection
+          setConversationId(cachedResult.data.conversation.id);
+          
+          // If data was stale, it will auto-refresh in background
+          if (cachedResult.stale) {
+            console.log(`Loaded stale ${cachedResult.source} data, background refresh triggered`);
+          }
+        }
       } catch (err) {
         if (cancelled) return;
         console.error('Failed to load conversation:', err);
@@ -233,17 +247,32 @@ export function ConversationPage() {
     sendingMessagesRef.current.add(localId);
 
     try {
-      await api.sendMessage(conversationId, text, images);
-      markSentRef.current(localId);
-      setAgentWorking(true);
-      setBreadcrumbs([{ type: 'user', label: 'User' }]);
+      if (isOnline) {
+        await api.sendMessage(conversationId, text, images);
+        markSentRef.current(localId);
+        setAgentWorking(true);
+        setBreadcrumbs([{ type: 'user', label: 'User' }]);
+      } else {
+        // Queue for offline sync
+        await queueOperation({
+          type: 'send_message',
+          conversationId,
+          payload: { text, images },
+          createdAt: new Date(),
+          retryCount: 0,
+          status: 'pending'
+        });
+        markSentRef.current(localId);
+        // Show offline indicator instead of agent working
+        setAgentWorking(false);
+      }
     } catch (err) {
       console.error('Failed to send message:', err);
       markFailedRef.current(localId);
     } finally {
       sendingMessagesRef.current.delete(localId);
     }
-  }, [conversationId]); // Only depends on conversationId - callbacks accessed via refs
+  }, [conversationId, isOnline, queueOperation]); // Added isOnline and queueOperation
 
   // Stable ref to sendMessage for effect
   const sendMessageRef = useRef(sendMessage);
@@ -358,6 +387,17 @@ export function ConversationPage() {
 
   return (
     <div id="app">
+      {/* Offline/Sync status banner */}
+      {(!isOnline || showSyncStatus) && (
+        <div className="status-header">
+          {!isOnline && (
+            <div className="offline-banner">
+              <span className="offline-icon">⚡</span>
+              Offline Mode - Messages will send when connection returns
+            </div>
+          )}
+        </div>
+      )}
       <StateBar
         conversation={conversation}
         convState={convState}
@@ -383,7 +423,7 @@ export function ConversationPage() {
         canSend={canSend}
         agentWorking={agentWorking}
         isCancelling={isCancelling}
-        isOffline={isOffline}
+        isOffline={!isOnline}
         queuedMessages={queuedMessages}
         onSend={handleSend}
         onCancel={handleCancel}

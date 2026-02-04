@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api, ModelsResponse } from '../api';
+import { enhancedApi } from '../enhancedApi';
 import { DirectoryPicker } from './DirectoryPicker';
 
 interface NewConversationModalProps {
@@ -90,7 +91,7 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       }
 
       // Create conversation
-      const conv = await api.createConversation(trimmed, selectedModel || undefined);
+      const conv = await enhancedApi.createConversation(trimmed, selectedModel || undefined);
       onCreated(conv);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');

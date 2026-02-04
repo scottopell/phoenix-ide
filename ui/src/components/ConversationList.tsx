@@ -15,6 +15,7 @@ interface ConversationListProps {
   onUnarchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
+  onConversationClick?: (conv: Conversation) => void;
 }
 
 export function ConversationList({
@@ -27,13 +28,18 @@ export function ConversationList({
   onUnarchive,
   onDelete,
   onRename,
+  onConversationClick,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const handleClick = (conv: Conversation) => {
-    navigate(`/c/${conv.slug}`);
+    if (onConversationClick) {
+      onConversationClick(conv);
+    } else {
+      navigate(`/c/${conv.slug}`);
+    }
   };
 
   const toggleActions = (e: React.MouseEvent, convId: string) => {

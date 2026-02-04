@@ -1604,3 +1604,94 @@ html * {
   color: var(--text-muted);
   font-size: 12px;
 }
+
+/* Status header styles */
+.status-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.offline-banner,
+.sync-banner {
+  padding: 8px 16px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.offline-banner {
+  background: #ff6b6b;
+  color: white;
+}
+
+.sync-banner {
+  background: #4ecdc4;
+  color: white;
+}
+
+.offline-icon,
+.sync-icon {
+  margin-right: 8px;
+}
+
+/* Last updated styles */
+.last-updated {
+  padding: 8px 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.refresh-btn {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.refresh-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--primary-color);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Pending operation indicator */
+.conv-item.pending {
+  opacity: 0.7;
+}
+
+.conv-item.pending::before {
+  content: '⏳';
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* Data source indicator (debug) */
+.data-source-indicator {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: monospace;
+  z-index: 9999;
+  pointer-events: none;
+}
