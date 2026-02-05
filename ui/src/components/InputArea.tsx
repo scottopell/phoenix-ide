@@ -90,7 +90,7 @@ export function InputArea({
         top: ${top}px;
         left: 10px;
         background: rgba(0,0,0,0.9);
-        color: #0f0;
+        color: #f0f;
         padding: 8px;
         font-family: monospace;
         font-size: 11px;
