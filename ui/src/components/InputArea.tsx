@@ -73,56 +73,22 @@ export function InputArea({
     const viewport = window.visualViewport;
     if (!viewport) return;
 
-    // Create debug overlay - position relative to visual viewport
-    let debugEl = document.getElementById('viewport-debug');
-    if (!debugEl) {
-      debugEl = document.createElement('div');
-      debugEl.id = 'viewport-debug';
-      document.body.appendChild(debugEl);
-    }
-    
-    const updateDebugPosition = () => {
-      if (!debugEl) return;
-      // Position at top of visual viewport
-      const top = viewport.offsetTop + 50;
-      debugEl.style.cssText = `
-        position: fixed;
-        top: ${top}px;
-        left: 10px;
-        background: rgba(0,0,0,0.9);
-        color: #f0f;
-        padding: 8px;
-        font-family: monospace;
-        font-size: 11px;
-        z-index: 99999;
-        border-radius: 4px;
-        pointer-events: none;
-        white-space: pre;
-      `;
-    };
-    updateDebugPosition();
-
     const handleViewportChange = () => {
       const footer = footerRef.current;
       if (!footer) return;
 
-      // Update debug overlay
-      if (debugEl) {
-        updateDebugPosition();
-        debugEl.textContent = [
-          `iter: 7`,
-          `vpH: ${Math.round(viewport.height)} vpTop: ${Math.round(viewport.offsetTop)}`,
-          `window.scrollY: ${Math.round(window.scrollY)}`,
-          `body.scrollTop: ${document.body.scrollTop}`,
-          `html.scrollTop: ${document.documentElement.scrollTop}`,
-        ].join('\n');
-      }
+      // Calculate the offset from the bottom of the layout viewport
+      // to the bottom of the visual viewport (keyboard height)
+      const offsetBottom = window.innerHeight - viewport.height - viewport.offsetTop;
       
-      // Currently just observing - no positioning changes
+      if (offsetBottom > 0) {
+        // Keyboard is open - position input above it
+        footer.style.bottom = `${offsetBottom}px`;
+      } else {
+        // Keyboard is closed - reset to default
+        footer.style.bottom = '0px';
+      }
     };
-
-    // Fire immediately to populate debug
-    handleViewportChange();
 
     viewport.addEventListener('resize', handleViewportChange);
     viewport.addEventListener('scroll', handleViewportChange);

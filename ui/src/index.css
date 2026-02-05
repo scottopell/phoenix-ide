@@ -58,10 +58,6 @@ html, body {
   background: var(--bg-primary);
   color: var(--text-primary);
   overflow: hidden;
-  /* Prevent iOS Safari from scrolling the page when keyboard opens */
-  position: fixed;
-  width: 100%;
-  overscroll-behavior: none;
 }
 
 #app {
