@@ -124,11 +124,18 @@ export function InputArea({
         ].join('\n');
       }
       
-      if (offsetBottom > 0) {
-        // Keyboard is open - position input above it
-        footer.style.bottom = `${offsetBottom}px`;
+      // Position footer at bottom of visual viewport
+      const footerHeight = footer.offsetHeight;
+      const targetTop = viewport.offsetTop + viewport.height - footerHeight;
+      
+      // Only use custom positioning when keyboard is likely open (viewport significantly smaller)
+      if (viewport.height < window.screen.height * 0.7) {
+        footer.style.position = 'fixed';
+        footer.style.top = `${targetTop}px`;
+        footer.style.bottom = 'auto';
       } else {
-        // Keyboard is closed - reset to default
+        // Keyboard closed - use default positioning
+        footer.style.top = '';
         footer.style.bottom = '0px';
       }
     };
