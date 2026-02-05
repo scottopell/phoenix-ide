@@ -106,21 +106,17 @@ export function InputArea({
       const footer = footerRef.current;
       if (!footer) return;
 
-      // Calculate the offset from the bottom of the layout viewport
-      // to the bottom of the visual viewport (keyboard height)
-      const offsetBottom = window.innerHeight - viewport.height - viewport.offsetTop;
-      
       // Update debug overlay
       if (debugEl) {
         updateDebugPosition();
-        const mainArea = document.getElementById('main-area');
+        const footerRect = footer.getBoundingClientRect();
         debugEl.textContent = [
-          `innerH: ${window.innerHeight}`,
-          `vpH: ${Math.round(viewport.height)}`,
-          `vpTop: ${Math.round(viewport.offsetTop)}`,
-          `kbHeight: ${Math.round(offsetBottom)}`,
-          `footer.bot: ${footer.style.bottom || '0px'}`,
-          `mainScroll: ${mainArea?.scrollHeight}/${mainArea?.clientHeight}`,
+          `iter: 4`,
+          `vpH: ${Math.round(viewport.height)} vpTop: ${Math.round(viewport.offsetTop)}`,
+          `footer.top: ${footer.style.top || 'auto'}`,
+          `footer.bottom: ${footer.style.bottom || 'auto'}`,
+          `footerRect.top: ${Math.round(footerRect.top)}`,
+          `screenH: ${window.screen.height}`,
         ].join('\n');
       }
       
