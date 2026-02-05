@@ -2,85 +2,141 @@
 
 ## Architecture Overview
 
-Minimal browser control tool focused on PWA testing needs:
+Native Rust tool using Chrome DevTools Protocol (CDP) for browser automation:
 
-1. **Page Controller** - Navigation and readiness detection
-2. **Service Worker Inspector** - Registration and state monitoring  
-3. **Network Observer** - Request source identification
-4. **Console Aggregator** - Multi-context log collection
+1. **CDP Client Layer** - WebSocket connection to Chrome debugging port
+2. **Command Interface** - Simple method calls that map to CDP domains
+3. **Chrome Process Manager** - Lifecycle management of headless Chrome
+4. **Result Formatting** - Structured output for AI agent consumption
+
+## Technology Stack
+
+- **Language**: Rust (consistent with Phoenix IDE)
+- **CDP Library**: Chromium Oxide (or similar, pending source code review)
+- **Chrome**: Headless Chrome with remote debugging enabled
+- **Protocol**: Chrome DevTools Protocol via WebSocket
 
 ## Component Design
 
+### Chrome Process Manager
+
+Handles Chrome lifecycle:
+
+- Launch headless Chrome with debugging port
+- Ensure single instance per tool invocation
+- Clean shutdown of Chrome process
+- Automatic port allocation to avoid conflicts
+
+### CDP Connection (All Requirements)
+
+Core WebSocket connection to Chrome:
+
+- Connect to Chrome debugging port
+- Handle connection failures gracefully
+- Automatic reconnection if needed
+- Message serialization/deserialization
+
 ### Page Navigation (REQ-BT-001)
 
-Simple navigation with readiness detection:
+Uses CDP Page domain:
 
-- Navigate to URL and wait for load event
-- Detect common error conditions from navigation result
-- Provide specific error types for debugging
-- No complex wait strategies - load event is sufficient for most cases
+- `Page.navigate` for URL navigation
+- `Page.loadEventFired` for basic readiness
+- Error detection from navigation response
+- Map CDP errors to user-friendly messages
 
-### Service Worker Monitor (REQ-BT-002) 
+### Service Worker Inspector (REQ-BT-002) 
 
-Basic service worker state inspection:
+Uses CDP ServiceWorker domain:
 
-- Check if any service worker is registered for the page
-- Determine if worker is active vs installing/waiting
-- Verify if worker is controlling the current page
-- Simple boolean/enum states, not full debugging info
+- `ServiceWorker.enable` to start tracking
+- Query registrations via Runtime evaluation
+- Check controller state for current page
+- Simple active/inactive status reporting
 
 ### Network Source Tracker (REQ-BT-003)
 
-Identify where each response was served from:
+Uses CDP Network domain:
 
-- Hook browser's network events
-- Check response headers and timing info to determine source
-- Categorize as: network, service-worker, disk-cache, or memory-cache
-- Focus on the critical distinction for offline testing
+- `Network.enable` to intercept requests
+- `Network.responseReceived` events
+- Check `response.fromServiceWorker` flag
+- Track `response.fromDiskCache` flag
+- Categorize into network/sw/cache buckets
 
 ### Offline Simulator (REQ-BT-004)
 
-Simple network blocking:
+Uses CDP Network domain:
 
-- Toggle network access for the page context
-- Allow service worker to continue serving from cache
-- No complex network condition simulation - just on/off
-- Browser's offline mode is sufficient
+- `Network.emulateNetworkConditions` with offline flag
+- Simple boolean offline state
+- No complex throttling profiles needed
 
 ### Console Aggregator (REQ-BT-005)
 
-Collect logs from all contexts:
+Uses CDP Runtime and Log domains:
 
-- Listen to console events from page
-- Subscribe to service worker console output
-- Tag each message with its source context
-- Include timestamp and log level
+- `Runtime.consoleAPICalled` for console messages
+- `Log.entryAdded` for service worker logs
+- Tag messages with source context
+- Forward all to unified output
 
 ### JavaScript Executor (REQ-BT-006)
 
-Basic script execution:
+Uses CDP Runtime domain:
 
-- Execute JavaScript strings in page context
-- Wait for promise resolution if returned
+- `Runtime.evaluate` with expression string
+- `awaitPromise: true` for async code
 - Serialize return values to JSON
-- Capture and return errors with stack traces
+- Capture exception details
 
 ### Screenshot Capture (REQ-BT-007)
 
-Viewport screenshots only:
+Uses CDP Page domain:
 
-- Capture current viewport as PNG
-- No element selection or full-page capture
-- Return as base64 or save to file
-- Simple and reliable
+- `Page.captureScreenshot` for viewport
+- PNG format by default
+- Base64 encoded result
+- Optional file save
+
+## Implementation Approach
+
+1. Start with provided Chromium Oxide source code
+2. Create minimal CLI binary
+3. Implement one command at a time
+4. Test against Phoenix IDE service worker
+5. Add commands as needed
+
+## Error Handling
+
+All CDP errors mapped to user-friendly messages:
+
+- Connection failures
+- Navigation errors  
+- Runtime exceptions
+- Timeout handling
+
+## Output Format
+
+Structured text suitable for AI agents:
+
+```
+SUCCESS: Navigation complete
+URL: http://localhost:8000
+Status: 200
+Ready: true
+
+ERROR: Navigation failed
+URL: http://localhost:9999
+Reason: net::ERR_CONNECTION_REFUSED
+```
 
 ## What This Design Explicitly Excludes
 
-- Complex state management (cookies, storage)
-- Performance metrics beyond basic timing
-- Accessibility testing
-- Full DevTools protocol exposure
-- Multiple browser contexts
-- Advanced screenshot features
+- Cross-browser support (Chrome only)
+- Complex wait strategies (just load event)
+- Full CDP protocol exposure
+- GUI or interactive mode
+- Test framework integration
 
-These exclusions keep the tool focused on solving the concrete PWA testing problems that motivated its creation.
+Focused on solving the PWA testing problems with minimal complexity.

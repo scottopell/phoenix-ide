@@ -6,7 +6,7 @@ The Phoenix Browser Tool enables AI agents to test Progressive Web Applications 
 
 ## Technical Summary  
 
-A focused implementation using browser debugging protocols to expose only essential PWA testing capabilities. The design avoids complexity by excluding features that don't directly enable AI agent testing scenarios. Navigation waits for simple load events. Service worker inspection provides basic registration and control state. Network observation categorizes request sources for cache verification. Offline simulation uses browser's built-in offline mode. Console aggregation includes service worker contexts. JavaScript execution handles promises and errors. Screenshots capture viewport only.
+A focused implementation using Chrome DevTools Protocol (CDP) via WebSocket to expose only essential PWA testing capabilities. Built as a native Rust tool using Chromium Oxide (or similar library based on available source code). The tool manages a headless Chrome instance and translates simple method calls to CDP commands. Each requirement maps to specific CDP domains: Page for navigation and screenshots, ServiceWorker and Runtime for worker state, Network for request analysis and offline mode, Runtime and Log for console aggregation. Output is structured text optimized for AI agent parsing rather than JSON.
 
 ## Status Summary
 
