@@ -1441,6 +1441,23 @@ pre:hover .copy-btn {
   color: var(--accent-red);
 }
 
+.path-status-hint {
+  font-size: 12px;
+  padding: 4px 8px;
+  margin-top: 4px;
+  border-radius: 4px;
+}
+
+.path-status-hint.will-create {
+  color: var(--accent-yellow);
+  background: rgba(255, 193, 7, 0.1);
+}
+
+.path-status-hint.invalid {
+  color: var(--accent-red);
+  background: rgba(244, 67, 54, 0.1);
+}
+
 .picker-nav {
   display: flex;
   align-items: center;

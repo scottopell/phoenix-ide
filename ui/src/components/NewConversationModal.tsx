@@ -83,11 +83,12 @@ export function NewConversationModal({ visible, onClose, onCreated }: NewConvers
       const validation = await enhancedApi.validateCwd(trimmed);
       if (!validation.valid) {
         // Directory doesn't exist - try to create it
-        // For now, we'll let the backend handle this or show an error
-        // In a full implementation, we'd call a mkdir API
-        setError('Directory does not exist. Please create it first or select an existing one.');
-        setCreating(false);
-        return;
+        const mkdirResult = await enhancedApi.mkdir(trimmed);
+        if (!mkdirResult.created) {
+          setError(mkdirResult.error || 'Failed to create directory');
+          setCreating(false);
+          return;
+        }
       }
 
       // Create conversation

@@ -6,7 +6,8 @@ use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
-    ListDirectoryResponse, ModelsResponse, RenameRequest, SuccessResponse, ValidateCwdResponse,
+    ListDirectoryResponse, MkdirResponse, ModelsResponse, RenameRequest, SuccessResponse,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::runtime::SseEvent;
@@ -67,6 +68,7 @@ pub fn create_router(state: AppState) -> Router {
         // Directory browser (REQ-API-008)
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
+        .route("/api/mkdir", post(mkdir))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
         // Version
@@ -489,6 +491,54 @@ async fn list_directory(
     });
 
     Ok(Json(ListDirectoryResponse { entries: result }))
+}
+
+/// Create a directory (with parents if needed)
+async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
+    let path = PathBuf::from(&payload.path);
+
+    // Security: ensure path is absolute and under allowed roots
+    if !path.is_absolute() {
+        return Json(MkdirResponse {
+            created: false,
+            error: Some("Path must be absolute".to_string()),
+        });
+    }
+
+    // Don't allow creating directories outside of /home or /tmp
+    let path_str = path.to_string_lossy();
+    if !path_str.starts_with("/home/") && !path_str.starts_with("/tmp/") {
+        return Json(MkdirResponse {
+            created: false,
+            error: Some("Can only create directories under /home or /tmp".to_string()),
+        });
+    }
+
+    // Check if already exists
+    if path.exists() {
+        if path.is_dir() {
+            return Json(MkdirResponse {
+                created: true, // Already exists, that's fine
+                error: None,
+            });
+        }
+        return Json(MkdirResponse {
+            created: false,
+            error: Some("Path exists but is not a directory".to_string()),
+        });
+    }
+
+    // Create the directory (and parents)
+    match fs::create_dir_all(&path) {
+        Ok(()) => Json(MkdirResponse {
+            created: true,
+            error: None,
+        }),
+        Err(e) => Json(MkdirResponse {
+            created: false,
+            error: Some(format!("Failed to create directory: {e}")),
+        }),
+    }
 }
 
 // ============================================================

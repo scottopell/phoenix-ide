@@ -378,6 +378,10 @@ class EnhancedAPI {
   async listDirectory(path: string): Promise<{ entries: { name: string; is_dir: boolean }[] }> {
     return baseApi.listDirectory(path);
   }
+
+  async mkdir(path: string): Promise<{ created: boolean; error?: string }> {
+    return baseApi.mkdir(path);
+  }
   
   async listModels(): Promise<ModelsResponse> {
     // Models don't change often, could cache for longer

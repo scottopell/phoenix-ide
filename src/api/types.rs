@@ -84,6 +84,14 @@ pub struct ListDirectoryResponse {
     pub entries: Vec<DirectoryEntry>,
 }
 
+/// Response for mkdir
+#[derive(Debug, Serialize)]
+pub struct MkdirResponse {
+    pub created: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Directory entry
 #[derive(Debug, Serialize)]
 pub struct DirectoryEntry {

@@ -101,18 +101,20 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
     onChange(parentPath);
   }, [value, onChange]);
 
-  const statusIcon = () => {
+  const statusInfo = () => {
     switch (pathStatus.type) {
       case 'checking':
-        return <span className="status-icon checking">⋯</span>;
+        return { icon: '⋯', title: 'Checking path...', className: 'checking' };
       case 'exists':
-        return <span className="status-icon exists">✓</span>;
+        return { icon: '✓', title: 'Directory exists', className: 'exists' };
       case 'will_create':
-        return <span className="status-icon will-create">+</span>;
+        return { icon: '+', title: 'Directory will be created', className: 'will-create' };
       case 'invalid':
-        return <span className="status-icon invalid">✗</span>;
+        return { icon: '✗', title: pathStatus.error, className: 'invalid' };
     }
   };
+
+  const status = statusInfo();
 
   return (
     <div className="directory-picker">
@@ -123,10 +125,24 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
           className={`path-input ${pathStatus.type}`}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="/home/exedev/project"
+          placeholder="/home/exedev/my-project"
         />
-        {statusIcon()}
+        <span className={`status-icon ${status.className}`} title={status.title}>
+          {status.icon}
+        </span>
       </div>
+
+      {/* Status message */}
+      {pathStatus.type === 'will_create' && (
+        <div className="path-status-hint will-create">
+          📁 New folder will be created
+        </div>
+      )}
+      {pathStatus.type === 'invalid' && (
+        <div className="path-status-hint invalid">
+          {pathStatus.error}
+        </div>
+      )}
 
       {/* Breadcrumb navigation with Up button */}
       <div className="picker-nav">
