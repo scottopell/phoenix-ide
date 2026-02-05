@@ -20,12 +20,39 @@ Native Rust tool using Chrome DevTools Protocol (CDP) for browser automation:
 
 ### Chrome Process Manager
 
-Handles Chrome lifecycle:
+Handles Chrome lifecycle with implicit session model:
 
-- Launch headless Chrome with debugging port
-- Ensure single instance per tool invocation
-- Clean shutdown of Chrome process
-- Automatic port allocation to avoid conflicts
+- First browser tool call in a conversation launches Chrome
+- Chrome instance persists across all tool calls in the same conversation
+- Automatic cleanup when conversation ends or after 5 minute idle timeout
+- Single Chrome instance per conversation (not per tool call)
+- No explicit session management required from AI agent
+
+### Session Model (All Requirements)
+
+Implicit stateful session for "pit of success":
+
+- **State Persistence**: Browser state (cookies, cache, loaded pages) persists across tool calls within a conversation
+- **No Context Parameters**: AI agents don't pass context/session IDs
+- **Automatic Initialization**: First tool call creates browser if needed
+- **Navigation Context**: After `navigate`, subsequent commands operate on that page
+- **Error Recovery**: If Chrome crashes, next tool call automatically restarts it
+- **Resource Safety**: Cannot leak browsers across conversations
+
+Example flow:
+```
+tool: browser_navigate(url="http://localhost:8000")
+  → Starts Chrome, navigates, keeps Chrome alive
+
+tool: browser_get_service_workers()
+  → Uses existing Chrome, checks current page
+
+tool: browser_screenshot()
+  → Still same Chrome, captures current page
+
+[Conversation ends or 5 minutes idle]
+  → Chrome automatically cleaned up
+```
 
 ### CDP Connection (All Requirements)
 
@@ -126,10 +153,18 @@ URL: http://localhost:8000
 Status: 200
 Ready: true
 
-ERROR: Navigation failed
+ERROR: Navigation failed  
 URL: http://localhost:9999
 Reason: net::ERR_CONNECTION_REFUSED
 ```
+
+## Session and Resource Management
+
+**Implicit Session Model**: The tool maintains a single browser instance per AI conversation. No session IDs or context parameters needed. First tool call starts Chrome, subsequent calls reuse it, automatic cleanup on conversation end or timeout.
+
+**State Persistence**: Browser state (cookies, cache, current page) persists across tool calls within a conversation, enabling natural test flows like login → navigate → verify.
+
+**Resource Safety**: Browser instances cannot leak across conversations. Each conversation gets isolated browser state. Automatic 5-minute idle timeout prevents long-running resource consumption.
 
 ## What This Design Explicitly Excludes
 
