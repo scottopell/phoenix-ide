@@ -4,7 +4,18 @@
 
 Tasks are tracked in `tasks/NNN-slug.md` files with YAML frontmatter.
 
-Use `./dev.py tasks ready` to see tasks available for implementation.
+```bash
+# List ready tasks
+grep -l "status: ready" tasks/*.md
+
+# Create a new task: copy template, use next available number
+cp tasks/_TEMPLATE.md tasks/NNN-short-slug.md
+
+# Close a task: edit the file, change status to done
+# status: ready  ->  status: done
+```
+
+No tooling required - the markdown files are the system.
 
 ---
 
@@ -91,10 +102,6 @@ The modern style is preferred because:
 
 # Code quality
 ./dev.py check         # Run clippy + fmt check + tests
-
-# Task management
-./dev.py tasks ready   # List tasks ready for implementation
-./dev.py tasks close <id> [--wont-do]  # Close a task
 ```
 
 ### Development Workflow
