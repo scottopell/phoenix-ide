@@ -54,6 +54,7 @@ export function InputArea({
 }: InputAreaProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const footerRef = useRef<HTMLElement>(null);
 
   const autoResize = () => {
     const ta = textareaRef.current;
@@ -66,6 +67,37 @@ export function InputArea({
   useEffect(() => {
     autoResize();
   }, [draft]);
+
+  // Handle mobile keyboard visual viewport changes
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+
+    const handleViewportChange = () => {
+      const footer = footerRef.current;
+      if (!footer) return;
+
+      // Calculate the offset from the bottom of the layout viewport
+      // to the bottom of the visual viewport (keyboard height)
+      const offsetBottom = window.innerHeight - viewport.height - viewport.offsetTop;
+      
+      if (offsetBottom > 0) {
+        // Keyboard is open - position input above it
+        footer.style.bottom = `${offsetBottom}px`;
+      } else {
+        // Keyboard is closed - reset to default
+        footer.style.bottom = '0px';
+      }
+    };
+
+    viewport.addEventListener('resize', handleViewportChange);
+    viewport.addEventListener('scroll', handleViewportChange);
+
+    return () => {
+      viewport.removeEventListener('resize', handleViewportChange);
+      viewport.removeEventListener('scroll', handleViewportChange);
+    };
+  }, []);
 
   const addImages = async (files: File[]) => {
     const validFiles = files.filter(file => {
@@ -140,7 +172,7 @@ export function InputArea({
   const sendEnabled = (canSend || isOffline) && hasContent;
 
   return (
-    <footer id="input-area">
+    <footer id="input-area" ref={footerRef}>
       {failedMessages.length > 0 && (
         <div className="failed-messages">
           {failedMessages.map(msg => (

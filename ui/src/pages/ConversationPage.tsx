@@ -434,8 +434,8 @@ export function ConversationPage() {
         contextWindowUsed={contextWindowUsed}
       />
       <BreadcrumbBar breadcrumbs={breadcrumbs} visible={true} />
-      {/* Data source indicator for debugging */}
-      {lastDataSource && initialLoadComplete && (
+      {/* Data source indicator for debugging - only in development */}
+      {import.meta.env.DEV && lastDataSource && initialLoadComplete && (
         <div className="data-source-indicator">
           Loaded from: {lastDataSource}
         </div>
