@@ -2,147 +2,85 @@
 
 ## Architecture Overview
 
-The browser automation tool consists of three main layers:
+Minimal browser control tool focused on PWA testing needs:
 
-1. **Browser Control Layer** - Manages browser instances and page lifecycle
-2. **DevTools Protocol Layer** - Interfaces with browser debugging protocols
-3. **API Layer** - Provides high-level methods for AI agents
+1. **Page Controller** - Navigation and readiness detection
+2. **Service Worker Inspector** - Registration and state monitoring  
+3. **Network Observer** - Request source identification
+4. **Console Aggregator** - Multi-context log collection
 
 ## Component Design
 
-### Browser Control (REQ-BT-001)
+### Page Navigation (REQ-BT-001)
 
-The browser controller manages page navigation and lifecycle:
+Simple navigation with readiness detection:
 
-- Page navigation with configurable wait strategies
-- Automatic wait for network idle, DOM ready, or custom conditions
-- Navigation history tracking for back/forward operations
-- Error categorization for network, DNS, SSL, and timeout failures
+- Navigate to URL and wait for load event
+- Detect common error conditions from navigation result
+- Provide specific error types for debugging
+- No complex wait strategies - load event is sufficient for most cases
 
-### Service Worker Inspector (REQ-BT-002)
+### Service Worker Monitor (REQ-BT-002) 
 
-Service worker inspection leverages the browser's debugging protocol:
+Basic service worker state inspection:
 
-- Enumerate all service worker registrations
-- Query individual worker state and properties
-- Monitor state transitions (installing → waiting → active)
-- Access worker script URLs and scope patterns
+- Check if any service worker is registered for the page
+- Determine if worker is active vs installing/waiting
+- Verify if worker is controlling the current page
+- Simple boolean/enum states, not full debugging info
 
-### Network Analysis (REQ-BT-003)
+### Network Source Tracker (REQ-BT-003)
 
-Network request interception provides detailed source information:
+Identify where each response was served from:
 
-- Hook into browser's network layer before requests
-- Capture which component served each response
-- Track full request/response lifecycle with timing
-- Categorize responses by source: network, service worker, memory cache, disk cache
+- Hook browser's network events
+- Check response headers and timing info to determine source
+- Categorize as: network, service-worker, disk-cache, or memory-cache
+- Focus on the critical distinction for offline testing
 
-### Storage Inspector (REQ-BT-004)
+### Offline Simulator (REQ-BT-004)
 
-Unified interface for all browser storage mechanisms:
+Simple network blocking:
 
-- Cache Storage API enumeration and content access
-- IndexedDB database and object store inspection
-- localStorage/sessionStorage key-value access
-- Cookie jar inspection with domain filtering
+- Toggle network access for the page context
+- Allow service worker to continue serving from cache
+- No complex network condition simulation - just on/off
+- Browser's offline mode is sufficient
 
-### Network Condition Simulator (REQ-BT-005)
+### Console Aggregator (REQ-BT-005)
 
-Offline simulation through browser protocol:
+Collect logs from all contexts:
 
-- Toggle network connectivity at protocol level
-- Simulate various network conditions (3G, 4G, offline)
-- Trigger proper online/offline browser events
-- Maintain WebSocket/SSE connection state awareness
+- Listen to console events from page
+- Subscribe to service worker console output
+- Tag each message with its source context
+- Include timestamp and log level
 
-### Screenshot Engine (REQ-BT-006)
+### JavaScript Executor (REQ-BT-006)
 
-Flexible screenshot capture system:
+Basic script execution:
 
-- Viewport capture for visible area
-- Full page capture with automatic scrolling
-- Element-specific capture using selectors
-- Multiple format support with quality settings
+- Execute JavaScript strings in page context
+- Wait for promise resolution if returned
+- Serialize return values to JSON
+- Capture and return errors with stack traces
 
-### Accessibility Inspector (REQ-BT-007)
+### Screenshot Capture (REQ-BT-007)
 
-Accessibility tree extraction:
+Viewport screenshots only:
 
-- Full accessibility tree serialization
-- Role, name, description, and state for each node
-- Keyboard navigation flow detection
-- ARIA property extraction
+- Capture current viewport as PNG
+- No element selection or full-page capture
+- Return as base64 or save to file
+- Simple and reliable
 
-### JavaScript Executor (REQ-BT-008)
+## What This Design Explicitly Excludes
 
-Multi-context JavaScript execution:
+- Complex state management (cookies, storage)
+- Performance metrics beyond basic timing
+- Accessibility testing
+- Full DevTools protocol exposure
+- Multiple browser contexts
+- Advanced screenshot features
 
-- Page context execution with full DOM access
-- Service worker context execution
-- Web worker context execution
-- Automatic promise resolution
-- Error serialization with stack traces
-
-### Console Collector (REQ-BT-009)
-
-Comprehensive console message collection:
-
-- Hook into all console methods
-- Capture from all execution contexts
-- Structured message format with metadata
-- Filtering by level and source
-
-### State Persistence (REQ-BT-010, REQ-BT-011, REQ-BT-012)
-
-Granular state management for different browser storage mechanisms:
-
-**Cookie Manager (REQ-BT-010)**:
-- Export cookies to JSON format with all attributes
-- Filter cookies by domain or path
-- Handle secure and httpOnly flags
-- Preserve expiration timestamps
-
-**Storage Manager (REQ-BT-011)**:
-- Enumerate all origins with storage data
-- Export localStorage/sessionStorage as key-value pairs
-- Handle storage quota limitations
-- Atomic restore operations per origin
-
-**Cache Manager (REQ-BT-012)**:
-- Export Cache Storage by cache name
-- Serialize cached responses with headers
-- Handle binary data in cached responses
-- Selective cache restoration
-
-### Performance Monitor (REQ-BT-013, REQ-BT-014)
-
-Targeted performance metrics collection:
-
-**Page Load Metrics (REQ-BT-013)**:
-- Navigation start to load event timing
-- First Contentful Paint (FCP) measurement
-- Time to Interactive (TTI) calculation
-- Structured timing data format
-
-**Resource Analysis (REQ-BT-014)**:
-- Filter resources by load duration threshold
-- Capture resource URL, size, and timing
-- Categorize resources by type (script, style, image)
-- Sort by impact on page load
-
-## Error Handling Strategy
-
-All operations follow a consistent error model:
-
-- Typed errors for different failure modes
-- Detailed error context including browser state
-- Automatic retry for transient failures
-- Clear error messages for AI agent consumption
-
-## API Design Principles
-
-1. **Async-First**: All operations return promises
-2. **Timeout Protection**: Configurable timeouts on all operations
-3. **Resource Cleanup**: Automatic cleanup of browser resources
-4. **Incremental Results**: Stream results for long operations
-5. **Idempotent Operations**: Safe to retry on failure
+These exclusions keep the tool focused on solving the concrete PWA testing problems that motivated its creation.
