@@ -109,32 +109,37 @@ export function InputArea({
       // Update debug overlay
       if (debugEl) {
         updateDebugPosition();
-        const footerRect = footer.getBoundingClientRect();
-        const targetBottom = window.innerHeight - (viewport.offsetTop + viewport.height);
+        const mainArea = document.getElementById('main-area');
         debugEl.textContent = [
-          `iter: 5`,
+          `iter: 6`,
           `vpH: ${Math.round(viewport.height)} vpTop: ${Math.round(viewport.offsetTop)}`,
-          `innerH: ${window.innerHeight}`,
-          `targetMoveUp: ${Math.round(targetBottom)}`,
-          `transform: ${footer.style.transform || 'none'}`,
-          `footerRect.bottom: ${Math.round(footerRect.bottom)}`,
+          `mainArea.maxH: ${mainArea?.style.maxHeight || 'none'}`,
+          `mainArea.scrollH: ${mainArea?.scrollHeight}`,
+          `mainArea.clientH: ${mainArea?.clientHeight}`,
         ].join('\n');
       }
       
-      // Position footer at bottom of visual viewport using transform
-      // Only use custom positioning when keyboard is likely open (viewport significantly smaller)
-      if (viewport.height < window.screen.height * 0.7) {
-        // Calculate how much to move the footer up from its default bottom:0 position
-        // Default position is at bottom of layout viewport (innerHeight)
-        // We want it at bottom of visual viewport (vpTop + vpH)
-        const defaultBottom = 0;
-        const targetBottom = window.innerHeight - (viewport.offsetTop + viewport.height);
-        const moveUp = targetBottom - defaultBottom;
+      // When keyboard is open, adjust the main scrollable area to prevent
+      // scrolling into the Safari toolbar gap
+      const mainArea = document.getElementById('main-area');
+      
+      if (viewport.height < window.screen.height * 0.7 && mainArea) {
+        // Keyboard is open
+        // Set max-height on main area to constrain scrolling
+        // The visible area is from vpTop to vpTop+vpH, minus the footer
+        const footerHeight = footer.offsetHeight;
+        const availableHeight = viewport.height - footerHeight;
         
-        footer.style.transform = `translateY(-${moveUp}px)`;
-      } else {
+        // Adjust for any header offset
+        const mainRect = mainArea.getBoundingClientRect();
+        const headerHeight = mainRect.top - viewport.offsetTop;
+        const scrollableHeight = availableHeight - Math.max(0, headerHeight);
+        
+        mainArea.style.maxHeight = `${scrollableHeight}px`;
+        mainArea.style.overflow = 'auto';
+      } else if (mainArea) {
         // Keyboard closed - reset
-        footer.style.transform = '';
+        mainArea.style.maxHeight = '';
       }
     };
 
