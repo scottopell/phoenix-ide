@@ -8,6 +8,7 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
 import { Toast } from '../components/Toast';
+import { ConversationListSkeleton } from '../components/Skeleton';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 
@@ -221,10 +222,15 @@ export function ConversationListPage() {
       </header>
       <main id="main-area">
         {loading ? (
-          <div className="empty-state">
-            <div className="spinner"></div>
-            <p>Loading...</p>
-          </div>
+          <section id="conversation-list" className="view active">
+            <div className="view-header">
+              <h2>Conversations</h2>
+              <div className="view-header-actions">
+                <button className="btn-primary" disabled>+ New</button>
+              </div>
+            </div>
+            <ConversationListSkeleton count={5} />
+          </section>
         ) : (
           <>
             {lastUpdated && (

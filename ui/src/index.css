@@ -716,6 +716,74 @@ pre:hover .copy-btn {
   color: var(--text-secondary);
 }
 
+/* Skeleton loading styles */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-tertiary) 25%,
+    var(--border-color) 50%,
+    var(--bg-tertiary) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.skeleton-text {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeleton-line {
+  display: block;
+}
+
+.skeleton-item {
+  pointer-events: none;
+}
+
+.skeleton-item .conv-item-meta {
+  display: flex;
+  gap: 12px;
+}
+
+.skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeleton-message {
+  pointer-events: none;
+}
+
+.skeleton-message .message-header {
+  display: flex;
+  align-items: center;
+}
+
+.skeleton-messages {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Fade in animation for content after skeleton */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.skeleton-loaded {
+  animation: fadeIn 0.2s ease-out;
+}
+
 /* Input Area */
 #input-area {
   position: fixed;

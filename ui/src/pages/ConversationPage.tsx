@@ -7,6 +7,7 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { MessageList } from '../components/MessageList';
 import { VirtualizedMessageList } from '../components/VirtualizedMessageList';
 import { InputArea } from '../components/InputArea';
+import { MessageListSkeleton } from '../components/Skeleton';
 import { useDraft, useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
 import type { Breadcrumb } from '../types';
@@ -397,10 +398,11 @@ export function ConversationPage() {
         />
         <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
-          <div className="empty-state">
-            <div className="spinner"></div>
-            <p>Loading...</p>
-          </div>
+          <section id="chat-view" className="view active">
+            <div id="messages">
+              <MessageListSkeleton count={4} />
+            </div>
+          </section>
         </main>
       </div>
     );
