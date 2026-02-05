@@ -109,33 +109,16 @@ export function InputArea({
       // Update debug overlay
       if (debugEl) {
         updateDebugPosition();
-        const footerRect = footer.getBoundingClientRect();
-        const targetBottom = window.innerHeight - (viewport.offsetTop + viewport.height);
         debugEl.textContent = [
-          `iter: 5`,
+          `iter: 7`,
           `vpH: ${Math.round(viewport.height)} vpTop: ${Math.round(viewport.offsetTop)}`,
-          `innerH: ${window.innerHeight}`,
-          `targetMoveUp: ${Math.round(targetBottom)}`,
-          `transform: ${footer.style.transform || 'none'}`,
-          `footerRect.bottom: ${Math.round(footerRect.bottom)}`,
+          `window.scrollY: ${Math.round(window.scrollY)}`,
+          `body.scrollTop: ${document.body.scrollTop}`,
+          `html.scrollTop: ${document.documentElement.scrollTop}`,
         ].join('\n');
       }
       
-      // Position footer at bottom of visual viewport using transform
-      // Only use custom positioning when keyboard is likely open (viewport significantly smaller)
-      if (viewport.height < window.screen.height * 0.7) {
-        // Calculate how much to move the footer up from its default bottom:0 position
-        // Default position is at bottom of layout viewport (innerHeight)
-        // We want it at bottom of visual viewport (vpTop + vpH)
-        const defaultBottom = 0;
-        const targetBottom = window.innerHeight - (viewport.offsetTop + viewport.height);
-        const moveUp = targetBottom - defaultBottom;
-        
-        footer.style.transform = `translateY(-${moveUp}px)`;
-      } else {
-        // Keyboard closed - reset
-        footer.style.transform = '';
-      }
+      // Currently just observing - no positioning changes
     };
 
     // Fire immediately to populate debug
