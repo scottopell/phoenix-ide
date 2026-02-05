@@ -75,7 +75,6 @@ export function InputArea({
 
     const handleViewportChange = () => {
       const footer = footerRef.current;
-      const mainArea = document.getElementById('main-area');
       if (!footer) return;
 
       // Calculate the offset from the bottom of the layout viewport
@@ -85,24 +84,9 @@ export function InputArea({
       if (offsetBottom > 0) {
         // Keyboard is open - position input above it
         footer.style.bottom = `${offsetBottom}px`;
-        
-        // Reduce the scrollable area height so content can't scroll behind keyboard
-        // Calculate: visual viewport height - top bars - input area height
-        if (mainArea) {
-          const stateBarHeight = 44; // var(--state-bar-height)
-          const breadcrumbHeight = 32; // var(--breadcrumb-height) 
-          const inputAreaHeight = footer.offsetHeight;
-          const availableHeight = viewport.height - stateBarHeight - breadcrumbHeight - inputAreaHeight;
-          mainArea.style.height = `${availableHeight}px`;
-          mainArea.style.flex = 'none';
-        }
       } else {
         // Keyboard is closed - reset to default
         footer.style.bottom = '0px';
-        if (mainArea) {
-          mainArea.style.height = '';
-          mainArea.style.flex = '';
-        }
       }
     };
 
@@ -112,12 +96,6 @@ export function InputArea({
     return () => {
       viewport.removeEventListener('resize', handleViewportChange);
       viewport.removeEventListener('scroll', handleViewportChange);
-      // Reset on unmount
-      const mainArea = document.getElementById('main-area');
-      if (mainArea) {
-        mainArea.style.height = '';
-        mainArea.style.flex = '';
-      }
     };
   }, []);
 
