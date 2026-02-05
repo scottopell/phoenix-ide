@@ -3,6 +3,7 @@ import { ConversationListPage } from './pages/ConversationListPage';
 import { ConversationPage } from './pages/ConversationPage';
 import { PerformanceDashboard } from './components/PerformanceDashboard';
 import { ServiceWorkerUpdatePrompt } from './components/ServiceWorkerUpdatePrompt';
+import { LayoutDebugOverlay } from './components/LayoutDebugOverlay';
 import './index.css';
 
 function App() {
@@ -14,6 +15,7 @@ function App() {
         <Route path="/c/:slug" element={<ConversationPage />} />
       </Routes>
       <PerformanceDashboard />
+      <LayoutDebugOverlay />
     </BrowserRouter>
   );
 }

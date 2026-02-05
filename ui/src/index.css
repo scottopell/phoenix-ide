@@ -2169,7 +2169,7 @@ html * {
 
 /* Layout Debug Overlay - using absolute within #app since fixed is broken on iOS */
 .layout-debug-overlay {
-  position: absolute;
+  position: fixed;
   top: 60px;
   left: 8px;
   background: rgba(0, 0, 0, 0.9);
