@@ -50,30 +50,45 @@
   --code-bg: #f6f8fa;
 }
 
-html, body {
+html {
   height: 100%;
+  height: 100dvh;
+  overflow: hidden;
+  /* Prevent iOS Safari from scrolling the window when keyboard opens */
+  position: fixed;
+  width: 100%;
+}
+
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  /* Prevent iOS Safari from scrolling the window when keyboard opens */
+  position: fixed;
+  width: 100%;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 16px;
   line-height: 1.5;
   background: var(--bg-primary);
   color: var(--text-primary);
-  overflow: hidden;
+}
+
+#root {
+  height: 100%;
 }
 
 #app {
   display: flex;
   flex-direction: column;
-  height: 100%;
-  max-height: 100vh;
-  max-height: 100dvh;
+  height: 100vh; /* Fallback */
+  height: 100dvh; /* Dynamic viewport height */
+  overflow: hidden;
+  position: relative;
 }
 
 /* State Bar */
 #state-bar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
+  flex: 0 0 auto;
   height: var(--state-bar-height);
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
@@ -81,7 +96,57 @@ html, body {
   align-items: center;
   justify-content: space-between;
   padding: 0 12px;
-  z-index: 100;
+}
+
+/* Minimized State Bar (when keyboard is open) */
+#state-bar.state-bar-minimized {
+  height: 28px;
+  cursor: pointer;
+  padding: 0 8px;
+}
+
+#state-bar.state-bar-minimized:active {
+  background: var(--bg-tertiary);
+}
+
+.state-bar-minimized-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font-size: 12px;
+}
+
+.minimized-back {
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 2px 4px;
+}
+
+.minimized-slug {
+  color: var(--text-primary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.minimized-expand {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.minimize-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+.minimize-btn:hover {
+  color: var(--text-secondary);
 }
 
 #state-indicator {
@@ -144,17 +209,13 @@ html, body {
 
 /* Breadcrumb Bar */
 #breadcrumb-bar {
-  position: fixed;
-  top: var(--state-bar-height);
-  left: 0;
-  right: 0;
+  flex: 0 0 auto;
   height: var(--breadcrumb-height);
   background: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
   overflow-x: auto;
   overflow-y: hidden;
   white-space: nowrap;
-  z-index: 99;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
 }
@@ -204,17 +265,12 @@ html, body {
 
 /* Main Area */
 #main-area {
-  flex: 1;
-  margin-top: calc(var(--state-bar-height) + var(--breadcrumb-height));
-  margin-bottom: var(--input-area-height);
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
-}
-
-/* List page has no bars */
-.list-page #main-area {
-  margin-top: 0;
-  margin-bottom: 0;
+  overscroll-behavior: contain;
 }
 
 /* Views */
@@ -786,15 +842,11 @@ pre:hover .copy-btn {
 
 /* Input Area */
 #input-area {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  flex: 0 0 auto;
   background: var(--bg-secondary);
   border-top: 1px solid var(--border-color);
   padding: 8px 12px;
-  padding-bottom: calc(8px + var(--safe-area-bottom));
-  z-index: 100;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
 }
 
 #input-container {
@@ -1148,11 +1200,7 @@ pre:hover .copy-btn {
 
 /* Offline Banner */
 .offline-banner {
-  position: fixed;
-  top: var(--state-bar-height);
-  left: 0;
-  right: 0;
-  height: var(--offline-banner-height, 36px);
+  flex: 0 0 auto;
   background: var(--accent-red);
   color: white;
   padding: 8px 16px;
@@ -1160,19 +1208,7 @@ pre:hover .copy-btn {
   align-items: center;
   gap: 8px;
   font-size: 14px;
-  z-index: 100;
   animation: slide-down 0.2s ease-out;
-}
-
-/* Adjust breadcrumb position when offline banner is visible */
-.offline-banner + #breadcrumb-bar,
-#app:has(.offline-banner) #breadcrumb-bar {
-  top: calc(var(--state-bar-height) + var(--offline-banner-height, 36px));
-}
-
-/* Adjust main area when offline banner is visible */
-#app:has(.offline-banner) #main-area {
-  margin-top: calc(var(--state-bar-height) + var(--breadcrumb-height) + var(--offline-banner-height, 36px));
 }
 
 @keyframes slide-down {
@@ -1926,24 +1962,16 @@ html * {
 
 /* Status header styles */
 .status-header {
-  position: sticky;
-  top: 0;
-  z-index: 100;
+  flex: 0 0 auto;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
 }
 
-.offline-banner,
 .sync-banner {
   padding: 8px 16px;
   text-align: center;
   font-size: 14px;
   font-weight: 500;
-}
-
-.offline-banner {
-  background: #ff6b6b;
-  color: white;
 }
 
 .sync-banner {
@@ -2094,4 +2122,90 @@ html * {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+/* Settings Modal */
+.settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.setting-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+.setting-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.setting-item input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+/* Settings button */
+.settings-btn {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 6px;
+  transition: background 0.15s;
+  line-height: 1;
+}
+
+.settings-btn:hover {
+  background: var(--bg-tertiary);
+}
+
+/* Layout Debug Overlay - using absolute within #app since fixed is broken on iOS */
+.layout-debug-overlay {
+  position: absolute;
+  top: 60px;
+  left: 8px;
+  background: rgba(0, 0, 0, 0.9);
+  color: #0f0;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 10px;
+  padding: 6px;
+  border-radius: 6px;
+  z-index: 10000;
+  pointer-events: none;
+  max-width: 160px;
+  line-height: 1.2;
+}
+
+.debug-section {
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #333;
+}
+
+.debug-section:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.debug-title {
+  color: #ff0;
+  font-weight: bold;
+  margin-bottom: 2px;
+}
+
+.debug-section.highlight {
+  background: rgba(255, 255, 0, 0.1);
+  padding: 4px;
+  margin: -4px;
+  margin-top: 4px;
+  border-radius: 4px;
 }
