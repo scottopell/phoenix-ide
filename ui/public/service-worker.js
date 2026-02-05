@@ -7,8 +7,7 @@ const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 const STATIC_ASSETS = [
   '/',
   '/index.html',
-  '/assets/index.css',
-  '/assets/index.js',
+  // Note: Vite generates hashed filenames, so we'll cache them dynamically
 ];
 
 // API endpoints to cache
@@ -99,6 +98,15 @@ self.addEventListener('fetch', (event) => {
             const responseToCache = response.clone();
             caches.open(API_CACHE_NAME).then((cache) => {
               cache.put(request, responseToCache);
+              // Store timestamp for cache expiration
+              const cacheMetadata = {
+                url: request.url,
+                timestamp: Date.now()
+              };
+              cache.put(
+                new Request(`${request.url}:metadata`),
+                new Response(JSON.stringify(cacheMetadata))
+              );
             });
           }
           return response;
