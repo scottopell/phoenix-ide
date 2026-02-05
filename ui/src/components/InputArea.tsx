@@ -73,6 +73,28 @@ export function InputArea({
     const viewport = window.visualViewport;
     if (!viewport) return;
 
+    // Create debug overlay
+    let debugEl = document.getElementById('viewport-debug');
+    if (!debugEl) {
+      debugEl = document.createElement('div');
+      debugEl.id = 'viewport-debug';
+      debugEl.style.cssText = `
+        position: fixed;
+        top: 50px;
+        left: 10px;
+        background: rgba(0,0,0,0.85);
+        color: #0f0;
+        padding: 8px;
+        font-family: monospace;
+        font-size: 11px;
+        z-index: 99999;
+        border-radius: 4px;
+        pointer-events: none;
+        white-space: pre;
+      `;
+      document.body.appendChild(debugEl);
+    }
+
     const handleViewportChange = () => {
       const footer = footerRef.current;
       if (!footer) return;
@@ -80,6 +102,19 @@ export function InputArea({
       // Calculate the offset from the bottom of the layout viewport
       // to the bottom of the visual viewport (keyboard height)
       const offsetBottom = window.innerHeight - viewport.height - viewport.offsetTop;
+      
+      // Update debug overlay
+      if (debugEl) {
+        const mainArea = document.getElementById('main-area');
+        debugEl.textContent = [
+          `innerHeight: ${window.innerHeight}`,
+          `vp.height: ${Math.round(viewport.height)}`,
+          `vp.offsetTop: ${Math.round(viewport.offsetTop)}`,
+          `offsetBottom: ${Math.round(offsetBottom)}`,
+          `footer.bottom: ${footer.style.bottom || '0px'}`,
+          `mainArea scroll: ${mainArea?.scrollHeight}/${mainArea?.clientHeight}`,
+        ].join('\n');
+      }
       
       if (offsetBottom > 0) {
         // Keyboard is open - position input above it
@@ -89,6 +124,9 @@ export function InputArea({
         footer.style.bottom = '0px';
       }
     };
+
+    // Fire immediately to populate debug
+    handleViewportChange();
 
     viewport.addEventListener('resize', handleViewportChange);
     viewport.addEventListener('scroll', handleViewportChange);
