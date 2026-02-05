@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
-import { escapeHtml, renderMarkdown } from '../utils';
+import { escapeHtml, renderMarkdown, formatRelativeTime } from '../utils';
+import { CopyButton } from './CopyButton';
 
 interface MessageListProps {
   messages: Message[];
@@ -79,15 +80,33 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
   );
 }
 
+function formatMessageTime(isoStr: string): string {
+  if (!isoStr) return '';
+  const date = new Date(isoStr);
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+  
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
 function UserMessage({ message }: { message: Message }) {
   const content = message.content as { text?: string; images?: { data: string; media_type: string }[] };
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
+  const timestamp = message.created_at;
 
   return (
     <div className="message user">
       <div className="message-header">
-        <span>You</span>
+        <span className="message-sender">You</span>
+        {timestamp && (
+          <span className="message-time" title={new Date(timestamp).toLocaleString()}>
+            {formatMessageTime(timestamp)}
+          </span>
+        )}
         <span className="message-status sent" title="Sent">✓</span>
       </div>
       <div className="message-content">
@@ -146,10 +165,18 @@ function AgentMessage({
   toolResults: Map<string, Message>;
 }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+  const timestamp = message.created_at;
 
   return (
     <div className="message agent">
-      <div className="message-header">Phoenix</div>
+      <div className="message-header">
+        <span className="message-sender">Phoenix</span>
+        {timestamp && (
+          <span className="message-time" title={new Date(timestamp).toLocaleString()}>
+            {formatMessageTime(timestamp)}
+          </span>
+        )}
+      </div>
       <div className="message-content">
         {blocks.map((block, i) => {
           if (block.type === 'text') {
@@ -175,21 +202,52 @@ function AgentMessage({
   );
 }
 
+// Thresholds for auto-expanding output
+const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
+const OUTPUT_PREVIEW_THRESHOLD = 500;      // Show preview if under this
+
+function formatToolInput(name: string, input: Record<string, unknown>): { display: string; isMultiline: boolean } {
+  switch (name) {
+    case 'bash': {
+      const cmd = String(input.command || '');
+      return { display: `$ ${cmd}`, isMultiline: cmd.includes('\n') };
+    }
+    case 'think': {
+      const thoughts = String(input.thoughts || '');
+      return { display: thoughts, isMultiline: thoughts.includes('\n') };
+    }
+    case 'patch': {
+      const path = String(input.path || '');
+      const patches = input.patches as Array<{ operation?: string }> | undefined;
+      const op = patches?.[0]?.operation || 'modify';
+      const count = patches?.length || 1;
+      const summary = count > 1 ? `${path}: ${count} patches` : `${path}: ${op}`;
+      return { display: summary, isMultiline: false };
+    }
+    case 'keyword_search': {
+      const query = String(input.query || '');
+      const terms = (input.search_terms as string[]) || [];
+      const termsStr = terms.length > 0 ? terms.slice(0, 3).join(', ') + (terms.length > 3 ? '...' : '') : '';
+      return { display: termsStr ? `"${query}" [${termsStr}]` : query, isMultiline: false };
+    }
+    case 'read_image': {
+      const path = String(input.path || '');
+      return { display: path, isMultiline: false };
+    }
+    default: {
+      const str = JSON.stringify(input, null, 2);
+      return { display: str, isMultiline: str.includes('\n') };
+    }
+  }
+}
+
 function ToolUseBlock({ block, result }: { block: ContentBlock; result?: Message }) {
-  const [expanded, setExpanded] = useState(false);
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
 
-  // Special handling for common tools
-  let inputStr: string;
-  if (name === 'bash' && input.command) {
-    inputStr = String(input.command);
-  } else if (name === 'think' && input.thoughts) {
-    inputStr = String(input.thoughts);
-  } else {
-    inputStr = JSON.stringify(input, null, 2);
-  }
+  // Format the input display based on tool type
+  const { display: inputDisplay, isMultiline: inputIsMultiline } = formatToolInput(name, input as Record<string, unknown>);
 
   // Get the paired result if available
   let resultContent: ToolResultContent | null = null;
@@ -199,32 +257,82 @@ function ToolUseBlock({ block, result }: { block: ContentBlock; result?: Message
 
   const resultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
   const isError = resultContent?.is_error || !!resultContent?.error;
+  const resultLength = resultText.length;
 
-  // Truncate long results
-  const maxLen = 500;
-  const truncated = resultText.length > maxLen;
-  const displayResult = truncated ? resultText.slice(0, maxLen) + '...' : resultText;
+  // Determine if output should be auto-expanded
+  const shouldAutoExpand = resultLength > 0 && resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
+  const [outputExpanded, setOutputExpanded] = useState(shouldAutoExpand);
+
+  // For display, truncate very long outputs even when expanded
+  const maxDisplayLen = 5000;
+  const displayResult = resultText.length > maxDisplayLen 
+    ? resultText.slice(0, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
+    : resultText;
+
+  // Preview for collapsed state
+  const previewLen = 100;
+  const previewText = resultText.length > previewLen 
+    ? resultText.slice(0, previewLen).split('\n')[0] + '...'
+    : resultText.split('\n')[0];
+
+  const hasOutput = resultContent !== null;
+  const isShortOutput = resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
+
+  // Get the raw input for copying (not the formatted display)
+  const rawInput = name === 'bash' ? String(input.command || '') : 
+                   name === 'think' ? String(input.thoughts || '') :
+                   JSON.stringify(input, null, 2);
 
   return (
-    <div className={`tool-group${expanded ? ' expanded' : ''}`} data-tool-id={toolId}>
-      <div className="tool-header" onClick={() => setExpanded(!expanded)}>
-        <span className="tool-name">{name}</span>
-        <span className="tool-chevron">▶</span>
-      </div>
-      <div className="tool-body">
-        <div className="tool-input">{inputStr}</div>
-        {resultContent && (
-          <div className={`tool-result-section${isError ? ' error' : ''}`}>
-            <div className="tool-result-label">
-              {isError ? '✗ error' : '✓ result'}
-              {truncated && <span className="tool-truncated"> (truncated)</span>}
-            </div>
-            <div className="tool-result-content">
-              {displayResult || <span className="tool-empty">(empty)</span>}
-            </div>
-          </div>
+    <div className="tool-block" data-tool-id={toolId}>
+      {/* Tool header with name */}
+      <div className="tool-block-header">
+        <span className="tool-block-name">{name}</span>
+        {hasOutput && (
+          <span className={`tool-block-status ${isError ? 'error' : 'success'}`}>
+            {isError ? '✗' : '✓'}
+          </span>
         )}
       </div>
+
+      {/* Tool input - always visible */}
+      <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
+        {inputDisplay}
+        <CopyButton text={rawInput} title="Copy command" />
+      </div>
+
+      {/* Tool output - collapsible for long outputs */}
+      {hasOutput && (
+        <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
+          {isShortOutput ? (
+            // Short output: show inline, no collapse
+            <div className="tool-block-output-content">
+              {displayResult || <span className="tool-empty">(empty)</span>}
+              {resultText && <CopyButton text={resultText} title="Copy output" />}
+            </div>
+          ) : (
+            // Long output: collapsible
+            <>
+              <div 
+                className="tool-block-output-header" 
+                onClick={() => setOutputExpanded(!outputExpanded)}
+              >
+                <span className="tool-block-output-chevron">{outputExpanded ? '▼' : '▶'}</span>
+                <span className="tool-block-output-label">
+                  {outputExpanded ? 'output' : previewText}
+                </span>
+                <span className="tool-block-output-size">({resultLength.toLocaleString()} chars)</span>
+                <CopyButton text={resultText} title="Copy output" />
+              </div>
+              {outputExpanded && (
+                <div className="tool-block-output-content">
+                  {displayResult}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -339,11 +339,30 @@ html, body {
 }
 
 .message-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
   color: var(--text-muted);
   margin-bottom: 8px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+.message-sender {
+  font-weight: 600;
+}
+
+.message-time {
+  font-weight: normal;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+.message-status {
+  margin-left: auto;
 }
 
 .message-content {
@@ -381,6 +400,226 @@ html, body {
 }
 
 /* Tool Groups - visually pairs tool call with result */
+/* New tool block styles - input always visible, output collapsible */
+.tool-block {
+  margin: 12px 0;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+
+.tool-block-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.tool-block-name {
+  color: var(--accent-purple);
+  font-weight: 600;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+}
+
+.tool-block-status {
+  margin-left: auto;
+  font-size: 14px;
+}
+
+.tool-block-status.success {
+  color: var(--accent-green);
+}
+
+.tool-block-status.error {
+  color: var(--accent-red);
+}
+
+/* Tool input - always visible */
+.tool-block-input {
+  padding: 10px 12px;
+  background: var(--code-bg);
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.4;
+}
+
+.tool-block-input.multiline {
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+/* Tool output section */
+.tool-block-output {
+  border-top: 1px solid var(--border-color);
+}
+
+.tool-block-output.error {
+  border-left: 3px solid var(--accent-red);
+}
+
+.tool-block-output:not(.error) {
+  border-left: 3px solid var(--accent-green);
+}
+
+/* Collapsible output header */
+.tool-block-output-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+}
+
+.tool-block-output-header:hover {
+  background: var(--bg-tertiary);
+}
+
+.tool-block-output-chevron {
+  color: var(--text-muted);
+  font-size: 10px;
+  width: 12px;
+  flex-shrink: 0;
+}
+
+.tool-block-output-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+}
+
+.tool-block-output-size {
+  color: var(--text-muted);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+/* Output content */
+.tool-block-output-content {
+  padding: 10px 12px;
+  background: var(--bg-primary);
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+  max-height: 300px;
+  overflow-y: auto;
+  line-height: 1.4;
+}
+
+/* Short output (no collapse header) */
+.tool-block-output:not(.expanded) .tool-block-output-content {
+  padding: 8px 12px;
+}
+
+.tool-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Copy button */
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.copy-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.copy-btn.copied {
+  color: var(--accent-green);
+}
+
+/* Copy button positioning in tool blocks */
+.tool-block-header {
+  position: relative;
+}
+
+.tool-block-header .copy-btn {
+  margin-left: auto;
+  margin-right: 4px;
+}
+
+.tool-block-input {
+  position: relative;
+}
+
+.tool-block-input .copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.tool-block-input:hover .copy-btn {
+  opacity: 1;
+}
+
+.tool-block-output-header .copy-btn {
+  margin-left: auto;
+}
+
+.tool-block-output-content {
+  position: relative;
+}
+
+.tool-block-output-content .copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.tool-block-output-content:hover .copy-btn {
+  opacity: 1;
+}
+
+/* Code block copy button */
+pre {
+  position: relative;
+}
+
+pre .copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+pre:hover .copy-btn {
+  opacity: 1;
+}
+
+/* Legacy styles kept for backward compatibility */
 .tool-group {
   margin: 12px 0;
   border: 1px solid var(--border-color);
@@ -475,11 +714,6 @@ html, body {
   max-height: 200px;
   overflow-y: auto;
   color: var(--text-secondary);
-}
-
-.tool-empty {
-  color: var(--text-muted);
-  font-style: italic;
 }
 
 /* Input Area */
