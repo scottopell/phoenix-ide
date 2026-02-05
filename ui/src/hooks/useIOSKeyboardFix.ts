@@ -14,6 +14,8 @@ import { useEffect, useRef, useCallback } from 'react';
 export function useIOSKeyboardFix() {
   const isIOSRef = useRef<boolean | null>(null);
   const originalHeightRef = useRef<string | null>(null);
+  const lastVVHeight = useRef<number>(0);
+
   const debugLog = (msg: string, data?: unknown) => {
     if (typeof window !== 'undefined' && (window as { __iosKbDebug?: boolean }).__iosKbDebug) {
       console.log(`[iOS-KB] ${msg}`, data ?? '');
@@ -48,6 +50,16 @@ export function useIOSKeyboardFix() {
         window.scrollTo(0, 0);
         debugLog('Reset window scroll');
       }
+
+      // Also scroll the focused input into view within the #app container
+      // This helps if the main-area needs to scroll to show the input
+      const activeEl = document.activeElement;
+      if (activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement) {
+        // Small delay to let layout settle
+        setTimeout(() => {
+          activeEl.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+        }, 50);
+      }
     } else {
       // Keyboard closed - reset to CSS default
       if (app.style.height) {
@@ -55,6 +67,8 @@ export function useIOSKeyboardFix() {
         debugLog('Reset #app height to CSS default');
       }
     }
+
+    lastVVHeight.current = vv.height;
   }, []);
 
   useEffect(() => {
@@ -80,19 +94,31 @@ export function useIOSKeyboardFix() {
     }
 
     debugLog('Setting up listeners');
+    lastVVHeight.current = vv.height;
 
     // Listen for visualViewport resize
     vv.addEventListener('resize', updateAppHeight);
     vv.addEventListener('scroll', updateAppHeight);
 
-    // Also handle window scroll to keep it at 0
+    // Also handle window scroll to keep it at 0 when keyboard is open
     const handleScroll = () => {
-      const keyboardHeight = vv.height < window.innerHeight - 100;
-      if (keyboardHeight && window.scrollY !== 0) {
+      const keyboardOpen = vv.height < window.innerHeight - 100;
+      if (keyboardOpen && window.scrollY !== 0) {
         window.scrollTo(0, 0);
       }
     };
     window.addEventListener('scroll', handleScroll, { passive: true });
+
+    // Handle focus events to trigger layout update when input is focused
+    const handleFocusIn = (e: FocusEvent) => {
+      const target = e.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+        // Delay to let iOS finish its scroll/resize
+        setTimeout(updateAppHeight, 100);
+        setTimeout(updateAppHeight, 300);
+      }
+    };
+    document.addEventListener('focusin', handleFocusIn);
 
     // Initial check
     updateAppHeight();
@@ -102,6 +128,7 @@ export function useIOSKeyboardFix() {
       vv.removeEventListener('resize', updateAppHeight);
       vv.removeEventListener('scroll', updateAppHeight);
       window.removeEventListener('scroll', handleScroll);
+      document.removeEventListener('focusin', handleFocusIn);
       
       // Reset height on cleanup
       if (app) {
