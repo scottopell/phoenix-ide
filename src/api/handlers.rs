@@ -444,7 +444,10 @@ struct PathQuery {
 }
 
 async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdResponse> {
-    let path = PathBuf::from(&query.path);
+    // Normalize path: remove trailing slashes (except for root)
+    let path_str = query.path.trim_end_matches('/');
+    let path_str = if path_str.is_empty() { "/" } else { path_str };
+    let path = PathBuf::from(path_str);
 
     if !path.exists() {
         return Json(ValidateCwdResponse {
@@ -469,7 +472,10 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
 async fn list_directory(
     Query(query): Query<PathQuery>,
 ) -> Result<Json<ListDirectoryResponse>, AppError> {
-    let path = PathBuf::from(&query.path);
+    // Normalize path: remove trailing slashes (except for root)
+    let path_str = query.path.trim_end_matches('/');
+    let path_str = if path_str.is_empty() { "/" } else { path_str };
+    let path = PathBuf::from(path_str);
 
     let entries = fs::read_dir(&path)
         .map_err(|e| AppError::BadRequest(format!("Cannot read directory: {e}")))?;
@@ -495,7 +501,10 @@ async fn list_directory(
 
 /// Create a directory (with parents if needed)
 async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
-    let path = PathBuf::from(&payload.path);
+    // Normalize path: remove trailing slashes (except for root)
+    let path_str = payload.path.trim_end_matches('/');
+    let path_str = if path_str.is_empty() { "/" } else { path_str };
+    let path = PathBuf::from(path_str);
 
     // Security: ensure path is absolute and under allowed roots
     if !path.is_absolute() {
