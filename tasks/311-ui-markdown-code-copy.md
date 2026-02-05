@@ -1,7 +1,7 @@
 ---
 created: 2026-02-05
 priority: p3
-status: ready
+status: done
 ---
 
 # Add Copy Button to Code Blocks

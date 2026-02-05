@@ -1,7 +1,7 @@
 ---
 created: 2026-02-05
 priority: p4
-status: ready
+status: done
 ---
 
 # Add Timestamps to Messages

@@ -1,7 +1,7 @@
 ---
 created: 2026-02-05
 priority: p2
-status: ready
+status: done
 ---
 
 # Redesign Tool Block Display: Inline Calls, Collapsed Output
