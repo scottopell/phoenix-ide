@@ -22,7 +22,7 @@ THE SYSTEM SHALL provide the specific error type (network, DNS, timeout, 404, 50
 WHEN checking a page with service workers
 THE SYSTEM SHALL report if a service worker is registered, active, and controlling the page
 
-**Rationale:** AI agents testing PWAs cannot verify the most basic requirement (SW registration) without this. This blocked service worker testing completely.
+**Rationale:** AI agents testing PWAs need to verify service worker registration as the foundational requirement for offline functionality. Without service worker state visibility, the agent has no way to confirm the PWA is properly configured.
 
 ---
 
@@ -31,7 +31,7 @@ THE SYSTEM SHALL report if a service worker is registered, active, and controlli
 WHEN network requests complete
 THE SYSTEM SHALL indicate if each request was served from network, service worker, or browser cache
 
-**Rationale:** AI agents cannot verify caching strategies work correctly without knowing where responses came from. This is the difference between a working and broken offline app.
+**Rationale:** AI agents verifying caching strategies need to know where each response originated. The difference between network and cache sources determines whether offline functionality will work.
 
 ---
 
@@ -42,7 +42,7 @@ THE SYSTEM SHALL block network requests on demand to simulate offline conditions
 WHEN offline
 THE SYSTEM SHALL allow the page to continue using cached resources
 
-**Rationale:** AI agents need to test offline functionality without disconnecting the entire VM's network. Manual offline testing doesn't scale.
+**Rationale:** AI agents need to test offline functionality in isolation from the host VM's network connection. Testing offline behavior requires controlled network conditions.
 
 ---
 
@@ -53,7 +53,7 @@ THE SYSTEM SHALL capture console messages from all contexts including service wo
 WHEN displaying messages
 THE SYSTEM SHALL indicate which context (page, service worker) produced each message
 
-**Rationale:** AI agents debugging service worker issues are blind without console output from worker contexts. Page-only logs miss critical error messages.
+**Rationale:** AI agents debugging service worker issues need visibility into worker-context logs. Service worker errors and status messages only appear in worker console output.
 
 ---
 
@@ -72,4 +72,4 @@ THE SYSTEM SHALL return the error message and stack trace
 
 THE SYSTEM SHALL capture screenshots of the current viewport
 
-**Rationale:** AI agents need visual verification when testing UI changes or debugging layout issues that can't be detected through DOM inspection alone.
+**Rationale:** AI agents need visual verification when testing UI changes or debugging layout issues where DOM inspection alone provides insufficient information.
