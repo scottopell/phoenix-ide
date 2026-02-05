@@ -2,8 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { enhancedApi } from '../enhancedApi';
 import { Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
-import { StateBar } from '../components/StateBar';
-import { BreadcrumbBar } from '../components/BreadcrumbBar';
+// Header removed - navigation and status moved to input area
 import { MessageList } from '../components/MessageList';
 import { VirtualizedMessageList } from '../components/VirtualizedMessageList';
 import { InputArea } from '../components/InputArea';
@@ -361,16 +360,6 @@ export function ConversationPage() {
   if (error) {
     return (
       <div id="app">
-        <StateBar
-          conversation={null}
-          convState="error"
-          stateData={null}
-          connectionState="disconnected"
-          connectionAttempt={0}
-          nextRetryIn={null}
-          contextWindowUsed={0}
-        />
-        <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
           <div className="empty-state">
             <div className="empty-state-icon">❌</div>
@@ -387,16 +376,6 @@ export function ConversationPage() {
   if (!conversation) {
     return (
       <div id="app">
-        <StateBar
-          conversation={null}
-          convState="idle"
-          stateData={null}
-          connectionState="connecting"
-          connectionAttempt={0}
-          nextRetryIn={null}
-          contextWindowUsed={0}
-        />
-        <BreadcrumbBar breadcrumbs={[]} visible={false} />
         <main id="main-area">
           <section id="chat-view" className="view active">
             <div id="messages">
@@ -413,27 +392,6 @@ export function ConversationPage() {
 
   return (
     <div id="app">
-      {/* Offline/Sync status banner */}
-      {(!isOnline || showSyncStatus) && (
-        <div className="status-header">
-          {!isOnline && (
-            <div className="offline-banner">
-              <span className="offline-icon">⚡</span>
-              Offline Mode - Messages will send when connection returns
-            </div>
-          )}
-        </div>
-      )}
-      <StateBar
-        conversation={conversation}
-        convState={convState}
-        stateData={stateData}
-        connectionState={connectionInfo.state}
-        connectionAttempt={connectionInfo.attempt}
-        nextRetryIn={connectionInfo.nextRetryIn}
-        contextWindowUsed={contextWindowUsed}
-      />
-      <BreadcrumbBar breadcrumbs={breadcrumbs} visible={true} />
       {/* Data source indicator for debugging - only in development */}
       {import.meta.env.DEV && lastDataSource && initialLoadComplete && (
         <div className="data-source-indicator">
@@ -471,6 +429,8 @@ export function ConversationPage() {
         onSend={handleSend}
         onCancel={handleCancel}
         onRetry={handleRetry}
+        conversationSlug={conversation.slug}
+        convState={convState}
       />
     </div>
   );

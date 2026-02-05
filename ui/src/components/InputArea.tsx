@@ -1,4 +1,5 @@
 import { useRef, useEffect, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { useNavigate } from 'react-router-dom';
 import type { QueuedMessage } from '../hooks';
 import type { ImageData } from '../api';
 import { ImageAttachments } from './ImageAttachments';
@@ -19,6 +20,8 @@ interface InputAreaProps {
   onSend: (text: string, images: ImageData[]) => void;
   onCancel: () => void;
   onRetry: (localId: string) => void;
+  conversationSlug?: string;
+  convState?: string;
 }
 
 async function fileToBase64(file: File): Promise<ImageData> {
@@ -51,7 +54,10 @@ export function InputArea({
   onSend,
   onCancel,
   onRetry,
+  conversationSlug,
+  convState,
 }: InputAreaProps) {
+  const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const footerRef = useRef<HTMLElement>(null);
@@ -171,8 +177,34 @@ export function InputArea({
   const hasContent = draft.trim().length > 0 || images.length > 0;
   const sendEnabled = (canSend || isOffline) && hasContent;
 
+  // Status indicator
+  const getStatusIndicator = () => {
+    if (isOffline) return { dot: 'offline', text: 'Offline' };
+    if (agentWorking) return { dot: 'working', text: convState || 'Working...' };
+    return { dot: 'idle', text: 'Ready' };
+  };
+  const status = getStatusIndicator();
+
   return (
     <footer id="input-area" ref={footerRef}>
+      {/* Navigation and status row */}
+      <div className="input-header">
+        <button 
+          className="back-btn" 
+          onClick={() => navigate('/')}
+          aria-label="Back to conversations"
+        >
+          ← Back
+        </button>
+        {conversationSlug && (
+          <span className="conv-title">{conversationSlug}</span>
+        )}
+        <div className="status-compact">
+          <span className={`dot ${status.dot}`} />
+          <span className="status-text">{status.text}</span>
+        </div>
+      </div>
+
       {failedMessages.length > 0 && (
         <div className="failed-messages">
           {failedMessages.map(msg => (
