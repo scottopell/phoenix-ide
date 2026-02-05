@@ -1,5 +1,5 @@
 // service-worker.js
-const CACHE_NAME = 'phoenix-ide-v6';
+const CACHE_NAME = 'phoenix-ide-v5';
 const API_CACHE_NAME = 'phoenix-api-v1';
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
