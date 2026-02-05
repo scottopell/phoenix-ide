@@ -113,22 +113,57 @@ THE SYSTEM SHALL include timestamp, level, source context, and message content
 
 ---
 
-### REQ-BT-010: Save and Restore Browser State
+### REQ-BT-010: Save and Restore Cookies
 
-THE SYSTEM SHALL save complete browser state including cookies, storage, and service workers
+THE SYSTEM SHALL export all browser cookies to a portable format
 
-WHEN restoring state
-THE SYSTEM SHALL return the browser to the exact saved condition
+WHEN restoring cookies
+THE SYSTEM SHALL set all cookies with their original domains, paths, and expiration dates
 
-**Rationale:** AI agents need to reproduce specific test scenarios and debug intermittent issues.
+**Rationale:** AI agents need to reproduce authentication states and user sessions for testing.
 
 ---
 
-### REQ-BT-011: Monitor Performance Metrics
+### REQ-BT-011: Save and Restore Local Storage
 
-THE SYSTEM SHALL provide page load timing, resource timing, and web vitals metrics
+THE SYSTEM SHALL export all localStorage and sessionStorage data by origin
 
-WHEN analyzing performance
-THE SYSTEM SHALL identify slow resources and performance bottlenecks
+WHEN restoring storage
+THE SYSTEM SHALL populate localStorage and sessionStorage with the saved key-value pairs
 
-**Rationale:** AI agents need to ensure changes don't degrade performance.
+**Rationale:** AI agents need to preserve application state stored in browser storage for test scenarios.
+
+---
+
+### REQ-BT-012: Export and Import Cache Contents
+
+THE SYSTEM SHALL export Cache Storage contents including cached URLs and response data
+
+WHEN importing cache contents
+THE SYSTEM SHALL populate the Cache Storage with the saved entries
+
+**Rationale:** AI agents need to test offline scenarios with pre-populated caches.
+
+---
+
+### REQ-BT-013: Measure Page Load Performance
+
+WHEN a page finishes loading
+THE SYSTEM SHALL report the time from navigation start to load event in milliseconds
+
+WHEN measuring performance
+THE SYSTEM SHALL also report time to first contentful paint and time to interactive
+
+**Rationale:** AI agents need to detect performance regressions by comparing load times across changes.
+
+---
+
+### REQ-BT-014: Identify Slow Resources
+
+WHEN analyzing page resources
+THE SYSTEM SHALL list all resources that took longer than 500ms to load
+
+WHEN reporting slow resources
+THE SYSTEM SHALL include the resource URL, size, and actual load time
+
+**Rationale:** AI agents need to identify performance bottlenecks to guide optimization efforts.

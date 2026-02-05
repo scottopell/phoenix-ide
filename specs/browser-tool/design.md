@@ -92,23 +92,43 @@ Comprehensive console message collection:
 - Structured message format with metadata
 - Filtering by level and source
 
-### State Manager (REQ-BT-010)
+### State Persistence (REQ-BT-010, REQ-BT-011, REQ-BT-012)
 
-Complete browser state persistence:
+Granular state management for different browser storage mechanisms:
 
-- Serialize all storage mechanisms
-- Export/import service worker registrations
-- Cookie jar serialization
-- Atomic state restoration
+**Cookie Manager (REQ-BT-010)**:
+- Export cookies to JSON format with all attributes
+- Filter cookies by domain or path
+- Handle secure and httpOnly flags
+- Preserve expiration timestamps
 
-### Performance Monitor (REQ-BT-011)
+**Storage Manager (REQ-BT-011)**:
+- Enumerate all origins with storage data
+- Export localStorage/sessionStorage as key-value pairs
+- Handle storage quota limitations
+- Atomic restore operations per origin
 
-Performance metrics collection:
+**Cache Manager (REQ-BT-012)**:
+- Export Cache Storage by cache name
+- Serialize cached responses with headers
+- Handle binary data in cached responses
+- Selective cache restoration
 
-- Navigation Timing API data
-- Resource Timing for all assets
-- Web Vitals calculation (LCP, FID, CLS)
-- Custom metric collection
+### Performance Monitor (REQ-BT-013, REQ-BT-014)
+
+Targeted performance metrics collection:
+
+**Page Load Metrics (REQ-BT-013)**:
+- Navigation start to load event timing
+- First Contentful Paint (FCP) measurement
+- Time to Interactive (TTI) calculation
+- Structured timing data format
+
+**Resource Analysis (REQ-BT-014)**:
+- Filter resources by load duration threshold
+- Capture resource URL, size, and timing
+- Categorize resources by type (script, style, image)
+- Sort by impact on page load
 
 ## Error Handling Strategy
 
