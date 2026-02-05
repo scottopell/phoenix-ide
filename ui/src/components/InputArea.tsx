@@ -110,7 +110,7 @@ export function InputArea({
       if (debugEl) {
         updateDebugPosition();
         debugEl.textContent = [
-          `iter: 7`,
+          `iter: 8`,
           `vpH: ${Math.round(viewport.height)} vpTop: ${Math.round(viewport.offsetTop)}`,
           `window.scrollY: ${Math.round(window.scrollY)}`,
           `body.scrollTop: ${document.body.scrollTop}`,
@@ -118,7 +118,13 @@ export function InputArea({
         ].join('\n');
       }
       
-      // Currently just observing - no positioning changes
+      // Force page scroll back to 0 to prevent iOS keyboard scroll bug
+      if (window.scrollY !== 0) {
+        window.scrollTo(0, 0);
+      }
+      if (document.documentElement.scrollTop !== 0) {
+        document.documentElement.scrollTop = 0;
+      }
     };
 
     // Fire immediately to populate debug
