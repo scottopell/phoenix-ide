@@ -5,9 +5,10 @@ interface SkeletonProps {
   height?: string | number;
   borderRadius?: string | number;
   className?: string;
+  style?: React.CSSProperties;
 }
 
-export function Skeleton({ width, height, borderRadius = 4, className = '' }: SkeletonProps) {
+export function Skeleton({ width, height, borderRadius = 4, className = '', style }: SkeletonProps) {
   return (
     <div
       className={`skeleton ${className}`}
@@ -15,6 +16,7 @@ export function Skeleton({ width, height, borderRadius = 4, className = '' }: Sk
         width: typeof width === 'number' ? `${width}px` : width,
         height: typeof height === 'number' ? `${height}px` : height,
         borderRadius: typeof borderRadius === 'number' ? `${borderRadius}px` : borderRadius,
+        ...style,
       }}
     />
   );

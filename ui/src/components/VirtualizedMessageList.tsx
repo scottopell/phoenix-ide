@@ -1,9 +1,30 @@
 // VirtualizedMessageList.tsx
+// Uses react-window for efficient rendering of large conversation histories.
+// For message rendering components, see MessageComponents.tsx
+
 import { useEffect, useRef, useState, useCallback, useMemo, CSSProperties } from 'react';
 import { VariableSizeList } from 'react-window';
-import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
+import type { Message, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
-import { escapeHtml, renderMarkdown } from '../utils';
+import {
+  UserMessage,
+  QueuedUserMessage,
+  AgentMessage,
+  SubAgentStatus,
+} from './MessageComponents';
+
+// Types for the item data passed through react-window
+interface ItemType {
+  type: 'message' | 'queued' | 'subagent';
+  data: Message | QueuedMessage | ConversationState;
+}
+
+interface RowData {
+  items: ItemType[];
+  toolResults: Map<string, Message>;
+  onRetry: (localId: string) => void;
+  setItemHeight: (index: number, height: number) => void;
+}
 
 // Define proper types for react-window
 interface ListChildComponentProps {
@@ -20,15 +41,40 @@ interface MessageListProps {
   onRetry: (localId: string) => void;
 }
 
-interface RowData {
-  messages: Message[];
-  queuedMessages: QueuedMessage[];
-  convState: string;
-  stateData: ConversationState | null;
-  toolResults: Map<string, Message>;
-  onRetry: (localId: string) => void;
-  getItemHeight: (index: number) => number;
-  setItemHeight: (index: number, height: number) => void;
+// Row component extracted to avoid hooks-in-conditional issue
+function RowRenderer({ index, style, data }: ListChildComponentProps) {
+  const item = data.items[index];
+  const rowRef = useRef<HTMLDivElement>(null);
+  
+  // Measure height after render
+  useEffect(() => {
+    if (rowRef.current) {
+      const height = rowRef.current.getBoundingClientRect().height;
+      data.setItemHeight(index, height);
+    }
+  });
+
+  if (!item) return null;
+
+  return (
+    <div ref={rowRef} style={style}>
+      {item.type === 'message' && (() => {
+        const msg = item.data as Message;
+        const msgType = msg.message_type || msg.type;
+        return msgType === 'user' ? (
+          <UserMessage message={msg} />
+        ) : (
+          <AgentMessage message={msg} toolResults={data.toolResults} />
+        );
+      })()}
+      {item.type === 'queued' && (
+        <QueuedUserMessage message={item.data as QueuedMessage} onRetry={data.onRetry} />
+      )}
+      {item.type === 'subagent' && (
+        <SubAgentStatus stateData={item.data as ConversationState} />
+      )}
+    </div>
+  );
 }
 
 export function VirtualizedMessageList({ messages, queuedMessages, convState, stateData, onRetry }: MessageListProps) {
@@ -71,7 +117,7 @@ export function VirtualizedMessageList({ messages, queuedMessages, convState, st
 
   // Combine all items to render
   const items = useMemo(() => {
-    const result: Array<{ type: 'message' | 'queued' | 'subagent', data: any }> = [];
+    const result: ItemType[] = [];
     
     // Add regular messages (skip tool messages)
     for (const msg of messages) {
@@ -149,50 +195,10 @@ export function VirtualizedMessageList({ messages, queuedMessages, convState, st
     }
   }, []);
 
-  // Row renderer
-  const Row = ({ index, style, data }: ListChildComponentProps) => {
-    const item = items[index];
-    if (!item) return null;
-
-    const rowRef = useRef<HTMLDivElement>(null);
-    
-    // Measure height after render
-    useEffect(() => {
-      if (rowRef.current) {
-        const height = rowRef.current.getBoundingClientRect().height;
-        data.setItemHeight(index, height);
-      }
-    });
-
-    return (
-      <div ref={rowRef} style={style}>
-        {item.type === 'message' && (
-          <>  
-            {item.data.message_type === 'user' || item.data.type === 'user' ? (
-              <UserMessage message={item.data} />
-            ) : (
-              <AgentMessage message={item.data} toolResults={data.toolResults} />
-            )}
-          </>
-        )}
-        {item.type === 'queued' && (
-          <QueuedUserMessage message={item.data} onRetry={data.onRetry} />
-        )}
-        {item.type === 'subagent' && (
-          <SubAgentStatus stateData={item.data} />
-        )}
-      </div>
-    );
-  };
-
   const itemData: RowData = {
-    messages,
-    queuedMessages: sendingMessages,
-    convState,
-    stateData,
+    items,
     toolResults,
     onRetry,
-    getItemHeight,
     setItemHeight,
   };
 
@@ -227,196 +233,10 @@ export function VirtualizedMessageList({ messages, queuedMessages, convState, st
               scrollPositionRef.current = scrollOffset;
             }}
           >
-            {Row}
+            {RowRenderer}
           </VariableSizeList>
         </div>
       </section>
     </main>
-  );
-}
-
-// Reuse the existing message components from MessageList.tsx
-function UserMessage({ message }: { message: Message }) {
-  const content = message.content as { text?: string; images?: { data: string; media_type: string }[] };
-  const text = content.text || (typeof message.content === 'string' ? message.content : '');
-  const images = content.images || [];
-
-  return (
-    <div className="message user">
-      <div className="message-header">
-        <span>You</span>
-        <span className="message-status sent" title="Sent">✓</span>
-      </div>
-      <div className="message-content">
-        {escapeHtml(text)}
-        {images.length > 0 && (
-          <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
-            [{images.length} image(s)]
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
-  const isFailed = message.status === 'failed';
-  const isSending = message.status === 'sending';
-
-  return (
-    <div className={`message user ${isFailed ? 'failed' : ''}`}>
-      <div className="message-header">
-        <span>You</span>
-        {isSending && (
-          <span className="message-status sending" title="Sending...">
-            <span className="sending-spinner">⏳</span>
-          </span>
-        )}
-        {isFailed && (
-          <span 
-            className="message-status failed" 
-            title="Failed - tap to retry"
-            onClick={() => onRetry(message.localId)}
-            style={{ cursor: 'pointer' }}
-          >
-            ⚠️
-          </span>
-        )}
-      </div>
-      <div className="message-content">
-        {escapeHtml(message.text)}
-        {message.images.length > 0 && (
-          <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
-            [{message.images.length} image(s)]
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function AgentMessage({
-  message,
-  toolResults,
-}: {
-  message: Message;
-  toolResults: Map<string, Message>;
-}) {
-  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-
-  return (
-    <div className="message agent">
-      <div className="message-header">Phoenix</div>
-      <div className="message-content">
-        {blocks.map((block, i) => {
-          if (block.type === 'text') {
-            return (
-              <div
-                key={i}
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(block.text || '') }}
-              />
-            );
-          } else if (block.type === 'tool_use') {
-            return (
-              <ToolUseBlock
-                key={block.id || i}
-                block={block}
-                result={toolResults.get(block.id || '')}
-              />
-            );
-          }
-          return null;
-        })}
-      </div>
-    </div>
-  );
-}
-
-function ToolUseBlock({ block, result }: { block: ContentBlock; result?: Message }) {
-  const [expanded, setExpanded] = useState(false);
-  const name = block.name || 'tool';
-  const input = block.input || {};
-  const toolId = block.id || '';
-
-  // Special handling for common tools
-  let inputStr: string;
-  if (name === 'bash' && input.command) {
-    inputStr = String(input.command);
-  } else if (name === 'think' && input.thoughts) {
-    inputStr = String(input.thoughts);
-  } else {
-    inputStr = JSON.stringify(input, null, 2);
-  }
-
-  // Get the paired result if available
-  let resultContent: ToolResultContent | null = null;
-  if (result) {
-    resultContent = result.content as ToolResultContent;
-  }
-
-  const resultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
-  const isError = resultContent?.is_error || !!resultContent?.error;
-
-  // Truncate long results
-  const maxLen = 500;
-  const truncated = resultText.length > maxLen;
-  const displayResult = truncated ? resultText.slice(0, maxLen) + '...' : resultText;
-
-  return (
-    <div className={`tool-group${expanded ? ' expanded' : ''}`} data-tool-id={toolId}>
-      <div className="tool-header" onClick={() => setExpanded(!expanded)}>
-        <span className="tool-name">{name}</span>
-        <span className="tool-chevron">▶</span>
-      </div>
-      <div className="tool-body">
-        <div className="tool-input">{inputStr}</div>
-        {resultContent && (
-          <div className={`tool-result-section${isError ? ' error' : ''}`}>
-            <div className="tool-result-label">
-              {isError ? '✗ error' : '✓ result'}
-              {truncated && <span className="tool-truncated"> (truncated)</span>}
-            </div>
-            <div className="tool-result-content">
-              {displayResult || <span className="tool-empty">(empty)</span>}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function SubAgentStatus({ stateData }: { stateData: ConversationState }) {
-  const pending = stateData.pending_ids?.length ?? 0;
-  const completed = stateData.completed_results?.length ?? 0;
-  const total = pending + completed;
-
-  return (
-    <div className="subagent-status-block">
-      <div className="subagent-header">
-        <span className="subagent-title">Sub-agents</span>
-        <span className="subagent-count">
-          {completed}/{total}
-        </span>
-      </div>
-      <div className="subagent-list">
-        {Array.from({ length: completed }).map((_, i) => (
-          <div key={`completed-${i}`} className="subagent-item completed">
-            <span className="subagent-icon">✓</span>
-            <span className="subagent-label">Sub-agent {i + 1}</span>
-            <span className="subagent-status">completed</span>
-          </div>
-        ))}
-        {Array.from({ length: pending }).map((_, i) => (
-          <div key={`pending-${i}`} className="subagent-item pending">
-            <span className="subagent-icon">
-              <span className="spinner"></span>
-            </span>
-            <span className="subagent-label">Sub-agent {completed + i + 1}</span>
-            <span className="subagent-status">running...</span>
-          </div>
-        ))}
-      </div>
-    </div>
   );
 }

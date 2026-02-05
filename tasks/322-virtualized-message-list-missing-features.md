@@ -1,56 +1,47 @@
 ---
 created: 2026-02-05
+completed: 2026-02-05
 priority: p1
-status: ready
+status: done
 type: bug
 ---
 
 # BUG: VirtualizedMessageList Missing Recent UI Improvements
 
-## Summary
+## Resolution
 
-Conversations with >50 messages use `VirtualizedMessageList` which is missing all recent UI improvements.
+Fixed by extracting shared components from MessageList.tsx into a new MessageComponents.tsx file, then having both MessageList.tsx and VirtualizedMessageList.tsx import from it.
 
-## Impact
+### Changes Made
 
-Users with long conversations don't see:
-- New tool block design (task 313) - still shows old collapsed-by-default style
-- Copy buttons (task 311) - no copy functionality
-- Timestamps (task 312) - no timestamps on messages
+1. Created `ui/src/components/MessageComponents.tsx` with all shared message rendering components:
+   - UserMessage (with timestamps)
+   - QueuedUserMessage
+   - AgentMessage (with timestamps)
+   - ToolUseBlock (new design with copy buttons)
+   - SubAgentStatus
+   - formatMessageTime helper
 
-## Root Cause
+2. Refactored `MessageList.tsx` to import from MessageComponents.tsx (reduced from 373 to 85 lines)
 
-`ConversationPage.tsx` switches implementations at 50 messages:
-```tsx
-{messages.length > 50 ? (
-  <VirtualizedMessageList ... />
-) : (
-  <MessageList ... />
-)}
-```
+3. Refactored `VirtualizedMessageList.tsx` to import from MessageComponents.tsx (reduced from 421 to 242 lines)
 
-The two components have duplicate implementations that have drifted.
+### Features Now Available in Both Implementations
 
-## Evidence
+- ✅ New tool block design (task 313)
+- ✅ Copy buttons (task 311)
+- ✅ Timestamps (task 312)
+- ✅ Proper "You"/"Phoenix" sender labels
+- ✅ Status indicators (checkmarks for success/error)
 
-```bash
-$ grep "tool-block\|tool-group" ui/src/components/VirtualizedMessageList.tsx
-    <div className={`tool-group${expanded ? ' expanded' : ''}`}  # OLD style
+### Fixed a Pre-existing Issue
 
-$ grep "tool-block\|tool-group" ui/src/components/MessageList.tsx  
-    <div className="tool-block"  # NEW style
-```
+- Fixed `Skeleton.tsx` type error (missing `style` prop in SkeletonProps)
 
-## Fix Options
+## Original Summary
 
-1. **Quick fix**: Port all changes to VirtualizedMessageList (duplicate work)
-2. **Proper fix**: Resolve task 321 first (consolidate or extract shared components)
-
-## Recommendation
-
-Do the quick fix now to restore feature parity, then address consolidation (task 321) separately.
+Conversations with >50 messages used `VirtualizedMessageList` which was missing all recent UI improvements.
 
 ## See Also
 
-- Task 321 - investigation of MessageList duplication
-- Task 311, 312, 313 - features that were only applied to MessageList
+- Task 321 - investigation that led to this fix (Option B chosen)
