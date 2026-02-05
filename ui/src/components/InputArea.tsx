@@ -81,12 +81,22 @@ export function InputArea({
       // to the bottom of the visual viewport (keyboard height)
       const offsetBottom = window.innerHeight - viewport.height - viewport.offsetTop;
       
+      // Get the main content area to adjust its bottom margin
+      const mainArea = document.getElementById('main-area');
+      
       if (offsetBottom > 0) {
-        // Keyboard is open - position input above it
+        // Keyboard is open - position input above it and adjust content area
         footer.style.bottom = `${offsetBottom}px`;
+        if (mainArea) {
+          // Increase margin to account for keyboard pushing input up
+          mainArea.style.marginBottom = `${60 + offsetBottom}px`;
+        }
       } else {
         // Keyboard is closed - reset to default
         footer.style.bottom = '0px';
+        if (mainArea) {
+          mainArea.style.marginBottom = '';
+        }
       }
     };
 
@@ -96,6 +106,11 @@ export function InputArea({
     return () => {
       viewport.removeEventListener('resize', handleViewportChange);
       viewport.removeEventListener('scroll', handleViewportChange);
+      // Reset on unmount
+      const mainArea = document.getElementById('main-area');
+      if (mainArea) {
+        mainArea.style.marginBottom = '';
+      }
     };
   }, []);
 
