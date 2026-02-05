@@ -110,29 +110,31 @@ export function InputArea({
       if (debugEl) {
         updateDebugPosition();
         const footerRect = footer.getBoundingClientRect();
+        const targetBottom = window.innerHeight - (viewport.offsetTop + viewport.height);
         debugEl.textContent = [
-          `iter: 4`,
+          `iter: 5`,
           `vpH: ${Math.round(viewport.height)} vpTop: ${Math.round(viewport.offsetTop)}`,
-          `footer.top: ${footer.style.top || 'auto'}`,
-          `footer.bottom: ${footer.style.bottom || 'auto'}`,
-          `footerRect.top: ${Math.round(footerRect.top)}`,
-          `screenH: ${window.screen.height}`,
+          `innerH: ${window.innerHeight}`,
+          `targetMoveUp: ${Math.round(targetBottom)}`,
+          `transform: ${footer.style.transform || 'none'}`,
+          `footerRect.bottom: ${Math.round(footerRect.bottom)}`,
         ].join('\n');
       }
       
-      // Position footer at bottom of visual viewport
-      const footerHeight = footer.offsetHeight;
-      const targetTop = viewport.offsetTop + viewport.height - footerHeight;
-      
+      // Position footer at bottom of visual viewport using transform
       // Only use custom positioning when keyboard is likely open (viewport significantly smaller)
       if (viewport.height < window.screen.height * 0.7) {
-        footer.style.position = 'fixed';
-        footer.style.top = `${targetTop}px`;
-        footer.style.bottom = 'auto';
+        // Calculate how much to move the footer up from its default bottom:0 position
+        // Default position is at bottom of layout viewport (innerHeight)
+        // We want it at bottom of visual viewport (vpTop + vpH)
+        const defaultBottom = 0;
+        const targetBottom = window.innerHeight - (viewport.offsetTop + viewport.height);
+        const moveUp = targetBottom - defaultBottom;
+        
+        footer.style.transform = `translateY(-${moveUp}px)`;
       } else {
-        // Keyboard closed - use default positioning
-        footer.style.top = '';
-        footer.style.bottom = '0px';
+        // Keyboard closed - reset
+        footer.style.transform = '';
       }
     };
 
