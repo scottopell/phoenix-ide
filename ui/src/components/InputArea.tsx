@@ -73,16 +73,23 @@ export function InputArea({
     const viewport = window.visualViewport;
     if (!viewport) return;
 
-    // Create debug overlay
+    // Create debug overlay - position relative to visual viewport
     let debugEl = document.getElementById('viewport-debug');
     if (!debugEl) {
       debugEl = document.createElement('div');
       debugEl.id = 'viewport-debug';
+      document.body.appendChild(debugEl);
+    }
+    
+    const updateDebugPosition = () => {
+      if (!debugEl) return;
+      // Position at top of visual viewport
+      const top = viewport.offsetTop + 50;
       debugEl.style.cssText = `
         position: fixed;
-        top: 50px;
+        top: ${top}px;
         left: 10px;
-        background: rgba(0,0,0,0.85);
+        background: rgba(0,0,0,0.9);
         color: #0f0;
         padding: 8px;
         font-family: monospace;
@@ -92,8 +99,8 @@ export function InputArea({
         pointer-events: none;
         white-space: pre;
       `;
-      document.body.appendChild(debugEl);
-    }
+    };
+    updateDebugPosition();
 
     const handleViewportChange = () => {
       const footer = footerRef.current;
@@ -105,14 +112,15 @@ export function InputArea({
       
       // Update debug overlay
       if (debugEl) {
+        updateDebugPosition();
         const mainArea = document.getElementById('main-area');
         debugEl.textContent = [
-          `innerHeight: ${window.innerHeight}`,
-          `vp.height: ${Math.round(viewport.height)}`,
-          `vp.offsetTop: ${Math.round(viewport.offsetTop)}`,
-          `offsetBottom: ${Math.round(offsetBottom)}`,
-          `footer.bottom: ${footer.style.bottom || '0px'}`,
-          `mainArea scroll: ${mainArea?.scrollHeight}/${mainArea?.clientHeight}`,
+          `innerH: ${window.innerHeight}`,
+          `vpH: ${Math.round(viewport.height)}`,
+          `vpTop: ${Math.round(viewport.offsetTop)}`,
+          `kbHeight: ${Math.round(offsetBottom)}`,
+          `footer.bot: ${footer.style.bottom || '0px'}`,
+          `mainScroll: ${mainArea?.scrollHeight}/${mainArea?.clientHeight}`,
         ].join('\n');
       }
       
