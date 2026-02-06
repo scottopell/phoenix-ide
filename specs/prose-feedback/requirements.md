@@ -93,14 +93,15 @@ THE SYSTEM SHALL detect file types by extension:
   - Directories → [icon: folder]
 
 WHEN file has no extension
-THE SYSTEM SHALL treat as text if content appears to be text
-OTHERWISE show as unknown type
+THE SYSTEM SHALL use backend-provided type information
+AND backend MAY check shebang for scripts (e.g., `#!/usr/bin/env python`)
+AND backend SHALL NOT peek at file contents in large directories
 
 WHEN file is non-text (images, binaries, data files)
 THE SYSTEM SHALL show with appropriate icon but in disabled/grayed state
 AND NOT allow selection
 
-**Rationale:** Visual file type indicators help users quickly identify relevant files to review. Minimalistic icons maintain a clean, professional interface. Showing but disabling non-text files provides complete directory context without confusion.
+**Rationale:** Visual file type indicators help users quickly identify relevant files to review. Minimalistic icons maintain a clean, professional interface. Showing but disabling non-text files provides complete directory context without confusion. Backend-side type detection prevents frontend performance issues when browsing large directories.
 
 ---
 
@@ -118,11 +119,12 @@ WHEN file is source code (recognized extensions: .rs, .ts, .tsx, .js, .jsx, .py,
 THE SYSTEM SHALL display with syntax highlighting and line numbers
 
 WHEN file is plain text or unrecognized format
-THE SYSTEM SHALL attempt to detect text encoding
-AND display as monospace text with line numbers if valid text encoding (UTF-8, UTF-16, ASCII)
-AND show error message if file contains invalid/binary data
+THE SYSTEM SHALL request file content from backend
+AND backend SHALL validate text encoding during read
+AND display as monospace text with line numbers if valid encoding
+AND show error message if backend reports invalid/binary data
 
-**Rationale:** Users need to read files in a comfortable format before providing feedback. Rendering markdown and highlighting code improves readability.
+**Rationale:** Users need to read files in a comfortable format before providing feedback. Rendering markdown and highlighting code improves readability. Text encoding validation happens during file read (not listing) for performance.
 
 ---
 

@@ -44,7 +44,7 @@ interface FileItem {
 
 **API Integration:**
 ```typescript
-// List directory contents
+// List directory contents with file type detection
 GET /api/files/list?path={currentPath}
 Response: {
   items: [{
@@ -52,32 +52,77 @@ Response: {
     path: string,
     isDirectory: boolean,
     size?: number,
-    modifiedTime?: number
+    modifiedTime?: number,
+    type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'image' | 'data' | 'unknown',
+    isTextFile: boolean,  // Can be opened in prose reader
+    mimeType?: string     // Optional, for additional context
   }]
 }
 ```
 
+**Backend File Type Detection Strategy:**
+1. **Extension-based detection first** - Fast, no file access needed
+2. **Special cases only** - Check shebang for extensionless scripts
+3. **Never peek large files** - Size threshold (e.g., skip content detection if >1MB)
+4. **Cache results** - Store file type in metadata cache if using content detection
+
+**Backend Implementation Notes:**
+```rust
+// Pseudo-code for efficient type detection
+fn detect_file_type(path: &Path, metadata: &Metadata) -> FileType {
+    // 1. Directory check (from metadata, no I/O)
+    if metadata.is_dir() {
+        return FileType::Folder;
+    }
+    
+    // 2. Extension-based detection (no I/O)
+    if let Some(ext) = path.extension() {
+        return match ext.to_str() {
+            Some("md") | Some("markdown") => FileType::Markdown,
+            Some("rs") | Some("py") | Some("js") => FileType::Code,
+            // ... etc
+            _ => FileType::Unknown
+        };
+    }
+    
+    // 3. Special handling for no extension
+    if metadata.len() < 1024 * 1024 {  // Only files <1MB
+        // Could check shebang for scripts
+        // But this is OPTIONAL - can just return Unknown
+    }
+    
+    FileType::Unknown
+}
+```
+
 **File Type Detection:**
+The backend handles all file type detection to avoid performance issues:
+
 ```typescript
-const getFileType = (name: string): { type: FileType, isTextFile: boolean } => {
-  const ext = name.split('.').pop()?.toLowerCase();
-  if (!ext) return { type: 'text', isTextFile: true }; // No extension = text
-  
-  const typeMap = {
-    markdown: { exts: ['md', 'markdown'], isText: true },
-    code: { exts: ['rs', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'java', 'cpp', 'c', 'h'], isText: true },
-    config: { exts: ['json', 'yaml', 'yml', 'toml', 'ini', 'env'], isText: true },
-    text: { exts: ['txt', 'log'], isText: true },
-    image: { exts: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'], isText: false },
-    data: { exts: ['db', 'sqlite', 'bin', 'dat'], isText: false }
+// Frontend just displays what backend provides
+const FileIcon = ({ type }: { type: FileType }) => {
+  const icons = {
+    folder: <FolderIcon />,
+    markdown: <FileTextIcon />,
+    code: <CodeIcon />,
+    config: <SettingsIcon />,
+    text: <FileIcon />,
+    image: <ImageIcon />,
+    data: <DatabaseIcon />,
+    unknown: <FileIcon />
   };
   
-  for (const [type, { exts, isText }] of Object.entries(typeMap)) {
-    if (exts.includes(ext)) return { type, isTextFile: isText };
+  return icons[type] || icons.unknown;
+};
+
+// Frontend uses isTextFile flag from API
+const handleFileClick = (item: FileItem) => {
+  if (item.isDirectory) {
+    navigateToDirectory(item.path);
+  } else if (item.isTextFile) {
+    openProseReader(item.path);
   }
-  
-  // Unknown extension - will need content detection
-  return { type: 'unknown', isTextFile: false };
+  // Non-text files are disabled by CSS
 };
 ```
 
@@ -108,28 +153,13 @@ The ProseReader is a modal overlay that receives:
 File type detection uses extension mapping:
 - Markdown: `.md`, `.markdown` → rendered via `react-markdown` with `remark-gfm`
 - Code: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.json`, `.yaml`, `.yml`, `.toml`, `.css`, `.html` → syntax highlighted via `react-syntax-highlighter`
-- Text: all other extensions → attempt text decoding, show as monospace if valid UTF-8/UTF-16/ASCII
+- Text: `.txt`, `.log` → displayed as monospace
+- Other: attempt to read and display as monospace if valid text encoding
 
-**Text encoding detection:**
-```typescript
-const isValidTextFile = async (content: ArrayBuffer): Promise<boolean> => {
-  try {
-    // Try UTF-8 first (most common)
-    new TextDecoder('utf-8', { fatal: true }).decode(content);
-    return true;
-  } catch {
-    try {
-      // Try UTF-16
-      new TextDecoder('utf-16', { fatal: true }).decode(content);
-      return true;
-    } catch {
-      // Check if it's ASCII (bytes 0-127)
-      const bytes = new Uint8Array(content);
-      return bytes.every(byte => byte < 128);
-    }
-  }
-};
-```
+**Text encoding validation:**
+- Happens when file is opened (not during listing)
+- Backend returns error if file is binary/invalid encoding
+- Frontend shows appropriate error message
 
 ### REQ-PF-006 Implementation: Long-Press Gesture
 
@@ -524,12 +554,24 @@ The backend must provide two endpoints:
 ```
 GET /api/files/list?path={path}
 ```
-Response: Array of file/directory metadata
+Response: Array of file/directory metadata with type detection
+
+**Performance considerations:**
+- Type detection based on extension only (no file I/O)
+- No content peeking for large directories
+- Backend may cache results for repeated listings
 
 ### Read File Contents
 ```
 GET /api/files/read?path={filePath}
 ```
+Response: `{ content: string, encoding: string }`
+
+**Text encoding detection happens HERE:**
+- Only when actually reading the file
+- Can check magic bytes, BOMs, etc.
+- Return error if binary/invalid encoding
+- Already limited to single file, so no performance concern
 
 Response: `{ content: string }`
 
@@ -567,13 +609,19 @@ All styles namespaced to avoid conflicts:
 ### Unit Tests
 
 **File Browser:**
-- File type detection from extension (including non-text files)
+- Backend API response parsing
 - Sorting logic (directories first, alphabetical)
 - Path navigation (up/down directories)
 - Human-readable file size formatting (KiB, MiB, GiB)
 - Relative time formatting
-- Text encoding detection (UTF-8, UTF-16, ASCII)
+- Icon mapping from backend-provided types
 - Expanded state persistence and restoration
+
+**Backend (separate tests):**
+- Extension-based file type detection
+- Performance with large directories (10k+ files)
+- Text encoding detection during file read
+- Shebang detection for extensionless files
 
 **Prose Reader:**
 - Long-press timer logic (mocked timers)
