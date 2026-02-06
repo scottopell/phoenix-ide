@@ -240,6 +240,133 @@ CSS uses:
 - Bottom-sheet pattern with `animation: slide-up` for dialogs
 - Loading/error states as centered flex containers
 
+### REQ-PF-014 Implementation: Patch Output Integration
+
+**Detecting Files in Patch Output:**
+```typescript
+// In message rendering component
+const renderPatchOutput = (content: string) => {
+  // Pattern to match file paths in patch output
+  const filePathRegex = /(?:patching|modified|created)\s+['"]?([^'"\s]+)['"]?/gi;
+  
+  return content.replace(filePathRegex, (match, filePath) => {
+    return `<span class="patch-file-link" data-path="${filePath}">${match}</span>`;
+  });
+};
+```
+
+**ProseReader Props for Patch Mode:**
+```typescript
+interface ProseReaderProps {
+  filePath: string;
+  rootDir: string;
+  onClose: () => void;
+  onSendNotes: (notes: string) => void;
+  // New props for patch integration
+  patchContext?: {
+    modifiedLines: Set<number>; // Line numbers that were modified
+    additions: Map<number, string>; // New lines added
+    deletions: Map<number, string>; // Lines removed
+    showChangesOnly: boolean;
+  };
+}
+```
+
+**Diff Highlighting CSS:**
+```css
+.prose-reader-line--modified {
+  background-color: rgba(255, 236, 156, 0.3); /* Gentle yellow */
+  border-left: 3px solid #f0ad4e;
+}
+
+.prose-reader-line--added {
+  background-color: rgba(195, 232, 195, 0.3); /* Gentle green */
+  border-left: 3px solid #5cb85c;
+}
+
+.prose-reader-line--deleted {
+  background-color: rgba(255, 220, 220, 0.3); /* Gentle red */
+  border-left: 3px solid #d9534f;
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.prose-reader-banner {
+  background: #f8f9fa;
+  padding: 8px 16px;
+  border-bottom: 1px solid #dee2e6;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+```
+
+**Collapsed Sections Implementation:**
+```typescript
+const CollapsedSection = ({ startLine, endLine, onExpand }) => (
+  <div className="prose-reader-collapsed" onClick={onExpand}>
+    <span className="collapse-icon">▶</span>
+    <span className="collapse-text">... {endLine - startLine + 1} lines hidden ...</span>
+  </div>
+);
+
+// Logic to determine visible lines with context
+const getVisibleLines = (totalLines: number, modifiedLines: Set<number>, contextSize = 3) => {
+  const visible = new Set<number>();
+  
+  modifiedLines.forEach(lineNum => {
+    // Add the modified line and context
+    for (let i = Math.max(1, lineNum - contextSize); 
+         i <= Math.min(totalLines, lineNum + contextSize); i++) {
+      visible.add(i);
+    }
+  });
+  
+  return visible;
+};
+```
+
+**Auto-prefix for Changed Line Notes:**
+```typescript
+const handleAddNote = (lineNumber: number, noteText: string) => {
+  const isModifiedLine = patchContext?.modifiedLines.has(lineNumber);
+  const finalNote = isModifiedLine && !noteText.startsWith("[Changed line]") 
+    ? `[Changed line] ${noteText}`
+    : noteText;
+  
+  addNote({
+    lineNumber,
+    note: finalNote,
+    // ... other fields
+  });
+};
+```
+
+### Integration with Message Display
+
+The conversation message component needs to parse patch tool output and make files clickable:
+
+```typescript
+// In ConversationMessage component
+useEffect(() => {
+  // Add click handlers to patch file links
+  const handleFileClick = (e: MouseEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.classList.contains('patch-file-link')) {
+      const filePath = target.dataset.path;
+      if (filePath) {
+        // Parse the message to extract diff info
+        const patchContext = parsePatchContext(message.content, filePath);
+        openProseReader(filePath, patchContext);
+      }
+    }
+  };
+  
+  messageRef.current?.addEventListener('click', handleFileClick);
+  return () => messageRef.current?.removeEventListener('click', handleFileClick);
+}, [message]);
+```
+
 ## Integration Points
 
 ### Conversation UI Integration
@@ -346,6 +473,13 @@ All styles namespaced to avoid conflicts:
 - Add note flow: long-press → dialog → add → verify in notes list
 - Send notes: verify formatted output matches expected structure
 - Close with unsaved notes: verify confirmation shown
+
+**Patch Integration Flow:**
+- Click file in patch output opens prose reader
+- Modified lines show diff highlighting
+- Toggle "Show changes only" collapses/expands sections
+- Auto-prefix works for annotations on changed lines
+- Banner shows patch context
 
 ### Manual Testing
 - Mobile Safari: touch gestures, keyboard appearance, safe areas

@@ -1,4 +1,32 @@
-# Prose Feedback UI
+### REQ-PF-014: Open File from Patch Tool Output
+
+WHEN patch tool generates output showing file modifications
+THE SYSTEM SHALL make filenames in the output clickable/tappable
+AND show a subtle indicator (underline or icon) that files can be opened
+
+WHEN user clicks/taps a filename in patch output
+THE SYSTEM SHALL open that file in the prose reader
+AND highlight the modified lines with a gentle visual indicator (light background color)
+AND auto-scroll to the first modified line
+AND allow normal annotation on any line (not just modified lines)
+
+WHEN displaying patch-triggered file view
+THE SYSTEM SHALL show a banner indicating "Viewing file from patch: {filename}"
+AND include a "Show changes only" toggle button
+AND default to showing the full file with diff highlights
+
+WHEN "Show changes only" is enabled
+THE SYSTEM SHALL collapse unmodified sections (showing "... N lines hidden ...")
+AND keep 3 lines of context above and below each change
+AND allow expanding collapsed sections by clicking/tapping
+
+WHEN user annotates a line that was modified by the patch
+THE SYSTEM SHALL prefix the note with "[Changed line]" automatically
+AND allow the user to edit or remove this prefix
+
+**Rationale:** Users often need to review files after patches are applied to verify changes and provide feedback on the modifications in context. Seeing the full file with diff highlights allows understanding the changes in their proper context while still drawing attention to what changed.
+
+---# Prose Feedback UI
 
 ## User Story
 
@@ -278,3 +306,33 @@ THE SYSTEM SHALL display an error message with the failure reason
 AND allow user to close the reader and return to conversation
 
 **Rationale:** Users need feedback when operations are in progress or have failed.
+
+---
+
+### REQ-PF-014: Open File from Patch Tool Output
+
+WHEN patch tool generates output showing file modifications
+THE SYSTEM SHALL make filenames in the output clickable/tappable
+AND show a subtle indicator (underline or icon) that files can be opened
+
+WHEN user clicks/taps a filename in patch output
+THE SYSTEM SHALL open that file in the prose reader
+AND highlight the modified lines with a gentle visual indicator (light background color)
+AND auto-scroll to the first modified line
+AND allow normal annotation on any line (not just modified lines)
+
+WHEN displaying patch-triggered file view
+THE SYSTEM SHALL show a banner indicating "Viewing file from patch: {filename}"
+AND include a "Show changes only" toggle button
+AND default to showing the full file with diff highlights
+
+WHEN "Show changes only" is enabled
+THE SYSTEM SHALL collapse unmodified sections (showing "... N lines hidden ...")
+AND keep 3 lines of context above and below each change
+AND allow expanding collapsed sections by clicking/tapping
+
+WHEN user annotates a line that was modified by the patch
+THE SYSTEM SHALL prefix the note with "[Changed line]" automatically
+AND allow the user to edit or remove this prefix
+
+**Rationale:** Users often need to review files after patches are applied to verify changes and provide feedback on the modifications in context. Seeing the full file with diff highlights allows understanding the changes in their proper context while still drawing attention to what changed.
