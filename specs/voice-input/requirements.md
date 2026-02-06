@@ -12,11 +12,7 @@ WHEN user taps the microphone button in the input area
 THE SYSTEM SHALL begin listening for voice input
 AND provide immediate visual feedback that recording is active
 
-WHEN user begins speaking without tapping the button
-AND the device supports native voice keyboard integration
-THE SYSTEM SHALL accept the dictated text through the standard input field
-
-**Rationale:** Users need clear, accessible ways to start voice input, whether through an explicit button or native keyboard features.
+**Rationale:** Users need a clear, accessible way to start voice input.
 
 ---
 
@@ -42,25 +38,22 @@ THE SYSTEM SHALL display the transcribed text in the message input field
 AND allow the user to edit the text before sending
 AND preserve the text if the user cancels sending
 
-WHEN transcription includes multiple sentences
-THE SYSTEM SHALL preserve sentence boundaries and punctuation
-
 **Rationale:** Users need to verify accuracy and make corrections before sending voice-dictated messages.
 
 ---
 
-### REQ-VOICE-004: Cancellation Control
+### REQ-VOICE-004: Stop Recording Control
 
 WHEN recording is active
 AND user taps the microphone button again OR presses escape
 THE SYSTEM SHALL stop recording immediately
-AND discard any partial transcription
+AND append any transcribed text to the input field
 
 WHEN user taps outside the input area while recording
 THE SYSTEM SHALL stop recording
-AND preserve any transcribed text in the input field
+AND append any transcribed text to the input field
 
-**Rationale:** Users need control to stop recording at any time, with clear expectations about what happens to their input.
+**Rationale:** Users need control to stop recording at any time without losing their transcribed content.
 
 ---
 

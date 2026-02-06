@@ -15,7 +15,7 @@ Implementation uses the Web Speech API where available, with automatic fallback 
 | **REQ-VOICE-001:** Voice Dictation Activation | ❌ Not Started | Microphone button and native keyboard support |
 | **REQ-VOICE-002:** Recording State Feedback | ❌ Not Started | Visual indicators for all states |
 | **REQ-VOICE-003:** Transcription Review | ❌ Not Started | Edit before sending capability |
-| **REQ-VOICE-004:** Cancellation Control | ❌ Not Started | Multiple ways to stop recording |
+| **REQ-VOICE-004:** Stop Recording Control | ❌ Not Started | Stop recording without losing content |
 | **REQ-VOICE-005:** Error Handling | ❌ Not Started | Permission, network, compatibility errors |
 | **REQ-VOICE-006:** Integration with Message Composition | ❌ Not Started | Append to drafts, preserve images |
 | **REQ-VOICE-007:** Mobile Optimization | ❌ Not Started | Keyboard management, interruption handling |
