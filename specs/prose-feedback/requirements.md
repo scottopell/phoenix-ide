@@ -2,18 +2,94 @@
 
 ## User Story
 
-As a user reviewing text files (markdown documentation, source code, or plain text), I need to annotate specific lines with notes and send those notes as a bundled message to the AI agent, so that I can provide structured feedback without manually copying line numbers and content.
-
-## Prerequisites
-
-- **File Browser Feature**: This spec assumes the existence of a file browsing capability that allows users to navigate and select files. If no file browser spec exists, one must be created as a dependency.
-- **File Read API**: Backend must provide an endpoint to read file contents given a path.
+As a user reviewing text files (markdown documentation, source code, or plain text), I need to browse project files, open them for review, annotate specific lines with notes, and send those notes as a bundled message to the AI agent, so that I can provide structured feedback without manually copying line numbers and content.
 
 ## Requirements
 
-### REQ-PF-001: Open File for Review
+### REQ-PF-001: Browse Project Files
 
-WHEN user selects a file from the file browser (see Prerequisites)
+WHEN user taps the file browse button in the conversation
+THE SYSTEM SHALL display a file browser overlay
+AND show the current working directory path
+AND list all files and directories in the current directory
+AND indicate file types with icons (folder, text, code, markdown)
+
+WHEN user taps a directory
+THE SYSTEM SHALL navigate into that directory
+AND update the current path display
+AND show the new directory contents
+
+WHEN user taps the back/up button
+THE SYSTEM SHALL navigate to the parent directory
+AND update the listing
+
+WHEN user taps a text file (any extension)
+THE SYSTEM SHALL open the prose reader for that file
+
+**Rationale:** Users need to navigate the project structure to find files they want to review. Visual indicators help identify file types quickly.
+
+---
+
+### REQ-PF-002: File Listing Display
+
+WHEN displaying directory contents
+THE SYSTEM SHALL show folders first, then files
+AND sort each group alphabetically (case-insensitive)
+AND display file/folder names with appropriate icons
+AND show file sizes for files (human readable: KB, MB)
+AND show modification time (relative: "2 hours ago", "3 days ago")
+
+WHEN directory contains more than 100 items
+THE SYSTEM SHALL virtualize the list for performance
+
+WHEN directory is empty
+THE SYSTEM SHALL show "Empty directory" message
+
+**Rationale:** Consistent ordering and metadata helps users find files efficiently. Virtualization prevents performance issues in large directories.
+
+---
+
+### REQ-PF-003: File Browser Navigation
+
+WHEN file browser is open
+THE SYSTEM SHALL show a header with:
+  - Current directory path (truncated if needed with ellipsis)
+  - Up/back button (disabled at root)
+  - Close button to return to conversation
+
+WHEN path is too long for display
+THE SYSTEM SHALL show "..." at the beginning
+AND preserve the last 2-3 path segments visible
+
+WHEN user is at the project root
+THE SYSTEM SHALL disable the up button
+
+**Rationale:** Clear navigation context prevents users from getting lost in the directory structure.
+
+---
+
+### REQ-PF-004: File Type Detection
+
+WHEN displaying files
+THE SYSTEM SHALL detect file types by extension:
+  - Markdown: .md, .markdown → 📄 icon
+  - Code: .rs, .ts, .tsx, .js, .jsx, .py, .go, .java, .cpp, .c, .h → 🔤 icon
+  - Config: .json, .yaml, .yml, .toml, .ini, .env → ⚙️ icon
+  - Text: .txt, .log → 📃 icon
+  - Other/unknown → 📎 icon
+  - Directories → 📁 icon
+
+WHEN file has no extension
+THE SYSTEM SHALL treat as text if content appears to be text
+OTHERWISE show as unknown type
+
+**Rationale:** Visual file type indicators help users quickly identify relevant files to review.
+
+---
+
+### REQ-PF-005: Open File for Review
+
+WHEN user selects a file from the file browser
 THE SYSTEM SHALL display the file content in a full-screen reading overlay
 AND show the filename in a header bar
 AND provide a back/close button to return to the conversation
@@ -31,7 +107,7 @@ THE SYSTEM SHALL display as monospace text with line numbers
 
 ---
 
-### REQ-PF-002: Select Content for Annotation
+### REQ-PF-006: Select Content for Annotation
 
 WHEN user long-presses (500ms) on a line or paragraph
 THE SYSTEM SHALL trigger haptic feedback (if device supports vibration)
@@ -48,7 +124,7 @@ THE SYSTEM SHALL cancel the long-press gesture (allow scrolling)
 
 ---
 
-### REQ-PF-003: Add Annotation Note
+### REQ-PF-007: Add Annotation Note
 
 WHEN annotation dialog is open
 THE SYSTEM SHALL display a text input for the user's note
@@ -76,7 +152,7 @@ THE SYSTEM SHALL submit the note (same as tapping Add Note)
 
 ---
 
-### REQ-PF-004: View and Manage Notes
+### REQ-PF-008: View and Manage Notes
 
 WHEN one or more notes exist
 THE SYSTEM SHALL display a badge in the header showing the note count
@@ -104,7 +180,7 @@ AND close the notes panel
 
 ---
 
-### REQ-PF-005: Send Notes to Conversation
+### REQ-PF-009: Send Notes to Conversation
 
 WHEN user taps Send (header) or Send All (notes panel)
 THE SYSTEM SHALL format all notes as a structured message:
@@ -124,7 +200,7 @@ AND focus the message input
 
 ---
 
-### REQ-PF-006: Unsaved Notes Warning
+### REQ-PF-010: Unsaved Notes Warning
 
 WHEN user taps back/close with unsaved notes
 THE SYSTEM SHALL display a confirmation dialog: "You have N unsaved note(s). Discard them?"
@@ -140,7 +216,7 @@ THE SYSTEM SHALL return to the prose reader with notes preserved
 
 ---
 
-### REQ-PF-007: Note Persistence Within Session
+### REQ-PF-011: Note Persistence Within Session
 
 WHILE prose reader is open for a file
 THE SYSTEM SHALL maintain notes in memory
@@ -155,7 +231,7 @@ THE SYSTEM SHALL start with zero notes (fresh review session)
 
 ---
 
-### REQ-PF-008: Responsive Layout
+### REQ-PF-012: Responsive Layout
 
 WHEN viewport is mobile-sized
 THE SYSTEM SHALL use full-screen overlay
@@ -171,7 +247,7 @@ AND support keyboard navigation (Escape to close dialogs)
 
 ---
 
-### REQ-PF-009: Loading and Error States
+### REQ-PF-013: Loading and Error States
 
 WHEN file content is loading
 THE SYSTEM SHALL display a loading indicator centered in the content area

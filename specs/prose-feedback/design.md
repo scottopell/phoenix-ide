@@ -12,7 +12,82 @@ This is a **frontend-only feature** - no backend API changes required beyond the
 
 ## Component Architecture
 
-### REQ-PF-001 Implementation: ProseReader Component
+### REQ-PF-001, REQ-PF-002, REQ-PF-003, REQ-PF-004 Implementation: FileBrowser Component
+
+**Location:** `ui/src/components/FileBrowser.tsx`
+
+The FileBrowser is a modal overlay that:
+- Fetches directory listings from the backend
+- Manages navigation state (current path)
+- Handles file selection callbacks
+
+**State:**
+```typescript
+interface FileBrowserState {
+  currentPath: string;
+  items: FileItem[];
+  loading: boolean;
+  error: string | null;
+}
+
+interface FileItem {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size?: number;
+  modifiedTime?: number;
+  type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'unknown';
+}
+```
+
+**API Integration:**
+```typescript
+// List directory contents
+GET /api/files/list?path={currentPath}
+Response: {
+  items: [{
+    name: string,
+    path: string,
+    isDirectory: boolean,
+    size?: number,
+    modifiedTime?: number
+  }]
+}
+```
+
+**File Type Detection:**
+```typescript
+const getFileType = (name: string): FileType => {
+  const ext = name.split('.').pop()?.toLowerCase();
+  if (!ext) return 'text'; // No extension = text
+  
+  const typeMap = {
+    markdown: ['md', 'markdown'],
+    code: ['rs', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'java', 'cpp', 'c', 'h'],
+    config: ['json', 'yaml', 'yml', 'toml', 'ini', 'env'],
+    text: ['txt', 'log']
+  };
+  
+  for (const [type, exts] of Object.entries(typeMap)) {
+    if (exts.includes(ext)) return type;
+  }
+  return 'unknown';
+};
+```
+
+**Sorting Logic:**
+```typescript
+items.sort((a, b) => {
+  // Directories first
+  if (a.isDirectory !== b.isDirectory) {
+    return a.isDirectory ? -1 : 1;
+  }
+  // Then alphabetical (case-insensitive)
+  return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+});
+```
+
+### REQ-PF-005 Implementation: ProseReader Component
 
 **Location:** `ui/src/components/ProseReader.tsx`
 
@@ -29,7 +104,7 @@ File type detection uses extension mapping:
 - Code: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.json`, `.yaml`, `.yml`, `.toml`, `.css`, `.html` → syntax highlighted via `react-syntax-highlighter`
 - Text: all other extensions → monospace pre-formatted
 
-### REQ-PF-002 Implementation: Long-Press Gesture
+### REQ-PF-006 Implementation: Long-Press Gesture
 
 Gesture handling uses three touch event handlers per selectable element:
 - `onTouchStart`: Start 500ms timer, store line info
@@ -42,7 +117,7 @@ For markdown content, each rendered block (p, h1-h3, li, blockquote) is wrapped 
 
 For code/text content, `react-syntax-highlighter`'s `lineProps` callback attaches handlers to each line, or lines are rendered individually in a loop.
 
-### REQ-PF-003 Implementation: Annotation Dialog
+### REQ-PF-007 Implementation: Annotation Dialog
 
 **State:**
 - `annotatingLine: { lineNumber: number; lineContent: string } | null`
@@ -54,7 +129,7 @@ Keyboard shortcuts handled in textarea's `onKeyDown`:
 - Escape → close dialog
 - Ctrl/Cmd+Enter → submit note
 
-### REQ-PF-004 Implementation: Notes Management
+### REQ-PF-008 Implementation: Notes Management
 
 **Note data structure:**
 ```typescript
@@ -75,7 +150,7 @@ interface ReviewNote {
 
 Jump-to-line uses a `Map<number, HTMLElement>` of refs registered during render. Scrolls element into view with `scrollIntoView({ behavior: 'smooth', block: 'center' })`. Highlight animation via CSS class with 2s timeout to remove.
 
-### REQ-PF-005 Implementation: Notes Formatting and Injection
+### REQ-PF-009 Implementation: Notes Formatting and Injection
 
 Format function:
 ```typescript
@@ -90,15 +165,15 @@ Note: The `lineContent` field stores the complete raw line text, not a truncated
 
 The `onSendNotes` callback passes this string to the parent component, which injects it into the message input state. The parent handles appending to existing draft with appropriate spacing.
 
-### REQ-PF-006 Implementation: Close Confirmation
+### REQ-PF-010 Implementation: Close Confirmation
 
 The `handleBack` function checks `notes.length > 0` before closing. Uses `window.confirm()` for simplicity, though a custom modal could be used for consistency.
 
-### REQ-PF-007 Implementation: Session Scope
+### REQ-PF-011 Implementation: Session Scope
 
 Notes state is local to the ProseReader component instance. When the component unmounts (on close), state is lost. No localStorage persistence is implemented - this is intentional per requirements.
 
-### REQ-PF-008, REQ-PF-009 Implementation: Layout and States
+### REQ-PF-012, REQ-PF-013 Implementation: Layout and States
 
 CSS uses:
 - `position: fixed; inset: 0` for full-screen overlay
@@ -108,14 +183,23 @@ CSS uses:
 
 ## Integration Points
 
-### File Browser Integration
+### Conversation UI Integration
 
-**Dependency**: This feature requires a file browser component. If one doesn't exist in the Phoenix UI, it needs to be specified and implemented first. The file browser should:
-- Allow navigation through the project directory structure
-- Support file selection with a callback
-- Pass both the file path and root directory to consumers
+The conversation page needs a button to open the file browser. This could be:
+- A button in the message input toolbar
+- A menu item in a conversation actions menu
+- A keyboard shortcut (e.g., Ctrl+O)
 
-The FileBrowser component calls `onFileSelect` with the file path. The parent (ChatInterface or ConversationPage) sets `proseReaderPath` state, which conditionally renders ProseReader.
+The parent component manages state:
+```typescript
+const [showFileBrowser, setShowFileBrowser] = useState(false);
+const [proseReaderPath, setProseReaderPath] = useState<string | null>(null);
+
+const handleFileSelect = (filePath: string) => {
+  setShowFileBrowser(false);
+  setProseReaderPath(filePath);
+};
+```
 
 ### Message Input Integration
 
@@ -123,16 +207,24 @@ The `onSendNotes` callback ultimately updates the message input's draft state. I
 
 For Phoenix UI, this should integrate with the existing `draft` state and `useDraft` hook, appending the formatted notes.
 
-## File Read API
+## File System API
 
-The existing Phoenix backend must support reading text files. Expected endpoint:
+The backend must provide two endpoints:
+
+### List Directory Contents
 ```
-GET /api/files/read?path={filePath}&root={rootDir}
+GET /api/files/list?path={path}
+```
+Response: Array of file/directory metadata
+
+### Read File Contents
+```
+GET /api/files/read?path={filePath}
 ```
 
 Response: `{ content: string }`
 
-If this endpoint doesn't exist, it needs to be added as a prerequisite.
+If these endpoints don't exist, they need to be added as part of the implementation.
 
 ## Dependencies
 
@@ -143,7 +235,16 @@ If this endpoint doesn't exist, it needs to be added as a prerequisite.
 
 ## CSS Architecture
 
-All styles namespaced with `.prose-reader-*` prefix to avoid conflicts. Key classes:
+All styles namespaced to avoid conflicts:
+
+### File Browser Classes
+- `.file-browser-overlay` - Full-screen container
+- `.file-browser-header` - Path display and navigation
+- `.file-browser-list` - Scrollable file list
+- `.file-browser-item` - Individual file/folder row
+- `.file-browser-empty` - Empty directory message
+
+### Prose Reader Classes
 - `.prose-reader-overlay` - Full-screen container
 - `.prose-reader-header` - Top bar with back button, filename, notes badge
 - `.prose-reader-content` - Scrollable content area
@@ -154,11 +255,28 @@ All styles namespaced with `.prose-reader-*` prefix to avoid conflicts. Key clas
 ## Testing Strategy
 
 ### Unit Tests
+
+**File Browser:**
+- File type detection from extension
+- Sorting logic (directories first, alphabetical)
+- Path navigation (up/down directories)
+- Human-readable file size formatting
+- Relative time formatting
+
+**Prose Reader:**
 - File type detection from extension
 - Notes formatting function
 - Long-press timer logic (mocked timers)
 
-### Integration Tests  
+### Integration Tests
+
+**File Browser Flow:**
+- Open browser, navigate directories, select file
+- Empty directory shows appropriate message  
+- Long paths truncate correctly
+- Up button disabled at root
+
+**Prose Reader Flow:**  
 - Render markdown file, verify formatted output
 - Render code file, verify syntax highlighting applied
 - Add note flow: long-press → dialog → add → verify in notes list
