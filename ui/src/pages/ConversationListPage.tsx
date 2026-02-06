@@ -23,8 +23,11 @@ export function ConversationListPage() {
   const scrollRestoredRef = useRef(false);
 
   // App state for offline/sync status
-  const { isOnline, isReady, showSyncStatus, syncProgress, pendingOpsCount } = useAppMachine();
+  const { isOnline, isReady, hasError, showSyncStatus, syncProgress, pendingOpsCount } = useAppMachine();
   const { toasts, dismissToast, showWarning, showError } = useToast();
+
+  // Track if we've started loading to avoid double-loads
+  const loadStartedRef = useRef(false);
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
@@ -73,13 +76,20 @@ export function ConversationListPage() {
     } catch (err) {
       console.error('Failed to load conversations:', err);
       // Even on error, try to show cached data
-      const [activeCached, archivedCached] = await Promise.all([
-        enhancedApi.listConversations({ forceFresh: false }),
-        enhancedApi.listArchivedConversations({ forceFresh: false }),
-      ]);
-      if (activeCached.data.length > 0 || archivedCached.data.length > 0) {
+      try {
+        const [activeCached, archivedCached] = await Promise.all([
+          enhancedApi.listConversations({ forceFresh: false }),
+          enhancedApi.listArchivedConversations({ forceFresh: false }),
+        ]);
+        // Always set the state, even if empty - this prevents stuck loading state
         setConversations(activeCached.data);
         setArchivedConversations(archivedCached.data);
+      } catch (cacheErr) {
+        console.error('Failed to load from cache:', cacheErr);
+        // Set empty arrays to show "no conversations" instead of infinite loading
+        setConversations([]);
+        setArchivedConversations([]);
+        showError('Failed to load conversations. Please try refreshing.', 5000);
       }
     } finally {
       setLoading(false);
@@ -87,11 +97,29 @@ export function ConversationListPage() {
   }, []);
 
   // Initial load - use cached data for instant display
+  // Also handle error state and add timeout fallback
   useEffect(() => {
-    if (isReady) {
+    if (loadStartedRef.current) return;
+    
+    if (isReady || hasError) {
+      // Cache is ready (or failed), load conversations
+      loadStartedRef.current = true;
       loadConversations(false);
     }
-  }, [loadConversations, isReady]);
+  }, [loadConversations, isReady, hasError]);
+
+  // Timeout fallback - if cache init takes too long, load anyway
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      if (!loadStartedRef.current && loading) {
+        console.warn('Cache init timeout, loading conversations without cache');
+        loadStartedRef.current = true;
+        loadConversations(true); // Force fresh since cache isn't ready
+      }
+    }, 2000); // 2 second timeout
+
+    return () => clearTimeout(timeout);
+  }, [loading, loadConversations]);
 
   // Restore scroll position after data loads
   useEffect(() => {
