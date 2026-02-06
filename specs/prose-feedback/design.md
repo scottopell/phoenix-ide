@@ -102,14 +102,67 @@ The ProseReader is a modal overlay that receives:
 File type detection uses extension mapping:
 - Markdown: `.md`, `.markdown` → rendered via `react-markdown` with `remark-gfm`
 - Code: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.json`, `.yaml`, `.yml`, `.toml`, `.css`, `.html` → syntax highlighted via `react-syntax-highlighter`
-- Text: all other extensions → monospace pre-formatted
+- Text: all other extensions → attempt text decoding, show as monospace if valid UTF-8/UTF-16/ASCII
+
+**Text encoding detection:**
+```typescript
+const isValidTextFile = async (content: ArrayBuffer): Promise<boolean> => {
+  try {
+    // Try UTF-8 first (most common)
+    new TextDecoder('utf-8', { fatal: true }).decode(content);
+    return true;
+  } catch {
+    try {
+      // Try UTF-16
+      new TextDecoder('utf-16', { fatal: true }).decode(content);
+      return true;
+    } catch {
+      // Check if it's ASCII (bytes 0-127)
+      const bytes = new Uint8Array(content);
+      return bytes.every(byte => byte < 128);
+    }
+  }
+};
+```
 
 ### REQ-PF-006 Implementation: Long-Press Gesture
 
 Gesture handling uses three touch event handlers per selectable element:
-- `onTouchStart`: Start 500ms timer, store line info
-- `onTouchMove`: Cancel timer (user is scrolling)
+- `onTouchStart`: Start 500ms timer, store line info and initial touch position
+- `onTouchMove`: Check if moved >10px from start position, cancel timer if so
 - `onTouchEnd`: Cancel timer if still running
+
+**Movement detection implementation:**
+```typescript
+const [touchStart, setTouchStart] = useState<{x: number, y: number} | null>(null);
+const [longPressTimer, setLongPressTimer] = useState<number | null>(null);
+
+const handleTouchStart = (e: TouchEvent, lineData: LineInfo) => {
+  const touch = e.touches[0];
+  setTouchStart({ x: touch.clientX, y: touch.clientY });
+  
+  const timer = window.setTimeout(() => {
+    navigator.vibrate?.(50);
+    openAnnotationDialog(lineData);
+  }, 500);
+  
+  setLongPressTimer(timer);
+};
+
+const handleTouchMove = (e: TouchEvent) => {
+  if (!touchStart || !longPressTimer) return;
+  
+  const touch = e.touches[0];
+  const deltaX = Math.abs(touch.clientX - touchStart.x);
+  const deltaY = Math.abs(touch.clientY - touchStart.y);
+  
+  // 10px threshold for cancellation - very sensitive to any movement
+  if (deltaX > 10 || deltaY > 10) {
+    window.clearTimeout(longPressTimer);
+    setLongPressTimer(null);
+  }
+};
+```
 
 Timer fires → trigger haptic feedback (`navigator.vibrate(50)`) and open annotation dialog.
 
@@ -260,10 +313,13 @@ All styles namespaced to avoid conflicts:
 - File type detection from extension
 - Sorting logic (directories first, alphabetical)
 - Path navigation (up/down directories)
-- Human-readable file size formatting
+- Human-readable file size formatting (KiB, MiB, GiB)
 - Relative time formatting
+- Text encoding detection (UTF-8, UTF-16, ASCII)
 
 **Prose Reader:**
+- Long-press timer logic (mocked timers)
+- Movement threshold detection (10px cancellation)
 - File type detection from extension
 - Notes formatting function
 - Long-press timer logic (mocked timers)
@@ -287,3 +343,18 @@ All styles namespaced to avoid conflicts:
 - Mobile Safari: touch gestures, keyboard appearance, safe areas
 - Desktop Chrome: mouse interactions, keyboard shortcuts
 - Various file types and sizes
+**Human-readable size formatting:**
+```typescript
+const formatFileSize = (bytes: number): string => {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let size = bytes;
+  let unitIndex = 0;
+  
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  
+  return `${size.toFixed(1)} ${units[unitIndex]}`;
+};
+```

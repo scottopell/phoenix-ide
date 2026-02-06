@@ -36,7 +36,7 @@ WHEN displaying directory contents
 THE SYSTEM SHALL show folders first, then files
 AND sort each group alphabetically (case-insensitive)
 AND display file/folder names with appropriate icons
-AND show file sizes for files (human readable: KB, MB)
+AND show file sizes for files (human readable: KiB, MiB, GiB)
 AND show modification time (relative: "2 hours ago", "3 days ago")
 
 WHEN directory contains more than 100 items
@@ -101,7 +101,9 @@ WHEN file is source code (recognized extensions: .rs, .ts, .tsx, .js, .jsx, .py,
 THE SYSTEM SHALL display with syntax highlighting and line numbers
 
 WHEN file is plain text or unrecognized format
-THE SYSTEM SHALL display as monospace text with line numbers
+THE SYSTEM SHALL attempt to detect text encoding
+AND display as monospace text with line numbers if valid text encoding (UTF-8, UTF-16, ASCII)
+AND show error message if file contains invalid/binary data
 
 **Rationale:** Users need to read files in a comfortable format before providing feedback. Rendering markdown and highlighting code improves readability.
 
@@ -118,9 +120,11 @@ WHEN user releases before 500ms threshold
 THE SYSTEM SHALL NOT open the annotation dialog (treated as normal touch/scroll)
 
 WHEN user moves finger during long-press
-THE SYSTEM SHALL cancel the long-press gesture (allow scrolling)
+THE SYSTEM SHALL cancel the long-press gesture immediately
+AND allow normal scrolling to continue
+AND require movement threshold of only 10 pixels to trigger cancellation
 
-**Rationale:** Long-press is a familiar mobile gesture for contextual actions. The 500ms threshold and movement cancellation prevent accidental triggers while scrolling.
+**Rationale:** Long-press is a familiar mobile gesture for contextual actions. The 500ms threshold and aggressive movement cancellation (10px threshold) prevents accidental triggers while scrolling, especially during slow reading scrolls. Users who slowly scroll while reading should never accidentally trigger annotations.
 
 ---
 
