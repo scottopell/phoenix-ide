@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(conversation_id, local_id) WHERE local_id IS NOT NULL;
+-- Note: idx_messages_local_id is created in migration, not here, because existing DBs
+-- need ALTER TABLE first to add the local_id column
 "#;
 
 /// Migration SQL to convert old state format to typed JSON

@@ -64,8 +64,9 @@ impl Database {
         
         // Try to add local_id column for idempotent message sends - ignore error if exists
         let _ = conn.execute_batch(MIGRATION_ADD_LOCAL_ID);
-        // Always try to create the index (IF NOT EXISTS handles idempotency)
-        let _ = conn.execute_batch(MIGRATION_LOCAL_ID_INDEX);
+        // Create the unique index on local_id (IF NOT EXISTS handles idempotency)
+        // This must run AFTER the ALTER TABLE above
+        conn.execute_batch(MIGRATION_LOCAL_ID_INDEX)?;
         
         Ok(())
     }
