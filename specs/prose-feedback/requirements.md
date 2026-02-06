@@ -284,23 +284,25 @@ AND allow user to close the reader and return to conversation
 ### REQ-PF-014: Open File from Patch Tool Output
 
 WHEN patch tool generates output with unified diffs (see REQ-PATCH-007)
-THE SYSTEM SHALL make filenames in the output clickable/tappable
-AND show a subtle indicator (underline or icon) that files can be opened
+THE SYSTEM SHALL extract all unique filenames mentioned in the diffs
+AND display them as a clickable list at the end of the patch output
+AND show count of changes per file (e.g., "file.rs (3 changes)")
 
-WHEN user clicks/taps a filename in patch output
+WHEN user clicks/taps a filename from the extracted list
 THE SYSTEM SHALL open that file in the prose reader
-AND parse the unified diff to identify modified line numbers
-AND highlight the modified lines with a gentle visual indicator (light background color)
+AND parse ALL unified diffs for that file across the entire patch output
+AND highlight ALL modified lines from all patches with gentle visual indicators
 AND auto-scroll to the first modified line
 AND allow normal annotation on any line (not just modified lines)
 
-WHEN displaying patch-triggered file view
-THE SYSTEM SHALL show a banner indicating "Viewing file from patch: {filename}"
+WHEN displaying patch-triggered file view with multiple changes
+THE SYSTEM SHALL show a banner indicating "Viewing {filename}: {N} changes from patch"
 AND display the full file content (never collapsed or filtered)
-AND gently highlight modified lines without obscuring readability
+AND merge all modifications into a single set of highlighted lines
+AND use consistent highlighting regardless of how many times a line was modified
 
-WHEN user annotates a line that was modified by the patch
+WHEN user annotates a line that was modified by any patch
 THE SYSTEM SHALL prefix the note with "[Changed line]" automatically
 AND allow the user to edit or remove this prefix
 
-**Rationale:** Integrates with patch tool output display (REQ-PATCH-007) to enable seamless file review after modifications. Always showing the full file ensures users understand the complete context. Gentle highlighting draws attention to changes without disrupting readability, and auto-scrolling helps users quickly locate the modifications.
+**Rationale:** When multiple patches modify the same file, users need a unified view showing all changes together. This prevents confusion from viewing the same file multiple times with different highlights. Extracting unique files and showing change counts helps users prioritize which files to review. Integration with REQ-PATCH-007 ensures consistency with patch tool output.

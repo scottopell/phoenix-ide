@@ -274,20 +274,113 @@ const parseUnifiedDiff = (diffContent: string): Set<number> => {
 ```
 
 **Detecting Files in Patch Output:**
+### REQ-PF-014 Implementation: Patch Output Integration
+
+**Context:** This feature integrates with the patch tool's unified diff output (REQ-PATCH-007). When multiple patches modify the same file, all changes are merged into a single view.
+
+**Extracting All File Changes:**
 ```typescript
-// Match filenames in unified diff headers
-const renderPatchOutput = (content: string) => {
-  // Pattern matches: --- a/path/to/file.ext or +++ b/path/to/file.ext
-  const diffFileRegex = /^[+-]{3}\s+[ab]\/(.+)$/gm;
+// Extract all unique files and their changes from patch output
+const extractFileChanges = (patchOutput: string): Map<string, Set<number>> => {
+  const fileChanges = new Map<string, Set<number>>();
+  const lines = patchOutput.split('\n');
+  let currentFile: string | null = null;
+  let currentLine = 0;
   
-  return content.replace(diffFileRegex, (match, filePath) => {
-    // Only make +++ lines clickable (the "after" state)
-    if (match.startsWith('+++')) {
-      return `<span class="patch-file-link" data-path="${filePath}">${match}</span>`;
+  lines.forEach(line => {
+    // Match file header: +++ b/path/to/file.ext
+    const fileMatch = line.match(/^\+{3}\s+b\/(.+)$/);
+    if (fileMatch) {
+      currentFile = fileMatch[1];
+      if (!fileChanges.has(currentFile)) {
+        fileChanges.set(currentFile, new Set());
+      }
+      return;
     }
-    return match;
+    
+    // Parse hunk headers: @@ -start,count +start,count @@
+    const hunkHeader = line.match(/@@ -\d+,?\d* \+(\d+),?(\d*) @@/);
+    if (hunkHeader && currentFile) {
+      currentLine = parseInt(hunkHeader[1]) - 1;
+      return;
+    }
+    
+    // Track added/modified lines
+    if (currentFile && line.startsWith('+') && !line.startsWith('+++')) {
+      fileChanges.get(currentFile)!.add(currentLine + 1);
+    }
+    
+    // Increment line counter for context and additions
+    if (currentFile && !line.startsWith('-')) {
+      currentLine++;
+    }
   });
+  
+  return fileChanges;
 };
+```
+
+**Rendering File List:**
+```typescript
+// Component to show at end of patch output
+const PatchFileSummary = ({ patchOutput }: { patchOutput: string }) => {
+  const fileChanges = extractFileChanges(patchOutput);
+  
+  return (
+    <div className="patch-file-summary">
+      <div className="patch-file-summary-header">Modified files:</div>
+      {Array.from(fileChanges.entries()).map(([filePath, changes]) => (
+        <button
+          key={filePath}
+          className="patch-file-link"
+          onClick={() => openProseReader(filePath, {
+            modifiedLines: changes,
+            firstModifiedLine: Math.min(...Array.from(changes))
+          })}
+        >
+          {filePath} ({changes.size} change{changes.size !== 1 ? 's' : ''})
+        </button>
+      ))}
+    </div>
+  );
+};
+```
+
+**CSS for File Summary:**
+```css
+.patch-file-summary {
+  margin-top: 16px;
+  padding: 12px;
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+}
+
+.patch-file-summary-header {
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #495057;
+}
+
+.patch-file-link {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  margin: 4px 0;
+  background: white;
+  border: 1px solid #dee2e6;
+  border-radius: 3px;
+  color: #0066cc;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.patch-file-link:hover {
+  background-color: #e9ecef;
+  border-color: #adb5bd;
+}
 ```
 
 **ProseReader Props for Patch Mode:**
@@ -331,6 +424,11 @@ interface ProseReaderProps {
   font-size: 14px;
   color: #6c757d;
 }
+
+/* Update banner text to show change count */
+.prose-reader-banner-text {
+  font-weight: 500;
+}
 ```
 
 **Auto-scroll to First Change:**
@@ -365,34 +463,30 @@ const handleAddNote = (lineNumber: number, noteText: string) => {
 
 ### Integration with Message Display
 
-The conversation message component needs to detect and parse unified diffs from patch tool output:
+The conversation message component appends a file summary after patch output:
 
 ```typescript
 // In ConversationMessage component
-useEffect(() => {
-  // Add click handlers to patch file links
-  const handleFileClick = (e: MouseEvent) => {
-    const target = e.target as HTMLElement;
-    if (target.classList.contains('patch-file-link')) {
-      const filePath = target.dataset.path;
-      if (filePath) {
-        // Extract the diff section for this file from the message
-        const diffContent = extractDiffForFile(message.content, filePath);
-        const modifiedLines = parseUnifiedDiff(diffContent);
-        const firstModified = Math.min(...Array.from(modifiedLines));
-        
-        openProseReader(filePath, {
-          modifiedLines,
-          firstModifiedLine: firstModified
-        });
-      }
-    }
-  };
+const MessageContent = ({ message }: { message: Message }) => {
+  const isPatchOutput = message.content.includes('@@') && message.content.includes('+++');
   
-  messageRef.current?.addEventListener('click', handleFileClick);
-  return () => messageRef.current?.removeEventListener('click', handleFileClick);
-}, [message]);
+  return (
+    <div className="message-content">
+      <div className="message-text">{message.content}</div>
+      {isPatchOutput && (
+        <PatchFileSummary patchOutput={message.content} />
+      )}
+    </div>
+  );
+};
 ```
+
+**Benefits of this approach:**
+- Users see all files affected at a glance
+- Change counts help prioritize review
+- Single view per file prevents confusion
+- Cleaner than making every filename in the diff clickable
+- Works well with multiple small edits across many files
 
 **Note:** This implementation leverages the existing unified diff output from REQ-PATCH-007, avoiding duplication of diff generation logic.
 
