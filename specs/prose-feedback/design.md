@@ -242,15 +242,50 @@ CSS uses:
 
 ### REQ-PF-014 Implementation: Patch Output Integration
 
+**Context:** This feature integrates with the patch tool's unified diff output (REQ-PATCH-007). The patch tool already generates diffs for UI display, so this implementation focuses on making those diffs interactive.
+
+**Parsing Unified Diffs:**
+```typescript
+// Parse line numbers from unified diff format
+const parseUnifiedDiff = (diffContent: string): Set<number> => {
+  const modifiedLines = new Set<number>();
+  const lines = diffContent.split('\n');
+  let currentLine = 0;
+  
+  lines.forEach(line => {
+    // @@ -start,count +start,count @@ format
+    const hunkHeader = line.match(/@@ -\d+,?\d* \+(\d+),?(\d*) @@/);
+    if (hunkHeader) {
+      currentLine = parseInt(hunkHeader[1]) - 1;
+      return;
+    }
+    
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      modifiedLines.add(currentLine + 1);
+    }
+    
+    if (!line.startsWith('-')) {
+      currentLine++;
+    }
+  });
+  
+  return modifiedLines;
+};
+```
+
 **Detecting Files in Patch Output:**
 ```typescript
-// In message rendering component
+// Match filenames in unified diff headers
 const renderPatchOutput = (content: string) => {
-  // Pattern to match file paths in patch output
-  const filePathRegex = /(?:patching|modified|created)\s+['"]?([^'"\s]+)['"]?/gi;
+  // Pattern matches: --- a/path/to/file.ext or +++ b/path/to/file.ext
+  const diffFileRegex = /^[+-]{3}\s+[ab]\/(.+)$/gm;
   
-  return content.replace(filePathRegex, (match, filePath) => {
-    return `<span class="patch-file-link" data-path="${filePath}">${match}</span>`;
+  return content.replace(diffFileRegex, (match, filePath) => {
+    // Only make +++ lines clickable (the "after" state)
+    if (match.startsWith('+++')) {
+      return `<span class="patch-file-link" data-path="${filePath}">${match}</span>`;
+    }
+    return match;
   });
 };
 ```
@@ -293,35 +328,23 @@ interface ProseReaderProps {
   background: #f8f9fa;
   padding: 8px 16px;
   border-bottom: 1px solid #dee2e6;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  font-size: 14px;
+  color: #6c757d;
 }
 ```
 
-**Collapsed Sections Implementation:**
+**Auto-scroll to First Change:**
 ```typescript
-const CollapsedSection = ({ startLine, endLine, onExpand }) => (
-  <div className="prose-reader-collapsed" onClick={onExpand}>
-    <span className="collapse-icon">▶</span>
-    <span className="collapse-text">... {endLine - startLine + 1} lines hidden ...</span>
-  </div>
-);
-
-// Logic to determine visible lines with context
-const getVisibleLines = (totalLines: number, modifiedLines: Set<number>, contextSize = 3) => {
-  const visible = new Set<number>();
-  
-  modifiedLines.forEach(lineNum => {
-    // Add the modified line and context
-    for (let i = Math.max(1, lineNum - contextSize); 
-         i <= Math.min(totalLines, lineNum + contextSize); i++) {
-      visible.add(i);
-    }
-  });
-  
-  return visible;
-};
+// In ProseReader component
+useEffect(() => {
+  if (patchContext?.firstModifiedLine) {
+    const lineElement = lineRefs.get(patchContext.firstModifiedLine);
+    lineElement?.scrollIntoView({ 
+      behavior: 'smooth', 
+      block: 'center' 
+    });
+  }
+}, [patchContext?.firstModifiedLine]);
 ```
 
 **Auto-prefix for Changed Line Notes:**
@@ -342,7 +365,7 @@ const handleAddNote = (lineNumber: number, noteText: string) => {
 
 ### Integration with Message Display
 
-The conversation message component needs to parse patch tool output and make files clickable:
+The conversation message component needs to detect and parse unified diffs from patch tool output:
 
 ```typescript
 // In ConversationMessage component
@@ -353,9 +376,15 @@ useEffect(() => {
     if (target.classList.contains('patch-file-link')) {
       const filePath = target.dataset.path;
       if (filePath) {
-        // Parse the message to extract diff info
-        const patchContext = parsePatchContext(message.content, filePath);
-        openProseReader(filePath, patchContext);
+        // Extract the diff section for this file from the message
+        const diffContent = extractDiffForFile(message.content, filePath);
+        const modifiedLines = parseUnifiedDiff(diffContent);
+        const firstModified = Math.min(...Array.from(modifiedLines));
+        
+        openProseReader(filePath, {
+          modifiedLines,
+          firstModifiedLine: firstModified
+        });
       }
     }
   };
@@ -364,6 +393,8 @@ useEffect(() => {
   return () => messageRef.current?.removeEventListener('click', handleFileClick);
 }, [message]);
 ```
+
+**Note:** This implementation leverages the existing unified diff output from REQ-PATCH-007, avoiding duplication of diff generation logic.
 
 ## Integration Points
 
@@ -475,7 +506,7 @@ All styles namespaced to avoid conflicts:
 **Patch Integration Flow:**
 - Click file in patch output opens prose reader
 - Modified lines show diff highlighting
-- Toggle "Show changes only" collapses/expands sections
+- Auto-scroll to first modified line works
 - Auto-prefix works for annotations on changed lines
 - Banner shows patch context
 
