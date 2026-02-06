@@ -2,11 +2,11 @@
 
 ## Requirements Summary
 
-The Prose Feedback feature enables users to review text files and provide structured, line-level feedback to the AI agent. Users open a file from the file browser, which displays in a full-screen reading view with appropriate formatting (rendered markdown, syntax-highlighted code, or plain text). Long-pressing on any line opens an annotation dialog where users type a note about that specific content. Notes accumulate in a session-local collection, visible via a badge and expandable notes panel. Users can review, delete, or jump to annotated lines before sending. When ready, tapping Send formats all notes into a structured message showing line numbers and content previews, then injects this into the message input for the user to review and send to the conversation. Closing the reader with unsaved notes prompts for confirmation to prevent accidental loss.
+The Prose Feedback feature enables users to review text files and provide structured, line-level feedback to the AI agent. Users open a file from the file browser (prerequisite component), which displays in a full-screen reading view with appropriate formatting (rendered markdown, syntax-highlighted code, or plain text). Long-pressing on any line opens an annotation dialog where users type a note about that specific content. Notes accumulate in a session-local collection, visible via a badge and expandable notes panel. Users can review, delete, or jump to annotated lines before sending. When ready, tapping Send formats all notes into a structured message showing the absolute file path, line numbers, and complete raw line content (for greppability), then injects this into the message input for the user to review and send to the conversation. Closing the reader with unsaved notes prompts for confirmation to prevent accidental loss.
 
 ## Technical Summary
 
-This is a frontend-only feature requiring no backend changes beyond an existing file read endpoint. The ProseReader component renders as a fixed full-screen overlay, using `react-markdown` with GFM support for documentation files and `react-syntax-highlighter` for code. Long-press detection uses touch event handlers with a 500ms timer that cancels on movement to avoid conflicting with scroll. Notes are stored in component state as an array of objects containing line number, content preview, and user note. The notes panel uses a bottom-drawer pattern with slide-up animation. Formatted output uses markdown blockquote syntax for line references. Integration with the message input uses a callback pattern where the parent component receives the formatted string and appends it to the draft state. All styles are namespaced with `prose-reader-*` prefix. The feature requires adding npm dependencies for markdown and syntax highlighting.
+This is a frontend-only feature requiring no backend changes beyond an existing file read endpoint. The ProseReader component renders as a fixed full-screen overlay, using `react-markdown` with GFM support for documentation files and `react-syntax-highlighter` for code. Long-press detection uses touch event handlers with a 500ms timer that cancels on movement to avoid conflicting with scroll. Notes are stored in component state as an array of objects containing line number, full raw content, and user note. The notes panel uses a bottom-drawer pattern with slide-up animation. Formatted output includes the absolute file path and uses markdown code blocks for raw line content to ensure greppability. Integration with the message input uses a callback pattern where the parent component receives the formatted string and appends it to the draft state. All styles are namespaced with `prose-reader-*` prefix. The feature requires adding npm dependencies for markdown and syntax highlighting, plus a file browser component as a prerequisite.
 
 ## Status Summary
 
@@ -26,6 +26,6 @@ This is a frontend-only feature requiring no backend changes beyond an existing 
 
 ## Prerequisites
 
+- **File Browser Component**: A file browsing UI must exist or be created (separate SPEARS spec recommended)
 - File read API endpoint must exist or be created
 - npm dependencies: `react-markdown`, `remark-gfm`, `react-syntax-highlighter`
-- File browser component to trigger opening files

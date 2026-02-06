@@ -22,6 +22,8 @@ The ProseReader is a modal overlay that receives:
 - `onClose`: Callback when reader is closed
 - `onSendNotes`: Callback receiving formatted notes string
 
+**Note**: The component should compute and store the absolute file path by resolving `filePath` against `rootDir` for use in the formatted output.
+
 File type detection uses extension mapping:
 - Markdown: `.md`, `.markdown` → rendered via `react-markdown` with `remark-gfm`
 - Code: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, `.json`, `.yaml`, `.yml`, `.toml`, `.css`, `.html` → syntax highlighted via `react-syntax-highlighter`
@@ -60,7 +62,7 @@ interface ReviewNote {
   id: string;           // crypto.randomUUID()
   filePath: string;
   lineNumber: number;
-  lineContent: string;  // Original line text for context
+  lineContent: string;  // Full raw line text (not truncated)
   note: string;         // User's annotation
   timestamp: number;    // Date.now() for ordering
 }
@@ -77,14 +79,14 @@ Jump-to-line uses a `Map<number, HTMLElement>` of refs registered during render.
 
 Format function:
 ```typescript
-const formatted = `Review notes for \`${fileName}\`:\n\n` +
+const formatted = `Review notes for \`${absoluteFilePath}\`:\n\n` +
   notes.map(n => {
-    const truncated = n.lineContent.length > 50 
-      ? n.lineContent.slice(0, 47) + "..." 
-      : n.lineContent;
-    return `> Line ${n.lineNumber}: "${truncated}"\n${n.note}`;
+    // Use the full raw line content for greppability
+    return `> Line ${n.lineNumber}: \`${n.lineContent}\`\n${n.note}`;
   }).join("\n\n");
 ```
+
+Note: The `lineContent` field stores the complete raw line text, not a truncated preview. This ensures the AI can search for exact matches in the codebase.
 
 The `onSendNotes` callback passes this string to the parent component, which injects it into the message input state. The parent handles appending to existing draft with appropriate spacing.
 
@@ -107,6 +109,11 @@ CSS uses:
 ## Integration Points
 
 ### File Browser Integration
+
+**Dependency**: This feature requires a file browser component. If one doesn't exist in the Phoenix UI, it needs to be specified and implemented first. The file browser should:
+- Allow navigation through the project directory structure
+- Support file selection with a callback
+- Pass both the file path and root directory to consumers
 
 The FileBrowser component calls `onFileSelect` with the file path. The parent (ChatInterface or ConversationPage) sets `proseReaderPath` state, which conditionally renders ProseReader.
 

@@ -4,11 +4,16 @@
 
 As a user reviewing text files (markdown documentation, source code, or plain text), I need to annotate specific lines with notes and send those notes as a bundled message to the AI agent, so that I can provide structured feedback without manually copying line numbers and content.
 
+## Prerequisites
+
+- **File Browser Feature**: This spec assumes the existence of a file browsing capability that allows users to navigate and select files. If no file browser spec exists, one must be created as a dependency.
+- **File Read API**: Backend must provide an endpoint to read file contents given a path.
+
 ## Requirements
 
 ### REQ-PF-001: Open File for Review
 
-WHEN user selects a file from the file browser
+WHEN user selects a file from the file browser (see Prerequisites)
 THE SYSTEM SHALL display the file content in a full-screen reading overlay
 AND show the filename in a header bar
 AND provide a back/close button to return to the conversation
@@ -103,8 +108,9 @@ AND close the notes panel
 
 WHEN user taps Send (header) or Send All (notes panel)
 THE SYSTEM SHALL format all notes as a structured message:
-  - Header: "Review notes for `{filename}`:"
-  - For each note: "> Line {N}: \"{content preview}\"" followed by the note text
+  - Header: "Review notes for `{absolute_file_path}`:"
+  - For each note: "> Line {N}: `{raw_line_content}`" followed by the note text
+  - The raw line content SHALL be the exact text from the file (untruncated) to ensure greppability
   - Notes separated by blank lines
 AND inject the formatted text into the message input field
 AND clear all notes
@@ -114,7 +120,7 @@ WHEN formatted notes are injected into message input
 THE SYSTEM SHALL append to any existing draft text (with blank line separator if draft is non-empty)
 AND focus the message input
 
-**Rationale:** Injecting into the input field rather than auto-sending gives users a chance to add context or edit before sending. The structured format helps the AI understand the feedback context.
+**Rationale:** Injecting into the input field rather than auto-sending gives users a chance to add context or edit before sending. The structured format with absolute paths and raw content helps the AI precisely locate and understand the feedback context. Including the complete raw line content ensures the AI can grep for exact matches in the codebase.
 
 ---
 
