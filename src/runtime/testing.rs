@@ -290,22 +290,20 @@ impl Default for InMemoryStorage {
 impl MessageStore for InMemoryStorage {
     async fn add_message(
         &self,
+        message_id: &str,
         conv_id: &str,
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
-        _local_id: Option<&str>,
     ) -> Result<Message, String> {
         let mut id_guard = self.next_msg_id.lock().unwrap();
-        let msg_num = *id_guard;
-        let id = format!("msg-{msg_num}");
         #[allow(clippy::cast_possible_wrap)]
-        let seq_id = msg_num as i64;
+        let seq_id = *id_guard as i64;
         *id_guard += 1;
         drop(id_guard);
 
         let msg = Message {
-            id: id.clone(),
+            message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id: seq_id,
             message_type: content.message_type(),
@@ -463,7 +461,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
             .send(Event::UserMessage {
                 text: text.to_string(),
                 images: vec![],
-                local_id: uuid::Uuid::new_v4().to_string(),
+                message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
             })
             .await
@@ -576,16 +574,16 @@ mod tests {
 
         let msg = storage
             .add_message(
+                "test-message-id",
                 "conv-1",
                 &MessageContent::user("hello"),
                 None,
                 None,
-                Some("test-local-id"),
             )
             .await
             .unwrap();
 
-        assert!(msg.id.starts_with("msg-"));
+        assert_eq!(msg.message_id, "test-message-id");
         assert_eq!(msg.message_type, MessageType::User);
 
         let messages = storage.get_messages("conv-1").await.unwrap();
@@ -717,7 +715,7 @@ mod tests {
             .send(Event::UserMessage {
                 text: "Hello".to_string(),
                 images: vec![],
-                local_id: uuid::Uuid::new_v4().to_string(),
+                message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
             })
             .await
@@ -825,7 +823,7 @@ mod tests {
             .send(Event::UserMessage {
                 text: "Run command".to_string(),
                 images: vec![],
-                local_id: uuid::Uuid::new_v4().to_string(),
+                message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
             })
             .await
@@ -915,7 +913,7 @@ mod tests {
             .send(Event::UserMessage {
                 text: "Run slow command".to_string(),
                 images: vec![],
-                local_id: uuid::Uuid::new_v4().to_string(),
+                message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
             })
             .await

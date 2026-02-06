@@ -32,7 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_conv
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
+    message_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,
     sequence_id INTEGER NOT NULL,
     message_type TEXT NOT NULL,
@@ -40,14 +40,11 @@ CREATE TABLE IF NOT EXISTS messages (
     display_data TEXT,
     usage_data TEXT,
     created_at TEXT NOT NULL,
-    local_id TEXT,
     
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
--- Note: idx_messages_local_id is created in migration, not here, because existing DBs
--- need ALTER TABLE first to add the local_id column
 "#;
 
 /// Migration SQL to convert old state format to typed JSON
@@ -73,14 +70,13 @@ pub const MIGRATION_ADD_MODEL: &str = r"
 ";
 
 /// Migration SQL to add local_id column for idempotent message sends
-pub const MIGRATION_ADD_LOCAL_ID: &str = r"
--- Add local_id column if it doesn't exist (SQLite will error if it does, which we ignore)
-ALTER TABLE messages ADD COLUMN local_id TEXT;
-";
-
-/// Create unique index on local_id (separate so we can ignore ALTER error but still create index)
-pub const MIGRATION_LOCAL_ID_INDEX: &str = r"
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(conversation_id, local_id) WHERE local_id IS NOT NULL;
+/// Migration to rename messages.id to messages.message_id
+/// SQLite 3.25+ supports ALTER TABLE RENAME COLUMN
+/// For older versions or if column already renamed, this is a no-op
+pub const MIGRATION_RENAME_MESSAGE_ID: &str = r"
+-- Rename id to message_id for searchability
+-- This will fail silently if already renamed or SQLite is too old
+ALTER TABLE messages RENAME COLUMN id TO message_id;
 ";
 
 /// Conversation record
@@ -362,7 +358,7 @@ impl Serialize for MessageContent {
 /// Message record
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
-    pub id: String,
+    pub message_id: String,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,

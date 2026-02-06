@@ -267,17 +267,16 @@ where
                 content,
                 display_data,
                 usage_data,
-                local_id,
-                user_agent: _, // user_agent stored in display_data if needed
+                message_id,
             } => {
                 let msg = self
                     .storage
                     .add_message(
+                        &message_id,
                         &self.context.conversation_id,
                         &content,
                         display_data.as_ref(),
                         usage_data.as_ref(),
-                        local_id.as_deref(),
                     )
                     .await?;
 
@@ -482,14 +481,15 @@ where
                         &result.output,
                         result.is_error,
                     );
+                    let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let msg = self
                         .storage
                         .add_message(
+                            &tool_msg_id,
                             &self.context.conversation_id,
                             &content,
                             None,
                             None,
-                            None, // Tool results don't have local_id
                         )
                         .await?;
 
@@ -565,13 +565,14 @@ where
                 let content = crate::db::MessageContent::system(
                     serde_json::to_string_pretty(&aggregated).unwrap_or_default()
                 );
+                let sys_msg_id = uuid::Uuid::new_v4().to_string();
                 self.storage
                     .add_message(
+                        &sys_msg_id,
                         &self.context.conversation_id,
                         &content,
                         None,
                         None,
-                        None, // System messages don't have local_id
                     )
                     .await?;
                 Ok(None)

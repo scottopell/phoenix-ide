@@ -15,15 +15,16 @@ use tokio_util::sync::CancellationToken;
 pub trait MessageStore: Send + Sync {
     /// Add a message to the conversation
     /// 
-    /// `local_id` is a client-generated UUID for idempotency (user messages only).
-    /// The database has a unique constraint on (conversation_id, local_id) to prevent duplicates.
+    /// `message_id` is the canonical identifier for this message. For user messages,
+    /// this is client-generated (enabling idempotent retries). For agent/tool messages,
+    /// this is server-generated.
     async fn add_message(
         &self,
+        message_id: &str,
         conv_id: &str,
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
-        local_id: Option<&str>,
     ) -> Result<Message, String>;
 
     /// Get all messages for a conversation
@@ -83,13 +84,13 @@ impl<T: MessageStore + StateStore> Storage for T {}
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     async fn add_message(
         &self,
+        message_id: &str,
         conv_id: &str,
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
-        local_id: Option<&str>,
     ) -> Result<Message, String> {
-        (**self).add_message(conv_id, content, display_data, usage_data, local_id).await
+        (**self).add_message(message_id, conv_id, content, display_data, usage_data).await
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
@@ -169,15 +170,14 @@ impl DatabaseStorage {
 impl MessageStore for DatabaseStorage {
     async fn add_message(
         &self,
+        message_id: &str,
         conv_id: &str,
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
-        local_id: Option<&str>,
     ) -> Result<Message, String> {
-        let id = uuid::Uuid::new_v4().to_string();
         self.db
-            .add_message(&id, conv_id, content, display_data, usage_data, local_id)
+            .add_message(message_id, conv_id, content, display_data, usage_data)
             .map_err(|e| e.to_string())
     }
 

@@ -189,10 +189,9 @@ impl RuntimeManager {
         };
 
         // 2. Insert initial task as synthetic user message
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        let local_id = uuid::Uuid::new_v4().to_string();
+        let message_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::user(&spec.task);
-        if let Err(e) = self.db.add_message(&msg_id, &conv.id, &content, None, None, Some(&local_id)) {
+        if let Err(e) = self.db.add_message(&message_id, &conv.id, &content, None, None) {
             tracing::error!(error = %e, "Failed to add initial message");
             let _ = parent_event_tx
                 .send(Event::SubAgentResult {
@@ -266,11 +265,11 @@ impl RuntimeManager {
         let task_text = spec.task.clone();
         tokio::spawn(async move {
             // Send initial UserMessage event to start the conversation
-            // Sub-agents generate their own local_id since they don't have a client
+            // Sub-agents generate their own message_id since they don't have a client
             let _ = event_tx.send(Event::UserMessage {
                 text: task_text,
                 images: vec![],
-                local_id: uuid::Uuid::new_v4().to_string(),
+                message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: Some("Phoenix Sub-Agent".to_string()),
             }).await;
 

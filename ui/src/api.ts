@@ -28,7 +28,7 @@ export interface ToolCall {
 }
 
 export interface Message {
-  id: number;
+  message_id: string;
   sequence_id: number;
   conversation_id: string;
   message_type: 'user' | 'agent' | 'tool';
@@ -143,7 +143,7 @@ export const api = {
       body: JSON.stringify({
         text,
         images,
-        local_id: localId,
+        message_id: localId,
         user_agent: navigator.userAgent,
       }),
     });

@@ -11,8 +11,8 @@ pub enum Event {
     UserMessage {
         text: String,
         images: Vec<ImageData>,
-        /// Client-generated UUID for idempotency - prevents duplicate messages on retry
-        local_id: String,
+        /// Client-generated UUID - the canonical identifier for this message
+        message_id: String,
         /// Browser user agent for display (e.g., show iPhone icon in UI)
         user_agent: Option<String>,
     },

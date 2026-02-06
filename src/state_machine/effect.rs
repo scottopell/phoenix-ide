@@ -14,12 +14,9 @@ pub enum Effect {
         content: MessageContent,
         display_data: Option<Value>,
         usage_data: Option<UsageData>,
-        /// Client-generated UUID for idempotency (user messages only)
-        local_id: Option<String>,
-        /// User agent string for UI display (user messages only)
-        /// Stored in display_data by persist_user_message, not read directly from here
-        #[allow(dead_code)]
-        user_agent: Option<String>,
+        /// The canonical message identifier (client-generated for user messages,
+        /// server-generated for agent/tool messages)
+        message_id: String,
     },
 
     /// Persist the new state
@@ -60,7 +57,7 @@ impl Effect {
     pub fn persist_user_message(
         text: impl Into<String>,
         images: Vec<ImageData>,
-        local_id: String,
+        message_id: String,
         user_agent: Option<String>,
     ) -> Self {
         let content = if images.is_empty() {
@@ -74,8 +71,7 @@ impl Effect {
             content,
             display_data,
             usage_data: None,
-            local_id: Some(local_id),
-            user_agent: None, // Already in display_data
+            message_id,
         }
     }
 
@@ -84,8 +80,7 @@ impl Effect {
             content: MessageContent::agent(blocks),
             display_data: None,
             usage_data: usage,
-            local_id: None,
-            user_agent: None,
+            message_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -99,8 +94,7 @@ impl Effect {
             content: MessageContent::tool(tool_use_id, output, is_error),
             display_data,
             usage_data: None,
-            local_id: None,
-            user_agent: None,
+            message_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
