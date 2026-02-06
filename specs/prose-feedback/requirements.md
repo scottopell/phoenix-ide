@@ -38,6 +38,9 @@ AND sort each group alphabetically (case-insensitive)
 AND display file/folder names with appropriate icons
 AND show file sizes for files (human readable: KiB, MiB, GiB)
 AND show modification time (relative: "2 hours ago", "3 days ago")
+AND show all files including non-text files (images, binaries, etc.)
+AND disable non-text files with visual indication (grayed out)
+AND show tooltip or subtitle "Non-text file" for disabled items
 
 WHEN directory contains more than 100 items
 THE SYSTEM SHALL virtualize the list for performance
@@ -45,7 +48,7 @@ THE SYSTEM SHALL virtualize the list for performance
 WHEN directory is empty
 THE SYSTEM SHALL show "Empty directory" message
 
-**Rationale:** Consistent ordering and metadata helps users find files efficiently. Virtualization prevents performance issues in large directories.
+**Rationale:** Consistent ordering and metadata helps users find files efficiently. Showing all files (even non-reviewable ones) gives complete directory context. Virtualization prevents performance issues in large directories.
 
 ---
 
@@ -64,7 +67,15 @@ AND preserve the last 2-3 path segments visible
 WHEN user is at the project root
 THE SYSTEM SHALL disable the up button
 
-**Rationale:** Clear navigation context prevents users from getting lost in the directory structure.
+WHEN user expands or collapses a directory
+THE SYSTEM SHALL persist this state for the current conversation
+AND restore expanded/collapsed states when file browser is reopened
+AND maintain separate expansion states per conversation
+
+WHEN conversation ends or user switches conversations
+THE SYSTEM SHALL reset all expanded/collapsed states
+
+**Rationale:** Clear navigation context prevents users from getting lost in the directory structure. Persisting folder expansion state within a conversation reduces repetitive navigation actions when reviewing multiple files.
 
 ---
 
@@ -72,18 +83,24 @@ THE SYSTEM SHALL disable the up button
 
 WHEN displaying files
 THE SYSTEM SHALL detect file types by extension:
-  - Markdown: .md, .markdown → 📄 icon
-  - Code: .rs, .ts, .tsx, .js, .jsx, .py, .go, .java, .cpp, .c, .h → 🔤 icon
-  - Config: .json, .yaml, .yml, .toml, .ini, .env → ⚙️ icon
-  - Text: .txt, .log → 📃 icon
-  - Other/unknown → 📎 icon
-  - Directories → 📁 icon
+  - Markdown: .md, .markdown → [icon: document-text]
+  - Code: .rs, .ts, .tsx, .js, .jsx, .py, .go, .java, .cpp, .c, .h → [icon: code]
+  - Config: .json, .yaml, .yml, .toml, .ini, .env → [icon: settings]
+  - Text: .txt, .log → [icon: document]
+  - Image: .png, .jpg, .jpeg, .gif, .svg, .webp → [icon: image]
+  - Data: .db, .sqlite, .bin, .dat → [icon: database]
+  - Other/unknown → [icon: file]
+  - Directories → [icon: folder]
 
 WHEN file has no extension
 THE SYSTEM SHALL treat as text if content appears to be text
 OTHERWISE show as unknown type
 
-**Rationale:** Visual file type indicators help users quickly identify relevant files to review.
+WHEN file is non-text (images, binaries, data files)
+THE SYSTEM SHALL show with appropriate icon but in disabled/grayed state
+AND NOT allow selection
+
+**Rationale:** Visual file type indicators help users quickly identify relevant files to review. Minimalistic icons maintain a clean, professional interface. Showing but disabling non-text files provides complete directory context without confusion.
 
 ---
 

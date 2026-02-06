@@ -28,6 +28,7 @@ interface FileBrowserState {
   items: FileItem[];
   loading: boolean;
   error: string | null;
+  expandedPaths: Set<string>; // Persisted per conversation
 }
 
 interface FileItem {
@@ -36,7 +37,8 @@ interface FileItem {
   isDirectory: boolean;
   size?: number;
   modifiedTime?: number;
-  type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'unknown';
+  type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'image' | 'data' | 'unknown';
+  isTextFile: boolean; // Can be opened in prose reader
 }
 ```
 
@@ -57,21 +59,25 @@ Response: {
 
 **File Type Detection:**
 ```typescript
-const getFileType = (name: string): FileType => {
+const getFileType = (name: string): { type: FileType, isTextFile: boolean } => {
   const ext = name.split('.').pop()?.toLowerCase();
-  if (!ext) return 'text'; // No extension = text
+  if (!ext) return { type: 'text', isTextFile: true }; // No extension = text
   
   const typeMap = {
-    markdown: ['md', 'markdown'],
-    code: ['rs', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'java', 'cpp', 'c', 'h'],
-    config: ['json', 'yaml', 'yml', 'toml', 'ini', 'env'],
-    text: ['txt', 'log']
+    markdown: { exts: ['md', 'markdown'], isText: true },
+    code: { exts: ['rs', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'java', 'cpp', 'c', 'h'], isText: true },
+    config: { exts: ['json', 'yaml', 'yml', 'toml', 'ini', 'env'], isText: true },
+    text: { exts: ['txt', 'log'], isText: true },
+    image: { exts: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'], isText: false },
+    data: { exts: ['db', 'sqlite', 'bin', 'dat'], isText: false }
   };
   
-  for (const [type, exts] of Object.entries(typeMap)) {
-    if (exts.includes(ext)) return type;
+  for (const [type, { exts, isText }] of Object.entries(typeMap)) {
+    if (exts.includes(ext)) return { type, isTextFile: isText };
   }
-  return 'unknown';
+  
+  // Unknown extension - will need content detection
+  return { type: 'unknown', isTextFile: false };
 };
 ```
 
@@ -295,6 +301,7 @@ All styles namespaced to avoid conflicts:
 - `.file-browser-header` - Path display and navigation
 - `.file-browser-list` - Scrollable file list
 - `.file-browser-item` - Individual file/folder row
+- `.file-browser-item--disabled` - Non-text file styling (grayed out)
 - `.file-browser-empty` - Empty directory message
 
 ### Prose Reader Classes
@@ -310,12 +317,13 @@ All styles namespaced to avoid conflicts:
 ### Unit Tests
 
 **File Browser:**
-- File type detection from extension
+- File type detection from extension (including non-text files)
 - Sorting logic (directories first, alphabetical)
 - Path navigation (up/down directories)
 - Human-readable file size formatting (KiB, MiB, GiB)
 - Relative time formatting
 - Text encoding detection (UTF-8, UTF-16, ASCII)
+- Expanded state persistence and restoration
 
 **Prose Reader:**
 - Long-press timer logic (mocked timers)
@@ -357,4 +365,35 @@ const formatFileSize = (bytes: number): string => {
   
   return `${size.toFixed(1)} ${units[unitIndex]}`;
 };
+```**Icon Implementation:**
+```typescript
+// Use SVG icons or icon font (e.g., Feather Icons, Heroicons)
+const FileIcon = ({ type }: { type: FileType }) => {
+  const icons = {
+    folder: <FolderIcon />,
+    markdown: <FileTextIcon />,
+    code: <CodeIcon />,
+    config: <SettingsIcon />,
+    text: <FileIcon />,
+    image: <ImageIcon />,
+    data: <DatabaseIcon />,
+    unknown: <FileIcon />
+  };
+  
+  return icons[type] || icons.unknown;
+};
+```
+
+**Expanded State Persistence:**
+```typescript
+// Store in conversation-specific state or context
+const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
+  // Load from conversation context if available
+  return new Set(conversationContext.expandedPaths || []);
+});
+
+// Save when paths change
+useEffect(() => {
+  conversationContext.setExpandedPaths(Array.from(expandedPaths));
+}, [expandedPaths]);
 ```
