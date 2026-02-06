@@ -23,10 +23,6 @@ THE SYSTEM SHALL display a clear visual indicator of the recording state
 AND show audio level feedback when sound is detected
 AND indicate when speech is being processed
 
-WHEN no speech is detected for a configurable timeout
-THE SYSTEM SHALL automatically stop recording
-AND return to the ready state
-
 **Rationale:** Users need confidence that the system is listening and responding to their voice.
 
 ---
@@ -79,7 +75,7 @@ AND rely on native keyboard voice features if available
 ### REQ-VOICE-006: Integration with Message Composition
 
 WHEN voice transcription completes successfully
-THE SYSTEM SHALL append the transcribed text to any existing draft text
+THE SYSTEM SHALL append the transcribed text to the end of any existing draft text
 AND position the cursor at the end of the new text
 AND maintain any attached images
 
@@ -94,7 +90,7 @@ AND return to the ready state for new input
 ### REQ-VOICE-007: Mobile Optimization
 
 WHEN using voice input on a mobile device
-THE SYSTEM SHALL prevent the on-screen keyboard from appearing during recording
+THE SYSTEM SHALL attempt to prevent the on-screen keyboard from appearing during recording
 AND ensure the microphone button is easily accessible with thumb reach
 AND handle interruptions (calls, notifications) gracefully
 
@@ -104,17 +100,3 @@ AND maintain the recording state indicator visibility
 
 **Rationale:** Mobile users are the primary beneficiaries of voice input and need an optimized experience.
 
----
-
-### REQ-VOICE-008: Privacy and Clarity
-
-WHEN voice input is available
-THE SYSTEM SHALL clearly indicate whether processing happens on-device or in the cloud
-AND respect user's browser privacy settings
-AND NOT store or transmit voice recordings beyond the transcription service
-
-WHEN displaying the microphone button
-THE SYSTEM SHALL use universally recognized iconography
-AND include accessibility labels for screen readers
-
-**Rationale:** Users need transparency about privacy and clear visual communication about voice features.

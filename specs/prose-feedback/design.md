@@ -265,9 +265,7 @@ interface ProseReaderProps {
   // New props for patch integration
   patchContext?: {
     modifiedLines: Set<number>; // Line numbers that were modified
-    additions: Map<number, string>; // New lines added
-    deletions: Map<number, string>; // Lines removed
-    showChangesOnly: boolean;
+    firstModifiedLine?: number; // For auto-scrolling
   };
 }
 ```

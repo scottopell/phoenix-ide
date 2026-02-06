@@ -138,7 +138,7 @@ interface ErrorRecovery {
 1. **Keyboard Management**:
    - Blur input field when recording starts
    - Restore focus after transcription
-   - Prevent keyboard popup during recording
+   - Attempt to prevent keyboard popup during recording
 
 2. **Touch Target**:
    - Minimum 44x44px button size
@@ -149,24 +149,6 @@ interface ErrorRecovery {
    - Save partial transcription on pause
    - Auto-resume when possible
    - Clear state indication
-
-### Privacy Implementation
-
-**REQ-VOICE-008**: Privacy and Clarity
-
-1. **Disclosure**:
-   - First-use tooltip explaining voice processing
-   - Link to privacy information
-   - Clear permission dialog text
-
-2. **Data Handling**:
-   - No audio storage
-   - Transcription only
-
-3. **Visual Design**:
-   - Standard microphone icon (🎙️)
-   - ARIA labels for accessibility
-   - High contrast states
 
 ## API Integration
 
@@ -195,8 +177,6 @@ No backend changes required - voice input produces text that follows the existin
 4. **Network Efficiency**: Batch interim results updates
 
 ## Accessibility
-
-**REQ-VOICE-008**: Privacy and Clarity
 
 1. **Keyboard Navigation**:
    - Tab-accessible microphone button

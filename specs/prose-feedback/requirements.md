@@ -1,32 +1,4 @@
-### REQ-PF-014: Open File from Patch Tool Output
-
-WHEN patch tool generates output showing file modifications
-THE SYSTEM SHALL make filenames in the output clickable/tappable
-AND show a subtle indicator (underline or icon) that files can be opened
-
-WHEN user clicks/taps a filename in patch output
-THE SYSTEM SHALL open that file in the prose reader
-AND highlight the modified lines with a gentle visual indicator (light background color)
-AND auto-scroll to the first modified line
-AND allow normal annotation on any line (not just modified lines)
-
-WHEN displaying patch-triggered file view
-THE SYSTEM SHALL show a banner indicating "Viewing file from patch: {filename}"
-AND include a "Show changes only" toggle button
-AND default to showing the full file with diff highlights
-
-WHEN "Show changes only" is enabled
-THE SYSTEM SHALL collapse unmodified sections (showing "... N lines hidden ...")
-AND keep 3 lines of context above and below each change
-AND allow expanding collapsed sections by clicking/tapping
-
-WHEN user annotates a line that was modified by the patch
-THE SYSTEM SHALL prefix the note with "[Changed line]" automatically
-AND allow the user to edit or remove this prefix
-
-**Rationale:** Users often need to review files after patches are applied to verify changes and provide feedback on the modifications in context. Seeing the full file with diff highlights allows understanding the changes in their proper context while still drawing attention to what changed.
-
----# Prose Feedback UI
+# Prose Feedback UI
 
 ## User Story
 
@@ -323,16 +295,11 @@ AND allow normal annotation on any line (not just modified lines)
 
 WHEN displaying patch-triggered file view
 THE SYSTEM SHALL show a banner indicating "Viewing file from patch: {filename}"
-AND include a "Show changes only" toggle button
-AND default to showing the full file with diff highlights
-
-WHEN "Show changes only" is enabled
-THE SYSTEM SHALL collapse unmodified sections (showing "... N lines hidden ...")
-AND keep 3 lines of context above and below each change
-AND allow expanding collapsed sections by clicking/tapping
+AND display the full file content (never collapsed or filtered)
+AND gently highlight modified lines without obscuring readability
 
 WHEN user annotates a line that was modified by the patch
 THE SYSTEM SHALL prefix the note with "[Changed line]" automatically
 AND allow the user to edit or remove this prefix
 
-**Rationale:** Users often need to review files after patches are applied to verify changes and provide feedback on the modifications in context. Seeing the full file with diff highlights allows understanding the changes in their proper context while still drawing attention to what changed.
+**Rationale:** Users often need to review files after patches are applied to verify changes and provide feedback on the modifications in context. Always showing the full file ensures users understand the complete context. Gentle highlighting draws attention to changes without disrupting readability, and auto-scrolling helps users quickly locate the modifications.
