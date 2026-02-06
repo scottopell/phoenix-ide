@@ -10,7 +10,8 @@ export class SyncQueue {
         await enhancedApi.sendMessage(
           op.conversationId,
           op.payload.text,
-          op.payload.images || []
+          op.payload.images || [],
+          op.payload.localId,
         );
         break;
       

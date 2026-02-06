@@ -294,6 +294,7 @@ impl MessageStore for InMemoryStorage {
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
+        _local_id: Option<&str>,
     ) -> Result<Message, String> {
         let mut id_guard = self.next_msg_id.lock().unwrap();
         let msg_num = *id_guard;
@@ -462,6 +463,8 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
             .send(Event::UserMessage {
                 text: text.to_string(),
                 images: vec![],
+                local_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
             })
             .await
             .expect("Failed to send message");
@@ -577,6 +580,7 @@ mod tests {
                 &MessageContent::user("hello"),
                 None,
                 None,
+                Some("test-local-id"),
             )
             .await
             .unwrap();
@@ -713,6 +717,8 @@ mod tests {
             .send(Event::UserMessage {
                 text: "Hello".to_string(),
                 images: vec![],
+                local_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
             })
             .await
             .unwrap();
@@ -819,6 +825,8 @@ mod tests {
             .send(Event::UserMessage {
                 text: "Run command".to_string(),
                 images: vec![],
+                local_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
             })
             .await
             .unwrap();
@@ -907,6 +915,8 @@ mod tests {
             .send(Event::UserMessage {
                 text: "Run slow command".to_string(),
                 images: vec![],
+                local_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
             })
             .await
             .unwrap();

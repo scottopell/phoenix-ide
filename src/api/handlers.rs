@@ -287,6 +287,17 @@ async fn send_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    // Idempotency check: if we've already processed this local_id, return success
+    // This prevents duplicate messages on retry
+    if state.db.message_exists_by_local_id(&id, &req.local_id).unwrap_or(false) {
+        tracing::info!(
+            conversation_id = %id,
+            local_id = %req.local_id,
+            "Duplicate message detected, returning success (idempotent)"
+        );
+        return Ok(Json(ChatResponse { queued: true }));
+    }
+
     // Convert images
     let images: Vec<ImageData> = req
         .images
@@ -297,10 +308,12 @@ async fn send_chat(
         })
         .collect();
 
-    // Send event to runtime
+    // Send event to runtime with local_id and user_agent for storage
     let event = Event::UserMessage {
         text: req.text,
         images,
+        local_id: req.local_id,
+        user_agent: req.user_agent,
     };
 
     state

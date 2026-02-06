@@ -5,7 +5,7 @@
 mod schema;
 
 pub use schema::*;
-use schema::MIGRATION_TYPED_STATE;
+use schema::{MIGRATION_ADD_LOCAL_ID, MIGRATION_LOCAL_ID_INDEX, MIGRATION_TYPED_STATE};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
@@ -61,6 +61,11 @@ impl Database {
         
         // Try to add model column - ignore error if it already exists
         let _ = conn.execute("ALTER TABLE conversations ADD COLUMN model TEXT", []);
+        
+        // Try to add local_id column for idempotent message sends - ignore error if exists
+        let _ = conn.execute_batch(MIGRATION_ADD_LOCAL_ID);
+        // Always try to create the index (IF NOT EXISTS handles idempotency)
+        let _ = conn.execute_batch(MIGRATION_LOCAL_ID_INDEX);
         
         Ok(())
     }
@@ -349,6 +354,9 @@ impl Database {
     // ==================== Message Operations ====================
 
     /// Add a message to a conversation
+    /// 
+    /// If `local_id` is provided, it will be stored for idempotency checks.
+    /// The unique constraint on (conversation_id, local_id) prevents duplicates.
     pub fn add_message(
         &self,
         id: &str,
@@ -356,6 +364,7 @@ impl Database {
         content: &MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
+        local_id: Option<&str>,
     ) -> DbResult<Message> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
@@ -373,8 +382,8 @@ impl Database {
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, local_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 conversation_id,
@@ -384,6 +393,7 @@ impl Database {
                 display_str,
                 usage_str,
                 now.to_rfc3339(),
+                local_id,
             ],
         )?;
 
@@ -431,6 +441,22 @@ impl Database {
 
         let rows = stmt.query_map(params![conversation_id, after_sequence], parse_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// Check if a message with the given local_id already exists for this conversation
+    /// Used for idempotent message sends - returns true if duplicate
+    pub fn message_exists_by_local_id(
+        &self,
+        conversation_id: &str,
+        local_id: &str,
+    ) -> DbResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND local_id = ?2",
+            params![conversation_id, local_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Get the last sequence ID for a conversation
@@ -522,6 +548,7 @@ mod tests {
                 &MessageContent::user("Hello"),
                 None,
                 None,
+                Some("local-1"),
             )
             .unwrap();
 
@@ -532,6 +559,7 @@ mod tests {
                 &MessageContent::agent(vec![ContentBlock::text("Hi there!")]),
                 None,
                 None,
+                None, // Agent messages don't have local_id
             )
             .unwrap();
 

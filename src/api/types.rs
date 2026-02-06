@@ -14,8 +14,13 @@ pub struct CreateConversationRequest {
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub text: String,
+    /// Client-generated UUID for idempotency - prevents duplicate messages on retry
+    pub local_id: String,
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    /// Browser user agent for display (e.g., show iPhone icon)
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 /// Image attachment in a chat message

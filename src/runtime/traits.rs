@@ -14,12 +14,16 @@ use tokio_util::sync::CancellationToken;
 #[async_trait]
 pub trait MessageStore: Send + Sync {
     /// Add a message to the conversation
+    /// 
+    /// `local_id` is a client-generated UUID for idempotency (user messages only).
+    /// The database has a unique constraint on (conversation_id, local_id) to prevent duplicates.
     async fn add_message(
         &self,
         conv_id: &str,
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
+        local_id: Option<&str>,
     ) -> Result<Message, String>;
 
     /// Get all messages for a conversation
@@ -83,8 +87,9 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
+        local_id: Option<&str>,
     ) -> Result<Message, String> {
-        (**self).add_message(conv_id, content, display_data, usage_data).await
+        (**self).add_message(conv_id, content, display_data, usage_data, local_id).await
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
@@ -168,10 +173,11 @@ impl MessageStore for DatabaseStorage {
         content: &MessageContent,
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
+        local_id: Option<&str>,
     ) -> Result<Message, String> {
         let id = uuid::Uuid::new_v4().to_string();
         self.db
-            .add_message(&id, conv_id, content, display_data, usage_data)
+            .add_message(&id, conv_id, content, display_data, usage_data, local_id)
             .map_err(|e| e.to_string())
     }
 

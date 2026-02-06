@@ -14,6 +14,12 @@ pub enum Effect {
         content: MessageContent,
         display_data: Option<Value>,
         usage_data: Option<UsageData>,
+        /// Client-generated UUID for idempotency (user messages only)
+        local_id: Option<String>,
+        /// User agent string for UI display (user messages only)
+        /// Stored in display_data by persist_user_message, not read directly from here
+        #[allow(dead_code)]
+        user_agent: Option<String>,
     },
 
     /// Persist the new state
@@ -51,16 +57,25 @@ pub enum Effect {
 }
 
 impl Effect {
-    pub fn persist_user_message(text: impl Into<String>, images: Vec<ImageData>) -> Self {
+    pub fn persist_user_message(
+        text: impl Into<String>,
+        images: Vec<ImageData>,
+        local_id: String,
+        user_agent: Option<String>,
+    ) -> Self {
         let content = if images.is_empty() {
             MessageContent::user(text)
         } else {
             MessageContent::user_with_images(text, images)
         };
+        // Store user_agent in display_data for UI to show device icon
+        let display_data = user_agent.map(|ua| serde_json::json!({ "user_agent": ua }));
         Effect::PersistMessage {
             content,
-            display_data: None,
+            display_data,
             usage_data: None,
+            local_id: Some(local_id),
+            user_agent: None, // Already in display_data
         }
     }
 
@@ -69,6 +84,8 @@ impl Effect {
             content: MessageContent::agent(blocks),
             display_data: None,
             usage_data: usage,
+            local_id: None,
+            user_agent: None,
         }
     }
 
@@ -82,6 +99,8 @@ impl Effect {
             content: MessageContent::tool(tool_use_id, output, is_error),
             display_data,
             usage_data: None,
+            local_id: None,
+            user_agent: None,
         }
     }
 

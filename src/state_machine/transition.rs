@@ -71,10 +71,10 @@ pub fn transition(
         // ============================================================
 
         // Idle or Error + UserMessage -> LlmRequesting (recovery from Error, REQ-BED-006)
-        (ConvState::Idle | ConvState::Error { .. }, Event::UserMessage { text, images }) => {
+        (ConvState::Idle | ConvState::Error { .. }, Event::UserMessage { text, images, local_id, user_agent }) => {
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_user_message(text, images))
+                    .with_effect(Effect::persist_user_message(text, images, local_id, user_agent))
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
@@ -826,6 +826,8 @@ mod tests {
             Event::UserMessage {
                 text: "Hello".to_string(),
                 images: vec![],
+                local_id: "test-local-id".to_string(),
+                user_agent: None,
             },
         )
         .unwrap();
@@ -845,6 +847,8 @@ mod tests {
             Event::UserMessage {
                 text: "Hello".to_string(),
                 images: vec![],
+                local_id: "test-local-id".to_string(),
+                user_agent: None,
             },
         );
 
@@ -862,6 +866,8 @@ mod tests {
             Event::UserMessage {
                 text: "Try again".to_string(),
                 images: vec![],
+                local_id: "test-local-id".to_string(),
+                user_agent: None,
             },
         )
         .unwrap();

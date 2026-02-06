@@ -267,6 +267,8 @@ where
                 content,
                 display_data,
                 usage_data,
+                local_id,
+                user_agent: _, // user_agent stored in display_data if needed
             } => {
                 let msg = self
                     .storage
@@ -275,6 +277,7 @@ where
                         &content,
                         display_data.as_ref(),
                         usage_data.as_ref(),
+                        local_id.as_deref(),
                     )
                     .await?;
 
@@ -486,6 +489,7 @@ where
                             &content,
                             None,
                             None,
+                            None, // Tool results don't have local_id
                         )
                         .await?;
 
@@ -567,6 +571,7 @@ where
                         &content,
                         None,
                         None,
+                        None, // System messages don't have local_id
                     )
                     .await?;
                 Ok(None)

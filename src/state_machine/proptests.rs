@@ -158,6 +158,8 @@ fn arb_user_message_event() -> impl Strategy<Value = Event> {
     "[a-zA-Z ]{1,30}".prop_map(|text| Event::UserMessage {
         text,
         images: vec![],
+        local_id: uuid::Uuid::new_v4().to_string(),
+        user_agent: None,
     })
 }
 
@@ -295,6 +297,8 @@ proptest! {
         let event = Event::UserMessage {
             text: "retry".to_string(),
             images: vec![],
+            local_id: uuid::Uuid::new_v4().to_string(),
+            user_agent: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -356,6 +360,8 @@ proptest! {
         let event = Event::UserMessage {
             text: "hi".to_string(),
             images: vec![],
+            local_id: uuid::Uuid::new_v4().to_string(),
+            user_agent: None,
         };
         let result = transition(&state, &test_context(), event);
         // Busy states either return AgentBusy, CancellationInProgress, or InvalidTransition
@@ -388,6 +394,8 @@ proptest! {
         let event = Event::UserMessage {
             text,
             images: vec![],
+            local_id: uuid::Uuid::new_v4().to_string(),
+            user_agent: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -752,6 +760,8 @@ fn test_complete_tool_cycle() {
         Event::UserMessage {
             text: "run ls".to_string(),
             images: vec![],
+            local_id: uuid::Uuid::new_v4().to_string(),
+            user_agent: None,
         },
     )
     .unwrap();

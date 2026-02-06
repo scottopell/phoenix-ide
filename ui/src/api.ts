@@ -131,11 +131,21 @@ export const api = {
     return resp.json();
   },
 
-  async sendMessage(convId: string, text: string, images: ImageData[] = []): Promise<{ queued: boolean }> {
+  async sendMessage(
+    convId: string,
+    text: string,
+    images: ImageData[] = [],
+    localId: string,
+  ): Promise<{ queued: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, images }),
+      body: JSON.stringify({
+        text,
+        images,
+        local_id: localId,
+        user_agent: navigator.userAgent,
+      }),
     });
     if (!resp.ok) throw new Error('Failed to send message');
     return resp.json();

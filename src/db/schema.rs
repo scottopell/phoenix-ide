@@ -40,11 +40,13 @@ CREATE TABLE IF NOT EXISTS messages (
     display_data TEXT,
     usage_data TEXT,
     created_at TEXT NOT NULL,
+    local_id TEXT,
     
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(conversation_id, local_id) WHERE local_id IS NOT NULL;
 "#;
 
 /// Migration SQL to convert old state format to typed JSON
@@ -67,6 +69,17 @@ WHERE state NOT LIKE '{%}';
 pub const MIGRATION_ADD_MODEL: &str = r"
 -- This is a no-op if the column already exists
 -- SQLite will return an error which we'll ignore
+";
+
+/// Migration SQL to add local_id column for idempotent message sends
+pub const MIGRATION_ADD_LOCAL_ID: &str = r"
+-- Add local_id column if it doesn't exist (SQLite will error if it does, which we ignore)
+ALTER TABLE messages ADD COLUMN local_id TEXT;
+";
+
+/// Create unique index on local_id (separate so we can ignore ALTER error but still create index)
+pub const MIGRATION_LOCAL_ID_INDEX: &str = r"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(conversation_id, local_id) WHERE local_id IS NOT NULL;
 ";
 
 /// Conversation record

@@ -272,7 +272,7 @@ export function ConversationPage() {
 
     try {
       if (isOnline) {
-        await enhancedApi.sendMessage(conversationId, text, images);
+        await enhancedApi.sendMessage(conversationId, text, images, localId);
         markSentRef.current(localId);
         setAgentWorking(true);
         setBreadcrumbs([{ type: 'user', label: 'User' }]);
@@ -281,7 +281,7 @@ export function ConversationPage() {
         await queueOperation({
           type: 'send_message',
           conversationId,
-          payload: { text, images },
+          payload: { text, images, localId },
           createdAt: new Date(),
           retryCount: 0,
           status: 'pending'

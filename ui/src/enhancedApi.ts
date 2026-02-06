@@ -312,9 +312,14 @@ class EnhancedAPI {
     return conversation;
   }
   
-  async sendMessage(convId: string, text: string, images: ImageData[] = []): Promise<{ queued: boolean }> {
+  async sendMessage(
+    convId: string,
+    text: string,
+    images: ImageData[] = [],
+    localId: string,
+  ): Promise<{ queued: boolean }> {
     // For offline support, this will be handled by the app machine
-    return baseApi.sendMessage(convId, text, images);
+    return baseApi.sendMessage(convId, text, images, localId);
   }
   
   async archiveConversation(convId: string): Promise<void> {
