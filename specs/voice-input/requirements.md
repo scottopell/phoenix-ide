@@ -70,7 +70,7 @@ WHEN microphone permission is not granted
 THE SYSTEM SHALL display a clear message explaining how to grant permission
 AND provide a button to retry permission request if possible
 
-WHEN speech recognition fails due to network or service issues
+WHEN speech recognition fails due to service issues
 THE SYSTEM SHALL display an appropriate error message
 AND preserve any partial transcription if available
 AND allow the user to retry

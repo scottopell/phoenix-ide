@@ -55,7 +55,7 @@ type VoiceState =
   | 'error'         // Error occurred
 
 interface VoiceError {
-  type: 'permission' | 'network' | 'not-supported' | 'unknown';
+  type: 'permission' | 'not-supported' | 'unknown';
   message: string;
   recoverable: boolean;
 }
@@ -123,11 +123,6 @@ interface ErrorRecovery {
     retriable: true,
     fallback: 'Use keyboard voice input'
   },
-  'network': {
-    action: 'Show offline message',
-    retriable: true,
-    fallback: 'Try again when connected'
-  },
   'not-supported': {
     action: 'Hide voice button',
     retriable: false,
@@ -167,7 +162,6 @@ interface ErrorRecovery {
 2. **Data Handling**:
    - No audio storage
    - Transcription only
-   - Respect browser DNT settings
 
 3. **Visual Design**:
    - Standard microphone icon (🎙️)
@@ -196,7 +190,7 @@ No backend changes required - voice input produces text that follows the existin
 ## Performance Considerations
 
 1. **Lazy Loading**: Load speech recognition only when requested
-2. **Timeout Management**: 30s maximum recording time
+2. **Continuous Recording**: No artificial time limits - user controls when to stop
 3. **Memory Cleanup**: Properly dispose of recognition instances
 4. **Network Efficiency**: Batch interim results updates
 
