@@ -1,5 +1,4 @@
 export { useLocalStorage, useLocalStorageString } from './useLocalStorage';
-export { useSettings } from './useSettings';
 export { useDraft } from './useDraft';
 export { useMessageQueue } from './useMessageQueue';
 export type { QueuedMessage, MessageStatus } from './useMessageQueue';

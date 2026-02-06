@@ -21,17 +21,17 @@ export function ConversationPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [convState, setConvState] = useState('idle');
   const [stateData, setStateData] = useState<ConversationState | null>(null);
-  const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
+  const [_breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
   const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [contextWindowUsed, setContextWindowUsed] = useState(0);
+  const [_contextWindowUsed, setContextWindowUsed] = useState(0);
   const [initialLoadComplete, setInitialLoadComplete] = useState(false);
   const [lastDataSource, setLastDataSource] = useState<'memory' | 'indexeddb' | 'network' | null>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set()); // Track localIds being sent
 
   // App state for offline support
-  const { isOnline, queueOperation, showSyncStatus } = useAppMachine();
+  const { isOnline, queueOperation, showSyncStatus: _showSyncStatus } = useAppMachine();
 
   // Draft management
   const [draft, setDraft, clearDraft] = useDraft(conversationId);
