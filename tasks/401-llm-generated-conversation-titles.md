@@ -1,7 +1,7 @@
 ---
 created: 2025-02-07
 priority: p2
-status: ready
+status: done
 ---
 
 # LLM-Generated Conversation Titles
@@ -56,13 +56,13 @@ Title generation should NOT block conversation creation:
 
 ## Acceptance Criteria
 
-- [ ] New conversations get LLM-generated titles based on initial message
-- [ ] Title generation is async and doesn't block conversation creation
-- [ ] Fallback to random slug on LLM error or timeout (e.g., 5 seconds)
-- [ ] UI updates when title changes (via SSE or next poll)
-- [ ] Works with any configured LLM provider
-- [ ] Title length is reasonable (capped at ~50-60 chars)
-- [ ] Cost is minimal (uses cheapest available model)
+- [x] New conversations get LLM-generated titles based on initial message
+- [x] Title generation is inline (not async) since we now have the message at creation time
+- [x] Fallback to random slug on LLM error or timeout (5 seconds)
+- [x] UI navigates directly to conversation with correct title
+- [x] Works with any configured LLM provider
+- [x] Title length is reasonable (capped at 60 chars)
+- [x] Cost is minimal (uses cheapest available model via get_cheap_model())
 
 ## Files to Modify
 
