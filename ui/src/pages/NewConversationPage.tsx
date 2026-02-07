@@ -8,6 +8,8 @@ import type { ModelsResponse, ImageData } from '../api';
 
 const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
+const LAST_CWD_KEY = 'phoenix-last-cwd';
+const LAST_MODEL_KEY = 'phoenix-last-model';
 
 async function fileToBase64(file: File): Promise<ImageData> {
   return new Promise((resolve, reject) => {
@@ -30,14 +32,15 @@ export function NewConversationPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
-  const [cwd, setCwd] = useState('/home/exedev');
+  // Load defaults from localStorage
+  const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '/home/exedev');
   const [models, setModels] = useState<ModelsResponse | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ImageData[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [pathValid, setPathValid] = useState(true);
+  const [showSettings, setShowSettings] = useState(false);
   
   // Voice input
   const voiceSupported = isWebSpeechSupported();
@@ -48,38 +51,24 @@ export function NewConversationPage() {
   useEffect(() => {
     enhancedApi.listModels().then(modelsData => {
       setModels(modelsData);
-      setSelectedModel(modelsData.default);
+      if (!selectedModel) {
+        setSelectedModel(modelsData.default);
+      }
     }).catch(err => {
       console.error('Failed to load models:', err);
-      setError('Failed to load available models');
     });
-  }, []);
+  }, [selectedModel]);
 
-  // Validate path
+  // Save preferences when they change
   useEffect(() => {
-    const validate = async () => {
-      const trimmed = cwd.trim();
-      if (!trimmed) {
-        setPathValid(false);
-        return;
-      }
-      
-      const validation = await enhancedApi.validateCwd(trimmed);
-      if (validation.valid) {
-        setPathValid(true);
-        setError(null);
-        return;
-      }
-      
-      // Check if parent exists (we can create this directory)
-      const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-      const parentValidation = await enhancedApi.validateCwd(parentPath);
-      setPathValid(parentValidation.valid);
-      setError(null);
-    };
-    
-    validate();
+    localStorage.setItem(LAST_CWD_KEY, cwd);
   }, [cwd]);
+
+  useEffect(() => {
+    if (selectedModel) {
+      localStorage.setItem(LAST_MODEL_KEY, selectedModel);
+    }
+  }, [selectedModel]);
 
   // Auto-resize textarea
   const autoResize = () => {
@@ -101,22 +90,16 @@ export function NewConversationPage() {
 
   const addImages = async (files: File[]) => {
     const validFiles = files.filter(file => {
-      if (!SUPPORTED_TYPES.includes(file.type)) {
-        console.warn(`Unsupported image type: ${file.type}`);
-        return false;
-      }
-      if (file.size > MAX_IMAGE_SIZE) {
-        console.warn(`Image too large: ${file.name}`);
-        return false;
-      }
+      if (!SUPPORTED_TYPES.includes(file.type)) return false;
+      if (file.size > MAX_IMAGE_SIZE) return false;
       return true;
     });
 
     try {
       const newImages = await Promise.all(validFiles.map(fileToBase64));
       setImages([...images, ...newImages]);
-    } catch (error) {
-      console.error('Error processing images:', error);
+    } catch (err) {
+      console.error('Error processing images:', err);
     }
   };
 
@@ -153,27 +136,24 @@ export function NewConversationPage() {
   const handleSend = async () => {
     const trimmed = draft.trim();
     if (!trimmed && images.length === 0) return;
-    if (!pathValid || creating) return;
+    if (creating) return;
 
     setError(null);
     setCreating(true);
 
     try {
-      // Create directory if needed
+      // Validate/create directory if needed
       const validation = await enhancedApi.validateCwd(cwd.trim());
       if (!validation.valid) {
         const mkdirResult = await enhancedApi.mkdir(cwd.trim());
         if (!mkdirResult.created) {
-          setError(mkdirResult.error || 'Failed to create directory');
+          setError(mkdirResult.error || 'Invalid directory');
           setCreating(false);
           return;
         }
       }
 
-      // Generate message ID
       const messageId = crypto.randomUUID();
-
-      // Create conversation with initial message
       const conv = await enhancedApi.createConversation(
         cwd.trim(),
         trimmed,
@@ -182,7 +162,6 @@ export function NewConversationPage() {
         images
       );
 
-      // Navigate to the new conversation
       navigate(`/c/${conv.slug}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
@@ -202,19 +181,9 @@ export function NewConversationPage() {
     if (!text) return;
     setInterimText('');
     const baseDraft = draftBeforeVoiceRef.current || draft;
-    const newDraft = baseDraft.trim() 
-      ? baseDraft.trimEnd() + ' ' + text 
-      : text;
+    const newDraft = baseDraft.trim() ? baseDraft.trimEnd() + ' ' + text : text;
     setDraft(newDraft);
     draftBeforeVoiceRef.current = newDraft;
-
-    requestAnimationFrame(() => {
-      if (textareaRef.current) {
-        textareaRef.current.focus();
-        const len = textareaRef.current.value.length;
-        textareaRef.current.setSelectionRange(len, len);
-      }
-    });
   };
 
   const handleVoiceInterim = (text: string) => {
@@ -225,101 +194,76 @@ export function NewConversationPage() {
   };
 
   const hasContent = draft.trim().length > 0 || images.length > 0;
-  const canSend = hasContent && pathValid && !creating;
+  const canSend = hasContent && !creating;
+
+  // Format display values
+  const cwdDisplay = cwd.replace(/^\/home\/exedev\/?/, '~/') || '~/';
+  const modelDisplay = selectedModel?.split('-').slice(0, 2).join('-') || 'loading...';
 
   return (
-    <div id="app" className="new-conversation-page">
-      <header className="new-conv-header">
-        <button 
-          className="back-btn" 
-          onClick={() => navigate('/')}
-          aria-label="Back to conversations"
-        >
+    <div className="new-conv-page">
+      {/* Minimal header */}
+      <header className="new-conv-header-minimal">
+        <button className="back-link" onClick={() => navigate('/')}>
           ← Back
         </button>
-        <h2>New Conversation</h2>
       </header>
 
-      <main className="new-conv-main">
-        <div className="new-conv-settings">
-          <div className="setting-group">
-            <label>Working Directory</label>
-            <DirectoryPicker value={cwd} onChange={setCwd} />
-          </div>
+      {/* Centered content */}
+      <main className="new-conv-center">
+        <h1 className="new-conv-title">New conversation</h1>
+        
+        {error && <div className="new-conv-error">{error}</div>}
 
-          <div className="setting-group">
-            <label>Model</label>
-            <select 
-              value={selectedModel || ''}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              className="model-select"
-              disabled={!models || creating}
-            >
-              {!models ? (
-                <option>Loading models...</option>
-              ) : (
-                models.models.map(model => (
-                  <option key={model.id} value={model.id}>
-                    {model.id} - {model.description}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
-        </div>
-
-        {error && (
-          <div className="error-banner">
-            {error}
-          </div>
-        )}
-
-        <div className="new-conv-input-area">
+        <div className="new-conv-input-box">
           <ImageAttachments images={images} onRemove={handleRemoveImage} />
           
-          <div className="input-row">
-            <button
-              className="attach-btn"
-              onClick={() => fileInputRef.current?.click()}
-              title="Attach image"
-              aria-label="Attach image"
-              disabled={creating}
-            >
-              📎
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept={SUPPORTED_TYPES.join(',')}
-              multiple
-              onChange={handleFileChange}
-              style={{ display: 'none' }}
-            />
-            {voiceSupported && (
-              <VoiceRecorder
-                onSpeech={handleVoiceFinal}
-                onInterim={handleVoiceInterim}
+          <textarea
+            ref={textareaRef}
+            className="new-conv-textarea"
+            placeholder="What would you like to work on?"
+            rows={3}
+            value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              if (interimText) {
+                setInterimText('');
+                draftBeforeVoiceRef.current = '';
+              }
+            }}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            disabled={creating}
+          />
+          
+          <div className="new-conv-input-actions">
+            <div className="new-conv-input-left">
+              <button
+                className="icon-btn"
+                onClick={() => fileInputRef.current?.click()}
+                title="Attach image"
                 disabled={creating}
+              >
+                📎
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={SUPPORTED_TYPES.join(',')}
+                multiple
+                onChange={handleFileChange}
+                style={{ display: 'none' }}
               />
-            )}
-            <textarea
-              ref={textareaRef}
-              placeholder="What would you like to work on?"
-              rows={3}
-              value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
-              onChange={(e) => {
-                setDraft(e.target.value);
-                if (interimText) {
-                  setInterimText('');
-                  draftBeforeVoiceRef.current = '';
-                }
-              }}
-              onKeyDown={handleKeyDown}
-              onPaste={handlePaste}
-              disabled={creating}
-            />
+              {voiceSupported && (
+                <VoiceRecorder
+                  onSpeech={handleVoiceFinal}
+                  onInterim={handleVoiceInterim}
+                  disabled={creating}
+                />
+              )}
+            </div>
             <button
-              className="send-btn"
+              className="new-conv-send"
               onClick={handleSend}
               disabled={!canSend}
             >
@@ -327,6 +271,41 @@ export function NewConversationPage() {
             </button>
           </div>
         </div>
+
+        {/* Subtle settings row */}
+        <div className="new-conv-settings-row">
+          <button 
+            className="settings-toggle"
+            onClick={() => setShowSettings(!showSettings)}
+          >
+            <span className="settings-summary">
+              {cwdDisplay} · {modelDisplay}
+            </span>
+            <span className="settings-caret">{showSettings ? '▲' : '▼'}</span>
+          </button>
+        </div>
+
+        {/* Expandable settings */}
+        {showSettings && (
+          <div className="new-conv-settings-panel">
+            <div className="settings-field">
+              <label>Working Directory</label>
+              <DirectoryPicker value={cwd} onChange={setCwd} />
+            </div>
+            <div className="settings-field">
+              <label>Model</label>
+              <select
+                value={selectedModel || ''}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                disabled={!models}
+              >
+                {models?.models.map(m => (
+                  <option key={m.id} value={m.id}>{m.id}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

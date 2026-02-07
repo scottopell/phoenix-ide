@@ -3094,159 +3094,230 @@ html * {
 }
 
 /* ============================================================
- * New Conversation Page
+ * New Conversation Page - Minimal Design
  * ============================================================ */
 
-.new-conversation-page {
+.new-conv-page {
+  min-height: 100vh;
+  background: var(--bg-primary);
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  background: var(--bg-primary);
 }
 
-.new-conv-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
+.new-conv-header-minimal {
   padding: 16px 20px;
-  border-bottom: 1px solid var(--border-color);
-  background: var(--bg-secondary);
 }
 
-.new-conv-header h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
+.back-link {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px 0;
 }
 
-.new-conv-main {
+.back-link:hover {
+  color: var(--text-primary);
+}
+
+.new-conv-center {
   flex: 1;
   display: flex;
   flex-direction: column;
+  align-items: center;
+  justify-content: center;
   padding: 20px;
-  max-width: 800px;
+  max-width: 600px;
   margin: 0 auto;
   width: 100%;
   box-sizing: border-box;
 }
 
-.new-conv-settings {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  margin-bottom: 24px;
-}
-
-.setting-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.setting-group label {
-  font-size: 14px;
+.new-conv-title {
+  font-size: 24px;
   font-weight: 500;
-  color: var(--text-secondary);
+  color: var(--text-primary);
+  margin: 0 0 24px 0;
 }
 
-.new-conv-input-area {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
+.new-conv-error {
+  background: var(--error-bg, rgba(239, 68, 68, 0.1));
+  color: var(--error-color, #ef4444);
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 14px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
-.new-conv-input-area .input-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 12px;
+.new-conv-input-box {
+  width: 100%;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 12px;
+  padding: 12px;
+  box-sizing: border-box;
 }
 
-.new-conv-input-area textarea {
-  flex: 1;
-  resize: none;
+.new-conv-textarea {
+  width: 100%;
   border: none;
   background: transparent;
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.5;
-  padding: 8px 0;
   color: var(--text-primary);
   font-family: inherit;
-  min-height: 60px;
+  resize: none;
+  min-height: 80px;
+  box-sizing: border-box;
 }
 
-.new-conv-input-area textarea:focus {
+.new-conv-textarea:focus {
   outline: none;
 }
 
-.new-conv-input-area textarea::placeholder {
+.new-conv-textarea::placeholder {
   color: var(--text-tertiary);
 }
 
-.new-conv-input-area .attach-btn {
+.new-conv-input-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+}
+
+.new-conv-input-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.icon-btn {
   background: transparent;
   border: none;
   cursor: pointer;
-  padding: 8px;
-  font-size: 18px;
+  padding: 6px;
+  font-size: 16px;
   color: var(--text-secondary);
   border-radius: 6px;
-  transition: background 0.15s;
+  transition: background 0.15s, color 0.15s;
 }
 
-.new-conv-input-area .attach-btn:hover {
+.icon-btn:hover {
   background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
-.new-conv-input-area .attach-btn:disabled {
+.icon-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-.new-conv-input-area .send-btn {
+.new-conv-send {
   background: var(--primary-color);
   color: white;
   border: none;
-  padding: 10px 20px;
-  border-radius: 8px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 14px;
   font-weight: 500;
   cursor: pointer;
   transition: opacity 0.15s;
 }
 
-.new-conv-input-area .send-btn:disabled {
-  opacity: 0.5;
+.new-conv-send:disabled {
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
-.new-conv-input-area .send-btn:not(:disabled):hover {
+.new-conv-send:not(:disabled):hover {
   opacity: 0.9;
 }
 
-.error-banner {
-  background: var(--error-bg, #fef2f2);
-  color: var(--error-color, #ef4444);
-  padding: 12px 16px;
+/* Settings row - subtle, below input */
+.new-conv-settings-row {
+  margin-top: 12px;
+  width: 100%;
+}
+
+.settings-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  transition: color 0.15s;
+}
+
+.settings-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.settings-summary {
+  font-family: var(--font-mono, monospace);
+}
+
+.settings-caret {
+  font-size: 10px;
+}
+
+/* Expandable settings panel */
+.new-conv-settings-panel {
+  margin-top: 12px;
+  padding: 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.settings-field {
   margin-bottom: 16px;
+}
+
+.settings-field:last-child {
+  margin-bottom: 0;
+}
+
+.settings-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.settings-field select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
   font-size: 14px;
 }
 
 /* Mobile adjustments */
 @media (max-width: 768px) {
-  .new-conv-main {
+  .new-conv-center {
     padding: 16px;
+    justify-content: flex-start;
+    padding-top: 40px;
   }
   
-  .new-conv-input-area .input-row {
-    padding: 8px;
-  }
-  
-  .new-conv-input-area .send-btn {
-    padding: 8px 16px;
+  .new-conv-title {
+    font-size: 20px;
   }
 }
