@@ -7,6 +7,7 @@
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
+    cdp::js_protocol::runtime::EventConsoleApiCalled,
     Page,
 };
 use futures::StreamExt;
@@ -65,6 +66,8 @@ pub struct BrowserSession {
     browser: Browser,
     #[allow(dead_code)] // Task must stay alive
     handler_task: JoinHandle<()>,
+    #[allow(dead_code)] // Task must stay alive
+    console_task: Option<JoinHandle<()>>,
     /// The current page (public for tool access)
     pub page: Page,
     /// Console logs captured from the page
@@ -80,15 +83,11 @@ impl BrowserSession {
         let user_data_dir = format!("/tmp/phoenix-chrome-{conversation_id}");
 
         let config = BrowserConfig::builder()
-            .with_head() // Will use headless if no display
-            .no_sandbox()
-            .disable_default_args()
-            .arg("--headless=new")
-            .arg("--no-sandbox")
-            .arg("--disable-gpu")
-            .arg("--disable-dev-shm-usage")
+            .new_headless_mode() // Uses --headless=new for modern headless
+            .no_sandbox() // Required for running as root / in containers
+            .arg("--disable-gpu") // No GPU in server environment
             .arg("--disable-software-rasterizer")
-            .arg(format!("--user-data-dir={user_data_dir}"))
+            .user_data_dir(&user_data_dir)
             .viewport(chromiumoxide::handler::viewport::Viewport {
                 width: DEFAULT_VIEWPORT_WIDTH,
                 height: DEFAULT_VIEWPORT_HEIGHT,
@@ -124,10 +123,49 @@ impl BrowserSession {
         Ok(Self {
             browser,
             handler_task,
+            console_task: None, // Set up later via setup_console_listener
             page,
             console_logs: VecDeque::with_capacity(MAX_CONSOLE_LOGS),
             last_activity: Instant::now(),
         })
+    }
+
+    /// Set up console log listener (called after session is wrapped in Arc<RwLock>)
+    pub async fn setup_console_listener(session: Arc<RwLock<Self>>) -> Result<(), BrowserError> {
+        // Get the page and create event listener
+        let mut console_events = {
+            let guard = session.read().await;
+            guard.page.event_listener::<EventConsoleApiCalled>().await?
+        };
+
+        // Spawn task to capture console events
+        let session_clone = session.clone();
+        let task = tokio::spawn(async move {
+            while let Some(event) = console_events.next().await {
+                // Extract log level and message
+                let level = format!("{:?}", event.r#type).to_lowercase();
+                let text = event
+                    .args
+                    .iter()
+                    .filter_map(|arg| arg.value.as_ref())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                // Add to session's console logs
+                if let Ok(mut guard) = session_clone.try_write() {
+                    guard.add_console_log(level, text);
+                }
+            }
+        });
+
+        // Store the task handle
+        {
+            let mut guard = session.write().await;
+            guard.console_task = Some(task);
+        }
+
+        Ok(())
     }
 
     /// Add a console log entry
@@ -191,18 +229,20 @@ impl BrowserSessionManager {
             cleanup_task: None,
         });
 
-        // Start background cleanup task
-        let manager_clone = manager.clone();
-        let cleanup_task = tokio::spawn(async move {
+        // Start background cleanup task with weak reference to avoid reference cycle
+        let manager_weak = Arc::downgrade(&manager);
+        tokio::spawn(async move {
             loop {
                 tokio::time::sleep(CLEANUP_INTERVAL).await;
-                manager_clone.cleanup_idle_sessions().await;
+                // Try to upgrade weak reference - if manager is dropped, exit loop
+                if let Some(manager) = manager_weak.upgrade() {
+                    manager.cleanup_idle_sessions().await;
+                } else {
+                    tracing::debug!("BrowserSessionManager dropped, cleanup task exiting");
+                    break;
+                }
             }
         });
-
-        // Store cleanup task handle (we can't mutate Arc, so we just let it run)
-        // The task will be cancelled when the manager is dropped
-        drop(cleanup_task);
 
         manager
     }
@@ -272,6 +312,12 @@ impl BrowserSessionManager {
         tracing::info!(conversation_id, "Creating new browser session");
         let session = BrowserSession::new(conversation_id).await?;
         let session_arc = Arc::new(RwLock::new(session));
+
+        // Set up console log listener
+        if let Err(e) = BrowserSession::setup_console_listener(session_arc.clone()).await {
+            tracing::warn!(error = %e, "Failed to set up console listener");
+        }
+
         sessions.insert(conversation_id.to_string(), session_arc.clone());
 
         Ok(session_arc)
