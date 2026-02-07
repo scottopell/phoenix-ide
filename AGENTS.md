@@ -176,3 +176,59 @@ git tag v0.1.0
 ```
 
 Binaries are built on-demand from git tags—no need to store release artifacts.
+
+---
+
+## UI Design Philosophy
+
+### Information Density, Not Minimalism
+
+Subtle UI ≠ hiding information. A subtle UI is **information-dense**—it communicates clearly without wasting visual elements on redundant information.
+
+**Do:**
+- Show status inline where it's needed (e.g., `DIR ✓ ~/project` tells you validity and value in one glance)
+- Use symbols and color to convey state without adding words
+- Provide feedback for every user action—creation, validation, errors
+- Progressive disclosure: show essentials by default, details on demand
+
+**Don't:**
+- Add labels that repeat what's already obvious from context
+- Use modals or separate screens when inline feedback works
+- Hide state that users need to make decisions
+- Leave users guessing ("did that work?")
+
+### Input-First Design
+
+The primary action should dominate the interface. For a chat app, that's the message input.
+
+- Center the input, make it prominent
+- Settings and configuration are secondary—collapsed by default
+- Remember user preferences (last directory, model) so they rarely need to change them
+- Typing and sending should require zero configuration for the common case
+
+### Feedback Patterns
+
+| State | Visual Pattern |
+|-------|----------------|
+| Valid/Success | Green `✓`, green border |
+| Will be created/Warning | Yellow `+`, yellow border |
+| Invalid/Error | Red `✗`, red border |
+| Loading/Checking | Muted `...` or spinner |
+
+Status indicators go **inline** with the value they describe, not in separate status bars or toasts.
+
+### Animation
+
+- Transitions should be quick (150-250ms) and purposeful
+- Expand/collapse uses smooth height animation
+- No animations that block user input
+- Avoid bounces, overshoots, or playful effects—this is a professional tool
+
+### The Test
+
+Before adding any UI element, ask:
+1. What information does this communicate?
+2. Is that information already available elsewhere on screen?
+3. Does the user need this information to complete their task?
+
+If #2 is yes or #3 is no, don't add it.
