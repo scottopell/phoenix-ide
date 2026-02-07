@@ -3288,6 +3288,16 @@ html * {
   font-size: 12px;
 }
 
+.settings-status {
+  font-size: 11px;
+  margin-right: 3px;
+}
+
+.settings-status.status-ok { color: var(--success-color, #4ade80); }
+.settings-status.status-create { color: var(--warning-color, #facc15); }
+.settings-status.status-error { color: var(--error-color, #f87171); }
+.settings-status.status-checking { opacity: 0.5; }
+
 .settings-dot {
   opacity: 0.4;
 }
@@ -3336,7 +3346,21 @@ html * {
   text-transform: uppercase;
   letter-spacing: 0.3px;
   color: var(--text-tertiary);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
+
+.field-status {
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.field-status.status-ok { color: var(--success-color, #4ade80); }
+.field-status.status-create { color: var(--warning-color, #facc15); }
+.field-status.status-error { color: var(--error-color, #f87171); }
+.field-status.status-checking { opacity: 0.6; }
 
 .settings-input,
 .settings-select {
@@ -3357,6 +3381,10 @@ html * {
   outline: none;
   border-color: var(--text-tertiary);
 }
+
+.settings-input.status-ok { border-color: var(--success-color, #4ade80); }
+.settings-input.status-create { border-color: var(--warning-color, #facc15); }
+.settings-input.status-error { border-color: var(--error-color, #f87171); }
 
 .settings-select {
   cursor: pointer;

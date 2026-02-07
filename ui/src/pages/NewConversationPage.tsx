@@ -10,6 +10,8 @@ const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 
+type DirStatus = 'checking' | 'exists' | 'will-create' | 'invalid';
+
 async function fileToBase64(file: File): Promise<ImageData> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -27,9 +29,9 @@ export function NewConversationPage() {
   const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const cwdInputRef = useRef<HTMLInputElement>(null);
   
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '/home/exedev');
+  const [dirStatus, setDirStatus] = useState<DirStatus>('checking');
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
   const [draft, setDraft] = useState('');
@@ -42,6 +44,7 @@ export function NewConversationPage() {
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
 
+  // Load models
   useEffect(() => {
     enhancedApi.listModels().then(modelsData => {
       setModels(modelsData);
@@ -49,18 +52,48 @@ export function NewConversationPage() {
     }).catch(console.error);
   }, [selectedModel]);
 
+  // Validate directory path
+  useEffect(() => {
+    const trimmed = cwd.trim();
+    if (!trimmed || !trimmed.startsWith('/')) {
+      setDirStatus('invalid');
+      return;
+    }
+
+    setDirStatus('checking');
+    const timeoutId = setTimeout(async () => {
+      try {
+        const validation = await enhancedApi.validateCwd(trimmed);
+        if (validation.valid) {
+          setDirStatus('exists');
+        } else {
+          // Check if parent exists (can create)
+          const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
+          const parentValidation = await enhancedApi.validateCwd(parentPath);
+          setDirStatus(parentValidation.valid ? 'will-create' : 'invalid');
+        }
+      } catch {
+        setDirStatus('invalid');
+      }
+    }, 300); // Debounce
+
+    return () => clearTimeout(timeoutId);
+  }, [cwd]);
+
+  // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  const autoResize = () => {
+  // Auto-resize textarea
+  useEffect(() => {
     const ta = textareaRef.current;
     if (ta) {
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
     }
-  };
+  }, [draft]);
 
-  useEffect(() => { autoResize(); }, [draft]);
+  // Focus textarea on mount
   useEffect(() => { textareaRef.current?.focus(); }, []);
 
   const addImages = async (files: File[]) => {
@@ -98,17 +131,17 @@ export function NewConversationPage() {
   const handleSend = async () => {
     const trimmed = draft.trim();
     if (!trimmed && images.length === 0) return;
-    if (creating) return;
+    if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
     setError(null);
     setCreating(true);
 
     try {
-      const validation = await enhancedApi.validateCwd(cwd.trim());
-      if (!validation.valid) {
+      // Create directory if needed
+      if (dirStatus === 'will-create') {
         const mkdirResult = await enhancedApi.mkdir(cwd.trim());
         if (!mkdirResult.created) {
-          setError(mkdirResult.error || 'Invalid directory');
+          setError(mkdirResult.error || 'Failed to create directory');
           setCreating(false);
           return;
         }
@@ -132,6 +165,8 @@ export function NewConversationPage() {
     }
   };
 
+
+
   const handleVoiceFinal = (text: string) => {
     if (!text) return;
     setInterimText('');
@@ -147,10 +182,31 @@ export function NewConversationPage() {
   };
 
   const hasContent = draft.trim().length > 0 || images.length > 0;
-  const canSend = hasContent && !creating;
+  const canSend = hasContent && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
 
-  const cwdDisplay = cwd.replace(/^\/home\/exedev\/?/, '~/') || '~/';
-  const modelDisplay = models?.models.find(m => m.id === selectedModel)?.id.replace('-sonnet', '').replace('-opus', '') || 'loading...';
+  // Display values
+  const cwdDisplay = cwd.trim().replace(/^\/home\/exedev\/?/, '~/') || '~/';
+  const modelDisplay = models?.models.find(m => m.id === selectedModel)?.id.replace('-sonnet', '').replace('-opus', '') || '...';
+
+  // Status indicator for directory
+  const dirStatusIcon = {
+    'checking': '...',
+    'exists': '✓',
+    'will-create': '+',
+    'invalid': '✗',
+  }[dirStatus];
+
+  const dirStatusClass = {
+    'checking': 'status-checking',
+    'exists': 'status-ok',
+    'will-create': 'status-create',
+    'invalid': 'status-error',
+  }[dirStatus];
+
+  // Button text
+  const buttonText = creating 
+    ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...')
+    : 'Send';
 
   return (
     <div className="new-conv-page">
@@ -188,7 +244,7 @@ export function NewConversationPage() {
               {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
             </div>
             <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
-              {creating ? 'Creating...' : 'Send'}
+              {buttonText}
             </button>
           </div>
         </div>
@@ -196,12 +252,13 @@ export function NewConversationPage() {
         {/* Settings row */}
         <button className="settings-row" onClick={() => setShowSettings(!showSettings)}>
           <span className="settings-item">
-            <span className="settings-label">Directory</span>
+            <span className="settings-label">dir</span>
+            <span className={`settings-status ${dirStatusClass}`}>{dirStatusIcon}</span>
             <span className="settings-value">{cwdDisplay}</span>
           </span>
           <span className="settings-dot">·</span>
           <span className="settings-item">
-            <span className="settings-label">Model</span>
+            <span className="settings-label">model</span>
             <span className="settings-value">{modelDisplay}</span>
           </span>
           <span className={`settings-caret ${showSettings ? 'open' : ''}`}>›</span>
@@ -211,11 +268,18 @@ export function NewConversationPage() {
         <div className={`settings-panel ${showSettings ? 'open' : ''}`}>
           <div className="settings-panel-inner">
             <label className="settings-field">
-              <span className="settings-field-label">Working Directory</span>
+              <span className="settings-field-label">
+                Directory
+                <span className={`field-status ${dirStatusClass}`}>
+                  {dirStatus === 'exists' && 'exists'}
+                  {dirStatus === 'will-create' && 'will be created'}
+                  {dirStatus === 'invalid' && 'invalid path'}
+                  {dirStatus === 'checking' && 'checking...'}
+                </span>
+              </span>
               <input
-                ref={cwdInputRef}
                 type="text"
-                className="settings-input"
+                className={`settings-input ${dirStatusClass}`}
                 value={cwd}
                 onChange={(e) => setCwd(e.target.value)}
                 placeholder="/path/to/project"
