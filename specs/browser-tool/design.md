@@ -12,9 +12,20 @@ Native Rust tool using Chrome DevTools Protocol (CDP) for browser automation:
 ## Technology Stack
 
 - **Language**: Rust (consistent with Phoenix IDE)
-- **CDP Library**: Chromium Oxide or direct CDP WebSocket
+- **CDP Library**: `chromiumoxide` - async-first, code-generated CDP client
 - **Chrome**: Headless Chrome with remote debugging enabled
-- **Protocol**: Chrome DevTools Protocol via WebSocket
+- **Protocol**: Chrome DevTools Protocol via WebSocket (handled by chromiumoxide)
+
+### Why chromiumoxide?
+
+| Factor | chromiumoxide | headless_chrome | fantoccini |
+|--------|---------------|-----------------|-------------|
+| Async runtime | Tokio-native ✓ | Mixed sync/async | Tokio |
+| Protocol coverage | Full CDP (code-gen) | Partial | WebDriver only |
+| Process control | Full (Child access) | Full | Requires chromedriver |
+| Performance | High-concurrency design | Heavier | WebDriver overhead |
+
+chromiumoxide is the right layer: it handles CDP protocol complexity while giving us full control over the Chrome process lifecycle.
 
 ---
 
@@ -39,26 +50,88 @@ Conversation starts
 First browser_* tool call
     |
     v
-Chrome process launched
+Chrome process launched (PID stored)
     |
     v
-Subsequent tool calls reuse browser
+Subsequent tool calls reuse browser (updates last_activity timestamp)
     |
     v
-[30 min idle OR conversation ends]
+[30 min idle OR conversation deleted OR server shutdown]
     |
     v
-Chrome process terminated
+Chrome process terminated (SIGKILL to process group)
 ```
+
+### Chrome Process Cleanup Strategy
+
+Chrome processes are heavyweight (~100MB+ RAM each), so robust cleanup is critical:
+
+**1. Idle Timeout (Primary)**
+- Global `BrowserSessionManager` holds `HashMap<ConversationId, BrowserSession>`
+- Each session tracks `last_activity: Instant` and `chrome_pid: u32`
+- Background task runs every 60 seconds, kills sessions idle > 30 minutes
+- Uses process group kill (`killpg`) to ensure all Chrome child processes die
+
+**2. Explicit Cleanup Hooks**
+- `delete_conversation` API calls `BrowserSessionManager::kill_session(conv_id)`
+- Server shutdown triggers `Drop` impl on `BrowserSessionManager` which kills all sessions
+- Each `BrowserSession` has `Drop` impl that kills its Chrome process group
+
+**3. Orphan Recovery (Startup)**
+- On Phoenix startup, scan for orphaned Chrome processes with `--remote-debugging-port`
+- Kill any Chrome processes spawned by previous Phoenix instances (matching user/cwd)
+- Prevents resource leaks across Phoenix crashes/restarts
+
+**4. Emergency Fallback**
+- Store Chrome PIDs in a temp file (`/tmp/phoenix-chrome-pids.txt`)
+- If process group kill fails, fall back to direct PID kill
+- Log warnings for any cleanup failures
 
 ### Chrome Launch Configuration
 
-- Headless mode enabled
-- No sandbox (for containerized environments)
-- WebSocket debugging enabled
+- Headless mode enabled (`--headless=new`)
+- No sandbox (`--no-sandbox` for containerized environments)
+- WebSocket debugging enabled (`--remote-debugging-port=0` for auto-assign)
+- Disable GPU (`--disable-gpu`)
 - Default viewport: 1280x720 (16:9)
-- Download directory: `/tmp/phoenix-downloads`
-- Screenshot directory: `/tmp/phoenix-screenshots`
+- User data dir: `/tmp/phoenix-chrome-{conversation_id}/`
+- Download directory: `/tmp/phoenix-downloads/`
+- Screenshot directory: `/tmp/phoenix-screenshots/`
+
+---
+
+## Stateless Tool Pattern (REQ-BT-012)
+
+All browser tools follow the stateless pattern - no per-conversation state:
+
+```rust
+/// Browser navigation tool - completely stateless
+pub struct BrowserNavigateTool;
+
+impl Tool for BrowserNavigateTool {
+    fn name(&self) -> &str { "browser_navigate" }
+    
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let input: NavigateInput = serde_json::from_value(input)?;
+        let timeout = input.timeout.unwrap_or(Duration::from_secs(15));
+        
+        // Get browser session via context (correct conversation guaranteed)
+        let mut browser = ctx.browser().await?;
+        
+        // Use chromiumoxide Page API
+        let result = tokio::time::timeout(
+            timeout,
+            browser.page_mut().goto(&input.url)
+        ).await;
+        
+        match result {
+            Ok(Ok(_)) => ToolOutput::success("done"),
+            Ok(Err(e)) => ToolOutput::error(format!("Navigation failed: {e}")),
+            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
+        }
+    }
+}
+```
 
 ---
 
@@ -341,16 +414,131 @@ Structured text suitable for LLM parsing:
 
 ## Implementation Notes
 
-### File Locations (TBD)
+### File Locations
 
-- Browser tool module: `src/tools/browser/`
-- Chrome process manager: `src/tools/browser/chrome.rs`
-- CDP client: `src/tools/browser/cdp.rs`
-- Tool definitions: `src/tools/browser/tools/`
+```
+src/tools/
+├── browser.rs                    # Module entry, exports tools and session manager
+└── browser/
+    ├── session.rs                # BrowserSession + BrowserSessionManager
+    └── tools.rs                  # Tool implementations (navigate, eval, screenshot, etc.)
+```
+
+Note: No `chrome.rs` or `cdp.rs` needed - chromiumoxide handles process spawning and CDP protocol internally.
+
+### ToolContext Integration (REQ-BT-012)
+
+All tools receive `ToolContext` which provides access to browser sessions:
+
+```rust
+/// All context needed for a tool invocation.
+/// Created fresh for each tool call with validated conversation context.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Cancellation signal for long-running operations
+    pub cancel: CancellationToken,
+    
+    /// The conversation this tool is executing within
+    pub conversation_id: String,
+    
+    /// Working directory for file operations
+    pub working_dir: PathBuf,
+    
+    /// Browser session manager (private - access via method only)
+    browser_sessions: Arc<BrowserSessionManager>,
+}
+
+impl ToolContext {
+    /// Get or create browser session for this conversation.
+    /// 
+    /// - Lazily initializes Chrome on first call
+    /// - Returns guard that updates last_activity on drop
+    /// - Conversation ID is derived internally (cannot be wrong)
+    pub async fn browser(&self) -> Result<BrowserSessionGuard<'_>, BrowserError> {
+        self.browser_sessions.get_or_create(&self.conversation_id).await
+    }
+}
+```
+
+**Key invariant:** `browser_sessions` is private. Tools call `ctx.browser()` which internally uses `ctx.conversation_id`. This makes it impossible to accidentally access another conversation's browser.
+
+### Key Types
+
+```rust
+use chromiumoxide::{Browser, Page, Handler};
+
+/// Global manager for all browser sessions (owned by Runtime)
+pub struct BrowserSessionManager {
+    sessions: RwLock<HashMap<String, BrowserSession>>,
+    cleanup_handle: Option<JoinHandle<()>>,
+}
+
+impl BrowserSessionManager {
+    /// Get or create session for conversation (called by ToolContext::browser())
+    pub async fn get_or_create(&self, conversation_id: &str) -> Result<BrowserSessionGuard<'_>, BrowserError>;
+    
+    /// Kill specific session (called on conversation delete)
+    pub async fn kill_session(&self, conversation_id: &str);
+    
+    /// Kill all sessions (called on shutdown)
+    pub async fn shutdown_all(&self);
+}
+
+impl Drop for BrowserSessionManager {
+    fn drop(&mut self) {
+        // Synchronously kill all Chrome processes on server shutdown
+    }
+}
+
+/// Per-conversation browser instance  
+/// Wraps chromiumoxide::Browser with Phoenix-specific state
+pub struct BrowserSession {
+    browser: Browser,              // chromiumoxide Browser (owns Chrome child process)
+    handler_task: JoinHandle<()>,  // CDP event handler task
+    page: Page,                    // Current page (single-tab model)
+    console_logs: VecDeque<ConsoleEntry>,
+    last_activity: Instant,
+}
+
+/// RAII guard returned by ToolContext::browser()
+/// Updates last_activity timestamp on drop
+pub struct BrowserSessionGuard<'a> {
+    session: RwLockWriteGuard<'a, BrowserSession>,
+    conversation_id: String,
+    manager: &'a BrowserSessionManager,
+}
+
+impl<'a> BrowserSessionGuard<'a> {
+    pub fn page(&self) -> &Page { &self.session.page }
+    pub fn page_mut(&mut self) -> &mut Page { &mut self.session.page }
+    pub fn console_logs(&self) -> &VecDeque<ConsoleEntry> { &self.session.console_logs }
+    pub fn console_logs_mut(&mut self) -> &mut VecDeque<ConsoleEntry> { &mut self.session.console_logs }
+}
+
+impl Drop for BrowserSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.session.last_activity = Instant::now();
+    }
+}
+```
+
+chromiumoxide handles all CDP protocol complexity internally:
+- WebSocket connection management
+- Request/response correlation  
+- Event dispatching
+- Process lifecycle (spawn, kill, wait)
+
+### Integration Points
+
+1. **Tool Registration**: Add browser tools to `ToolRegistry::standard()` in `src/tools.rs` (tools are now stateless singletons)
+2. **ToolContext Creation**: Runtime creates `ToolContext` at tool invocation time with `browser_sessions: Arc<BrowserSessionManager>`
+3. **Cleanup Hook**: `delete_conversation` handler calls `runtime.browser_sessions.kill_session(&id)`
+4. **Shutdown Hook**: `BrowserSessionManager::drop()` kills all Chrome processes
+5. **Runtime Ownership**: `Runtime` owns `Arc<BrowserSessionManager>`, passes clone to each `ToolContext`
 
 ### Dependencies
 
+- `chromiumoxide` - Async CDP client with built-in browser lifecycle management
+- `image` - Screenshot resizing (already used by `read_image`)
+- `futures` - For `StreamExt` on the CDP handler
 - Chrome/Chromium installation (headless-shell in containers)
-- WebSocket client for CDP
-- JSON serialization
-- Image processing (resize, format conversion)

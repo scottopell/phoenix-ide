@@ -142,11 +142,15 @@ THE SYSTEM SHALL maintain browser state across tool calls within a conversation
 
 THE SYSTEM SHALL automatically start the browser on first browser tool call
 
-THE SYSTEM SHALL automatically close the browser after idle timeout (e.g., 30 minutes)
+THE SYSTEM SHALL automatically close the browser after idle timeout (30 minutes)
 
 THE SYSTEM SHALL isolate browser state between different conversations
 
-**Rationale:** Agents should not need to manage session IDs or browser lifecycle. An implicit "one browser per conversation" model provides stateful interaction with minimal cognitive overhead.
+WHEN browser tools receive `ToolContext`
+THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.conversation_id`
+AND the mapping from conversation to browser SHALL be enforced by construction
+
+**Rationale:** Agents should not need to manage session IDs or browser lifecycle. The `ToolContext.browser()` method provides correct-by-construction session access - tools cannot accidentally use the wrong conversation's browser.
 
 **User Stories:** US-1, US-2, US-3
 
@@ -157,9 +161,35 @@ THE SYSTEM SHALL isolate browser state between different conversations
 WHILE a conversation is active
 THE SYSTEM SHALL persist browser state (cookies, cache, current page) across tool calls
 
+WHEN `ctx.browser()` is called
+THE SYSTEM SHALL update the session's last-activity timestamp
+AND return a guard that provides access to the browser session
+
 **Rationale:** Natural testing flows like "login → navigate → verify" require state to persist between steps.
 
 **User Stories:** US-2
+
+---
+
+### REQ-BT-012: Stateless Tools with Context Injection
+
+WHEN browser tools are invoked
+THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
+AND derive conversation identity from `ToolContext.conversation_id`
+AND access browser session via `ToolContext.browser()` method
+
+WHEN browser tools are constructed
+THE SYSTEM SHALL NOT store per-conversation state
+AND tool instances SHALL be reusable across conversations
+
+THE `ToolContext.browser()` method SHALL:
+- Use `conversation_id` internally (not exposed to tool)
+- Return a guard that updates activity timestamp on drop
+- Lazily initialize Chrome on first call
+
+**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use wrong conversation's browser because `browser()` derives identity from the context.
+
+**User Stories:** US-1, US-2, US-3
 
 ---
 
@@ -225,6 +255,7 @@ THE SYSTEM SHALL indicate which context (page, service worker) produced each mes
 | REQ-BT-006: Read Image Files | US-1, US-2 | ✅ |
 | REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 | ✅ |
 | REQ-BT-011: State Persistence | US-2 | ✅ |
+| REQ-BT-012: Stateless Tools with Context | US-1, US-2, US-3 | ✅ |
 | REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |

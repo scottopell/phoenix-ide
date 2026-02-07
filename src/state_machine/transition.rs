@@ -7,8 +7,8 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::{ConvContext, ConvState, Effect, Event};
 use super::state::SubAgentResult;
+use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -62,7 +62,7 @@ pub enum TransitionError {
 #[allow(clippy::too_many_lines)] // State machine is inherently complex
 pub fn transition(
     state: &ConvState,
-    _context: &ConvContext,
+    context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, TransitionError> {
     match (state, event) {
@@ -71,15 +71,23 @@ pub fn transition(
         // ============================================================
 
         // Idle or Error + UserMessage -> LlmRequesting (recovery from Error, REQ-BED-006)
-        (ConvState::Idle | ConvState::Error { .. }, Event::UserMessage { text, images, message_id, user_agent }) => {
-            Ok(
-                TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_user_message(text, images, message_id, user_agent))
-                    .with_effect(Effect::PersistState)
-                    .with_effect(notify_llm_requesting(1))
-                    .with_effect(Effect::RequestLlm),
-            )
-        }
+        (
+            ConvState::Idle | ConvState::Error { .. },
+            Event::UserMessage {
+                text,
+                images,
+                message_id,
+                user_agent,
+            },
+        ) => Ok(
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::persist_user_message(
+                    text, images, message_id, user_agent,
+                ))
+                .with_effect(Effect::PersistState)
+                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::RequestLlm),
+        ),
 
         // Busy states + UserMessage -> Reject (REQ-BED-002)
         (ConvState::AwaitingLlm, Event::UserMessage { .. })
@@ -120,18 +128,19 @@ pub fn transition(
                     .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_agent_done()))
-            } else if _context.is_sub_agent {
+            } else if context.is_sub_agent {
                 // Check for terminal tools (submit_result/submit_error)
                 let terminal_tool = tool_calls.iter().find(|t| t.input.is_terminal_tool());
-                
+
                 if let Some(tool) = terminal_tool {
                     // Terminal tool must be the only tool
                     if tool_calls.len() > 1 {
                         return Err(TransitionError::InvalidTransition(
-                            "submit_result/submit_error must be the only tool in response".to_string()
+                            "submit_result/submit_error must be the only tool in response"
+                                .to_string(),
                         ));
                     }
-                    
+
                     // Transition directly to terminal state
                     match &tool.input {
                         crate::state_machine::state::ToolInput::SubmitResult(input) => {
@@ -178,7 +187,12 @@ pub fn transition(
                     })
                     .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
-                    .with_effect(notify_tool_executing(first.name(), &first.id, remaining_count, 0))
+                    .with_effect(notify_tool_executing(
+                        first.name(),
+                        &first.id,
+                        remaining_count,
+                        0,
+                    ))
                     .with_effect(Effect::execute_tool(first)))
                 }
             } else {
@@ -195,7 +209,12 @@ pub fn transition(
                 })
                 .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                 .with_effect(Effect::PersistState)
-                .with_effect(notify_tool_executing(first.name(), &first.id, remaining_count, 0))
+                .with_effect(notify_tool_executing(
+                    first.name(),
+                    &first.id,
+                    remaining_count,
+                    0,
+                ))
                 .with_effect(Effect::execute_tool(first)))
             }
         }
@@ -313,7 +332,12 @@ pub fn transition(
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
-            .with_effect(notify_tool_executing(next_tool.name(), &next_tool.id, remaining_count, completed_count))
+            .with_effect(notify_tool_executing(
+                next_tool.name(),
+                &next_tool.id,
+                remaining_count,
+                completed_count,
+            ))
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
@@ -329,7 +353,10 @@ pub fn transition(
                 tool_use_id,
                 result,
             },
-        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && pending_sub_agents.is_empty() => {
+        ) if tool_use_id == current_tool.id
+            && remaining_tools.is_empty()
+            && pending_sub_agents.is_empty() =>
+        {
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::persist_tool_message(
@@ -356,22 +383,23 @@ pub fn transition(
                 tool_use_id,
                 result,
             },
-        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && !pending_sub_agents.is_empty() => {
+        ) if tool_use_id == current_tool.id
+            && remaining_tools.is_empty()
+            && !pending_sub_agents.is_empty() =>
+        {
             let pending_count = pending_sub_agents.len();
-            Ok(
-                TransitionResult::new(ConvState::AwaitingSubAgents {
-                    pending_ids: pending_sub_agents.clone(),
-                    completed_results: vec![],
-                })
-                    .with_effect(Effect::persist_tool_message(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                        result.display_data(),
-                    ))
-                    .with_effect(Effect::PersistState)
-                    .with_effect(notify_awaiting_sub_agents(pending_count, 0)),
-            )
+            Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
+                pending_ids: pending_sub_agents.clone(),
+                completed_results: vec![],
+            })
+            .with_effect(Effect::persist_tool_message(
+                &result.tool_use_id,
+                &result.output,
+                result.is_error,
+                result.display_data(),
+            ))
+            .with_effect(Effect::PersistState)
+            .with_effect(notify_awaiting_sub_agents(pending_count, 0)))
         }
 
         // ToolExecuting + SpawnAgentsComplete (more tools) -> ToolExecuting (accumulate agents)
@@ -412,7 +440,12 @@ pub fn transition(
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
-            .with_effect(notify_tool_executing(next_tool.name(), &next_tool.id, remaining_count, completed_count))
+            .with_effect(notify_tool_executing(
+                next_tool.name(),
+                &next_tool.id,
+                remaining_count,
+                completed_count,
+            ))
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
@@ -434,20 +467,18 @@ pub fn transition(
             all_pending.extend(agent_ids);
             let pending_count = all_pending.len();
 
-            Ok(
-                TransitionResult::new(ConvState::AwaitingSubAgents {
-                    pending_ids: all_pending,
-                    completed_results: vec![],
-                })
-                    .with_effect(Effect::persist_tool_message(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                        result.display_data(),
-                    ))
-                    .with_effect(Effect::PersistState)
-                    .with_effect(notify_awaiting_sub_agents(pending_count, 0)),
-            )
+            Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
+                pending_ids: all_pending,
+                completed_results: vec![],
+            })
+            .with_effect(Effect::persist_tool_message(
+                &result.tool_use_id,
+                &result.output,
+                result.is_error,
+                result.display_data(),
+            ))
+            .with_effect(Effect::PersistState)
+            .with_effect(notify_awaiting_sub_agents(pending_count, 0)))
         }
 
         // ============================================================
@@ -455,7 +486,7 @@ pub fn transition(
         // ============================================================
 
         // LlmRequesting + UserCancel -> CancellingLlm (parent) or Failed (sub-agent)
-        (ConvState::LlmRequesting { .. }, Event::UserCancel) if !_context.is_sub_agent => {
+        (ConvState::LlmRequesting { .. }, Event::UserCancel) if !context.is_sub_agent => {
             Ok(TransitionResult::new(ConvState::CancellingLlm)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::AbortLlm))
@@ -469,7 +500,7 @@ pub fn transition(
         }
 
         // AwaitingLlm + UserCancel -> Idle (parent) or Failed (sub-agent)
-        (ConvState::AwaitingLlm, Event::UserCancel) if !_context.is_sub_agent => {
+        (ConvState::AwaitingLlm, Event::UserCancel) if !context.is_sub_agent => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -482,14 +513,14 @@ pub fn transition(
                 completed_results,
             },
             Event::UserCancel,
-        ) => {
-            Ok(TransitionResult::new(ConvState::CancellingSubAgents {
-                pending_ids: pending_ids.clone(),
-                completed_results: completed_results.clone(),
-            })
-            .with_effect(Effect::CancelSubAgents { ids: pending_ids.clone() })
-            .with_effect(Effect::PersistState))
-        }
+        ) => Ok(TransitionResult::new(ConvState::CancellingSubAgents {
+            pending_ids: pending_ids.clone(),
+            completed_results: completed_results.clone(),
+        })
+        .with_effect(Effect::CancelSubAgents {
+            ids: pending_ids.clone(),
+        })
+        .with_effect(Effect::PersistState)),
 
         // ToolExecuting + UserCancel -> CancellingTool (parent) or Failed (sub-agent)
         (
@@ -500,7 +531,7 @@ pub fn transition(
                 pending_sub_agents,
             },
             Event::UserCancel,
-        ) if !_context.is_sub_agent => {
+        ) if !context.is_sub_agent => {
             let mut result = TransitionResult::new(ConvState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
                 skipped_tools: remaining_tools.clone(),
@@ -513,7 +544,9 @@ pub fn transition(
 
             // Also cancel any already-spawned sub-agents
             if !pending_sub_agents.is_empty() {
-                result = result.with_effect(Effect::CancelSubAgents { ids: pending_sub_agents.clone() });
+                result = result.with_effect(Effect::CancelSubAgents {
+                    ids: pending_sub_agents.clone(),
+                });
             }
 
             Ok(result)
@@ -546,7 +579,9 @@ pub fn transition(
             validate_no_duplicate_persists(&new_results, persisted_tool_ids)?;
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: new_results })
+                .with_effect(Effect::PersistToolResults {
+                    results: new_results,
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -560,7 +595,7 @@ pub fn transition(
             },
             Event::ToolComplete {
                 tool_use_id: completed_id,
-                result: _,  // Discard actual result, use synthetic
+                result: _, // Discard actual result, use synthetic
             },
         ) if *tool_use_id == completed_id => {
             // Tool finished before we could abort it - still use synthetic result.
@@ -579,7 +614,9 @@ pub fn transition(
             validate_no_duplicate_persists(&new_results, persisted_tool_ids)?;
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: new_results })
+                .with_effect(Effect::PersistToolResults {
+                    results: new_results,
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -635,7 +672,9 @@ pub fn transition(
 
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistSubAgentResults { results: new_results })
+                    .with_effect(Effect::PersistSubAgentResults {
+                        results: new_results,
+                    })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
@@ -671,10 +710,7 @@ pub fn transition(
 
         // CancellingSubAgents + SubAgentResult (last one) -> Idle
         (
-            ConvState::CancellingSubAgents {
-                pending_ids,
-                ..
-            },
+            ConvState::CancellingSubAgents { pending_ids, .. },
             Event::SubAgentResult { agent_id, .. },
         ) if pending_ids.contains(&agent_id) && pending_ids.len() == 1 => {
             Ok(TransitionResult::new(ConvState::Idle)
@@ -685,7 +721,7 @@ pub fn transition(
         // ============================================================
         // Sub-Agent Cancellation (wildcard for non-terminal states)
         // ============================================================
-        (state, Event::UserCancel) if _context.is_sub_agent && !state.is_terminal() => {
+        (state, Event::UserCancel) if context.is_sub_agent && !state.is_terminal() => {
             use crate::state_machine::state::SubAgentOutcome;
             Ok(TransitionResult::new(ConvState::Failed {
                 error: "Cancelled by parent".to_string(),
@@ -712,7 +748,7 @@ pub fn transition(
 // Helper functions
 
 /// Validates that none of the tool results to be persisted have IDs that are already persisted.
-/// This is a critical invariant: each tool_use_id must be persisted exactly once.
+/// This is a critical invariant: each `tool_use_id` must be persisted exactly once.
 fn validate_no_duplicate_persists(
     results: &[ToolResult],
     already_persisted: &HashSet<String>,
@@ -749,7 +785,7 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(1 << (attempt - 1))
 }
 
-/// Helper to create state_change notification for LlmRequesting
+/// Helper to create `state_change` notification for `LlmRequesting`
 fn notify_llm_requesting(attempt: u32) -> Effect {
     Effect::notify_state_change(
         "llm_requesting",
@@ -759,7 +795,7 @@ fn notify_llm_requesting(attempt: u32) -> Effect {
     )
 }
 
-/// Helper to create state_change notification for ToolExecuting
+/// Helper to create `state_change` notification for `ToolExecuting`
 fn notify_tool_executing(
     tool_name: &str,
     tool_id: &str,
@@ -779,7 +815,7 @@ fn notify_tool_executing(
     )
 }
 
-/// Helper to create state_change notification for AwaitingSubAgents
+/// Helper to create `state_change` notification for `AwaitingSubAgents`
 fn notify_awaiting_sub_agents(pending_count: usize, completed_count: usize) -> Effect {
     Effect::notify_state_change(
         "awaiting_sub_agents",
@@ -806,8 +842,6 @@ impl ErrorKind {
         matches!(self, ErrorKind::Network | ErrorKind::RateLimit)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -954,7 +988,7 @@ mod tests {
         already_persisted.insert("tool-1".to_string());
 
         let state = ConvState::CancellingTool {
-            tool_use_id: "tool-1".to_string(),  // This tool would create duplicate
+            tool_use_id: "tool-1".to_string(), // This tool would create duplicate
             skipped_tools: vec![],
             persisted_tool_ids: already_persisted,
         };

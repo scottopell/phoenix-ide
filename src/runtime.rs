@@ -3,6 +3,8 @@
 //! REQ-BED-007: State Persistence
 //! REQ-BED-010: Fixed Working Directory
 //! REQ-BED-011: Real-time Event Streaming
+
+#![allow(dead_code)] // browser_sessions() will be used when browser cleanup is wired up
 //! REQ-BED-012: Context Window Tracking
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
@@ -17,7 +19,7 @@ pub use executor::ConversationRuntime;
 pub use traits::*;
 
 use crate::state_machine::state::{SubAgentOutcome, SubAgentSpec};
-use crate::tools::ToolRegistry;
+use crate::tools::{BrowserSessionManager, ToolRegistry};
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -53,6 +55,7 @@ pub struct SubAgentCancelRequest {
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    browser_sessions: Arc<BrowserSessionManager>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
@@ -82,7 +85,7 @@ pub enum SseEvent {
         message: serde_json::Value,
     },
     StateChange {
-        /// Full state as JSON object (e.g., {"type":"awaiting_sub_agents","pending_ids":[...]})
+        /// Full state as JSON object (e.g., `{"type":"awaiting_sub_agents","pending_ids":[...]}`)
         state: serde_json::Value,
     },
     AgentDone,
@@ -98,12 +101,18 @@ impl RuntimeManager {
         Self {
             db,
             llm_registry,
+            browser_sessions: Arc::new(BrowserSessionManager::default()),
             runtimes: RwLock::new(HashMap::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
         }
+    }
+
+    /// Get the browser session manager
+    pub fn browser_sessions(&self) -> &Arc<BrowserSessionManager> {
+        &self.browser_sessions
     }
 
     /// Get the spawn channel sender (cloned for each runtime)
@@ -119,14 +128,14 @@ impl RuntimeManager {
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
-    /// Must be called once after creating the RuntimeManager
+    /// Must be called once after creating the `RuntimeManager`
     pub async fn start_sub_agent_handler(self: &Arc<Self>) {
         let manager = Arc::clone(self);
-        
+
         // Take the receivers (can only be done once)
         let spawn_rx = self.spawn_rx.write().await.take();
         let cancel_rx = self.cancel_rx.write().await.take();
-        
+
         if let (Some(mut spawn_rx), Some(mut cancel_rx)) = (spawn_rx, cancel_rx) {
             tokio::spawn(async move {
                 loop {
@@ -146,6 +155,7 @@ impl RuntimeManager {
     }
 
     /// Handle a sub-agent spawn request
+    #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(&self, req: SubAgentSpawnRequest) {
         let SubAgentSpawnRequest {
             spec,
@@ -191,7 +201,10 @@ impl RuntimeManager {
         // 2. Insert initial task as synthetic user message
         let message_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::user(&spec.task);
-        if let Err(e) = self.db.add_message(&message_id, &conv.id, &content, None, None) {
+        if let Err(e) = self
+            .db
+            .add_message(&message_id, &conv.id, &content, None, None)
+        {
             tracing::error!(error = %e, "Failed to add initial message");
             let _ = parent_event_tx
                 .send(Event::SubAgentResult {
@@ -206,11 +219,7 @@ impl RuntimeManager {
         }
 
         // 3. Create sub-agent context
-        let context = ConvContext::sub_agent(
-            &conv.id,
-            PathBuf::from(&conv.cwd),
-            &model_id,
-        );
+        let conv_context = ConvContext::sub_agent(&conv.id, PathBuf::from(&conv.cwd), &model_id);
 
         // 4. Create channels for the sub-agent runtime
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -218,22 +227,22 @@ impl RuntimeManager {
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(
-            self.llm_registry.clone(),
-            model_id,
-        );
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
+        #[allow(deprecated)]
         let tool_executor = ToolRegistryExecutor::new(ToolRegistry::new_for_subagent(
-            context.working_dir.clone(),
+            conv_context.working_dir.clone(),
             self.llm_registry.clone(),
         ));
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
-            context,
+            conv_context,
             ConvState::Idle,
             storage,
             llm_client,
             tool_executor,
+            self.browser_sessions.clone(),
+            self.llm_registry.clone(),
             event_rx,
             event_tx.clone(),
             broadcast_tx.clone(),
@@ -266,20 +275,22 @@ impl RuntimeManager {
         tokio::spawn(async move {
             // Send initial UserMessage event to start the conversation
             // Sub-agents generate their own message_id since they don't have a client
-            let _ = event_tx.send(Event::UserMessage {
-                text: task_text,
-                images: vec![],
-                message_id: uuid::Uuid::new_v4().to_string(),
-                user_agent: Some("Phoenix Sub-Agent".to_string()),
-            }).await;
+            let _ = event_tx
+                .send(Event::UserMessage {
+                    text: task_text,
+                    images: vec![],
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    user_agent: Some("Phoenix Sub-Agent".to_string()),
+                })
+                .await;
 
             runtime.run().await;
-            
+
             // Cancel timeout if it exists
             if let Some(task) = timeout_task {
                 task.abort();
             }
-            
+
             tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished");
         });
     }
@@ -293,7 +304,7 @@ impl RuntimeManager {
         } = req;
 
         let runtimes = self.runtimes.read().await;
-        
+
         for agent_id in ids {
             if let Some(handle) = runtimes.get(&agent_id) {
                 tracing::info!(agent_id = %agent_id, "Sending cancel to sub-agent");
@@ -341,13 +352,17 @@ impl RuntimeManager {
             ConvContext::sub_agent(
                 &conv.id,
                 PathBuf::from(&conv.cwd),
-                conv.model.as_deref().unwrap_or(self.llm_registry.default_model_id()),
+                conv.model
+                    .as_deref()
+                    .unwrap_or(self.llm_registry.default_model_id()),
             )
         } else {
             ConvContext::new(
                 &conv.id,
                 PathBuf::from(&conv.cwd),
-                conv.model.as_deref().unwrap_or(self.llm_registry.default_model_id()),
+                conv.model
+                    .as_deref()
+                    .unwrap_or(self.llm_registry.default_model_id()),
             )
         };
 
@@ -358,10 +373,13 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(
             self.llm_registry.clone(),
-            conv.model.clone().unwrap_or_else(|| self.llm_registry.default_model_id().to_string()),
+            conv.model
+                .clone()
+                .unwrap_or_else(|| self.llm_registry.default_model_id().to_string()),
         );
-        
+
         // Use appropriate tool registry based on whether this is a sub-agent
+        #[allow(deprecated)]
         let tool_executor = if is_sub_agent {
             ToolRegistryExecutor::new(ToolRegistry::new_for_subagent(
                 context.working_dir.clone(),
@@ -380,6 +398,8 @@ impl RuntimeManager {
             storage,
             llm_client,
             tool_executor,
+            self.browser_sessions.clone(),
+            self.llm_registry.clone(),
             event_rx,
             event_tx.clone(),
             broadcast_tx.clone(),

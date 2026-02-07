@@ -2,7 +2,7 @@
 //!
 //! Generates short, meaningful titles based on the initial user message.
 
-use crate::llm::{LlmRequest, LlmService, LlmMessage, LlmResponse, ContentBlock, MessageRole};
+use crate::llm::{ContentBlock, LlmMessage, LlmRequest, LlmResponse, LlmService, MessageRole};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -18,7 +18,7 @@ const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TITLE_LENGTH: usize = 60;
 
 /// Generate a title for a conversation based on the initial message.
-/// 
+///
 /// Returns None if title generation fails (timeout, error, etc.)
 /// The caller should fall back to a random slug in that case.
 pub async fn generate_title(
@@ -86,13 +86,13 @@ fn sanitize_title(title: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_')
         .collect();
-    
+
     let kebab: String = cleaned
         .split_whitespace()
         .collect::<Vec<_>>()
         .join("-")
         .to_lowercase();
-    
+
     // Truncate if too long
     if kebab.len() > MAX_TITLE_LENGTH {
         // Try to cut at a word boundary
@@ -114,7 +114,10 @@ mod tests {
     #[test]
     fn test_sanitize_title() {
         assert_eq!(sanitize_title("Fix Login Page CSS"), "fix-login-page-css");
-        assert_eq!(sanitize_title("Python CSV Parser Script"), "python-csv-parser-script");
+        assert_eq!(
+            sanitize_title("Python CSV Parser Script"),
+            "python-csv-parser-script"
+        );
         assert_eq!(sanitize_title("What's the best way?"), "whats-the-best-way");
         assert_eq!(sanitize_title("  Multiple   Spaces  "), "multiple-spaces");
     }

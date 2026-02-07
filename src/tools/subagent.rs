@@ -1,14 +1,13 @@
 //! Sub-agent tools - tools for sub-agent lifecycle management
 //!
-//! - spawn_agents: Spawn sub-agents (parent only)
-//! - submit_result: Submit successful result (sub-agent only)
-//! - submit_error: Submit error result (sub-agent only)
+//! - `spawn_agents`: Spawn sub-agents (parent only)
+//! - `submit_result`: Submit successful result (sub-agent only)
+//! - `submit_error`: Submit error result (sub-agent only)
 
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // submit_result - Sub-agent successful completion
@@ -45,7 +44,7 @@ impl Tool for SubmitResultTool {
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
         // Validate input structure
         match serde_json::from_value::<SubmitResultInput>(input) {
             Ok(parsed) => {
@@ -94,7 +93,7 @@ impl Tool for SubmitErrorTool {
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
         match serde_json::from_value::<SubmitErrorInput>(input) {
             Ok(parsed) => {
                 // Same as submit_result - actual transition handled by state machine
@@ -162,7 +161,7 @@ impl Tool for SpawnAgentsTool {
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
         match serde_json::from_value::<SpawnAgentsInput>(input) {
             Ok(parsed) => {
                 if parsed.tasks.is_empty() {
@@ -177,7 +176,10 @@ impl Tool for SpawnAgentsTool {
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        let cwd_info = t.cwd.as_ref().map_or(String::new(), |c| format!(" (cwd: {c})"));
+                        let cwd_info = t
+                            .cwd
+                            .as_ref()
+                            .map_or(String::new(), |c| format!(" (cwd: {c})"));
                         format!("{}. {}{}", i + 1, truncate(&t.task, 100), cwd_info)
                     })
                     .collect();
@@ -204,6 +206,20 @@ fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::browser::BrowserSessionManager;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context() -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            PathBuf::from("/tmp"),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::llm::ModelRegistry::new_empty()),
+        )
+    }
 
     #[tokio::test]
     async fn test_submit_result_valid() {
@@ -211,7 +227,7 @@ mod tests {
         let result = tool
             .run(
                 json!({"result": "Task completed successfully"}),
-                CancellationToken::new(),
+                test_context(),
             )
             .await;
         assert!(result.success);
@@ -221,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_result_missing_field() {
         let tool = SubmitResultTool;
-        let result = tool.run(json!({}), CancellationToken::new()).await;
+        let result = tool.run(json!({}), test_context()).await;
         assert!(!result.success);
     }
 
@@ -229,10 +245,7 @@ mod tests {
     async fn test_submit_error_valid() {
         let tool = SubmitErrorTool;
         let result = tool
-            .run(
-                json!({"error": "Could not find the file"}),
-                CancellationToken::new(),
-            )
+            .run(json!({"error": "Could not find the file"}), test_context())
             .await;
         assert!(result.success); // Tool execution succeeds, even though it reports an error
         assert!(result.output.contains("Error submitted"));
@@ -249,7 +262,7 @@ mod tests {
                         {"task": "Review performance", "cwd": "/project"}
                     ]
                 }),
-                CancellationToken::new(),
+                test_context(),
             )
             .await;
         assert!(result.success);
@@ -259,16 +272,14 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_agents_empty_tasks() {
         let tool = SpawnAgentsTool;
-        let result = tool
-            .run(json!({"tasks": []}), CancellationToken::new())
-            .await;
+        let result = tool.run(json!({"tasks": []}), test_context()).await;
         assert!(!result.success);
     }
 
     #[tokio::test]
     async fn test_spawn_agents_missing_tasks() {
         let tool = SpawnAgentsTool;
-        let result = tool.run(json!({}), CancellationToken::new()).await;
+        let result = tool.run(json!({}), test_context()).await;
         assert!(!result.success);
     }
 }

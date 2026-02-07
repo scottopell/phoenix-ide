@@ -27,13 +27,12 @@ mod proptests;
 pub use planner::PatchPlanner;
 pub use types::*;
 
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use executor::{execute_effects, read_file_content};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 
 const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 
@@ -41,25 +40,27 @@ const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 ///
 /// This is the Tool implementation that wraps the pure `PatchPlanner`
 /// with actual filesystem IO.
+///
+/// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir`
 pub struct PatchTool {
-    working_dir: PathBuf,
     planner: Mutex<PatchPlanner>,
 }
 
 impl PatchTool {
-    pub fn new(working_dir: PathBuf) -> Self {
-        Self {
-            working_dir,
-            planner: Mutex::new(PatchPlanner::new()),
-        }
-    }
-
-    fn resolve_path(&self, path: &str) -> PathBuf {
+    fn resolve_path(ctx: &ToolContext, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
             p
         } else {
-            self.working_dir.join(p)
+            ctx.working_dir.join(p)
+        }
+    }
+}
+
+impl Default for PatchTool {
+    fn default() -> Self {
+        Self {
+            planner: Mutex::new(PatchPlanner::new()),
         }
     }
 }
@@ -164,7 +165,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         // Check input size
         let input_str = input.to_string();
         if input_str.len() > MAX_INPUT_SIZE {
@@ -186,7 +187,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         }
 
         // Resolve path
-        let path = self.resolve_path(&patch_input.path);
+        let path = Self::resolve_path(&ctx, &patch_input.path);
 
         // Read current content
         let current_content = match read_file_content(&path) {
@@ -228,27 +229,45 @@ large overwrite. Prefer incremental replace operations over full file overwrites
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::browser::BrowserSessionManager;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context(working_dir: PathBuf) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            working_dir,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::llm::ModelRegistry::new_empty()),
+        )
+    }
 
     #[tokio::test]
     async fn test_replace_operation() {
         let dir = tempdir().unwrap();
-        let tool = PatchTool::new(dir.path().to_path_buf());
+        let tool = PatchTool::default();
+        let ctx = test_context(dir.path().to_path_buf());
 
         // Create test file
         let test_file = dir.path().join("test.txt");
         fs::write(&test_file, "Hello World").unwrap();
 
         let result = tool
-            .run(json!({
-                "path": "test.txt",
-                "patches": [{
-                    "operation": "replace",
-                    "oldText": "World",
-                    "newText": "Rust"
-                }]
-            }), CancellationToken::new())
+            .run(
+                json!({
+                    "path": "test.txt",
+                    "patches": [{
+                        "operation": "replace",
+                        "oldText": "World",
+                        "newText": "Rust"
+                    }]
+                }),
+                ctx,
+            )
             .await;
 
         assert!(result.success, "Error: {}", result.output);
@@ -258,16 +277,20 @@ mod tests {
     #[tokio::test]
     async fn test_overwrite_creates_file() {
         let dir = tempdir().unwrap();
-        let tool = PatchTool::new(dir.path().to_path_buf());
+        let tool = PatchTool::default();
+        let ctx = test_context(dir.path().to_path_buf());
 
         let result = tool
-            .run(json!({
-                "path": "new_file.txt",
-                "patches": [{
-                    "operation": "overwrite",
-                    "newText": "New content"
-                }]
-            }), CancellationToken::new())
+            .run(
+                json!({
+                    "path": "new_file.txt",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "New content"
+                    }]
+                }),
+                ctx,
+            )
             .await;
 
         assert!(result.success);
@@ -278,34 +301,42 @@ mod tests {
     #[tokio::test]
     async fn test_clipboard_operations() {
         let dir = tempdir().unwrap();
-        let tool = PatchTool::new(dir.path().to_path_buf());
+        let tool = PatchTool::default();
 
         let test_file = dir.path().join("test.txt");
         fs::write(&test_file, "AAA BBB CCC").unwrap();
 
         // Cut BBB to clipboard
-        tool.run(json!({
-            "path": "test.txt",
-            "patches": [{
-                "operation": "replace",
-                "oldText": "BBB",
-                "newText": "",
-                "toClipboard": "clip1"
-            }]
-        }), CancellationToken::new())
+        let ctx = test_context(dir.path().to_path_buf());
+        tool.run(
+            json!({
+                "path": "test.txt",
+                "patches": [{
+                    "operation": "replace",
+                    "oldText": "BBB",
+                    "newText": "",
+                    "toClipboard": "clip1"
+                }]
+            }),
+            ctx,
+        )
         .await;
 
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "AAA  CCC");
 
         // Paste from clipboard
-        tool.run(json!({
-            "path": "test.txt",
-            "patches": [{
-                "operation": "replace",
-                "oldText": "CCC",
-                "fromClipboard": "clip1"
-            }]
-        }), CancellationToken::new())
+        let ctx = test_context(dir.path().to_path_buf());
+        tool.run(
+            json!({
+                "path": "test.txt",
+                "patches": [{
+                    "operation": "replace",
+                    "oldText": "CCC",
+                    "fromClipboard": "clip1"
+                }]
+            }),
+            ctx,
+        )
         .await;
 
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "AAA  BBB");

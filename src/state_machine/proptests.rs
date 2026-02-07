@@ -86,14 +86,14 @@ fn arb_tool_executing_state() -> impl Strategy<Value = ConvState> {
         proptest::collection::vec(arb_tool_call(), 0..3),
         proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3),
     )
-        .prop_map(|(current_tool, remaining_tools, persisted_ids)| {
-            ConvState::ToolExecuting {
+        .prop_map(
+            |(current_tool, remaining_tools, persisted_ids)| ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
                 persisted_tool_ids: persisted_ids.into_iter().collect(),
                 pending_sub_agents: vec![],
-            }
-        })
+            },
+        )
 }
 
 fn arb_error_state() -> impl Strategy<Value = ConvState> {
@@ -113,13 +113,13 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
         proptest::collection::vec(arb_tool_call(), 0..3),
         proptest::collection::vec("[a-z]{8}".prop_map(String::from), 0..3),
     )
-        .prop_map(|(tool_use_id, skipped_tools, persisted_ids)| {
-            ConvState::CancellingTool {
+        .prop_map(
+            |(tool_use_id, skipped_tools, persisted_ids)| ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
                 persisted_tool_ids: persisted_ids.into_iter().collect(),
-            }
-        })
+            },
+        )
 }
 
 fn arb_awaiting_llm_state() -> impl Strategy<Value = ConvState> {
@@ -767,7 +767,10 @@ fn test_complete_tool_cycle() {
     .unwrap();
     state = result.new_state;
     assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
-    assert!(result.effects.iter().any(|e| matches!(e, Effect::RequestLlm)));
+    assert!(result
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::RequestLlm)));
 
     // Step 2: LLM responds with tool call
     let tool = ToolCall::new(
@@ -812,7 +815,10 @@ fn test_complete_tool_cycle() {
     .unwrap();
     state = result.new_state;
     assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
-    assert!(result.effects.iter().any(|e| matches!(e, Effect::RequestLlm)));
+    assert!(result
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::RequestLlm)));
 
     // Step 4: LLM responds with text only
     let result = transition(
@@ -858,7 +864,10 @@ fn test_retry_cycle() {
     let result = transition(&state, &ctx, Event::RetryTimeout { attempt: 2 }).unwrap();
     state = result.new_state;
     assert!(matches!(state, ConvState::LlmRequesting { attempt: 2 }));
-    assert!(result.effects.iter().any(|e| matches!(e, Effect::RequestLlm)));
+    assert!(result
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::RequestLlm)));
 
     // Second attempt succeeds
     let result = transition(
@@ -1092,7 +1101,11 @@ fn test_cancel_mid_tool_chain() {
     if let Some(Effect::PersistToolResults { results }) = persist_effect {
         // Should have results for aborted (t2) + skipped (t3, t4) = 3 total
         // Note: completed (t1) was already persisted via PersistMessage
-        assert_eq!(results.len(), 3, "Should have 3 results (aborted + skipped)");
+        assert_eq!(
+            results.len(),
+            3,
+            "Should have 3 results (aborted + skipped)"
+        );
         // All should be cancelled/skipped (no success)
         assert!(results.iter().all(|r| !r.success));
     }
@@ -1214,9 +1227,8 @@ use super::state::SubAgentOutcome;
 fn arb_sub_agent_outcome() -> impl Strategy<Value = SubAgentOutcome> {
     prop_oneof![
         "[a-zA-Z ]{1,50}".prop_map(|result| SubAgentOutcome::Success { result }),
-        ("[a-zA-Z ]{1,30}", arb_error_kind()).prop_map(|(error, error_kind)| {
-            SubAgentOutcome::Failure { error, error_kind }
-        }),
+        ("[a-zA-Z ]{1,30}", arb_error_kind())
+            .prop_map(|(error, error_kind)| { SubAgentOutcome::Failure { error, error_kind } }),
     ]
 }
 
@@ -1521,7 +1533,7 @@ proptest! {
         // This simulates the bug scenario where we would try to persist it again
         let mut persisted = HashSet::new();
         persisted.insert(tool_use_id.clone());
-        
+
         let state = ConvState::CancellingTool {
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped,
@@ -1552,12 +1564,12 @@ proptest! {
     ) {
         // Ensure tool_use_id is NOT in persisted_tool_ids (use uppercase for others)
         let persisted: HashSet<String> = other_persisted.into_iter().collect();
-        
+
         // Also ensure skipped tool IDs don't collide with persisted
         let skipped_filtered: Vec<_> = skipped.into_iter()
             .filter(|t| !persisted.contains(&t.id))
             .collect();
-        
+
         let state = ConvState::CancellingTool {
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped_filtered,

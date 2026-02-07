@@ -3,10 +3,11 @@
 use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 use crate::db::{MessageContent, ToolResult};
-use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
+use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
 use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event};
 use crate::system_prompt::build_system_prompt;
+use crate::tools::{BrowserSessionManager, ToolContext};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -24,6 +25,10 @@ where
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
+    /// Browser session manager for `ToolContext`
+    browser_sessions: Arc<BrowserSessionManager>,
+    /// LLM registry for `ToolContext`
+    llm_registry: Arc<ModelRegistry>,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: broadcast::Sender<SseEvent>,
@@ -37,7 +42,7 @@ where
     spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
     /// Channel to request sub-agent cancellation (parent only)
     cancel_tx: Option<mpsc::Sender<SubAgentCancelRequest>>,
-    /// Buffer for SubAgentResult events received before entering AwaitingSubAgents
+    /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`
     sub_agent_result_buffer: Vec<Event>,
 }
 
@@ -47,12 +52,15 @@ where
     L: LlmClient + 'static,
     T: ToolExecutor + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: ConvContext,
         state: ConvState,
         storage: S,
         llm_client: L,
         tool_executor: T,
+        browser_sessions: Arc<BrowserSessionManager>,
+        llm_registry: Arc<ModelRegistry>,
         event_rx: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
         broadcast_tx: broadcast::Sender<SseEvent>,
@@ -63,6 +71,8 @@ where
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor: Arc::new(tool_executor),
+            browser_sessions,
+            llm_registry,
             event_rx,
             event_tx,
             broadcast_tx,
@@ -143,9 +153,13 @@ where
             let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
 
             // Check if we just entered AwaitingSubAgents - drain the buffer
-            if !matches!(old_state, ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. })
-                && matches!(self.state, ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. })
-            {
+            if !matches!(
+                old_state,
+                ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+            ) && matches!(
+                self.state,
+                ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+            ) {
                 // Just entered a state that can handle SubAgentResult events
                 // Drain the buffer and add to events to process
                 let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
@@ -169,7 +183,7 @@ where
         Ok(())
     }
 
-    /// Check if the current state can handle SubAgentResult events
+    /// Check if the current state can handle `SubAgentResult` events
     fn can_handle_sub_agent_result(&self) -> bool {
         matches!(
             self.state,
@@ -177,29 +191,38 @@ where
         )
     }
 
-    /// Handle the spawn_agents tool specially:
+    /// Handle the `spawn_agents` tool specially:
     /// 1. Parse tasks and generate agent IDs
-    /// 2. Send spawn requests to RuntimeManager for each task
-    /// 3. Return SpawnAgentsComplete event
+    /// 2. Send spawn requests to `RuntimeManager` for each task
+    /// 3. Return `SpawnAgentsComplete` event
     async fn handle_spawn_agents_tool(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         use crate::state_machine::state::{SpawnAgentsInput, SubAgentSpec};
 
         let tool_use_id = tool.id.clone();
         let input_value = tool.input.to_value();
-        
+
         // Parse the spawn_agents input
         let input: SpawnAgentsInput = match serde_json::from_value(input_value) {
             Ok(i) => i,
             Err(e) => {
                 // Return error as regular tool completion
                 let result = ToolResult::error(tool_use_id.clone(), format!("Invalid input: {e}"));
-                return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id,
+                    result,
+                }));
             }
         };
 
         if input.tasks.is_empty() {
-            let result = ToolResult::error(tool_use_id.clone(), "At least one task is required".to_string());
-            return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+            let result = ToolResult::error(
+                tool_use_id.clone(),
+                "At least one task is required".to_string(),
+            );
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }));
         }
 
         // Generate agent IDs and prepare spawn specs
@@ -209,7 +232,7 @@ where
         for task in &input.tasks {
             let agent_id = uuid::Uuid::new_v4().to_string();
             let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
-            
+
             agent_ids.push(agent_id.clone());
 
             // Send spawn request to RuntimeManager
@@ -228,13 +251,25 @@ where
                 };
                 if let Err(e) = spawn_tx.send(request).await {
                     tracing::error!(error = %e, "Failed to send spawn request");
-                    let result = ToolResult::error(tool_use_id.clone(), format!("Failed to spawn sub-agents: {e}"));
-                    return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!("Failed to spawn sub-agents: {e}"),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
                 }
             } else {
                 tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
-                let result = ToolResult::error(tool_use_id.clone(), "Sub-agent spawning not configured".to_string());
-                return Ok(Some(Event::ToolComplete { tool_use_id, result }));
+                let result = ToolResult::error(
+                    tool_use_id.clone(),
+                    "Sub-agent spawning not configured".to_string(),
+                );
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id,
+                    result,
+                }));
             }
         }
 
@@ -296,9 +331,9 @@ where
 
                 // Broadcast state change with full state data
                 let state_json = serde_json::to_value(&self.state).unwrap_or(Value::Null);
-                let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                    state: state_json,
-                });
+                let _ = self
+                    .broadcast_tx
+                    .send(SseEvent::StateChange { state: state_json });
                 Ok(None)
             }
 
@@ -321,7 +356,10 @@ where
                 };
 
                 tokio::spawn(async move {
-                    tracing::info!(is_sub_agent = is_sub_agent, "Making LLM request (background)");
+                    tracing::info!(
+                        is_sub_agent = is_sub_agent,
+                        "Making LLM request (background)"
+                    );
 
                     // Build messages from history
                     let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
@@ -403,6 +441,15 @@ where
                 let cancel_token = CancellationToken::new();
                 self.tool_cancel_token = Some(cancel_token.clone());
 
+                // Create ToolContext for this invocation
+                let tool_ctx = ToolContext::new(
+                    cancel_token,
+                    self.context.conversation_id.clone(),
+                    self.context.working_dir.clone(),
+                    self.browser_sessions.clone(),
+                    self.llm_registry.clone(),
+                );
+
                 // Spawn tool execution as background task
                 let tool_executor = self.tool_executor.clone();
                 let event_tx = self.event_tx.clone();
@@ -413,9 +460,9 @@ where
                 tokio::spawn(async move {
                     tracing::info!(tool = %tool_name, id = %tool_use_id, "Executing tool (background)");
 
-                    // Pass cancellation token to tool for subprocess management
+                    // Execute tool with context
                     let output = tool_executor
-                        .execute(&tool_name, tool_input, cancel_token)
+                        .execute(&tool_name, tool_input, tool_ctx)
                         .await;
 
                     let result = match output {
@@ -439,7 +486,10 @@ where
                         ),
                     };
                     let _ = event_tx
-                        .send(Event::ToolComplete { tool_use_id, result })
+                        .send(Event::ToolComplete {
+                            tool_use_id,
+                            result,
+                        })
                         .await;
                 });
 
@@ -476,11 +526,8 @@ where
 
             Effect::PersistToolResults { results } => {
                 for result in results {
-                    let content = MessageContent::tool(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                    );
+                    let content =
+                        MessageContent::tool(&result.tool_use_id, &result.output, result.is_error);
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let msg = self
                         .storage
@@ -523,7 +570,7 @@ where
 
             Effect::CancelSubAgents { ids } => {
                 tracing::info!(?ids, "Cancelling sub-agents");
-                
+
                 if let Some(cancel_tx) = &self.cancel_tx {
                     let request = SubAgentCancelRequest {
                         ids,
@@ -541,7 +588,7 @@ where
 
             Effect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
-                
+
                 if let Some(parent_tx) = &self.parent_event_tx {
                     let event = Event::SubAgentResult {
                         agent_id: self.context.conversation_id.clone(),
@@ -563,7 +610,7 @@ where
                     "sub_agent_results": results
                 });
                 let content = crate::db::MessageContent::system(
-                    serde_json::to_string_pretty(&aggregated).unwrap_or_default()
+                    serde_json::to_string_pretty(&aggregated).unwrap_or_default(),
                 );
                 let sys_msg_id = uuid::Uuid::new_v4().to_string();
                 self.storage
@@ -590,8 +637,8 @@ where
         storage: &S,
         conv_id: &str,
     ) -> Result<Vec<LlmMessage>, String> {
-        use crate::db::{MessageContent, UserContent, ToolContent};
-        
+        use crate::db::{MessageContent, ToolContent, UserContent};
+
         let db_messages = storage.get_messages(conv_id).await?;
 
         let mut messages = Vec::new();
@@ -600,7 +647,7 @@ where
             match &msg.content {
                 MessageContent::User(UserContent { text, images }) => {
                     let mut content = vec![ContentBlock::text(text)];
-                    
+
                     // Add images (REQ-BED-013)
                     for img in images {
                         content.push(ContentBlock::Image {
@@ -621,15 +668,15 @@ where
                     });
                 }
 
-                MessageContent::Tool(ToolContent { tool_use_id, content, is_error }) => {
+                MessageContent::Tool(ToolContent {
+                    tool_use_id,
+                    content,
+                    is_error,
+                }) => {
                     // Tool results go in user message
                     messages.push(LlmMessage {
                         role: MessageRole::User,
-                        content: vec![ContentBlock::tool_result(
-                            tool_use_id,
-                            content,
-                            *is_error,
-                        )],
+                        content: vec![ContentBlock::tool_result(tool_use_id, content, *is_error)],
                     });
                 }
 

@@ -3,9 +3,9 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
-use super::{AnthropicService, OpenAIService, LlmService};
 use super::anthropic::AnthropicModel;
 use super::openai::OpenAIModel;
+use super::{AnthropicService, LlmService, OpenAIService};
 use std::sync::Arc;
 
 /// LLM provider enumeration
@@ -25,7 +25,7 @@ impl Provider {
             Provider::Fireworks => "Fireworks",
         }
     }
-    
+
     /// Get the environment variable name for this provider's API key
     #[allow(dead_code)] // Will be used for error messages
     pub fn api_key_env_var(self) -> &'static str {
@@ -52,10 +52,12 @@ pub struct ModelDef {
     /// Context window size in tokens
     pub context_window: usize,
     /// Factory function to create the service
+    #[allow(clippy::type_complexity)]
     pub factory: fn(&str, Option<&str>) -> Result<Arc<dyn LlmService>, String>,
 }
 
 /// Get all available model definitions
+#[allow(clippy::too_many_lines)]
 pub fn all_models() -> &'static [ModelDef] {
     &[
         // Anthropic models
@@ -86,7 +88,9 @@ pub fn all_models() -> &'static [ModelDef] {
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-4.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string());
+                    return Err(
+                        "claude-4.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string()
+                    );
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
@@ -104,7 +108,9 @@ pub fn all_models() -> &'static [ModelDef] {
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-3.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string());
+                    return Err(
+                        "claude-3.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string()
+                    );
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
@@ -122,7 +128,9 @@ pub fn all_models() -> &'static [ModelDef] {
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
-                    return Err("claude-4.5-haiku requires ANTHROPIC_API_KEY or gateway".to_string());
+                    return Err(
+                        "claude-4.5-haiku requires ANTHROPIC_API_KEY or gateway".to_string()
+                    );
                 }
                 Ok(Arc::new(AnthropicService::new(
                     api_key.to_string(),
@@ -133,7 +141,7 @@ pub fn all_models() -> &'static [ModelDef] {
         },
         // Additional providers - These work in gateway mode
         // The gateway handles the actual API communication
-        
+
         // OpenAI models
         ModelDef {
             id: "gpt-4o",
@@ -290,7 +298,6 @@ pub fn all_models() -> &'static [ModelDef] {
                 )))
             },
         },
-        
         // Fireworks models
         ModelDef {
             id: "glm-4p7-fireworks",
@@ -300,7 +307,9 @@ pub fn all_models() -> &'static [ModelDef] {
             context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
-                    return Err("glm-4p7-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                    return Err(
+                        "glm-4p7-fireworks requires FIREWORKS_API_KEY or gateway".to_string()
+                    );
                 }
                 Ok(Arc::new(OpenAIService::new(
                     api_key.to_string(),
@@ -317,7 +326,9 @@ pub fn all_models() -> &'static [ModelDef] {
             context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
-                    return Err("qwen3-coder-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                    return Err(
+                        "qwen3-coder-fireworks requires FIREWORKS_API_KEY or gateway".to_string(),
+                    );
                 }
                 Ok(Arc::new(OpenAIService::new(
                     api_key.to_string(),
@@ -334,7 +345,9 @@ pub fn all_models() -> &'static [ModelDef] {
             context_window: 128_000,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
-                    return Err("deepseek-v3-fireworks requires FIREWORKS_API_KEY or gateway".to_string());
+                    return Err(
+                        "deepseek-v3-fireworks requires FIREWORKS_API_KEY or gateway".to_string(),
+                    );
                 }
                 Ok(Arc::new(OpenAIService::new(
                     api_key.to_string(),

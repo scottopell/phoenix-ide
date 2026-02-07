@@ -469,4 +469,3 @@ mod tests {
         assert!(check("# this is a comment").is_ok());
     }
 }
-

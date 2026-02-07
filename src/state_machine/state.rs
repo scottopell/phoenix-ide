@@ -1,12 +1,12 @@
 //! Conversation state types
 
 use crate::db::ErrorKind;
-use std::collections::HashSet;
-use std::time::Duration;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 // ============================================================================
 // Tool Input Types - Strongly typed inputs for each tool
@@ -49,7 +49,7 @@ pub struct ReadImageInput {
     pub path: String,
 }
 
-/// Task specification for spawn_agents tool
+/// Task specification for `spawn_agents` tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubAgentTask {
     pub task: String,
@@ -57,19 +57,19 @@ pub struct SubAgentTask {
     pub cwd: Option<String>,
 }
 
-/// Input for the spawn_agents tool (parent only)
+/// Input for the `spawn_agents` tool (parent only)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAgentsInput {
     pub tasks: Vec<SubAgentTask>,
 }
 
-/// Input for the submit_result tool (sub-agent only)
+/// Input for the `submit_result` tool (sub-agent only)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitResultInput {
     pub result: String,
 }
 
-/// Input for the submit_error tool (sub-agent only)
+/// Input for the `submit_error` tool (sub-agent only)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitErrorInput {
     pub error: String,
@@ -309,7 +309,6 @@ impl ConvState {
     pub fn is_working(&self) -> bool {
         !matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
-
 }
 
 // ============================================================================
@@ -320,8 +319,13 @@ impl ConvState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubAgentOutcome {
-    Success { result: String },
-    Failure { error: String, error_kind: ErrorKind },
+    Success {
+        result: String,
+    },
+    Failure {
+        error: String,
+        error_kind: ErrorKind,
+    },
 }
 
 /// Result from a completed sub-agent

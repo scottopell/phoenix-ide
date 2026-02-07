@@ -18,7 +18,10 @@ use llm::{LlmConfig, ModelRegistry};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::{cors::{Any, CorsLayer}, compression::CompressionLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{Any, CorsLayer},
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -33,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::fmt::layer()
                 .json()
                 .with_current_span(false)
-                .with_span_list(false)
+                .with_span_list(false),
         )
         .init();
 
@@ -82,16 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-    
+
     let compression = CompressionLayer::new()
         .gzip(true)
         .br(true)
         .deflate(true)
         .zstd(true);
 
-    let app = create_router(state)
-        .layer(cors)
-        .layer(compression);
+    let app = create_router(state).layer(cors).layer(compression);
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

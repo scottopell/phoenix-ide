@@ -21,7 +21,7 @@ pub struct CreateConversationRequest {
 pub struct ChatRequest {
     pub text: String,
     /// Client-generated UUID - the canonical identifier for this message
-    /// Enables idempotent retries (sending same message_id twice = no duplicate)
+    /// Enables idempotent retries (sending same `message_id` twice = no duplicate)
     pub message_id: String,
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
@@ -140,6 +140,7 @@ pub struct ReadFileResponse {
 
 /// Error response for file operations
 #[derive(Debug, Serialize)]
+#[allow(dead_code)] // Reserved for future use
 pub struct FileErrorResponse {
     pub error: String,
     pub is_binary: bool,

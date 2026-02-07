@@ -63,10 +63,7 @@ impl AnthropicService {
         let base_url = match gateway {
             Some(gw) => {
                 // exe.dev gateway format: gateway_base + /anthropic/v1/messages
-                format!(
-                    "{}/anthropic/v1/messages",
-                    gw.trim_end_matches('/')
-                )
+                format!("{}/anthropic/v1/messages", gw.trim_end_matches('/'))
             }
             None => "https://api.anthropic.com/v1/messages".to_string(),
         };

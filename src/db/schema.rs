@@ -69,9 +69,9 @@ pub const MIGRATION_ADD_MODEL: &str = r"
 -- SQLite will return an error which we'll ignore
 ";
 
-/// Migration SQL to add local_id column for idempotent message sends
-/// Migration to rename messages.id to messages.message_id
-/// SQLite 3.25+ supports ALTER TABLE RENAME COLUMN
+/// Migration SQL to add `local_id` column for idempotent message sends
+/// Migration to rename `messages.id` to `messages.message_id`
+/// `SQLite` 3.25+ supports ALTER TABLE RENAME COLUMN
 /// For older versions or if column already renamed, this is a no-op
 pub const MIGRATION_RENAME_MESSAGE_ID: &str = r"
 -- Rename id to message_id for searchability
@@ -100,10 +100,7 @@ pub struct Conversation {
 impl Conversation {
     /// Check if the agent is currently working
     pub fn is_agent_working(&self) -> bool {
-        !matches!(
-            self.state,
-            ConvState::Idle | ConvState::Error { .. }
-        )
+        !matches!(self.state, ConvState::Idle | ConvState::Error { .. })
     }
 }
 
@@ -199,7 +196,7 @@ pub struct ImageData {
 }
 
 impl ImageData {
-    /// Convert to LLM ImageSource format
+    /// Convert to LLM `ImageSource` format
     pub fn to_image_source(&self) -> crate::llm::ImageSource {
         crate::llm::ImageSource::Base64 {
             media_type: self.media_type.clone(),
@@ -239,7 +236,7 @@ pub struct ErrorContent {
 }
 
 /// Typed message content
-/// 
+///
 /// This enum provides type safety for message content while maintaining
 /// backward compatibility with the database schema where `message_type`
 /// and `content` are stored as separate columns.
@@ -278,31 +275,21 @@ impl MessageContent {
     /// Deserialize content from JSON value using the message type as discriminator
     pub fn from_json(msg_type: MessageType, value: Value) -> Result<Self, String> {
         match msg_type {
-            MessageType::User => {
-                serde_json::from_value(value)
-                    .map(Self::User)
-                    .map_err(|e| format!("Invalid user content: {e}"))
-            }
-            MessageType::Agent => {
-                serde_json::from_value(value)
-                    .map(Self::Agent)
-                    .map_err(|e| format!("Invalid agent content: {e}"))
-            }
-            MessageType::Tool => {
-                serde_json::from_value(value)
-                    .map(Self::Tool)
-                    .map_err(|e| format!("Invalid tool content: {e}"))
-            }
-            MessageType::System => {
-                serde_json::from_value(value)
-                    .map(Self::System)
-                    .map_err(|e| format!("Invalid system content: {e}"))
-            }
-            MessageType::Error => {
-                serde_json::from_value(value)
-                    .map(Self::Error)
-                    .map_err(|e| format!("Invalid error content: {e}"))
-            }
+            MessageType::User => serde_json::from_value(value)
+                .map(Self::User)
+                .map_err(|e| format!("Invalid user content: {e}")),
+            MessageType::Agent => serde_json::from_value(value)
+                .map(Self::Agent)
+                .map_err(|e| format!("Invalid agent content: {e}")),
+            MessageType::Tool => serde_json::from_value(value)
+                .map(Self::Tool)
+                .map_err(|e| format!("Invalid tool content: {e}")),
+            MessageType::System => serde_json::from_value(value)
+                .map(Self::System)
+                .map_err(|e| format!("Invalid system content: {e}")),
+            MessageType::Error => serde_json::from_value(value)
+                .map(Self::Error)
+                .map_err(|e| format!("Invalid error content: {e}")),
         }
     }
 
@@ -322,7 +309,11 @@ impl MessageContent {
     }
 
     /// Create tool content
-    pub fn tool(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self::Tool(ToolContent::new(tool_use_id, content, is_error))
     }
 
@@ -335,7 +326,9 @@ impl MessageContent {
     /// Create error content
     #[allow(dead_code)] // Used as fallback for parse errors
     pub fn error(message: impl Into<String>) -> Self {
-        Self::Error(ErrorContent { message: message.into() })
+        Self::Error(ErrorContent {
+            message: message.into(),
+        })
     }
 }
 
@@ -357,6 +350,7 @@ impl Serialize for MessageContent {
 
 /// Message record
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Message {
     pub message_id: String,
     pub conversation_id: String,

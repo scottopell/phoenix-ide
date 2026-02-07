@@ -166,3 +166,18 @@ WHEN user attempts to enable Restricted mode without Landlock
 THE SYSTEM SHALL return error explaining Landlock requirements
 
 **Rationale:** Not all environments support Landlock (requires Linux 5.13+). System must work gracefully without it, clearly communicating reduced protection. macOS, Windows/WSL, and older Linux kernels fall back to Unrestricted-only mode with safety checks as the only guardrail.
+
+---
+
+### REQ-BASH-010: Stateless Tool with Context Injection
+
+WHEN bash tool is invoked
+THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
+AND derive working directory from `ToolContext.working_dir`
+AND use `ToolContext.cancel` for cancellation handling
+
+WHEN bash tool is constructed
+THE SYSTEM SHALL NOT store per-conversation state
+AND tool instance SHALL be reusable across conversations
+
+**Rationale:** Stateless tools with context injection eliminate the possibility of using stale or incorrect conversation state. All context flows through a single, validated parameter created at call time.

@@ -10,11 +10,11 @@ Post-MVP extends to PWA-specific needs: service worker inspection, network sourc
 
 ## Technical Summary
 
-Built as a native Rust module using Chrome DevTools Protocol (CDP) via WebSocket. The architecture follows shelley's proven browser tool design: implicit per-conversation browser instances with auto-start on first use and idle timeout cleanup. Chrome runs headless with debugging enabled.
+Built using `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access - conversation ID is derived internally, making it impossible to use wrong session.
 
-Core tools map directly to CDP domains: Page for navigation and screenshots, Runtime for JavaScript execution and console capture, Emulation for viewport control. The `browser_eval` tool serves as a universal interaction interface—clicks, typing, scrolling, and waiting are all achievable via JavaScript without dedicated tools.
+`BrowserSessionManager` (owned by Runtime) maps conversation IDs to Chrome instances. Sessions auto-start on first `browser()` call, auto-cleanup after 30-minute idle timeout. Cleanup hooks fire on conversation delete and server shutdown.
 
-Large outputs (console logs, JS results) automatically redirect to files. Screenshots are resized to fit LLM vision limits and returned as base64 with the image data.
+Core tools wrap chromiumoxide's Page API: navigation, JavaScript evaluation, screenshots, viewport control. Console logs captured via CDP event subscription. Large outputs redirect to files. Screenshots resized for LLM vision limits.
 
 ## Status Summary
 
@@ -27,9 +27,10 @@ Large outputs (console logs, JS results) automatically redirect to files. Screen
 | **REQ-BT-003:** Take Screenshots | ❌ Not Started | - |
 | **REQ-BT-004:** Capture Console Logs | ❌ Not Started | - |
 | **REQ-BT-005:** Resize Viewport | ❌ Not Started | - |
-| **REQ-BT-006:** Read Image Files | ❌ Not Started | - |
-| **REQ-BT-010:** Implicit Session Model | ❌ Not Started | - |
-| **REQ-BT-011:** State Persistence | ❌ Not Started | - |
+| **REQ-BT-006:** Read Image Files | ✅ Complete | Existing `read_image` tool |
+| **REQ-BT-010:** Implicit Session Model | ❌ Not Started | BrowserSessionManager |
+| **REQ-BT-011:** State Persistence | ❌ Not Started | Session guard pattern |
+| **REQ-BT-012:** Stateless Tools with Context | 🔄 In Progress | ToolContext refactor (shared with bash) |
 
 ### Post-MVP Requirements
 
@@ -40,5 +41,5 @@ Large outputs (console logs, JS results) automatically redirect to files. Screen
 | **REQ-BT-022:** Offline Mode Simulation | ❌ Not Started | PWA-specific |
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
 
-**MVP Progress:** 0 of 8 complete  
-**Total Progress:** 0 of 12 complete
+**MVP Progress:** 1 of 9 complete (REQ-BT-006 exists)  
+**Total Progress:** 1 of 13 complete

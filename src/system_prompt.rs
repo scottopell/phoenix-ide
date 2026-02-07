@@ -63,7 +63,7 @@ pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
     let guidance_files = discover_guidance_files(working_dir);
     if !guidance_files.is_empty() {
         prompt.push_str("\n\n<project_guidance>\n");
-        
+
         for (i, file) in guidance_files.iter().enumerate() {
             if i > 0 {
                 prompt.push_str("\n---\n\n");
@@ -76,7 +76,7 @@ pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
                 prompt.push('\n');
             }
         }
-        
+
         prompt.push_str("</project_guidance>");
     }
 
@@ -144,7 +144,7 @@ mod tests {
     fn test_build_system_prompt_no_guidance() {
         let temp = TempDir::new().unwrap();
         let prompt = build_system_prompt(temp.path(), false);
-        
+
         assert!(prompt.contains("helpful AI assistant"));
         assert!(!prompt.contains("<project_guidance>"));
         assert!(!prompt.contains("sub-agent"));
@@ -156,7 +156,7 @@ mod tests {
         fs::write(temp.path().join("AGENTS.md"), "# Project Rules\nBe nice.").unwrap();
 
         let prompt = build_system_prompt(temp.path(), false);
-        
+
         assert!(prompt.contains("<project_guidance>"));
         assert!(prompt.contains("# Project Rules"));
         assert!(prompt.contains("Be nice."));
@@ -167,7 +167,7 @@ mod tests {
     fn test_build_system_prompt_sub_agent() {
         let temp = TempDir::new().unwrap();
         let prompt = build_system_prompt(temp.path(), true);
-        
+
         assert!(prompt.contains("sub-agent"));
         assert!(prompt.contains("submit_result"));
     }

@@ -1,15 +1,13 @@
-//! OpenAI and OpenAI-compatible provider implementation
+//! `OpenAI` and `OpenAI`-compatible provider implementation
 
-use super::types::{
-    ContentBlock, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage,
-};
+use super::types::{ContentBlock, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage};
 use super::{LlmError, LlmService};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// OpenAI-compatible models (OpenAI and Fireworks)
+/// `OpenAI`-compatible models (`OpenAI` and Fireworks)
 #[derive(Debug, Clone, Copy)]
 pub enum OpenAIModel {
     // OpenAI GPT-4 models
@@ -43,7 +41,9 @@ impl OpenAIModel {
             OpenAIModel::GPT51Codex => "gpt-5.1-codex",
             OpenAIModel::GPT52Codex => "gpt-5.2-codex",
             OpenAIModel::GLM4P7Fireworks => "accounts/fireworks/models/glm-4p7",
-            OpenAIModel::QwenCoderFireworks => "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
+            OpenAIModel::QwenCoderFireworks => {
+                "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"
+            }
             OpenAIModel::DeepseekV3Fireworks => "accounts/fireworks/models/deepseek-v3p1",
         }
     }
@@ -68,11 +68,13 @@ impl OpenAIModel {
     pub fn is_fireworks(self) -> bool {
         matches!(
             self,
-            OpenAIModel::GLM4P7Fireworks | OpenAIModel::QwenCoderFireworks | OpenAIModel::DeepseekV3Fireworks
+            OpenAIModel::GLM4P7Fireworks
+                | OpenAIModel::QwenCoderFireworks
+                | OpenAIModel::DeepseekV3Fireworks
         )
     }
 
-    /// Models that use max_completion_tokens instead of max_tokens
+    /// Models that use `max_completion_tokens` instead of `max_tokens`
     pub fn uses_max_completion_tokens(self) -> bool {
         matches!(
             self,
@@ -103,7 +105,10 @@ impl OpenAIService {
         let base_url = match (gateway, model.is_fireworks(), model.uses_responses_api()) {
             (Some(gw), true, _) => {
                 // Fireworks via gateway
-                format!("{}/fireworks/inference/v1/chat/completions", gw.trim_end_matches('/'))
+                format!(
+                    "{}/fireworks/inference/v1/chat/completions",
+                    gw.trim_end_matches('/')
+                )
             }
             (Some(gw), false, true) => {
                 // OpenAI responses API via gateway (for codex models)
@@ -152,7 +157,7 @@ impl OpenAIService {
                 .map(|s| s.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            
+
             messages.push(OpenAIMessage {
                 role: "system".to_string(),
                 content: Some(system_text),
@@ -163,7 +168,7 @@ impl OpenAIService {
 
         // Add conversation messages
         for msg in &request.messages {
-            messages.push(self.translate_message(msg));
+            messages.push(Self::translate_message(msg));
         }
 
         // Convert tools
@@ -204,7 +209,7 @@ impl OpenAIService {
         }
     }
 
-    fn translate_message(&self, msg: &LlmMessage) -> OpenAIMessage {
+    fn translate_message(msg: &LlmMessage) -> OpenAIMessage {
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
@@ -246,7 +251,7 @@ impl OpenAIService {
                     OpenAIMessage {
                         role: "tool".to_string(),
                         content: Some(if *is_error {
-                            format!("Error: {}", content)
+                            format!("Error: {content}")
                         } else {
                             content.clone()
                         }),
@@ -254,7 +259,7 @@ impl OpenAIService {
                         tool_call_id: Some(tool_use_id.clone()),
                     }
                 }
-                _ => {
+                ContentBlock::Image { .. } => {
                     // Images not supported in basic implementation
                     OpenAIMessage {
                         role: role.to_string(),
@@ -306,10 +311,10 @@ impl OpenAIService {
                 if tc.function.name.is_empty() {
                     continue;
                 }
-                
+
                 let input = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({}));
-                
+
                 content.push(ContentBlock::ToolUse {
                     id: tc.id,
                     name: tc.function.name,
@@ -324,8 +329,8 @@ impl OpenAIService {
             content,
             end_turn,
             usage: Usage {
-                input_tokens: resp.usage.prompt_tokens as u64,
-                output_tokens: resp.usage.completion_tokens as u64,
+                input_tokens: u64::from(resp.usage.prompt_tokens),
+                output_tokens: u64::from(resp.usage.completion_tokens),
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
@@ -351,18 +356,18 @@ impl LlmService for OpenAIService {
 
     fn context_window(&self) -> usize {
         match self.model {
-            OpenAIModel::GPT4o => 128_000,
-            OpenAIModel::GPT4oMini => 128_000,
-            OpenAIModel::O4Mini => 200_000,
-            OpenAIModel::GPT5 => 128_000,
-            OpenAIModel::GPT5Mini => 128_000,
-            OpenAIModel::GPT51 => 128_000,
-            OpenAIModel::GPT5Codex => 200_000,
-            OpenAIModel::GPT51Codex => 200_000,
-            OpenAIModel::GPT52Codex => 200_000,
-            OpenAIModel::GLM4P7Fireworks => 128_000,
-            OpenAIModel::QwenCoderFireworks => 128_000,
-            OpenAIModel::DeepseekV3Fireworks => 128_000,
+            OpenAIModel::O4Mini
+            | OpenAIModel::GPT5Codex
+            | OpenAIModel::GPT51Codex
+            | OpenAIModel::GPT52Codex => 200_000,
+            OpenAIModel::GPT4o
+            | OpenAIModel::GPT4oMini
+            | OpenAIModel::GPT5
+            | OpenAIModel::GPT5Mini
+            | OpenAIModel::GPT51
+            | OpenAIModel::GLM4P7Fireworks
+            | OpenAIModel::QwenCoderFireworks
+            | OpenAIModel::DeepseekV3Fireworks => 128_000,
         }
     }
 
@@ -386,11 +391,11 @@ impl OpenAIService {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    LlmError::network(format!("Request timeout: {}", e))
+                    LlmError::network(format!("Request timeout: {e}"))
                 } else if e.is_connect() {
-                    LlmError::network(format!("Connection failed: {}", e))
+                    LlmError::network(format!("Connection failed: {e}"))
                 } else {
-                    LlmError::unknown(format!("Request failed: {}", e))
+                    LlmError::unknown(format!("Request failed: {e}"))
                 }
             })?;
 
@@ -398,28 +403,25 @@ impl OpenAIService {
         let body = response
             .text()
             .await
-            .map_err(|e| LlmError::network(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
         if !status.is_success() {
             // Parse error response
             if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
                 let message = error_resp.error.message;
                 return Err(match status.as_u16() {
-                    401 => LlmError::auth(format!("Authentication failed: {}", message)),
-                    429 => LlmError::rate_limit(format!("Rate limit exceeded: {}", message)),
-                    400 => LlmError::invalid_request(format!("Invalid request: {}", message)),
-                    500..=599 => LlmError::server_error(format!("Server error: {}", message)),
-                    _ => LlmError::unknown(format!("HTTP {}: {}", status, message)),
+                    401 => LlmError::auth(format!("Authentication failed: {message}")),
+                    429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+                    400 => LlmError::invalid_request(format!("Invalid request: {message}")),
+                    500..=599 => LlmError::server_error(format!("Server error: {message}")),
+                    _ => LlmError::unknown(format!("HTTP {status}: {message}")),
                 });
             }
-            return Err(LlmError::unknown(format!(
-                "HTTP {} error: {}",
-                status, body
-            )));
+            return Err(LlmError::unknown(format!("HTTP {status} error: {body}")));
         }
 
         let openai_response: OpenAIResponse = serde_json::from_str(&body).map_err(|e| {
-            LlmError::unknown(format!("Failed to parse response: {} - body: {}", e, body))
+            LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
         })?;
 
         Self::normalize_response(openai_response)
@@ -439,11 +441,11 @@ impl OpenAIService {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    LlmError::network(format!("Request timeout: {}", e))
+                    LlmError::network(format!("Request timeout: {e}"))
                 } else if e.is_connect() {
-                    LlmError::network(format!("Connection failed: {}", e))
+                    LlmError::network(format!("Connection failed: {e}"))
                 } else {
-                    LlmError::unknown(format!("Request failed: {}", e))
+                    LlmError::unknown(format!("Request failed: {e}"))
                 }
             })?;
 
@@ -451,37 +453,35 @@ impl OpenAIService {
         let body = response
             .text()
             .await
-            .map_err(|e| LlmError::network(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
         if !status.is_success() {
             if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
                 let message = error_resp.error.message;
                 return Err(match status.as_u16() {
-                    401 => LlmError::auth(format!("Authentication failed: {}", message)),
-                    429 => LlmError::rate_limit(format!("Rate limit exceeded: {}", message)),
-                    400 => LlmError::invalid_request(format!("Invalid request: {}", message)),
-                    500..=599 => LlmError::server_error(format!("Server error: {}", message)),
-                    _ => LlmError::unknown(format!("HTTP {}: {}", status, message)),
+                    401 => LlmError::auth(format!("Authentication failed: {message}")),
+                    429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+                    400 => LlmError::invalid_request(format!("Invalid request: {message}")),
+                    500..=599 => LlmError::server_error(format!("Server error: {message}")),
+                    _ => LlmError::unknown(format!("HTTP {status}: {message}")),
                 });
             }
-            return Err(LlmError::unknown(format!(
-                "HTTP {} error: {}",
-                status, body
-            )));
+            return Err(LlmError::unknown(format!("HTTP {status} error: {body}")));
         }
 
-        let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
-            LlmError::unknown(format!("Failed to parse response: {} - body: {}", e, body))
-        })?;
+        let responses_response: ResponsesApiResponse =
+            serde_json::from_str(&body).map_err(|e| {
+                LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
+            })?;
 
-        Self::normalize_responses_api_response(responses_response)
+        Ok(Self::normalize_responses_api_response(responses_response))
     }
 
-    /// Translate LlmRequest to ResponsesApiRequest
+    /// Translate `LlmRequest` to `ResponsesApiRequest`
     fn translate_to_responses_request(&self, request: &LlmRequest) -> ResponsesApiRequest {
         // Build input from system prompt and messages
         let mut input_parts = Vec::new();
-        
+
         // Add system prompt
         if !request.system.is_empty() {
             let system_text = request
@@ -490,9 +490,9 @@ impl OpenAIService {
                 .map(|s| s.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            input_parts.push(format!("System: {}\n", system_text));
+            input_parts.push(format!("System: {system_text}\n"));
         }
-        
+
         // Add messages
         for msg in &request.messages {
             let role = match msg.role {
@@ -501,11 +501,11 @@ impl OpenAIService {
             };
             for block in &msg.content {
                 if let ContentBlock::Text { text } = block {
-                    input_parts.push(format!("{}: {}", role, text));
+                    input_parts.push(format!("{role}: {text}"));
                 }
             }
         }
-        
+
         // Convert tools to responses API format
         let tools: Option<Vec<ResponsesApiTool>> = if request.tools.is_empty() {
             None
@@ -523,7 +523,7 @@ impl OpenAIService {
                     .collect(),
             )
         };
-        
+
         ResponsesApiRequest {
             model: self.model.api_name().to_string(),
             input: input_parts.join("\n"),
@@ -532,10 +532,10 @@ impl OpenAIService {
         }
     }
 
-    /// Normalize ResponsesApiResponse to LlmResponse
-    fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
+    /// Normalize `ResponsesApiResponse` to `LlmResponse`
+    fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
         let mut content = Vec::new();
-        
+
         // Find message output and extract content
         for output in resp.output {
             if output.r#type == "message" {
@@ -552,24 +552,26 @@ impl OpenAIService {
                 }
             }
         }
-        
+
         // If no content found, return empty
         if content.is_empty() {
-            content.push(ContentBlock::Text { text: String::new() });
+            content.push(ContentBlock::Text {
+                text: String::new(),
+            });
         }
-        
+
         let end_turn = resp.status == "completed";
-        
-        Ok(LlmResponse {
+
+        LlmResponse {
             content,
             end_turn,
             usage: Usage {
-                input_tokens: resp.usage.input_tokens as u64,
-                output_tokens: resp.usage.output_tokens as u64,
+                input_tokens: u64::from(resp.usage.input_tokens),
+                output_tokens: u64::from(resp.usage.output_tokens),
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
-        })
+        }
     }
 }
 
@@ -640,9 +642,11 @@ struct OpenAIChoice {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct OpenAIUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[allow(dead_code)] // Part of API response, not always used
     total_tokens: u32,
 }
 

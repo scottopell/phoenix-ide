@@ -4,14 +4,15 @@
 
 use super::traits::*;
 use crate::db::{Message, MessageContent, MessageType, UsageData};
+use crate::llm::ModelRegistry;
 use crate::llm::{LlmError, LlmRequest, LlmResponse, ToolDefinition};
 use crate::state_machine::ConvState;
-use crate::tools::ToolOutput;
+use crate::tools::browser::BrowserSessionManager;
+use crate::tools::{ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
-use tokio_util::sync::CancellationToken;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Mock LLM Client
@@ -117,12 +118,7 @@ impl Default for MockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for MockToolExecutor {
-    async fn execute(
-        &self,
-        name: &str,
-        input: Value,
-        _cancel: CancellationToken,
-    ) -> Option<ToolOutput> {
+    async fn execute(&self, name: &str, input: Value, _ctx: ToolContext) -> Option<ToolOutput> {
         self.executions
             .lock()
             .unwrap()
@@ -139,7 +135,6 @@ impl ToolExecutor for MockToolExecutor {
 // Delayed Mock LLM Client (for cancellation testing)
 // ============================================================================
 
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -213,12 +208,7 @@ impl DelayedMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DelayedMockToolExecutor {
-    async fn execute(
-        &self,
-        name: &str,
-        input: Value,
-        cancel: CancellationToken,
-    ) -> Option<ToolOutput> {
+    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
         self.inner
             .executions
             .lock()
@@ -231,7 +221,7 @@ impl ToolExecutor for DelayedMockToolExecutor {
             _ = tokio::time::sleep(self.delay) => {
                 self.inner.outputs.get(name).cloned()
             }
-            _ = cancel.cancelled() => {
+            _ = ctx.cancel.cancelled() => {
                 Some(ToolOutput::error("[command cancelled]"))
             }
         }
@@ -330,11 +320,7 @@ impl MessageStore for InMemoryStorage {
 
 #[async_trait]
 impl StateStore for InMemoryStorage {
-    async fn update_state(
-        &self,
-        conv_id: &str,
-        state: &ConvState,
-    ) -> Result<(), String> {
+    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
         self.states
             .lock()
             .unwrap()
@@ -428,6 +414,8 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
             storage.clone(),
             llm.clone(),
             tools.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -522,6 +510,18 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 mod tests {
     use super::*;
     use crate::llm::{ContentBlock, Usage};
+    use std::path::PathBuf;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context() -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            PathBuf::from("/tmp"),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
+        )
+    }
 
     #[tokio::test]
     async fn test_mock_llm_client() {
@@ -553,17 +553,13 @@ mod tests {
         let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
 
         let result = executor
-            .execute(
-                "bash",
-                serde_json::json!({ "cmd": "ls" }),
-                CancellationToken::new(),
-            )
+            .execute("bash", serde_json::json!({ "cmd": "ls" }), test_context())
             .await;
         assert!(result.is_some());
         assert!(result.unwrap().success);
 
         let result = executor
-            .execute("unknown", serde_json::json!({}), CancellationToken::new())
+            .execute("unknown", serde_json::json!({}), test_context())
             .await;
         assert!(result.is_none());
     }
@@ -588,7 +584,7 @@ mod tests {
 
         let messages = storage.get_messages("conv-1").await.unwrap();
         assert_eq!(messages.len(), 1);
-        
+
         // Verify typed content
         match &messages[0].content {
             MessageContent::User(u) => assert_eq!(u.text, "hello"),
@@ -625,7 +621,11 @@ mod tests {
         let llm = MockLlmClient::new("test-model");
         // First response: tool call
         llm.queue_response(LlmResponse {
-            content: vec![ContentBlock::tool_use("tool-1", "bash", serde_json::json!({"command": "ls"}))],
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"command": "ls"}),
+            )],
             end_turn: false,
             usage: Usage::default(),
         });
@@ -701,6 +701,8 @@ mod tests {
             storage.clone(),
             llm,
             tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -760,7 +762,12 @@ mod tests {
 
         // Should only have user message - LLM response was discarded
         let msgs = storage.get_all_messages("test-conv");
-        assert_eq!(msgs.len(), 1, "Should only have user message, got {:?}", msgs);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "Should only have user message, got {:?}",
+            msgs
+        );
         assert_eq!(msgs[0].message_type, MessageType::User);
     }
 
@@ -809,6 +816,8 @@ mod tests {
             storage.clone(),
             llm,
             tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -901,6 +910,8 @@ mod tests {
             storage.clone(),
             llm,
             tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -1045,16 +1056,12 @@ mod tests {
     /// Test sub-agent terminal tool: submit_result transitions to Completed
     #[tokio::test]
     async fn test_subagent_submit_result_transitions_to_completed() {
+        use crate::state_machine::state::{SubmitResultInput, ToolCall, ToolInput};
         use crate::state_machine::{transition, ConvContext, Effect, Event};
-        use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput};
         use std::path::PathBuf;
 
         // Create sub-agent context
-        let context = ConvContext::sub_agent(
-            "sub-agent-1",
-            PathBuf::from("/tmp"),
-            "test-model",
-        );
+        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
 
         // Start from LlmRequesting
         let state = ConvState::LlmRequesting { attempt: 1 };
@@ -1089,22 +1096,21 @@ mod tests {
         }
 
         // Should have NotifyParent effect
-        let notify = result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. }));
+        let notify = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyParent { .. }));
         assert!(notify, "Should have NotifyParent effect");
     }
 
     /// Test sub-agent terminal tool: submit_error transitions to Failed
     #[tokio::test]
     async fn test_subagent_submit_error_transitions_to_failed() {
+        use crate::state_machine::state::{SubmitErrorInput, ToolCall, ToolInput};
         use crate::state_machine::{transition, ConvContext, Effect, Event};
-        use crate::state_machine::state::{ToolCall, ToolInput, SubmitErrorInput};
         use std::path::PathBuf;
 
-        let context = ConvContext::sub_agent(
-            "sub-agent-1",
-            PathBuf::from("/tmp"),
-            "test-model",
-        );
+        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1138,7 +1144,10 @@ mod tests {
         }
 
         // Should have NotifyParent effect
-        let notify = result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. }));
+        let notify = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyParent { .. }));
         assert!(notify, "Should have NotifyParent effect");
     }
 
@@ -1148,11 +1157,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Effect, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::sub_agent(
-            "sub-agent-1",
-            PathBuf::from("/tmp"),
-            "test-model",
-        );
+        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
 
         // Can be in various states when cancelled
         let states = [
@@ -1173,24 +1178,29 @@ mod tests {
             }
 
             // Should have NotifyParent effect
-            let notify = result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. }));
-            assert!(notify, "Should have NotifyParent effect for cancel from {:?}", state);
+            let notify = result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. }));
+            assert!(
+                notify,
+                "Should have NotifyParent effect for cancel from {:?}",
+                state
+            );
         }
     }
 
     /// Test terminal tool validation: must be sole tool in response
     #[tokio::test]
     async fn test_subagent_terminal_tool_must_be_alone() {
-        use crate::state_machine::{transition, ConvContext, Event};
+        use crate::state_machine::state::{
+            BashInput, BashMode, SubmitResultInput, ToolCall, ToolInput,
+        };
         use crate::state_machine::transition::TransitionError;
-        use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput, BashInput, BashMode};
+        use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::sub_agent(
-            "sub-agent-1",
-            PathBuf::from("/tmp"),
-            "test-model",
-        );
+        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1212,7 +1222,11 @@ mod tests {
         let event = Event::LlmResponse {
             content: vec![
                 ContentBlock::tool_use("tool-1", "bash", serde_json::json!({ "command": "ls" })),
-                ContentBlock::tool_use("tool-2", "submit_result", serde_json::json!({ "result": "done" })),
+                ContentBlock::tool_use(
+                    "tool-2",
+                    "submit_result",
+                    serde_json::json!({ "result": "done" }),
+                ),
             ],
             tool_calls: vec![bash_call, submit_call],
             end_turn: true,
@@ -1228,16 +1242,12 @@ mod tests {
     /// Test that parent conversations don't handle terminal tools specially
     #[tokio::test]
     async fn test_parent_ignores_terminal_tools() {
+        use crate::state_machine::state::{SubmitResultInput, ToolCall, ToolInput};
         use crate::state_machine::{transition, ConvContext, Event};
-        use crate::state_machine::state::{ToolCall, ToolInput, SubmitResultInput};
         use std::path::PathBuf;
 
         // Parent context (not sub-agent)
-        let context = ConvContext::new(
-            "parent-conv",
-            PathBuf::from("/tmp"),
-            "test-model",
-        );
+        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model");
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1273,8 +1283,8 @@ mod tests {
     /// Test sub-agent result buffering (early completion)
     #[tokio::test]
     async fn test_subagent_result_buffering() {
-        use crate::state_machine::state::SubAgentOutcome;
         use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::state::SubAgentOutcome;
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
         use tokio::sync::{broadcast, mpsc};
@@ -1300,6 +1310,8 @@ mod tests {
             storage.clone(),
             llm,
             tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
             event_rx,
             event_tx.clone(),
             broadcast_tx,

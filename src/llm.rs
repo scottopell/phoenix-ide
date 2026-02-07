@@ -11,7 +11,7 @@ mod types;
 
 pub use anthropic::AnthropicService;
 pub use error::{LlmError, LlmErrorKind};
-pub use models::{Provider, ModelDef, all_models};
+pub use models::{all_models, ModelDef, Provider};
 pub use openai::OpenAIService;
 pub use registry::{LlmConfig, ModelRegistry};
 pub use types::*;

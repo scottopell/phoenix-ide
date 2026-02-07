@@ -6,8 +6,8 @@
 //! REQ-KWS-004: Tool Schema
 //! REQ-KWS-005: LLM Selection
 
-use super::{Tool, ToolOutput};
-use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
+use super::{Tool, ToolContext, ToolOutput};
+use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio_util::sync::CancellationToken;
 
 const MAX_TERM_RESULTS: usize = 64 * 1024; // 64KB per term
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
@@ -60,29 +59,21 @@ struct KeywordSearchInput {
 }
 
 /// Keyword search tool
-pub struct KeywordSearchTool {
-    working_dir: PathBuf,
-    llm_registry: Arc<ModelRegistry>,
-}
+///
+/// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir` and `llm_registry`
+pub struct KeywordSearchTool;
 
 impl KeywordSearchTool {
-    pub fn new(working_dir: PathBuf, llm_registry: Arc<ModelRegistry>) -> Self {
-        Self {
-            working_dir,
-            llm_registry,
-        }
-    }
-
     /// Find git repository root or fall back to working directory
-    fn find_search_root(&self) -> PathBuf {
-        let mut current = self.working_dir.clone();
+    fn find_search_root(ctx: &ToolContext) -> PathBuf {
+        let mut current = ctx.working_dir.clone();
         loop {
             if current.join(".git").exists() {
                 return current;
             }
             match current.parent() {
                 Some(parent) => current = parent.to_path_buf(),
-                None => return self.working_dir.clone(),
+                None => return ctx.working_dir.clone(),
             }
         }
     }
@@ -123,27 +114,26 @@ impl KeywordSearchTool {
     }
 
     /// Select an LLM for filtering
-    fn select_filter_llm(&self) -> Option<Arc<dyn crate::llm::LlmService>> {
+    fn select_filter_llm(ctx: &ToolContext) -> Option<Arc<dyn crate::llm::LlmService>> {
         // Try preferred models in order
         for model_id in PREFERRED_MODELS {
-            if let Some(svc) = self.llm_registry.get(model_id) {
+            if let Some(svc) = ctx.llm_registry().get(model_id) {
                 return Some(svc);
             }
         }
         // Fall back to any available model
-        self.llm_registry.default()
+        ctx.llm_registry().default()
     }
 
     /// Filter results using LLM
     async fn filter_with_llm(
         &self,
+        ctx: &ToolContext,
         query: &str,
         search_root: &Path,
         results: &str,
     ) -> Result<String, String> {
-        let llm = self
-            .select_filter_llm()
-            .ok_or("No LLM available for filtering")?;
+        let llm = Self::select_filter_llm(ctx).ok_or("No LLM available for filtering")?;
 
         let user_content = format!(
             "Search root: {}\n\nRipgrep results:\n{}\n\nOriginal query: {}",
@@ -208,7 +198,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let input: KeywordSearchInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -218,7 +208,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             return ToolOutput::error("At least one search term is required");
         }
 
-        let search_root = self.find_search_root();
+        let search_root = Self::find_search_root(&ctx);
 
         // Filter out overly broad terms
         let mut usable_terms = Vec::new();
@@ -265,7 +255,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
 
         // Filter with LLM
         match self
-            .filter_with_llm(&input.query, &search_root, &results)
+            .filter_with_llm(&ctx, &input.query, &search_root, &results)
             .await
         {
             Ok(filtered) => ToolOutput::success(filtered),
@@ -286,13 +276,24 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::LlmConfig;
+    use crate::tools::browser::BrowserSessionManager;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context(working_dir: PathBuf) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            working_dir,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::llm::ModelRegistry::new_empty()),
+        )
+    }
 
     #[test]
     fn test_find_search_root() {
-        let registry = Arc::new(ModelRegistry::new(&LlmConfig::default()));
-        let tool = KeywordSearchTool::new(PathBuf::from("/tmp"), registry);
-        let root = tool.find_search_root();
+        let tool = KeywordSearchTool;
+        let ctx = test_context(PathBuf::from("/tmp"));
+        let root = KeywordSearchTool::find_search_root(&ctx);
         // Should fall back to working dir since /tmp isn't a git repo
         assert_eq!(root, PathBuf::from("/tmp"));
     }

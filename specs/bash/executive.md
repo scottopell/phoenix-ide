@@ -6,7 +6,7 @@ The bash tool enables LLM agents to execute shell commands in the conversation's
 
 ## Technical Summary
 
-Implemented as a Tool trait with schema defining `command` (required) and `mode` (optional enum: default/slow/background). Foreground execution uses tokio process spawning with mode-dependent timeouts. Background execution detaches the process, redirects output to a temp file, and spawns a monitoring task for completion status. Output truncation preserves 4KB from each end when exceeding 128KB limit. No TTY is attached; stdin is null.
+Implemented as a stateless Tool receiving all context via `ToolContext` parameter. The tool schema defines `command` (required) and `mode` (optional enum: default/slow/background). Foreground execution uses tokio process spawning with mode-dependent timeouts and cancellation support via `ctx.cancel`. Background execution detaches the process, redirects output to a temp file, and spawns a monitoring task. Working directory comes from `ctx.working_dir`, not stored state. Output truncation preserves 4KB from each end when exceeding 128KB limit. No TTY is attached; stdin is null.
 
 ## Status Summary
 
@@ -21,5 +21,6 @@ Implemented as a Tool trait with schema defining `command` (required) and `mode`
 | **REQ-BASH-007:** Command Safety Checks | ✅ Complete | tree-sitter parsing, pattern rejection |
 | **REQ-BASH-008:** Landlock Enforcement | ❌ Not Started | Read-only fs, no network in Restricted mode |
 | **REQ-BASH-009:** Graceful Degradation | ❌ Not Started | Non-Linux and old kernel fallback |
+| **REQ-BASH-010:** Stateless Tool with Context | 🔄 In Progress | ToolContext refactor |
 
-**Progress:** 7 of 9 complete
+**Progress:** 7 of 10 complete

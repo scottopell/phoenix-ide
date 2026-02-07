@@ -56,6 +56,68 @@ For complex scripts, write them to a file first and then execute the file.
 <pwd>{working_directory}</pwd>
 ```
 
+## Tool Context Model (REQ-BASH-010)
+
+All tools receive execution context via `ToolContext`, eliminating per-conversation state:
+
+```rust
+/// All context needed for a tool invocation.
+/// Created fresh for each tool call with validated conversation context.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Cancellation signal for long-running operations
+    pub cancel: CancellationToken,
+    
+    /// The conversation this tool is executing within
+    pub conversation_id: String,
+    
+    /// Working directory for file operations
+    pub working_dir: PathBuf,
+    
+    /// Browser session manager (access via browser() method)
+    browser_sessions: Arc<BrowserSessionManager>,
+}
+
+impl ToolContext {
+    /// Get or create browser session for this conversation.
+    /// Only browser tools call this; other tools ignore it.
+    pub async fn browser(&self) -> Result<BrowserSessionGuard<'_>, BrowserError> {
+        self.browser_sessions.get_or_create(&self.conversation_id).await
+    }
+}
+```
+
+### Tool Trait Signature
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> String;
+    fn input_schema(&self) -> Value;
+    
+    /// Execute tool with all context provided via ToolContext
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput;
+}
+```
+
+### Stateless BashTool
+
+```rust
+/// Bash tool has no per-conversation state
+pub struct BashTool;
+
+impl Tool for BashTool {
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let input: BashInput = serde_json::from_value(input)?;
+        match input.mode {
+            ExecutionMode::Background => self.execute_background(&input.command, &ctx).await,
+            mode => self.execute_foreground(&input.command, mode, &ctx).await,
+        }
+    }
+}
+```
+
 ## Execution Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-003)
 
 ```rust
@@ -71,21 +133,12 @@ struct BashInput {
     command: String,
     mode: ExecutionMode,
 }
-
-impl BashTool {
-    pub async fn run(&self, input: BashInput) -> ToolResult {
-        match input.mode {
-            ExecutionMode::Background => self.execute_background(input.command).await,
-            mode => self.execute_foreground(input.command, mode).await,
-        }
-    }
-}
 ```
 
 ## Foreground Execution (REQ-BASH-001, REQ-BASH-002, REQ-BASH-004)
 
 ```rust
-async fn execute_foreground(&self, command: String, mode: ExecutionMode) -> ToolResult {
+async fn execute_foreground(&self, command: &str, mode: ExecutionMode, ctx: &ToolContext) -> ToolResult {
     let timeout = match mode {
         ExecutionMode::Default => Duration::from_secs(30),
         ExecutionMode::Slow => Duration::from_secs(15 * 60),
@@ -93,22 +146,30 @@ async fn execute_foreground(&self, command: String, mode: ExecutionMode) -> Tool
     };
     
     let mut cmd = Command::new("bash");
-    cmd.args(["-c", &command])
-       .current_dir(&self.working_dir)
-       .stdin(Stdio::null())       // REQ-BASH-004: No TTY
+    cmd.args(["-c", command])
+       .current_dir(&ctx.working_dir)  // From ToolContext
+       .stdin(Stdio::null())           // REQ-BASH-004: No TTY
        .stdout(Stdio::piped())
        .stderr(Stdio::piped());
     
     let child = cmd.spawn()?;
     
-    match tokio::time::timeout(timeout, self.wait_with_output(child)).await {
-        Ok(result) => self.format_output(result),
-        Err(_) => {
-            // REQ-BASH-002: Kill process on timeout
-            child.kill();
-            ToolResult::Error(format!(
-                "[command timed out after {:?}]", timeout
-            ))
+    // Race between completion, timeout, and cancellation
+    tokio::select! {
+        biased;
+        
+        () = ctx.cancel.cancelled() => {
+            Self::kill_process_group(child.id());
+            ToolResult::Error("[command cancelled]".into())
+        }
+        
+        () = tokio::time::sleep(timeout) => {
+            Self::kill_process_group(child.id());
+            ToolResult::Error(format!("[command timed out after {:?}]", timeout))
+        }
+        
+        result = child.wait_with_output() => {
+            self.format_output(result)
         }
     }
 }
@@ -117,17 +178,15 @@ async fn execute_foreground(&self, command: String, mode: ExecutionMode) -> Tool
 ## Background Execution (REQ-BASH-003)
 
 ```rust
-async fn execute_background(&self, command: String) -> ToolResult {
-    let timeout = Duration::from_secs(24 * 60 * 60);  // 24 hours
-    
+async fn execute_background(&self, command: &str, ctx: &ToolContext) -> ToolResult {
     // Create temp directory for output
     let tmp_dir = tempfile::tempdir()?;
     let output_file = tmp_dir.path().join("output");
     let output_handle = File::create(&output_file)?;
     
     let mut cmd = Command::new("bash");
-    cmd.args(["-c", &command])
-       .current_dir(&self.working_dir)
+    cmd.args(["-c", command])
+       .current_dir(&ctx.working_dir)  // From ToolContext
        .stdin(Stdio::null())
        .stdout(output_handle.try_clone()?)
        .stderr(output_handle);
@@ -252,15 +311,19 @@ fn check_node(node: Node, source: &[u8]) -> Result<(), CheckError> {
 
 ```rust
 // In BashTool::run()
-async fn run(&self, input: Value, cancel: CancellationToken) -> ToolOutput {
-    // ... parse input ...
+async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+    let input: BashInput = serde_json::from_value(input)?;
     
     // REQ-BASH-007: Check for dangerous patterns
     if let Err(e) = bash_check::check(&input.command) {
         return ToolOutput::error(e.message);
     }
     
-    // ... execute command ...
+    // Execute with context
+    match input.mode {
+        ExecutionMode::Background => self.execute_background(&input.command, &ctx).await,
+        mode => self.execute_foreground(&input.command, mode, &ctx).await,
+    }
 }
 ```
 

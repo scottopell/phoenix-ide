@@ -50,7 +50,7 @@ pub enum Event {
     },
 
     // Sub-agent events
-    /// spawn_agents tool completed, sub-agents are now running
+    /// `spawn_agents` tool completed, sub-agents are now running
     SpawnAgentsComplete {
         tool_use_id: String,
         /// Normal tool result for LLM context
@@ -64,5 +64,3 @@ pub enum Event {
         outcome: SubAgentOutcome,
     },
 }
-
-

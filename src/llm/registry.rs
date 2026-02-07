@@ -1,6 +1,8 @@
 //! Model registry for managing available LLM providers
 
-use super::{LlmService, LoggingService, all_models, Provider};
+#![allow(dead_code)] // new_empty() used in tests
+
+use super::{all_models, LlmService, LoggingService, Provider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,6 +37,14 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// Create an empty registry for testing purposes
+    pub fn new_empty() -> Self {
+        Self {
+            services: HashMap::new(),
+            default_model: "test-model".to_string(),
+        }
+    }
+
     pub fn new(config: &LlmConfig) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
 
@@ -125,7 +135,7 @@ impl ModelRegistry {
     /// Get detailed information about available models
     pub fn available_model_info(&self) -> Vec<crate::api::ModelInfo> {
         let mut model_infos = Vec::new();
-        
+
         // Get info for each registered model
         for model_def in super::all_models() {
             if self.services.contains_key(model_def.id) {
@@ -137,7 +147,7 @@ impl ModelRegistry {
                 });
             }
         }
-        
+
         model_infos
     }
 
@@ -150,11 +160,7 @@ impl ModelRegistry {
     /// Prefers: claude-4.5-haiku > gpt-4o-mini > any available model
     pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
         // Priority order for cheap models
-        const CHEAP_MODELS: &[&str] = &[
-            "claude-4.5-haiku",
-            "gpt-4o-mini",
-            "gpt-5-mini",
-        ];
+        const CHEAP_MODELS: &[&str] = &["claude-4.5-haiku", "gpt-4o-mini", "gpt-5-mini"];
 
         for model_id in CHEAP_MODELS {
             if let Some(service) = self.get(model_id) {
@@ -166,7 +172,6 @@ impl ModelRegistry {
         self.default()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -186,10 +191,10 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        
+
         let models = registry.available_models();
         assert!(!models.is_empty());
-        
+
         // All models should be Anthropic models
         for model_id in &models {
             assert!(
@@ -201,14 +206,18 @@ mod tests {
     }
 
     #[test]
-    fn test_gateway_with_no_keys_no_models() {
-        // Even with gateway, we need API keys
+    fn test_gateway_enables_all_models() {
+        // With gateway, all models become available (gateway handles auth)
         let config = LlmConfig {
             gateway: Some("https://example.com".to_string()),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert!(registry.available_models().is_empty());
+        // All models should be available since gateway mode uses "implicit" API key
+        assert!(!registry.available_models().is_empty());
+        // Should have models from multiple providers
+        assert!(registry.get("claude-4.5-sonnet").is_some());
+        assert!(registry.get("gpt-4o").is_some());
     }
 
     #[test]
@@ -219,7 +228,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        
+
         let models = registry.available_models();
         assert!(!models.is_empty());
         assert!(models.contains(&"claude-4.5-opus".to_string()));
@@ -232,7 +241,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        
+
         // Should default to claude-4.5-sonnet
         assert_eq!(registry.default_model_id(), "claude-4.5-sonnet");
     }
@@ -245,7 +254,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        
+
         assert_eq!(registry.default_model_id(), "claude-4.5-opus");
     }
 
@@ -256,10 +265,10 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        
+
         let model_infos = registry.available_model_info();
         assert!(!model_infos.is_empty());
-        
+
         // Check that all models have proper metadata
         for info in &model_infos {
             assert!(!info.id.is_empty());
@@ -267,7 +276,7 @@ mod tests {
             assert!(!info.description.is_empty());
             assert!(info.context_window > 0);
         }
-        
+
         // Check specific model
         let opus = model_infos.iter().find(|m| m.id == "claude-4.5-opus");
         assert!(opus.is_some());

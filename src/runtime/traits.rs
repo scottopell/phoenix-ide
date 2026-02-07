@@ -8,13 +8,12 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
     /// Add a message to the conversation
-    /// 
+    ///
     /// `message_id` is the canonical identifier for this message. For user messages,
     /// this is client-generated (enabling idempotent retries). For agent/tool messages,
     /// this is server-generated.
@@ -35,11 +34,7 @@ pub trait MessageStore: Send + Sync {
 #[async_trait]
 pub trait StateStore: Send + Sync {
     /// Update the conversation state (full state as JSON)
-    async fn update_state(
-        &self,
-        conv_id: &str,
-        state: &ConvState,
-    ) -> Result<(), String>;
+    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String>;
 
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
@@ -57,16 +52,13 @@ pub trait LlmClient: Send + Sync {
     fn model_id(&self) -> &str;
 }
 
+use crate::tools::ToolContext;
+
 /// Executor for tools
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    /// Execute a tool by name with cancellation support
-    async fn execute(
-        &self,
-        name: &str,
-        input: Value,
-        cancel: CancellationToken,
-    ) -> Option<ToolOutput>;
+    /// Execute a tool by name with context
+    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput>;
 
     /// Get tool definitions for LLM
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
@@ -90,7 +82,9 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
-        (**self).add_message(message_id, conv_id, content, display_data, usage_data).await
+        (**self)
+            .add_message(message_id, conv_id, content, display_data, usage_data)
+            .await
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
@@ -100,11 +94,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
-    async fn update_state(
-        &self,
-        conv_id: &str,
-        state: &ConvState,
-    ) -> Result<(), String> {
+    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
         (**self).update_state(conv_id, state).await
     }
 
@@ -126,13 +116,8 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
 #[async_trait]
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
-    async fn execute(
-        &self,
-        name: &str,
-        input: Value,
-        cancel: CancellationToken,
-    ) -> Option<ToolOutput> {
-        (**self).execute(name, input, cancel).await
+    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
+        (**self).execute(name, input, ctx).await
     }
 
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
@@ -188,23 +173,22 @@ impl MessageStore for DatabaseStorage {
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
-    async fn update_state(
-        &self,
-        conv_id: &str,
-        state: &ConvState,
-    ) -> Result<(), String> {
+    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
         self.db
             .update_conversation_state(conv_id, state)
             .map_err(|e| e.to_string())
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
-        let conv = self.db.get_conversation(conv_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conv_id)
+            .map_err(|e| e.to_string())?;
         Ok(conv.state)
     }
 }
 
-/// Adapter to use ModelRegistry as LlmClient
+/// Adapter to use `ModelRegistry` as `LlmClient`
 pub struct RegistryLlmClient {
     registry: Arc<ModelRegistry>,
     model_id: String,
@@ -232,7 +216,7 @@ impl LlmClient for RegistryLlmClient {
     }
 }
 
-/// Adapter to use ToolRegistry as ToolExecutor
+/// Adapter to use `ToolRegistry` as `ToolExecutor`
 pub struct ToolRegistryExecutor {
     registry: ToolRegistry,
 }
@@ -245,18 +229,11 @@ impl ToolRegistryExecutor {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
-    async fn execute(
-        &self,
-        name: &str,
-        input: Value,
-        cancel: CancellationToken,
-    ) -> Option<ToolOutput> {
-        self.registry.execute(name, input, cancel).await
+    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
+        self.registry.execute(name, input, ctx).await
     }
 
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
         self.registry.definitions()
     }
 }
-
-

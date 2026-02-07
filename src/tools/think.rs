@@ -3,11 +3,10 @@
 //! REQ-THINK-001: Thought Recording
 //! REQ-THINK-002: Tool Schema
 
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 /// Think tool for LLM reasoning
 pub struct ThinkTool;
@@ -41,7 +40,7 @@ impl Tool for ThinkTool {
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
         // Parse input (mainly for validation)
         match serde_json::from_value::<ThinkInput>(input) {
             Ok(_) => ToolOutput::success("recorded"),
@@ -53,6 +52,19 @@ impl Tool for ThinkTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::BrowserSessionManager;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context() -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::llm::ModelRegistry::new_empty()),
+        )
+    }
 
     #[tokio::test]
     async fn test_think_records() {
@@ -60,7 +72,7 @@ mod tests {
         let result = tool
             .run(
                 json!({"thoughts": "Planning my approach..."}),
-                CancellationToken::new(),
+                test_context(),
             )
             .await;
         assert!(result.success);
@@ -70,16 +82,14 @@ mod tests {
     #[tokio::test]
     async fn test_think_empty_thoughts() {
         let tool = ThinkTool;
-        let result = tool
-            .run(json!({"thoughts": ""}), CancellationToken::new())
-            .await;
+        let result = tool.run(json!({"thoughts": ""}), test_context()).await;
         assert!(result.success);
     }
 
     #[tokio::test]
     async fn test_think_missing_thoughts() {
         let tool = ThinkTool;
-        let result = tool.run(json!({}), CancellationToken::new()).await;
+        let result = tool.run(json!({}), test_context()).await;
         assert!(!result.success);
     }
 }

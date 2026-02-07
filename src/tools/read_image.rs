@@ -2,14 +2,13 @@
 //!
 //! REQ-TOOL: `read_image` for viewing screenshots, diagrams, etc.
 
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio_util::sync::CancellationToken;
 
 /// Maximum image size (5MB)
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
@@ -24,21 +23,17 @@ const SUPPORTED_FORMATS: &[(&str, &str)] = &[
 ];
 
 /// Read image tool for examining images in the workspace
-pub struct ReadImageTool {
-    working_dir: PathBuf,
-}
+///
+/// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir`
+pub struct ReadImageTool;
 
 impl ReadImageTool {
-    pub fn new(working_dir: PathBuf) -> Self {
-        Self { working_dir }
-    }
-
-    fn resolve_path(&self, path: &str) -> PathBuf {
+    fn resolve_path(ctx: &ToolContext, path: &str) -> PathBuf {
         let path = Path::new(path);
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.working_dir.join(path)
+            ctx.working_dir.join(path)
         }
     }
 
@@ -86,13 +81,13 @@ impl Tool for ReadImageTool {
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let input: ReadImageInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        let path = self.resolve_path(&input.path);
+        let path = Self::resolve_path(&ctx, &input.path);
 
         // Check file exists
         if !path.exists() {
@@ -149,8 +144,21 @@ impl Tool for ReadImageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::browser::BrowserSessionManager;
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context(working_dir: PathBuf) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            working_dir,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::llm::ModelRegistry::new_empty()),
+        )
+    }
 
     fn create_test_image(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
         let path = dir.join(name);
@@ -171,10 +179,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_png() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadImageTool::new(dir.path().to_path_buf());
+        let tool = ReadImageTool;
+        let ctx = test_context(dir.path().to_path_buf());
         create_test_image(dir.path(), "test.png", MINIMAL_PNG);
 
-        let result = tool.run(json!({"path": "test.png"}), CancellationToken::new()).await;
+        let result = tool.run(json!({"path": "test.png"}), ctx).await;
         assert!(result.success, "Failed: {}", result.output);
 
         let output: Value = serde_json::from_str(&result.output).unwrap();
@@ -186,19 +195,23 @@ mod tests {
     #[tokio::test]
     async fn test_read_absolute_path() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadImageTool::new(PathBuf::from("/tmp"));
+        let tool = ReadImageTool;
+        let ctx = test_context(PathBuf::from("/tmp"));
         let img_path = create_test_image(dir.path(), "abs.png", MINIMAL_PNG);
 
-        let result = tool.run(json!({"path": img_path.to_str().unwrap()}), CancellationToken::new()).await;
+        let result = tool
+            .run(json!({"path": img_path.to_str().unwrap()}), ctx)
+            .await;
         assert!(result.success, "Failed: {}", result.output);
     }
 
     #[tokio::test]
     async fn test_file_not_found() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadImageTool::new(dir.path().to_path_buf());
+        let tool = ReadImageTool;
+        let ctx = test_context(dir.path().to_path_buf());
 
-        let result = tool.run(json!({"path": "nonexistent.png"}), CancellationToken::new()).await;
+        let result = tool.run(json!({"path": "nonexistent.png"}), ctx).await;
         assert!(!result.success);
         assert!(result.output.contains("not found"));
     }
@@ -206,10 +219,11 @@ mod tests {
     #[tokio::test]
     async fn test_unsupported_format() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadImageTool::new(dir.path().to_path_buf());
+        let tool = ReadImageTool;
+        let ctx = test_context(dir.path().to_path_buf());
         create_test_image(dir.path(), "test.bmp", b"fake bmp data");
 
-        let result = tool.run(json!({"path": "test.bmp"}), CancellationToken::new()).await;
+        let result = tool.run(json!({"path": "test.bmp"}), ctx).await;
         assert!(!result.success);
         assert!(result.output.contains("Unsupported"));
     }
@@ -217,10 +231,11 @@ mod tests {
     #[tokio::test]
     async fn test_directory_rejected() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadImageTool::new(dir.path().to_path_buf());
+        let tool = ReadImageTool;
+        let ctx = test_context(dir.path().to_path_buf());
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
-        let result = tool.run(json!({"path": "subdir"}), CancellationToken::new()).await;
+        let result = tool.run(json!({"path": "subdir"}), ctx).await;
         assert!(!result.success);
         assert!(result.output.contains("Not a file"));
     }
@@ -228,13 +243,14 @@ mod tests {
     #[tokio::test]
     async fn test_all_supported_formats() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadImageTool::new(dir.path().to_path_buf());
+        let tool = ReadImageTool;
 
         for (ext, expected_type) in SUPPORTED_FORMATS {
             let filename = format!("test.{}", ext);
             create_test_image(dir.path(), &filename, b"fake image data");
 
-            let result = tool.run(json!({"path": filename}), CancellationToken::new()).await;
+            let ctx = test_context(dir.path().to_path_buf());
+            let result = tool.run(json!({"path": filename}), ctx).await;
             assert!(result.success, "Failed for {}: {}", ext, result.output);
 
             let output: Value = serde_json::from_str(&result.output).unwrap();

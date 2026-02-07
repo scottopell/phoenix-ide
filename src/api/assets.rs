@@ -17,7 +17,7 @@ struct Assets;
 /// Serve embedded static files, with filesystem fallback for development
 pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
-    
+
     // Try embedded assets first
     if let Some(content) = Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
@@ -27,7 +27,7 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
             .body(Body::from(content.data.to_vec()))
             .unwrap();
     }
-    
+
     // Fallback to filesystem in development
     let fs_path = PathBuf::from("ui/dist").join(path);
     if fs_path.exists() {
@@ -40,7 +40,7 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
                 .unwrap();
         }
     }
-    
+
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::from("Not found"))
@@ -58,7 +58,7 @@ pub async fn serve_service_worker() -> impl IntoResponse {
             .body(Body::from(content.data.to_vec()))
             .unwrap();
     }
-    
+
     // Fallback to filesystem in development
     let fs_path = PathBuf::from("ui/dist/service-worker.js");
     if fs_path.exists() {
@@ -71,7 +71,7 @@ pub async fn serve_service_worker() -> impl IntoResponse {
                 .unwrap();
         }
     }
-    
+
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::from("Service worker not found"))
@@ -84,7 +84,7 @@ pub fn get_index_html() -> Option<String> {
     if let Some(content) = Assets::get("index.html") {
         return String::from_utf8(content.data.to_vec()).ok();
     }
-    
+
     // Fallback to filesystem
     std::fs::read_to_string("ui/dist/index.html").ok()
 }

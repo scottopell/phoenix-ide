@@ -98,7 +98,7 @@ impl Effect {
         }
     }
 
-    /// Create a state_change notification with the state as an object
+    /// Create a `state_change` notification with the state as an object
     /// This merges the state type with the additional data into a single object
     #[allow(clippy::needless_pass_by_value)] // data is consumed by json! macro
     pub fn notify_state_change(state_type: &str, mut data: Value) -> Self {

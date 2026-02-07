@@ -2,6 +2,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+use super::assets::{get_index_html, serve_service_worker, serve_static};
 use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
@@ -10,17 +11,16 @@ use super::types::{
     ReadFileResponse, RenameRequest, SuccessResponse, ValidateCwdResponse,
 };
 use super::AppState;
-use crate::runtime::SseEvent;
 use crate::db::ImageData;
+use crate::runtime::SseEvent;
 use crate::state_machine::Event;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response, Html},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use super::assets::{get_index_html, serve_static, serve_service_worker};
 use chrono::Datelike;
 use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
@@ -158,7 +158,9 @@ async fn create_conversation(
 
     // Validate message text is not empty
     if req.text.trim().is_empty() {
-        return Err(AppError::BadRequest("Message text cannot be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "Message text cannot be empty".to_string(),
+        ));
     }
 
     // Idempotency check: if message_id already exists, find and return that conversation
@@ -180,7 +182,7 @@ async fn create_conversation(
 
     // Generate ID
     let id = uuid::Uuid::new_v4().to_string();
-    
+
     // Try to generate a title using a cheap LLM model
     let slug = if let Some(cheap_model) = state.runtime.model_registry().get_cheap_model() {
         match crate::title_generator::generate_title(&req.text, cheap_model).await {
@@ -203,8 +205,11 @@ async fn create_conversation(
         .runtime
         .db()
         .create_conversation(
-            &id, &slug, &req.cwd, true, // user_initiated
-            None, // no parent
+            &id,
+            &slug,
+            &req.cwd,
+            true,                 // user_initiated
+            None,                 // no parent
             req.model.as_deref(), // selected model
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -231,7 +236,7 @@ async fn create_conversation(
         .runtime
         .send_event(&id, event)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| AppError::Internal(e.clone()))?;
 
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
@@ -638,43 +643,35 @@ fn detect_file_type(path: &std::path::Path) -> (String, bool) {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
+        .map(str::to_lowercase);
 
     match ext.as_deref() {
         // Markdown
-        Some("md") | Some("markdown") => ("markdown".to_string(), true),
+        Some("md" | "markdown") => ("markdown".to_string(), true),
         // Code files
-        Some("rs") | Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("py")
-        | Some("go") | Some("java") | Some("cpp") | Some("c") | Some("h") | Some("hpp")
-        | Some("css") | Some("html") | Some("htm") | Some("vue") | Some("svelte")
-        | Some("php") | Some("rb") | Some("swift") | Some("kt") | Some("scala")
-        | Some("sh") | Some("bash") | Some("zsh") | Some("fish") | Some("ps1")
-        | Some("sql") | Some("graphql") | Some("proto") => ("code".to_string(), true),
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "cpp" | "c" | "h" | "hpp"
+            | "css" | "html" | "htm" | "vue" | "svelte" | "php" | "rb" | "swift" | "kt" | "scala"
+            | "sh" | "bash" | "zsh" | "fish" | "ps1" | "sql" | "graphql" | "proto",
+        ) => ("code".to_string(), true),
         // Config files
-        Some("json") | Some("yaml") | Some("yml") | Some("toml") | Some("ini")
-        | Some("env") | Some("conf") | Some("cfg") | Some("xml") | Some("properties") => {
-            ("config".to_string(), true)
-        }
+        Some(
+            "json" | "yaml" | "yml" | "toml" | "ini" | "env" | "conf" | "cfg" | "xml"
+            | "properties",
+        ) => ("config".to_string(), true),
         // Text files
-        Some("txt") | Some("log") | Some("csv") | Some("tsv") | Some("rtf") => {
-            ("text".to_string(), true)
-        }
+        Some("txt" | "log" | "csv" | "tsv" | "rtf") => ("text".to_string(), true),
         // Image files
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("svg") | Some("webp")
-        | Some("ico") | Some("bmp") | Some("tiff") | Some("tif") => {
+        Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "tif") => {
             ("image".to_string(), false)
         }
         // Data/binary files
-        Some("db") | Some("sqlite") | Some("sqlite3") | Some("bin") | Some("dat")
-        | Some("exe") | Some("dll") | Some("so") | Some("dylib") | Some("o") | Some("a")
-        | Some("wasm") | Some("class") | Some("jar") | Some("war") | Some("pyc")
-        | Some("pyo") | Some("pdf") | Some("doc") | Some("docx") | Some("xls")
-        | Some("xlsx") | Some("ppt") | Some("pptx") | Some("zip") | Some("tar")
-        | Some("gz") | Some("bz2") | Some("xz") | Some("7z") | Some("rar")
-        | Some("mp3") | Some("mp4") | Some("wav") | Some("avi") | Some("mkv")
-        | Some("mov") | Some("webm") | Some("flac") | Some("ogg") => {
-            ("data".to_string(), false)
-        }
+        Some(
+            "db" | "sqlite" | "sqlite3" | "bin" | "dat" | "exe" | "dll" | "so" | "dylib" | "o"
+            | "a" | "wasm" | "class" | "jar" | "war" | "pyc" | "pyo" | "pdf" | "doc" | "docx"
+            | "xls" | "xlsx" | "ppt" | "pptx" | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar"
+            | "mp3" | "mp4" | "wav" | "avi" | "mkv" | "mov" | "webm" | "flac" | "ogg",
+        ) => ("data".to_string(), false),
         // Unknown - could be text, need to check when reading
         _ => ("unknown".to_string(), true),
     }
@@ -715,10 +712,7 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
             let full_path = entry_path.to_string_lossy().to_string();
             let metadata = entry.metadata().ok();
 
-            let is_directory = metadata
-                .as_ref()
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
+            let is_directory = metadata.as_ref().is_some_and(std::fs::Metadata::is_dir);
 
             let (file_type, is_text_file) = if is_directory {
                 ("folder".to_string(), false)
@@ -729,7 +723,7 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
             let size = if is_directory {
                 None
             } else {
-                metadata.as_ref().map(|m| m.len())
+                metadata.as_ref().map(std::fs::Metadata::len)
             };
 
             let modified_time = metadata
@@ -751,12 +745,10 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
         .collect();
 
     // Sort: directories first, then alphabetically (case-insensitive)
-    items.sort_by(|a, b| {
-        match (a.is_directory, b.is_directory) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    items.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     Ok(Json(ListFilesResponse { items }))
@@ -783,8 +775,8 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
     }
 
     // Read file content
-    let content = fs::read(&path)
-        .map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
+    let content =
+        fs::read(&path).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
 
     // Validate text encoding
     if !is_valid_text(&content) {
@@ -810,7 +802,7 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
 async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     // Get model metadata from registry
     let models = state.llm_registry.available_model_info();
-    
+
     Json(ModelsResponse {
         models,
         default: state.llm_registry.default_model_id().to_string(),
