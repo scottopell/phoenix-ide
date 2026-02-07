@@ -26,9 +26,15 @@ export async function register() {
         });
 
         // Handle controller change (new SW activated)
+        // Only reload if we already had a controller (meaning this is an update, not initial install)
+        let hadController = !!navigator.serviceWorker.controller;
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          // Reload the page to get fresh content
-          window.location.reload();
+          if (hadController) {
+            // Reload the page to get fresh content from the new SW
+            window.location.reload();
+          }
+          // After first controller change, set flag so future changes trigger reload
+          hadController = true;
         });
       });
     } catch (error) {
