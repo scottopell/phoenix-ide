@@ -98,11 +98,18 @@ WHEN mode transitions occur
 THE SYSTEM SHALL emit appropriate effects (persist, notify, inject message)
 AND maintain all state machine invariants
 
-WHEN sub-agent is spawned
-THE SYSTEM SHALL inherit parent conversation's mode
-AND NOT allow sub-agent to request mode upgrade (only parent can)
+WHEN sub-agent is spawned AND Restricted mode is available
+THE SYSTEM SHALL always create sub-agent in Restricted mode
+REGARDLESS of parent conversation's mode
 
-**Rationale:** Mode is conversation-level state that participates in the state machine. Sub-agents inherit context but cannot escalate privileges.
+WHEN sub-agent is spawned AND Restricted mode is unavailable (no Landlock)
+THE SYSTEM SHALL create sub-agent in Unrestricted mode (only option)
+
+WHEN sub-agent is running
+THE SYSTEM SHALL NOT provide request_mode_upgrade tool to sub-agents
+AND sub-agents cannot change their mode
+
+**Rationale:** Sub-agents are autonomous and less supervised. Forcing Restricted mode (when available) limits blast radius. Only the parent conversation, with direct user oversight, can operate in Unrestricted mode.
 
 ---
 
@@ -251,11 +258,12 @@ enum ConvState {
 ## Property Invariants (for proptesting)
 
 1. **Mode monotonicity during upgrade flow**: Once AwaitingModeApproval, only UserApprove/UserDeny can exit
-2. **Sub-agent mode inheritance**: Sub-agent mode always equals parent mode at spawn time
+2. **Sub-agent mode invariant**: If Landlock available, sub-agent mode is always Restricted (never Unrestricted)
 3. **Tool availability consistency**: In Restricted mode, patch tool always returns mode error
 4. **Downgrade immediacy**: UserRequestDowngrade from Idle always succeeds immediately
 5. **No automatic escalation**: No event sequence from Restricted reaches Unrestricted without UserApproveUpgrade
 6. **Sandbox availability determines mode enum**: If !landlock_available, mode is always Unrestricted
+7. **Sub-agent tool restriction**: Sub-agents never have access to request_mode_upgrade tool
 
 ---
 
