@@ -335,17 +335,106 @@ impl Database {
         Ok(())
     }
 
-    /// Reset all conversations to idle on server restart
+    /// Reset all conversations to idle on server restart.
+    /// Also repairs any orphaned tool_use by injecting synthetic tool_result.
     pub fn reset_all_to_idle(&self) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
+        // First, repair any orphaned tool_use blocks
+        self.repair_orphaned_tool_use_internal(&conn, &now)?;
+
+        // Then reset all non-idle conversations to idle
         conn.execute(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
              WHERE json_extract(state, '$.type') != 'idle'",
             params![idle_state, now.to_rfc3339()],
         )?;
+        Ok(())
+    }
+
+    /// Scan all conversations for orphaned tool_use and inject synthetic tool_result.
+    /// An orphaned tool_use is an agent message containing tool_use blocks where
+    /// not all tool_use IDs have a corresponding tool_result in the following messages.
+    fn repair_orphaned_tool_use_internal(
+        &self,
+        conn: &Connection,
+        now: &DateTime<Utc>,
+    ) -> DbResult<()> {
+        use crate::llm::ContentBlock;
+
+        // Get all conversations
+        let mut conv_stmt = conn.prepare("SELECT id FROM conversations")?;
+        let conv_ids: Vec<String> = conv_stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(Result::ok)
+            .collect();
+
+        for conv_id in conv_ids {
+            // Get all messages for this conversation in order
+            let mut msg_stmt = conn.prepare(
+                "SELECT message_id, sequence_id, message_type, content 
+                 FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC"
+            )?;
+
+            let messages: Vec<(String, i64, String, String)> = msg_stmt
+                .query_map(params![conv_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .filter_map(Result::ok)
+                .collect();
+
+            // Find orphaned tool_use IDs
+            let mut pending_tool_ids: Vec<String> = Vec::new();
+            let mut max_sequence_id: i64 = 0;
+
+            for (_, seq_id, msg_type, content) in &messages {
+                max_sequence_id = *seq_id;
+
+                if msg_type == "agent" {
+                    // Parse agent content to find tool_use blocks
+                    if let Ok(blocks) = serde_json::from_str::<Vec<ContentBlock>>(content) {
+                        for block in blocks {
+                            if let ContentBlock::ToolUse { id, .. } = block {
+                                pending_tool_ids.push(id);
+                            }
+                        }
+                    }
+                } else if msg_type == "tool" {
+                    // Parse tool content to find tool_use_id
+                    if let Ok(tool_content) = serde_json::from_str::<ToolContent>(content) {
+                        pending_tool_ids.retain(|id| id != &tool_content.tool_use_id);
+                    }
+                }
+            }
+
+            // Insert synthetic tool_result for any remaining orphaned tool_use
+            for tool_id in pending_tool_ids {
+                max_sequence_id += 1;
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let tool_content = ToolContent::new(
+                    &tool_id,
+                    "[Tool execution interrupted by server restart]",
+                    true,
+                );
+                let content_json = serde_json::to_string(&tool_content)
+                    .unwrap_or_else(|_| "{}".to_string());
+
+                conn.execute(
+                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+                     VALUES (?1, ?2, ?3, 'tool', ?4, ?5)",
+                    params![msg_id, conv_id, max_sequence_id, content_json, now.to_rfc3339()],
+                )?;
+
+                tracing::info!(
+                    conv_id = %conv_id,
+                    tool_id = %tool_id,
+                    "Injected synthetic tool_result for orphaned tool_use"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -574,5 +663,170 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    #[test]
+    fn test_reset_repairs_orphaned_tool_use() {
+        use crate::llm::ContentBlock;
+
+        let db = Database::open_in_memory().unwrap();
+
+        // Create a conversation
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .unwrap();
+
+        // Add user message
+        db.add_message(
+            "msg-1",
+            "conv-1",
+            &MessageContent::user("Run a command"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Add agent message with tool_use (simulating LLM response)
+        db.add_message(
+            "msg-2",
+            "conv-1",
+            &MessageContent::agent(vec![
+                ContentBlock::text("Let me run that for you."),
+                ContentBlock::tool_use("tool-123", "bash", serde_json::json!({"command": "ls"})),
+            ]),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // NO tool_result added - simulating crash during tool execution
+
+        // Verify we have an orphaned tool_use
+        let messages_before = db.get_messages("conv-1").unwrap();
+        assert_eq!(messages_before.len(), 2);
+
+        // Run reset (which should repair orphans)
+        db.reset_all_to_idle().unwrap();
+
+        // Verify synthetic tool_result was injected
+        let messages_after = db.get_messages("conv-1").unwrap();
+        assert_eq!(messages_after.len(), 3, "Should have injected synthetic tool_result");
+
+        // Check the synthetic result
+        let tool_msg = &messages_after[2];
+        assert_eq!(tool_msg.message_type, MessageType::Tool);
+        match &tool_msg.content {
+            MessageContent::Tool(tc) => {
+                assert_eq!(tc.tool_use_id, "tool-123");
+                assert!(tc.is_error);
+                assert!(tc.content.contains("interrupted"));
+            }
+            _ => panic!("Expected Tool content"),
+        }
+    }
+
+    #[test]
+    fn test_reset_does_not_duplicate_complete_exchanges() {
+        use crate::llm::ContentBlock;
+
+        let db = Database::open_in_memory().unwrap();
+
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .unwrap();
+
+        // Add a complete exchange: user -> agent(tool_use) -> tool_result
+        db.add_message(
+            "msg-1",
+            "conv-1",
+            &MessageContent::user("Run a command"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        db.add_message(
+            "msg-2",
+            "conv-1",
+            &MessageContent::agent(vec![
+                ContentBlock::tool_use("tool-123", "bash", serde_json::json!({"command": "ls"})),
+            ]),
+            None,
+            None,
+        )
+        .unwrap();
+
+        db.add_message(
+            "msg-3",
+            "conv-1",
+            &MessageContent::tool("tool-123", "file1.txt\nfile2.txt", false),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Run reset
+        db.reset_all_to_idle().unwrap();
+
+        // Should still have exactly 3 messages (no synthetic added)
+        let messages = db.get_messages("conv-1").unwrap();
+        assert_eq!(messages.len(), 3, "Complete exchange should not be modified");
+    }
+
+    #[test]
+    fn test_reset_repairs_multiple_orphaned_tools() {
+        use crate::llm::ContentBlock;
+
+        let db = Database::open_in_memory().unwrap();
+
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .unwrap();
+
+        // Agent message with multiple tool_use blocks
+        db.add_message(
+            "msg-1",
+            "conv-1",
+            &MessageContent::agent(vec![
+                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({"command": "ls"})),
+                ContentBlock::tool_use("tool-2", "bash", serde_json::json!({"command": "pwd"})),
+                ContentBlock::tool_use("tool-3", "bash", serde_json::json!({"command": "date"})),
+            ]),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Only tool-1 completed before crash
+        db.add_message(
+            "msg-2",
+            "conv-1",
+            &MessageContent::tool("tool-1", "output", false),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Run reset
+        db.reset_all_to_idle().unwrap();
+
+        // Should have 2 synthetic results for tool-2 and tool-3
+        let messages = db.get_messages("conv-1").unwrap();
+        assert_eq!(messages.len(), 4, "Should have 1 agent + 1 real tool + 2 synthetic");
+
+        // Check that tool-2 and tool-3 have synthetic results
+        let tool_results: Vec<_> = messages
+            .iter()
+            .filter(|m| m.message_type == MessageType::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 3);
+
+        let tool_ids: Vec<_> = tool_results
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::Tool(tc) => Some(tc.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(tool_ids.contains(&"tool-1".to_string()));
+        assert!(tool_ids.contains(&"tool-2".to_string()));
+        assert!(tool_ids.contains(&"tool-3".to_string()));
     }
 }
