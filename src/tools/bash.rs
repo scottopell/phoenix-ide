@@ -419,4 +419,44 @@ mod tests {
             String::from_utf8_lossy(&ps_output.stdout)
         );
     }
+
+    #[tokio::test]
+    async fn test_blocked_git_add() {
+        let tool = BashTool::new(temp_dir());
+        let result = tool
+            .run(json!({"command": "git add -A"}), CancellationToken::new())
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("blind git add"));
+    }
+
+    #[tokio::test]
+    async fn test_blocked_rm_rf_root() {
+        let tool = BashTool::new(temp_dir());
+        let result = tool
+            .run(json!({"command": "rm -rf /"}), CancellationToken::new())
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("critical data"));
+    }
+
+    #[tokio::test]
+    async fn test_blocked_git_push_force() {
+        let tool = BashTool::new(temp_dir());
+        let result = tool
+            .run(json!({"command": "git push --force"}), CancellationToken::new())
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("--force is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_allowed_command_runs() {
+        let tool = BashTool::new(temp_dir());
+        let result = tool
+            .run(json!({"command": "echo hello"}), CancellationToken::new())
+            .await;
+        assert!(result.success);
+        assert!(result.output.contains("hello"));
+    }
 }
