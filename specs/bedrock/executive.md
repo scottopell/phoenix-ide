@@ -25,7 +25,6 @@ Implements Elm Architecture: pure `transition(state, event) -> (new_state, effec
 | **REQ-BED-011:** Real-time Event Streaming | ✅ Complete | SSE with broadcast channels |
 | **REQ-BED-012:** Context Window Tracking | ✅ Complete | Usage data stored in messages |
 | **REQ-BED-013:** Image Handling | ✅ Complete | Base64 images passed to LLM |
-
 | **REQ-BED-014:** Conversation Mode | ❌ Not Started | Restricted/Unrestricted modes with Landlock |
 | **REQ-BED-015:** Mode Upgrade Request | ❌ Not Started | Agent requests upgrade, user approves |
 | **REQ-BED-016:** Mode Downgrade | ❌ Not Started | Immediate user-initiated downgrade |
