@@ -2,22 +2,43 @@
 
 ## Requirements Summary
 
-The Phoenix Browser Tool enables AI agents to test Progressive Web Applications without manual DevTools access. Born from concrete pain points during service worker testing, it provides the minimum capabilities needed to verify offline functionality: navigation with error detection, service worker state verification, network request source identification, offline mode simulation, multi-context console capture, JavaScript execution, and basic screenshots. The tool solves specific testing blockers rather than providing comprehensive browser automation.
+The Phoenix Browser Tool enables AI agents to interact with web pages during development, testing, and debugging. It addresses three user stories: web development (navigate, screenshot, debug), automated testing (interact via JavaScript, capture evidence), and specialized PWA testing (service workers, offline mode).
 
-## Technical Summary  
+The MVP covers 90% of use cases with six core capabilities: navigation with error handling, JavaScript execution for universal page interaction, screenshot capture with LLM vision support, console log access for debugging, viewport resizing for responsive testing, and image file reading. An implicit session model eliminates browser lifecycle management burden from agents.
 
-A focused implementation using Chrome DevTools Protocol (CDP) via WebSocket to expose only essential PWA testing capabilities. Built as a native Rust tool using Chromium Oxide (or similar library based on available source code). The tool manages a headless Chrome instance and translates simple method calls to CDP commands. Each requirement maps to specific CDP domains: Page for navigation and screenshots, ServiceWorker and Runtime for worker state, Network for request analysis and offline mode, Runtime and Log for console aggregation. Output is structured text optimized for AI agent parsing rather than JSON.
+Post-MVP extends to PWA-specific needs: service worker inspection, network source identification, offline simulation, and multi-context console capture.
+
+## Technical Summary
+
+Built as a native Rust module using Chrome DevTools Protocol (CDP) via WebSocket. The architecture follows shelley's proven browser tool design: implicit per-conversation browser instances with auto-start on first use and idle timeout cleanup. Chrome runs headless with debugging enabled.
+
+Core tools map directly to CDP domains: Page for navigation and screenshots, Runtime for JavaScript execution and console capture, Emulation for viewport control. The `browser_eval` tool serves as a universal interaction interface—clicks, typing, scrolling, and waiting are all achievable via JavaScript without dedicated tools.
+
+Large outputs (console logs, JS results) automatically redirect to files. Screenshots are resized to fit LLM vision limits and returned as base64 with the image data.
 
 ## Status Summary
 
+### MVP Requirements
+
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-BT-001:** Navigate and Wait for Ready State | ❌ Not Started | - |
-| **REQ-BT-002:** Verify Service Worker State | ❌ Not Started | - |
-| **REQ-BT-003:** Identify Request Cache Source | ❌ Not Started | - |
-| **REQ-BT-004:** Simulate Offline Mode | ❌ Not Started | - |
-| **REQ-BT-005:** Capture All Console Output | ❌ Not Started | - |
-| **REQ-BT-006:** Execute JavaScript and Get Results | ❌ Not Started | - |
-| **REQ-BT-007:** Take Screenshots for Verification | ❌ Not Started | - |
+| **REQ-BT-001:** Navigate to URLs | ❌ Not Started | - |
+| **REQ-BT-002:** Execute JavaScript | ❌ Not Started | - |
+| **REQ-BT-003:** Take Screenshots | ❌ Not Started | - |
+| **REQ-BT-004:** Capture Console Logs | ❌ Not Started | - |
+| **REQ-BT-005:** Resize Viewport | ❌ Not Started | - |
+| **REQ-BT-006:** Read Image Files | ❌ Not Started | - |
+| **REQ-BT-010:** Implicit Session Model | ❌ Not Started | - |
+| **REQ-BT-011:** State Persistence | ❌ Not Started | - |
 
-**Progress:** 0 of 7 complete
+### Post-MVP Requirements
+
+| Requirement | Status | Notes |
+|-------------|--------|-------|
+| **REQ-BT-020:** Service Worker Inspection | ❌ Not Started | PWA-specific |
+| **REQ-BT-021:** Network Request Source | ❌ Not Started | PWA-specific |
+| **REQ-BT-022:** Offline Mode Simulation | ❌ Not Started | PWA-specific |
+| **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
+
+**MVP Progress:** 0 of 8 complete  
+**Total Progress:** 0 of 12 complete

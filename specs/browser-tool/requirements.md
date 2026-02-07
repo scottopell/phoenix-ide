@@ -1,75 +1,231 @@
 # Browser Automation Tool
 
-## User Story
+## User Stories
 
-As an AI agent, I need to test Progressive Web Applications and verify their caching and offline behavior so that I can ensure they work correctly without manual DevTools intervention.
+### US-1: Web Development and Debugging (Primary)
 
-## Requirements
+As an AI agent building web applications, I need to navigate to pages, inspect content, take screenshots, and verify UI functionality so I can develop and debug web apps effectively.
 
-### REQ-BT-001: Navigate and Wait for Ready State
+**Motivation:** This is the dominant use case for LLM agents with browser access. When building web services on localhost, agents need to:
+- Navigate to the running application
+- Verify visual output matches expectations
+- Debug issues by inspecting console output
+- Test different viewport sizes for responsive design
 
-THE SYSTEM SHALL navigate to URLs and indicate when the page is ready for interaction
+### US-2: Automated Testing and Verification
 
-WHEN navigation fails
-THE SYSTEM SHALL provide the specific error type (network, DNS, timeout, 404, 500)
+As an AI agent, I need to interact with web pages (click buttons, fill forms, check results) and capture evidence (screenshots, console logs) so I can verify application behavior.
 
-**Rationale:** AI agents need reliable navigation to start any testing sequence. Without knowing when a page is ready, tests would use arbitrary sleeps.
+**Motivation:** After implementing features, agents need to verify they work:
+- Execute JavaScript to interact with UI elements
+- Capture screenshots as evidence of current state
+- Check console for errors or expected log output
+- Wait for async operations to complete
+
+### US-3: Progressive Web App Testing (Specialized)
+
+As an AI agent testing PWAs, I need to verify service worker registration, caching behavior, and offline functionality so I can ensure PWAs work correctly.
+
+**Motivation:** PWA development requires specialized verification that DevTools typically provides:
+- Verify service workers are registered and active
+- Confirm requests are served from cache
+- Test offline behavior in isolation
 
 ---
 
-### REQ-BT-002: Verify Service Worker State
+## Core Requirements (MVP)
+
+### REQ-BT-001: Navigate to URLs
+
+THE SYSTEM SHALL navigate to a specified URL and wait for the page to be ready for interaction
+
+WHEN navigation fails (network error, DNS failure, timeout, HTTP error)
+THE SYSTEM SHALL return a clear error message indicating the failure type
+
+WHEN the URL triggers a file download instead of navigation
+THE SYSTEM SHALL report the download completion and file location
+
+**Rationale:** Navigation is the foundation of all browser automation. Agents need reliable feedback about whether navigation succeeded and when the page is ready.
+
+**User Stories:** US-1, US-2, US-3
+
+---
+
+### REQ-BT-002: Execute JavaScript
+
+THE SYSTEM SHALL execute JavaScript expressions in the page context and return results
+
+WHEN the expression returns a Promise
+THE SYSTEM SHALL await the Promise and return the resolved value (configurable)
+
+WHEN execution throws an exception
+THE SYSTEM SHALL return the error message and context
+
+WHEN the result is large
+THE SYSTEM SHALL write output to a file and return the file path
+
+**Rationale:** JavaScript execution is the universal interface for page interaction. Rather than providing separate tools for click/type/scroll/wait, a flexible JS eval tool handles all interactions with one capability.
+
+**User Stories:** US-1, US-2
+
+---
+
+### REQ-BT-003: Take Screenshots
+
+THE SYSTEM SHALL capture screenshots of the current viewport
+
+WHEN a CSS selector is provided
+THE SYSTEM SHALL capture only the specified element
+
+THE SYSTEM SHALL return the screenshot as base64-encoded image data suitable for LLM vision input
+
+WHEN the image exceeds LLM size limits
+THE SYSTEM SHALL resize the image to fit within limits
+
+THE SYSTEM SHALL save screenshots to a known location for later retrieval
+
+**Rationale:** Visual verification is essential for web development. Screenshots provide evidence of current state and enable agents to see what they've built.
+
+**User Stories:** US-1, US-2
+
+---
+
+### REQ-BT-004: Capture Console Logs
+
+THE SYSTEM SHALL capture console messages (log, warn, error, info) from the page context
+
+THE SYSTEM SHALL provide a way to retrieve recent console logs
+
+THE SYSTEM SHALL provide a way to clear captured logs
+
+WHEN output exceeds a size threshold
+THE SYSTEM SHALL write logs to a file and return the file path
+
+**Rationale:** Console output is the primary debugging channel for web applications. Agents need visibility into errors and diagnostic output.
+
+**User Stories:** US-1, US-2
+
+---
+
+### REQ-BT-005: Resize Viewport
+
+THE SYSTEM SHALL resize the browser viewport to specified dimensions
+
+THE SYSTEM SHALL use a sensible default viewport size (e.g., 1280x720)
+
+**Rationale:** Responsive design verification requires testing at different viewport sizes. Agents need control over viewport dimensions.
+
+**User Stories:** US-1
+
+---
+
+### REQ-BT-006: Read Image Files
+
+THE SYSTEM SHALL read image files from disk and return them as base64-encoded data for LLM vision input
+
+WHEN the image exceeds LLM size limits
+THE SYSTEM SHALL resize the image to fit within limits
+
+THE SYSTEM SHALL support common image formats (PNG, JPEG, GIF, WebP)
+
+**Rationale:** Agents may need to analyze existing images (screenshots from disk, user-provided images) in addition to taking new screenshots.
+
+**User Stories:** US-1, US-2
+
+---
+
+## Session Management Requirements
+
+### REQ-BT-010: Implicit Session Model
+
+THE SYSTEM SHALL maintain browser state across tool calls within a conversation
+
+THE SYSTEM SHALL automatically start the browser on first browser tool call
+
+THE SYSTEM SHALL automatically close the browser after idle timeout (e.g., 30 minutes)
+
+THE SYSTEM SHALL isolate browser state between different conversations
+
+**Rationale:** Agents should not need to manage session IDs or browser lifecycle. An implicit "one browser per conversation" model provides stateful interaction with minimal cognitive overhead.
+
+**User Stories:** US-1, US-2, US-3
+
+---
+
+### REQ-BT-011: State Persistence
+
+WHILE a conversation is active
+THE SYSTEM SHALL persist browser state (cookies, cache, current page) across tool calls
+
+**Rationale:** Natural testing flows like "login → navigate → verify" require state to persist between steps.
+
+**User Stories:** US-2
+
+---
+
+## Extended Requirements (Post-MVP)
+
+### REQ-BT-020: Service Worker Inspection
 
 WHEN checking a page with service workers
 THE SYSTEM SHALL report if a service worker is registered, active, and controlling the page
 
-**Rationale:** AI agents testing PWAs need to verify service worker registration as the foundational requirement for offline functionality. Without service worker state visibility, the agent has no way to confirm the PWA is properly configured.
+**Rationale:** PWA testing requires verification that service workers are properly configured.
+
+**User Stories:** US-3
 
 ---
 
-### REQ-BT-003: Identify Request Cache Source
+### REQ-BT-021: Network Request Source Identification
 
 WHEN network requests complete
 THE SYSTEM SHALL indicate if each request was served from network, service worker, or browser cache
 
-**Rationale:** AI agents verifying caching strategies need to know where each response originated. The difference between network and cache sources determines whether offline functionality will work.
+**Rationale:** Verifying caching strategies requires knowing where responses originated.
+
+**User Stories:** US-3
 
 ---
 
-### REQ-BT-004: Simulate Offline Mode
+### REQ-BT-022: Offline Mode Simulation
 
 THE SYSTEM SHALL block network requests on demand to simulate offline conditions
 
 WHEN offline
 THE SYSTEM SHALL allow the page to continue using cached resources
 
-**Rationale:** AI agents need to test offline functionality in isolation from the host VM's network connection. Testing offline behavior requires controlled network conditions.
+**Rationale:** Testing offline functionality requires controlled network conditions independent of the host system.
+
+**User Stories:** US-3
 
 ---
 
-### REQ-BT-005: Capture All Console Output
+### REQ-BT-023: Multi-Context Console Capture
 
-THE SYSTEM SHALL capture console messages from all contexts including service workers
+THE SYSTEM SHALL capture console messages from service worker contexts in addition to page context
 
 WHEN displaying messages
 THE SYSTEM SHALL indicate which context (page, service worker) produced each message
 
-**Rationale:** AI agents debugging service worker issues need visibility into worker-context logs. Service worker errors and status messages only appear in worker console output.
+**Rationale:** Service worker debugging requires visibility into worker-context logs that are separate from page logs.
+
+**User Stories:** US-3
 
 ---
 
-### REQ-BT-006: Execute JavaScript and Get Results
+## Requirements Traceability
 
-THE SYSTEM SHALL execute JavaScript in the page context and return results
-
-WHEN execution fails
-THE SYSTEM SHALL return the error message and stack trace
-
-**Rationale:** AI agents need to interact with SPAs, check application state, and trigger actions that aren't possible through basic navigation.
-
----
-
-### REQ-BT-007: Take Screenshots for Verification
-
-THE SYSTEM SHALL capture screenshots of the current viewport
-
-**Rationale:** AI agents need visual verification when testing UI changes or debugging layout issues where DOM inspection alone provides insufficient information.
+| Requirement | User Story | MVP |
+|-------------|------------|-----|
+| REQ-BT-001: Navigate to URLs | US-1, US-2, US-3 | ✅ |
+| REQ-BT-002: Execute JavaScript | US-1, US-2 | ✅ |
+| REQ-BT-003: Take Screenshots | US-1, US-2 | ✅ |
+| REQ-BT-004: Capture Console Logs | US-1, US-2 | ✅ |
+| REQ-BT-005: Resize Viewport | US-1 | ✅ |
+| REQ-BT-006: Read Image Files | US-1, US-2 | ✅ |
+| REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 | ✅ |
+| REQ-BT-011: State Persistence | US-2 | ✅ |
+| REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
+| REQ-BT-021: Network Request Source | US-3 | ❌ |
+| REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
+| REQ-BT-023: Multi-Context Console | US-3 | ❌ |
