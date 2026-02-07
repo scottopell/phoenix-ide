@@ -1,4 +1,4 @@
-import { useRef, useEffect, useCallback, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { useRef, useEffect, useCallback, useState, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { FolderOpen } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { QueuedMessage } from '../hooks';
@@ -65,6 +65,10 @@ export function InputArea({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const voiceSupported = isWebSpeechSupported();
+  
+  // Voice input interim text (shown in input while speaking)
+  const [interimText, setInterimText] = useState('');
+  const draftBeforeVoiceRef = useRef<string>('');
 
 
   const autoResize = () => {
@@ -147,18 +151,22 @@ export function InputArea({
     }
   };
 
-  // Handle voice transcript - append to existing draft (REQ-VOICE-006)
-  const handleVoiceTranscript = useCallback((text: string) => {
+  // Handle final voice transcript - append to draft (REQ-VOICE-006)
+  const handleVoiceFinal = useCallback((text: string) => {
     if (!text) return;
     
+    // Clear interim since we're committing final text
+    setInterimText('');
+    
     // Append to existing draft - if there's existing text, add a space
-    const currentDraft = draft;
-    const newDraft = currentDraft.trim() 
-      ? currentDraft.trimEnd() + ' ' + text 
+    const baseDraft = draftBeforeVoiceRef.current || draft;
+    const newDraft = baseDraft.trim() 
+      ? baseDraft.trimEnd() + ' ' + text 
       : text;
     setDraft(newDraft);
+    draftBeforeVoiceRef.current = newDraft; // Update base for next final
 
-    // Focus the textarea and move cursor to end after state update
+    // Focus the textarea and move cursor to end
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
@@ -167,6 +175,15 @@ export function InputArea({
       }
     });
   }, [draft, setDraft]);
+
+  // Handle interim voice text - show in input as user speaks
+  const handleVoiceInterim = useCallback((text: string) => {
+    // Store the draft before voice started (only on first interim)
+    if (!interimText && text) {
+      draftBeforeVoiceRef.current = draft;
+    }
+    setInterimText(text);
+  }, [draft, interimText]);
 
   const failedMessages = queuedMessages.filter(m => m.status === 'failed');
   const hasContent = draft.trim().length > 0 || images.length > 0;
@@ -250,7 +267,8 @@ export function InputArea({
         />
         {voiceSupported && (
           <VoiceRecorder
-            onTranscript={handleVoiceTranscript}
+            onSpeech={handleVoiceFinal}
+            onInterim={handleVoiceInterim}
             disabled={agentWorking}
           />
         )}
@@ -259,8 +277,15 @@ export function InputArea({
           id="message-input"
           placeholder={isOffline ? 'Type a message (will send when back online)...' : 'Type a message...'}
           rows={1}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            // Clear interim if user types manually
+            if (interimText) {
+              setInterimText('');
+              draftBeforeVoiceRef.current = '';
+            }
+          }}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
         />

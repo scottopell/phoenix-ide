@@ -74,18 +74,17 @@ export function isWebSpeechSupported(): boolean {
 }
 
 interface VoiceRecorderProps {
-  onTranscript: (text: string) => void;
+  onSpeech: (text: string) => void;
+  onInterim?: (text: string) => void;
   disabled?: boolean;
 }
 
-export function VoiceRecorder({ onTranscript, disabled }: VoiceRecorderProps) {
+export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderProps) {
   const [state, setState] = useState<VoiceState>('idle');
   const [error, setError] = useState<VoiceError | null>(null);
-  const [interimText, setInterimText] = useState('');
-  
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const finalTranscriptRef = useRef('');
   const containerRef = useRef<HTMLDivElement>(null);
+  const lastInterimRef = useRef<string>('');
 
   // Cleanup on unmount
   useEffect(() => {
@@ -137,27 +136,38 @@ export function VoiceRecorder({ onTranscript, disabled }: VoiceRecorderProps) {
     recognition.onstart = () => {
       setState('listening');
       setError(null);
-      finalTranscriptRef.current = '';
-      setInterimText('');
     };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       let interim = '';
-      let final = '';
-
+      
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
+        const transcript = result[0].transcript;
+        
         if (result.isFinal) {
-          final += result[0].transcript;
+          // Clear interim and commit final text
+          if (lastInterimRef.current && onInterim) {
+            onInterim(''); // Clear interim display
+          }
+          lastInterimRef.current = '';
+          
+          const finalText = transcript.trim();
+          if (finalText) {
+            onSpeech(finalText);
+          }
         } else {
-          interim += result[0].transcript;
+          interim += transcript;
         }
       }
-
-      if (final) {
-        finalTranscriptRef.current += final;
+      
+      // Update interim display
+      if (interim !== lastInterimRef.current) {
+        lastInterimRef.current = interim;
+        if (onInterim) {
+          onInterim(interim);
+        }
       }
-      setInterimText(interim);
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -200,20 +210,19 @@ export function VoiceRecorder({ onTranscript, disabled }: VoiceRecorderProps) {
     };
 
     recognition.onend = () => {
-      // Send final transcript when recording ends
-      const transcript = finalTranscriptRef.current.trim();
-      if (transcript) {
-        onTranscript(transcript);
+      // Clear any remaining interim text
+      if (lastInterimRef.current && onInterim) {
+        onInterim('');
       }
+      lastInterimRef.current = '';
       
       // Only reset to idle if we're not in error state
       setState(prev => prev === 'error' ? 'error' : 'idle');
-      setInterimText('');
       recognitionRef.current = null;
     };
 
     return recognition;
-  }, [onTranscript]);
+  }, [onSpeech, onInterim]);
 
   const startRecording = useCallback(async () => {
     if (!isWebSpeechSupported()) {
@@ -285,12 +294,6 @@ export function VoiceRecorder({ onTranscript, disabled }: VoiceRecorderProps) {
         onClick={handleButtonClick}
         disabled={disabled}
       />
-      
-      {interimText && state === 'listening' && (
-        <div className="voice-interim">
-          <span className="voice-interim-text">{interimText}</span>
-        </div>
-      )}
 
       {error && (
         <VoicePermission

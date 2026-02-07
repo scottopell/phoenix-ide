@@ -71,8 +71,8 @@ body {
 #app {
   display: flex;
   flex-direction: column;
-  height: 100dvh;
-  height: 100vh; /* fallback */
+  height: 100vh; /* fallback for older browsers */
+  height: 100dvh; /* dynamic viewport height - accounts for iOS Safari URL bar */
 }
 
 /* State Bar */
