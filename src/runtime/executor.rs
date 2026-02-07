@@ -577,6 +577,58 @@ where
                     .await?;
                 Ok(None)
             }
+
+            Effect::PersistToolExchange {
+                agent_content,
+                agent_usage,
+                tool_results,
+            } => {
+                // Persist agent message and all tool results atomically.
+                // This ensures we never have orphaned tool_use in the database.
+                
+                // 1. Persist the agent message (with tool_use blocks)
+                let agent_msg_id = uuid::Uuid::new_v4().to_string();
+                let agent_msg = self
+                    .storage
+                    .add_message(
+                        &agent_msg_id,
+                        &self.context.conversation_id,
+                        &MessageContent::agent(agent_content),
+                        None,
+                        agent_usage.as_ref(),
+                    )
+                    .await?;
+
+                // Broadcast agent message to clients
+                let agent_json = serde_json::to_value(&agent_msg).unwrap_or(Value::Null);
+                let _ = self.broadcast_tx.send(SseEvent::Message { message: agent_json });
+
+                // 2. Persist all tool results
+                for result in tool_results {
+                    let tool_msg_id = uuid::Uuid::new_v4().to_string();
+                    let tool_content = MessageContent::tool(
+                        &result.tool_use_id,
+                        &result.output,
+                        result.is_error,
+                    );
+                    let tool_msg = self
+                        .storage
+                        .add_message(
+                            &tool_msg_id,
+                            &self.context.conversation_id,
+                            &tool_content,
+                            None,
+                            None,
+                        )
+                        .await?;
+
+                    // Broadcast tool result to clients
+                    let tool_json = serde_json::to_value(&tool_msg).unwrap_or(Value::Null);
+                    let _ = self.broadcast_tx.send(SseEvent::Message { message: tool_json });
+                }
+
+                Ok(None)
+            }
         }
     }
     /// Build LLM messages from conversation history (instance method)

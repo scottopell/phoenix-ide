@@ -11,7 +11,6 @@ use super::{ConvContext, ConvState, Effect, Event};
 use super::state::SubAgentResult;
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -116,6 +115,7 @@ pub fn transition(
 
             if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
+                // Safe to persist immediately since there's no tool_use requiring a result
                 Ok(TransitionResult::new(ConvState::Idle)
                     .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
@@ -133,6 +133,7 @@ pub fn transition(
                     }
                     
                     // Transition directly to terminal state
+                    // Terminal tools don't need tool_result, safe to persist immediately
                     match &tool.input {
                         crate::state_machine::state::ToolInput::SubmitResult(input) => {
                             use crate::state_machine::state::SubAgentOutcome;
@@ -166,6 +167,7 @@ pub fn transition(
                     }
                 } else {
                     // Normal tool execution for sub-agent
+                    // DON'T persist agent message yet - buffer it until all tools complete
                     let first = tool_calls[0].clone();
                     let rest = tool_calls[1..].to_vec();
                     let remaining_count = rest.len();
@@ -173,16 +175,19 @@ pub fn transition(
                     Ok(TransitionResult::new(ConvState::ToolExecuting {
                         current_tool: first.clone(),
                         remaining_tools: rest,
-                        persisted_tool_ids: HashSet::new(),
                         pending_sub_agents: vec![],
+                        pending_agent_content: content,
+                        pending_usage: Some(usage_data),
+                        completed_tool_results: vec![],
                     })
-                    .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_tool_executing(first.name(), &first.id, remaining_count, 0))
                     .with_effect(Effect::execute_tool(first)))
                 }
             } else {
                 // Has tools -> ToolExecuting
+                // DON'T persist agent message yet - buffer it until all tools complete
+                // This ensures we never have orphaned tool_use in the database
                 let first = tool_calls[0].clone();
                 let rest = tool_calls[1..].to_vec();
                 let remaining_count = rest.len();
@@ -190,10 +195,11 @@ pub fn transition(
                 Ok(TransitionResult::new(ConvState::ToolExecuting {
                     current_tool: first.clone(),
                     remaining_tools: rest,
-                    persisted_tool_ids: HashSet::new(),
                     pending_sub_agents: vec![],
+                    pending_agent_content: content,
+                    pending_usage: Some(usage_data),
+                    completed_tool_results: vec![],
                 })
-                .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_tool_executing(first.name(), &first.id, remaining_count, 0))
                 .with_effect(Effect::execute_tool(first)))
@@ -284,17 +290,20 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                persisted_tool_ids,
                 pending_sub_agents,
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::ToolComplete {
                 tool_use_id,
                 result,
             },
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_persisted = persisted_tool_ids.clone();
-            new_persisted.insert(result.tool_use_id.clone());
-            let completed_count = new_persisted.len();
+            // Accumulate tool result, but DON'T persist yet
+            let mut new_results = completed_tool_results.clone();
+            new_results.push(result);
+            let completed_count = new_results.len();
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
@@ -303,15 +312,11 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
                 remaining_tools: new_remaining,
-                persisted_tool_ids: new_persisted,
                 pending_sub_agents: pending_sub_agents.clone(),
+                pending_agent_content: pending_agent_content.clone(),
+                pending_usage: pending_usage.clone(),
+                completed_tool_results: new_results,
             })
-            .with_effect(Effect::persist_tool_message(
-                &result.tool_use_id,
-                &result.output,
-                result.is_error,
-                result.display_data(),
-            ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_tool_executing(next_tool.name(), &next_tool.id, remaining_count, completed_count))
             .with_effect(Effect::execute_tool(next_tool)))
@@ -323,21 +328,26 @@ pub fn transition(
                 current_tool,
                 remaining_tools,
                 pending_sub_agents,
-                ..
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::ToolComplete {
                 tool_use_id,
                 result,
             },
         ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && pending_sub_agents.is_empty() => {
+            // All tools complete - NOW persist the entire exchange atomically
+            let mut all_results = completed_tool_results.clone();
+            all_results.push(result);
+
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_tool_message(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                        result.display_data(),
-                    ))
+                    .with_effect(Effect::PersistToolExchange {
+                        agent_content: pending_agent_content.clone(),
+                        agent_usage: pending_usage.clone(),
+                        tool_results: all_results,
+                    })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
@@ -350,25 +360,30 @@ pub fn transition(
                 current_tool,
                 remaining_tools,
                 pending_sub_agents,
-                ..
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::ToolComplete {
                 tool_use_id,
                 result,
             },
         ) if tool_use_id == current_tool.id && remaining_tools.is_empty() && !pending_sub_agents.is_empty() => {
+            // All tools complete - NOW persist the entire exchange atomically
+            let mut all_results = completed_tool_results.clone();
+            all_results.push(result);
             let pending_count = pending_sub_agents.len();
+
             Ok(
                 TransitionResult::new(ConvState::AwaitingSubAgents {
                     pending_ids: pending_sub_agents.clone(),
                     completed_results: vec![],
                 })
-                    .with_effect(Effect::persist_tool_message(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                        result.display_data(),
-                    ))
+                    .with_effect(Effect::PersistToolExchange {
+                        agent_content: pending_agent_content.clone(),
+                        agent_usage: pending_usage.clone(),
+                        tool_results: all_results,
+                    })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_awaiting_sub_agents(pending_count, 0)),
             )
@@ -379,8 +394,10 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                persisted_tool_ids,
                 pending_sub_agents,
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::SpawnAgentsComplete {
                 tool_use_id,
@@ -388,9 +405,10 @@ pub fn transition(
                 agent_ids,
             },
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_persisted = persisted_tool_ids.clone();
-            new_persisted.insert(result.tool_use_id.clone());
-            let completed_count = new_persisted.len();
+            // Accumulate tool result, but DON'T persist yet
+            let mut new_results = completed_tool_results.clone();
+            new_results.push(result);
+            let completed_count = new_results.len();
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(agent_ids);
@@ -402,15 +420,11 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
                 remaining_tools: new_remaining,
-                persisted_tool_ids: new_persisted,
                 pending_sub_agents: new_pending,
+                pending_agent_content: pending_agent_content.clone(),
+                pending_usage: pending_usage.clone(),
+                completed_tool_results: new_results,
             })
-            .with_effect(Effect::persist_tool_message(
-                &result.tool_use_id,
-                &result.output,
-                result.is_error,
-                result.display_data(),
-            ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_tool_executing(next_tool.name(), &next_tool.id, remaining_count, completed_count))
             .with_effect(Effect::execute_tool(next_tool)))
@@ -422,7 +436,9 @@ pub fn transition(
                 current_tool,
                 remaining_tools,
                 pending_sub_agents,
-                ..
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::SpawnAgentsComplete {
                 tool_use_id,
@@ -430,6 +446,10 @@ pub fn transition(
                 agent_ids,
             },
         ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
+            // All tools complete - NOW persist the entire exchange atomically
+            let mut all_results = completed_tool_results.clone();
+            all_results.push(result);
+
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(agent_ids);
             let pending_count = all_pending.len();
@@ -439,12 +459,11 @@ pub fn transition(
                     pending_ids: all_pending,
                     completed_results: vec![],
                 })
-                    .with_effect(Effect::persist_tool_message(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                        result.display_data(),
-                    ))
+                    .with_effect(Effect::PersistToolExchange {
+                        agent_content: pending_agent_content.clone(),
+                        agent_usage: pending_usage.clone(),
+                        tool_results: all_results,
+                    })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_awaiting_sub_agents(pending_count, 0)),
             )
@@ -496,15 +515,19 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                persisted_tool_ids,
                 pending_sub_agents,
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::UserCancel,
         ) if !_context.is_sub_agent => {
             let mut result = TransitionResult::new(ConvState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
                 skipped_tools: remaining_tools.clone(),
-                persisted_tool_ids: persisted_tool_ids.clone(),
+                pending_agent_content: pending_agent_content.clone(),
+                pending_usage: pending_usage.clone(),
+                completed_tool_results: completed_tool_results.clone(),
             })
             .with_effect(Effect::AbortTool {
                 tool_use_id: current_tool.id.clone(),
@@ -519,34 +542,38 @@ pub fn transition(
             Ok(result)
         }
 
-        // CancellingTool + ToolAborted -> Idle with synthetic results
+        // CancellingTool + ToolAborted -> Idle with complete exchange persisted
         (
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                persisted_tool_ids,
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::ToolAborted {
                 tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
-            // Generate synthetic results for aborted and skipped tools only.
-            // Tools in persisted_tool_ids were already persisted via PersistMessage
-            // when each tool completed, so we don't include them here.
+            // Generate synthetic results for aborted and skipped tools
             let aborted_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
             let skipped_results: Vec<ToolResult> = skipped_tools
                 .iter()
                 .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
 
-            let mut new_results = vec![aborted_result];
-            new_results.extend(skipped_results);
+            // Combine completed + aborted + skipped results
+            let mut all_results = completed_tool_results.clone();
+            all_results.push(aborted_result);
+            all_results.extend(skipped_results);
 
-            // Validate: none of the new results should be for already-persisted tools
-            validate_no_duplicate_persists(&new_results, persisted_tool_ids)?;
-
+            // Persist the complete exchange atomically (agent + all tool results)
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: new_results })
+                .with_effect(Effect::PersistToolExchange {
+                    agent_content: pending_agent_content.clone(),
+                    agent_usage: pending_usage.clone(),
+                    tool_results: all_results,
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -556,30 +583,34 @@ pub fn transition(
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                persisted_tool_ids,
+                pending_agent_content,
+                pending_usage,
+                completed_tool_results,
             },
             Event::ToolComplete {
                 tool_use_id: completed_id,
                 result: _,  // Discard actual result, use synthetic
             },
         ) if *tool_use_id == completed_id => {
-            // Tool finished before we could abort it - still use synthetic result.
-            // Tools in persisted_tool_ids were already persisted via PersistMessage
-            // when each tool completed, so we don't include them here.
+            // Tool finished before we could abort it - still use synthetic result
             let cancelled_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
             let skipped_results: Vec<ToolResult> = skipped_tools
                 .iter()
                 .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
                 .collect();
 
-            let mut new_results = vec![cancelled_result];
-            new_results.extend(skipped_results);
+            // Combine completed + cancelled + skipped results
+            let mut all_results = completed_tool_results.clone();
+            all_results.push(cancelled_result);
+            all_results.extend(skipped_results);
 
-            // Validate: none of the new results should be for already-persisted tools
-            validate_no_duplicate_persists(&new_results, persisted_tool_ids)?;
-
+            // Persist the complete exchange atomically (agent + all tool results)
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults { results: new_results })
+                .with_effect(Effect::PersistToolExchange {
+                    agent_content: pending_agent_content.clone(),
+                    agent_usage: pending_usage.clone(),
+                    tool_results: all_results,
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -710,23 +741,6 @@ pub fn transition(
 }
 
 // Helper functions
-
-/// Validates that none of the tool results to be persisted have IDs that are already persisted.
-/// This is a critical invariant: each tool_use_id must be persisted exactly once.
-fn validate_no_duplicate_persists(
-    results: &[ToolResult],
-    already_persisted: &HashSet<String>,
-) -> Result<(), TransitionError> {
-    for result in results {
-        if already_persisted.contains(&result.tool_use_id) {
-            return Err(TransitionError::InvalidTransition(format!(
-                "Attempted to persist duplicate tool result for tool_use_id: {}",
-                result.tool_use_id
-            )));
-        }
-    }
-    Ok(())
-}
 
 impl ToolResult {
     #[allow(clippy::unused_self)] // Method signature for future extension
@@ -881,6 +895,7 @@ mod tests {
     #[test]
     fn test_cancellation_produces_synthetic_results() {
         use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
+        use crate::llm::ContentBlock;
 
         let result = transition(
             &ConvState::ToolExecuting {
@@ -907,8 +922,10 @@ mod tests {
                         }),
                     ),
                 ],
-                persisted_tool_ids: HashSet::new(),
                 pending_sub_agents: vec![],
+                pending_agent_content: vec![ContentBlock::text("test")],
+                pending_usage: None,
+                completed_tool_results: vec![],
             },
             &test_context(),
             Event::UserCancel,
@@ -928,7 +945,7 @@ mod tests {
             "Should have AbortTool effect"
         );
 
-        // Phase 2: ToolAborted -> Idle with synthetic results
+        // Phase 2: ToolAborted -> Idle with PersistToolExchange
         let result2 = transition(
             &result.new_state,
             &test_context(),
@@ -939,38 +956,10 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result2.new_state, ConvState::Idle));
+        // Should persist the complete exchange atomically
         assert!(result2
             .effects
             .iter()
-            .any(|e| matches!(e, Effect::PersistToolResults { .. })));
-    }
-
-    #[test]
-    fn test_duplicate_persist_validation_fails() {
-        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
-
-        // Create a CancellingTool state where tool-1 was already persisted
-        let mut already_persisted = HashSet::new();
-        already_persisted.insert("tool-1".to_string());
-
-        let state = ConvState::CancellingTool {
-            tool_use_id: "tool-1".to_string(),  // This tool would create duplicate
-            skipped_tools: vec![],
-            persisted_tool_ids: already_persisted,
-        };
-
-        // This should fail because tool-1 is in persisted_tool_ids
-        let result = transition(
-            &state,
-            &test_context(),
-            Event::ToolAborted {
-                tool_use_id: "tool-1".to_string(),
-            },
-        );
-
-        assert!(
-            matches!(result, Err(TransitionError::InvalidTransition(_))),
-            "Should fail with InvalidTransition due to duplicate persist"
-        );
+            .any(|e| matches!(e, Effect::PersistToolExchange { .. })));
     }
 }

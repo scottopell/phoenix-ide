@@ -9,7 +9,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -991,8 +991,10 @@ mod tests {
                     }),
                 ),
             ],
-            persisted_tool_ids: HashSet::new(),
             pending_sub_agents: vec![],
+            pending_agent_content: vec![],
+            pending_usage: None,
+            completed_tool_results: vec![],
         };
 
         // Phase 1: UserCancel -> CancellingTool with AbortTool
@@ -1010,7 +1012,7 @@ mod tests {
             "Should have AbortTool effect"
         );
 
-        // Phase 2: ToolAborted -> Idle with synthetic results
+        // Phase 2: ToolAborted -> Idle with PersistToolExchange
         let result2 = transition(
             &result.new_state,
             &context,
@@ -1022,17 +1024,17 @@ mod tests {
 
         assert!(matches!(result2.new_state, ConvState::Idle));
 
-        // Should have PersistToolResults effect with 3 synthetic results
+        // Should have PersistToolExchange effect with all results
         let persist = result2
             .effects
             .iter()
-            .find(|e| matches!(e, Effect::PersistToolResults { .. }));
-        assert!(persist.is_some(), "Should have PersistToolResults effect");
+            .find(|e| matches!(e, Effect::PersistToolExchange { .. }));
+        assert!(persist.is_some(), "Should have PersistToolExchange effect");
 
-        if let Some(Effect::PersistToolResults { results }) = persist {
-            assert_eq!(results.len(), 3, "Should have results for all 3 tools");
+        if let Some(Effect::PersistToolExchange { tool_results, .. }) = persist {
+            assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
-                results.iter().all(|r| !r.success),
+                tool_results.iter().all(|r| !r.success),
                 "All should be marked as failed/cancelled"
             );
         }
