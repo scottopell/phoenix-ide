@@ -18,5 +18,8 @@ Implemented as a Tool trait with schema defining `command` (required) and `mode`
 | **REQ-BASH-004:** No TTY Attached | ✅ Complete | stdin null, process group |
 | **REQ-BASH-005:** Tool Schema | ✅ Complete | Schema with mode enum (default/slow/background) |
 | **REQ-BASH-006:** Error Reporting | ✅ Complete | Exit codes, truncated output |
+| **REQ-BASH-007:** Command Safety Checks | ✅ Complete | tree-sitter parsing, pattern rejection |
+| **REQ-BASH-008:** Landlock Enforcement | ❌ Not Started | Read-only fs, no network in Restricted mode |
+| **REQ-BASH-009:** Graceful Degradation | ❌ Not Started | Non-Linux and old kernel fallback |
 
-**Progress:** 6 of 6 complete
+**Progress:** 7 of 9 complete

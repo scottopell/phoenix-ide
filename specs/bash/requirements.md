@@ -114,3 +114,55 @@ WHEN command appears in a pipeline or compound command
 THE SYSTEM SHALL check all command components
 
 **Rationale:** LLMs sometimes execute dangerous commands despite instructions. Parsing-based checks provide UX guardrails with helpful error messages. This is NOT a security boundary - just catches common mistakes and guides toward safer alternatives.
+
+---
+
+### REQ-BASH-008: Landlock Enforcement
+
+WHEN conversation is in Restricted mode AND Landlock is available (Linux 5.13+)
+THE SYSTEM SHALL execute bash commands under Landlock restrictions providing:
+- Read-only filesystem access (all writes blocked at kernel level)
+- No outbound network (TCP connect/bind blocked, prevents exfiltration)
+- Signal scoping (kernel 6.12+): processes cannot signal outside sandbox
+- Resource limits via rlimits (memory, CPU time, process count)
+
+WHEN Landlock blocks an operation
+THE SYSTEM SHALL return the kernel error (EACCES, EPERM)
+AND tool description SHALL include clear explanation of sandbox constraints
+
+WHEN bash command fails due to Landlock restrictions
+THE SYSTEM SHALL NOT retry or attempt to work around restrictions
+
+**Rationale:** Landlock provides true read-only mode enforced at the kernel level that cannot be bypassed by clever shell commands, environment manipulation, or prompt injection. Defense-in-depth beyond LLM instruction-following.
+
+> **Landlock Feature Matrix:**
+> | Kernel | ABI | Features |
+> |--------|-----|----------|
+> | 6.12+  | v6  | Full protection: filesystem, network, ioctl, signal/socket scoping |
+> | 6.10-6.11 | v5 | + Device ioctl blocking |
+> | 6.7-6.9 | v4 | Filesystem + network (TCP) |
+> | 5.13-6.6 | v1-v3 | Filesystem only |
+>
+> Recommended: Kernel 6.12+ for full signal scoping; 6.7+ minimum for network blocking.
+
+---
+
+### REQ-BASH-009: Graceful Degradation Without Landlock
+
+WHEN Landlock is unavailable on the host system
+THE SYSTEM SHALL detect this at startup
+AND disable Restricted mode entirely
+AND log warning about reduced security posture
+
+WHEN running on non-Linux operating system
+THE SYSTEM SHALL operate with only Unrestricted mode available
+AND indicate that Landlock requires Linux
+
+WHEN degraded mode is active
+THE SYSTEM SHALL still apply command safety checks (REQ-BASH-007)
+AND indicate to user that Landlock is unavailable
+
+WHEN user attempts to enable Restricted mode without Landlock
+THE SYSTEM SHALL return error explaining Landlock requirements
+
+**Rationale:** Not all environments support Landlock (requires Linux 5.13+). System must work gracefully without it, clearly communicating reduced protection. macOS, Windows/WSL, and older Linux kernels fall back to Unrestricted-only mode with safety checks as the only guardrail.

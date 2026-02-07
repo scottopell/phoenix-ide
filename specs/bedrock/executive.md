@@ -26,4 +26,10 @@ Implements Elm Architecture: pure `transition(state, event) -> (new_state, effec
 | **REQ-BED-012:** Context Window Tracking | ✅ Complete | Usage data stored in messages |
 | **REQ-BED-013:** Image Handling | ✅ Complete | Base64 images passed to LLM |
 
-**Progress:** 13 of 13 complete
+| **REQ-BED-014:** Conversation Mode | ❌ Not Started | Restricted/Unrestricted modes with Landlock |
+| **REQ-BED-015:** Mode Upgrade Request | ❌ Not Started | Agent requests upgrade, user approves |
+| **REQ-BED-016:** Mode Downgrade | ❌ Not Started | Immediate user-initiated downgrade |
+| **REQ-BED-017:** Mode Indication to Agent | ❌ Not Started | Synthetic messages, error responses |
+| **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Sub-agents always Restricted (when available) |
+
+**Progress:** 13 of 18 complete

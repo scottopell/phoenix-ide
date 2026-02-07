@@ -215,3 +215,104 @@ WHEN context approaches model limit
 THE SYSTEM SHALL notify user of approaching limit
 
 **Rationale:** Users need visibility into context usage to manage long conversations effectively.
+
+---
+
+### REQ-BED-014: Conversation Mode
+
+WHEN conversation is created
+THE SYSTEM SHALL initialize in Restricted mode (if Landlock is available)
+
+WHEN Landlock is unavailable (non-Linux OS or kernel < 5.13)
+THE SYSTEM SHALL operate with only Unrestricted mode available
+AND indicate Landlock unavailability to the user
+
+WHEN conversation is in Restricted mode
+THE SYSTEM SHALL enforce read-only semantics on all tools
+AND execute bash commands under Landlock restrictions
+AND block outbound network connections (no TCP connect/bind)
+AND disable write-capable tools (patch)
+
+WHEN conversation is in Unrestricted mode
+THE SYSTEM SHALL allow full tool capabilities
+
+**Rationale:** Users need a safe exploration mode for understanding codebases and triaging issues before committing to changes. Landlock provides kernel-level enforcement that cannot be bypassed by clever commands or prompt injection.
+
+> **What is Landlock?** Landlock is a Linux Security Module (LSM) introduced in kernel 5.13 that enables unprivileged processes to restrict their own capabilities. Unlike traditional sandboxing (containers, VMs), Landlock runs in the same process and enforces allowlist-based restrictions on filesystem access (read-only everywhere, write only to specific paths) and network operations (block TCP connect/bind). It's defense-in-depth: even if an attacker achieves prompt injection and the model complies, the kernel blocks exfiltration and mutation.
+
+---
+
+### REQ-BED-015: Mode Upgrade Request
+
+WHEN LLM needs write capabilities in Restricted mode
+THE SYSTEM SHALL provide a `request_mode_upgrade` tool
+WHICH accepts a reason string explaining why upgrade is needed
+
+WHEN upgrade is requested
+THE SYSTEM SHALL transition to AwaitingModeApproval state
+AND notify user of the upgrade request with reason
+AND pause agent execution until user responds
+
+WHEN user approves upgrade
+THE SYSTEM SHALL transition to Unrestricted mode
+AND inject synthetic system message indicating mode change
+AND resume agent execution
+
+WHEN user denies upgrade
+THE SYSTEM SHALL remain in Restricted mode
+AND return denial to agent via tool result
+AND resume agent execution
+
+WHEN user does not respond within reasonable time
+THE SYSTEM SHALL remain paused (no automatic timeout to Unrestricted)
+
+**Rationale:** Agents should be able to request capabilities when needed, with human approval as the gate. This enables "planning mode" → "implementation mode" workflow where agents explore and understand before making changes.
+
+---
+
+### REQ-BED-016: Mode Downgrade
+
+WHEN user requests mode downgrade (Unrestricted → Restricted)
+THE SYSTEM SHALL transition immediately to Restricted mode
+AND inject synthetic system message indicating mode change
+AND NOT require agent approval
+
+WHEN mode changes (either direction)
+THE SYSTEM SHALL persist the new mode as part of conversation state
+
+**Rationale:** Users can always tighten permissions. The asymmetry (user approval to upgrade, immediate downgrade) reflects the trust model: escalation requires consent, de-escalation does not.
+
+---
+
+### REQ-BED-017: Mode Indication to Agent
+
+WHEN mode changes during conversation
+THE SYSTEM SHALL inject a synthetic system message visible to the agent
+WHICH clearly states the new mode and its implications
+
+WHEN agent is in Restricted mode
+THE SYSTEM SHALL NOT modify tool descriptions based on mode
+AND rely on synthetic messages and tool error responses to communicate restrictions
+
+WHEN tool is unavailable due to mode restrictions
+THE SYSTEM SHALL return clear, actionable error message
+WHICH suggests using request_mode_upgrade if write access is needed
+
+**Rationale:** Tool descriptions must remain static throughout conversation to avoid confusing the LLM. Mode awareness comes through synthetic messages and clear error responses.
+
+---
+
+### REQ-BED-018: Sub-Agent Mode Enforcement
+
+WHEN sub-agent is spawned AND Landlock is available
+THE SYSTEM SHALL always create sub-agent in Restricted mode
+REGARDLESS of parent conversation's mode
+
+WHEN sub-agent is spawned AND Landlock is unavailable
+THE SYSTEM SHALL create sub-agent in Unrestricted mode (only option)
+
+WHEN sub-agent is running
+THE SYSTEM SHALL NOT provide request_mode_upgrade tool to sub-agents
+AND sub-agents cannot change their mode
+
+**Rationale:** Sub-agents are autonomous and less supervised than the parent conversation. Forcing Restricted mode (when available) limits blast radius. Only the parent conversation, with direct user oversight, can operate in Unrestricted mode.
