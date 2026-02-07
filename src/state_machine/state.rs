@@ -1,7 +1,7 @@
 //! Conversation state types
 
-use crate::db::{ErrorKind, ToolResult, UsageData};
-use crate::llm::ContentBlock;
+use crate::db::ErrorKind;
+use std::collections::HashSet;
 use std::time::Duration;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
@@ -247,18 +247,12 @@ pub enum ConvState {
         current_tool: ToolCall,
         /// Remaining tools to execute after current completes
         remaining_tools: Vec<ToolCall>,
+        /// IDs of tools whose results have been persisted
+        #[serde(default)]
+        persisted_tool_ids: HashSet<String>,
         /// Sub-agents spawned during this tool execution phase
         #[serde(default)]
         pending_sub_agents: Vec<String>,
-        /// Buffered agent message content (persisted only when all tools complete)
-        #[serde(default)]
-        pending_agent_content: Vec<ContentBlock>,
-        /// Buffered usage data for the agent message
-        #[serde(default)]
-        pending_usage: Option<UsageData>,
-        /// Accumulated tool results (persisted only when all tools complete)
-        #[serde(default)]
-        completed_tool_results: Vec<ToolResult>,
     },
 
     /// User requested cancellation of LLM request, waiting for response to discard
@@ -270,12 +264,8 @@ pub enum ConvState {
         tool_use_id: String,
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
-        /// Buffered agent message content to persist on cancel
-        pending_agent_content: Vec<ContentBlock>,
-        /// Buffered usage data for the agent message
-        pending_usage: Option<UsageData>,
-        /// Tool results completed before cancellation
-        completed_tool_results: Vec<ToolResult>,
+        /// IDs of tools whose results have been persisted (for validation)
+        persisted_tool_ids: HashSet<String>,
     },
 
     /// Waiting for sub-agents to complete

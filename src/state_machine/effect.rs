@@ -46,21 +46,11 @@ pub enum Effect {
     /// Schedule a retry
     ScheduleRetry { delay: Duration, attempt: u32 },
 
-    /// Persist multiple tool results at once (used for cancellation synthetic results)
+    /// Persist multiple tool results at once
     PersistToolResults { results: Vec<ToolResult> },
 
     /// Persist aggregated sub-agent results as a message
     PersistSubAgentResults { results: Vec<SubAgentResult> },
-
-    /// Persist a complete tool exchange atomically:
-    /// - The agent message (with tool_use blocks)
-    /// - All tool results
-    /// This ensures we never have orphaned tool_use in the database.
-    PersistToolExchange {
-        agent_content: Vec<ContentBlock>,
-        agent_usage: Option<UsageData>,
-        tool_results: Vec<ToolResult>,
-    },
 }
 
 impl Effect {

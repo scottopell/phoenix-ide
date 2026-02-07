@@ -1,16 +1,10 @@
 ---
 created: 2025-02-07
 priority: p3
-status: done
+status: in-progress
 ---
 
 # Investigate: Orphaned Tool Use Recovery
-
-## ⚠️ INVESTIGATION ONLY
-
-**This task is for investigation and documentation only. Do NOT implement any code fixes.**
-
-Deliver findings as a report appended to this file. If vulnerabilities are found, document them and recommend fixes, but do not write implementation code.
 
 ## Summary
 
@@ -174,48 +168,27 @@ Only persist `tool_use` and `tool_result` together after tool completes.
 
 ### Recommendation
 
-**Implemented: Deferred Persistence (makes invalid states unrepresentable)**
+**Option 2 (Synthetic Error Results)** is preferred because:
+1. Maintains complete history (no silent drops)
+2. User can see what was interrupted
+3. Can be implemented in `reset_all_to_idle()` without changing the executor
 
-Instead of the filter/synthetic approaches, we implemented a cleaner architectural fix:
-
-1. Agent messages with `tool_use` are NOT persisted until all tools complete
-2. Tool results are accumulated in `completed_tool_results` state field
-3. When all tools complete (or cancel), we persist atomically via `PersistToolExchange`
-4. This makes orphaned `tool_use` structurally impossible
-
-### Implementation Summary
-
-**State Machine Changes:**
-- `ToolExecuting` state now holds:
-  - `pending_agent_content: Vec<ContentBlock>` - buffered agent message
-  - `pending_usage: Option<UsageData>` - buffered usage stats  
-  - `completed_tool_results: Vec<ToolResult>` - accumulated results
-- Removed `persisted_tool_ids` (no longer needed)
-- `CancellingTool` also holds these fields for cancel-path persistence
-
-**Effect Changes:**
-- Added `Effect::PersistToolExchange` - persists agent message + all tool results atomically
-- Removed per-tool `persist_tool_message` during execution
-- Removed `PersistToolResults` (only used for cancellation edge case, now unified)
-
-**Transition Changes:**
-- `LlmResponse` with tools: DON'T persist agent message, store in pending fields
-- `ToolComplete` (mid-chain): Accumulate result, DON'T persist
-- `ToolComplete` (last tool): Emit `PersistToolExchange` with all results
-- Cancellation: Emit `PersistToolExchange` with completed + synthetic results
-
-**Key Files Modified:**
-- `src/state_machine/state.rs` - new state fields
-- `src/state_machine/transition.rs` - deferred persistence logic
-- `src/state_machine/effect.rs` - `PersistToolExchange` effect
-- `src/runtime/executor.rs` - effect handler
-- `src/db/schema.rs` - `PartialEq` for `UsageData`
+Implementation sketch:
+```rust
+pub fn reset_all_to_idle_with_recovery(&self) -> DbResult<()> {
+    // Find conversations in ToolExecuting state
+    // For each, find the last agent message with tool_use
+    // Inject synthetic tool_result: "Tool execution interrupted by server restart"
+    // Then reset to Idle
+}
+```
 
 ### Checklist Update
 
-- [x] What happens when phoenix-ide crashes mid-tool-execution? → **Now safe: no orphans possible**
-- [x] Is there history filtering when loading conversations? → **Not needed with new design**
-- [x] Phoenix has `ToolExecuting` state - what's persisted? → **Only state, not messages until complete**
-- [x] Is `tool_use` stored before or after execution completes? → **After (atomically with results)**
-- [x] What state do we resume to after crash? → **Idle, with clean history**
-- [x] Implement fix → **Done: deferred persistence makes invalid states unrepresentable**
+- [x] What happens when phoenix-ide crashes mid-tool-execution? → **Bug: orphaned tool_use**
+- [x] Is there history filtering when loading conversations? → **No filtering**
+- [x] Phoenix has `ToolExecuting` state - what's persisted? → **Agent message with tool_use persisted BEFORE execution**
+- [x] Is `tool_use` stored before or after execution completes? → **Before**
+- [x] What state do we resume to after crash? → **Idle (via reset_all_to_idle)**
+- [ ] Test the crash scenario manually (deferred - analysis confirms vulnerability)
+- [ ] Implement fix (separate task)
