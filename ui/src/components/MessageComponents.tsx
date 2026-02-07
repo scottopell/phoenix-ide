@@ -17,6 +17,7 @@ import type { Message, ContentBlock, ToolResultContent, ConversationState } from
 import type { QueuedMessage } from '../hooks';
 import { escapeHtml, renderMarkdown } from '../utils';
 import { CopyButton } from './CopyButton';
+import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 
 // ============================================================================
 // Helper functions
@@ -148,9 +149,11 @@ export function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage
 export function AgentMessage({
   message,
   toolResults,
+  onOpenFile,
 }: {
   message: Message;
   toolResults: Map<string, Message>;
+  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
 }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
@@ -180,6 +183,7 @@ export function AgentMessage({
                 key={block.id || i}
                 block={block}
                 result={toolResults.get(block.id || '')}
+                onOpenFile={onOpenFile}
               />
             );
           }
@@ -194,7 +198,13 @@ export function AgentMessage({
 // Tool Use Block
 // ============================================================================
 
-export function ToolUseBlock({ block, result }: { block: ContentBlock; result?: Message }) {
+interface ToolUseBlockProps {
+  block: ContentBlock;
+  result?: Message;
+  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+}
+
+export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -285,6 +295,11 @@ export function ToolUseBlock({ block, result }: { block: ContentBlock; result?: 
             </>
           )}
         </div>
+      )}
+
+      {/* Patch file summary (REQ-PF-014) */}
+      {name === 'patch' && resultText && containsUnifiedDiff(resultText) && onOpenFile && (
+        <PatchFileSummary patchOutput={resultText} onFileClick={onOpenFile} />
       )}
     </div>
   );

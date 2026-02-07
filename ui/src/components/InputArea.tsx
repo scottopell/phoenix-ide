@@ -1,4 +1,5 @@
 import { useRef, useEffect, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { FolderOpen } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { QueuedMessage } from '../hooks';
 import type { ImageData } from '../api';
@@ -20,6 +21,7 @@ interface InputAreaProps {
   onSend: (text: string, images: ImageData[]) => void;
   onCancel: () => void;
   onRetry: (localId: string) => void;
+  onOpenFileBrowser?: () => void;
   conversationSlug?: string;
   convState?: string;
 }
@@ -54,6 +56,7 @@ export function InputArea({
   onSend,
   onCancel,
   onRetry,
+  onOpenFileBrowser,
   conversationSlug,
   convState,
 }: InputAreaProps) {
@@ -196,6 +199,16 @@ export function InputArea({
       <ImageAttachments images={images} onRemove={handleRemoveImage} />
       
       <div id="input-container">
+        {onOpenFileBrowser && (
+          <button
+            className="file-browse-btn"
+            onClick={onOpenFileBrowser}
+            title="Browse files"
+            aria-label="Browse files"
+          >
+            <FolderOpen size={20} />
+          </button>
+        )}
         <button
           className="attach-btn"
           onClick={() => fileInputRef.current?.click()}

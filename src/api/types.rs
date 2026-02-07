@@ -105,6 +105,40 @@ pub struct DirectoryEntry {
     pub is_dir: bool,
 }
 
+/// Enhanced file entry for file browser (REQ-PF-001 through REQ-PF-004)
+#[derive(Debug, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_time: Option<u64>, // Unix timestamp in seconds
+    pub file_type: String, // folder, markdown, code, config, text, image, data, unknown
+    pub is_text_file: bool,
+}
+
+/// Response for file listing
+#[derive(Debug, Serialize)]
+pub struct ListFilesResponse {
+    pub items: Vec<FileEntry>,
+}
+
+/// Response for file reading
+#[derive(Debug, Serialize)]
+pub struct ReadFileResponse {
+    pub content: String,
+    pub encoding: String,
+}
+
+/// Error response for file operations
+#[derive(Debug, Serialize)]
+pub struct FileErrorResponse {
+    pub error: String,
+    pub is_binary: bool,
+}
+
 /// Model information with metadata
 #[derive(Debug, Serialize)]
 pub struct ModelInfo {

@@ -2242,3 +2242,853 @@ html * {
   margin-top: 4px;
   border-radius: 4px;
 }
+
+/* ============================================================
+ * File Browser Component (REQ-PF-001 through REQ-PF-004)
+ * ============================================================ */
+
+.file-browser-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-primary);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.file-browser-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-width: 800px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.file-browser-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.file-browser-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+  min-width: 36px;
+  min-height: 36px;
+}
+
+.file-browser-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.file-browser-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-browser-path {
+  flex: 1;
+  font-size: 14px;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-browser-content {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.file-browser-list {
+  padding: 8px 0;
+}
+
+.file-browser-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  cursor: pointer;
+  transition: background 0.1s;
+  min-height: 44px;
+  user-select: none;
+}
+
+.file-browser-item:hover:not(.file-browser-item--disabled) {
+  background: var(--bg-tertiary);
+}
+
+.file-browser-item:active:not(.file-browser-item--disabled) {
+  background: var(--bg-hover);
+}
+
+.file-browser-item--disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-browser-expand-icon {
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+}
+
+.file-icon {
+  flex-shrink: 0;
+}
+
+.file-icon-folder {
+  color: #f0ad4e;
+}
+
+.file-icon-markdown {
+  color: #5cb85c;
+}
+
+.file-icon-code {
+  color: #5bc0de;
+}
+
+.file-icon-config {
+  color: #a87fdf;
+}
+
+.file-icon-text {
+  color: var(--text-secondary);
+}
+
+.file-icon-image {
+  color: #e74c3c;
+}
+
+.file-icon-data {
+  color: #95a5a6;
+}
+
+.file-icon-unknown {
+  color: var(--text-tertiary);
+}
+
+.file-browser-name {
+  flex: 1;
+  font-size: 14px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-browser-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.file-browser-disabled-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.file-browser-loading,
+.file-browser-error,
+.file-browser-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px 16px;
+  color: var(--text-secondary);
+}
+
+.file-browser-error button {
+  margin-top: 8px;
+  padding: 8px 16px;
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.file-browser-empty-icon {
+  color: var(--text-tertiary);
+  opacity: 0.5;
+}
+
+.file-browser-children {
+  border-left: 1px solid var(--border-color);
+  margin-left: 24px;
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ============================================================
+ * Prose Reader Component (REQ-PF-005 through REQ-PF-013)
+ * ============================================================ */
+
+.prose-reader-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-primary);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.prose-reader-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.prose-reader-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+  min-width: 36px;
+  min-height: 36px;
+}
+
+.prose-reader-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.prose-reader-title {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prose-reader-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prose-reader-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.prose-reader-badge:hover {
+  opacity: 0.9;
+}
+
+.prose-reader-send-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--success-color, #10b981);
+  color: white;
+  border: none;
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.prose-reader-send-btn:hover {
+  opacity: 0.9;
+}
+
+.prose-reader-banner {
+  background: var(--bg-tertiary);
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.prose-reader-banner-text {
+  font-weight: 500;
+}
+
+.prose-reader-content {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.prose-reader-loading,
+.prose-reader-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 48px 16px;
+  color: var(--text-secondary);
+  height: 100%;
+}
+
+.prose-reader-error button {
+  margin-top: 8px;
+  padding: 8px 16px;
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+/* Text/Code display */
+.prose-reader-text {
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.prose-reader-line {
+  display: flex;
+  min-height: 24px;
+  transition: background-color 0.15s;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.prose-reader-line:hover {
+  background: var(--bg-tertiary);
+}
+
+.prose-reader-line--modified {
+  background-color: rgba(255, 236, 156, 0.3) !important;
+  border-left: 3px solid #f0ad4e;
+}
+
+.prose-reader-line--highlighted {
+  background-color: rgba(59, 130, 246, 0.3) !important;
+  animation: highlight-fade 2s ease-out;
+}
+
+@keyframes highlight-fade {
+  0% { background-color: rgba(59, 130, 246, 0.5); }
+  100% { background-color: transparent; }
+}
+
+.prose-reader-line-number {
+  width: 48px;
+  padding: 0 12px;
+  text-align: right;
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.prose-reader-line-content {
+  flex: 1;
+  padding: 0 16px;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+/* Markdown display */
+.prose-reader-markdown {
+  padding: 16px;
+  max-width: 800px;
+  margin: 0 auto;
+  line-height: 1.6;
+}
+
+.prose-reader-markdown h1,
+.prose-reader-markdown h2,
+.prose-reader-markdown h3 {
+  margin-top: 24px;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+.prose-reader-markdown h1 { font-size: 1.75rem; }
+.prose-reader-markdown h2 { font-size: 1.5rem; }
+.prose-reader-markdown h3 { font-size: 1.25rem; }
+
+.prose-reader-markdown p {
+  margin-bottom: 12px;
+}
+
+.prose-reader-markdown code {
+  background: var(--bg-tertiary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.prose-reader-markdown pre {
+  margin: 16px 0;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.prose-reader-markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.prose-reader-markdown ul,
+.prose-reader-markdown ol {
+  margin-bottom: 12px;
+  padding-left: 24px;
+}
+
+.prose-reader-markdown blockquote {
+  border-left: 4px solid var(--border-color);
+  padding-left: 16px;
+  margin: 12px 0;
+  color: var(--text-secondary);
+}
+
+.prose-reader-block {
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: background-color 0.15s;
+  cursor: default;
+}
+
+.prose-reader-block:hover {
+  background: var(--bg-tertiary);
+}
+
+/* Code display */
+.prose-reader-code {
+  font-size: 13px;
+}
+
+.prose-reader-code pre {
+  margin: 0 !important;
+  border-radius: 0 !important;
+}
+
+/* Annotation Dialog (REQ-PF-007) */
+.prose-reader-annotation-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 1100;
+  animation: fade-in 0.15s ease-out;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.prose-reader-annotation-dialog {
+  background: var(--bg-primary);
+  width: 100%;
+  max-width: 500px;
+  border-radius: 16px 16px 0 0;
+  padding: 16px;
+  animation: slide-up 0.2s ease-out;
+}
+
+@keyframes slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.prose-reader-annotation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.prose-reader-annotation-header button {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px;
+}
+
+.prose-reader-annotation-preview {
+  background: var(--bg-tertiary);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prose-reader-annotation-input {
+  width: 100%;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 14px;
+  resize: none;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}
+
+.prose-reader-annotation-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.prose-reader-annotation-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.prose-reader-annotation-actions button {
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  min-height: 44px;
+}
+
+.prose-reader-annotation-actions button:first-child {
+  background: var(--bg-tertiary);
+  border: none;
+  color: var(--text-secondary);
+}
+
+.prose-reader-annotation-actions button.primary {
+  background: var(--primary-color);
+  border: none;
+  color: white;
+}
+
+.prose-reader-annotation-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Notes Panel (REQ-PF-008) */
+.prose-reader-notes-panel {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--bg-primary);
+  border-radius: 16px 16px 0 0;
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.15);
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  z-index: 1050;
+  animation: slide-up 0.2s ease-out;
+}
+
+.prose-reader-notes-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 500;
+}
+
+.prose-reader-notes-header button {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px;
+}
+
+.prose-reader-notes-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.prose-reader-note {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.prose-reader-note:last-child {
+  border-bottom: none;
+}
+
+.prose-reader-note-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.prose-reader-note-line {
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.prose-reader-note-delete {
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 4px;
+}
+
+.prose-reader-note-delete:hover {
+  color: var(--error-color, #ef4444);
+}
+
+.prose-reader-note-preview {
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prose-reader-note-text {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.prose-reader-notes-actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.prose-reader-notes-actions button {
+  flex: 1;
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+}
+
+.prose-reader-notes-actions button:first-child {
+  background: var(--bg-tertiary);
+  border: none;
+  color: var(--text-secondary);
+}
+
+.prose-reader-notes-actions button.primary {
+  background: var(--success-color, #10b981);
+  border: none;
+  color: white;
+}
+
+/* Close Confirmation (REQ-PF-010) */
+.prose-reader-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1200;
+  padding: 16px;
+}
+
+.prose-reader-confirm-dialog {
+  background: var(--bg-primary);
+  border-radius: 12px;
+  padding: 20px;
+  max-width: 340px;
+  width: 100%;
+}
+
+.prose-reader-confirm-dialog p {
+  margin-bottom: 16px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.prose-reader-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.prose-reader-confirm-actions button {
+  flex: 1;
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  min-height: 44px;
+}
+
+.prose-reader-confirm-actions button:first-child {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.prose-reader-confirm-actions button.danger {
+  background: var(--error-color, #ef4444);
+  color: white;
+}
+
+/* ============================================================
+ * Patch File Summary Component (REQ-PF-014)
+ * ============================================================ */
+
+.patch-file-summary {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+.patch-file-summary-header {
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.patch-file-summary-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.patch-file-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--primary-color);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+  font-size: 13px;
+}
+
+.patch-file-link:hover {
+  background-color: var(--bg-hover);
+  border-color: var(--primary-color);
+}
+
+.patch-file-icon {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.patch-file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.patch-file-changes {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.patch-file-chevron {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+/* File Browse Button in Input Area */
+.file-browse-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+
+.file-browse-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}

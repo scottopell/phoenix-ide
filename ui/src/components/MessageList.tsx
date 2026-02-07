@@ -14,9 +14,10 @@ interface MessageListProps {
   convState: string;
   stateData: ConversationState | null;
   onRetry: (localId: string) => void;
+  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
 }
 
-export function MessageList({ messages, queuedMessages, convState, stateData, onRetry }: MessageListProps) {
+export function MessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile }: MessageListProps) {
   const mainRef = useRef<HTMLElement>(null);
 
   // Scroll to bottom when messages change
@@ -63,6 +64,7 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
                       key={msg.sequence_id}
                       message={msg}
                       toolResults={toolResults}
+                      onOpenFile={onOpenFile}
                     />
                   );
                 }

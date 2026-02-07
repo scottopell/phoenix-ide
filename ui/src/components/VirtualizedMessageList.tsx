@@ -23,6 +23,7 @@ interface RowData {
   items: ItemType[];
   toolResults: Map<string, Message>;
   onRetry: (localId: string) => void;
+  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
   setItemHeight: (index: number, height: number) => void;
 }
 
@@ -39,6 +40,7 @@ interface MessageListProps {
   convState: string;
   stateData: ConversationState | null;
   onRetry: (localId: string) => void;
+  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
 }
 
 // Row component extracted to avoid hooks-in-conditional issue
@@ -64,7 +66,7 @@ function RowRenderer({ index, style, data }: ListChildComponentProps) {
         return msgType === 'user' ? (
           <UserMessage message={msg} />
         ) : (
-          <AgentMessage message={msg} toolResults={data.toolResults} />
+          <AgentMessage message={msg} toolResults={data.toolResults} onOpenFile={data.onOpenFile} />
         );
       })()}
       {item.type === 'queued' && (
@@ -77,7 +79,7 @@ function RowRenderer({ index, style, data }: ListChildComponentProps) {
   );
 }
 
-export function VirtualizedMessageList({ messages, queuedMessages, convState, stateData, onRetry }: MessageListProps) {
+export function VirtualizedMessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile }: MessageListProps) {
   const mainRef = useRef<HTMLElement>(null);
   const listRef = useRef<VariableSizeList>(null);
   const [mainHeight, setMainHeight] = useState(600);
@@ -199,6 +201,7 @@ export function VirtualizedMessageList({ messages, queuedMessages, convState, st
     items,
     toolResults,
     onRetry,
+    onOpenFile,
     setItemHeight,
   };
 

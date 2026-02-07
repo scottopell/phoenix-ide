@@ -7,6 +7,8 @@ import { MessageList } from '../components/MessageList';
 import { VirtualizedMessageList } from '../components/VirtualizedMessageList';
 import { InputArea } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
+import { FileBrowser } from '../components/FileBrowser';
+import { ProseReader } from '../components/ProseReader';
 import { useDraft, useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
 import type { Breadcrumb } from '../types';
@@ -27,6 +29,17 @@ export function ConversationPage() {
   const [_contextWindowUsed, setContextWindowUsed] = useState(0);
   const [initialLoadComplete, setInitialLoadComplete] = useState(false);
   const [lastDataSource, setLastDataSource] = useState<'memory' | 'indexeddb' | 'network' | null>(null);
+  
+  // File browser and prose reader state (REQ-PF-001 through REQ-PF-014)
+  const [showFileBrowser, setShowFileBrowser] = useState(false);
+  const [proseReaderFile, setProseReaderFile] = useState<{
+    path: string;
+    rootDir: string;
+    patchContext?: {
+      modifiedLines: Set<number>;
+      firstModifiedLine?: number;
+    };
+  } | null>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set()); // Track localIds being sent
 
@@ -357,6 +370,43 @@ export function ConversationPage() {
     }
   };
 
+  // File browser handlers (REQ-PF-001 through REQ-PF-004)
+  const handleOpenFileBrowser = useCallback(() => {
+    setShowFileBrowser(true);
+  }, []);
+
+  const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
+    setShowFileBrowser(false);
+    setProseReaderFile({ path: filePath, rootDir });
+  }, []);
+
+  // Prose reader handlers (REQ-PF-005 through REQ-PF-014)
+  const handleCloseProseReader = useCallback(() => {
+    setProseReaderFile(null);
+  }, []);
+
+  const handleSendNotes = useCallback((formattedNotes: string) => {
+    // Inject notes into the draft (REQ-PF-009)
+    if (draft.trim()) {
+      setDraft(draft + '\n\n' + formattedNotes);
+    } else {
+      setDraft(formattedNotes);
+    }
+    setProseReaderFile(null);
+  }, [draft, setDraft]);
+
+  // Open file from patch output (REQ-PF-014)
+  const handleOpenFileFromPatch = useCallback((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
+    // Resolve the file path against the conversation's cwd
+    const rootDir = conversation?.cwd || '/';
+    const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
+    setProseReaderFile({
+      path: fullPath,
+      rootDir,
+      patchContext: { modifiedLines, firstModifiedLine },
+    });
+  }, [conversation?.cwd]);
+
   if (error) {
     return (
       <div id="app">
@@ -406,6 +456,7 @@ export function ConversationPage() {
           convState={convState}
           stateData={stateData}
           onRetry={handleRetry}
+          onOpenFile={handleOpenFileFromPatch}
         />
       ) : (
         <MessageList
@@ -414,6 +465,7 @@ export function ConversationPage() {
           convState={convState}
           stateData={stateData}
           onRetry={handleRetry}
+          onOpenFile={handleOpenFileFromPatch}
         />
       )}
       <InputArea
@@ -429,9 +481,30 @@ export function ConversationPage() {
         onSend={handleSend}
         onCancel={handleCancel}
         onRetry={handleRetry}
+        onOpenFileBrowser={handleOpenFileBrowser}
         conversationSlug={conversation.slug}
         convState={convState}
       />
+
+      {/* File Browser (REQ-PF-001 through REQ-PF-004) */}
+      <FileBrowser
+        isOpen={showFileBrowser}
+        rootPath={conversation.cwd}
+        conversationId={conversation.id}
+        onClose={() => setShowFileBrowser(false)}
+        onFileSelect={handleFileSelect}
+      />
+
+      {/* Prose Reader (REQ-PF-005 through REQ-PF-013) */}
+      {proseReaderFile && (
+        <ProseReader
+          filePath={proseReaderFile.path}
+          rootDir={proseReaderFile.rootDir}
+          onClose={handleCloseProseReader}
+          onSendNotes={handleSendNotes}
+          patchContext={proseReaderFile.patchContext}
+        />
+      )}
     </div>
   );
 }

@@ -6,8 +6,8 @@ use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
-    ListDirectoryResponse, MkdirResponse, ModelsResponse, RenameRequest, SuccessResponse,
-    ValidateCwdResponse,
+    FileEntry, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    ReadFileResponse, RenameRequest, SuccessResponse, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::runtime::SseEvent;
@@ -69,6 +69,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
         .route("/api/mkdir", post(mkdir))
+        // File browser API (REQ-PF-001 through REQ-PF-004)
+        .route("/api/files/list", get(list_files))
+        .route("/api/files/read", get(read_file))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
         // Version
@@ -560,6 +563,180 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
             error: Some(format!("Failed to create directory: {e}")),
         }),
     }
+}
+
+// ============================================================
+// File Browser API (REQ-PF-001 through REQ-PF-004)
+// ============================================================
+
+/// Detect file type from extension (REQ-PF-004)
+fn detect_file_type(path: &std::path::Path) -> (String, bool) {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+
+    match ext.as_deref() {
+        // Markdown
+        Some("md") | Some("markdown") => ("markdown".to_string(), true),
+        // Code files
+        Some("rs") | Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("py")
+        | Some("go") | Some("java") | Some("cpp") | Some("c") | Some("h") | Some("hpp")
+        | Some("css") | Some("html") | Some("htm") | Some("vue") | Some("svelte")
+        | Some("php") | Some("rb") | Some("swift") | Some("kt") | Some("scala")
+        | Some("sh") | Some("bash") | Some("zsh") | Some("fish") | Some("ps1")
+        | Some("sql") | Some("graphql") | Some("proto") => ("code".to_string(), true),
+        // Config files
+        Some("json") | Some("yaml") | Some("yml") | Some("toml") | Some("ini")
+        | Some("env") | Some("conf") | Some("cfg") | Some("xml") | Some("properties") => {
+            ("config".to_string(), true)
+        }
+        // Text files
+        Some("txt") | Some("log") | Some("csv") | Some("tsv") | Some("rtf") => {
+            ("text".to_string(), true)
+        }
+        // Image files
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("svg") | Some("webp")
+        | Some("ico") | Some("bmp") | Some("tiff") | Some("tif") => {
+            ("image".to_string(), false)
+        }
+        // Data/binary files
+        Some("db") | Some("sqlite") | Some("sqlite3") | Some("bin") | Some("dat")
+        | Some("exe") | Some("dll") | Some("so") | Some("dylib") | Some("o") | Some("a")
+        | Some("wasm") | Some("class") | Some("jar") | Some("war") | Some("pyc")
+        | Some("pyo") | Some("pdf") | Some("doc") | Some("docx") | Some("xls")
+        | Some("xlsx") | Some("ppt") | Some("pptx") | Some("zip") | Some("tar")
+        | Some("gz") | Some("bz2") | Some("xz") | Some("7z") | Some("rar")
+        | Some("mp3") | Some("mp4") | Some("wav") | Some("avi") | Some("mkv")
+        | Some("mov") | Some("webm") | Some("flac") | Some("ogg") => {
+            ("data".to_string(), false)
+        }
+        // Unknown - could be text, need to check when reading
+        _ => ("unknown".to_string(), true),
+    }
+}
+
+/// Check if file content appears to be valid text
+fn is_valid_text(content: &[u8]) -> bool {
+    // Check for null bytes (common in binary files)
+    if content.contains(&0) {
+        return false;
+    }
+
+    // Try to parse as UTF-8
+    std::str::from_utf8(content).is_ok()
+}
+
+/// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
+async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResponse>, AppError> {
+    let path_str = query.path.trim_end_matches('/');
+    let path_str = if path_str.is_empty() { "/" } else { path_str };
+    let path = PathBuf::from(path_str);
+
+    if !path.exists() {
+        return Err(AppError::NotFound("Directory does not exist".to_string()));
+    }
+    if !path.is_dir() {
+        return Err(AppError::BadRequest("Path is not a directory".to_string()));
+    }
+
+    let entries = fs::read_dir(&path)
+        .map_err(|e| AppError::BadRequest(format!("Cannot read directory: {e}")))?;
+
+    let mut items: Vec<FileEntry> = entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let entry_path = entry.path();
+            let full_path = entry_path.to_string_lossy().to_string();
+            let metadata = entry.metadata().ok();
+
+            let is_directory = metadata
+                .as_ref()
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+
+            let (file_type, is_text_file) = if is_directory {
+                ("folder".to_string(), false)
+            } else {
+                detect_file_type(&entry_path)
+            };
+
+            let size = if is_directory {
+                None
+            } else {
+                metadata.as_ref().map(|m| m.len())
+            };
+
+            let modified_time = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+
+            FileEntry {
+                name,
+                path: full_path,
+                is_directory,
+                size,
+                modified_time,
+                file_type,
+                is_text_file,
+            }
+        })
+        .collect();
+
+    // Sort: directories first, then alphabetically (case-insensitive)
+    items.sort_by(|a, b| {
+        match (a.is_directory, b.is_directory) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    Ok(Json(ListFilesResponse { items }))
+}
+
+/// Read file contents with text encoding validation (REQ-PF-005)
+async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileResponse>, AppError> {
+    let path = PathBuf::from(&query.path);
+
+    if !path.exists() {
+        return Err(AppError::NotFound("File does not exist".to_string()));
+    }
+    if path.is_dir() {
+        return Err(AppError::BadRequest("Path is a directory".to_string()));
+    }
+
+    // Check file size (limit to 10MB for safety)
+    let metadata = fs::metadata(&path)
+        .map_err(|e| AppError::BadRequest(format!("Cannot read file metadata: {e}")))?;
+    if metadata.len() > 10 * 1024 * 1024 {
+        return Err(AppError::BadRequest(
+            "File too large (max 10MB)".to_string(),
+        ));
+    }
+
+    // Read file content
+    let content = fs::read(&path)
+        .map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
+
+    // Validate text encoding
+    if !is_valid_text(&content) {
+        return Err(AppError::BadRequest(
+            "File appears to be binary or has invalid encoding".to_string(),
+        ));
+    }
+
+    // Convert to string (we know it's valid UTF-8 from is_valid_text check)
+    let text = String::from_utf8(content)
+        .map_err(|_| AppError::BadRequest("Invalid UTF-8 encoding".to_string()))?;
+
+    Ok(Json(ReadFileResponse {
+        content: text,
+        encoding: "utf-8".to_string(),
+    }))
 }
 
 // ============================================================
