@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import { enhancedApi } from '../enhancedApi';
 import type { Conversation } from '../api';
 import { ConversationList } from '../components/ConversationList';
-import { NewConversationModal } from '../components/NewConversationModal';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
@@ -17,7 +16,7 @@ export function ConversationListPage() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const [showArchived, setShowArchived] = useState(false);
-  const [showModal, setShowModal] = useState(false);
+
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const scrollRestoredRef = useRef(false);
@@ -140,10 +139,8 @@ export function ConversationListPage() {
     navigate(`/c/${conv.slug}`);
   }, [navigate]);
 
-  const handleCreated = (conv: { id: string; slug: string }) => {
-    setShowModal(false);
-    loadConversations(true); // Force fresh to include new conversation
-    navigate(`/c/${conv.slug}`);
+  const handleNewConversation = () => {
+    navigate('/new');
   };
 
   const handleArchive = async (conv: Conversation) => {
@@ -278,7 +275,7 @@ export function ConversationListPage() {
               archivedConversations={archivedConversations}
               showArchived={showArchived}
               onToggleArchived={() => setShowArchived(!showArchived)}
-              onNewConversation={() => setShowModal(true)}
+              onNewConversation={handleNewConversation}
               onArchive={handleArchive}
               onUnarchive={handleUnarchive}
               onDelete={(conv) => setDeleteTarget(conv)}
@@ -291,11 +288,6 @@ export function ConversationListPage() {
           </>
         )}
       </main>
-      <NewConversationModal
-        visible={showModal}
-        onClose={() => setShowModal(false)}
-        onCreated={handleCreated}
-      />
       <ConfirmDialog
         visible={deleteTarget !== null}
         title="Delete Conversation"

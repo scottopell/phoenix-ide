@@ -9,6 +9,7 @@ mod llm;
 mod runtime;
 mod state_machine;
 mod system_prompt;
+mod title_generator;
 mod tools;
 
 use api::{create_router, AppState};

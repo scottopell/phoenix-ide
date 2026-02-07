@@ -3092,3 +3092,161 @@ html * {
   background: var(--bg-tertiary);
   color: var(--text-primary);
 }
+
+/* ============================================================
+ * New Conversation Page
+ * ============================================================ */
+
+.new-conversation-page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg-primary);
+}
+
+.new-conv-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.new-conv-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.new-conv-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  max-width: 800px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.new-conv-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.setting-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setting-group label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.new-conv-input-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.new-conv-input-area .input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+}
+
+.new-conv-input-area textarea {
+  flex: 1;
+  resize: none;
+  border: none;
+  background: transparent;
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 8px 0;
+  color: var(--text-primary);
+  font-family: inherit;
+  min-height: 60px;
+}
+
+.new-conv-input-area textarea:focus {
+  outline: none;
+}
+
+.new-conv-input-area textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+.new-conv-input-area .attach-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 8px;
+  font-size: 18px;
+  color: var(--text-secondary);
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+.new-conv-input-area .attach-btn:hover {
+  background: var(--bg-tertiary);
+}
+
+.new-conv-input-area .attach-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.new-conv-input-area .send-btn {
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.new-conv-input-area .send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.new-conv-input-area .send-btn:not(:disabled):hover {
+  opacity: 0.9;
+}
+
+.error-banner {
+  background: var(--error-bg, #fef2f2);
+  color: var(--error-color, #ef4444);
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 14px;
+}
+
+/* Mobile adjustments */
+@media (max-width: 768px) {
+  .new-conv-main {
+    padding: 16px;
+  }
+  
+  .new-conv-input-area .input-row {
+    padding: 8px;
+  }
+  
+  .new-conv-input-area .send-btn {
+    padding: 8px 16px;
+  }
+}

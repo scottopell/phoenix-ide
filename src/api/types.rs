@@ -2,12 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Request to create a new conversation
+/// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
     pub cwd: String,
-    #[allow(dead_code)] // Reserved for model selection
     pub model: Option<String>,
+    /// Initial message text (required)
+    pub text: String,
+    /// Client-generated message ID for idempotency
+    pub message_id: String,
+    /// Optional image attachments
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
 }
 
 /// Request to send a chat message

@@ -145,6 +145,26 @@ impl ModelRegistry {
     pub fn has_models(&self) -> bool {
         !self.services.is_empty()
     }
+
+    /// Get a cheap/fast model for auxiliary tasks like title generation.
+    /// Prefers: claude-4.5-haiku > gpt-4o-mini > any available model
+    pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
+        // Priority order for cheap models
+        const CHEAP_MODELS: &[&str] = &[
+            "claude-4.5-haiku",
+            "gpt-4o-mini",
+            "gpt-5-mini",
+        ];
+
+        for model_id in CHEAP_MODELS {
+            if let Some(service) = self.get(model_id) {
+                return Some(service);
+            }
+        }
+
+        // Fall back to default model if no cheap model available
+        self.default()
+    }
 }
 
 

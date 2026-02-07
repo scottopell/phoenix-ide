@@ -109,11 +109,17 @@ export const api = {
     return (await resp.json()).conversations;
   },
 
-  async createConversation(cwd: string, model?: string): Promise<Conversation> {
+  async createConversation(
+    cwd: string,
+    text: string,
+    messageId: string,
+    model?: string,
+    images: ImageData[] = []
+  ): Promise<Conversation> {
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cwd, model }),
+      body: JSON.stringify({ cwd, model, text, message_id: messageId, images }),
     });
     if (!resp.ok) {
       const err = await resp.json();

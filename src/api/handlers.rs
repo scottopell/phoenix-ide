@@ -36,6 +36,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(serve_spa))
         // Deep links to conversations
         .route("/c/:slug", get(serve_spa))
+        // New conversation page
+        .route("/new", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Static assets (embedded or filesystem fallback)
@@ -154,9 +156,47 @@ async fn create_conversation(
         return Err(AppError::BadRequest("Path is not a directory".to_string()));
     }
 
-    // Generate ID and slug
+    // Validate message text is not empty
+    if req.text.trim().is_empty() {
+        return Err(AppError::BadRequest("Message text cannot be empty".to_string()));
+    }
+
+    // Idempotency check: if message_id already exists, find and return that conversation
+    if state.db.message_exists(&req.message_id).unwrap_or(false) {
+        tracing::info!(
+            message_id = %req.message_id,
+            "Duplicate create request detected, returning existing conversation"
+        );
+        // Find the conversation for this message
+        if let Ok(msg) = state.db.get_message_by_id(&req.message_id) {
+            if let Ok(conv) = state.runtime.db().get_conversation(&msg.conversation_id) {
+                return Ok(Json(ConversationResponse {
+                    conversation: serde_json::to_value(conv).unwrap_or(Value::Null),
+                }));
+            }
+        }
+        // If we can't find it, fall through to create (shouldn't happen)
+    }
+
+    // Generate ID
     let id = uuid::Uuid::new_v4().to_string();
-    let slug = generate_slug();
+    
+    // Try to generate a title using a cheap LLM model
+    let slug = if let Some(cheap_model) = state.runtime.model_registry().get_cheap_model() {
+        match crate::title_generator::generate_title(&req.text, cheap_model).await {
+            Some(title) if !title.is_empty() => {
+                tracing::info!(title = %title, "Generated conversation title");
+                title
+            }
+            _ => {
+                tracing::info!("Title generation failed, using random slug");
+                generate_slug()
+            }
+        }
+    } else {
+        tracing::info!("No cheap model available for title generation, using random slug");
+        generate_slug()
+    };
 
     // Create conversation
     let conversation = state
@@ -167,6 +207,30 @@ async fn create_conversation(
             None, // no parent
             req.model.as_deref(), // selected model
         )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Convert images
+    let images: Vec<ImageData> = req
+        .images
+        .into_iter()
+        .map(|img| ImageData {
+            data: img.data,
+            media_type: img.media_type,
+        })
+        .collect();
+
+    // Send the initial message to the runtime
+    let event = Event::UserMessage {
+        text: req.text,
+        images,
+        message_id: req.message_id,
+        user_agent: None,
+    };
+
+    state
+        .runtime
+        .send_event(&id, event)
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(ConversationResponse {

@@ -19,6 +19,8 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
     #[error("Conversation not found: {0}")]
     ConversationNotFound(String),
+    #[error("Message not found: {0}")]
+    MessageNotFound(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
 }
@@ -527,6 +529,21 @@ impl Database {
 
         let rows = stmt.query_map(params![conversation_id, after_sequence], parse_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// Get a message by its message_id
+    pub fn get_message_by_id(&self, message_id: &str) -> DbResult<Message> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1"
+        )?;
+
+        stmt.query_row(params![message_id], parse_message_row)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => DbError::MessageNotFound(message_id.to_string()),
+                other => DbError::Sqlite(other),
+            })
     }
 
     /// Check if a message with the given message_id already exists

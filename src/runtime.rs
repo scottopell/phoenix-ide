@@ -434,6 +434,10 @@ impl RuntimeManager {
         &self.db
     }
 
+    pub fn model_registry(&self) -> &ModelRegistry {
+        &self.llm_registry
+    }
+
     /// Get the LLM registry
     #[allow(dead_code)] // For future API use
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {

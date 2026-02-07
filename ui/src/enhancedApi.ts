@@ -296,8 +296,14 @@ class EnhancedAPI {
   }
   
   // Operations that modify data (these invalidate caches)
-  async createConversation(cwd: string, model?: string): Promise<Conversation> {
-    const conversation = await baseApi.createConversation(cwd, model);
+  async createConversation(
+    cwd: string,
+    text: string,
+    messageId: string,
+    model?: string,
+    images: ImageData[] = []
+  ): Promise<Conversation> {
+    const conversation = await baseApi.createConversation(cwd, text, messageId, model, images);
     
     // Add to caches
     memoryCache.setConversation(conversation);
