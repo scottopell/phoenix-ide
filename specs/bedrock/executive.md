@@ -29,7 +29,7 @@ Implements Elm Architecture: pure `transition(state, event) -> (new_state, effec
 | **REQ-BED-014:** Conversation Mode | ❌ Not Started | Restricted/Unrestricted modes with Landlock |
 | **REQ-BED-015:** Mode Upgrade Request | ❌ Not Started | Agent requests upgrade, user approves |
 | **REQ-BED-016:** Mode Downgrade | ❌ Not Started | Immediate user-initiated downgrade |
-| **REQ-BED-017:** Mode Indication to Agent | ❌ Not Started | Synthetic messages, error responses |
+| **REQ-BED-017:** Mode Communication | ❌ Not Started | Synthetic messages, error responses |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Sub-agents always Restricted (when available) |
 
 **Progress:** 13 of 18 complete

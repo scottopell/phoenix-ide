@@ -255,7 +255,6 @@ AND pause agent execution until user responds
 
 WHEN user approves upgrade
 THE SYSTEM SHALL transition to Unrestricted mode
-AND inject synthetic system message indicating mode change
 AND resume agent execution
 
 WHEN user denies upgrade
@@ -274,7 +273,6 @@ THE SYSTEM SHALL remain paused (no automatic timeout to Unrestricted)
 
 WHEN user requests mode downgrade (Unrestricted → Restricted)
 THE SYSTEM SHALL transition immediately to Restricted mode
-AND inject synthetic system message indicating mode change
 AND NOT require agent approval
 
 WHEN mode changes (either direction)
@@ -284,21 +282,20 @@ THE SYSTEM SHALL persist the new mode as part of conversation state
 
 ---
 
-### REQ-BED-017: Mode Indication to Agent
+### REQ-BED-017: Mode Communication
 
-WHEN mode changes during conversation
+WHEN mode changes (upgrade or downgrade)
 THE SYSTEM SHALL inject a synthetic system message visible to the agent
 WHICH clearly states the new mode and its implications
 
 WHEN agent is in Restricted mode
 THE SYSTEM SHALL NOT modify tool descriptions based on mode
-AND rely on synthetic messages and tool error responses to communicate restrictions
 
 WHEN tool is unavailable due to mode restrictions
 THE SYSTEM SHALL return clear, actionable error message
 WHICH suggests using request_mode_upgrade if write access is needed
 
-**Rationale:** Tool descriptions must remain static throughout conversation to avoid confusing the LLM. Mode awareness comes through synthetic messages and clear error responses.
+**Rationale:** Tool descriptions must remain static throughout conversation to avoid confusing the LLM. Mode awareness comes through synthetic messages (on transitions) and clear error responses (when tools are blocked).
 
 ---
 
