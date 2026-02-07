@@ -1,9 +1,10 @@
-import { useRef, useEffect, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { useRef, useEffect, useCallback, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { FolderOpen } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { QueuedMessage } from '../hooks';
 import type { ImageData } from '../api';
 import { ImageAttachments } from './ImageAttachments';
+import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 
 const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
@@ -63,6 +64,7 @@ export function InputArea({
   const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const voiceSupported = isWebSpeechSupported();
 
 
   const autoResize = () => {
@@ -145,6 +147,27 @@ export function InputArea({
     }
   };
 
+  // Handle voice transcript - append to existing draft (REQ-VOICE-006)
+  const handleVoiceTranscript = useCallback((text: string) => {
+    if (!text) return;
+    
+    // Append to existing draft - if there's existing text, add a space
+    const currentDraft = draft;
+    const newDraft = currentDraft.trim() 
+      ? currentDraft.trimEnd() + ' ' + text 
+      : text;
+    setDraft(newDraft);
+
+    // Focus the textarea and move cursor to end after state update
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        const len = textareaRef.current.value.length;
+        textareaRef.current.setSelectionRange(len, len);
+      }
+    });
+  }, [draft, setDraft]);
+
   const failedMessages = queuedMessages.filter(m => m.status === 'failed');
   const hasContent = draft.trim().length > 0 || images.length > 0;
   const sendEnabled = (canSend || isOffline) && hasContent;
@@ -225,6 +248,12 @@ export function InputArea({
           onChange={handleFileChange}
           style={{ display: 'none' }}
         />
+        {voiceSupported && (
+          <VoiceRecorder
+            onTranscript={handleVoiceTranscript}
+            disabled={agentWorking}
+          />
+        )}
         <textarea
           ref={textareaRef}
           id="message-input"
