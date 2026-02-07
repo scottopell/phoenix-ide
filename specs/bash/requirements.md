@@ -89,3 +89,28 @@ THE SYSTEM SHALL return descriptive error message
 AND distinguish from command execution failure
 
 **Rationale:** Agents need detailed error information to diagnose and recover from failures.
+
+---
+
+### REQ-BASH-007: Command Safety Checks
+
+WHEN bash command is submitted for execution
+THE SYSTEM SHALL parse the command using a shell syntax parser (tree-sitter-bash)
+AND check for dangerous patterns before execution
+
+WHEN dangerous pattern is detected
+THE SYSTEM SHALL reject the command with descriptive error message
+AND NOT execute the command
+
+THE SYSTEM SHALL reject the following patterns:
+- Blind git add: `git add -A`, `git add .`, `git add --all`, `git add *`
+- Force push: `git push --force`, `git push -f` (allow `--force-with-lease`)
+- Dangerous rm: `rm -rf` on `/`, `~`, `$HOME`, `.git`, `*`, `.*`
+
+WHEN command has `sudo` prefix
+THE SYSTEM SHALL apply safety checks to the command following sudo
+
+WHEN command appears in a pipeline or compound command
+THE SYSTEM SHALL check all command components
+
+**Rationale:** LLMs sometimes execute dangerous commands despite instructions. Parsing-based checks provide UX guardrails with helpful error messages. This is NOT a security boundary - just catches common mistakes and guides toward safer alternatives.

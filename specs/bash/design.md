@@ -196,6 +196,96 @@ fn format_output(&self, result: CommandResult) -> ToolResult {
 }
 ```
 
+## Command Safety Checks (REQ-BASH-007)
+
+Before execution, commands are parsed and checked for dangerous patterns.
+
+### Architecture
+
+```rust
+// src/tools/bash_check.rs
+
+pub fn check(script: &str) -> Result<(), CheckError> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_bash::LANGUAGE.into())?;
+    let tree = parser.parse(script, None)?;
+    check_node(tree.root_node(), script.as_bytes())
+}
+```
+
+### Check Functions
+
+| Check | Blocked Patterns | Allowed |
+|-------|-----------------|----------|
+| `no_blind_git_add` | `git add -A`, `git add .`, `git add --all`, `git add *` | `git add file.rs` |
+| `no_force_push` | `git push --force`, `git push -f` | `git push --force-with-lease` |
+| `no_dangerous_rm` | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `rm -rf *` | `rm -rf node_modules` |
+
+### Sudo Handling
+
+The `sudo` prefix is stripped before checking:
+```rust
+let args = if args.first() == Some(&"sudo".to_string()) {
+    &args[1..]
+} else {
+    &args[..]
+};
+```
+
+### Pipeline/Compound Command Handling
+
+The parser walks the full AST, checking each command node:
+```rust
+fn check_node(node: Node, source: &[u8]) -> Result<(), CheckError> {
+    if node.kind() == "command" {
+        check_command(node, source)?;
+    }
+    // Recurse into children (handles &&, ||, pipes, etc.)
+    for child in node.children(&mut cursor) {
+        check_node(child, source)?;
+    }
+    Ok(())
+}
+```
+
+### Integration Point
+
+```rust
+// In BashTool::run()
+async fn run(&self, input: Value, cancel: CancellationToken) -> ToolOutput {
+    // ... parse input ...
+    
+    // REQ-BASH-007: Check for dangerous patterns
+    if let Err(e) = bash_check::check(&input.command) {
+        return ToolOutput::error(e.message);
+    }
+    
+    // ... execute command ...
+}
+```
+
+### Error Messages
+
+Error messages are descriptive and suggest alternatives:
+
+```
+permission denied: blind git add commands (git add -A, git add ., 
+git add --all, git add *) are not allowed, specify files explicitly
+```
+
+```
+permission denied: git push --force is not allowed. Use 
+--force-with-lease for safer force pushes, or push without force
+```
+
+```
+permission denied: this rm command could delete critical data 
+(.git, home directory, or root). Specify the full path explicitly 
+(no wildcards, ~, or $HOME)
+```
+
+---
+
 ## Testing Strategy
 
 ### Unit Tests
@@ -207,6 +297,22 @@ fn format_output(&self, result: CommandResult) -> ToolResult {
 - Foreground command execution (default and slow modes)
 - Background process lifecycle
 - Exit code handling
+
+### Command Safety Check Tests (REQ-BASH-007)
+
+42 unit tests covering:
+- Git add patterns (allowed and blocked)
+- Git push patterns (force vs force-with-lease)
+- Rm patterns (dangerous paths vs safe paths)
+- Sudo prefix handling
+- Pipeline/compound commands
+- Edge cases (empty scripts, comments)
+
+4 integration tests verifying checks run before execution:
+- `test_blocked_git_add`
+- `test_blocked_rm_rf_root`
+- `test_blocked_git_push_force`
+- `test_allowed_command_runs`
 
 ### Property Tests
 ```rust
@@ -221,13 +327,13 @@ fn output_never_exceeds_limit(output: String) {
 
 ```
 src/tools/
-├── mod.rs
-├── bash/
-│   ├── mod.rs
-│   ├── executor.rs      # Command execution logic
-│   ├── output.rs        # Output formatting/truncation
-│   ├── background.rs    # Background execution
-│   └── tests.rs
-├── patch/
-└── think/
+├── mod.rs               # Tool registry, trait definitions
+├── bash.rs              # BashTool implementation (REQ-BASH-001 through 006)
+├── bash_check.rs        # Command safety checks (REQ-BASH-007)
+├── patch.rs             # PatchTool
+├── patch/               # Patch tool internals
+├── think.rs             # ThinkTool
+├── keyword_search.rs    # KeywordSearchTool
+├── read_image.rs        # ReadImageTool
+└── subagent.rs          # Sub-agent tools
 ```
