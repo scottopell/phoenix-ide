@@ -287,6 +287,11 @@ For complex scripts, write them to a file first and then execute the file.
             return ToolOutput::error("Command cannot be empty");
         }
 
+        // Check for dangerous command patterns (UX guardrail, not security)
+        if let Err(e) = super::bash_check::check(&input.command) {
+            return ToolOutput::error(e.message);
+        }
+
         match input.mode {
             ExecutionMode::Background => self.execute_background(&input.command),
             mode => self.execute_foreground(&input.command, mode, cancel).await,

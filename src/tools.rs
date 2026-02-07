@@ -1,6 +1,7 @@
 //! Tool implementations for Phoenix IDE
 
 mod bash;
+mod bash_check;
 mod keyword_search;
 pub mod patch;
 mod read_image;
