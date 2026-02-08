@@ -241,12 +241,24 @@ mod tests {
         let registry = ToolRegistry::standard();
         let defs = registry.definitions();
         let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
-        
-        assert!(names.contains(&"browser_navigate"), "Missing browser_navigate");
+
+        assert!(
+            names.contains(&"browser_navigate"),
+            "Missing browser_navigate"
+        );
         assert!(names.contains(&"browser_eval"), "Missing browser_eval");
-        assert!(names.contains(&"browser_take_screenshot"), "Missing browser_take_screenshot");
-        assert!(names.contains(&"browser_recent_console_logs"), "Missing browser_recent_console_logs");
-        assert!(names.contains(&"browser_clear_console_logs"), "Missing browser_clear_console_logs");
+        assert!(
+            names.contains(&"browser_take_screenshot"),
+            "Missing browser_take_screenshot"
+        );
+        assert!(
+            names.contains(&"browser_recent_console_logs"),
+            "Missing browser_recent_console_logs"
+        );
+        assert!(
+            names.contains(&"browser_clear_console_logs"),
+            "Missing browser_clear_console_logs"
+        );
         assert!(names.contains(&"browser_resize"), "Missing browser_resize");
     }
 }

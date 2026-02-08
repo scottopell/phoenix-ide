@@ -284,6 +284,7 @@ where
             success: true,
             output,
             is_error: false,
+            display_data: None,
         };
 
         // Send SpawnAgentsComplete event (synchronously returned, not async)
@@ -478,6 +479,7 @@ where
                                 success: out.success,
                                 output: out.output,
                                 is_error: !out.success,
+                                display_data: out.display_data,
                             }
                         }
                         None => ToolResult::error(

@@ -765,9 +765,8 @@ fn validate_no_duplicate_persists(
 }
 
 impl ToolResult {
-    #[allow(clippy::unused_self)] // Method signature for future extension
     fn display_data(&self) -> Option<Value> {
-        None // Tool results don't have special display data by default
+        self.display_data.clone()
     }
 }
 

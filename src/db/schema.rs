@@ -126,6 +126,8 @@ pub struct ToolResult {
     pub output: String,
     #[serde(default)]
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_data: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -136,6 +138,7 @@ impl ToolResult {
             success: true,
             output,
             is_error: false,
+            display_data: None,
         }
     }
 
@@ -145,6 +148,7 @@ impl ToolResult {
             success: false,
             output: error,
             is_error: true,
+            display_data: None,
         }
     }
 
@@ -154,6 +158,22 @@ impl ToolResult {
             success: false,
             output: message.to_string(),
             is_error: false,
+            display_data: None,
+        }
+    }
+
+    /// Create a successful result with display data for UI rendering
+    pub fn success_with_display(
+        tool_use_id: String,
+        output: String,
+        display_data: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            tool_use_id,
+            success: true,
+            output,
+            is_error: false,
+            display_data,
         }
     }
 }
