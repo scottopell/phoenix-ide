@@ -2040,7 +2040,7 @@ html * {
 
 .refresh-btn:hover:not(:disabled) {
   background: var(--bg-hover);
-  border-color: var(--primary-color);
+  border-color: var(--accent-blue);
 }
 
 .refresh-btn:disabled {
@@ -2428,7 +2428,7 @@ html * {
 .file-browser-error button {
   margin-top: 8px;
   padding: 8px 16px;
-  background: var(--primary-color);
+  background: var(--accent-blue);
   color: white;
   border: none;
   border-radius: 6px;
@@ -2517,7 +2517,7 @@ html * {
   display: flex;
   align-items: center;
   gap: 4px;
-  background: var(--primary-color);
+  background: var(--accent-blue);
   color: white;
   border: none;
   padding: 6px 10px;
@@ -2582,7 +2582,7 @@ html * {
 .prose-reader-error button {
   margin-top: 8px;
   padding: 8px 16px;
-  background: var(--primary-color);
+  background: var(--accent-blue);
   color: white;
   border: none;
   border-radius: 6px;
@@ -2792,7 +2792,7 @@ html * {
 
 .prose-reader-annotation-input:focus {
   outline: none;
-  border-color: var(--primary-color);
+  border-color: var(--accent-blue);
 }
 
 .prose-reader-annotation-actions {
@@ -2818,7 +2818,7 @@ html * {
 }
 
 .prose-reader-annotation-actions button.primary {
-  background: var(--primary-color);
+  background: var(--accent-blue);
   border: none;
   color: white;
 }
@@ -2884,7 +2884,7 @@ html * {
 }
 
 .prose-reader-note-line {
-  background: var(--primary-color);
+  background: var(--accent-blue);
   color: white;
   border: none;
   padding: 2px 8px;
@@ -3040,7 +3040,7 @@ html * {
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  color: var(--primary-color);
+  color: var(--accent-blue);
   cursor: pointer;
   transition: background-color 0.15s, border-color 0.15s;
   font-size: 13px;
@@ -3048,7 +3048,7 @@ html * {
 
 .patch-file-link:hover {
   background-color: var(--bg-hover);
-  border-color: var(--primary-color);
+  border-color: var(--accent-blue);
 }
 
 .patch-file-icon {
@@ -3225,7 +3225,7 @@ html * {
 }
 
 .new-conv-send {
-  background: var(--primary-color);
+  background: var(--accent-blue);
   color: white;
   border: none;
   padding: 7px 14px;
