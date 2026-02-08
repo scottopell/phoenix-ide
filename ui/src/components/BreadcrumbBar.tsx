@@ -17,11 +17,7 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
   }, [breadcrumbs]);
 
   if (!visible || breadcrumbs.length === 0) {
-    return (
-      <nav id="breadcrumb-bar" ref={barRef}>
-        <div id="breadcrumb-trail"></div>
-      </nav>
-    );
+    return null;
   }
 
   return (
