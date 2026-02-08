@@ -26,7 +26,7 @@ export function ConversationPage() {
   const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [_contextWindowUsed, setContextWindowUsed] = useState(0);
-  const [initialLoadComplete, setInitialLoadComplete] = useState(false);
+  const [_initialLoadComplete, setInitialLoadComplete] = useState(false);
   
   // File browser and prose reader state
   const [showFileBrowser, setShowFileBrowser] = useState(false);
