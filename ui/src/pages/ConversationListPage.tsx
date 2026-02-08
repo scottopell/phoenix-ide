@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { enhancedApi } from '../enhancedApi';
+import { api } from '../api';
 import type { Conversation } from '../api';
+import { cacheDB } from '../cache';
 import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
@@ -22,11 +23,8 @@ export function ConversationListPage() {
   const scrollRestoredRef = useRef(false);
 
   // App state for offline/sync status
-  const { isOnline, isReady, hasError, showSyncStatus, syncProgress, pendingOpsCount } = useAppMachine();
+  const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
   const { toasts, dismissToast, showWarning, showError } = useToast();
-
-  // Track if we've started loading to avoid double-loads
-  const loadStartedRef = useRef(false);
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
@@ -55,75 +53,58 @@ export function ConversationListPage() {
     };
   }, [showWarning, showError]);
 
-  const loadConversations = useCallback(async (forceFresh = false) => {
+  // Load conversations: cache first, then network
+  const loadConversations = useCallback(async () => {
     try {
-      const [activeResult, archivedResult] = await Promise.all([
-        enhancedApi.listConversations({ forceFresh }),
-        enhancedApi.listArchivedConversations({ forceFresh }),
-      ]);
-      
-      setConversations(activeResult.data);
-      setArchivedConversations(archivedResult.data);
-      
-      // Update last updated time based on freshest data
-      if (activeResult.source === 'network' || archivedResult.source === 'network') {
-        setLastUpdated(new Date());
+      // Step 1: Show cached data immediately
+      const cached = await cacheDB.getAllConversations();
+      const cachedActive = cached.filter(c => !c.archived);
+      const cachedArchived = cached.filter(c => c.archived);
+      if (cachedActive.length > 0 || cachedArchived.length > 0) {
+        setConversations(cachedActive);
+        setArchivedConversations(cachedArchived);
+        setLoading(false);
       }
-      
-      // Log cache hit/miss for debugging
-      console.log(`Loaded conversations - Active: ${activeResult.source} (stale: ${activeResult.stale}), Archived: ${archivedResult.source} (stale: ${archivedResult.stale})`);
+
+      // Step 2: Fetch fresh if online
+      if (navigator.onLine) {
+        try {
+          const [freshActive, freshArchived] = await Promise.all([
+            api.listConversations(),
+            api.listArchivedConversations()
+          ]);
+          setConversations(freshActive);
+          setArchivedConversations(freshArchived);
+          setLastUpdated(new Date());
+          
+          // Update cache
+          await cacheDB.putConversations([...freshActive, ...freshArchived]);
+        } catch (err) {
+          console.error('Failed to fetch fresh conversations:', err);
+          // Network failed, cached data still showing (if any)
+          if (cachedActive.length === 0 && cachedArchived.length === 0) {
+            showError('Failed to load conversations. Please check your connection.', 5000);
+          }
+        }
+      }
     } catch (err) {
       console.error('Failed to load conversations:', err);
-      // Even on error, try to show cached data
-      try {
-        const [activeCached, archivedCached] = await Promise.all([
-          enhancedApi.listConversations({ forceFresh: false }),
-          enhancedApi.listArchivedConversations({ forceFresh: false }),
-        ]);
-        // Always set the state, even if empty - this prevents stuck loading state
-        setConversations(activeCached.data);
-        setArchivedConversations(archivedCached.data);
-      } catch (cacheErr) {
-        console.error('Failed to load from cache:', cacheErr);
-        // Set empty arrays to show "no conversations" instead of infinite loading
-        setConversations([]);
-        setArchivedConversations([]);
-        showError('Failed to load conversations. Please try refreshing.', 5000);
-      }
+      showError('Failed to load conversations.', 5000);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [showError]);
 
-  // Initial load - use cached data for instant display
-  // Also handle error state and add timeout fallback
+  // Initial load when cache is ready
   useEffect(() => {
-    if (loadStartedRef.current) return;
-    
-    if (isReady || hasError) {
-      // Cache is ready (or failed), load conversations
-      loadStartedRef.current = true;
-      loadConversations(false);
+    if (isReady) {
+      loadConversations();
     }
-  }, [loadConversations, isReady, hasError]);
-
-  // Timeout fallback - if cache init takes too long, load anyway
-  useEffect(() => {
-    const timeout = setTimeout(() => {
-      if (!loadStartedRef.current && loading) {
-        console.warn('Cache init timeout, loading conversations without cache');
-        loadStartedRef.current = true;
-        loadConversations(true); // Force fresh since cache isn't ready
-      }
-    }, 2000); // 2 second timeout
-
-    return () => clearTimeout(timeout);
-  }, [loading, loadConversations]);
+  }, [isReady, loadConversations]);
 
   // Restore scroll position after data loads
   useEffect(() => {
     if (!loading && !scrollRestoredRef.current && conversations.length > 0) {
-      // Get scroll position from cache
       const savedPosition = sessionStorage.getItem('conversationListScrollPosition');
       if (savedPosition) {
         window.scrollTo(0, parseInt(savedPosition, 10));
@@ -146,10 +127,9 @@ export function ConversationListPage() {
   const handleArchive = async (conv: Conversation) => {
     try {
       if (isOnline) {
-        await enhancedApi.archiveConversation(conv.id);
+        await api.archiveConversation(conv.id);
+        await loadConversations();
       } else {
-        // Queue for later
-        const { queueOperation } = useAppMachine();
         await queueOperation({
           type: 'archive',
           conversationId: conv.id,
@@ -158,8 +138,10 @@ export function ConversationListPage() {
           retryCount: 0,
           status: 'pending'
         });
+        // Optimistically update UI
+        setConversations(prev => prev.filter(c => c.id !== conv.id));
+        setArchivedConversations(prev => [...prev, { ...conv, archived: true }]);
       }
-      await loadConversations(true);
     } catch (err) {
       console.error('Failed to archive:', err);
     }
@@ -168,10 +150,9 @@ export function ConversationListPage() {
   const handleUnarchive = async (conv: Conversation) => {
     try {
       if (isOnline) {
-        await enhancedApi.unarchiveConversation(conv.id);
+        await api.unarchiveConversation(conv.id);
+        await loadConversations();
       } else {
-        // Queue for later
-        const { queueOperation } = useAppMachine();
         await queueOperation({
           type: 'unarchive',
           conversationId: conv.id,
@@ -180,8 +161,10 @@ export function ConversationListPage() {
           retryCount: 0,
           status: 'pending'
         });
+        // Optimistically update UI
+        setArchivedConversations(prev => prev.filter(c => c.id !== conv.id));
+        setConversations(prev => [...prev, { ...conv, archived: false }]);
       }
-      await loadConversations(true);
     } catch (err) {
       console.error('Failed to unarchive:', err);
     }
@@ -190,9 +173,9 @@ export function ConversationListPage() {
   const handleDelete = async () => {
     if (!deleteTarget) return;
     try {
-      await enhancedApi.deleteConversation(deleteTarget.id);
+      await api.deleteConversation(deleteTarget.id);
       setDeleteTarget(null);
-      await loadConversations(true);
+      await loadConversations();
     } catch (err) {
       console.error('Failed to delete:', err);
     }
@@ -201,10 +184,10 @@ export function ConversationListPage() {
   const handleRename = async (newName: string) => {
     if (!renameTarget) return;
     try {
-      await enhancedApi.renameConversation(renameTarget.id, newName);
+      await api.renameConversation(renameTarget.id, newName);
       setRenameTarget(null);
       setRenameError(undefined);
-      await loadConversations(true);
+      await loadConversations();
     } catch (err) {
       setRenameError(err instanceof Error ? err.message : 'Failed to rename');
     }
@@ -222,6 +205,20 @@ export function ConversationListPage() {
     return `Updated ${hours} hours ago`;
   };
 
+  // Show error UI if IndexedDB init failed
+  if (initError) {
+    return (
+      <div id="app" className="list-page">
+        <div className="init-error">
+          <h2>⚠️ Storage Error</h2>
+          <p>Failed to initialize local storage: {initError}</p>
+          <p>Please try refreshing the page. If the problem persists, try clearing your browser data for this site.</p>
+          <button onClick={() => window.location.reload()}>Refresh Page</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div id="app" className="list-page">
       <Toast messages={toasts} onDismiss={dismissToast} />
@@ -232,12 +229,6 @@ export function ConversationListPage() {
               <span className="offline-icon">⚡</span>
               Offline Mode
               {pendingOpsCount > 0 && ` (${pendingOpsCount} pending)`}
-            </div>
-          )}
-          {showSyncStatus && syncProgress !== null && (
-            <div className="sync-banner">
-              <span className="sync-icon">🔄</span>
-              Syncing... {syncProgress}%
             </div>
           )}
         </div>
@@ -263,7 +254,7 @@ export function ConversationListPage() {
                 {getLastUpdatedText()}
                 <button 
                   className="refresh-btn"
-                  onClick={() => loadConversations(true)}
+                  onClick={() => loadConversations()}
                   disabled={!isOnline}
                 >
                   ↻

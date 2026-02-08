@@ -1,19 +1,10 @@
 // Phoenix IDE Cache Layer using IndexedDB
+// Simplified: Pure get/put storage, no TTL or staleness logic
 
 import type { Conversation, Message } from './api';
 
 const DB_NAME = 'phoenix-ide-cache';
 const DB_VERSION = 1;
-
-export interface CacheMeta {
-  timestamp: number;
-  etag?: string;
-  scrollPosition?: number;
-}
-
-export interface CachedConversation extends Conversation {
-  _meta: CacheMeta;
-}
 
 export interface PendingOperation {
   id: string;
@@ -71,17 +62,12 @@ export class CacheDB {
           opsStore.createIndex('by-created', 'createdAt');
           opsStore.createIndex('by-conversation', 'conversationId');
         }
-
-        // Cache metadata
-        if (!db.objectStoreNames.contains('cacheMeta')) {
-          db.createObjectStore('cacheMeta', { keyPath: 'key' });
-        }
       };
     });
   }
 
-  // Conversations
-  async getConversation(id: string): Promise<CachedConversation | null> {
+  // Conversations - simple get/put
+  async getConversation(id: string): Promise<Conversation | null> {
     await this.init();
     const tx = this.db!.transaction(['conversations'], 'readonly');
     const store = tx.objectStore('conversations');
@@ -92,7 +78,7 @@ export class CacheDB {
     });
   }
 
-  async getConversationBySlug(slug: string): Promise<CachedConversation | null> {
+  async getConversationBySlug(slug: string): Promise<Conversation | null> {
     await this.init();
     const tx = this.db!.transaction(['conversations'], 'readonly');
     const store = tx.objectStore('conversations');
@@ -104,7 +90,7 @@ export class CacheDB {
     });
   }
 
-  async getAllConversations(): Promise<CachedConversation[]> {
+  async getAllConversations(): Promise<Conversation[]> {
     await this.init();
     const tx = this.db!.transaction(['conversations'], 'readonly');
     const store = tx.objectStore('conversations');
@@ -115,21 +101,20 @@ export class CacheDB {
     });
   }
 
-  async putConversation(conversation: Conversation, meta?: Partial<CacheMeta>): Promise<void> {
+  async putConversation(conversation: Conversation): Promise<void> {
     await this.init();
-    const existing = await this.getConversation(conversation.id);
-    const cached: CachedConversation = {
-      ...conversation,
-      _meta: {
-        timestamp: Date.now(),
-        ...(existing?._meta || {}),
-        ...meta
-      }
-    };
-
     const tx = this.db!.transaction(['conversations'], 'readwrite');
     const store = tx.objectStore('conversations');
-    store.put(cached);
+    store.put(conversation);
+  }
+
+  async putConversations(conversations: Conversation[]): Promise<void> {
+    await this.init();
+    const tx = this.db!.transaction(['conversations'], 'readwrite');
+    const store = tx.objectStore('conversations');
+    for (const conversation of conversations) {
+      store.put(conversation);
+    }
   }
 
   async deleteConversation(id: string): Promise<void> {
@@ -154,10 +139,8 @@ export class CacheDB {
     };
   }
 
-  // Messages
-  // Messages - Optimized with getAll instead of cursor
-  async getMessages(conversationId: string, afterSequence?: number): Promise<Message[]> {
-    const start = performance.now();
+  // Messages - simple get/put
+  async getMessages(conversationId: string): Promise<Message[]> {
     await this.init();
     const tx = this.db!.transaction(['messages'], 'readonly');
     const store = tx.objectStore('messages');
@@ -168,33 +151,27 @@ export class CacheDB {
       const request = index.getAll(range);
       
       request.onsuccess = () => {
-        let messages = request.result || [];
-        
-        // Filter by sequence if needed
-        if (afterSequence) {
-          messages = messages.filter((msg: Message) => msg.sequence_id > afterSequence);
-        }
-        
+        const messages = request.result || [];
         // Sort by sequence
         messages.sort((a: Message, b: Message) => a.sequence_id - b.sequence_id);
-        
-        const duration = performance.now() - start;
-        console.log(`[IndexedDB] getMessages (optimized) took ${duration.toFixed(1)}ms for ${messages.length} messages`);
         resolve(messages);
       };
       
-      request.onerror = () => {
-        console.error('[IndexedDB] getMessages error');
-        resolve([]);
-      };
+      request.onerror = () => resolve([]);
     });
+  }
+
+  async putMessage(message: Message): Promise<void> {
+    await this.init();
+    const tx = this.db!.transaction(['messages'], 'readwrite');
+    const store = tx.objectStore('messages');
+    store.put(message);
   }
 
   async putMessages(messages: Message[]): Promise<void> {
     await this.init();
     const tx = this.db!.transaction(['messages'], 'readwrite');
     const store = tx.objectStore('messages');
-    
     for (const message of messages) {
       store.put(message);
     }
@@ -253,25 +230,6 @@ export class CacheDB {
     const tx = this.db!.transaction(['pendingOps'], 'readwrite');
     const store = tx.objectStore('pendingOps');
     store.delete(id);
-  }
-
-  // Cache metadata (for storing global state like last sync time)
-  async getMeta(key: string): Promise<any> {
-    await this.init();
-    const tx = this.db!.transaction(['cacheMeta'], 'readonly');
-    const store = tx.objectStore('cacheMeta');
-    return new Promise((resolve) => {
-      const request = store.get(key);
-      request.onsuccess = () => resolve(request.result?.value);
-      request.onerror = () => resolve(null);
-    });
-  }
-
-  async setMeta(key: string, value: any): Promise<void> {
-    await this.init();
-    const tx = this.db!.transaction(['cacheMeta'], 'readwrite');
-    const store = tx.objectStore('cacheMeta');
-    store.put({ key, value });
   }
 
   // Storage management

@@ -1,13 +1,13 @@
 // Sync queue for handling offline operations
 
-import { enhancedApi } from './enhancedApi';
+import { api } from './api';
 import type { PendingOperation } from './cache';
 
 export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
     switch (op.type) {
       case 'send_message':
-        await enhancedApi.sendMessage(
+        await api.sendMessage(
           op.conversationId,
           op.payload.text,
           op.payload.images || [],
@@ -16,19 +16,19 @@ export class SyncQueue {
         break;
       
       case 'archive':
-        await enhancedApi.archiveConversation(op.conversationId);
+        await api.archiveConversation(op.conversationId);
         break;
       
       case 'unarchive':
-        await enhancedApi.unarchiveConversation(op.conversationId);
+        await api.unarchiveConversation(op.conversationId);
         break;
       
       case 'delete':
-        await enhancedApi.deleteConversation(op.conversationId);
+        await api.deleteConversation(op.conversationId);
         break;
       
       case 'rename':
-        await enhancedApi.renameConversation(
+        await api.renameConversation(
           op.conversationId,
           op.payload.name
         );
@@ -41,12 +41,10 @@ export class SyncQueue {
   
   isRetryableError(error: unknown): boolean {
     if (error instanceof TypeError && error.message.includes('fetch')) {
-      // Network errors
       return true;
     }
     
     if (error instanceof Error) {
-      // Look for common retryable patterns
       const message = error.message.toLowerCase();
       if (
         message.includes('network') ||

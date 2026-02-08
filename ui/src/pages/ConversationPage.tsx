@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { enhancedApi } from '../enhancedApi';
-import { Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
-// Header removed - navigation and status moved to input area
+import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
+import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { VirtualizedMessageList } from '../components/VirtualizedMessageList';
 import { InputArea } from '../components/InputArea';
@@ -28,9 +27,8 @@ export function ConversationPage() {
   const [error, setError] = useState<string | null>(null);
   const [_contextWindowUsed, setContextWindowUsed] = useState(0);
   const [initialLoadComplete, setInitialLoadComplete] = useState(false);
-  const [lastDataSource, setLastDataSource] = useState<'memory' | 'indexeddb' | 'network' | null>(null);
   
-  // File browser and prose reader state (REQ-PF-001 through REQ-PF-014)
+  // File browser and prose reader state
   const [showFileBrowser, setShowFileBrowser] = useState(false);
   const [proseReaderFile, setProseReaderFile] = useState<{
     path: string;
@@ -41,10 +39,10 @@ export function ConversationPage() {
     };
   } | null>(null);
 
-  const sendingMessagesRef = useRef<Set<string>>(new Set()); // Track localIds being sent
+  const sendingMessagesRef = useRef<Set<string>>(new Set());
 
   // App state for offline support
-  const { isOnline, queueOperation, showSyncStatus: _showSyncStatus } = useAppMachine();
+  const { isOnline, queueOperation } = useAppMachine();
 
   // Draft management
   const [draft, setDraft, clearDraft] = useDraft(conversationId);
@@ -112,11 +110,9 @@ export function ConversationPage() {
           setConversation(initData.conversation);
           
           // On reconnection, we request ?after=lastSeqId and get only NEW messages.
-          // If we already have messages, append new ones; otherwise replace.
           const newMessages = initData.messages || [];
           setMessages((prev) => {
             if (prev.length === 0) {
-              // First connection - use server's full list
               return newMessages;
             }
             // Reconnection - append new messages, deduplicating by sequence_id
@@ -134,6 +130,14 @@ export function ConversationPage() {
             setContextWindowUsed(initData.context_window_size);
           }
           updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
+          
+          // Update cache with fresh data from SSE
+          if (initData.conversation) {
+            cacheDB.putConversation(initData.conversation);
+          }
+          if (newMessages.length > 0) {
+            cacheDB.putMessages(newMessages);
+          }
           break;
         }
 
@@ -142,13 +146,14 @@ export function ConversationPage() {
           const msg = msgData.message;
           if (msg) {
             setMessages((prev) => {
-              // Deduplicate by sequence_id
               if (prev.some(m => m.sequence_id === msg.sequence_id)) {
                 return prev;
               }
               return [...prev, msg];
             });
-            // Update context window usage from message usage data
+            // Update cache with new message
+            cacheDB.putMessage(msg);
+            
             if (msg.usage_data) {
               const usage = msg.usage_data;
               const msgTokens = (usage.input_tokens || 0) + (usage.output_tokens || 0) +
@@ -157,7 +162,6 @@ export function ConversationPage() {
                 setContextWindowUsed(prev => prev + msgTokens);
               }
             }
-            // New user message = new turn, reset breadcrumbs
             if (msg.message_type === 'user' || msg.type === 'user') {
               setBreadcrumbs([{ type: 'user', label: 'User' }]);
             }
@@ -183,7 +187,6 @@ export function ConversationPage() {
           break;
 
         case 'disconnected':
-          // Connection hook handles reconnection, no action needed here
           break;
       }
     },
@@ -200,11 +203,9 @@ export function ConversationPage() {
   useEffect(() => {
     if (!conversationId) return;
     
-    console.log('[ConversationPage] Deferring SSE connection...');
     const timer = setTimeout(() => {
-      console.log('[ConversationPage] Starting SSE connection');
       setConversationIdForSSE(conversationId);
-    }, 100); // Small delay to let UI render first
+    }, 100);
     
     return () => {
       clearTimeout(timer);
@@ -215,7 +216,7 @@ export function ConversationPage() {
   const isOffline = connectionInfo.state === 'offline' || connectionInfo.state === 'reconnecting';
   const isConnected = connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
 
-  // Load conversation by slug (just to get the ID)
+  // Load conversation by slug: cache first, then SSE provides fresh data
   useEffect(() => {
     if (!slug) {
       navigate('/');
@@ -227,39 +228,52 @@ export function ConversationPage() {
     setConversation(null);
     setMessages([]);
     setError(null);
+    setInitialLoadComplete(false);
 
     let cancelled = false;
 
     const loadConversation = async () => {
-      console.log(`[ConversationPage] Starting to load conversation: ${slug}`);
-      const loadStart = Date.now();
-      
       try {
-        // First, try to load from cache for instant display
-        const cachedResult = await enhancedApi.getConversationBySlug(slug, { forceFresh: false });
-        const loadDuration = Date.now() - loadStart;
-        console.log(`[ConversationPage] Load completed in ${loadDuration}ms from ${cachedResult.source}`);
-        
-        if (!cancelled && cachedResult.data) {
-          setConversation(cachedResult.data.conversation);
-          setMessages(cachedResult.data.messages);
-          setAgentWorking(cachedResult.data.agent_working);
-          setContextWindowUsed(cachedResult.data.context_window_size || 0);
-          setLastDataSource(cachedResult.source);
+        // Step 1: Show cached data immediately
+        const cached = await cacheDB.getConversationBySlug(slug);
+        if (cached && !cancelled) {
+          setConversation(cached);
+          const cachedMessages = await cacheDB.getMessages(cached.id);
+          setMessages(cachedMessages);
           setInitialLoadComplete(true);
-          
-          // Set conversation ID for hooks - this triggers the SSE connection
-          setConversationId(cachedResult.data.conversation.id);
-          
-          // If data was stale, it will auto-refresh in background
-          if (cachedResult.stale) {
-            console.log(`Loaded stale ${cachedResult.source} data, background refresh triggered`);
+          setConversationId(cached.id); // Triggers SSE connection
+          return;
+        }
+
+        // Step 2: No cache, fetch from network
+        if (navigator.onLine && !cancelled) {
+          try {
+            const result = await api.getConversationBySlug(slug);
+            if (!cancelled) {
+              setConversation(result.conversation);
+              setMessages(result.messages);
+              setAgentWorking(result.agent_working);
+              setContextWindowUsed(result.context_window_size || 0);
+              setConversationId(result.conversation.id);
+              setInitialLoadComplete(true);
+              
+              // Cache it
+              await cacheDB.putConversation(result.conversation);
+              await cacheDB.putMessages(result.messages);
+            }
+          } catch (err) {
+            if (!cancelled) {
+              setError(err instanceof Error ? err.message : 'Failed to load conversation');
+            }
           }
+        } else if (!cancelled) {
+          setError('Conversation not found in cache and offline');
         }
       } catch (err) {
-        if (cancelled) return;
-        console.error('Failed to load conversation:', err);
-        setError(err instanceof Error ? err.message : 'Failed to load conversation');
+        if (!cancelled) {
+          console.error('Failed to load conversation:', err);
+          setError(err instanceof Error ? err.message : 'Failed to load conversation');
+        }
       }
     };
 
@@ -276,21 +290,19 @@ export function ConversationPage() {
   useEffect(() => { markSentRef.current = markSent; }, [markSent]);
   useEffect(() => { markFailedRef.current = markFailed; }, [markFailed]);
 
-  // Send a message (either new or retry)
+  // Send a message
   const sendMessage = useCallback(async (localId: string, text: string, images: { data: string; media_type: string }[] = []) => {
     if (!conversationId) return;
 
-    // Mark as being sent
     sendingMessagesRef.current.add(localId);
 
     try {
       if (isOnline) {
-        await enhancedApi.sendMessage(conversationId, text, images, localId);
+        await api.sendMessage(conversationId, text, images, localId);
         markSentRef.current(localId);
         setAgentWorking(true);
         setBreadcrumbs([{ type: 'user', label: 'User' }]);
       } else {
-        // Queue for offline sync
         await queueOperation({
           type: 'send_message',
           conversationId,
@@ -300,7 +312,6 @@ export function ConversationPage() {
           status: 'pending'
         });
         markSentRef.current(localId);
-        // Show offline indicator instead of agent working
         setAgentWorking(false);
       }
     } catch (err) {
@@ -309,9 +320,8 @@ export function ConversationPage() {
     } finally {
       sendingMessagesRef.current.delete(localId);
     }
-  }, [conversationId, isOnline, queueOperation]); // Added isOnline and queueOperation
+  }, [conversationId, isOnline, queueOperation]);
 
-  // Stable ref to sendMessage for effect
   const sendMessageRef = useRef(sendMessage);
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
@@ -326,27 +336,21 @@ export function ConversationPage() {
     for (const msg of pending) {
       sendMessageRef.current(msg.localId, msg.text, msg.images);
     }
-  }, [isConnected, conversationId, queuedMessages]); // sendMessage accessed via ref
+  }, [isConnected, conversationId, queuedMessages]);
 
-  // Handle send from input
   const handleSend = (text: string, attachedImages: ImageData[]) => {
     if (!conversationId) return;
 
-    // Clear draft and images
     clearDraft();
     setImages([]);
 
-    // Enqueue the message (shows immediately with sending state)
     const msg = enqueue(text, attachedImages);
 
-    // If we're connected, send immediately
     if (isConnected) {
       sendMessage(msg.localId, text, attachedImages);
     }
-    // If offline, message will be sent when connection is restored (via useEffect above)
   };
 
-  // Handle retry
   const handleRetry = (localId: string) => {
     const msg = queuedMessages.find(m => m.localId === localId);
     if (!msg) return;
@@ -358,19 +362,17 @@ export function ConversationPage() {
     }
   };
 
-  // Cancel operation
   const handleCancel = async () => {
     if (!conversationId || !agentWorking) return;
     if (convState.startsWith('cancelling')) return;
 
     try {
-      await enhancedApi.cancelConversation(conversationId);
+      await api.cancelConversation(conversationId);
     } catch (err) {
       console.error('Failed to cancel:', err);
     }
   };
 
-  // File browser handlers (REQ-PF-001 through REQ-PF-004)
   const handleOpenFileBrowser = useCallback(() => {
     setShowFileBrowser(true);
   }, []);
@@ -380,13 +382,11 @@ export function ConversationPage() {
     setProseReaderFile({ path: filePath, rootDir });
   }, []);
 
-  // Prose reader handlers (REQ-PF-005 through REQ-PF-014)
   const handleCloseProseReader = useCallback(() => {
     setProseReaderFile(null);
   }, []);
 
   const handleSendNotes = useCallback((formattedNotes: string) => {
-    // Inject notes into the draft (REQ-PF-009)
     if (draft.trim()) {
       setDraft(draft + '\n\n' + formattedNotes);
     } else {
@@ -395,9 +395,7 @@ export function ConversationPage() {
     setProseReaderFile(null);
   }, [draft, setDraft]);
 
-  // Open file from patch output (REQ-PF-014)
   const handleOpenFileFromPatch = useCallback((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
-    // Resolve the file path against the conversation's cwd
     const rootDir = conversation?.cwd || '/';
     const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
     setProseReaderFile({
@@ -442,13 +440,6 @@ export function ConversationPage() {
 
   return (
     <div id="app">
-      {/* Data source indicator for debugging - only in development */}
-      {import.meta.env.DEV && lastDataSource && initialLoadComplete && (
-        <div className="data-source-indicator">
-          Loaded from: {lastDataSource}
-        </div>
-      )}
-      {/* Use virtualized list for large conversations */}
       {messages.length > 50 ? (
         <VirtualizedMessageList
           messages={messages}
@@ -487,7 +478,6 @@ export function ConversationPage() {
         stateData={stateData}
       />
 
-      {/* File Browser (REQ-PF-001 through REQ-PF-004) */}
       <FileBrowser
         isOpen={showFileBrowser}
         rootPath={conversation.cwd}
@@ -496,7 +486,6 @@ export function ConversationPage() {
         onFileSelect={handleFileSelect}
       />
 
-      {/* Prose Reader (REQ-PF-005 through REQ-PF-013) */}
       {proseReaderFile && (
         <ProseReader
           filePath={proseReaderFile.path}

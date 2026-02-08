@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { enhancedApi } from '../enhancedApi';
+import { api } from '../api';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from '../components/VoiceInput';
 import type { ModelsResponse, ImageData } from '../api';
@@ -46,7 +46,7 @@ export function NewConversationPage() {
 
   // Load models
   useEffect(() => {
-    enhancedApi.listModels().then(modelsData => {
+    api.listModels().then(modelsData => {
       setModels(modelsData);
       if (!selectedModel) setSelectedModel(modelsData.default);
     }).catch(console.error);
@@ -63,13 +63,13 @@ export function NewConversationPage() {
     setDirStatus('checking');
     const timeoutId = setTimeout(async () => {
       try {
-        const validation = await enhancedApi.validateCwd(trimmed);
+        const validation = await api.validateCwd(trimmed);
         if (validation.valid) {
           setDirStatus('exists');
         } else {
           // Check if parent exists (can create)
           const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-          const parentValidation = await enhancedApi.validateCwd(parentPath);
+          const parentValidation = await api.validateCwd(parentPath);
           setDirStatus(parentValidation.valid ? 'will-create' : 'invalid');
         }
       } catch {
@@ -139,7 +139,7 @@ export function NewConversationPage() {
     try {
       // Create directory if needed
       if (dirStatus === 'will-create') {
-        const mkdirResult = await enhancedApi.mkdir(cwd.trim());
+        const mkdirResult = await api.mkdir(cwd.trim());
         if (!mkdirResult.created) {
           setError(mkdirResult.error || 'Failed to create directory');
           setCreating(false);
@@ -148,7 +148,7 @@ export function NewConversationPage() {
       }
 
       const messageId = crypto.randomUUID();
-      const conv = await enhancedApi.createConversation(
+      const conv = await api.createConversation(
         cwd.trim(), trimmed, messageId, selectedModel || undefined, images
       );
       navigate(`/c/${conv.slug}`);
