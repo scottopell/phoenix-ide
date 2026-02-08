@@ -1,7 +1,7 @@
 ---
 created: 2026-02-08
 priority: p2
-status: ready
+status: done
 ---
 
 # Breadcrumb Subagent Support (Stub)
