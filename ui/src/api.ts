@@ -72,12 +72,19 @@ export interface UsageData {
   cache_read_input_tokens?: number;
 }
 
+export interface SseBreadcrumb {
+  type: 'user' | 'llm' | 'tool' | 'subagents';
+  label: string;
+  tool_id?: string;
+}
+
 export interface SseInitData {
   conversation: Conversation;
   messages: Message[];
   agent_working: boolean;
   last_sequence_id: number;
   context_window_size?: number;
+  breadcrumbs?: SseBreadcrumb[];
 }
 
 export interface SseMessageData {

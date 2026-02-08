@@ -11,8 +11,10 @@ use super::types::{
     ReadFileResponse, RenameRequest, SuccessResponse, ValidateCwdResponse,
 };
 use super::AppState;
-use crate::db::ImageData;
+use crate::db::{ImageData, Message, MessageContent, MessageType};
+use crate::llm::ContentBlock;
 use crate::runtime::SseEvent;
+use serde::Serialize;
 use crate::state_machine::Event;
 use axum::{
     extract::{Path, Query, State},
@@ -299,6 +301,64 @@ struct StreamQuery {
     after: Option<i64>,
 }
 
+/// Breadcrumb for showing LLM thought process trail
+#[derive(Debug, Clone, Serialize)]
+pub struct Breadcrumb {
+    #[serde(rename = "type")]
+    pub crumb_type: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+}
+
+/// Extract breadcrumbs from the last turn in message history
+/// A "turn" starts with the last user message and includes all subsequent agent/tool messages
+fn extract_breadcrumbs(messages: &[Message]) -> Vec<Breadcrumb> {
+    // Find the last user message index
+    let last_user_idx = messages
+        .iter()
+        .rposition(|m| m.message_type == MessageType::User);
+
+    let Some(start_idx) = last_user_idx else {
+        return vec![];
+    };
+
+    let mut breadcrumbs = vec![Breadcrumb {
+        crumb_type: "user".to_string(),
+        label: "User".to_string(),
+        tool_id: None,
+    }];
+
+    // Process messages after the last user message
+    for msg in messages.iter().skip(start_idx + 1) {
+        if let MessageContent::Agent(blocks) = &msg.content {
+            // Check for tool_use blocks
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    breadcrumbs.push(Breadcrumb {
+                        crumb_type: "tool".to_string(),
+                        label: name.clone(),
+                        tool_id: Some(id.clone()),
+                    });
+                }
+            }
+            // Add LLM breadcrumb if there's text content (final response)
+            if blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })) {
+                // Only add LLM if it's not already the last crumb
+                if !breadcrumbs.last().is_some_and(|b| b.crumb_type == "llm") {
+                    breadcrumbs.push(Breadcrumb {
+                        crumb_type: "llm".to_string(),
+                        label: "LLM".to_string(),
+                        tool_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    breadcrumbs
+}
+
 async fn stream_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -331,6 +391,13 @@ async fn stream_conversation(
         .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
         .collect();
 
+    // Extract breadcrumbs from the last turn
+    let breadcrumbs = extract_breadcrumbs(&messages);
+    let json_breadcrumbs: Vec<Value> = breadcrumbs
+        .iter()
+        .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
+        .collect();
+
     // Subscribe to updates
     let broadcast_rx = state
         .runtime
@@ -345,6 +412,7 @@ async fn stream_conversation(
         agent_working: conversation.is_agent_working(),
         last_sequence_id,
         context_window_size,
+        breadcrumbs: json_breadcrumbs,
     };
 
     Ok(sse_stream(init_event, broadcast_rx))

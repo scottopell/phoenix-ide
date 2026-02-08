@@ -131,7 +131,18 @@ export function ConversationPage() {
           if (initData.context_window_size !== undefined) {
             setContextWindowUsed(initData.context_window_size);
           }
-          updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
+          // Set breadcrumbs from server (reconstructed from message history)
+          if (initData.breadcrumbs && initData.breadcrumbs.length > 0) {
+            setBreadcrumbs(initData.breadcrumbs.map(b => ({
+              type: b.type,
+              label: b.label,
+              toolId: b.tool_id,
+            })));
+          }
+          // Also update from state if agent is still working
+          if (initData.agent_working) {
+            updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
+          }
           
           // Update cache with fresh data from SSE
           if (initData.conversation) {
