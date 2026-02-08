@@ -1,6 +1,5 @@
 import { useRef, useEffect, useCallback, useState, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { FolderOpen } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
 import type { QueuedMessage } from '../hooks';
 import type { ImageData } from '../api';
 import { ImageAttachments } from './ImageAttachments';
@@ -21,9 +20,6 @@ interface InputAreaProps {
   onCancel: () => void;
   onRetry: (localId: string) => void;
   onOpenFileBrowser?: () => void;
-  conversationSlug?: string;
-  convState?: string;
-  stateData?: { message?: string } | null;
 }
 
 
@@ -42,11 +38,7 @@ export function InputArea({
   onCancel,
   onRetry,
   onOpenFileBrowser,
-  conversationSlug,
-  convState,
-  stateData,
 }: InputAreaProps) {
-  const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const voiceSupported = isWebSpeechSupported();
@@ -162,44 +154,8 @@ export function InputArea({
   const hasContent = draft.trim().length > 0 || images.length > 0;
   const sendEnabled = (canSend || isOffline) && hasContent;
 
-  // Status indicator
-  const getStatusIndicator = () => {
-    if (isOffline) return { dot: 'offline', text: 'Offline' };
-    if (convState === 'error') {
-      // Extract a short error summary
-      const errorMsg = stateData?.message || 'Error occurred';
-      const shortError = errorMsg.includes('tokens')
-        ? 'Token limit exceeded'
-        : errorMsg.length > 50 
-          ? errorMsg.slice(0, 50) + '...'
-          : errorMsg;
-      return { dot: 'error', text: shortError };
-    }
-    if (agentWorking) return { dot: 'working', text: convState || 'Working...' };
-    return { dot: 'idle', text: 'Ready' };
-  };
-  const status = getStatusIndicator();
-
   return (
     <footer id="input-area">
-      {/* Navigation and status row */}
-      <div className="input-header">
-        <button 
-          className="back-btn" 
-          onClick={() => navigate('/')}
-          aria-label="Back to conversations"
-        >
-          ← Back
-        </button>
-        {conversationSlug && (
-          <span className="conv-title">{conversationSlug}</span>
-        )}
-        <div className="status-compact">
-          <span className={`dot ${status.dot}`} />
-          <span className="status-text">{status.text}</span>
-        </div>
-      </div>
-
       {failedMessages.length > 0 && (
         <div className="failed-messages">
           {failedMessages.map(msg => (

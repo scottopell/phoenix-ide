@@ -80,7 +80,7 @@ body {
   flex: 0 0 auto;
   height: var(--state-bar-height);
   background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-color);
+  border-top: 1px solid var(--border-color);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -201,12 +201,13 @@ body {
   flex: 0 0 auto;
   height: var(--breadcrumb-height);
   background: var(--bg-tertiary);
-  border-bottom: 1px solid var(--border-color);
+  border-top: 1px solid var(--border-color);
   overflow-x: auto;
   overflow-y: hidden;
   white-space: nowrap;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
+  padding: 0 12px;
 }
 
 #breadcrumb-bar::-webkit-scrollbar {

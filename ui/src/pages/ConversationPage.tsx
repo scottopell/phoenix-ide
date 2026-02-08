@@ -10,6 +10,8 @@ import { FileBrowser } from '../components/FileBrowser';
 import { ProseReader } from '../components/ProseReader';
 import { useDraft, useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
+import { StateBar } from '../components/StateBar';
+import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import type { Breadcrumb } from '../types';
 
 export function ConversationPage() {
@@ -22,11 +24,11 @@ export function ConversationPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [convState, setConvState] = useState('idle');
   const [stateData, setStateData] = useState<ConversationState | null>(null);
-  const [_breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
+  const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
   const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [_contextWindowUsed, setContextWindowUsed] = useState(0);
-  const [_initialLoadComplete, setInitialLoadComplete] = useState(false);
+  const [contextWindowUsed, setContextWindowUsed] = useState(0);
+
   
   // File browser and prose reader state
   const [showFileBrowser, setShowFileBrowser] = useState(false);
@@ -154,14 +156,6 @@ export function ConversationPage() {
             // Update cache with new message
             cacheDB.putMessage(msg);
             
-            if (msg.usage_data) {
-              const usage = msg.usage_data;
-              const msgTokens = (usage.input_tokens || 0) + (usage.output_tokens || 0) +
-                (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
-              if (msgTokens > 0) {
-                setContextWindowUsed(prev => prev + msgTokens);
-              }
-            }
             if (msg.message_type === 'user' || msg.type === 'user') {
               setBreadcrumbs([{ type: 'user', label: 'User' }]);
             }
@@ -228,7 +222,6 @@ export function ConversationPage() {
     setConversation(null);
     setMessages([]);
     setError(null);
-    setInitialLoadComplete(false);
 
     let cancelled = false;
 
@@ -240,7 +233,6 @@ export function ConversationPage() {
           setConversation(cached);
           const cachedMessages = await cacheDB.getMessages(cached.id);
           setMessages(cachedMessages);
-          setInitialLoadComplete(true);
           setConversationId(cached.id); // Triggers SSE connection
           return;
         }
@@ -255,7 +247,6 @@ export function ConversationPage() {
               setAgentWorking(result.agent_working);
               setContextWindowUsed(result.context_window_size || 0);
               setConversationId(result.conversation.id);
-              setInitialLoadComplete(true);
               
               // Cache it
               await cacheDB.putConversation(result.conversation);
@@ -473,9 +464,19 @@ export function ConversationPage() {
         onCancel={handleCancel}
         onRetry={handleRetry}
         onOpenFileBrowser={handleOpenFileBrowser}
-        conversationSlug={conversation.slug}
+      />
+      <BreadcrumbBar
+        breadcrumbs={breadcrumbs}
+        visible={agentWorking}
+      />
+      <StateBar
+        conversation={conversation}
         convState={convState}
         stateData={stateData}
+        connectionState={connectionInfo.state}
+        connectionAttempt={connectionInfo.attempt}
+        nextRetryIn={connectionInfo.nextRetryIn}
+        contextWindowUsed={contextWindowUsed}
       />
 
       <FileBrowser
