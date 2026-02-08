@@ -484,6 +484,7 @@ export function ConversationPage() {
         onOpenFileBrowser={handleOpenFileBrowser}
         conversationSlug={conversation.slug}
         convState={convState}
+        stateData={stateData}
       />
 
       {/* File Browser (REQ-PF-001 through REQ-PF-004) */}

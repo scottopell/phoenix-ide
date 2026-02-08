@@ -25,6 +25,7 @@ interface InputAreaProps {
   onOpenFileBrowser?: () => void;
   conversationSlug?: string;
   convState?: string;
+  stateData?: { message?: string } | null;
 }
 
 async function fileToBase64(file: File): Promise<ImageData> {
@@ -60,6 +61,7 @@ export function InputArea({
   onOpenFileBrowser,
   conversationSlug,
   convState,
+  stateData,
 }: InputAreaProps) {
   const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -192,6 +194,16 @@ export function InputArea({
   // Status indicator
   const getStatusIndicator = () => {
     if (isOffline) return { dot: 'offline', text: 'Offline' };
+    if (convState === 'error') {
+      // Extract a short error summary
+      const errorMsg = stateData?.message || 'Error occurred';
+      const shortError = errorMsg.includes('tokens')
+        ? 'Token limit exceeded'
+        : errorMsg.length > 50 
+          ? errorMsg.slice(0, 50) + '...'
+          : errorMsg;
+      return { dot: 'error', text: shortError };
+    }
     if (agentWorking) return { dot: 'working', text: convState || 'Working...' };
     return { dot: 'idle', text: 'Ready' };
   };
