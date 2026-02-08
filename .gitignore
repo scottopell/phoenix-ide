@@ -8,3 +8,7 @@ ui/node_modules
 ui/dist
 static/dist/
 static/dist/
+
+# Tools
+.claude/
+.playwright-mcp/
