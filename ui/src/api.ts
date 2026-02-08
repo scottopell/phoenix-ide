@@ -34,6 +34,7 @@ export interface Message {
   message_type: 'user' | 'agent' | 'tool';
   type?: string; // legacy
   content: MessageContent;
+  display_data?: ImageData | Record<string, unknown>; // For tool results with images (e.g., screenshots)
   usage_data?: UsageData;
   created_at: string;
 }

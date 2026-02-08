@@ -97,8 +97,15 @@ export function UserMessage({ message }: { message: Message }) {
       <div className="message-content">
         {escapeHtml(text)}
         {images.length > 0 && (
-          <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
-            [{images.length} image(s)]
+          <div className="message-images">
+            {images.map((img, idx) => (
+              <img
+                key={idx}
+                src={`data:${img.media_type};base64,${img.data}`}
+                alt={`Attachment ${idx + 1}`}
+                className="message-image"
+              />
+            ))}
           </div>
         )}
       </div>
@@ -133,8 +140,15 @@ export function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage
       <div className="message-content">
         {escapeHtml(message.text)}
         {message.images.length > 0 && (
-          <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 13 }}>
-            [{message.images.length} image(s)]
+          <div className="message-images">
+            {message.images.map((img, idx) => (
+              <img
+                key={idx}
+                src={`data:${img.media_type};base64,${img.data}`}
+                alt={`Attachment ${idx + 1}`}
+                className="message-image"
+              />
+            ))}
           </div>
         )}
       </div>
@@ -204,6 +218,20 @@ interface ToolUseBlockProps {
   onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
 }
 
+// Helper to parse image data from read_image tool result
+function parseImageResult(text: string): { media_type: string; data: string } | null {
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed.type === 'image' && parsed.media_type && parsed.data) {
+      return { media_type: parsed.media_type, data: parsed.data };
+    }
+  } catch {
+    // Not JSON or not an image result
+  }
+  return null;
+}
+
 export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
@@ -221,6 +249,20 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
   const resultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
   const isError = resultContent?.is_error || !!resultContent?.error;
   const resultLength = resultText.length;
+  
+  // Check if this is an image result
+  // First check display_data (preferred for browser_take_screenshot)
+  // Then fall back to parsing the result content (for read_image)
+  let imageResult: { media_type: string; data: string } | null = null;
+  if (result?.display_data) {
+    const dd = result.display_data as { type?: string; media_type?: string; data?: string };
+    if (dd.type === 'image' && dd.media_type && dd.data) {
+      imageResult = { media_type: dd.media_type, data: dd.data };
+    }
+  }
+  if (!imageResult && (name === 'read_image' || name === 'browser_take_screenshot')) {
+    imageResult = parseImageResult(resultText);
+  }
 
   // Determine if output should be auto-expanded
   const shouldAutoExpand = resultLength > 0 && resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
@@ -267,7 +309,16 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
       {/* Tool output - collapsible for long outputs */}
       {hasOutput && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
-          {isShortOutput ? (
+          {imageResult ? (
+            // Image result: render as image
+            <div className="tool-block-image-output">
+              <img
+                src={`data:${imageResult.media_type};base64,${imageResult.data}`}
+                alt="Tool result"
+                className="message-image"
+              />
+            </div>
+          ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">
               {displayResult || <span className="tool-empty">(empty)</span>}

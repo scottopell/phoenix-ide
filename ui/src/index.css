@@ -441,6 +441,38 @@ body {
   border-radius: 4px;
 }
 
+/* Images in messages */
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.message-image {
+  max-width: 100%;
+  max-height: 400px;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+}
+
+.message-image:hover {
+  border-color: var(--accent-color);
+}
+
+/* Image output in tool blocks */
+.tool-block-image-output {
+  padding: 8px;
+  background: var(--bg-secondary);
+}
+
+.tool-block-image-output .message-image {
+  display: block;
+  margin: 0 auto;
+}
+
 /* Tool Groups - visually pairs tool call with result */
 /* New tool block styles - input always visible, output collapsible */
 .tool-block {
