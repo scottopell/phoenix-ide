@@ -250,57 +250,64 @@ export function InputArea({
       
       <ImageAttachments images={images} onRemove={handleRemoveImage} />
       
-      <div id="input-container">
-        {onOpenFileBrowser && (
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={SUPPORTED_TYPES.join(',')}
+        multiple
+        onChange={handleFileChange}
+        style={{ display: 'none' }}
+      />
+      
+      {/* Full-width textarea */}
+      <textarea
+        ref={textareaRef}
+        id="message-input"
+        placeholder={isOffline ? 'Type a message (will send when back online)...' : 'Type a message...'}
+        rows={2}
+        value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          // Clear interim if user types manually
+          if (interimText) {
+            setInterimText('');
+            draftBeforeVoiceRef.current = '';
+          }
+        }}
+        onKeyDown={handleKeyDown}
+        onPaste={handlePaste}
+      />
+      
+      {/* Action row: icons left, send/cancel right */}
+      <div id="input-actions">
+        <div className="input-actions-left">
+          {onOpenFileBrowser && (
+            <button
+              className="file-browse-btn"
+              onClick={onOpenFileBrowser}
+              title="Browse files"
+              aria-label="Browse files"
+            >
+              <FolderOpen size={20} />
+            </button>
+          )}
           <button
-            className="file-browse-btn"
-            onClick={onOpenFileBrowser}
-            title="Browse files"
-            aria-label="Browse files"
+            className="attach-btn"
+            onClick={() => fileInputRef.current?.click()}
+            title="Attach image"
+            aria-label="Attach image"
           >
-            <FolderOpen size={20} />
+            📎
           </button>
-        )}
-        <button
-          className="attach-btn"
-          onClick={() => fileInputRef.current?.click()}
-          title="Attach image"
-          aria-label="Attach image"
-        >
-          📎
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept={SUPPORTED_TYPES.join(',')}
-          multiple
-          onChange={handleFileChange}
-          style={{ display: 'none' }}
-        />
-        {voiceSupported && (
-          <VoiceRecorder
-            onSpeech={handleVoiceFinal}
-            onInterim={handleVoiceInterim}
-            disabled={agentWorking}
-          />
-        )}
-        <textarea
-          ref={textareaRef}
-          id="message-input"
-          placeholder={isOffline ? 'Type a message (will send when back online)...' : 'Type a message...'}
-          rows={1}
-          value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            // Clear interim if user types manually
-            if (interimText) {
-              setInterimText('');
-              draftBeforeVoiceRef.current = '';
-            }
-          }}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-        />
+          {voiceSupported && (
+            <VoiceRecorder
+              onSpeech={handleVoiceFinal}
+              onInterim={handleVoiceInterim}
+              disabled={agentWorking}
+            />
+          )}
+        </div>
         {agentWorking ? (
           <button
             id="cancel-btn"
