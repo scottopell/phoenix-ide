@@ -27,7 +27,8 @@ async function fileToBase64(file: File): Promise<ImageData> {
 
 export function NewConversationPage() {
   const navigate = useNavigate();
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaDesktopRef = useRef<HTMLTextAreaElement>(null);
+  const textareaMobileRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '/home/exedev');
@@ -84,17 +85,25 @@ export function NewConversationPage() {
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  // Auto-resize textarea
+  // Auto-resize textareas
   useEffect(() => {
-    const ta = textareaRef.current;
-    if (ta) {
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
-    }
+    [textareaDesktopRef.current, textareaMobileRef.current].forEach(ta => {
+      if (ta) {
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+      }
+    });
   }, [draft]);
 
-  // Focus textarea on mount
-  useEffect(() => { textareaRef.current?.focus(); }, []);
+  // Focus appropriate textarea on mount (mobile vs desktop)
+  useEffect(() => {
+    const isMobile = window.innerWidth <= 768;
+    if (isMobile) {
+      textareaMobileRef.current?.focus();
+    } else {
+      textareaDesktopRef.current?.focus();
+    }
+  }, []);
 
   const addImages = async (files: File[]) => {
     const validFiles = files.filter(f => SUPPORTED_TYPES.includes(f.type) && f.size <= MAX_IMAGE_SIZE);
@@ -210,63 +219,22 @@ export function NewConversationPage() {
 
   return (
     <div className="new-conv-page">
+      {/* Hidden file input - shared by both desktop and mobile */}
+      <input ref={fileInputRef} type="file" accept={SUPPORTED_TYPES.join(',')} multiple onChange={handleFileChange} style={{ display: 'none' }} />
+      
       <header className="new-conv-header-minimal">
         <button className="back-link" onClick={() => navigate('/')}>← Back</button>
       </header>
 
-      <main className="new-conv-center">
-        <h1 className="new-conv-title">New conversation</h1>
-        
-        {error && <div className="new-conv-error">{error}</div>}
-
-        <div className="new-conv-input-box">
-          <ImageAttachments images={images} onRemove={(i) => setImages(images.filter((_, idx) => idx !== i))} />
+      {/* Main content area - settings visible on mobile */}
+      <main className="new-conv-main">
+        <div className="new-conv-content">
+          <h1 className="new-conv-title">New conversation</h1>
           
-          <textarea
-            ref={textareaRef}
-            className="new-conv-textarea"
-            placeholder="What would you like to work on?"
-            rows={3}
-            value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
-            onChange={(e) => {
-              setDraft(e.target.value);
-              if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
-            }}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            disabled={creating}
-          />
-          
-          <div className="new-conv-input-actions">
-            <div className="new-conv-input-left">
-              <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
-              <input ref={fileInputRef} type="file" accept={SUPPORTED_TYPES.join(',')} multiple onChange={handleFileChange} style={{ display: 'none' }} />
-              {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
-            </div>
-            <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
-              {buttonText}
-            </button>
-          </div>
-        </div>
+          {error && <div className="new-conv-error">{error}</div>}
 
-        {/* Settings row */}
-        <button className="settings-row" onClick={() => setShowSettings(!showSettings)}>
-          <span className="settings-item">
-            <span className="settings-label">dir</span>
-            <span className={`settings-status ${dirStatusClass}`}>{dirStatusIcon}</span>
-            <span className="settings-value">{cwdDisplay}</span>
-          </span>
-          <span className="settings-dot">·</span>
-          <span className="settings-item">
-            <span className="settings-label">model</span>
-            <span className="settings-value">{modelDisplay}</span>
-          </span>
-          <span className={`settings-caret ${showSettings ? 'open' : ''}`}>›</span>
-        </button>
-
-        {/* Expandable settings */}
-        <div className={`settings-panel ${showSettings ? 'open' : ''}`}>
-          <div className="settings-panel-inner">
+          {/* Settings card - always visible on mobile, collapsible on desktop */}
+          <div className="new-conv-settings-card">
             <label className="settings-field">
               <span className="settings-field-label">
                 Directory
@@ -299,8 +267,117 @@ export function NewConversationPage() {
               </select>
             </label>
           </div>
+
+          {/* Desktop: centered input box */}
+          <div className="new-conv-input-box desktop-only">
+            <ImageAttachments images={images} onRemove={(i) => setImages(images.filter((_, idx) => idx !== i))} />
+            
+            <textarea
+              ref={textareaDesktopRef}
+              className="new-conv-textarea"
+              placeholder="What would you like to work on?"
+              rows={3}
+              value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
+              }}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              disabled={creating}
+            />
+            
+            <div className="new-conv-input-actions">
+              <div className="new-conv-input-left">
+                <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
+                {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
+              </div>
+              <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
+                {buttonText}
+              </button>
+            </div>
+          </div>
+
+          {/* Desktop: collapsible settings row */}
+          <button className="settings-row desktop-only" onClick={() => setShowSettings(!showSettings)}>
+            <span className="settings-item">
+              <span className="settings-label">dir</span>
+              <span className={`settings-status ${dirStatusClass}`}>{dirStatusIcon}</span>
+              <span className="settings-value">{cwdDisplay}</span>
+            </span>
+            <span className="settings-dot">·</span>
+            <span className="settings-item">
+              <span className="settings-label">model</span>
+              <span className="settings-value">{modelDisplay}</span>
+            </span>
+            <span className={`settings-caret ${showSettings ? 'open' : ''}`}>›</span>
+          </button>
+
+          <div className={`settings-panel desktop-only ${showSettings ? 'open' : ''}`}>
+            <div className="settings-panel-inner">
+              <label className="settings-field">
+                <span className="settings-field-label">
+                  Directory
+                  <span className={`field-status ${dirStatusClass}`}>
+                    {dirStatus === 'exists' && 'exists'}
+                    {dirStatus === 'will-create' && 'will be created'}
+                    {dirStatus === 'invalid' && 'invalid path'}
+                    {dirStatus === 'checking' && 'checking...'}
+                  </span>
+                </span>
+                <input
+                  type="text"
+                  className={`settings-input ${dirStatusClass}`}
+                  value={cwd}
+                  onChange={(e) => setCwd(e.target.value)}
+                  placeholder="/path/to/project"
+                />
+              </label>
+              <label className="settings-field">
+                <span className="settings-field-label">Model</span>
+                <select
+                  className="settings-select"
+                  value={selectedModel || ''}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  disabled={!models}
+                >
+                  {models?.models.map(m => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </div>
         </div>
       </main>
+
+      {/* Mobile: bottom-anchored input */}
+      <div className="new-conv-bottom-input mobile-only">
+        <ImageAttachments images={images} onRemove={(i) => setImages(images.filter((_, idx) => idx !== i))} />
+        <div className="new-conv-input-row">
+          <div className="new-conv-input-left">
+            <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
+            {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
+          </div>
+          <textarea
+            ref={textareaMobileRef}
+            className="new-conv-textarea-mobile"
+            placeholder="What would you like to work on?"
+            rows={2}
+            value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
+            }}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            disabled={creating}
+          />
+          <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
+            {buttonText}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
