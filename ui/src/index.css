@@ -441,6 +441,101 @@ body {
   border-radius: 4px;
 }
 
+/* Agent text blocks - markdown content */
+.agent-text-block h1,
+.agent-text-block h2,
+.agent-text-block h3,
+.agent-text-block h4,
+.agent-text-block h5,
+.agent-text-block h6 {
+  margin-top: 16px;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.agent-text-block h1 { font-size: 1.5rem; }
+.agent-text-block h2 { font-size: 1.3rem; }
+.agent-text-block h3 { font-size: 1.15rem; }
+.agent-text-block h4 { font-size: 1.05rem; }
+.agent-text-block h5,
+.agent-text-block h6 { font-size: 1rem; }
+
+.agent-text-block h1:first-child,
+.agent-text-block h2:first-child,
+.agent-text-block h3:first-child,
+.agent-text-block h4:first-child {
+  margin-top: 0;
+}
+
+.agent-text-block ul,
+.agent-text-block ol {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+
+.agent-text-block li {
+  margin: 4px 0;
+}
+
+.agent-text-block blockquote {
+  border-left: 3px solid var(--accent-color);
+  margin: 12px 0;
+  padding: 8px 16px;
+  background: var(--bg-tertiary);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-secondary);
+}
+
+.agent-text-block blockquote p {
+  margin: 0;
+}
+
+/* Tables in agent messages */
+.agent-text-block table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 14px;
+}
+
+.agent-text-block th,
+.agent-text-block td {
+  border: 1px solid var(--border-color);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.agent-text-block th {
+  background: var(--bg-tertiary);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.agent-text-block tr:nth-child(even) {
+  background: var(--bg-secondary);
+}
+
+.agent-text-block tr:hover {
+  background: var(--bg-tertiary);
+}
+
+.agent-text-block hr {
+  border: none;
+  border-top: 1px solid var(--border-color);
+  margin: 16px 0;
+}
+
+/* Links in agent messages */
+.agent-text-block a {
+  color: var(--accent-color);
+  text-decoration: none;
+}
+
+.agent-text-block a:hover {
+  text-decoration: underline;
+}
+
 /* Images in messages */
 .message-images {
   display: flex;

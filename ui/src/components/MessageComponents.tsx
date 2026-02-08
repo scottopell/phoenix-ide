@@ -13,9 +13,13 @@
  */
 
 import { useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
-import { escapeHtml, renderMarkdown } from '../utils';
+import { escapeHtml } from '../utils';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 
@@ -186,10 +190,32 @@ export function AgentMessage({
         {blocks.map((block, i) => {
           if (block.type === 'text') {
             return (
-              <div
-                key={i}
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(block.text || '') }}
-              />
+              <div key={i} className="agent-text-block">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    code: ({ inline, className, children, ...props }: any) => {
+                      const match = /language-(\w+)/.exec(className || '');
+                      return !inline && match ? (
+                        <SyntaxHighlighter
+                          style={oneDark}
+                          language={match[1]}
+                          PreTag="div"
+                          {...props}
+                        >
+                          {String(children).replace(/\n$/, '')}
+                        </SyntaxHighlighter>
+                      ) : (
+                        <code className={className} {...props}>
+                          {children}
+                        </code>
+                      );
+                    },
+                  }}
+                >
+                  {block.text || ''}
+                </ReactMarkdown>
+              </div>
             );
           } else if (block.type === 'tool_use') {
             return (
