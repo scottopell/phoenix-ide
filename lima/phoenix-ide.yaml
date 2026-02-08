@@ -1,0 +1,56 @@
+vmType: vz
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+
+images:
+  - location: "https://dl01.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-42-1.1.aarch64.qcow2"
+    arch: "aarch64"
+  - location: "https://dl01.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2"
+    arch: "x86_64"
+
+cpus: 4
+memory: "8GiB"
+disk: "50GiB"
+
+portForwards:
+  - guestPort: 7331
+    hostPort: 7331
+
+mounts: []
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+
+      # Create phoenix-user (skip subordinate UID/GID allocation — not running containers)
+      id phoenix-user &>/dev/null || useradd -M -s /bin/bash -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 phoenix-user
+      mkdir -p /home/phoenix-user /home/phoenix-user/projects
+      chown phoenix-user:phoenix-user /home/phoenix-user /home/phoenix-user/projects
+
+      # Service directories
+      mkdir -p /opt/phoenix-ide /opt/phoenix-build /etc/phoenix-ide
+      chown phoenix-user:phoenix-user /opt/phoenix-ide /opt/phoenix-build
+
+      # SELinux permissive — dev VM, not worth fighting /opt context labels
+      setenforce 0
+      sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+
+      # Build dependencies (idempotent — dnf skips already-installed)
+      dnf install -y gcc make openssl-devel pkg-config nodejs npm
+
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      # Install or update Rust toolchain
+      if command -v rustup &>/dev/null; then
+        rustup update stable
+      else
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      fi

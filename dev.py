@@ -6,6 +6,7 @@
 
 import argparse
 import fcntl
+import getpass
 import hashlib
 import json
 import os
@@ -27,6 +28,12 @@ PROD_SERVICE_NAME = "phoenix-ide"
 PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
 PROD_PORT = 7331
+
+# Lima VM configuration
+LIMA_VM_NAME = "phoenix-ide"
+LIMA_YAML = ROOT / "lima" / "phoenix-ide.yaml"
+LIMA_BUILD_DIR = "/opt/phoenix-build"
+LIMA_ENV_FILE = "/etc/phoenix-ide/env"
 
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
@@ -397,6 +404,20 @@ def cmd_check():
 # Production Commands
 # =============================================================================
 
+
+def detect_prod_env() -> str | None:
+    """Detect production environment: 'native' (Linux) or 'lima' (macOS+VM)."""
+    if sys.platform == "linux":
+        return "native"
+    if sys.platform == "darwin":
+        if lima_is_running():
+            return "lima"
+        if lima_vm_exists():
+            lima_ensure_running()
+            return "lima"
+    return None
+
+
 # Production build worktree location
 PROD_BUILD_WORKTREE = ROOT.parent / ".phoenix-ide-build"
 
@@ -494,13 +515,8 @@ WantedBy=multi-user.target
 """
 
 
-def cmd_prod_build(version: str | None = None):
-    """Build production binary from git tag."""
-    prod_build(version)
-
-
-def cmd_prod_deploy(version: str | None = None):
-    """Build and deploy to production."""
+def native_prod_deploy(version: str | None = None):
+    """Build and deploy to production (native Linux)."""
     # Build
     binary = prod_build(version)
     
@@ -565,8 +581,8 @@ def cmd_prod_deploy(version: str | None = None):
         sys.exit(1)
 
 
-def cmd_prod_status():
-    """Show production service status."""
+def native_prod_status():
+    """Show production service status (native Linux)."""
     # Check if service exists
     result = subprocess.run(
         ["systemctl", "is-active", PROD_SERVICE_NAME],
@@ -598,10 +614,373 @@ def cmd_prod_status():
         print(f"Production: {status}")
 
 
-def cmd_prod_stop():
-    """Stop production service."""
+def native_prod_stop():
+    """Stop production service (native Linux)."""
     subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME])
     print(f"Stopped {PROD_SERVICE_NAME}")
+
+
+def cmd_prod_build(version: str | None = None):
+    """Build production binary from git tag."""
+    if sys.platform != "linux":
+        print("Production builds happen inside the Lima VM during './dev.py prod deploy'.")
+        return
+    prod_build(version)
+
+
+def cmd_prod_deploy(version: str | None = None):
+    """Build and deploy to production (auto-detects environment)."""
+    env = detect_prod_env()
+    if env == "native":
+        native_prod_deploy(version)
+    elif env == "lima":
+        lima_prod_deploy()
+    else:
+        print("No Linux environment available.", file=sys.stderr)
+        print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_prod_status():
+    """Show production status (auto-detects environment)."""
+    env = detect_prod_env()
+    if env == "native":
+        native_prod_status()
+    elif env == "lima":
+        lima_prod_status()
+    else:
+        print("No Linux environment available.", file=sys.stderr)
+        print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_prod_stop():
+    """Stop production service (auto-detects environment)."""
+    env = detect_prod_env()
+    if env == "native":
+        native_prod_stop()
+    elif env == "lima":
+        lima_prod_stop()
+    else:
+        print("No Linux environment available.", file=sys.stderr)
+        print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
+        sys.exit(1)
+
+
+# =============================================================================
+# Lima VM Commands
+# =============================================================================
+
+def lima_shell(cmd: str, check=True) -> subprocess.CompletedProcess:
+    """Run a command inside the Lima VM via bash -lc (loads .bashrc for Rust PATH)."""
+    return subprocess.run(
+        ["limactl", "shell", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
+        check=check,
+    )
+
+
+def lima_shell_quiet(cmd: str, check=True) -> subprocess.CompletedProcess:
+    """Run a command inside the Lima VM, capturing output."""
+    return subprocess.run(
+        ["limactl", "shell", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
+        check=check, capture_output=True, text=True,
+    )
+
+
+def lima_is_running() -> bool:
+    """Check if the Lima VM is running."""
+    result = subprocess.run(
+        ["limactl", "list", "--json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.strip().splitlines():
+        try:
+            vm = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if vm.get("name") == LIMA_VM_NAME and vm.get("status") == "Running":
+            return True
+    return False
+
+
+def lima_vm_exists() -> bool:
+    """Check if the Lima VM exists (any status)."""
+    result = subprocess.run(
+        ["limactl", "list", "--json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.strip().splitlines():
+        try:
+            vm = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if vm.get("name") == LIMA_VM_NAME:
+            return True
+    return False
+
+
+def lima_ensure_running():
+    """Start VM if stopped, error if not created."""
+    if lima_is_running():
+        return
+    if not lima_vm_exists():
+        print("Lima VM does not exist. Run './dev.py lima create' first.", file=sys.stderr)
+        sys.exit(1)
+    print("Starting Lima VM...")
+    subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
+
+
+def lima_has_api_key() -> bool:
+    """Check if API key is configured in the VM."""
+    result = lima_shell_quiet(f"test -f {LIMA_ENV_FILE} && grep -q ANTHROPIC_API_KEY {LIMA_ENV_FILE}", check=False)
+    return result.returncode == 0
+
+
+def lima_prompt_api_key():
+    """Prompt user for API key and write to VM env file.
+
+    Falls back to ANTHROPIC_API_KEY env var if no terminal is available.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        print("Using ANTHROPIC_API_KEY from host environment.")
+    else:
+        try:
+            key = getpass.getpass("ANTHROPIC_API_KEY: ")
+        except EOFError:
+            print("No terminal available and ANTHROPIC_API_KEY not set in environment.", file=sys.stderr)
+            print("Set ANTHROPIC_API_KEY in your environment and re-run './dev.py prod deploy'.", file=sys.stderr)
+            return
+    if not key.strip():
+        print("No key provided, skipping.", file=sys.stderr)
+        return
+    env_content = f"ANTHROPIC_API_KEY={key.strip()}\n"
+    subprocess.run(
+        ["limactl", "shell", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
+        input=env_content.encode(), check=True, capture_output=True,
+    )
+    lima_shell(f"sudo chmod 600 {LIMA_ENV_FILE}")
+    print("API key saved.")
+
+
+def lima_get_systemd_unit(version: str) -> str:
+    """Generate systemd unit file for the Lima VM deployment."""
+    return f"""[Unit]
+Description=Phoenix IDE
+After=network.target
+
+[Service]
+Type=simple
+User=phoenix-user
+EnvironmentFile={LIMA_ENV_FILE}
+Environment=PHOENIX_PORT={PROD_PORT}
+Environment=PHOENIX_DB_PATH=/home/phoenix-user/.phoenix-ide/prod.db
+Environment=PHOENIX_VERSION={version}
+ExecStart=/opt/phoenix-ide/phoenix-ide
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cmd_lima_create():
+    """Create and provision the Lima VM."""
+    # Check limactl exists
+    result = subprocess.run(["limactl", "--version"], capture_output=True)
+    if result.returncode != 0:
+        print("limactl not found. Install Lima: brew install lima", file=sys.stderr)
+        sys.exit(1)
+
+    if lima_vm_exists():
+        print(f"VM '{LIMA_VM_NAME}' already exists.")
+        if not lima_is_running():
+            print("Starting VM...")
+            subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
+        print("VM is running.")
+        return
+
+    print(f"Creating Lima VM '{LIMA_VM_NAME}' from {LIMA_YAML}...")
+    subprocess.run(
+        ["limactl", "create", f"--name={LIMA_VM_NAME}", str(LIMA_YAML)],
+        check=True,
+    )
+
+    print("Starting VM...")
+    subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
+
+    # Verify provisioning
+    print("\nVerifying provisioning...")
+    result = lima_shell_quiet("rustc --version", check=False)
+    if result.returncode == 0:
+        print(f"  Rust: {result.stdout.strip()}")
+    else:
+        print("  WARNING: Rust not found. Provisioning may have failed.", file=sys.stderr)
+
+    result = lima_shell_quiet("uname -r", check=False)
+    if result.returncode == 0:
+        print(f"  Kernel: {result.stdout.strip()}")
+
+    result = lima_shell_quiet("node --version", check=False)
+    if result.returncode == 0:
+        print(f"  Node: {result.stdout.strip()}")
+
+    print(f"\nVM '{LIMA_VM_NAME}' is ready.")
+
+
+def lima_prod_deploy():
+    """Build and deploy phoenix-ide inside the Lima VM."""
+    lima_ensure_running()
+
+    # Ensure build dir is writable by the Lima default user
+    lima_shell(f"sudo chown -R $(id -u):$(id -g) {LIMA_BUILD_DIR}")
+
+    # Sync source via tar pipe (--no-mac-metadata avoids macOS ._ extended attr files)
+    print("Syncing source to VM...")
+    tar_cmd = [
+        "tar", "-cf", "-", "--no-mac-metadata",
+        "--exclude=target", "--exclude=node_modules", "--exclude=.git",
+        ".",
+    ]
+    tar_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, cwd=ROOT)
+    # Suppress tar warnings about macOS extended header keywords on the receiving side
+    subprocess.run(
+        ["limactl", "shell", LIMA_VM_NAME, "--",
+         "tar", "xf", "-", "-C", LIMA_BUILD_DIR,
+         "--warning=no-unknown-keyword"],
+        stdin=tar_proc.stdout, check=True,
+        stderr=subprocess.DEVNULL,
+    )
+    tar_proc.wait()
+    if tar_proc.returncode != 0:
+        print("Failed to create tar archive", file=sys.stderr)
+        sys.exit(1)
+    print("Source synced.")
+
+    # Build UI
+    print("\nBuilding UI...")
+    lima_shell(f"cd {LIMA_BUILD_DIR}/ui && npm install && npm run build")
+
+    # Build Rust
+    print("\nBuilding Rust (release)...")
+    lima_shell(f"cd {LIMA_BUILD_DIR} && cargo build --release")
+
+    # Strip and install binary
+    print("\nInstalling binary...")
+    lima_shell(f"strip {LIMA_BUILD_DIR}/target/release/phoenix_ide")
+    lima_shell(f"sudo cp {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
+    lima_shell("sudo chmod +x /opt/phoenix-ide/phoenix-ide")
+
+    # API key
+    if not lima_has_api_key():
+        print("\nNo API key configured in VM.")
+        lima_prompt_api_key()
+
+    # Get version string
+    result = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    version = f"dev-{result.stdout.strip()}" if result.returncode == 0 else "dev-unknown"
+
+    # Install systemd unit
+    print("\nInstalling systemd service...")
+    unit_content = lima_get_systemd_unit(version)
+    subprocess.run(
+        ["limactl", "shell", LIMA_VM_NAME, "--",
+         "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.service"],
+        input=unit_content.encode(), check=True, capture_output=True,
+    )
+    lima_shell("sudo systemctl daemon-reload")
+    lima_shell(f"sudo systemctl enable {PROD_SERVICE_NAME}")
+    lima_shell(f"sudo systemctl restart {PROD_SERVICE_NAME}")
+
+    time.sleep(1)
+
+    # Verify
+    result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
+    status = result.stdout.strip()
+    if status == "active":
+        print(f"\nDeployed {version} to Lima VM")
+        print(f"  URL: http://localhost:{PROD_PORT}")
+    else:
+        print(f"\nService failed to start (status: {status})", file=sys.stderr)
+        lima_shell(f"sudo journalctl -u {PROD_SERVICE_NAME} -n 20 --no-pager")
+        sys.exit(1)
+
+
+def lima_prod_status():
+    """Show Lima VM and service status."""
+    if not lima_vm_exists():
+        print(f"VM '{LIMA_VM_NAME}': not created")
+        return
+
+    if not lima_is_running():
+        print(f"VM '{LIMA_VM_NAME}': stopped")
+        return
+
+    print(f"VM '{LIMA_VM_NAME}': running")
+
+    # Kernel version
+    result = lima_shell_quiet("uname -r", check=False)
+    if result.returncode == 0:
+        print(f"  Kernel: {result.stdout.strip()}")
+
+    # Service status
+    result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
+    svc_status = result.stdout.strip()
+    print(f"  Service: {svc_status}")
+
+    # API key
+    if lima_has_api_key():
+        print("  API key: configured")
+    else:
+        print("  API key: not set")
+
+    # Health check from host
+    if svc_status == "active":
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
+                print(f"  Health: {resp.read().decode().strip()}")
+        except Exception:
+            print("  Health: not responding on host (port forward may not be active)")
+
+
+def lima_prod_stop():
+    """Stop the phoenix-ide service in the Lima VM."""
+    lima_ensure_running()
+    lima_shell(f"sudo systemctl stop {PROD_SERVICE_NAME}", check=False)
+    print(f"Stopped {PROD_SERVICE_NAME} in Lima VM.")
+
+
+def cmd_lima_shell():
+    """Open an interactive shell as phoenix-user in the Lima VM."""
+    lima_ensure_running()
+    os.execvp("limactl", [
+        "limactl", "shell", LIMA_VM_NAME, "--",
+        "sudo", "-u", "phoenix-user", "-i",
+    ])
+
+
+def cmd_lima_destroy():
+    """Delete the Lima VM."""
+    if not lima_vm_exists():
+        print(f"VM '{LIMA_VM_NAME}' does not exist.")
+        return
+
+    # Stop service first (ignore errors)
+    if lima_is_running():
+        lima_shell(f"sudo systemctl stop {PROD_SERVICE_NAME}", check=False)
+
+    print(f"Deleting VM '{LIMA_VM_NAME}'...")
+    subprocess.run(["limactl", "delete", LIMA_VM_NAME, "--force"], check=True)
+    print("VM deleted.")
 
 
 # =============================================================================
@@ -640,6 +1019,13 @@ def main():
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
 
+    # lima
+    lima_parser = sub.add_parser("lima", help="Lima VM management")
+    lima_sub = lima_parser.add_subparsers(dest="lima_command", required=True)
+    lima_sub.add_parser("create", help="Create and provision Lima VM")
+    lima_sub.add_parser("shell", help="Open shell as phoenix-user")
+    lima_sub.add_parser("destroy", help="Delete Lima VM")
+
     args = parser.parse_args()
 
     if args.command == "up":
@@ -661,6 +1047,13 @@ def main():
             cmd_prod_status()
         elif args.prod_command == "stop":
             cmd_prod_stop()
+    elif args.command == "lima":
+        if args.lima_command == "create":
+            cmd_lima_create()
+        elif args.lima_command == "shell":
+            cmd_lima_shell()
+        elif args.lima_command == "destroy":
+            cmd_lima_destroy()
 
 
 if __name__ == "__main__":
