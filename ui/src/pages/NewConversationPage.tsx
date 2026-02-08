@@ -3,32 +3,71 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from '../components/VoiceInput';
+import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import type { ModelsResponse, ImageData } from '../api';
 
-const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
-const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 
 type DirStatus = 'checking' | 'exists' | 'will-create' | 'invalid';
 
-async function fileToBase64(file: File): Promise<ImageData> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const base64 = result.split(',')[1];
-      resolve({ data: base64, media_type: file.type });
-    };
-    reader.onerror = () => reject(new Error('Failed to read file'));
-    reader.readAsDataURL(file);
-  });
+const DIR_STATUS_CONFIG = {
+  checking: { icon: '...', class: 'status-checking', label: 'checking...' },
+  exists: { icon: '✓', class: 'status-ok', label: 'exists' },
+  'will-create': { icon: '+', class: 'status-create', label: 'will be created' },
+  invalid: { icon: '✗', class: 'status-error', label: 'invalid path' },
+} as const;
+
+// Settings fields component - reused in both layouts
+function SettingsFields({
+  cwd, setCwd, dirStatus, dirStatusClass,
+  selectedModel, setSelectedModel, models
+}: {
+  cwd: string;
+  setCwd: (v: string) => void;
+  dirStatus: DirStatus;
+  dirStatusClass: string;
+  selectedModel: string | null;
+  setSelectedModel: (v: string) => void;
+  models: ModelsResponse | null;
+}) {
+  return (
+    <>
+      <label className="settings-field">
+        <span className="settings-field-label">
+          Directory
+          <span className={`field-status ${dirStatusClass}`}>
+            {DIR_STATUS_CONFIG[dirStatus].label}
+          </span>
+        </span>
+        <input
+          type="text"
+          className={`settings-input ${dirStatusClass}`}
+          value={cwd}
+          onChange={(e) => setCwd(e.target.value)}
+          placeholder="/path/to/project"
+        />
+      </label>
+      <label className="settings-field">
+        <span className="settings-field-label">Model</span>
+        <select
+          className="settings-select"
+          value={selectedModel || ''}
+          onChange={(e) => setSelectedModel(e.target.value)}
+          disabled={!models}
+        >
+          {models?.models.map(m => (
+            <option key={m.id} value={m.id}>{m.id}</option>
+          ))}
+        </select>
+      </label>
+    </>
+  );
 }
 
 export function NewConversationPage() {
   const navigate = useNavigate();
-  const textareaDesktopRef = useRef<HTMLTextAreaElement>(null);
-  const textareaMobileRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '/home/exedev');
@@ -68,7 +107,6 @@ export function NewConversationPage() {
         if (validation.valid) {
           setDirStatus('exists');
         } else {
-          // Check if parent exists (can create)
           const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
           const parentValidation = await api.validateCwd(parentPath);
           setDirStatus(parentValidation.valid ? 'will-create' : 'invalid');
@@ -76,7 +114,7 @@ export function NewConversationPage() {
       } catch {
         setDirStatus('invalid');
       }
-    }, 300); // Debounce
+    }, 300);
 
     return () => clearTimeout(timeoutId);
   }, [cwd]);
@@ -85,30 +123,21 @@ export function NewConversationPage() {
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  // Auto-resize textareas
+  // Auto-resize textarea
   useEffect(() => {
-    [textareaDesktopRef.current, textareaMobileRef.current].forEach(ta => {
-      if (ta) {
-        ta.style.height = 'auto';
-        ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
-      }
-    });
+    const ta = textareaRef.current;
+    if (ta) {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+    }
   }, [draft]);
 
-  // Focus appropriate textarea on mount (mobile vs desktop)
-  useEffect(() => {
-    const isMobile = window.innerWidth <= 768;
-    if (isMobile) {
-      textareaMobileRef.current?.focus();
-    } else {
-      textareaDesktopRef.current?.focus();
-    }
-  }, []);
+  // Focus textarea on mount
+  useEffect(() => { textareaRef.current?.focus(); }, []);
 
   const addImages = async (files: File[]) => {
-    const validFiles = files.filter(f => SUPPORTED_TYPES.includes(f.type) && f.size <= MAX_IMAGE_SIZE);
     try {
-      const newImages = await Promise.all(validFiles.map(fileToBase64));
+      const newImages = await processImageFiles(files);
       setImages([...images, ...newImages]);
     } catch (err) {
       console.error('Error processing images:', err);
@@ -146,7 +175,6 @@ export function NewConversationPage() {
     setCreating(true);
 
     try {
-      // Create directory if needed
       if (dirStatus === 'will-create') {
         const mkdirResult = await api.mkdir(cwd.trim());
         if (!mkdirResult.created) {
@@ -174,8 +202,6 @@ export function NewConversationPage() {
     }
   };
 
-
-
   const handleVoiceFinal = (text: string) => {
     if (!text) return;
     setInterimText('');
@@ -190,94 +216,57 @@ export function NewConversationPage() {
     setInterimText(text);
   };
 
+  const handleRemoveImage = (index: number) => {
+    setImages(images.filter((_, idx) => idx !== index));
+  };
+
   const hasContent = draft.trim().length > 0 || images.length > 0;
   const canSend = hasContent && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
 
-  // Display values
+  const { icon: dirStatusIcon, class: dirStatusClass } = DIR_STATUS_CONFIG[dirStatus];
   const cwdDisplay = cwd.trim().replace(/^\/home\/exedev\/?/, '~/') || '~/';
-  const modelDisplay = models?.models.find(m => m.id === selectedModel)?.id.replace('-sonnet', '').replace('-opus', '') || '...';
+  const modelDisplay = models?.models.find(m => m.id === selectedModel)?.id.replace(/-sonnet|-opus/g, '') || '...';
+  const buttonText = creating ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
+  const textareaValue = interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft;
 
-  // Status indicator for directory
-  const dirStatusIcon = {
-    'checking': '...',
-    'exists': '✓',
-    'will-create': '+',
-    'invalid': '✗',
-  }[dirStatus];
-
-  const dirStatusClass = {
-    'checking': 'status-checking',
-    'exists': 'status-ok',
-    'will-create': 'status-create',
-    'invalid': 'status-error',
-  }[dirStatus];
-
-  // Button text
-  const buttonText = creating 
-    ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...')
-    : 'Send';
+  const settingsProps = { cwd, setCwd, dirStatus, dirStatusClass, selectedModel, setSelectedModel, models };
 
   return (
     <div className="new-conv-page">
-      {/* Hidden file input - shared by both desktop and mobile */}
-      <input ref={fileInputRef} type="file" accept={SUPPORTED_TYPES.join(',')} multiple onChange={handleFileChange} style={{ display: 'none' }} />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={SUPPORTED_IMAGE_TYPES.join(',')}
+        multiple
+        onChange={handleFileChange}
+        style={{ display: 'none' }}
+      />
       
       <header className="new-conv-header-minimal">
         <button className="back-link" onClick={() => navigate('/')}>← Back</button>
       </header>
 
-      {/* Main content area - settings visible on mobile */}
       <main className="new-conv-main">
         <div className="new-conv-content">
           <h1 className="new-conv-title">New conversation</h1>
           
           {error && <div className="new-conv-error">{error}</div>}
 
-          {/* Settings card - always visible on mobile, collapsible on desktop */}
-          <div className="new-conv-settings-card">
-            <label className="settings-field">
-              <span className="settings-field-label">
-                Directory
-                <span className={`field-status ${dirStatusClass}`}>
-                  {dirStatus === 'exists' && 'exists'}
-                  {dirStatus === 'will-create' && 'will be created'}
-                  {dirStatus === 'invalid' && 'invalid path'}
-                  {dirStatus === 'checking' && 'checking...'}
-                </span>
-              </span>
-              <input
-                type="text"
-                className={`settings-input ${dirStatusClass}`}
-                value={cwd}
-                onChange={(e) => setCwd(e.target.value)}
-                placeholder="/path/to/project"
-              />
-            </label>
-            <label className="settings-field">
-              <span className="settings-field-label">Model</span>
-              <select
-                className="settings-select"
-                value={selectedModel || ''}
-                onChange={(e) => setSelectedModel(e.target.value)}
-                disabled={!models}
-              >
-                {models?.models.map(m => (
-                  <option key={m.id} value={m.id}>{m.id}</option>
-                ))}
-              </select>
-            </label>
+          {/* Mobile: settings card at top */}
+          <div className="new-conv-settings-card mobile-only">
+            <SettingsFields {...settingsProps} />
           </div>
 
           {/* Desktop: centered input box */}
           <div className="new-conv-input-box desktop-only">
-            <ImageAttachments images={images} onRemove={(i) => setImages(images.filter((_, idx) => idx !== i))} />
+            <ImageAttachments images={images} onRemove={handleRemoveImage} />
             
             <textarea
-              ref={textareaDesktopRef}
+              ref={textareaRef}
               className="new-conv-textarea"
               placeholder="What would you like to work on?"
               rows={3}
-              value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+              value={textareaValue}
               onChange={(e) => {
                 setDraft(e.target.value);
                 if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
@@ -292,9 +281,7 @@ export function NewConversationPage() {
                 <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
                 {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
               </div>
-              <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
-                {buttonText}
-              </button>
+              <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>{buttonText}</button>
             </div>
           </div>
 
@@ -315,37 +302,7 @@ export function NewConversationPage() {
 
           <div className={`settings-panel desktop-only ${showSettings ? 'open' : ''}`}>
             <div className="settings-panel-inner">
-              <label className="settings-field">
-                <span className="settings-field-label">
-                  Directory
-                  <span className={`field-status ${dirStatusClass}`}>
-                    {dirStatus === 'exists' && 'exists'}
-                    {dirStatus === 'will-create' && 'will be created'}
-                    {dirStatus === 'invalid' && 'invalid path'}
-                    {dirStatus === 'checking' && 'checking...'}
-                  </span>
-                </span>
-                <input
-                  type="text"
-                  className={`settings-input ${dirStatusClass}`}
-                  value={cwd}
-                  onChange={(e) => setCwd(e.target.value)}
-                  placeholder="/path/to/project"
-                />
-              </label>
-              <label className="settings-field">
-                <span className="settings-field-label">Model</span>
-                <select
-                  className="settings-select"
-                  value={selectedModel || ''}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                  disabled={!models}
-                >
-                  {models?.models.map(m => (
-                    <option key={m.id} value={m.id}>{m.id}</option>
-                  ))}
-                </select>
-              </label>
+              <SettingsFields {...settingsProps} />
             </div>
           </div>
         </div>
@@ -353,13 +310,12 @@ export function NewConversationPage() {
 
       {/* Mobile: bottom-anchored input */}
       <div className="new-conv-bottom-input mobile-only">
-        <ImageAttachments images={images} onRemove={(i) => setImages(images.filter((_, idx) => idx !== i))} />
+        <ImageAttachments images={images} onRemove={handleRemoveImage} />
         <textarea
-          ref={textareaMobileRef}
           className="new-conv-textarea-mobile"
           placeholder="What would you like to work on?"
           rows={2}
-          value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+          value={textareaValue}
           onChange={(e) => {
             setDraft(e.target.value);
             if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
@@ -373,9 +329,7 @@ export function NewConversationPage() {
             <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
             {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
           </div>
-          <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
-            {buttonText}
-          </button>
+          <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>{buttonText}</button>
         </div>
       </div>
     </div>

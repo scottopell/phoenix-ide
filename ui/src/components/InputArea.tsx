@@ -5,9 +5,7 @@ import type { QueuedMessage } from '../hooks';
 import type { ImageData } from '../api';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
-
-const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
-const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
+import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 
 interface InputAreaProps {
   draft: string;
@@ -28,22 +26,7 @@ interface InputAreaProps {
   stateData?: { message?: string } | null;
 }
 
-async function fileToBase64(file: File): Promise<ImageData> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      // Extract base64 data after the data URL prefix
-      const base64 = result.split(',')[1];
-      resolve({
-        data: base64,
-        media_type: file.type,
-      });
-    };
-    reader.onerror = () => reject(new Error('Failed to read file'));
-    reader.readAsDataURL(file);
-  });
-}
+
 
 export function InputArea({
   draft,
@@ -86,20 +69,8 @@ export function InputArea({
   }, [draft]);
 
   const addImages = async (files: File[]) => {
-    const validFiles = files.filter(file => {
-      if (!SUPPORTED_TYPES.includes(file.type)) {
-        console.warn(`Unsupported image type: ${file.type}`);
-        return false;
-      }
-      if (file.size > MAX_IMAGE_SIZE) {
-        console.warn(`Image too large: ${file.name}`);
-        return false;
-      }
-      return true;
-    });
-
     try {
-      const newImages = await Promise.all(validFiles.map(fileToBase64));
+      const newImages = await processImageFiles(files);
       setImages([...images, ...newImages]);
     } catch (error) {
       console.error('Error processing images:', error);
@@ -254,7 +225,7 @@ export function InputArea({
       <input
         ref={fileInputRef}
         type="file"
-        accept={SUPPORTED_TYPES.join(',')}
+        accept={SUPPORTED_IMAGE_TYPES.join(',')}
         multiple
         onChange={handleFileChange}
         style={{ display: 'none' }}
