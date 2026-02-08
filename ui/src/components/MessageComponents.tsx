@@ -88,7 +88,7 @@ export function UserMessage({ message }: { message: Message }) {
   const timestamp = message.created_at;
 
   return (
-    <div className="message user">
+    <div className="message user" data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-sender">You</span>
         {timestamp && (
@@ -177,7 +177,7 @@ export function AgentMessage({
   const timestamp = message.created_at;
 
   return (
-    <div className="message agent">
+    <div className="message agent" data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-sender">Phoenix</span>
         {timestamp && (

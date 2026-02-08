@@ -247,6 +247,76 @@ body {
   color: var(--accent-purple);
 }
 
+.breadcrumb-item.subagents {
+  color: var(--accent-yellow);
+  background: rgba(210, 153, 34, 0.15);
+}
+
+.breadcrumb-item.subagents.active {
+  color: var(--accent-yellow);
+  background: rgba(210, 153, 34, 0.25);
+}
+
+/* Breadcrumb tooltip */
+.breadcrumb-item {
+  position: relative;
+}
+
+.breadcrumb-tooltip {
+  position: fixed;
+  bottom: calc(var(--breadcrumb-height) + 16px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 120px;
+  max-width: 280px;
+  white-space: normal;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.breadcrumb-tooltip::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-top-color: var(--border-color);
+}
+
+.breadcrumb-tooltip::before {
+  content: '';
+  position: absolute;
+  top: calc(100% - 1px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: var(--bg-primary);
+  z-index: 1;
+}
+
+.breadcrumb-tooltip strong {
+  display: block;
+  font-size: 12px;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.breadcrumb-tooltip-preview {
+  display: block;
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+  line-height: 1.4;
+}
+
 .breadcrumb-arrow {
   color: var(--text-muted);
   font-size: 10px;
@@ -370,6 +440,20 @@ body {
   padding: 12px;
   border-radius: 8px;
   max-width: 100%;
+  transition: box-shadow 0.3s ease;
+}
+
+.message.breadcrumb-highlight {
+  box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgba(88, 166, 255, 0.3);
+}
+
+@keyframes breadcrumb-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgba(88, 166, 255, 0.3); }
+  50% { box-shadow: 0 0 0 3px var(--accent-blue), 0 0 24px rgba(88, 166, 255, 0.5); }
+}
+
+.message.breadcrumb-highlight {
+  animation: breadcrumb-pulse 0.75s ease-in-out 2;
 }
 
 .message.user {

@@ -76,6 +76,8 @@ export interface SseBreadcrumb {
   type: 'user' | 'llm' | 'tool' | 'subagents';
   label: string;
   tool_id?: string;
+  sequence_id?: number;
+  preview?: string;
 }
 
 export interface SseInitData {

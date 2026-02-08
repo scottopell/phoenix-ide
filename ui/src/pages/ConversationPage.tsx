@@ -137,6 +137,8 @@ export function ConversationPage() {
               type: b.type,
               label: b.label,
               toolId: b.tool_id,
+              sequenceId: b.sequence_id,
+              preview: b.preview,
             })));
           }
           // Also update from state if agent is still working

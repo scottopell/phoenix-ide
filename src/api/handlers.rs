@@ -14,7 +14,6 @@ use super::AppState;
 use crate::db::{ImageData, Message, MessageContent, MessageType};
 use crate::llm::ContentBlock;
 use crate::runtime::SseEvent;
-use serde::Serialize;
 use crate::state_machine::Event;
 use axum::{
     extract::{Path, Query, State},
@@ -27,6 +26,7 @@ use chrono::Datelike;
 use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -309,6 +309,10 @@ pub struct Breadcrumb {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 /// Extract breadcrumbs from the last turn in message history
@@ -323,40 +327,200 @@ fn extract_breadcrumbs(messages: &[Message]) -> Vec<Breadcrumb> {
         return vec![];
     };
 
+    // Extract preview from user message
+    let user_preview = messages.get(start_idx).and_then(|msg| {
+        if let MessageContent::User(user_content) = &msg.content {
+            if user_content.text.is_empty() {
+                None
+            } else {
+                Some(truncate_preview(&user_content.text, 50))
+            }
+        } else {
+            None
+        }
+    });
+
+    let user_seq_id = messages.get(start_idx).map(|m| m.sequence_id);
+
     let mut breadcrumbs = vec![Breadcrumb {
         crumb_type: "user".to_string(),
         label: "User".to_string(),
         tool_id: None,
+        sequence_id: user_seq_id,
+        preview: user_preview,
     }];
+
+    // Track subagent calls for grouping
+    let mut pending_subagents: Vec<(String, i64, Option<String>)> = vec![]; // (tool_id, seq_id, slug)
 
     // Process messages after the last user message
     for msg in messages.iter().skip(start_idx + 1) {
         if let MessageContent::Agent(blocks) = &msg.content {
             // Check for tool_use blocks
             for block in blocks {
-                if let ContentBlock::ToolUse { id, name, .. } = block {
-                    breadcrumbs.push(Breadcrumb {
-                        crumb_type: "tool".to_string(),
-                        label: name.clone(),
-                        tool_id: Some(id.clone()),
-                    });
+                if let ContentBlock::ToolUse { id, name, input } = block {
+                    if name == "subagent" {
+                        // Collect subagent calls for grouping
+                        let slug = input.get("slug").and_then(|v| v.as_str()).map(String::from);
+                        pending_subagents.push((id.clone(), msg.sequence_id, slug));
+                    } else {
+                        // Flush any pending subagents before adding this tool
+                        flush_subagents(&mut breadcrumbs, &mut pending_subagents);
+
+                        let preview = extract_tool_preview(name, input);
+                        breadcrumbs.push(Breadcrumb {
+                            crumb_type: "tool".to_string(),
+                            label: name.clone(),
+                            tool_id: Some(id.clone()),
+                            sequence_id: Some(msg.sequence_id),
+                            preview,
+                        });
+                    }
                 }
             }
             // Add LLM breadcrumb if there's text content (final response)
-            if blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })) {
+            if blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }))
+            {
+                // Flush any pending subagents
+                flush_subagents(&mut breadcrumbs, &mut pending_subagents);
+
                 // Only add LLM if it's not already the last crumb
-                if !breadcrumbs.last().is_some_and(|b| b.crumb_type == "llm") {
+                if breadcrumbs.last().is_none_or(|b| b.crumb_type != "llm") {
                     breadcrumbs.push(Breadcrumb {
                         crumb_type: "llm".to_string(),
                         label: "LLM".to_string(),
                         tool_id: None,
+                        sequence_id: Some(msg.sequence_id),
+                        preview: Some("Agent response".to_string()),
                     });
                 }
             }
         }
     }
 
+    // Flush any remaining subagents
+    flush_subagents(&mut breadcrumbs, &mut pending_subagents);
+
     breadcrumbs
+}
+
+/// Flush pending subagent calls into a single breadcrumb
+fn flush_subagents(
+    breadcrumbs: &mut Vec<Breadcrumb>,
+    pending: &mut Vec<(String, i64, Option<String>)>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let count = pending.len();
+    let (first_id, first_seq, first_slug) = pending.first().cloned().unwrap();
+
+    let (label, preview) = if count == 1 {
+        let slug_preview = first_slug.as_ref().map_or_else(
+            || "Spawning subagent".to_string(),
+            |s| format!("Spawning: {s}"),
+        );
+        ("subagent".to_string(), Some(slug_preview))
+    } else {
+        let slugs: Vec<_> = pending.iter().filter_map(|(_, _, s)| s.as_ref()).collect();
+        let preview = if slugs.is_empty() {
+            format!("{count} subagents")
+        } else if slugs.len() <= 3 {
+            slugs
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!(
+                "{}, +{} more",
+                slugs[..2]
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                slugs.len() - 2
+            )
+        };
+        (format!("{count} subagents"), Some(preview))
+    };
+
+    breadcrumbs.push(Breadcrumb {
+        crumb_type: "subagents".to_string(),
+        label,
+        tool_id: Some(first_id),
+        sequence_id: Some(first_seq),
+        preview,
+    });
+
+    pending.clear();
+}
+
+/// Extract a preview string from tool input based on tool type
+fn extract_tool_preview(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_preview(s, 60)),
+        "patch" => {
+            // Get path or first patch path
+            input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    input
+                        .get("patches")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|p| p.get("path"))
+                        .and_then(|v| v.as_str())
+                })
+                .map(|s| truncate_preview(s, 60))
+        }
+        "think" => Some("Internal reasoning".to_string()),
+        "keyword_search" => input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_preview(s, 60)),
+        "read_image" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_preview(s, 60)),
+        "browser_navigate" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_preview(s, 60)),
+        "browser_eval" => input
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_preview(s, 50)),
+        "change_dir" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_preview(s, 60)),
+        "output_iframe" => input
+            .get("title")
+            .and_then(|v| v.as_str())
+            .or_else(|| input.get("path").and_then(|v| v.as_str()))
+            .map(|s| truncate_preview(s, 60)),
+        _ => None,
+    }
+}
+
+/// Truncate a string for preview, adding ellipsis if needed
+fn truncate_preview(s: &str, max_len: usize) -> String {
+    // Take first line only
+    let first_line = s.lines().next().unwrap_or(s);
+    let trimmed = first_line.trim();
+    if trimmed.len() <= max_len {
+        trimmed.to_string()
+    } else {
+        format!("{}…", &trimmed[..max_len - 1])
+    }
 }
 
 async fn stream_conversation(

@@ -4,6 +4,8 @@ export interface Breadcrumb {
   type: 'user' | 'llm' | 'tool' | 'subagents';
   label: string;
   toolId?: string;
+  sequenceId?: number;
+  preview?: string;
 }
 
 export interface AppState {

@@ -163,6 +163,7 @@ impl ToolResult {
     }
 
     /// Create a successful result with display data for UI rendering
+    #[allow(dead_code)]
     pub fn success_with_display(
         tool_use_id: String,
         output: String,

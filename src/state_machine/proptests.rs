@@ -59,6 +59,7 @@ fn arb_tool_result() -> impl Strategy<Value = ToolResult> {
         success,
         output,
         is_error: !success,
+        display_data: None,
     })
 }
 
@@ -347,6 +348,7 @@ proptest! {
                 success: result_success,
                 output: result_output,
                 is_error: !result_success,
+                display_data: None,
             },
         };
 
@@ -687,6 +689,7 @@ proptest! {
             success: true,
             output: "actual output that should be discarded".to_string(),
             is_error: false,
+                display_data: None,
         };
 
         let result = transition(
@@ -731,6 +734,7 @@ proptest! {
                 success: true,
                 output: "output".to_string(),
                 is_error: false,
+                display_data: None,
             },
         };
 
@@ -809,6 +813,7 @@ fn test_complete_tool_cycle() {
                 success: true,
                 output: "file1 file2".to_string(),
                 is_error: false,
+                display_data: None,
             },
         },
     )
@@ -950,6 +955,7 @@ fn test_multi_tool_chain() {
                 success: true,
                 output: "1".to_string(),
                 is_error: false,
+                display_data: None,
             },
         },
     )
@@ -982,6 +988,7 @@ fn test_multi_tool_chain() {
                 success: true,
                 output: "2".to_string(),
                 is_error: false,
+                display_data: None,
             },
         },
     )
@@ -1014,6 +1021,7 @@ fn test_multi_tool_chain() {
                 success: true,
                 output: "3".to_string(),
                 is_error: false,
+                display_data: None,
             },
         },
     )
@@ -1149,6 +1157,7 @@ fn test_tool_completion_advances_to_next_tool() {
                 success: true,
                 output: "1".to_string(),
                 is_error: false,
+                display_data: None,
             },
         },
     )
@@ -1202,6 +1211,7 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
                 success: true,
                 output: "done".to_string(),
                 is_error: false,
+                display_data: None,
             },
         },
     )
@@ -1453,6 +1463,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
             success: true,
             output: "done".to_string(),
             is_error: false,
+            display_data: None,
         },
     };
 
@@ -1495,6 +1506,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
             success: true,
             output: "Spawned 2 agents".to_string(),
             is_error: false,
+            display_data: None,
         },
         agent_ids: vec!["new-agent-1".to_string(), "new-agent-2".to_string()],
     };
