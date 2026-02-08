@@ -66,9 +66,10 @@ class PhoenixClient:
 
     def send_message(self, conv_id: str, text: str, images: list[dict]) -> None:
         """Send chat message."""
+        import uuid
         resp = self.http.post(
             f"{self.base_url}/api/conversations/{conv_id}/chat",
-            json={"text": text, "images": images}
+            json={"text": text, "images": images, "message_id": str(uuid.uuid4())}
         )
         resp.raise_for_status()
 

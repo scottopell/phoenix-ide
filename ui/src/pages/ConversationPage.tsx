@@ -177,7 +177,7 @@ export function ConversationPage() {
         case 'agent_done':
           setAgentWorking(false);
           setConvState('idle');
-          setBreadcrumbs([]);
+          // Keep breadcrumbs visible to show what happened - they clear on next user message
           break;
 
         case 'disconnected':
@@ -467,7 +467,7 @@ export function ConversationPage() {
       />
       <BreadcrumbBar
         breadcrumbs={breadcrumbs}
-        visible={agentWorking}
+        visible={breadcrumbs.length > 0}
       />
       <StateBar
         conversation={conversation}
