@@ -77,8 +77,8 @@ export function ConversationListPage() {
           setArchivedConversations(freshArchived);
           setLastUpdated(new Date());
           
-          // Update cache
-          await cacheDB.putConversations([...freshActive, ...freshArchived]);
+          // Sync cache (removes stale entries, adds fresh ones)
+          await cacheDB.syncConversations([...freshActive, ...freshArchived]);
         } catch (err) {
           console.error('Failed to fetch fresh conversations:', err);
           // Network failed, cached data still showing (if any)

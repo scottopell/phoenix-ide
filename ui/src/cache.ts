@@ -96,7 +96,14 @@ export class CacheDB {
     const store = tx.objectStore('conversations');
     return new Promise((resolve) => {
       const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
+      request.onsuccess = () => {
+        const conversations = request.result || [];
+        // Sort by updated_at descending (most recent first)
+        conversations.sort((a: Conversation, b: Conversation) => 
+          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+        );
+        resolve(conversations);
+      };
       request.onerror = () => resolve([]);
     });
   }
@@ -115,6 +122,43 @@ export class CacheDB {
     for (const conversation of conversations) {
       store.put(conversation);
     }
+  }
+
+  /**
+   * Replace all conversations in cache with fresh data from server.
+   * This removes any stale entries that no longer exist on the server.
+   */
+  async syncConversations(conversations: Conversation[]): Promise<void> {
+    await this.init();
+    const tx = this.db!.transaction(['conversations'], 'readwrite');
+    const store = tx.objectStore('conversations');
+    
+    // Get IDs of fresh conversations
+    const freshIds = new Set(conversations.map(c => c.id));
+    
+    // Get all existing conversations
+    const existingRequest = store.getAll();
+    
+    await new Promise<void>((resolve, reject) => {
+      existingRequest.onsuccess = () => {
+        const existing = existingRequest.result || [];
+        
+        // Delete conversations that are no longer on server
+        for (const conv of existing) {
+          if (!freshIds.has(conv.id)) {
+            store.delete(conv.id);
+          }
+        }
+        
+        // Put fresh conversations
+        for (const conv of conversations) {
+          store.put(conv);
+        }
+        
+        resolve();
+      };
+      existingRequest.onerror = () => reject(existingRequest.error);
+    });
   }
 
   async deleteConversation(id: string): Promise<void> {
