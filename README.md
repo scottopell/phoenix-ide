@@ -1,73 +1,89 @@
 # Phoenix IDE
 
-A Rust backend for LLM-powered development environments, designed for the exe.dev platform.
+LLM-powered coding agent. Rust backend, React frontend, self-hosted.
+
+## Philosophy
+
+**State is visible, not inferred.** The UI reflects exact system state —
+which tool is running, how many are queued, what retry attempt you're on,
+whether your message was sent or is still in the local queue. Nothing is
+hidden behind a spinner.
+
+**Deterministic core.** The conversation lifecycle is a pure state machine
+(Elm architecture): same inputs always produce the same outputs. All I/O
+is isolated in effect executors. State transitions are property-tested.
+
+**Recoverable by default.** State is persisted to SQLite on every transition.
+SSE reconnection replays missed events by sequence ID. Drafts survive
+tab close. The server restarts to a known-good state.
+
+**Subtle, not minimal.** The UI is information-dense — it communicates
+clearly without wasting visual elements. Status is shown inline with
+symbols and color, not buried in separate screens or modals. Progressive
+disclosure: essentials visible by default, details on demand.
 
 ## Quick Start
 
 ```bash
-# Build
-cargo build --release
+# Start everything (backend build + frontend dev server)
+./dev.py up
 
-# Run with exe.dev LLM gateway
-LLM_GATEWAY="http://169.254.169.254/gateway/llm" ./target/release/phoenix_ide
-
-# Or with direct Anthropic API key
-ANTHROPIC_API_KEY="your-key" ./target/release/phoenix_ide
+# Other lifecycle commands
+./dev.py down        # stop services
+./dev.py restart     # restart services
+./dev.py status      # show running state
+./dev.py check       # pre-commit checks (fmt, clippy, tests)
 ```
 
-Server runs on port 8000 by default.
-
-## Using the Python Client
+### Single-shot CLI
 
 ```bash
-# Install dependencies (if needed)
-pip3 install httpx click --break-system-packages
-
-# Create a new conversation and send a message
-python3 phoenix-client.py -d /tmp "Create hello.txt with 'Hello World'"
-
-# Continue an existing conversation
-python3 phoenix-client.py -c <conversation-slug> "Now modify it to say 'Hello Phoenix'"
+# Runs via uv — no manual dependency install needed
+./phoenix-client.py -d /tmp "Create hello.txt with 'Hello World'"
+./phoenix-client.py -c <conversation-slug> "Now modify it"
 ```
 
 ## Architecture
 
-- **State Machine**: Manages conversation lifecycle (Idle → Processing → ToolExecuting → etc.)
-- **Tool System**: Modular tools (bash, patch, think, keyword_search, read_image)
-- **LLM Integration**: Supports Anthropic Claude models via direct API or exe.dev gateway
-- **SQLite Database**: Persists conversations and messages
+Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
+SQLite persists conversations and messages. A bedrock state machine drives the conversation
+lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
+Multi-provider LLM support routes through either the Anthropic API or an exe.dev gateway.
 
-### Patch Tool
+## Tools
 
-The patch tool uses an Effect/Command pattern for property-based testing:
+| Tool | Description | Spec |
+|------|-------------|------|
+| bash | Shell command execution with timeout, truncation, background mode | [spec](specs/bash/executive.md) |
+| patch | Structured file editing — create, modify, delete with fuzzy matching | [spec](specs/patch/executive.md) |
+| keyword_search | Semantic code search using LLM-filtered results | [spec](specs/keyword_search/executive.md) |
+| think | Reasoning scratchpad with zero side effects | [spec](specs/think/executive.md) |
+| browser | Headless browser — navigate, eval JS, screenshot, console logs | [spec](specs/browser-tool/executive.md) |
+| read_image | Read and encode image files for vision models | — |
+| subagent | Parallel task delegation to child agents | — |
 
-```
-src/tools/patch/
-├── types.rs       # Core types (Operation, PatchRequest, etc.)
-├── matching.rs    # Text matching logic (exact, dedent, trimmed)
-├── planner.rs     # Pure patch planning (no IO)
-├── executor.rs    # Filesystem IO operations
-├── interpreter.rs # In-memory effect interpreter for testing
-└── proptests.rs   # Property-based tests (6 invariants, 500 cases each)
-```
-
-## Tests
+## Production Deployment
 
 ```bash
-# Run all tests
-cargo test --release
+./dev.py prod deploy   # build release + deploy (auto-detects Linux native vs macOS+Lima)
+./dev.py prod status   # check running production instance
+./dev.py prod stop     # stop production instance
 
-# Run patch tool demo
-./demo_patch_fix.sh
+# Lima VM lifecycle (macOS only)
+./dev.py lima create   # provision VM
+./dev.py lima shell    # SSH into VM
+./dev.py lima destroy  # tear down VM
 ```
 
 ## Environment Variables
 
-- `LLM_GATEWAY`: exe.dev LLM gateway URL (e.g., `http://169.254.169.254/gateway/llm`)
-- `ANTHROPIC_API_KEY`: Direct Anthropic API key (alternative to gateway)
-- `PHOENIX_PORT`: Server port (default: 8000)
-- `PHOENIX_DB_PATH`: Database path (default: `~/.phoenix-ide/phoenix.db`)
-- `RUST_LOG`: Log level (e.g., `info`, `debug`)
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLM_GATEWAY` | exe.dev LLM gateway URL | — |
+| `ANTHROPIC_API_KEY` | Direct Anthropic API key (alternative to gateway) | — |
+| `PHOENIX_PORT` | Server port | `8000` |
+| `PHOENIX_DB_PATH` | SQLite database path | `~/.phoenix-ide/phoenix.db` |
+| `RUST_LOG` | Log level (`info`, `debug`, …) | — |
 
 ## API Endpoints
 
@@ -77,54 +93,7 @@ cargo test --release
 - `POST /api/conversations/:id/messages` - Send a message
 - `GET /api/conversations/:id/events` - SSE stream for real-time updates
 
-## Frontend Performance Features
+## Documentation
 
-### Offline Support
-
-Phoenix IDE works seamlessly offline:
-- Queue messages while disconnected
-- Automatic sync when connection returns  
-- All data cached locally in IndexedDB
-
-### Instant Navigation
-
-- Conversation list loads from cache instantly
-- No loading spinners on back navigation
-- Scroll position perfectly restored
-- Background refresh keeps data fresh
-
-### Network Efficiency
-
-- 85% smaller responses via Brotli compression
-- ~90% fewer API calls due to intelligent caching
-- Request deduplication prevents redundant calls
-
-### Performance Monitoring
-
-View real-time metrics with `?debug=1`:
-- Cache hit rate
-- Average response time  
-- Network request count
-
-## Troubleshooting
-
-### Offline Mode Not Working
-
-1. Check IndexedDB is enabled in your browser
-2. Ensure you have sufficient storage quota
-3. Look for errors in browser console
-
-### Data Not Updating
-
-1. Click the refresh button (↻) in the UI
-2. Check "Last updated" timestamp
-3. Hard refresh with Ctrl+Shift+R if needed
-
-### Performance Issues
-
-1. Enable debug mode: `http://localhost:8000?debug=1`
-2. Check cache hit rate (should be >90%)
-3. Monitor IndexedDB usage in DevTools
-4. Clear old data: Settings → Clear browsing data
-
-For detailed architecture docs, see `ui/ARCHITECTURE.md`.
+- `specs/` — Per-tool and subsystem specs using the [spEARS methodology](SPEARS.md)
+- [AGENTS.md](AGENTS.md) — Agent architecture and conventions
