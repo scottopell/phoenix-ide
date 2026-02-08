@@ -3568,15 +3568,9 @@ html * {
   padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
 }
 
-.new-conv-input-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-}
-
 .new-conv-textarea-mobile {
-  flex: 1;
-  padding: 10px 12px;
+  width: 100%;
+  padding: 12px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -3584,9 +3578,10 @@ html * {
   font-size: 16px;
   font-family: inherit;
   resize: none;
-  min-height: 44px;
-  max-height: 120px;
-  line-height: 1.4;
+  min-height: 60px;
+  max-height: 150px;
+  line-height: 1.5;
+  box-sizing: border-box;
 }
 
 .new-conv-textarea-mobile:focus {
@@ -3596,6 +3591,13 @@ html * {
 
 .new-conv-textarea-mobile::placeholder {
   color: var(--text-tertiary);
+}
+
+.new-conv-input-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
 }
 
 /* Responsive visibility helpers */
@@ -3641,14 +3643,15 @@ html * {
   }
   
   .new-conv-bottom-input .new-conv-input-left {
-    flex: 0 0 auto;
     display: flex;
     align-items: center;
+    gap: 4px;
   }
   
   .new-conv-bottom-input .new-conv-send {
     min-height: 44px;
-    padding: 10px 16px;
+    padding: 10px 20px;
+    font-size: 14px;
   }
 }
 

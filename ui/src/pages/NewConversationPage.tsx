@@ -354,25 +354,25 @@ export function NewConversationPage() {
       {/* Mobile: bottom-anchored input */}
       <div className="new-conv-bottom-input mobile-only">
         <ImageAttachments images={images} onRemove={(i) => setImages(images.filter((_, idx) => idx !== i))} />
+        <textarea
+          ref={textareaMobileRef}
+          className="new-conv-textarea-mobile"
+          placeholder="What would you like to work on?"
+          rows={2}
+          value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
+          }}
+          onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          disabled={creating}
+        />
         <div className="new-conv-input-row">
           <div className="new-conv-input-left">
             <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
             {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
           </div>
-          <textarea
-            ref={textareaMobileRef}
-            className="new-conv-textarea-mobile"
-            placeholder="What would you like to work on?"
-            rows={2}
-            value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
-            onChange={(e) => {
-              setDraft(e.target.value);
-              if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
-            }}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            disabled={creating}
-          />
           <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>
             {buttonText}
           </button>
