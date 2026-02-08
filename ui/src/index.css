@@ -1393,6 +1393,10 @@ pre:hover .copy-btn {
   background: rgba(63, 185, 80, 0.1);
 }
 
+.subagent-item.completed.error {
+  background: rgba(248, 81, 73, 0.1);
+}
+
 .subagent-icon {
   width: 20px;
   height: 20px;
@@ -1404,6 +1408,10 @@ pre:hover .copy-btn {
 
 .subagent-item.completed .subagent-icon {
   color: var(--accent-green);
+}
+
+.subagent-item.completed.error .subagent-icon {
+  color: var(--accent-red);
 }
 
 .subagent-item.pending .subagent-icon .spinner {

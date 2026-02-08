@@ -58,7 +58,7 @@ export function getStateDescription(convState: string, stateData: ConversationSt
       return remaining > 0 ? `${tool} (+${remaining} queued)` : tool;
     }
     case 'awaiting_sub_agents': {
-      const pending = stateData?.pending_ids?.length ?? 0;
+      const pending = stateData?.pending?.length ?? 0;
       const completed = stateData?.completed_results?.length ?? 0;
       const total = pending + completed;
       if (completed > 0) {

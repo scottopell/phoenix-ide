@@ -2,7 +2,7 @@
 
 use crate::db::{ErrorKind, ImageData, ToolResult};
 use crate::llm::{ContentBlock, Usage};
-use crate::state_machine::state::{SubAgentOutcome, ToolCall};
+use crate::state_machine::state::{PendingSubAgent, SubAgentOutcome, ToolCall};
 
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
@@ -55,8 +55,8 @@ pub enum Event {
         tool_use_id: String,
         /// Normal tool result for LLM context
         result: ToolResult,
-        /// IDs of spawned sub-agent conversations
-        agent_ids: Vec<String>,
+        /// Spawned sub-agents with their tasks
+        spawned: Vec<PendingSubAgent>,
     },
     /// A sub-agent has completed (success or failure)
     SubAgentResult {

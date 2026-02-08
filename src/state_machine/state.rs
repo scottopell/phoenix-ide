@@ -252,7 +252,7 @@ pub enum ConvState {
         persisted_tool_ids: HashSet<String>,
         /// Sub-agents spawned during this tool execution phase
         #[serde(default)]
-        pending_sub_agents: Vec<String>,
+        pending_sub_agents: Vec<PendingSubAgent>,
     },
 
     /// User requested cancellation of LLM request, waiting for response to discard
@@ -270,14 +270,16 @@ pub enum ConvState {
 
     /// Waiting for sub-agents to complete
     AwaitingSubAgents {
-        pending_ids: Vec<String>,
+        /// Sub-agents still running (id + task co-located)
+        pending: Vec<PendingSubAgent>,
         #[serde(default)]
         completed_results: Vec<SubAgentResult>,
     },
 
     /// User requested cancellation while waiting for sub-agents
     CancellingSubAgents {
-        pending_ids: Vec<String>,
+        /// Sub-agents still running (id + task co-located)
+        pending: Vec<PendingSubAgent>,
         #[serde(default)]
         completed_results: Vec<SubAgentResult>,
     },
@@ -326,6 +328,13 @@ pub enum SubAgentOutcome {
         error: String,
         error_kind: ErrorKind,
     },
+}
+
+/// A sub-agent that is still running
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingSubAgent {
+    pub agent_id: String,
+    pub task: String,
 }
 
 /// Result from a completed sub-agent

@@ -7,7 +7,7 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::state::SubAgentResult;
+use super::state::{PendingSubAgent, SubAgentResult};
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
@@ -387,9 +387,8 @@ pub fn transition(
             && remaining_tools.is_empty()
             && !pending_sub_agents.is_empty() =>
         {
-            let pending_count = pending_sub_agents.len();
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
-                pending_ids: pending_sub_agents.clone(),
+                pending: pending_sub_agents.clone(),
                 completed_results: vec![],
             })
             .with_effect(Effect::persist_tool_message(
@@ -399,7 +398,7 @@ pub fn transition(
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
-            .with_effect(notify_awaiting_sub_agents(pending_count, 0)))
+            .with_effect(notify_awaiting_sub_agents(pending_sub_agents, &[])))
         }
 
         // ToolExecuting + SpawnAgentsComplete (more tools) -> ToolExecuting (accumulate agents)
@@ -413,7 +412,7 @@ pub fn transition(
             Event::SpawnAgentsComplete {
                 tool_use_id,
                 result,
-                agent_ids,
+                spawned,
             },
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_persisted = persisted_tool_ids.clone();
@@ -421,7 +420,7 @@ pub fn transition(
             let completed_count = new_persisted.len();
 
             let mut new_pending = pending_sub_agents.clone();
-            new_pending.extend(agent_ids);
+            new_pending.extend(spawned);
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
@@ -460,15 +459,14 @@ pub fn transition(
             Event::SpawnAgentsComplete {
                 tool_use_id,
                 result,
-                agent_ids,
+                spawned,
             },
         ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
             let mut all_pending = pending_sub_agents.clone();
-            all_pending.extend(agent_ids);
-            let pending_count = all_pending.len();
+            all_pending.extend(spawned);
 
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
-                pending_ids: all_pending,
+                pending: all_pending.clone(),
                 completed_results: vec![],
             })
             .with_effect(Effect::persist_tool_message(
@@ -478,7 +476,7 @@ pub fn transition(
                 result.display_data(),
             ))
             .with_effect(Effect::PersistState)
-            .with_effect(notify_awaiting_sub_agents(pending_count, 0)))
+            .with_effect(notify_awaiting_sub_agents(&all_pending, &[])))
         }
 
         // ============================================================
@@ -509,18 +507,19 @@ pub fn transition(
         // AwaitingSubAgents + UserCancel -> CancellingSubAgents
         (
             ConvState::AwaitingSubAgents {
-                pending_ids,
+                pending,
                 completed_results,
             },
             Event::UserCancel,
-        ) => Ok(TransitionResult::new(ConvState::CancellingSubAgents {
-            pending_ids: pending_ids.clone(),
-            completed_results: completed_results.clone(),
-        })
-        .with_effect(Effect::CancelSubAgents {
-            ids: pending_ids.clone(),
-        })
-        .with_effect(Effect::PersistState)),
+        ) => {
+            let ids: Vec<String> = pending.iter().map(|p| p.agent_id.clone()).collect();
+            Ok(TransitionResult::new(ConvState::CancellingSubAgents {
+                pending: pending.clone(),
+                completed_results: completed_results.clone(),
+            })
+            .with_effect(Effect::CancelSubAgents { ids })
+            .with_effect(Effect::PersistState))
+        }
 
         // ToolExecuting + UserCancel -> CancellingTool (parent) or Failed (sub-agent)
         (
@@ -544,9 +543,11 @@ pub fn transition(
 
             // Also cancel any already-spawned sub-agents
             if !pending_sub_agents.is_empty() {
-                result = result.with_effect(Effect::CancelSubAgents {
-                    ids: pending_sub_agents.clone(),
-                });
+                let ids: Vec<String> = pending_sub_agents
+                    .iter()
+                    .map(|p| p.agent_id.clone())
+                    .collect();
+                result = result.with_effect(Effect::CancelSubAgents { ids });
             }
 
             Ok(result)
@@ -628,45 +629,57 @@ pub fn transition(
         // AwaitingSubAgents + SubAgentResult (more pending) -> AwaitingSubAgents
         (
             ConvState::AwaitingSubAgents {
-                pending_ids,
+                pending,
                 completed_results,
             },
             Event::SubAgentResult { agent_id, outcome },
-        ) if pending_ids.contains(&agent_id) && pending_ids.len() > 1 => {
-            let new_pending: Vec<_> = pending_ids
+        ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
+            // Find the completed agent's task and remove it from pending
+            let task = pending
                 .iter()
-                .filter(|id| *id != &agent_id)
+                .find(|p| p.agent_id == agent_id)
+                .map(|p| p.task.clone())
+                .unwrap_or_default();
+            let new_pending: Vec<_> = pending
+                .iter()
+                .filter(|p| p.agent_id != agent_id)
                 .cloned()
                 .collect();
             let mut new_results = completed_results.clone();
             new_results.push(SubAgentResult {
                 agent_id,
-                task: String::new(), // Task is stored elsewhere
+                task,
                 outcome,
             });
-            let pending_count = new_pending.len();
-            let completed_count = new_results.len();
+
+            // Build notification before moving values into state
+            let notify = notify_awaiting_sub_agents(&new_pending, &new_results);
 
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
-                pending_ids: new_pending,
+                pending: new_pending,
                 completed_results: new_results,
             })
             .with_effect(Effect::PersistState)
-            .with_effect(notify_awaiting_sub_agents(pending_count, completed_count)))
+            .with_effect(notify))
         }
 
         // AwaitingSubAgents + SubAgentResult (last one) -> LlmRequesting
         (
             ConvState::AwaitingSubAgents {
-                pending_ids,
+                pending,
                 completed_results,
             },
             Event::SubAgentResult { agent_id, outcome },
-        ) if pending_ids.contains(&agent_id) && pending_ids.len() == 1 => {
+        ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
+            let task = pending
+                .iter()
+                .find(|p| p.agent_id == agent_id)
+                .map(|p| p.task.clone())
+                .unwrap_or_default();
             let mut new_results = completed_results.clone();
             new_results.push(SubAgentResult {
                 agent_id,
-                task: String::new(),
+                task,
                 outcome,
             });
 
@@ -684,25 +697,30 @@ pub fn transition(
         // CancellingSubAgents + SubAgentResult (more pending) -> CancellingSubAgents
         (
             ConvState::CancellingSubAgents {
-                pending_ids,
+                pending,
                 completed_results,
             },
             Event::SubAgentResult { agent_id, outcome },
-        ) if pending_ids.contains(&agent_id) && pending_ids.len() > 1 => {
-            let new_pending: Vec<_> = pending_ids
+        ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
+            let task = pending
                 .iter()
-                .filter(|id| *id != &agent_id)
+                .find(|p| p.agent_id == agent_id)
+                .map(|p| p.task.clone())
+                .unwrap_or_default();
+            let new_pending: Vec<_> = pending
+                .iter()
+                .filter(|p| p.agent_id != agent_id)
                 .cloned()
                 .collect();
             let mut new_results = completed_results.clone();
             new_results.push(SubAgentResult {
                 agent_id,
-                task: String::new(),
+                task,
                 outcome,
             });
 
             Ok(TransitionResult::new(ConvState::CancellingSubAgents {
-                pending_ids: new_pending,
+                pending: new_pending,
                 completed_results: new_results,
             })
             .with_effect(Effect::PersistState))
@@ -710,9 +728,9 @@ pub fn transition(
 
         // CancellingSubAgents + SubAgentResult (last one) -> Idle
         (
-            ConvState::CancellingSubAgents { pending_ids, .. },
+            ConvState::CancellingSubAgents { pending, .. },
             Event::SubAgentResult { agent_id, .. },
-        ) if pending_ids.contains(&agent_id) && pending_ids.len() == 1 => {
+        ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -815,12 +833,12 @@ fn notify_tool_executing(
 }
 
 /// Helper to create `state_change` notification for `AwaitingSubAgents`
-fn notify_awaiting_sub_agents(pending_count: usize, completed_count: usize) -> Effect {
+fn notify_awaiting_sub_agents(pending: &[PendingSubAgent], completed: &[SubAgentResult]) -> Effect {
     Effect::notify_state_change(
         "awaiting_sub_agents",
         json!({
-            "pending_count": pending_count,
-            "completed_count": completed_count
+            "pending": pending,
+            "completed_results": completed
         }),
     )
 }

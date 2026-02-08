@@ -1242,6 +1242,14 @@ fn arb_sub_agent_outcome() -> impl Strategy<Value = SubAgentOutcome> {
     ]
 }
 
+/// Helper to create PendingSubAgent from id string
+fn pending_agent(id: &str) -> PendingSubAgent {
+    PendingSubAgent {
+        agent_id: id.to_string(),
+        task: format!("Task for {id}"),
+    }
+}
+
 /// Fan-in conservation: pending + completed = constant
 proptest! {
     #[test]
@@ -1249,8 +1257,9 @@ proptest! {
         initial_ids in proptest::collection::vec("[a-z]{8}", 1..5),
     ) {
     let n = initial_ids.len();
+    let initial_pending: Vec<PendingSubAgent> = initial_ids.iter().map(|id| pending_agent(id)).collect();
     let mut state = ConvState::AwaitingSubAgents {
-        pending_ids: initial_ids.clone(),
+        pending: initial_pending,
         completed_results: vec![],
     };
 
@@ -1269,10 +1278,10 @@ proptest! {
         // Check conservation at each step
         match &state {
             ConvState::AwaitingSubAgents {
-                pending_ids,
+                pending,
                 completed_results,
             } => {
-                prop_assert_eq!(pending_ids.len() + completed_results.len(), n);
+                prop_assert_eq!(pending.len() + completed_results.len(), n);
             }
             ConvState::LlmRequesting { .. } => {
                 // Terminal - all collected
@@ -1292,8 +1301,9 @@ proptest! {
     fn prop_pending_decreases_monotonically(
         initial_ids in proptest::collection::vec("[a-z]{8}", 2..5),
     ) {
+    let initial_pending: Vec<PendingSubAgent> = initial_ids.iter().map(|id| pending_agent(id)).collect();
     let mut state = ConvState::AwaitingSubAgents {
-        pending_ids: initial_ids.clone(),
+        pending: initial_pending,
         completed_results: vec![],
     };
     let mut prev_pending = initial_ids.len();
@@ -1308,9 +1318,9 @@ proptest! {
 
         state = transition(&state, &test_context(), event).unwrap().new_state;
 
-        if let ConvState::AwaitingSubAgents { pending_ids, .. } = &state {
-            prop_assert!(pending_ids.len() < prev_pending);
-            prev_pending = pending_ids.len();
+        if let ConvState::AwaitingSubAgents { pending, .. } = &state {
+            prop_assert!(pending.len() < prev_pending);
+            prev_pending = pending.len();
         }
     }
     }
@@ -1323,8 +1333,9 @@ proptest! {
         pending_ids in proptest::collection::vec("[a-z]{8}", 1..3),
         unknown_id in "[A-Z]{8}", // Different pattern to ensure no overlap
     ) {
+    let pending: Vec<PendingSubAgent> = pending_ids.iter().map(|id| pending_agent(id)).collect();
     let state = ConvState::AwaitingSubAgents {
-        pending_ids,
+        pending,
         completed_results: vec![],
     };
 
@@ -1347,8 +1358,9 @@ proptest! {
         agent_ids in proptest::collection::vec("[a-z]{8}", 1..4),
         outcome in arb_sub_agent_outcome(),
     ) {
+    let pending: Vec<PendingSubAgent> = agent_ids.iter().map(|id| pending_agent(id)).collect();
     let mut state = ConvState::AwaitingSubAgents {
-        pending_ids: agent_ids.clone(),
+        pending,
         completed_results: vec![],
     };
 
@@ -1379,8 +1391,9 @@ proptest! {
     fn prop_awaiting_cancel_goes_to_cancelling(
         pending_ids in proptest::collection::vec("[a-z]{8}", 1..4),
     ) {
+    let pending: Vec<PendingSubAgent> = pending_ids.iter().map(|id| pending_agent(id)).collect();
     let state = ConvState::AwaitingSubAgents {
-        pending_ids: pending_ids.clone(),
+        pending: pending.clone(),
         completed_results: vec![],
     };
 
@@ -1388,10 +1401,10 @@ proptest! {
 
     match result.new_state {
         ConvState::CancellingSubAgents {
-            pending_ids: new_pending,
+            pending: new_pending,
             ..
         } => {
-            prop_assert_eq!(new_pending, pending_ids);
+            prop_assert_eq!(new_pending, pending);
         }
         _ => prop_assert!(false, "Expected CancellingSubAgents"),
     }
@@ -1411,8 +1424,9 @@ proptest! {
     fn prop_cancelling_collects_until_done(
         initial_ids in proptest::collection::vec("[a-z]{8}", 2..4),
     ) {
+    let pending: Vec<PendingSubAgent> = initial_ids.iter().map(|id| pending_agent(id)).collect();
     let mut state = ConvState::CancellingSubAgents {
-        pending_ids: initial_ids.clone(),
+        pending,
         completed_results: vec![],
     };
 
@@ -1453,7 +1467,16 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
         ),
         remaining_tools: vec![],
         persisted_tool_ids: HashSet::new(),
-        pending_sub_agents: vec!["agent-1".to_string(), "agent-2".to_string()],
+        pending_sub_agents: vec![
+            PendingSubAgent {
+                agent_id: "agent-1".to_string(),
+                task: "Task 1".to_string(),
+            },
+            PendingSubAgent {
+                agent_id: "agent-2".to_string(),
+                task: "Task 2".to_string(),
+            },
+        ],
     };
 
     let event = Event::ToolComplete {
@@ -1470,8 +1493,10 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     let result = transition(&state, &test_context(), event).unwrap();
 
     match result.new_state {
-        ConvState::AwaitingSubAgents { pending_ids, .. } => {
-            assert_eq!(pending_ids, vec!["agent-1", "agent-2"]);
+        ConvState::AwaitingSubAgents { pending, .. } => {
+            assert_eq!(pending.len(), 2);
+            assert_eq!(pending[0].agent_id, "agent-1");
+            assert_eq!(pending[1].agent_id, "agent-2");
         }
         _ => panic!("Expected AwaitingSubAgents, got {:?}", result.new_state),
     }
@@ -1496,7 +1521,10 @@ fn test_spawn_agents_complete_accumulates_ids() {
             }),
         )],
         persisted_tool_ids: HashSet::new(),
-        pending_sub_agents: vec!["existing-agent".to_string()],
+        pending_sub_agents: vec![PendingSubAgent {
+            agent_id: "existing-agent".to_string(),
+            task: "Existing task".to_string(),
+        }],
     };
 
     let event = Event::SpawnAgentsComplete {
@@ -1508,7 +1536,16 @@ fn test_spawn_agents_complete_accumulates_ids() {
             is_error: false,
             display_data: None,
         },
-        agent_ids: vec!["new-agent-1".to_string(), "new-agent-2".to_string()],
+        spawned: vec![
+            PendingSubAgent {
+                agent_id: "new-agent-1".to_string(),
+                task: "New task 1".to_string(),
+            },
+            PendingSubAgent {
+                agent_id: "new-agent-2".to_string(),
+                task: "New task 2".to_string(),
+            },
+        ],
     };
 
     let result = transition(&state, &test_context(), event).unwrap();
@@ -1520,10 +1557,10 @@ fn test_spawn_agents_complete_accumulates_ids() {
             ..
         } => {
             assert_eq!(current_tool.id, "t2");
-            assert_eq!(
-                pending_sub_agents,
-                vec!["existing-agent", "new-agent-1", "new-agent-2"]
-            );
+            assert_eq!(pending_sub_agents.len(), 3);
+            assert_eq!(pending_sub_agents[0].agent_id, "existing-agent");
+            assert_eq!(pending_sub_agents[1].agent_id, "new-agent-1");
+            assert_eq!(pending_sub_agents[2].agent_id, "new-agent-2");
         }
         _ => panic!("Expected ToolExecuting, got {:?}", result.new_state),
     }

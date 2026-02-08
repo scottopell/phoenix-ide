@@ -196,7 +196,7 @@ where
     /// 2. Send spawn requests to `RuntimeManager` for each task
     /// 3. Return `SpawnAgentsComplete` event
     async fn handle_spawn_agents_tool(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
-        use crate::state_machine::state::{SpawnAgentsInput, SubAgentSpec};
+        use crate::state_machine::state::{PendingSubAgent, SpawnAgentsInput, SubAgentSpec};
 
         let tool_use_id = tool.id.clone();
         let input_value = tool.input.to_value();
@@ -226,14 +226,17 @@ where
         }
 
         // Generate agent IDs and prepare spawn specs
-        let mut agent_ids = Vec::new();
+        let mut spawned = Vec::new();
         let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
 
         for task in &input.tasks {
             let agent_id = uuid::Uuid::new_v4().to_string();
             let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
 
-            agent_ids.push(agent_id.clone());
+            spawned.push(PendingSubAgent {
+                agent_id: agent_id.clone(),
+                task: task.task.clone(),
+            });
 
             // Send spawn request to RuntimeManager
             if let Some(spawn_tx) = &self.spawn_tx {
@@ -274,9 +277,10 @@ where
         }
 
         // Build success result
+        let agent_ids: Vec<&str> = spawned.iter().map(|p| p.agent_id.as_str()).collect();
         let output = format!(
             "Spawning {} sub-agent(s): {}",
-            agent_ids.len(),
+            spawned.len(),
             agent_ids.join(", ")
         );
         let result = ToolResult {
@@ -291,7 +295,7 @@ where
         Ok(Some(Event::SpawnAgentsComplete {
             tool_use_id,
             result,
-            agent_ids,
+            spawned,
         }))
     }
 

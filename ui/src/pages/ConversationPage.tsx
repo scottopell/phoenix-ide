@@ -85,7 +85,7 @@ export function ConversationPage() {
       }
 
       if (state === 'awaiting_sub_agents') {
-        const pending = data?.pending_ids?.length ?? 0;
+        const pending = data?.pending?.length ?? 0;
         const completed = data?.completed_results?.length ?? 0;
         const total = pending + completed;
         const label = `sub-agents (${completed}/${total})`;

@@ -12,13 +12,32 @@ export interface Conversation {
   archived?: boolean;
 }
 
+export interface PendingSubAgent {
+  agent_id: string;
+  task: string;
+}
+
+export interface SubAgentOutcome {
+  type: 'success' | 'failure';
+  result?: string;
+  error?: string;
+  error_kind?: string;
+}
+
+export interface SubAgentResult {
+  agent_id: string;
+  task: string;
+  outcome: SubAgentOutcome;
+}
+
 export interface ConversationState {
   type: string;
   attempt?: number;
   current_tool?: ToolCall;
   remaining_tools?: ToolCall[];
-  pending_ids?: string[];
-  completed_results?: unknown[];
+  // Sub-agent state
+  pending?: PendingSubAgent[];
+  completed_results?: SubAgentResult[];
   message?: string;
 }
 

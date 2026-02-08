@@ -17,7 +17,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { Message, ContentBlock, ToolResultContent, ConversationState } from '../api';
+import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult } from '../api';
 import type { QueuedMessage } from '../hooks';
 import { escapeHtml } from '../utils';
 import { CopyButton } from './CopyButton';
@@ -386,33 +386,54 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
 // Sub-Agent Status
 // ============================================================================
 
+/** Truncate text with ellipsis */
+function truncateTask(text: string, maxLen = 60): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 1) + '…';
+}
+
+/** Get display info for a completed result */
+function getResultDisplay(result: SubAgentResult): { icon: string; status: string; isError: boolean } {
+  if (result.outcome.type === 'success') {
+    return { icon: '✓', status: 'completed', isError: false };
+  }
+  return { icon: '✗', status: 'failed', isError: true };
+}
+
 export function SubAgentStatus({ stateData }: { stateData: ConversationState }) {
-  const pending = stateData.pending_ids?.length ?? 0;
-  const completed = stateData.completed_results?.length ?? 0;
-  const total = pending + completed;
+  const pending = stateData.pending ?? [];
+  const completed = stateData.completed_results ?? [];
+  const total = pending.length + completed.length;
 
   return (
     <div className="subagent-status-block">
       <div className="subagent-header">
         <span className="subagent-title">Sub-agents</span>
         <span className="subagent-count">
-          {completed}/{total}
+          {completed.length}/{total}
         </span>
       </div>
       <div className="subagent-list">
-        {Array.from({ length: completed }).map((_, i) => (
-          <div key={`completed-${i}`} className="subagent-item completed">
-            <span className="subagent-icon">✓</span>
-            <span className="subagent-label">Sub-agent {i + 1}</span>
-            <span className="subagent-status">completed</span>
-          </div>
-        ))}
-        {Array.from({ length: pending }).map((_, i) => (
-          <div key={`pending-${i}`} className="subagent-item pending">
+        {completed.map((result) => {
+          const { icon, status, isError } = getResultDisplay(result);
+          return (
+            <div key={result.agent_id} className={`subagent-item completed ${isError ? 'error' : ''}`}>
+              <span className="subagent-icon">{icon}</span>
+              <span className="subagent-label" title={result.task}>
+                {truncateTask(result.task)}
+              </span>
+              <span className="subagent-status">{status}</span>
+            </div>
+          );
+        })}
+        {pending.map((agent) => (
+          <div key={agent.agent_id} className="subagent-item pending">
             <span className="subagent-icon">
               <span className="spinner"></span>
             </span>
-            <span className="subagent-label">Sub-agent {completed + i + 1}</span>
+            <span className="subagent-label" title={agent.task}>
+              {truncateTask(agent.task)}
+            </span>
             <span className="subagent-status">running...</span>
           </div>
         ))}
