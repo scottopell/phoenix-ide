@@ -3,7 +3,7 @@
 //! UX layer to catch common LLM mistakes before execution.
 //! NOT a security boundary - just helpful guardrails.
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 /// Error returned when a command is blocked
 #[derive(Debug)]
@@ -19,21 +19,120 @@ impl std::fmt::Display for CheckError {
 
 impl std::error::Error for CheckError {}
 
-/// Check a bash script for potentially dangerous patterns.
-/// Returns Ok(()) if safe to run, Err with helpful message if blocked.
-pub fn check(script: &str) -> Result<(), CheckError> {
+/// Parse a bash script into a tree-sitter AST.
+fn parse_script(script: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .map_err(|e| CheckError {
-            message: format!("Failed to set parser language: {e}"),
-        })?;
+        .ok()?;
+    parser.parse(script, None)
+}
 
-    let tree = parser.parse(script, None).ok_or_else(|| CheckError {
+/// Check a bash script for potentially dangerous patterns.
+/// Returns Ok(()) if safe to run, Err with helpful message if blocked.
+pub fn check(script: &str) -> Result<(), CheckError> {
+    let tree = parse_script(script).ok_or_else(|| CheckError {
         message: "Failed to parse script".into(),
     })?;
 
     check_node(tree.root_node(), script.as_bytes())
+}
+
+/// Extract the "interesting" part of a bash command for display purposes.
+///
+/// LLMs commonly emit commands like `cd /path && actual_command`. For UI display,
+/// we want to show `actual_command` since the `cd` prefix is boilerplate.
+///
+/// This uses tree-sitter to properly parse the command structure rather than
+/// fragile regex matching.
+///
+/// Examples:
+/// - `cd /foo && cargo test` -> `cargo test`
+/// - `cd /foo; npm build` -> `npm build`
+/// - `cd /a; cd /b && cmd` -> `cmd`
+/// - `cargo test` -> `cargo test` (unchanged)
+/// - `cd /foo` -> `cd /foo` (no follow-up command)
+pub fn display_command(script: &str) -> &str {
+    let Some(tree) = parse_script(script) else {
+        return script;
+    };
+
+    // Find the last non-cd command in the script
+    let source = script.as_bytes();
+    if let Some(interesting) = find_interesting_command(tree.root_node(), source) {
+        interesting
+    } else {
+        script
+    }
+}
+
+/// Recursively find the last non-cd command in the AST.
+/// Returns the text slice of that command.
+fn find_interesting_command<'a>(node: Node, source: &'a [u8]) -> Option<&'a str> {
+    let kind = node.kind();
+
+    // For a "list" (commands joined by && or ||), check children right-to-left
+    // to find the last interesting command
+    if kind == "list" {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            if let Some(result) = find_interesting_command(child, source) {
+                return Some(result);
+            }
+        }
+        return None;
+    }
+
+    // For a "program" (the root), check children left-to-right but prefer
+    // later non-cd commands over earlier ones
+    if kind == "program" {
+        let mut cursor = node.walk();
+        let mut last_interesting: Option<&str> = None;
+        for child in node.children(&mut cursor) {
+            if let Some(result) = find_interesting_command(child, source) {
+                last_interesting = Some(result);
+            }
+        }
+        return last_interesting;
+    }
+
+    // For a command, check if it's a "cd" command
+    if kind == "command" {
+        if is_cd_command(node, source) {
+            return None;
+        }
+        // This is an interesting command - return its text
+        return node.utf8_text(source).ok();
+    }
+
+    // For pipelines, return the whole pipeline text (it's interesting)
+    if kind == "pipeline" {
+        return node.utf8_text(source).ok();
+    }
+
+    // For other node types, recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(result) = find_interesting_command(child, source) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Check if a command node is a `cd` command
+fn is_cd_command(node: Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "command_name" {
+            if let Ok(text) = child.utf8_text(source) {
+                return text == "cd";
+            }
+        }
+    }
+    false
 }
 
 /// Recursively check all nodes in the AST
@@ -467,5 +566,66 @@ mod tests {
     #[test]
     fn test_comment_only() {
         assert!(check("# this is a comment").is_ok());
+    }
+
+    // ==================== Display Command Tests ====================
+
+    #[test]
+    fn test_display_strips_cd_and() {
+        assert_eq!(display_command("cd /foo && cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn test_display_strips_cd_semicolon() {
+        assert_eq!(display_command("cd /foo; npm build"), "npm build");
+    }
+
+    #[test]
+    fn test_display_strips_chained_cds() {
+        assert_eq!(display_command("cd /a; cd /b && cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn test_display_no_cd_unchanged() {
+        assert_eq!(
+            display_command("cargo test --release"),
+            "cargo test --release"
+        );
+    }
+
+    #[test]
+    fn test_display_cd_only_unchanged() {
+        // If there's only a cd with no follow-up, show the whole thing
+        assert_eq!(display_command("cd /foo"), "cd /foo");
+    }
+
+    #[test]
+    fn test_display_complex_chain() {
+        // cd /path && actual && more -> shows the last interesting command
+        assert_eq!(
+            display_command("cd /path && echo hello && ls -la"),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn test_display_with_pipes() {
+        assert_eq!(
+            display_command("cd /foo && cat file.txt | grep pattern"),
+            "cat file.txt | grep pattern"
+        );
+    }
+
+    #[test]
+    fn test_display_empty() {
+        assert_eq!(display_command(""), "");
+    }
+
+    #[test]
+    fn test_display_multiple_semicolon_cds() {
+        assert_eq!(
+            display_command("cd /a; cd /b; cd /c; actual_command arg"),
+            "actual_command arg"
+        );
     }
 }

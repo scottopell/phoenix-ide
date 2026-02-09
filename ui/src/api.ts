@@ -69,6 +69,8 @@ export interface ContentBlock {
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  /** For bash tool_use blocks, the cleaned display command (cd prefix stripped) */
+  display?: string;
 }
 
 export interface ToolResultContent {

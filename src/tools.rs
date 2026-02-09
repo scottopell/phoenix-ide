@@ -3,7 +3,7 @@
 //! REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 
 mod bash;
-mod bash_check;
+pub mod bash_check;
 pub mod browser;
 mod keyword_search;
 pub mod patch;

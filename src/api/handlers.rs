@@ -15,6 +15,7 @@ use crate::db::{ImageData, Message, MessageContent, MessageType};
 use crate::llm::ContentBlock;
 use crate::runtime::SseEvent;
 use crate::state_machine::Event;
+use crate::tools::bash_check::display_command;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -83,6 +84,64 @@ pub fn create_router(state: AppState) -> Router {
         // Version
         .route("/version", get(get_version))
         .with_state(state)
+}
+
+// ============================================================
+// Message Transformation
+// ============================================================
+
+/// Transform a message for API output, enriching bash `tool_use` blocks with display info.
+///
+/// For bash commands like `cd /path && cargo test`, the LLM emits the full command,
+/// but for UI display we want to show just `cargo test`. This adds a `display` field
+/// to bash `tool_use` blocks with the cleaned-up command.
+fn enrich_message_for_api(msg: &Message) -> Value {
+    let mut json = serde_json::to_value(msg).unwrap_or(Value::Null);
+
+    // Only process agent messages (which contain tool_use blocks)
+    if msg.message_type != MessageType::Agent {
+        return json;
+    }
+
+    enrich_message_json(&mut json);
+    json
+}
+
+/// Enrich an already-serialized message JSON with bash display info.
+/// Used for SSE streaming where messages come pre-serialized.
+pub(super) fn enrich_message_json(json: &mut Value) {
+    // Only process if this looks like an agent message
+    if json.get("message_type").and_then(|t| t.as_str()) != Some("agent") {
+        return;
+    }
+
+    // Get mutable access to the content array
+    if let Some(content) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for block in content.iter_mut() {
+            // Check if this is a bash tool_use block
+            let is_bash = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && block.get("name").and_then(|n| n.as_str()) == Some("bash");
+
+            if !is_bash {
+                continue;
+            }
+
+            // Extract the command from input (need to clone to avoid borrow issues)
+            let command = block
+                .get("input")
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+                .map(ToString::to_string);
+
+            if let Some(command) = command {
+                // Add the display field with the cleaned command
+                let display = display_command(&command).to_string();
+                if let Some(obj) = block.as_object_mut() {
+                    obj.insert("display".to_string(), Value::String(display));
+                }
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -274,10 +333,7 @@ async fn get_conversation(
     }
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_msgs: Vec<Value> = messages
-        .iter()
-        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
-        .collect();
+    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
 
     // Calculate context window from last usage
     let context_window_size = messages
@@ -552,10 +608,7 @@ async fn stream_conversation(
         .next_back()
         .map_or(0, crate::db::UsageData::context_window_used);
 
-    let json_msgs: Vec<Value> = messages
-        .iter()
-        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
-        .collect();
+    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
 
     // Extract breadcrumbs from the last turn
     let breadcrumbs = extract_breadcrumbs(&messages);
@@ -733,10 +786,7 @@ async fn get_by_slug(
         .get_messages(&conversation.id)
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_msgs: Vec<Value> = messages
-        .iter()
-        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
-        .collect();
+    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
 
     let context_window_size = messages
         .iter()

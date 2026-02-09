@@ -2,6 +2,7 @@
 //!
 //! REQ-API-005: Real-time Streaming
 
+use super::handlers::enrich_message_json;
 use crate::runtime::SseEvent;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
@@ -42,25 +43,40 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             last_sequence_id,
             context_window_size,
             breadcrumbs,
-        } => (
-            "init",
-            json!({
-                "type": "init",
-                "conversation": conversation,
-                "messages": messages,
-                "agent_working": agent_working,
-                "last_sequence_id": last_sequence_id,
-                "context_window_size": context_window_size,
-                "breadcrumbs": breadcrumbs
-            }),
-        ),
-        SseEvent::Message { message } => (
-            "message",
-            json!({
-                "type": "message",
-                "message": message
-            }),
-        ),
+        } => {
+            // Enrich all messages with bash display info
+            let enriched_messages: Vec<_> = messages
+                .into_iter()
+                .map(|mut m| {
+                    enrich_message_json(&mut m);
+                    m
+                })
+                .collect();
+            (
+                "init",
+                json!({
+                    "type": "init",
+                    "conversation": conversation,
+                    "messages": enriched_messages,
+                    "agent_working": agent_working,
+                    "last_sequence_id": last_sequence_id,
+                    "context_window_size": context_window_size,
+                    "breadcrumbs": breadcrumbs
+                }),
+            )
+        }
+        SseEvent::Message { message } => {
+            // Enrich single message with bash display info
+            let mut enriched = message;
+            enrich_message_json(&mut enriched);
+            (
+                "message",
+                json!({
+                    "type": "message",
+                    "message": enriched
+                }),
+            )
+        }
         SseEvent::StateChange { state } => (
             "state_change",
             json!({

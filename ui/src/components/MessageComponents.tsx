@@ -43,11 +43,13 @@ export function formatMessageTime(isoStr: string): string {
 // Thresholds for auto-expanding output
 const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 
-function formatToolInput(name: string, input: Record<string, unknown>): { display: string; isMultiline: boolean } {
+function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
   switch (name) {
     case 'bash': {
       const cmd = String(input.command || '');
-      return { display: `$ ${cmd}`, isMultiline: cmd.includes('\n') };
+      // Use server-provided display string if available (has cd prefix stripped)
+      const displayCmd = displayOverride || cmd;
+      return { display: `$ ${displayCmd}`, isMultiline: cmd.includes('\n') };
     }
     case 'think': {
       const thoughts = String(input.thoughts || '');
@@ -285,7 +287,12 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
   const toolId = block.id || '';
 
   // Format the input display based on tool type
-  const { display: inputDisplay, isMultiline: inputIsMultiline } = formatToolInput(name, input as Record<string, unknown>);
+  // For bash, use server-provided display field (has cd prefix stripped)
+  const { display: inputDisplay, isMultiline: inputIsMultiline } = formatToolInput(
+    name,
+    input as Record<string, unknown>,
+    block.display
+  );
 
   // Get the paired result if available
   let resultContent: ToolResultContent | null = null;
