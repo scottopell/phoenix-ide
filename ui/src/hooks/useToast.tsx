@@ -1,5 +1,5 @@
 // useToast.tsx
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import type { ToastMessage, ToastType } from '../components/Toast';
 
 export function useToast() {
@@ -15,14 +15,31 @@ export function useToast() {
     setToasts((prev) => prev.filter(t => t.id !== id));
   }, []);
 
-  return {
+  // Memoize convenience methods to prevent re-renders causing dependency loops
+  const showInfo = useCallback(
+    (message: string, duration?: number) => showToast('info', message, duration),
+    [showToast]
+  );
+  const showWarning = useCallback(
+    (message: string, duration?: number) => showToast('warning', message, duration),
+    [showToast]
+  );
+  const showError = useCallback(
+    (message: string, duration?: number) => showToast('error', message, duration),
+    [showToast]
+  );
+  const showSuccess = useCallback(
+    (message: string, duration?: number) => showToast('success', message, duration),
+    [showToast]
+  );
+
+  return useMemo(() => ({
     toasts,
     showToast,
     dismissToast,
-    // Convenience methods
-    showInfo: (message: string, duration?: number) => showToast('info', message, duration),
-    showWarning: (message: string, duration?: number) => showToast('warning', message, duration),
-    showError: (message: string, duration?: number) => showToast('error', message, duration),
-    showSuccess: (message: string, duration?: number) => showToast('success', message, duration),
-  };
+    showInfo,
+    showWarning,
+    showError,
+    showSuccess,
+  }), [toasts, showToast, dismissToast, showInfo, showWarning, showError, showSuccess]);
 }

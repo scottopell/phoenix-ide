@@ -2,7 +2,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
-use super::assets::{get_index_html, serve_service_worker, serve_static};
+use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
@@ -42,6 +42,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/new", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
+        // Favicon (referenced from index.html)
+        .route("/phoenix.svg", get(serve_favicon))
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
         // Conversation listing (REQ-API-001)

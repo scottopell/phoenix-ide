@@ -47,6 +47,37 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
         .unwrap()
 }
 
+/// Serve the favicon (phoenix.svg)
+pub async fn serve_favicon() -> impl IntoResponse {
+    // Try embedded asset first
+    if let Some(content) = Assets::get("phoenix.svg") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/svg+xml")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .body(Body::from(content.data.to_vec()))
+            .unwrap();
+    }
+
+    // Fallback to filesystem in development
+    let fs_path = PathBuf::from("ui/dist/phoenix.svg");
+    if fs_path.exists() {
+        if let Ok(content) = std::fs::read(&fs_path) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/svg+xml")
+                .header(header::CACHE_CONTROL, "public, max-age=31536000")
+                .body(Body::from(content))
+                .unwrap();
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("Favicon not found"))
+        .unwrap()
+}
+
 /// Serve the service worker file
 pub async fn serve_service_worker() -> impl IntoResponse {
     // Try embedded asset first

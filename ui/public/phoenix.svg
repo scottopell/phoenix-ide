@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Phoenix bird rising - minimalist design -->
+  <defs>
+    <linearGradient id="flame" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="50%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+  </defs>
+  <!-- Body/flame -->
+  <path d="M16 2 C12 8, 8 12, 8 18 C8 24, 12 28, 16 30 C20 28, 24 24, 24 18 C24 12, 20 8, 16 2" fill="url(#flame)"/>
+  <!-- Wing left -->
+  <path d="M8 18 C4 14, 2 10, 4 6 C6 10, 8 14, 10 16" fill="#ea580c" opacity="0.8"/>
+  <!-- Wing right -->
+  <path d="M24 18 C28 14, 30 10, 28 6 C26 10, 24 14, 22 16" fill="#ea580c" opacity="0.8"/>
+</svg>
