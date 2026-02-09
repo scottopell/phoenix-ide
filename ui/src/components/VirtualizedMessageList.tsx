@@ -27,12 +27,6 @@ interface RowData {
   setItemHeight: (index: number, height: number) => void;
 }
 
-// Define proper types for react-window
-interface ListChildComponentProps {
-  index: number;
-  style: CSSProperties;
-  data: RowData;
-}
 
 interface MessageListProps {
   messages: Message[];
@@ -44,7 +38,8 @@ interface MessageListProps {
 }
 
 // Row component extracted to avoid hooks-in-conditional issue
-function RowRenderer({ index, style, data }: ListChildComponentProps) {
+function RowRenderer({ index, style, data: rawData }: { index: number; style: CSSProperties; data: unknown }) {
+  const data = rawData as RowData;
   const item = data.items[index];
   const rowRef = useRef<HTMLDivElement>(null);
   

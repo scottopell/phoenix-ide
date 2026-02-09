@@ -125,7 +125,8 @@ export function ConversationPage() {
           
           const initState = initData.conversation?.state || { type: 'idle' };
           setConvState(initState.type || 'idle');
-          const { type: _, ...initStateData } = initState;
+          const { type: _initType, ...initStateData } = initState;
+          void _initType; // Destructured to extract remaining state data
           setStateData(Object.keys(initStateData).length > 0 ? initStateData as ConversationState : null);
           setAgentWorking(initData.agent_working || false);
           if (initData.context_window_size !== undefined) {
@@ -188,7 +189,8 @@ export function ConversationPage() {
         case 'state_change': {
           const stateChangeData = data as SseStateChangeData;
           const newState = stateChangeData.state?.type || 'idle';
-          const { type, ...rest } = stateChangeData.state || { type: 'idle' };
+          const { type: _stateType, ...rest } = stateChangeData.state || { type: 'idle' };
+          void _stateType; // Used newState above instead
           setConvState(newState);
           setStateData(Object.keys(rest).length > 0 ? rest as ConversationState : null);
           setAgentWorking(!['idle', 'error', 'completed', 'failed'].includes(newState));

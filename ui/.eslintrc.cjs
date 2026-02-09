@@ -14,5 +14,9 @@ module.exports = {
       'warn',
       { allowConstantExport: true },
     ],
+    // Upgrade from warn to error - missing/unstable deps cause infinite loops
+    'react-hooks/exhaustive-deps': 'error',
+    // Rules of hooks catches hooks in non-component functions
+    'react-hooks/rules-of-hooks': 'error',
   },
 }

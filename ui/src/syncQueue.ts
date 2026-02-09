@@ -7,6 +7,9 @@ export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
     switch (op.type) {
       case 'send_message':
+        if (!op.payload.text || !op.payload.localId) {
+          throw new Error('send_message requires text and localId');
+        }
         await api.sendMessage(
           op.conversationId,
           op.payload.text,
@@ -28,6 +31,9 @@ export class SyncQueue {
         break;
       
       case 'rename':
+        if (!op.payload.name) {
+          throw new Error('rename requires name');
+        }
         await api.renameConversation(
           op.conversationId,
           op.payload.name
@@ -35,7 +41,7 @@ export class SyncQueue {
         break;
       
       default:
-        throw new Error(`Unknown operation type: ${(op as any).type}`);
+        throw new Error(`Unknown operation type: ${(op as PendingOperation).type}`);
     }
   }
   

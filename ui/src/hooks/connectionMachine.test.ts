@@ -282,7 +282,7 @@ describe('connectionMachine', () => {
 
     it('BROWSER_ONLINE triggers reconnect from offline', () => {
       // Get to offline state
-      let state: ConnectionMachineState = {
+      const state: ConnectionMachineState = {
         state: 'offline',
         attempt: 5,
         nextRetryMs: 30000,

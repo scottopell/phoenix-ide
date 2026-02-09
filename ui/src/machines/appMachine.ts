@@ -143,7 +143,7 @@ export function transition(
             effects: []
           };
         
-        case 'SYNC_ERROR':
+        case 'SYNC_ERROR': {
           if (state.network === 'offline') {
             // Don't retry if offline
             return {
@@ -178,6 +178,7 @@ export function transition(
               }
             ]
           };
+        }
         
         case 'RETRY_SYNC':
           if (state.network === 'online' && context.pendingOpsCount > 0) {

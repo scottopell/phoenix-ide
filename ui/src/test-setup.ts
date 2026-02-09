@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom';
 
 // Mock IndexedDB for tests
-global.indexedDB = {} as any;
+global.indexedDB = {} as unknown as IDBFactory;
 
 // Mock navigator.storage
 Object.defineProperty(navigator, 'storage', {

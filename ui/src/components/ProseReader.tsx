@@ -184,6 +184,7 @@ function SelectableLine({
   );
 }
 
+
 export function ProseReader({
   filePath,
   rootDir,
@@ -275,6 +276,9 @@ export function ProseReader({
     setAnnotatingLine({ lineNumber, lineContent });
     setNoteInput('');
   }, []);
+
+  // Long press handlers for markdown blocks - call hook at component level
+  const longPressHandlers = useLongPress(handleLongPress);
 
   // Add a note
   const handleAddNote = useCallback(() => {
@@ -413,7 +417,7 @@ export function ProseReader({
             lineCounter++;
             const lineNumber = lineCounter;
             const lineContent = String(children).slice(0, 200);
-            const { start, move, end } = useLongPress(handleLongPress);
+            const { start, move, end } = longPressHandlers;
             const isModified = patchContext?.modifiedLines.has(lineNumber);
             const isHighlightedLine = highlightedLine === lineNumber;
 
@@ -440,7 +444,7 @@ export function ProseReader({
             lineCounter++;
             const lineNumber = lineCounter;
             const lineContent = String(children);
-            const { start, move, end } = useLongPress(handleLongPress);
+            const { start, move, end } = longPressHandlers;
 
             return (
               <h1
@@ -462,7 +466,7 @@ export function ProseReader({
             lineCounter++;
             const lineNumber = lineCounter;
             const lineContent = String(children);
-            const { start, move, end } = useLongPress(handleLongPress);
+            const { start, move, end } = longPressHandlers;
 
             return (
               <h2
@@ -484,7 +488,7 @@ export function ProseReader({
             lineCounter++;
             const lineNumber = lineCounter;
             const lineContent = String(children);
-            const { start, move, end } = useLongPress(handleLongPress);
+            const { start, move, end } = longPressHandlers;
 
             return (
               <h3
@@ -502,7 +506,7 @@ export function ProseReader({
               </h3>
             );
           },
-          code: ({ inline, className, children, ...props }: any) => {
+          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) => {
             const match = /language-(\w+)/.exec(className || '');
             return !inline && match ? (
               <SyntaxHighlighter
@@ -524,7 +528,7 @@ export function ProseReader({
         {content}
       </ReactMarkdown>
     );
-  }, [content, fileType, patchContext?.modifiedLines, highlightedLine, handleLongPress]);
+  }, [content, fileType, patchContext?.modifiedLines, highlightedLine, longPressHandlers]);
 
   // Get file name from path
   const fileName = filePath.split('/').pop() || filePath;
@@ -612,15 +616,18 @@ export function ProseReader({
                     : undefined,
                 },
                 onTouchStart: (e: React.TouchEvent) => {
-                  const { start } = useLongPress(handleLongPress);
                   const lineContent = (content?.split('\n')[lineNumber - 1] || '');
-                  start(e, lineNumber, lineContent);
+                  longPressHandlers.start(e, lineNumber, lineContent);
                 },
+                onTouchMove: longPressHandlers.move,
+                onTouchEnd: longPressHandlers.end,
                 onMouseDown: (e: React.MouseEvent) => {
-                  const { start } = useLongPress(handleLongPress);
                   const lineContent = (content?.split('\n')[lineNumber - 1] || '');
-                  start(e, lineNumber, lineContent);
+                  longPressHandlers.start(e, lineNumber, lineContent);
                 },
+                onMouseMove: longPressHandlers.move,
+                onMouseUp: longPressHandlers.end,
+                onMouseLeave: longPressHandlers.end,
                 ref: (el: HTMLDivElement | null) => {
                   if (el) lineRefs.current.set(lineNumber, el);
                 },

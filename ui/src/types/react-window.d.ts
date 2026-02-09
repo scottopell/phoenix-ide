@@ -1,13 +1,19 @@
 declare module 'react-window' {
-  import { ComponentType, CSSProperties, ReactElement } from 'react';
+  import { ComponentType } from 'react';
+
+  export interface ListChildComponentProps {
+    index: number;
+    style: React.CSSProperties;
+    data: unknown;
+  }
 
   export interface VariableSizeListProps {
-    children: ComponentType<any>;
+    children: ComponentType<ListChildComponentProps>;
     height: number | string;
     itemCount: number;
     itemSize: (index: number) => number;
     width: number | string;
-    itemData?: any;
+    itemData?: unknown;
     overscanCount?: number;
     onScroll?: (props: { scrollOffset: number; scrollDirection: 'forward' | 'backward' }) => void;
   }

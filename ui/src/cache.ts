@@ -6,11 +6,18 @@ import type { Conversation, Message } from './api';
 const DB_NAME = 'phoenix-ide-cache';
 const DB_VERSION = 1;
 
+export interface PendingOperationPayload {
+  text?: string;
+  images?: { data: string; media_type: string }[];
+  localId?: string;
+  name?: string;
+}
+
 export interface PendingOperation {
   id: string;
   type: 'send_message' | 'archive' | 'unarchive' | 'delete' | 'rename';
   conversationId: string;
-  payload: any;
+  payload: PendingOperationPayload;
   createdAt: Date;
   retryCount: number;
   status: 'pending' | 'processing' | 'failed';

@@ -96,6 +96,13 @@ export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderPr
     };
   }, []);
 
+  const stopRecording = useCallback(() => {
+    if (recognitionRef.current) {
+      setState('processing');
+      recognitionRef.current.stop();
+    }
+  }, []);
+
   // Handle escape key and outside click
   useEffect(() => {
     if (state !== 'listening') return;
@@ -119,7 +126,7 @@ export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderPr
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [state]);
+  }, [state, stopRecording]);
 
   const createRecognition = useCallback((): SpeechRecognitionInstance => {
     const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -256,12 +263,6 @@ export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderPr
     }
   }, [createRecognition]);
 
-  const stopRecording = useCallback(() => {
-    if (recognitionRef.current) {
-      setState('processing');
-      recognitionRef.current.stop();
-    }
-  }, []);
 
   const handleButtonClick = useCallback(() => {
     if (state === 'listening') {
