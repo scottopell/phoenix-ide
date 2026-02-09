@@ -41,20 +41,26 @@ interface MessageListProps {
 function RowRenderer({ index, style, data: rawData }: { index: number; style: CSSProperties; data: unknown }) {
   const data = rawData as RowData;
   const item = data.items[index];
-  const rowRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   
-  // Measure height after render
+  // Measure content height after render (not the positioned wrapper)
   useEffect(() => {
-    if (rowRef.current) {
-      const height = rowRef.current.getBoundingClientRect().height;
+    if (contentRef.current) {
+      const height = contentRef.current.getBoundingClientRect().height;
       data.setItemHeight(index, height);
     }
   });
 
   if (!item) return null;
 
+  // Extract positioning from style but don't constrain height
+  // react-window sets: position, top, left, height, width
+  // We keep position/top/left/width but let content determine height
+  const { height: _height, ...positionStyle } = style as CSSProperties & { height?: number };
+
   return (
-    <div ref={rowRef} style={style}>
+    <div style={positionStyle}>
+      <div ref={contentRef}>
       {item.type === 'message' && (() => {
         const msg = item.data as Message;
         const msgType = msg.message_type || msg.type;
@@ -70,6 +76,7 @@ function RowRenderer({ index, style, data: rawData }: { index: number; style: CS
       {item.type === 'subagent' && (
         <SubAgentStatus stateData={item.data as ConversationState} />
       )}
+      </div>
     </div>
   );
 }

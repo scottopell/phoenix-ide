@@ -1,7 +1,7 @@
 ---
 created: 2025-05-30
 priority: p1
-status: ready
+status: done
 ---
 
 # VirtualizedMessageList height cutoff bug
