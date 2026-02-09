@@ -55,11 +55,12 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()['conversation']
 
-    def create_conversation(self, cwd: str) -> dict:
-        """Create new conversation."""
+    def create_conversation(self, cwd: str, text: str, images: list[dict]) -> dict:
+        """Create new conversation with initial message."""
+        import uuid
         resp = self.http.post(
             f"{self.base_url}/api/conversations/new",
-            json={"cwd": cwd}
+            json={"cwd": cwd, "text": text, "images": images, "message_id": str(uuid.uuid4())}
         )
         resp.raise_for_status()
         return resp.json()['conversation']
@@ -269,21 +270,21 @@ def main(message, conversation, directory, images, api_url, timeout, poll_interv
     """
     client = PhoenixClient(api_url)
 
-    # Resolve or create conversation
-    if conversation:
-        conv = client.get_conversation(conversation)
-        click.echo(f"Continuing conversation: {conv.get('slug', conv['id'])}", err=True)
-    else:
-        cwd = directory or os.getcwd()
-        conv = client.create_conversation(cwd)
-        click.echo(f"Created conversation: {conv.get('slug', conv['id'])}", err=True)
-
     # Prepare images
     image_data = [encode_image(path) for path in images]
 
-    # Send message
-    click.echo("Sending message...", err=True)
-    client.send_message(conv['id'], message, image_data)
+    if conversation:
+        conv = client.get_conversation(conversation)
+        click.echo(f"Continuing conversation: {conv.get('slug', conv['id'])}", err=True)
+        # Send message to existing conversation
+        click.echo("Sending message...", err=True)
+        client.send_message(conv['id'], message, image_data)
+    else:
+        cwd = directory or os.getcwd()
+        # Create conversation with initial message
+        click.echo("Sending message...", err=True)
+        conv = client.create_conversation(cwd, message, image_data)
+        click.echo(f"Created conversation: {conv.get('slug', conv['id'])}", err=True)
 
     # Wait for completion (SSE or polling)
     if poll:
