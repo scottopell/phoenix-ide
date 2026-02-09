@@ -168,7 +168,8 @@ impl OpenAIService {
 
         // Add conversation messages
         for msg in &request.messages {
-            messages.push(Self::translate_message(msg));
+            // translate_message may return multiple messages (e.g., tool results need separate messages)
+            messages.extend(Self::translate_message(msg));
         }
 
         // Convert tools
@@ -209,84 +210,98 @@ impl OpenAIService {
         }
     }
 
-    fn translate_message(msg: &LlmMessage) -> OpenAIMessage {
+    /// Translate an LLM message to `OpenAI` format.
+    /// Returns a Vec because tool results need separate messages with role "tool".
+    fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
         };
 
-        // Handle content
-        if msg.content.len() == 1 {
-            // Single content block - use simple string format
-            match &msg.content[0] {
-                ContentBlock::Text { text } => OpenAIMessage {
-                    role: role.to_string(),
-                    content: Some(text.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
+        // Separate content into categories
+        let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_results = Vec::new();
+
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    text_parts.push(text.clone());
+                }
                 ContentBlock::ToolUse { id, name, input } => {
-                    // Convert tool use to tool_calls
-                    OpenAIMessage {
-                        role: role.to_string(),
-                        content: None,
-                        tool_calls: Some(vec![OpenAIToolCall {
-                            id: id.clone(),
-                            r#type: "function".to_string(),
-                            function: OpenAIFunctionCall {
-                                name: name.clone(),
-                                arguments: serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            },
-                        }]),
-                        tool_call_id: None,
-                    }
+                    tool_calls.push(OpenAIToolCall {
+                        id: id.clone(),
+                        r#type: "function".to_string(),
+                        function: OpenAIFunctionCall {
+                            name: name.clone(),
+                            arguments: serde_json::to_string(input)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        },
+                    });
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
                 } => {
-                    // Tool results are sent as separate messages in OpenAI
-                    OpenAIMessage {
-                        role: "tool".to_string(),
-                        content: Some(if *is_error {
-                            format!("Error: {content}")
-                        } else {
-                            content.clone()
-                        }),
-                        tool_calls: None,
-                        tool_call_id: Some(tool_use_id.clone()),
-                    }
+                    tool_results.push((tool_use_id.clone(), content.clone(), *is_error));
                 }
                 ContentBlock::Image { .. } => {
-                    // Images not supported in basic implementation
-                    OpenAIMessage {
-                        role: role.to_string(),
-                        content: Some("[unsupported content]".to_string()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    }
+                    // Images not yet supported
+                    tracing::warn!("Images not supported in OpenAI Chat Completions translation");
                 }
             }
-        } else {
-            // Multiple content blocks - concatenate text
-            let text_parts: Vec<String> = msg
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect();
+        }
 
-            OpenAIMessage {
+        let mut messages = Vec::new();
+
+        // Build message based on what content we have
+        if !text_parts.is_empty() || !tool_calls.is_empty() {
+            let content = if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n"))
+            };
+
+            let tool_calls_opt = if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            };
+
+            messages.push(OpenAIMessage {
                 role: role.to_string(),
-                content: Some(text_parts.join("\n")),
+                content,
+                tool_calls: tool_calls_opt,
+                tool_call_id: None,
+            });
+        }
+
+        // Tool results are separate messages with role "tool"
+        for (tool_use_id, content, is_error) in tool_results {
+            messages.push(OpenAIMessage {
+                role: "tool".to_string(),
+                content: Some(if is_error {
+                    format!("Error: {content}")
+                } else {
+                    content
+                }),
+                tool_calls: None,
+                tool_call_id: Some(tool_use_id),
+            });
+        }
+
+        // Edge case: empty message (shouldn't happen, but handle gracefully)
+        if messages.is_empty() {
+            messages.push(OpenAIMessage {
+                role: role.to_string(),
+                content: Some(String::new()),
                 tool_calls: None,
                 tool_call_id: None,
-            }
+            });
         }
+
+        messages
     }
 
     fn normalize_response(resp: OpenAIResponse) -> Result<LlmResponse, LlmError> {
@@ -479,29 +494,67 @@ impl OpenAIService {
 
     /// Translate `LlmRequest` to `ResponsesApiRequest`
     fn translate_to_responses_request(&self, request: &LlmRequest) -> ResponsesApiRequest {
-        // Build input from system prompt and messages
-        let mut input_parts = Vec::new();
+        // Build input as array of conversation items
+        let mut input_items = Vec::new();
 
-        // Add system prompt
-        if !request.system.is_empty() {
-            let system_text = request
-                .system
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            input_parts.push(format!("System: {system_text}\n"));
-        }
+        // Add system prompt as instructions
+        let instructions = if request.system.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .system
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )
+        };
 
-        // Add messages
+        // Process messages into conversation items
         for msg in &request.messages {
             let role = match msg.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
             };
+
             for block in &msg.content {
-                if let ContentBlock::Text { text } = block {
-                    input_parts.push(format!("{role}: {text}"));
+                match block {
+                    ContentBlock::Text { text } => {
+                        input_items.push(ResponsesApiInputItem::Message {
+                            role: role.to_string(),
+                            content: text.clone(),
+                        });
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        // Assistant's function call - include it for context
+                        input_items.push(ResponsesApiInputItem::FunctionCall {
+                            call_id: id.clone(),
+                            name: name.clone(),
+                            arguments: serde_json::to_string(input)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        });
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        // Tool result - provide the output
+                        let output = if *is_error {
+                            format!("Error: {content}")
+                        } else {
+                            content.clone()
+                        };
+                        input_items.push(ResponsesApiInputItem::FunctionCallOutput {
+                            call_id: tool_use_id.clone(),
+                            output,
+                        });
+                    }
+                    ContentBlock::Image { .. } => {
+                        // Images not supported yet in Responses API
+                        tracing::warn!("Images not supported in Responses API");
+                    }
                 }
             }
         }
@@ -526,7 +579,8 @@ impl OpenAIService {
 
         ResponsesApiRequest {
             model: self.model.api_name().to_string(),
-            input: input_parts.join("\n"),
+            input: input_items,
+            instructions,
             tools,
             max_output_tokens: request.max_tokens,
         }
@@ -692,11 +746,33 @@ struct OpenAIError {
 #[derive(Debug, Serialize)]
 struct ResponsesApiRequest {
     model: String,
-    input: String,
+    /// Input can be a string or array of conversation items
+    input: Vec<ResponsesApiInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+}
+
+/// Input item for the Responses API conversation
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ResponsesApiInputItem {
+    /// User or assistant message
+    #[serde(rename = "message")]
+    Message { role: String, content: String },
+    /// Function call from assistant (echoed back for context)
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    /// Output from a function call
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput { call_id: String, output: String },
 }
 
 #[derive(Debug, Serialize)]
