@@ -161,12 +161,21 @@ export function ConversationPage() {
           const msg = msgData.message;
           if (msg) {
             setMessages((prev) => {
+              // Check if message already exists (by message_id)
+              const existingIdx = prev.findIndex(m => m.message_id === msg.message_id);
+              if (existingIdx >= 0) {
+                // Update existing message (e.g., display_data updated)
+                const updated = [...prev];
+                updated[existingIdx] = msg;
+                return updated;
+              }
+              // Check by sequence_id as fallback (shouldn't happen but safety)
               if (prev.some(m => m.sequence_id === msg.sequence_id)) {
                 return prev;
               }
               return [...prev, msg];
             });
-            // Update cache with new message
+            // Update cache with new/updated message
             cacheDB.putMessage(msg);
             
             if (msg.message_type === 'user' || msg.type === 'user') {

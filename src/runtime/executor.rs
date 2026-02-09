@@ -635,15 +635,24 @@ where
                             "Failed to update spawn_agents message display_data"
                         );
                     } else {
-                        // Notify clients the message was updated
-                        // We need to fetch and re-broadcast - or use a simpler update event
-                        let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                            state: serde_json::json!({
-                                "type": "subagent_results_updated",
-                                "message_id": message_id,
-                                "display_data": display_data
-                            }),
-                        });
+                        // Fetch the updated message and broadcast it
+                        // This allows the frontend to update its message state
+                        match self.storage.get_message_by_id(&message_id).await {
+                            Ok(updated_msg) => {
+                                let msg_json =
+                                    serde_json::to_value(&updated_msg).unwrap_or(Value::Null);
+                                let _ = self
+                                    .broadcast_tx
+                                    .send(SseEvent::Message { message: msg_json });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    message_id = %message_id,
+                                    "Failed to fetch updated message for broadcast"
+                                );
+                            }
+                        }
                     }
                 } else {
                     // No spawn_tool_id - create a standalone summary message

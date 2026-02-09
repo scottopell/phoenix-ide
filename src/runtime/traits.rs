@@ -29,6 +29,9 @@ pub trait MessageStore: Send + Sync {
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
+    /// Get a single message by ID
+    async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String>;
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -96,6 +99,10 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         (**self).get_messages(conv_id).await
+    }
+
+    async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
+        (**self).get_message_by_id(message_id).await
     }
 
     async fn update_message_display_data(
@@ -185,6 +192,12 @@ impl MessageStore for DatabaseStorage {
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         self.db.get_messages(conv_id).map_err(|e| e.to_string())
+    }
+
+    async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
+        self.db
+            .get_message_by_id(message_id)
+            .map_err(|e| e.to_string())
     }
 
     async fn update_message_display_data(

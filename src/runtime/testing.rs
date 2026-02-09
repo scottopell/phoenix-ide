@@ -317,6 +317,18 @@ impl MessageStore for InMemoryStorage {
         Ok(self.get_all_messages(conv_id))
     }
 
+    async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
+        let messages = self.messages.lock().unwrap();
+        for msgs in messages.values() {
+            for msg in msgs {
+                if msg.message_id == message_id {
+                    return Ok(msg.clone());
+                }
+            }
+        }
+        Err(format!("Message not found: {message_id}"))
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
