@@ -1,7 +1,7 @@
 ---
 created: 2026-02-07
 priority: p1
-status: ready
+status: done
 ---
 
 # Browser Tool Launch Failure - Chrome Process Exit
