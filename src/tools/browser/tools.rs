@@ -388,19 +388,21 @@ impl Tool for BrowserRecentConsoleLogsTool {
 
         let guard = session.read().await;
 
-        // Get recent logs
-        let logs: Vec<_> = guard
-            .console_logs
-            .iter()
-            .rev()
-            .take(input.limit)
-            .map(|entry| {
-                json!({
-                    "level": entry.level,
-                    "text": entry.text,
+        // Get recent logs (lock the console_logs mutex)
+        let logs: Vec<_> = {
+            let console_logs = guard.console_logs.lock().unwrap();
+            console_logs
+                .iter()
+                .rev()
+                .take(input.limit)
+                .map(|entry| {
+                    json!({
+                        "level": entry.level,
+                        "text": entry.text,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
 
         let json_str = serde_json::to_string_pretty(&logs).unwrap_or_else(|_| "[]".to_string());
 
@@ -447,10 +449,13 @@ impl Tool for BrowserClearConsoleLogsTool {
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
 
-        let mut guard = session.write().await;
-        let count = guard.console_logs.len();
-        guard.console_logs.clear();
-        guard.last_activity = std::time::Instant::now();
+        let guard = session.write().await;
+        let count = {
+            let mut console_logs = guard.console_logs.lock().unwrap();
+            let len = console_logs.len();
+            console_logs.clear();
+            len
+        };
 
         ToolOutput::success(format!("Cleared {count} console log entries."))
     }

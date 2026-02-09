@@ -12,7 +12,7 @@ use chromiumoxide::{
 };
 use futures::StreamExt;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -70,8 +70,8 @@ pub struct BrowserSession {
     console_task: Option<JoinHandle<()>>,
     /// The current page (public for tool access)
     pub page: Page,
-    /// Console logs captured from the page
-    pub console_logs: VecDeque<ConsoleEntry>,
+    /// Console logs captured from the page (separate lock to avoid contention)
+    pub console_logs: Arc<StdMutex<VecDeque<ConsoleEntry>>>,
     /// Last activity timestamp (for idle timeout)
     pub last_activity: Instant,
 }
@@ -125,21 +125,22 @@ impl BrowserSession {
             handler_task,
             console_task: None, // Set up later via setup_console_listener
             page,
-            console_logs: VecDeque::with_capacity(MAX_CONSOLE_LOGS),
+            console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
             last_activity: Instant::now(),
         })
     }
 
     /// Set up console log listener (called after session is wrapped in Arc<RwLock>)
     pub async fn setup_console_listener(session: Arc<RwLock<Self>>) -> Result<(), BrowserError> {
-        // Get the page and create event listener
-        let mut console_events = {
+        // Get the page event listener and console_logs handle
+        let (mut console_events, console_logs) = {
             let guard = session.read().await;
-            guard.page.event_listener::<EventConsoleApiCalled>().await?
+            let events = guard.page.event_listener::<EventConsoleApiCalled>().await?;
+            let logs = guard.console_logs.clone();
+            (events, logs)
         };
 
-        // Spawn task to capture console events
-        let session_clone = session.clone();
+        // Spawn task to capture console events (uses separate lock, no contention)
         let task = tokio::spawn(async move {
             while let Some(event) = console_events.next().await {
                 // Extract log level and message
@@ -147,14 +148,37 @@ impl BrowserSession {
                 let text = event
                     .args
                     .iter()
-                    .filter_map(|arg| arg.value.as_ref())
-                    .map(ToString::to_string)
+                    .map(|arg| {
+                        // Try value first (for JSON-serializable primitives)
+                        if let Some(value) = &arg.value {
+                            match value {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            }
+                        // Fall back to description (string representation of any object)
+                        } else if let Some(desc) = &arg.description {
+                            desc.clone()
+                        // Fall back to unserializable value (undefined, NaN, Infinity, etc.)
+                        } else if let Some(unser) = &arg.unserializable_value {
+                            unser.inner().to_string()
+                        } else {
+                            String::from("[unknown]")
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                // Add to session's console logs
-                if let Ok(mut guard) = session_clone.try_write() {
-                    guard.add_console_log(level, text);
+                // Add to console logs using separate lock (won't block tool execution)
+                tracing::debug!(level = %level, text = %text, "Console event captured");
+                if let Ok(mut logs) = console_logs.lock() {
+                    if logs.len() >= MAX_CONSOLE_LOGS {
+                        logs.pop_front();
+                    }
+                    logs.push_back(ConsoleEntry {
+                        level,
+                        text,
+                        timestamp: Instant::now(),
+                    });
                 }
             }
         });
@@ -166,18 +190,6 @@ impl BrowserSession {
         }
 
         Ok(())
-    }
-
-    /// Add a console log entry
-    pub fn add_console_log(&mut self, level: String, text: String) {
-        if self.console_logs.len() >= MAX_CONSOLE_LOGS {
-            self.console_logs.pop_front();
-        }
-        self.console_logs.push_back(ConsoleEntry {
-            level,
-            text,
-            timestamp: Instant::now(),
-        });
     }
 }
 
@@ -196,16 +208,8 @@ impl BrowserSessionGuard<'_> {
         &mut self.session.page
     }
 
-    pub fn console_logs(&self) -> &VecDeque<ConsoleEntry> {
+    pub fn console_logs(&self) -> &Arc<StdMutex<VecDeque<ConsoleEntry>>> {
         &self.session.console_logs
-    }
-
-    pub fn console_logs_mut(&mut self) -> &mut VecDeque<ConsoleEntry> {
-        &mut self.session.console_logs
-    }
-
-    pub fn add_console_log(&mut self, level: String, text: String) {
-        self.session.add_console_log(level, text);
     }
 }
 
