@@ -54,6 +54,7 @@ chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+which = "7"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

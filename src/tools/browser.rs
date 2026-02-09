@@ -7,6 +7,9 @@
 pub mod session;
 mod tools;
 
+#[cfg(test)]
+mod tests;
+
 pub use session::{BrowserError, BrowserSessionManager};
 pub use tools::{
     BrowserClearConsoleLogsTool, BrowserEvalTool, BrowserNavigateTool,
