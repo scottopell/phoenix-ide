@@ -90,14 +90,28 @@ export function useDraft(conversationId: string | undefined): [
     }
   }, [conversationId]);
 
-  // Cleanup on unmount - save any pending draft
+  // Track current draft value for flush on unmount
+  const draftRef = useRef(draft);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
+  // Cleanup on unmount - flush any pending draft save
   useEffect(() => {
     return () => {
       if (debounceRef.current !== null) {
         clearTimeout(debounceRef.current);
+        // Flush the pending save immediately
+        if (storageKey && draftRef.current) {
+          try {
+            localStorage.setItem(storageKey, draftRef.current);
+          } catch (error) {
+            console.warn('Error flushing draft on unmount:', error);
+          }
+        }
       }
     };
-  }, []);
+  }, [storageKey]);
 
   return [draft, setDraft, clearDraft];
 }
