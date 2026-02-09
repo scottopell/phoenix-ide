@@ -12,12 +12,13 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult } from '../api';
+import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult, SseEventType, SseEventData, SseInitData, SseMessageData } from '../api';
+import { api } from '../api';
 import type { QueuedMessage } from '../hooks';
 import { escapeHtml } from '../utils';
 import { CopyButton } from './CopyButton';
@@ -378,26 +379,270 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
       {name === 'patch' && resultText && containsUnifiedDiff(resultText) && onOpenFile && (
         <PatchFileSummary patchOutput={resultText} onFileClick={onOpenFile} />
       )}
+
+      {/* Sub-agent summary (when subagents complete and update this tool result) */}
+      {result?.display_data && isSubAgentSummaryData(result.display_data) && (
+        <SubAgentSummary results={result.display_data.results} />
+      )}
     </div>
   );
 }
 
 // ============================================================================
-// Sub-Agent Status
+// Sub-Agent Summary (persistent view after completion)
+// ============================================================================
+
+/** Display data format for subagent_summary */
+interface SubAgentSummaryData {
+  type: 'subagent_summary';
+  results: SubAgentResult[];
+}
+
+/** Type guard for SubAgentSummaryData */
+function isSubAgentSummaryData(data: unknown): data is SubAgentSummaryData {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (data as Record<string, unknown>).type === 'subagent_summary' &&
+    Array.isArray((data as Record<string, unknown>).results)
+  );
+}
+
+/** Single completed sub-agent row with expandable conversation view */
+function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
+  const [conversationExpanded, setConversationExpanded] = useState(false);
+  const isError = result.outcome.type === 'failure';
+  const icon = isError ? '✗' : '✓';
+  const resultText = getOutcomeText(result.outcome);
+
+  return (
+    <div className={`subagent-summary-row ${isError ? 'error' : ''}`}>
+      <div 
+        className="subagent-summary-header"
+        onClick={() => setConversationExpanded(!conversationExpanded)}
+      >
+        <span className={`subagent-summary-icon ${isError ? 'error' : 'success'}`}>{icon}</span>
+        <span className="subagent-summary-task" title={result.task}>
+          {truncate(result.task, 60)}
+        </span>
+        <span className="subagent-summary-outcome">
+          {truncate(resultText, 50)}
+        </span>
+        <span className="subagent-summary-expand">
+          {conversationExpanded ? '▲' : '▼'}
+        </span>
+      </div>
+      {conversationExpanded && (
+        <div className="subagent-embedded-view">
+          <EmbeddedSubagentView agentId={result.agent_id} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Persistent summary of completed subagents (shown in spawn_agents tool result) */
+function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
+  const successCount = results.filter(r => r.outcome.type === 'success').length;
+  const failCount = results.length - successCount;
+
+  return (
+    <div className="subagent-summary-block">
+      <div className="subagent-summary-title">
+        <span className="subagent-summary-stats">
+          {successCount > 0 && <span className="success">✓ {successCount}</span>}
+          {failCount > 0 && <span className="error">✗ {failCount}</span>}
+        </span>
+        <span>completed</span>
+      </div>
+      <div className="subagent-summary-list">
+        {results.map((result) => (
+          <SubAgentSummaryRow key={result.agent_id} result={result} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Embedded Subagent View (simplified message list for expanded subagent)
+// ============================================================================
+
+/** Renders a simplified view of subagent conversation messages */
+function EmbeddedSubagentView({ agentId }: { agentId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let eventSource: EventSource | null = null;
+    let mounted = true;
+
+    // Connect to subagent's SSE stream
+    eventSource = api.streamConversation(agentId, (eventType: SseEventType, data: SseEventData) => {
+      if (!mounted) return;
+
+      switch (eventType) {
+        case 'init': {
+          const initData = data as SseInitData;
+          setMessages(initData.messages);
+          setLoading(false);
+          break;
+        }
+        case 'message': {
+          const msgData = data as SseMessageData;
+          setMessages(prev => [...prev, msgData.message]);
+          break;
+        }
+        case 'disconnected':
+          // Connection closed, likely subagent finished
+          break;
+      }
+    });
+
+    eventSource.onerror = () => {
+      if (mounted) {
+        // Don't show error for completed subagents (SSE closes normally)
+        if (loading) {
+          setError('Failed to load subagent conversation');
+        }
+        setLoading(false);
+      }
+    };
+
+    return () => {
+      mounted = false;
+      eventSource?.close();
+    };
+  }, [agentId, loading]);
+
+  if (loading) {
+    return <div className="embedded-subagent-loading">Loading conversation...</div>;
+  }
+
+  if (error) {
+    return <div className="embedded-subagent-error">{error}</div>;
+  }
+
+  // Build tool results map
+  const toolResults = new Map<string, Message>();
+  for (const msg of messages) {
+    if (msg.message_type === 'tool') {
+      const content = msg.content as ToolResultContent;
+      if (content.tool_use_id) {
+        toolResults.set(content.tool_use_id, msg);
+      }
+    }
+  }
+
+  return (
+    <div className="embedded-subagent-messages">
+      {messages.map((msg) => {
+        if (msg.message_type === 'user') {
+          // Show user messages (the task prompt)
+          const content = msg.content as { text?: string };
+          return (
+            <div key={msg.message_id} className="embedded-msg user">
+              <span className="embedded-msg-label">Task:</span>
+              <span className="embedded-msg-text">{content.text || ''}</span>
+            </div>
+          );
+        }
+
+        if (msg.message_type === 'agent') {
+          // Show agent messages with text and tool blocks
+          const blocks = Array.isArray(msg.content) ? (msg.content as ContentBlock[]) : [];
+          return (
+            <div key={msg.message_id} className="embedded-msg agent">
+              {blocks.map((block, i) => {
+                if (block.type === 'text' && block.text) {
+                  return (
+                    <div key={i} className="embedded-agent-text">
+                      {truncate(block.text, 500)}
+                    </div>
+                  );
+                }
+                if (block.type === 'tool_use') {
+                  const toolName = block.name || 'tool';
+                  const toolResult = toolResults.get(block.id || '');
+                  const resultContent = toolResult?.content as ToolResultContent | undefined;
+                  const isToolError = resultContent?.is_error || !!resultContent?.error;
+                  const toolOutput = resultContent?.content || resultContent?.result || resultContent?.error || '';
+
+                  return (
+                    <div key={block.id || i} className="embedded-tool-block">
+                      <div className="embedded-tool-header">
+                        <span className="embedded-tool-name">{toolName}</span>
+                        {toolResult && (
+                          <span className={`embedded-tool-status ${isToolError ? 'error' : 'success'}`}>
+                            {isToolError ? '✗' : '✓'}
+                          </span>
+                        )}
+                      </div>
+                      {toolOutput && (
+                        <div className={`embedded-tool-output ${isToolError ? 'error' : ''}`}>
+                          {truncate(toolOutput, 200)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+                return null;
+              })}
+            </div>
+          );
+        }
+
+        return null;
+      })}
+    </div>
+  );
+}
+
+// ============================================================================
+// Sub-Agent Status (live progress indicator)
 // ============================================================================
 
 /** Truncate text with ellipsis */
-function truncateTask(text: string, maxLen = 60): string {
+function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   return text.slice(0, maxLen - 1) + '…';
 }
 
-/** Get display info for a completed result */
-function getResultDisplay(result: SubAgentResult): { icon: string; status: string; isError: boolean } {
-  if (result.outcome.type === 'success') {
-    return { icon: '✓', status: 'completed', isError: false };
+/** Get the result text from an outcome */
+function getOutcomeText(outcome: SubAgentResult['outcome']): string {
+  if (outcome.type === 'success') {
+    return outcome.result || 'Completed successfully';
   }
-  return { icon: '✗', status: 'failed', isError: true };
+  return outcome.error || 'Failed';
+}
+
+/** Single completed sub-agent with expandable result */
+function CompletedSubAgent({ result }: { result: SubAgentResult }) {
+  const [expanded, setExpanded] = useState(false);
+  const isError = result.outcome.type === 'failure';
+  const icon = isError ? '✗' : '✓';
+  const resultText = getOutcomeText(result.outcome);
+  const hasLongResult = resultText.length > 100;
+
+  return (
+    <div className={`subagent-item completed ${isError ? 'error' : ''}`}>
+      <div className="subagent-item-header" onClick={() => hasLongResult && setExpanded(!expanded)}>
+        <span className="subagent-icon">{icon}</span>
+        <span className="subagent-label" title={result.task}>
+          {truncate(result.task, 50)}
+        </span>
+        {hasLongResult && (
+          <span className="subagent-expand-toggle">
+            {expanded ? '▲' : '▼'}
+          </span>
+        )}
+      </div>
+      <div className={`subagent-result ${expanded ? 'expanded' : ''}`}>
+        {expanded ? resultText : truncate(resultText, 100)}
+      </div>
+    </div>
+  );
 }
 
 export function SubAgentStatus({ stateData }: { stateData: ConversationState }) {
@@ -414,25 +659,16 @@ export function SubAgentStatus({ stateData }: { stateData: ConversationState }) 
         </span>
       </div>
       <div className="subagent-list">
-        {completed.map((result) => {
-          const { icon, status, isError } = getResultDisplay(result);
-          return (
-            <div key={result.agent_id} className={`subagent-item completed ${isError ? 'error' : ''}`}>
-              <span className="subagent-icon">{icon}</span>
-              <span className="subagent-label" title={result.task}>
-                {truncateTask(result.task)}
-              </span>
-              <span className="subagent-status">{status}</span>
-            </div>
-          );
-        })}
+        {completed.map((result) => (
+          <CompletedSubAgent key={result.agent_id} result={result} />
+        ))}
         {pending.map((agent) => (
           <div key={agent.agent_id} className="subagent-item pending">
             <span className="subagent-icon">
               <span className="spinner"></span>
             </span>
             <span className="subagent-label" title={agent.task}>
-              {truncateTask(agent.task)}
+              {truncate(agent.task, 50)}
             </span>
             <span className="subagent-status">running...</span>
           </div>

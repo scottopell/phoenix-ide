@@ -23,6 +23,8 @@ pub enum DbError {
     MessageNotFound(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -561,6 +563,26 @@ impl Database {
             |row| row.get(0),
         )
         .map_err(DbError::from)
+    }
+
+    /// Update `display_data` for an existing message
+    /// Used to enrich tool results with additional data after execution (e.g., subagent outcomes)
+    pub fn update_message_display_data(
+        &self,
+        message_id: &str,
+        display_data: &serde_json::Value,
+    ) -> DbResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let display_str = serde_json::to_string(display_data)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let rows_affected = conn.execute(
+            "UPDATE messages SET display_data = ?1 WHERE message_id = ?2",
+            params![display_str, message_id],
+        )?;
+        if rows_affected == 0 {
+            return Err(DbError::MessageNotFound(message_id.to_string()));
+        }
+        Ok(())
     }
 }
 

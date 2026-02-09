@@ -390,6 +390,7 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
+                spawn_tool_id: None, // spawn_agents was earlier in the batch, tool_use_id lost
             })
             .with_effect(Effect::persist_tool_message(
                 &result.tool_use_id,
@@ -465,9 +466,12 @@ pub fn transition(
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(spawned);
 
+            // spawn_agents is the last tool, so we have its tool_use_id
+            let spawn_id = result.tool_use_id.clone();
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending: all_pending.clone(),
                 completed_results: vec![],
+                spawn_tool_id: Some(spawn_id),
             })
             .with_effect(Effect::persist_tool_message(
                 &result.tool_use_id,
@@ -509,6 +513,7 @@ pub fn transition(
             ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                ..
             },
             Event::UserCancel,
         ) => {
@@ -631,6 +636,7 @@ pub fn transition(
             ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                spawn_tool_id,
             },
             Event::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -658,6 +664,7 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending: new_pending,
                 completed_results: new_results,
+                spawn_tool_id: spawn_tool_id.clone(),
             })
             .with_effect(Effect::PersistState)
             .with_effect(notify))
@@ -668,6 +675,7 @@ pub fn transition(
             ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                spawn_tool_id,
             },
             Event::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
@@ -687,6 +695,7 @@ pub fn transition(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::PersistSubAgentResults {
                         results: new_results,
+                        spawn_tool_id: spawn_tool_id.clone(),
                     })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))

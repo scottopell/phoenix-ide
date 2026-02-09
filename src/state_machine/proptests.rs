@@ -1250,7 +1250,7 @@ fn pending_agent(id: &str) -> PendingSubAgent {
     }
 }
 
-/// Fan-in conservation: pending + completed = constant
+// Fan-in conservation: pending + completed = constant
 proptest! {
     #[test]
     fn prop_subagent_count_conserved(
@@ -1261,6 +1261,7 @@ proptest! {
     let mut state = ConvState::AwaitingSubAgents {
         pending: initial_pending,
         completed_results: vec![],
+        spawn_tool_id: None,
     };
 
     for agent_id in initial_ids {
@@ -1280,6 +1281,7 @@ proptest! {
             ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                ..
             } => {
                 prop_assert_eq!(pending.len() + completed_results.len(), n);
             }
@@ -1295,7 +1297,7 @@ proptest! {
     }
 }
 
-/// Pending IDs decrease monotonically
+// Pending IDs decrease monotonically
 proptest! {
     #[test]
     fn prop_pending_decreases_monotonically(
@@ -1305,6 +1307,7 @@ proptest! {
     let mut state = ConvState::AwaitingSubAgents {
         pending: initial_pending,
         completed_results: vec![],
+        spawn_tool_id: None,
     };
     let mut prev_pending = initial_ids.len();
 
@@ -1326,7 +1329,7 @@ proptest! {
     }
 }
 
-/// Unknown agent_id is rejected
+// Unknown agent_id is rejected
 proptest! {
     #[test]
     fn prop_unknown_agent_rejected(
@@ -1337,6 +1340,7 @@ proptest! {
     let state = ConvState::AwaitingSubAgents {
         pending,
         completed_results: vec![],
+        spawn_tool_id: None,
     };
 
     let event = Event::SubAgentResult {
@@ -1351,7 +1355,7 @@ proptest! {
     }
 }
 
-/// Last completion exits AwaitingSubAgents
+// Last completion exits AwaitingSubAgents
 proptest! {
     #[test]
     fn prop_last_completion_exits_awaiting(
@@ -1362,6 +1366,7 @@ proptest! {
     let mut state = ConvState::AwaitingSubAgents {
         pending,
         completed_results: vec![],
+        spawn_tool_id: None,
     };
 
     for (i, agent_id) in agent_ids.iter().enumerate() {
@@ -1385,7 +1390,7 @@ proptest! {
     }
 }
 
-/// AwaitingSubAgents + UserCancel -> CancellingSubAgents
+// AwaitingSubAgents + UserCancel -> CancellingSubAgents
 proptest! {
     #[test]
     fn prop_awaiting_cancel_goes_to_cancelling(
@@ -1395,6 +1400,7 @@ proptest! {
     let state = ConvState::AwaitingSubAgents {
         pending: pending.clone(),
         completed_results: vec![],
+        spawn_tool_id: None,
     };
 
     let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
@@ -1418,7 +1424,7 @@ proptest! {
     }
 }
 
-/// CancellingSubAgents collects results until all done
+// CancellingSubAgents collects results until all done
 proptest! {
     #[test]
     fn prop_cancelling_collects_until_done(
@@ -1570,8 +1576,8 @@ fn test_spawn_agents_complete_accumulates_ids() {
 // Invariant: No Duplicate Tool Persists
 // ============================================================================
 
-/// Property: Cancellation should fail if it would produce duplicate persists
-/// This tests that our validation logic correctly catches the bug scenario.
+// Property: Cancellation should fail if it would produce duplicate persists
+// This tests that our validation logic correctly catches the bug scenario.
 proptest! {
     #[test]
     fn prop_duplicate_persist_detected(

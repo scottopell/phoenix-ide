@@ -610,24 +610,69 @@ where
                 Ok(None)
             }
 
-            Effect::PersistSubAgentResults { results } => {
-                // Persist aggregated sub-agent results as a system message
-                let aggregated = serde_json::json!({
-                    "sub_agent_results": results
+            Effect::PersistSubAgentResults {
+                results,
+                spawn_tool_id,
+            } => {
+                // Build the display_data for subagent results
+                let display_data = serde_json::json!({
+                    "type": "subagent_summary",
+                    "results": results
                 });
-                let content = crate::db::MessageContent::system(
-                    serde_json::to_string_pretty(&aggregated).unwrap_or_default(),
-                );
-                let sys_msg_id = uuid::Uuid::new_v4().to_string();
-                self.storage
-                    .add_message(
-                        &sys_msg_id,
-                        &self.context.conversation_id,
-                        &content,
-                        None,
-                        None,
-                    )
-                    .await?;
+
+                // If we have a spawn_tool_id, update its message's display_data
+                // The message was persisted as "{spawn_tool_id}-result" by persist_tool_message
+                if let Some(tool_id) = spawn_tool_id {
+                    let message_id = format!("{tool_id}-result");
+                    if let Err(e) = self
+                        .storage
+                        .update_message_display_data(&message_id, &display_data)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            message_id = %message_id,
+                            "Failed to update spawn_agents message display_data"
+                        );
+                    } else {
+                        // Notify clients the message was updated
+                        // We need to fetch and re-broadcast - or use a simpler update event
+                        let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                            state: serde_json::json!({
+                                "type": "subagent_results_updated",
+                                "message_id": message_id,
+                                "display_data": display_data
+                            }),
+                        });
+                    }
+                } else {
+                    // No spawn_tool_id - create a standalone summary message
+                    // This happens when spawn_agents wasn't the last tool in a batch
+                    let summary_text = format!("{} sub-agent(s) completed", results.len());
+                    let content = crate::db::MessageContent::tool(
+                        uuid::Uuid::new_v4().to_string(),
+                        &summary_text,
+                        false,
+                    );
+                    let msg_id = uuid::Uuid::new_v4().to_string();
+                    let message = self
+                        .storage
+                        .add_message(
+                            &msg_id,
+                            &self.context.conversation_id,
+                            &content,
+                            Some(&display_data),
+                            None,
+                        )
+                        .await?;
+
+                    // Broadcast the new message
+                    let msg_json = serde_json::to_value(&message).unwrap_or(Value::Null);
+                    let _ = self
+                        .broadcast_tx
+                        .send(SseEvent::Message { message: msg_json });
+                }
+
                 Ok(None)
             }
         }

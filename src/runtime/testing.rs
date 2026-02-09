@@ -316,6 +316,23 @@ impl MessageStore for InMemoryStorage {
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         Ok(self.get_all_messages(conv_id))
     }
+
+    async fn update_message_display_data(
+        &self,
+        message_id: &str,
+        display_data: &Value,
+    ) -> Result<(), String> {
+        let mut messages = self.messages.lock().unwrap();
+        for msgs in messages.values_mut() {
+            for msg in msgs.iter_mut() {
+                if msg.message_id == message_id {
+                    msg.display_data = Some(display_data.clone());
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!("Message not found: {message_id}"))
+    }
 }
 
 #[async_trait]

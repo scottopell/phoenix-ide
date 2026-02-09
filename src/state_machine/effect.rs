@@ -50,7 +50,11 @@ pub enum Effect {
     PersistToolResults { results: Vec<ToolResult> },
 
     /// Persist aggregated sub-agent results as a message
-    PersistSubAgentResults { results: Vec<SubAgentResult> },
+    PersistSubAgentResults {
+        results: Vec<SubAgentResult>,
+        /// `tool_use_id` of `spawn_agents` call - used to update its `display_data`
+        spawn_tool_id: Option<String>,
+    },
 }
 
 impl Effect {
@@ -90,11 +94,14 @@ impl Effect {
         is_error: bool,
         display_data: Option<Value>,
     ) -> Self {
+        let tool_use_id = tool_use_id.into();
+        // Use predictable message_id so we can update display_data later (e.g., subagent results)
+        let message_id = format!("{tool_use_id}-result");
         Effect::PersistMessage {
             content: MessageContent::tool(tool_use_id, output, is_error),
             display_data,
             usage_data: None,
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id,
         }
     }
 

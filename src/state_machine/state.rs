@@ -274,6 +274,9 @@ pub enum ConvState {
         pending: Vec<PendingSubAgent>,
         #[serde(default)]
         completed_results: Vec<SubAgentResult>,
+        /// `tool_use_id` of the `spawn_agents` call (to update `display_data` when done)
+        #[serde(default)]
+        spawn_tool_id: Option<String>,
     },
 
     /// User requested cancellation while waiting for sub-agents

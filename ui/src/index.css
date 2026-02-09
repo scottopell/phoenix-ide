@@ -1424,11 +1424,15 @@ pre:hover .copy-btn {
   flex: 1;
   font-size: 13px;
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .subagent-status {
   font-size: 12px;
   color: var(--text-secondary);
+  flex-shrink: 0;
 }
 
 .subagent-item.completed .subagent-status {
@@ -1437,6 +1441,251 @@ pre:hover .copy-btn {
 
 .subagent-item.pending .subagent-status {
   color: var(--accent-yellow);
+}
+
+/* Completed sub-agent with expandable result */
+.subagent-item.completed {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.subagent-item-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.subagent-item-header:hover {
+  opacity: 0.9;
+}
+
+.subagent-expand-toggle {
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+
+.subagent-result {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+  padding-left: 30px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.subagent-result.expanded {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.subagent-item.completed.error .subagent-result {
+  color: var(--accent-red);
+}
+
+/* ============================================================================
+ * Sub-Agent Summary (persistent view in spawn_agents tool result)
+ * ============================================================================ */
+
+.subagent-summary-block {
+  margin-top: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.subagent-summary-title {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-subtle);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.subagent-summary-stats {
+  display: flex;
+  gap: 8px;
+}
+
+.subagent-summary-stats .success {
+  color: var(--accent-green);
+}
+
+.subagent-summary-stats .error {
+  color: var(--accent-red);
+}
+
+.subagent-summary-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.subagent-summary-row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.subagent-summary-row:first-child {
+  border-top: none;
+}
+
+.subagent-summary-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.subagent-summary-header:hover {
+  background: var(--bg-hover);
+}
+
+.subagent-summary-icon {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.subagent-summary-icon.success {
+  color: var(--accent-green);
+}
+
+.subagent-summary-icon.error {
+  color: var(--accent-red);
+}
+
+.subagent-summary-task {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-summary-outcome {
+  font-size: 11px;
+  color: var(--text-muted);
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-summary-row.error .subagent-summary-outcome {
+  color: var(--accent-red);
+}
+
+.subagent-summary-expand {
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+/* Embedded Subagent View */
+.subagent-embedded-view {
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.embedded-subagent-loading,
+.embedded-subagent-error {
+  padding: 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.embedded-subagent-error {
+  color: var(--accent-red);
+}
+
+.embedded-subagent-messages {
+  padding: 8px 12px;
+}
+
+.embedded-msg {
+  padding: 6px 0;
+  font-size: 12px;
+}
+
+.embedded-msg.user {
+  color: var(--text-muted);
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--border-subtle);
+  margin-bottom: 8px;
+}
+
+.embedded-msg-label {
+  font-weight: 500;
+  margin-right: 6px;
+}
+
+.embedded-msg-text {
+  color: var(--text-primary);
+}
+
+.embedded-msg.agent {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.embedded-agent-text {
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.embedded-tool-block {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin: 4px 0;
+}
+
+.embedded-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.embedded-tool-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.embedded-tool-status {
+  font-size: 11px;
+}
+
+.embedded-tool-status.success {
+  color: var(--accent-green);
+}
+
+.embedded-tool-status.error {
+  color: var(--accent-red);
+}
+
+.embedded-tool-output {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 100px;
+  overflow-y: auto;
+}
+
+.embedded-tool-output.error {
+  color: var(--accent-red);
 }
 
 /* Connection States */
