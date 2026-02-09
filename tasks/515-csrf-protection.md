@@ -1,7 +1,7 @@
 ---
 created: 2025-02-07
 priority: p1
-status: ready
+status: wontdo
 ---
 
 # Add CSRF Protection Headers
