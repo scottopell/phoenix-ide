@@ -765,6 +765,41 @@ body {
   flex-shrink: 0;
 }
 
+/* Collapsed output preview */
+.tool-block-output-preview {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  background: var(--bg-secondary);
+}
+
+.tool-block-output-preview:hover {
+  background: var(--bg-tertiary);
+}
+
+.tool-block-preview-lines {
+  flex: 1;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  overflow: hidden;
+}
+
+.tool-block-preview-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-block-preview-more {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
 /* Output content */
 .tool-block-output-content {
   padding: 10px 12px;

@@ -328,11 +328,10 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
     ? resultText.slice(0, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
     : resultText;
 
-  // Preview for collapsed state
-  const previewLen = 100;
-  const previewText = resultText.length > previewLen 
-    ? resultText.slice(0, previewLen).split('\n')[0] + '...'
-    : resultText.split('\n')[0];
+  // Preview for collapsed state: show first 3 lines faded
+  const previewLines = resultText.split('\n').slice(0, 3);
+  const lineCount = resultText.split('\n').length;
+  const hasMoreLines = lineCount > 3;
 
   const hasOutput = resultContent !== null;
   const isShortOutput = resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
@@ -379,22 +378,39 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
               {resultText && <CopyButton text={resultText} title="Copy output" />}
             </div>
           ) : (
-            // Long output: collapsible
+            // Long output: collapsible with preview
             <>
-              <div 
-                className="tool-block-output-header" 
-                onClick={() => setOutputExpanded(!outputExpanded)}
-              >
-                <span className="tool-block-output-chevron">{outputExpanded ? '▼' : '▶'}</span>
-                <span className="tool-block-output-label">
-                  {outputExpanded ? 'output' : previewText}
-                </span>
-                <span className="tool-block-output-size">({resultLength.toLocaleString()} chars)</span>
-                <CopyButton text={resultText} title="Copy output" />
-              </div>
-              {outputExpanded && (
-                <div className="tool-block-output-content">
-                  {displayResult}
+              {outputExpanded ? (
+                // Expanded: full output with collapse header
+                <>
+                  <div 
+                    className="tool-block-output-header" 
+                    onClick={() => setOutputExpanded(false)}
+                  >
+                    <span className="tool-block-output-chevron">▼</span>
+                    <span className="tool-block-output-label">output</span>
+                    <span className="tool-block-output-size">{lineCount} lines</span>
+                    <CopyButton text={resultText} title="Copy output" />
+                  </div>
+                  <div className="tool-block-output-content">
+                    {displayResult}
+                  </div>
+                </>
+              ) : (
+                // Collapsed: show preview lines that expand on click
+                <div 
+                  className="tool-block-output-preview"
+                  onClick={() => setOutputExpanded(true)}
+                >
+                  <div className="tool-block-preview-lines">
+                    {previewLines.map((line, i) => (
+                      <div key={i} className="tool-block-preview-line">{line || ' '}</div>
+                    ))}
+                    {hasMoreLines && (
+                      <div className="tool-block-preview-more">+{lineCount - 3} more lines</div>
+                    )}
+                  </div>
+                  <CopyButton text={resultText} title="Copy output" />
                 </div>
               )}
             </>
