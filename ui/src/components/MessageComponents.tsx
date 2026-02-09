@@ -177,6 +177,22 @@ export function AgentMessage({
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
 
+  // Check if there's any renderable content
+  const hasRenderableContent = blocks.some(block => {
+    if (block.type === 'text') {
+      return block.text && block.text.trim() !== '';
+    }
+    if (block.type === 'tool_use') {
+      return true;
+    }
+    return false;
+  });
+
+  // Don't render empty agent messages
+  if (!hasRenderableContent) {
+    return null;
+  }
+
   return (
     <div className="message agent" data-sequence-id={message.sequence_id}>
       <div className="message-header">
@@ -190,6 +206,10 @@ export function AgentMessage({
       <div className="message-content">
         {blocks.map((block, i) => {
           if (block.type === 'text') {
+            // Skip empty text blocks - they produce empty bubbles
+            if (!block.text || block.text.trim() === '') {
+              return null;
+            }
             return (
               <div key={i} className="agent-text-block">
                 <ReactMarkdown
@@ -214,7 +234,7 @@ export function AgentMessage({
                     },
                   }}
                 >
-                  {block.text || ''}
+                  {block.text}
                 </ReactMarkdown>
               </div>
             );

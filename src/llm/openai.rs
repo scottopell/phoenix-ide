@@ -536,31 +536,54 @@ impl OpenAIService {
     fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
         let mut content = Vec::new();
 
-        // Find message output and extract content
+        // Process all outputs
         for output in resp.output {
-            if output.r#type == "message" {
-                if let Some(output_content) = output.content {
-                    for item in output_content {
-                        if item.r#type == "output_text" {
-                            if let Some(text) = item.text {
-                                if !text.is_empty() {
-                                    content.push(ContentBlock::Text { text });
+            match output.r#type.as_str() {
+                "message" => {
+                    // Extract text content from message outputs
+                    if let Some(output_content) = output.content {
+                        for item in output_content {
+                            if item.r#type == "output_text" {
+                                if let Some(text) = item.text {
+                                    if !text.is_empty() {
+                                        content.push(ContentBlock::Text { text });
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                "function_call" => {
+                    // Extract tool use from function_call outputs
+                    if let (Some(name), Some(arguments), Some(call_id)) =
+                        (output.name, output.arguments, output.call_id)
+                    {
+                        // Parse arguments JSON
+                        let input = serde_json::from_str(&arguments).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, arguments = %arguments, "Failed to parse function call arguments");
+                            serde_json::Value::Object(serde_json::Map::new())
+                        });
+                        content.push(ContentBlock::ToolUse {
+                            id: call_id,
+                            name,
+                            input,
+                        });
+                    }
+                }
+                "reasoning" => {
+                    // Skip reasoning outputs - they're internal model thinking
+                }
+                other => {
+                    tracing::debug!(output_type = %other, "Ignoring unknown output type");
+                }
             }
         }
 
-        // If no content found, return empty
-        if content.is_empty() {
-            content.push(ContentBlock::Text {
-                text: String::new(),
-            });
-        }
-
-        let end_turn = resp.status == "completed";
+        // Determine end_turn: if there are tool calls, the model wants to continue
+        let has_tool_calls = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let end_turn = resp.status == "completed" && !has_tool_calls;
 
         LlmResponse {
             content,
@@ -694,8 +717,16 @@ struct ResponsesApiResponse {
 #[derive(Debug, Deserialize)]
 struct ResponsesApiOutput {
     r#type: String,
+    /// For message outputs
     #[serde(default)]
     content: Option<Vec<ResponsesApiContent>>,
+    /// For `function_call` outputs
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
