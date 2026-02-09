@@ -4,6 +4,7 @@ import type { Conversation } from '../api';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 import { ThemeToggle } from './ThemeToggle';
 import { useTheme } from '../hooks/useTheme';
+import { useKeyboardNav } from '../hooks';
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -34,6 +35,14 @@ export function ConversationList({
   const { theme, toggleTheme } = useTheme();
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
+  const displayList = showArchived ? archivedConversations : conversations;
+
+  // Keyboard navigation
+  const { selectedId } = useKeyboardNav({
+    items: displayList,
+    onNew: onNewConversation,
+  });
+
   const handleClick = (conv: Conversation) => {
     if (onConversationClick) {
       onConversationClick(conv);
@@ -46,8 +55,6 @@ export function ConversationList({
     e.stopPropagation();
     setExpandedId(expandedId === convId ? null : convId);
   };
-
-  const displayList = showArchived ? archivedConversations : conversations;
 
   return (
     <section id="conversation-list" className="view active">
@@ -86,7 +93,7 @@ export function ConversationList({
           displayList.map((conv) => (
             <li
               key={conv.id}
-              className={`conv-item ${expandedId === conv.id ? 'expanded' : ''}`}
+              className={`conv-item ${expandedId === conv.id ? 'expanded' : ''} ${selectedId === conv.id ? 'keyboard-selected' : ''}`}
               data-id={conv.id}
             >
               <div className="conv-item-main" onClick={() => handleClick(conv)}>

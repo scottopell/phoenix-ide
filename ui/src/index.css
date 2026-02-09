@@ -381,6 +381,12 @@ body {
   background: var(--bg-tertiary);
 }
 
+.conv-item.keyboard-selected {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 1px var(--accent-color);
+}
+
 .conv-item:active {
   background: var(--border-color);
 }

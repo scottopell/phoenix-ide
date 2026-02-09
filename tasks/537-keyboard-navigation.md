@@ -1,7 +1,7 @@
 ---
 created: 2025-05-30
 priority: p2
-status: ready
+status: done
 ---
 
 # Keyboard navigation for Phoenix UI
