@@ -1,7 +1,7 @@
 ---
 created: 2026-02-08
 priority: p0
-status: ready
+status: done
 ---
 
 # Simplify Caching Architecture: Remove Service Worker, Eliminate Race Conditions
