@@ -1,7 +1,7 @@
 ---
 created: 2026-02-07
 priority: p2
-status: ready
+status: done
 ---
 
 # Add Browser Tools End-to-End Tests
