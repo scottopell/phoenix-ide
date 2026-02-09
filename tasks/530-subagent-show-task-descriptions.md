@@ -1,7 +1,7 @@
 ---
 created: 2026-02-08
 priority: p1
-status: ready
+status: done
 ---
 
 # Show Subagent Task Descriptions
