@@ -2513,58 +2513,24 @@ html * {
 }
 
 /* Status header styles */
-.status-header {
-  flex: 0 0 auto;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-color);
+/* Offline banner - minimal top bar */
+.offline-banner {
+  padding: 6px 16px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--accent-yellow);
+  color: #000;
 }
 
-.sync-banner {
+/* Pull-to-refresh indicator */
+.pull-refresh-indicator {
   padding: 8px 16px;
   text-align: center;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.sync-banner {
-  background: #4ecdc4;
-  color: white;
-}
-
-.offline-icon,
-.sync-icon {
-  margin-right: 8px;
-}
-
-/* Last updated styles */
-.last-updated {
-  padding: 8px 16px;
   font-size: 12px;
   color: var(--text-muted);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
-}
-
-.refresh-btn {
-  background: none;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  padding: 4px 8px;
-  font-size: 14px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.refresh-btn:hover:not(:disabled) {
-  background: var(--bg-hover);
-  border-color: var(--accent-blue);
-}
-
-.refresh-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 /* Pending operation indicator */
@@ -2656,25 +2622,6 @@ html * {
   background: rgba(255, 255, 255, 0.2);
 }
 /* Status header improvements */
-.status-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 16px;
-  min-height: 48px;
-}
-
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
 /* Settings Modal */
 .settings-list {
   display: flex;

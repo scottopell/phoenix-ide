@@ -19,8 +19,10 @@ export function ConversationListPage() {
   const [showArchived, setShowArchived] = useState(false);
 
   const [loading, setLoading] = useState(true);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const scrollRestoredRef = useRef(false);
+  const pullStartY = useRef<number | null>(null);
+  const mainRef = useRef<HTMLElement>(null);
 
   // App state for offline/sync status
   const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
@@ -75,7 +77,6 @@ export function ConversationListPage() {
           ]);
           setConversations(freshActive);
           setArchivedConversations(freshArchived);
-          setLastUpdated(new Date());
           
           // Sync cache (removes stale entries, adds fresh ones)
           await cacheDB.syncConversations([...freshActive, ...freshArchived]);
@@ -193,17 +194,26 @@ export function ConversationListPage() {
     }
   };
 
-  // Format last updated time
-  const getLastUpdatedText = () => {
-    if (!lastUpdated) return null;
-    const minutes = Math.floor((Date.now() - lastUpdated.getTime()) / 60000);
-    if (minutes < 1) return 'Updated just now';
-    if (minutes === 1) return 'Updated 1 minute ago';
-    if (minutes < 60) return `Updated ${minutes} minutes ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours === 1) return 'Updated 1 hour ago';
-    return `Updated ${hours} hours ago`;
-  };
+  // Pull-to-refresh handlers
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (window.scrollY === 0) {
+      pullStartY.current = e.touches[0].clientY;
+    }
+  }, []);
+
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (pullStartY.current === null || refreshing) return;
+    const pullDistance = e.touches[0].clientY - pullStartY.current;
+    if (pullDistance > 80 && window.scrollY === 0) {
+      pullStartY.current = null;
+      setRefreshing(true);
+      loadConversations().finally(() => setRefreshing(false));
+    }
+  }, [refreshing, loadConversations]);
+
+  const handleTouchEnd = useCallback(() => {
+    pullStartY.current = null;
+  }, []);
 
   // Show error UI if IndexedDB init failed
   if (initError) {
@@ -219,24 +229,27 @@ export function ConversationListPage() {
     );
   }
 
+  const totalConversations = conversations.length + archivedConversations.length;
+
   return (
     <div id="app" className="list-page">
       <Toast messages={toasts} onDismiss={dismissToast} />
-      <header className="status-header">
-        <div className="header-left">
-          {!isOnline && (
-            <div className="offline-banner">
-              <span className="offline-icon">⚡</span>
-              Offline Mode
-              {pendingOpsCount > 0 && ` (${pendingOpsCount} pending)`}
-            </div>
-          )}
+      {!isOnline && (
+        <div className="offline-banner">
+          Offline
+          {pendingOpsCount > 0 && ` · ${pendingOpsCount} pending`}
         </div>
-        <div className="header-right">
-          <StorageStatus />
-        </div>
-      </header>
-      <main id="main-area">
+      )}
+      {refreshing && (
+        <div className="pull-refresh-indicator">Refreshing...</div>
+      )}
+      <main 
+        id="main-area" 
+        ref={mainRef}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+      >
         {loading ? (
           <section id="conversation-list" className="view active">
             <div className="view-header">
@@ -249,18 +262,6 @@ export function ConversationListPage() {
           </section>
         ) : (
           <>
-            {lastUpdated && (
-              <div className="last-updated">
-                {getLastUpdatedText()}
-                <button 
-                  className="refresh-btn"
-                  onClick={() => loadConversations()}
-                  disabled={!isOnline}
-                >
-                  ↻
-                </button>
-              </div>
-            )}
             <ConversationList
               conversations={conversations}
               archivedConversations={archivedConversations}
@@ -276,6 +277,7 @@ export function ConversationListPage() {
               }}
               onConversationClick={handleConversationClick}
             />
+            <StorageStatus conversationCount={totalConversations} />
           </>
         )}
       </main>
