@@ -4,6 +4,7 @@ import { api } from '../api';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from '../components/VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
+import { generateUUID } from '../utils/uuid';
 import type { ModelsResponse, ImageData } from '../api';
 
 const LAST_CWD_KEY = 'phoenix-last-cwd';
@@ -184,7 +185,7 @@ export function NewConversationPage() {
         }
       }
 
-      const messageId = crypto.randomUUID();
+      const messageId = generateUUID();
       const conv = await api.createConversation(
         cwd.trim(), trimmed, messageId, selectedModel || undefined, images
       );

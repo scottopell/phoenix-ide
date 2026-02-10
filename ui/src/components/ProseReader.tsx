@@ -13,6 +13,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { generateUUID } from '../utils/uuid';
 import {
   ArrowLeft,
   X,
@@ -293,7 +294,7 @@ export function ProseReader({
     }
 
     const note: ReviewNote = {
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       filePath: absolutePath,
       lineNumber: annotatingLine.lineNumber,
       lineContent: annotatingLine.lineContent,

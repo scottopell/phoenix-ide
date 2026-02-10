@@ -265,6 +265,41 @@ export const api = {
     return resp.json();
   },
 
+  async checkAIGatewayAuthStatus(): Promise<{
+    status: 'not_required' | 'authenticated' | 'required' | 'in_progress' | 'failed';
+    oauth_url?: string;
+    device_code?: string;
+    error?: string;
+  }> {
+    const resp = await fetch('/api/ai-gateway/auth-status');
+    if (!resp.ok) throw new Error('Failed to check auth');
+    return resp.json();
+  },
+
+  async initiateAIGatewayAuth(): Promise<{
+    status: 'not_required' | 'authenticated' | 'required' | 'in_progress' | 'failed';
+    oauth_url?: string;
+    device_code?: string;
+    error?: string;
+  }> {
+    const resp = await fetch('/api/ai-gateway/initiate-auth', {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to initiate auth');
+    return resp.json();
+  },
+
+  async pollAIGatewayAuth(): Promise<{
+    status: 'not_required' | 'authenticated' | 'required' | 'in_progress' | 'failed';
+    oauth_url?: string;
+    device_code?: string;
+    error?: string;
+  }> {
+    const resp = await fetch('/api/ai-gateway/poll-auth');
+    if (!resp.ok) throw new Error('Failed to poll auth');
+    return resp.json();
+  },
+
   streamConversation(
     convId: string,
     onEvent: (eventType: SseEventType, data: SseEventData) => void

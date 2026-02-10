@@ -1,6 +1,7 @@
 // Phoenix IDE Cache Layer using IndexedDB
 // Simplified: Pure get/put storage, no TTL or staleness logic
 
+import { generateUUID } from './utils/uuid';
 import type { Conversation, Message } from './api';
 
 const DB_NAME = 'phoenix-ide-cache';
@@ -231,7 +232,7 @@ export class CacheDB {
   // Pending operations for offline support
   async addPendingOp(op: Omit<PendingOperation, 'id'>): Promise<string> {
     await this.init();
-    const id = crypto.randomUUID();
+    const id = generateUUID();
     const pendingOp: PendingOperation = {
       ...op,
       id,

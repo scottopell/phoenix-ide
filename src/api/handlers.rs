@@ -2,6 +2,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+use super::ai_gateway_auth::{get_auth_status, initiate_auth, poll_auth};
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::sse::sse_stream;
 use super::types::{
@@ -81,6 +82,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/read", get(read_file))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
+        // AI Gateway auth endpoints
+        .route("/api/ai-gateway/auth-status", get(get_auth_status))
+        .route("/api/ai-gateway/initiate-auth", post(initiate_auth))
+        .route("/api/ai-gateway/poll-auth", get(poll_auth))
         // Version
         .route("/version", get(get_version))
         .with_state(state)

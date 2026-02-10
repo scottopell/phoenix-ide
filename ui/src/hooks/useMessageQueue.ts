@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
+import { generateUUID } from '../utils/uuid';
 import type { ImageData } from '../api';
 
 export type MessageStatus = 'sending' | 'failed';
@@ -85,7 +86,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
   // Add a new message to the queue
   const enqueue = useCallback((text: string, images: ImageData[] = []): QueuedMessage => {
     const msg: QueuedMessage = {
-      localId: crypto.randomUUID(),
+      localId: generateUUID(),
       text,
       images,
       timestamp: Date.now(),

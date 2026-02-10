@@ -14,6 +14,12 @@ pub struct LlmConfig {
     pub fireworks_api_key: Option<String>,
     /// exe.dev gateway URL (e.g., `http://169.254.169.254/gateway/llm`)
     pub gateway: Option<String>,
+    /// Enable Datadog AI Gateway (internal unified LLM proxy)
+    pub ai_gateway_enabled: bool,
+    /// Source identifier for AI Gateway telemetry (e.g., "phoenix-ide")
+    pub ai_gateway_source: String,
+    /// Organization ID for AI Gateway (use "2" for staging)
+    pub ai_gateway_org_id: String,
     /// Default model ID
     pub default_model: Option<String>,
 }
@@ -25,6 +31,14 @@ impl LlmConfig {
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             fireworks_api_key: std::env::var("FIREWORKS_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
+            ai_gateway_enabled: std::env::var("AI_GATEWAY_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+            ai_gateway_source: std::env::var("AI_GATEWAY_SOURCE")
+                .unwrap_or_else(|_| "phoenix-ide".to_string()),
+            ai_gateway_org_id: std::env::var("AI_GATEWAY_ORG_ID")
+                .unwrap_or_else(|_| "2".to_string()),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
         }
     }
@@ -81,7 +95,12 @@ impl ModelRegistry {
         model_def: &super::ModelDef,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
-        // In gateway mode, use "implicit" as the API key
+        // AI Gateway mode takes precedence
+        if config.ai_gateway_enabled {
+            return Self::create_ai_gateway_service(model_def, config);
+        }
+
+        // In exe.dev gateway mode, use "implicit" as the API key
         // The gateway will handle the actual authentication
         let api_key = if config.gateway.is_some() {
             "implicit".to_string()
@@ -108,6 +127,32 @@ impl ModelRegistry {
             }
             Err(_) => None,
         }
+    }
+
+    /// Create an AI Gateway service for a model
+    fn create_ai_gateway_service(
+        model_def: &super::ModelDef,
+        config: &LlmConfig,
+    ) -> Option<Arc<dyn LlmService>> {
+        use super::AIGatewayService;
+
+        // Determine provider prefix for model routing
+        let provider_prefix = match model_def.provider {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAI => "openai",
+            Provider::Fireworks => "openai", // Fireworks uses OpenAI-compatible API
+        };
+
+        let service = AIGatewayService::new(
+            model_def.id,
+            model_def.api_name,
+            provider_prefix,
+            config.ai_gateway_source.clone(),
+            config.ai_gateway_org_id.clone(),
+        );
+
+        // Wrap with logging
+        Some(Arc::new(LoggingService::new(service)))
     }
 
     /// Get a model by ID

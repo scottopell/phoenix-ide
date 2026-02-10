@@ -160,7 +160,7 @@ impl OpenAIService {
 
             messages.push(OpenAIMessage {
                 role: "system".to_string(),
-                content: Some(system_text),
+                content: Some(OpenAIContent::Text(system_text)),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -184,7 +184,7 @@ impl OpenAIService {
                         r#type: "function".to_string(),
                         function: OpenAIFunction {
                             name: t.name.clone(),
-                            description: t.description.clone(),
+                            description: Some(t.description.clone()),
                             parameters: t.input_schema.clone(),
                         },
                     })
@@ -206,13 +206,22 @@ impl OpenAIService {
             max_tokens,
             max_completion_tokens,
             temperature: None,
-            stream: false,
+            top_p: None,
+            n: None,
+            stream: Some(false),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logit_bias: None,
+            user: None,
         }
     }
 
     /// Translate an LLM message to `OpenAI` format.
     /// Returns a Vec because tool results need separate messages with role "tool".
     fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
+        use super::types::ImageSource;
+
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
@@ -220,6 +229,7 @@ impl OpenAIService {
 
         // Separate content into categories
         let mut text_parts = Vec::new();
+        let mut images = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
 
@@ -227,6 +237,10 @@ impl OpenAIService {
             match block {
                 ContentBlock::Text { text } => {
                     text_parts.push(text.clone());
+                }
+                ContentBlock::Image { source } => {
+                    let ImageSource::Base64 { media_type, data } = source;
+                    images.push((media_type.clone(), data.clone()));
                 }
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(OpenAIToolCall {
@@ -246,21 +260,38 @@ impl OpenAIService {
                 } => {
                     tool_results.push((tool_use_id.clone(), content.clone(), *is_error));
                 }
-                ContentBlock::Image { .. } => {
-                    // Images not yet supported
-                    tracing::warn!("Images not supported in OpenAI Chat Completions translation");
-                }
             }
         }
 
         let mut messages = Vec::new();
 
         // Build message based on what content we have
-        if !text_parts.is_empty() || !tool_calls.is_empty() {
-            let content = if text_parts.is_empty() {
-                None
+        if !text_parts.is_empty() || !images.is_empty() || !tool_calls.is_empty() {
+            let content = if images.is_empty() && !text_parts.is_empty() {
+                // Simple text-only message
+                Some(OpenAIContent::Text(text_parts.join("\n")))
+            } else if !images.is_empty() {
+                // Vision message with images (must use parts format)
+                let mut parts = Vec::new();
+
+                // Add text parts
+                for text in text_parts {
+                    parts.push(OpenAIContentPart::Text { text });
+                }
+
+                // Add images
+                for (media_type, data) in images {
+                    parts.push(OpenAIContentPart::ImageUrl {
+                        image_url: OpenAIImageUrl {
+                            url: format!("data:{};base64,{}", media_type, data),
+                        },
+                    });
+                }
+
+                Some(OpenAIContent::Parts(parts))
             } else {
-                Some(text_parts.join("\n"))
+                // No text or images (tool calls only)
+                None
             };
 
             let tool_calls_opt = if tool_calls.is_empty() {
@@ -281,11 +312,11 @@ impl OpenAIService {
         for (tool_use_id, content, is_error) in tool_results {
             messages.push(OpenAIMessage {
                 role: "tool".to_string(),
-                content: Some(if is_error {
+                content: Some(OpenAIContent::Text(if is_error {
                     format!("Error: {content}")
                 } else {
                     content
-                }),
+                })),
                 tool_calls: None,
                 tool_call_id: Some(tool_use_id),
             });
@@ -295,7 +326,7 @@ impl OpenAIService {
         if messages.is_empty() {
             messages.push(OpenAIMessage {
                 role: role.to_string(),
-                content: Some(String::new()),
+                content: Some(OpenAIContent::Text(String::new())),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -314,9 +345,23 @@ impl OpenAIService {
         let mut content = Vec::new();
 
         // Add text content if present
-        if let Some(text) = choice.message.content {
-            if !text.is_empty() {
-                content.push(ContentBlock::Text { text });
+        if let Some(msg_content) = choice.message.content {
+            match msg_content {
+                OpenAIContent::Text(text) => {
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text { text });
+                    }
+                }
+                OpenAIContent::Parts(parts) => {
+                    // Extract text from parts (images in responses are rare/unsupported)
+                    for part in parts {
+                        if let OpenAIContentPart::Text { text } = part {
+                            if !text.is_empty() {
+                                content.push(ContentBlock::Text { text });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -652,79 +697,115 @@ impl OpenAIService {
     }
 }
 
-// OpenAI API types
+// OpenAI API types (public for use by AI Gateway)
 
 #[derive(Debug, Serialize)]
-struct OpenAIRequest {
-    model: String,
-    messages: Vec<OpenAIMessage>,
+pub(crate) struct OpenAIRequest {
+    pub model: String,
+    pub messages: Vec<OpenAIMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<OpenAITool>>,
+    pub tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_completion_tokens: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    stream: bool,
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct OpenAIMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OpenAIToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAITool {
-    r#type: String,
-    function: OpenAIFunction,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAIFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+#[serde(untagged)]
+pub(crate) enum OpenAIContent {
+    Text(String),
+    Parts(Vec<OpenAIContentPart>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct OpenAIToolCall {
-    id: String,
-    r#type: String,
-    function: OpenAIFunctionCall,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum OpenAIContentPart {
+    Text { text: String },
+    ImageUrl { image_url: OpenAIImageUrl },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct OpenAIFunctionCall {
-    name: String,
-    arguments: String,
+pub(crate) struct OpenAIImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<OpenAIContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAIToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OpenAITool {
+    pub r#type: String,
+    pub function: OpenAIFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OpenAIFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub function: OpenAIFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIFunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAIResponse {
-    choices: Vec<OpenAIChoice>,
-    usage: OpenAIUsage,
+pub(crate) struct OpenAIResponse {
+    pub choices: Vec<OpenAIChoice>,
+    pub usage: OpenAIUsage,
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAIChoice {
-    message: OpenAIMessage,
-    finish_reason: Option<String>,
+pub(crate) struct OpenAIChoice {
+    pub message: OpenAIMessage,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(clippy::struct_field_names)]
-struct OpenAIUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
+pub(crate) struct OpenAIUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
     #[allow(dead_code)] // Part of API response, not always used
-    total_tokens: u32,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
