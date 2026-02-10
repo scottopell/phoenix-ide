@@ -3,7 +3,6 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
-import { VirtualizedMessageList } from '../components/VirtualizedMessageList';
 import { InputArea } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowser } from '../components/FileBrowser';
@@ -455,25 +454,14 @@ export function ConversationPage() {
 
   return (
     <div id="app">
-      {messages.length > 50 ? (
-        <VirtualizedMessageList
-          messages={messages}
-          queuedMessages={queuedMessages}
-          convState={convState}
-          stateData={stateData}
-          onRetry={handleRetry}
-          onOpenFile={handleOpenFileFromPatch}
-        />
-      ) : (
-        <MessageList
-          messages={messages}
-          queuedMessages={queuedMessages}
-          convState={convState}
-          stateData={stateData}
-          onRetry={handleRetry}
-          onOpenFile={handleOpenFileFromPatch}
-        />
-      )}
+      <MessageList
+        messages={messages}
+        queuedMessages={queuedMessages}
+        convState={convState}
+        stateData={stateData}
+        onRetry={handleRetry}
+        onOpenFile={handleOpenFileFromPatch}
+      />
       <InputArea
         draft={draft}
         setDraft={setDraft}
