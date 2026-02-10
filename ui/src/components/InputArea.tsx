@@ -101,11 +101,23 @@ export function InputArea({
   };
 
   const handleSend = () => {
-    const trimmed = draft.trim();
+    // Get the current text (from voice recording or draft)
+    let text: string;
+    if (voiceBase !== null) {
+      text = voiceBase.trim() + (voiceInterim ? ' ' + voiceInterim.trim() : '');
+      // End recording state
+      setVoiceBase(null);
+      setVoiceInterim('');
+      setDraft(''); // Clear draft too since we're sending
+    } else {
+      text = draft.trim();
+      setDraft('');
+    }
+    
     // Can send if there's text OR images
-    if (!trimmed && images.length === 0) return;
+    if (!text && images.length === 0) return;
     if (!canSend && !isOffline) return;
-    onSend(trimmed, images);
+    onSend(text, images);
     setImages([]); // Clear images after send
   };
 
@@ -149,7 +161,8 @@ export function InputArea({
   }, []);
 
   const failedMessages = queuedMessages.filter(m => m.status === 'failed');
-  const hasContent = draft.trim().length > 0 || images.length > 0;
+  const displayedText = voiceBase !== null ? voiceBase : draft;
+  const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
   const sendEnabled = (canSend || isOffline) && hasContent;
 
   return (
