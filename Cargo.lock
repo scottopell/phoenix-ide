@@ -312,7 +312,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "which",
+ "which 8.0.0",
  "windows-registry",
 ]
 
@@ -1249,6 +1249,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",
+ "which 7.0.3",
 ]
 
 [[package]]
@@ -2483,6 +2484,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12bed680863276c63889429bfd6cab3b99943659923822de1c8a39c49e4d722c"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix",
+ "winsafe",
 ]
 
 [[package]]
