@@ -432,19 +432,19 @@ body {
 
 /* Chat View */
 #chat-view {
-  padding: 16px;
+  padding: 12px;
 }
 
 #messages {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 8px;
 }
 
 /* Message Styles */
 .message {
-  padding: 12px;
-  border-radius: 8px;
+  padding: 8px;
+  border-radius: 6px;
   max-width: 100%;
   transition: box-shadow 0.3s ease;
 }
@@ -475,9 +475,9 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-muted);
-  margin-bottom: 8px;
+  margin-bottom: 4px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -662,9 +662,9 @@ body {
 /* Tool Groups - visually pairs tool call with result */
 /* New tool block styles - input always visible, output collapsible */
 .tool-block {
-  margin: 12px 0;
+  margin: 6px 0;
   border: 1px solid var(--border-color);
-  border-radius: 8px;
+  border-radius: 6px;
   overflow: hidden;
   background: var(--bg-secondary);
 }
@@ -672,8 +672,8 @@ body {
 .tool-block-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 10px;
   background: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
   font-size: 12px;
@@ -700,14 +700,14 @@ body {
 
 /* Tool input - always visible */
 .tool-block-input {
-  padding: 10px 12px;
+  padding: 8px 10px;
   background: var(--code-bg);
   font-family: 'SF Mono', Monaco, Consolas, monospace;
   font-size: 13px;
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.4;
+  line-height: 1.35;
 }
 
 .tool-block-input.multiline {
@@ -732,8 +732,8 @@ body {
 .tool-block-output-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 10px;
   cursor: pointer;
   font-size: 12px;
   color: var(--text-secondary);
@@ -802,7 +802,7 @@ body {
 
 /* Output content */
 .tool-block-output-content {
-  padding: 10px 12px;
+  padding: 8px 10px;
   background: var(--bg-primary);
   font-family: 'SF Mono', Monaco, Consolas, monospace;
   font-size: 13px;
@@ -811,12 +811,12 @@ body {
   color: var(--text-secondary);
   max-height: 300px;
   overflow-y: auto;
-  line-height: 1.4;
+  line-height: 1.35;
 }
 
 /* Short output (no collapse header) */
 .tool-block-output:not(.expanded) .tool-block-output-content {
-  padding: 8px 12px;
+  padding: 6px 10px;
 }
 
 .tool-empty {
@@ -1783,17 +1783,6 @@ pre:hover .copy-btn {
 }
 
 /* Message Status Indicators */
-.message-header {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .message-status {
   font-size: 14px;
   text-transform: none;
