@@ -629,7 +629,7 @@ impl Tool for BrowserWaitForSelectorTool {
         // Build the JavaScript to check for the element
         let check_script = if input.visible {
             format!(
-                r#"(() => {{
+                r"(() => {{
                     const el = document.querySelector({selector});
                     if (!el) return false;
                     const style = window.getComputedStyle(el);
@@ -637,7 +637,7 @@ impl Tool for BrowserWaitForSelectorTool {
                            style.visibility !== 'hidden' && 
                            style.opacity !== '0' &&
                            el.offsetParent !== null;
-                }})()"#,
+                }})()",
                 selector = serde_json::to_string(&input.selector).unwrap()
             )
         } else {
@@ -668,8 +668,13 @@ impl Tool for BrowserWaitForSelectorTool {
                 Err(e) => {
                     // Check if it's a selector syntax error
                     let err_str = e.to_string();
-                    if err_str.contains("SyntaxError") || err_str.contains("is not a valid selector") {
-                        return ToolOutput::error(format!("Invalid selector '{}': {}", input.selector, e));
+                    if err_str.contains("SyntaxError")
+                        || err_str.contains("is not a valid selector")
+                    {
+                        return ToolOutput::error(format!(
+                            "Invalid selector '{}': {}",
+                            input.selector, e
+                        ));
                     }
                     // Other errors might be transient, continue polling
                 }
@@ -716,7 +721,8 @@ impl Tool for BrowserClickTool {
     }
 
     fn description(&self) -> String {
-        "Click an element on the page using CDP-level mouse events (works with all frameworks)".to_string()
+        "Click an element on the page using CDP-level mouse events (works with all frameworks)"
+            .to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -799,7 +805,7 @@ impl Tool for BrowserClickTool {
         // Click using CDP (works with React, Vue, etc.)
         match element.click().await {
             Ok(_) => ToolOutput::success(format!("Clicked element '{}'", input.selector)),
-            Err(e) => ToolOutput::error(format!("Click failed: {}", e)),
+            Err(e) => ToolOutput::error(format!("Click failed: {e}")),
         }
     }
 }
@@ -892,7 +898,7 @@ impl Tool for BrowserTypeTool {
 
         // Click to focus
         if let Err(e) = element.click().await {
-            return ToolOutput::error(format!("Failed to focus element: {}", e));
+            return ToolOutput::error(format!("Failed to focus element: {e}"));
         }
 
         // Small delay to ensure focus
@@ -901,16 +907,20 @@ impl Tool for BrowserTypeTool {
         // Clear existing text if requested
         if input.clear {
             // Select all and delete
-            if let Err(e) = guard.page.evaluate(format!(
-                "document.querySelector({}).select()",
-                serde_json::to_string(&input.selector).unwrap()
-            )).await {
-                return ToolOutput::error(format!("Failed to select text: {}", e));
+            if let Err(e) = guard
+                .page
+                .evaluate(format!(
+                    "document.querySelector({}).select()",
+                    serde_json::to_string(&input.selector).unwrap()
+                ))
+                .await
+            {
+                return ToolOutput::error(format!("Failed to select text: {e}"));
             }
-            
+
             // Press backspace to delete selected text
             if let Err(e) = element.press_key("Backspace").await {
-                return ToolOutput::error(format!("Failed to clear text: {}", e));
+                return ToolOutput::error(format!("Failed to clear text: {e}"));
             }
         }
 
@@ -921,13 +931,13 @@ impl Tool for BrowserTypeTool {
             // Type the text part
             if !part.is_empty() {
                 if let Err(e) = element.type_str(part).await {
-                    return ToolOutput::error(format!("Type failed: {}", e));
+                    return ToolOutput::error(format!("Type failed: {e}"));
                 }
             }
             // Add Enter between parts (not after last)
             if i < parts.len() - 1 {
                 if let Err(e) = element.press_key("Enter").await {
-                    return ToolOutput::error(format!("Failed to press Enter: {}", e));
+                    return ToolOutput::error(format!("Failed to press Enter: {e}"));
                 }
             }
         }

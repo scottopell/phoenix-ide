@@ -1312,7 +1312,7 @@ mod tests {
     /// Test sub-agent result buffering (early completion)
     #[tokio::test]
     async fn test_subagent_result_buffering() {
-        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::runtime::ConversationRuntime;
         use crate::state_machine::state::SubAgentOutcome;
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;

@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_find_search_root() {
-        let tool = KeywordSearchTool;
+        let _tool = KeywordSearchTool;
         let ctx = test_context(PathBuf::from("/tmp"));
         let root = KeywordSearchTool::find_search_root(&ctx);
         // Should fall back to working dir since /tmp isn't a git repo

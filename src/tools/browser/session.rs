@@ -160,7 +160,7 @@ impl BrowserSession {
                             desc.clone()
                         // Fall back to unserializable value (undefined, NaN, Infinity, etc.)
                         } else if let Some(unser) = &arg.unserializable_value {
-                            unser.inner().to_string()
+                            unser.inner().clone()
                         } else {
                             String::from("[unknown]")
                         }

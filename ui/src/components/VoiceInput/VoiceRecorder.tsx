@@ -66,6 +66,7 @@ declare global {
 }
 
 // Check if Web Speech API is available
+// eslint-disable-next-line react-refresh/only-export-components
 export function isWebSpeechSupported(): boolean {
   return !!(
     typeof window !== 'undefined' &&

@@ -69,7 +69,7 @@ impl TestServer {
                             tokio::spawn(async move {
                                 let mut buf = [0u8; 1024];
                                 let _ = socket.read(&mut buf).await;
-                                
+
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\n\
                                      Content-Type: text/html\r\n\
@@ -154,7 +154,9 @@ async fn test_browser_eval_local() {
 
     // First navigate
     let nav_tool = BrowserNavigateTool;
-    let nav_result = nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    let nav_result = nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
     assert!(nav_result.success, "Navigate failed: {}", nav_result.output);
 
     // Then eval
@@ -216,7 +218,9 @@ async fn test_browser_console_logs_local() {
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Small delay to ensure console listener is set up
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -224,13 +228,22 @@ async fn test_browser_console_logs_local() {
     // Log some messages
     let eval_tool = BrowserEvalTool;
     eval_tool
-        .run(json!({"expression": "console.log('test message')"}), ctx.clone())
+        .run(
+            json!({"expression": "console.log('test message')"}),
+            ctx.clone(),
+        )
         .await;
     eval_tool
-        .run(json!({"expression": "console.warn('warning message')"}), ctx.clone())
+        .run(
+            json!({"expression": "console.warn('warning message')"}),
+            ctx.clone(),
+        )
         .await;
     eval_tool
-        .run(json!({"expression": "console.error('error message')"}), ctx.clone())
+        .run(
+            json!({"expression": "console.error('error message')"}),
+            ctx.clone(),
+        )
         .await;
 
     // Small delay to allow async event capture
@@ -296,17 +309,15 @@ async fn test_browser_screenshot_local() {
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Take screenshot
     let screenshot_tool = BrowserTakeScreenshotTool;
     let result = screenshot_tool.run(json!({}), ctx.clone()).await;
 
-    assert!(
-        result.success,
-        "Screenshot failed: {}",
-        result.output
-    );
+    assert!(result.success, "Screenshot failed: {}", result.output);
 
     // Check that we got image data (either inline base64 or file path)
     let has_image = result.output.contains("Screenshot saved")
@@ -319,10 +330,7 @@ async fn test_browser_screenshot_local() {
         if let Some(data) = display.get("data") {
             if let Some(base64_data) = data.as_str() {
                 // PNG magic bytes after base64 decode start with iVBORw0KGgo
-                assert!(
-                    base64_data.starts_with("iVBORw0KGgo"),
-                    "Not valid PNG data"
-                );
+                assert!(base64_data.starts_with("iVBORw0KGgo"), "Not valid PNG data");
             }
         }
     }
@@ -347,7 +355,9 @@ async fn test_browser_resize_local() {
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Resize
     let resize_tool = BrowserResizeTool;
@@ -390,7 +400,9 @@ async fn test_browser_session_persistence() {
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let eval_tool = BrowserEvalTool;
 
@@ -485,7 +497,11 @@ async fn test_browser_eval_before_navigate() {
 
     // This should work - browser starts on about:blank
     assert!(result.success, "Eval failed: {}", result.output);
-    assert!(result.output.contains('2'), "Wrong result: {}", result.output);
+    assert!(
+        result.output.contains('2'),
+        "Wrong result: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
@@ -496,11 +512,16 @@ async fn test_browser_eval_syntax_error() {
     let (ctx, _manager) = test_context("test-eval-syntax-error");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let eval_tool = BrowserEvalTool;
     let result = eval_tool
-        .run(json!({"expression": "this is not valid javascript {{{{"}), ctx.clone())
+        .run(
+            json!({"expression": "this is not valid javascript {{{{"}),
+            ctx.clone(),
+        )
         .await;
 
     // Should fail gracefully
@@ -528,10 +549,7 @@ async fn test_browser_navigate_invalid_url() {
 
     // Should fail or handle gracefully
     // (chromiumoxide may accept weird URLs, so we just check it doesn't panic)
-    assert!(
-        !result.output.is_empty(),
-        "Should have some output"
-    );
+    assert!(!result.output.is_empty(), "Should have some output");
 }
 
 // ============================================================================
@@ -555,7 +573,9 @@ async fn test_wait_for_selector_immediate() {
     let (ctx, _manager) = test_context("test-wait-immediate");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let wait_tool = BrowserWaitForSelectorTool;
     let result = wait_tool
@@ -596,7 +616,9 @@ async fn test_wait_for_selector_delayed() {
     let (ctx, _manager) = test_context("test-wait-delayed");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let wait_tool = BrowserWaitForSelectorTool;
     let result = wait_tool
@@ -628,7 +650,9 @@ async fn test_wait_for_selector_timeout() {
     let (ctx, _manager) = test_context("test-wait-timeout");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let wait_tool = BrowserWaitForSelectorTool;
     let result = wait_tool
@@ -673,10 +697,12 @@ async fn test_wait_for_selector_hidden_then_visible() {
     let (ctx, _manager) = test_context("test-wait-visible");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let wait_tool = BrowserWaitForSelectorTool;
-    
+
     // With visible: true, should wait for element to be visible
     let result = wait_tool
         .run(
@@ -698,7 +724,9 @@ async fn test_wait_for_selector_invalid_selector() {
     let (ctx, _manager) = test_context("test-wait-invalid");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let wait_tool = BrowserWaitForSelectorTool;
     let result = wait_tool
@@ -740,7 +768,9 @@ async fn test_click_button() {
     let (ctx, _manager) = test_context("test-click-button");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Click the button
     let click_tool = BrowserClickTool;
@@ -787,7 +817,9 @@ async fn test_click_link() {
     let (ctx, _manager) = test_context("test-click-link");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Click the link
     let click_tool = BrowserClickTool;
@@ -821,7 +853,9 @@ async fn test_click_element_not_found() {
     let (ctx, _manager) = test_context("test-click-not-found");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let click_tool = BrowserClickTool;
     let result = click_tool
@@ -859,7 +893,9 @@ async fn test_click_checkbox() {
     let (ctx, _manager) = test_context("test-click-checkbox");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Verify unchecked initially
     let eval_tool = BrowserEvalTool;
@@ -923,7 +959,9 @@ async fn test_click_with_wait() {
     let (ctx, _manager) = test_context("test-click-wait");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Click with wait - should wait for element to appear
     let click_tool = BrowserClickTool;
@@ -975,7 +1013,9 @@ async fn test_type_in_input() {
     let (ctx, _manager) = test_context("test-type-input");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type into input
     let type_tool = BrowserTypeTool;
@@ -1025,7 +1065,9 @@ async fn test_type_in_textarea() {
     let (ctx, _manager) = test_context("test-type-textarea");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type multiline text
     let type_tool = BrowserTypeTool;
@@ -1086,7 +1128,9 @@ async fn test_type_triggers_react_events() {
     let (ctx, _manager) = test_context("test-type-react");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type into input - should trigger input events
     let type_tool = BrowserTypeTool;
@@ -1136,7 +1180,9 @@ async fn test_type_with_clear() {
     let (ctx, _manager) = test_context("test-type-clear");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type with clear option - should replace existing text
     let type_tool = BrowserTypeTool;
@@ -1186,15 +1232,14 @@ async fn test_type_append() {
     let (ctx, _manager) = test_context("test-type-append");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type without clear - should append
     let type_tool = BrowserTypeTool;
     let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "World"}),
-            ctx.clone(),
-        )
+        .run(json!({"selector": "#input", "text": "World"}), ctx.clone())
         .await;
 
     assert!(result.success, "Type failed: {}", result.output);
@@ -1226,7 +1271,9 @@ async fn test_type_element_not_found() {
     let (ctx, _manager) = test_context("test-type-not-found");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let type_tool = BrowserTypeTool;
     let result = type_tool
@@ -1266,7 +1313,9 @@ async fn test_type_special_characters() {
     let (ctx, _manager) = test_context("test-type-special");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type special characters
     let type_tool = BrowserTypeTool;
@@ -1316,7 +1365,9 @@ async fn test_type_password_field() {
     let (ctx, _manager) = test_context("test-type-password");
 
     let nav_tool = BrowserNavigateTool;
-    nav_tool.run(json!({"url": server.url()}), ctx.clone()).await;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     // Type into password field
     let type_tool = BrowserTypeTool;

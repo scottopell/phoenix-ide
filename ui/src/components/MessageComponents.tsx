@@ -28,6 +28,7 @@ import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 // Helper functions
 // ============================================================================
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function formatMessageTime(isoStr: string): string {
   if (!isoStr) return '';
   const date = new Date(isoStr);

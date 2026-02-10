@@ -23,6 +23,7 @@ interface PatchFileSummaryProps {
  * Extract all unique files and their changes from patch output.
  * Parses unified diff format to find modified line numbers.
  */
+// eslint-disable-next-line react-refresh/only-export-components
 export function extractFileChanges(patchOutput: string): FileChanges[] {
   const fileChangesMap = new Map<string, Set<number>>();
   const lines = patchOutput.split('\n');
@@ -76,6 +77,7 @@ export function extractFileChanges(patchOutput: string): FileChanges[] {
 /**
  * Detect if text contains unified diff content.
  */
+// eslint-disable-next-line react-refresh/only-export-components
 export function containsUnifiedDiff(text: string): boolean {
   return text.includes('@@') && (text.includes('+++') || text.includes('---'));
 }

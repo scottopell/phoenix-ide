@@ -1007,6 +1007,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_persist_validation_fails() {
+        #[allow(unused_imports)]
         use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
 
         // Create a CancellingTool state where tool-1 was already persisted

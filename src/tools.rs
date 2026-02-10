@@ -14,9 +14,8 @@ mod think;
 pub use bash::BashTool;
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
-    BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
-    BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
-    BrowserWaitForSelectorTool,
+    BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool, BrowserSessionManager,
+    BrowserTakeScreenshotTool, BrowserTypeTool, BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;

@@ -13,6 +13,6 @@ mod tests;
 pub use session::{BrowserError, BrowserSessionManager};
 pub use tools::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserNavigateTool,
-    BrowserRecentConsoleLogsTool, BrowserResizeTool, BrowserTakeScreenshotTool,
-    BrowserTypeTool, BrowserWaitForSelectorTool,
+    BrowserRecentConsoleLogsTool, BrowserResizeTool, BrowserTakeScreenshotTool, BrowserTypeTool,
+    BrowserWaitForSelectorTool,
 };
