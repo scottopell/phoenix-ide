@@ -556,3 +556,386 @@ impl Tool for BrowserResizeTool {
         }
     }
 }
+
+// ============================================================================
+// browser_wait_for_selector (TDD)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct WaitForSelectorInput {
+    /// CSS selector to wait for
+    selector: String,
+    /// Timeout as duration string (default: "30s")
+    #[serde(default)]
+    timeout: Option<String>,
+    /// If true, wait for element to be visible (not just present in DOM)
+    #[serde(default)]
+    visible: bool,
+}
+
+pub struct BrowserWaitForSelectorTool;
+
+#[async_trait]
+impl Tool for BrowserWaitForSelectorTool {
+    fn name(&self) -> &'static str {
+        "browser_wait_for_selector"
+    }
+
+    fn description(&self) -> String {
+        "Wait for an element matching a CSS selector to appear in the page".to_string()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector to wait for"
+                },
+                "timeout": {
+                    "type": "string",
+                    "description": "Timeout as a duration string (default: 30s). Examples: '5s', '1m', '500ms'"
+                },
+                "visible": {
+                    "type": "boolean",
+                    "description": "If true, wait for element to be visible, not just in DOM (default: false)"
+                }
+            },
+            "required": ["selector"]
+        })
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let input: WaitForSelectorInput = match serde_json::from_value(input) {
+            Ok(i) => i,
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+        };
+
+        let timeout = input
+            .timeout
+            .as_deref()
+            .and_then(parse_duration)
+            .unwrap_or(Duration::from_secs(30));
+
+        // Get browser session
+        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
+        };
+
+        let guard = session.read().await;
+
+        // Build the JavaScript to check for the element
+        let check_script = if input.visible {
+            format!(
+                r#"(() => {{
+                    const el = document.querySelector({selector});
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.display !== 'none' && 
+                           style.visibility !== 'hidden' && 
+                           style.opacity !== '0' &&
+                           el.offsetParent !== null;
+                }})()"#,
+                selector = serde_json::to_string(&input.selector).unwrap()
+            )
+        } else {
+            format!(
+                "document.querySelector({}) !== null",
+                serde_json::to_string(&input.selector).unwrap()
+            )
+        };
+
+        let poll_interval = Duration::from_millis(100);
+        let start = std::time::Instant::now();
+
+        loop {
+            // Check if element exists/is visible
+            match guard.page.evaluate(check_script.clone()).await {
+                Ok(result) => {
+                    if let Ok(found) = result.into_value::<bool>() {
+                        if found {
+                            let elapsed = start.elapsed();
+                            return ToolOutput::success(format!(
+                                "Element '{}' found after {:.1}s",
+                                input.selector,
+                                elapsed.as_secs_f64()
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Check if it's a selector syntax error
+                    let err_str = e.to_string();
+                    if err_str.contains("SyntaxError") || err_str.contains("is not a valid selector") {
+                        return ToolOutput::error(format!("Invalid selector '{}': {}", input.selector, e));
+                    }
+                    // Other errors might be transient, continue polling
+                }
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                return ToolOutput::error(format!(
+                    "Timeout after {:?}: element '{}' not found{}",
+                    timeout,
+                    input.selector,
+                    if input.visible { " or not visible" } else { "" }
+                ));
+            }
+
+            // Wait before next poll
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+// ============================================================================
+// browser_click (TDD)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct ClickInput {
+    /// CSS selector for element to click
+    selector: String,
+    /// If true, wait for element to appear before clicking (default: false)
+    #[serde(default)]
+    wait: bool,
+    /// Timeout for waiting (default: "30s")
+    #[serde(default)]
+    timeout: Option<String>,
+}
+
+pub struct BrowserClickTool;
+
+#[async_trait]
+impl Tool for BrowserClickTool {
+    fn name(&self) -> &'static str {
+        "browser_click"
+    }
+
+    fn description(&self) -> String {
+        "Click an element on the page using CDP-level mouse events (works with all frameworks)".to_string()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for the element to click"
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "If true, wait for element to appear before clicking (default: false)"
+                },
+                "timeout": {
+                    "type": "string",
+                    "description": "Timeout for waiting (default: 30s)"
+                }
+            },
+            "required": ["selector"]
+        })
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let input: ClickInput = match serde_json::from_value(input) {
+            Ok(i) => i,
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+        };
+
+        let timeout = input
+            .timeout
+            .as_deref()
+            .and_then(parse_duration)
+            .unwrap_or(Duration::from_secs(30));
+
+        // Get browser session
+        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
+        };
+
+        let guard = session.read().await;
+
+        // Optionally wait for element
+        if input.wait {
+            let check_script = format!(
+                "document.querySelector({}) !== null",
+                serde_json::to_string(&input.selector).unwrap()
+            );
+            let poll_interval = Duration::from_millis(100);
+            let start = std::time::Instant::now();
+
+            loop {
+                if let Ok(result) = guard.page.evaluate(check_script.clone()).await {
+                    if let Ok(true) = result.into_value::<bool>() {
+                        break;
+                    }
+                }
+                if start.elapsed() >= timeout {
+                    return ToolOutput::error(format!(
+                        "Timeout waiting for element '{}'",
+                        input.selector
+                    ));
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+
+        // Find the element
+        let element = match guard.page.find_element(&input.selector).await {
+            Ok(el) => el,
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "Could not find element '{}': {}",
+                    input.selector, e
+                ));
+            }
+        };
+
+        // Click using CDP (works with React, Vue, etc.)
+        match element.click().await {
+            Ok(_) => ToolOutput::success(format!("Clicked element '{}'", input.selector)),
+            Err(e) => ToolOutput::error(format!("Click failed: {}", e)),
+        }
+    }
+}
+
+// ============================================================================
+// browser_type (TDD)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct TypeInput {
+    /// CSS selector for input element
+    selector: String,
+    /// Text to type
+    text: String,
+    /// If true, clear existing text before typing (default: false)
+    #[serde(default)]
+    clear: bool,
+    /// Timeout (default: "30s")
+    #[serde(default)]
+    timeout: Option<String>,
+}
+
+pub struct BrowserTypeTool;
+
+#[async_trait]
+impl Tool for BrowserTypeTool {
+    fn name(&self) -> &'static str {
+        "browser_type"
+    }
+
+    fn description(&self) -> String {
+        "Type text into an input element using CDP-level keyboard events (works with React, Vue, Angular)".to_string()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for the input element"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to type into the element"
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "If true, clear existing text before typing (default: false)"
+                },
+                "timeout": {
+                    "type": "string",
+                    "description": "Timeout (default: 30s)"
+                }
+            },
+            "required": ["selector", "text"]
+        })
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let input: TypeInput = match serde_json::from_value(input) {
+            Ok(i) => i,
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+        };
+
+        let _timeout = input
+            .timeout
+            .as_deref()
+            .and_then(parse_duration)
+            .unwrap_or(Duration::from_secs(30));
+
+        // Get browser session
+        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
+        };
+
+        let guard = session.read().await;
+
+        // Find the element
+        let element = match guard.page.find_element(&input.selector).await {
+            Ok(el) => el,
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "Could not find element '{}': {}",
+                    input.selector, e
+                ));
+            }
+        };
+
+        // Click to focus
+        if let Err(e) = element.click().await {
+            return ToolOutput::error(format!("Failed to focus element: {}", e));
+        }
+
+        // Small delay to ensure focus
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Clear existing text if requested
+        if input.clear {
+            // Select all and delete
+            if let Err(e) = guard.page.evaluate(format!(
+                "document.querySelector({}).select()",
+                serde_json::to_string(&input.selector).unwrap()
+            )).await {
+                return ToolOutput::error(format!("Failed to select text: {}", e));
+            }
+            
+            // Press backspace to delete selected text
+            if let Err(e) = element.press_key("Backspace").await {
+                return ToolOutput::error(format!("Failed to clear text: {}", e));
+            }
+        }
+
+        // Type the text using CDP keyboard events
+        // Handle newlines specially since type_str doesn't support them
+        let parts: Vec<&str> = input.text.split('\n').collect();
+        for (i, part) in parts.iter().enumerate() {
+            // Type the text part
+            if !part.is_empty() {
+                if let Err(e) = element.type_str(part).await {
+                    return ToolOutput::error(format!("Type failed: {}", e));
+                }
+            }
+            // Add Enter between parts (not after last)
+            if i < parts.len() - 1 {
+                if let Err(e) = element.press_key("Enter").await {
+                    return ToolOutput::error(format!("Failed to press Enter: {}", e));
+                }
+            }
+        }
+
+        ToolOutput::success(format!(
+            "Typed {} characters into '{}'",
+            input.text.len(),
+            input.selector
+        ))
+    }
+}

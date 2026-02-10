@@ -13,9 +13,10 @@ mod think;
 
 pub use bash::BashTool;
 pub use browser::{
-    BrowserClearConsoleLogsTool, BrowserError, BrowserEvalTool, BrowserNavigateTool,
-    BrowserRecentConsoleLogsTool, BrowserResizeTool, BrowserSessionManager,
-    BrowserTakeScreenshotTool,
+    BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
+    BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
+    BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
+    BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
@@ -180,6 +181,9 @@ impl ToolRegistry {
             Arc::new(BrowserRecentConsoleLogsTool),
             Arc::new(BrowserClearConsoleLogsTool),
             Arc::new(BrowserResizeTool),
+            Arc::new(BrowserWaitForSelectorTool),
+            Arc::new(BrowserClickTool),
+            Arc::new(BrowserTypeTool),
         ];
 
         if is_sub_agent {
