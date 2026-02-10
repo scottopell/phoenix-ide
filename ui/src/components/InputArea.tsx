@@ -43,9 +43,9 @@ export function InputArea({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const voiceSupported = isWebSpeechSupported();
   
-  // Voice input interim text (shown in input while speaking)
-  const [interimText, setInterimText] = useState('');
-  const draftBeforeVoiceRef = useRef<string>('');
+  // Voice input: base text (accumulated finals) + interim (current partial)
+  const [voiceBase, setVoiceBase] = useState<string | null>(null); // null = not recording
+  const [voiceInterim, setVoiceInterim] = useState('');
 
 
   const autoResize = () => {
@@ -116,39 +116,37 @@ export function InputArea({
     }
   };
 
-  // Handle final voice transcript - append to draft (REQ-VOICE-006)
+  // Voice recording started - capture current draft as base
+  const handleVoiceStart = useCallback(() => {
+    setVoiceBase(draft);
+    setVoiceInterim('');
+  }, [draft]);
+
+  // Voice recording ended - sync final state to draft
+  const handleVoiceEnd = useCallback(() => {
+    setVoiceBase(prev => {
+      if (prev !== null) {
+        setDraft(prev);
+      }
+      return null;
+    });
+    setVoiceInterim('');
+  }, [setDraft]);
+
+  // Final transcript - append to base permanently
   const handleVoiceFinal = useCallback((text: string) => {
     if (!text) return;
-    
-    // Clear interim since we're committing final text
-    setInterimText('');
-    
-    // Append to existing draft - if there's existing text, add a space
-    const baseDraft = draftBeforeVoiceRef.current || draft;
-    const newDraft = baseDraft.trim() 
-      ? baseDraft.trimEnd() + ' ' + text 
-      : text;
-    setDraft(newDraft);
-    draftBeforeVoiceRef.current = newDraft; // Update base for next final
-
-    // Focus the textarea and move cursor to end
-    requestAnimationFrame(() => {
-      if (textareaRef.current) {
-        textareaRef.current.focus();
-        const len = textareaRef.current.value.length;
-        textareaRef.current.setSelectionRange(len, len);
-      }
+    setVoiceBase(prev => {
+      if (prev === null) return null;
+      return prev.trim() ? prev.trimEnd() + ' ' + text : text;
     });
-  }, [draft, setDraft]);
+    setVoiceInterim(''); // Clear interim, final is now in base
+  }, []);
 
-  // Handle interim voice text - show in input as user speaks
+  // Interim transcript - show temporarily (will be replaced)
   const handleVoiceInterim = useCallback((text: string) => {
-    // Store the draft before voice started (only on first interim)
-    if (!interimText && text) {
-      draftBeforeVoiceRef.current = draft;
-    }
-    setInterimText(text);
-  }, [draft, interimText]);
+    setVoiceInterim(text);
+  }, []);
 
   const failedMessages = queuedMessages.filter(m => m.status === 'failed');
   const hasContent = draft.trim().length > 0 || images.length > 0;
@@ -193,13 +191,18 @@ export function InputArea({
         id="message-input"
         placeholder={isOffline ? 'Type a message (will send when back online)...' : 'Type a message...'}
         rows={2}
-        value={interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft}
+        value={voiceBase !== null
+          ? (voiceBase.trim()
+              ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
+              : voiceInterim)
+          : draft}
         onChange={(e) => {
-          setDraft(e.target.value);
-          // Clear interim if user types manually
-          if (interimText) {
-            setInterimText('');
-            draftBeforeVoiceRef.current = '';
+          // If recording, update voice base; otherwise update draft
+          if (voiceBase !== null) {
+            setVoiceBase(e.target.value);
+            setVoiceInterim('');
+          } else {
+            setDraft(e.target.value);
           }
         }}
         onKeyDown={handleKeyDown}
@@ -229,6 +232,8 @@ export function InputArea({
           </button>
           {voiceSupported && (
             <VoiceRecorder
+              onStart={handleVoiceStart}
+              onEnd={handleVoiceEnd}
               onSpeech={handleVoiceFinal}
               onInterim={handleVoiceInterim}
               disabled={agentWorking}

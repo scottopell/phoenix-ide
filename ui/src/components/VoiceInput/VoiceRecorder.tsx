@@ -74,12 +74,14 @@ export function isWebSpeechSupported(): boolean {
 }
 
 interface VoiceRecorderProps {
+  onStart?: () => void;
+  onEnd?: () => void;
   onSpeech: (text: string) => void;
   onInterim?: (text: string) => void;
   disabled?: boolean;
 }
 
-export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderProps) {
+export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }: VoiceRecorderProps) {
   const [state, setState] = useState<VoiceState>('idle');
   const [error, setError] = useState<VoiceError | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
@@ -143,6 +145,7 @@ export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderPr
     recognition.onstart = () => {
       setState('listening');
       setError(null);
+      if (onStart) onStart();
     };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
@@ -226,10 +229,11 @@ export function VoiceRecorder({ onSpeech, onInterim, disabled }: VoiceRecorderPr
       // Only reset to idle if we're not in error state
       setState(prev => prev === 'error' ? 'error' : 'idle');
       recognitionRef.current = null;
+      if (onEnd) onEnd();
     };
 
     return recognition;
-  }, [onSpeech, onInterim]);
+  }, [onStart, onEnd, onSpeech, onInterim]);
 
   const startRecording = useCallback(async () => {
     if (!isWebSpeechSupported()) {
