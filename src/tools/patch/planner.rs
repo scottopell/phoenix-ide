@@ -104,13 +104,14 @@ impl PatchPlanner {
 
         for patch in patches {
             // Get new text (from clipboard if specified)
+            // Treat empty string as None (LLMs sometimes pass "" instead of omitting)
             let mut new_text = match &patch.from_clipboard {
-                Some(name) => self
+                Some(name) if !name.is_empty() => self
                     .clipboards
                     .get(name)
                     .ok_or_else(|| PatchError::ClipboardNotFound(name.clone()))?
                     .clone(),
-                None => patch.new_text.clone().unwrap_or_default(),
+                _ => patch.new_text.clone().unwrap_or_default(),
             };
 
             // Apply reindentation
@@ -118,10 +119,12 @@ impl PatchPlanner {
                 new_text = apply_reindent(&new_text, reindent)?;
             }
 
-            // Store to clipboard if requested
+            // Store to clipboard if requested (ignore empty string names)
             if let Some(name) = &patch.to_clipboard {
-                if let Some(old_text) = &patch.old_text {
-                    self.clipboards.insert(name.clone(), old_text.clone());
+                if !name.is_empty() {
+                    if let Some(old_text) = &patch.old_text {
+                        self.clipboards.insert(name.clone(), old_text.clone());
+                    }
                 }
             }
 
@@ -149,8 +152,10 @@ impl PatchPlanner {
 
                     // Update clipboard with actual matched text if it differed
                     if let Some(name) = &patch.to_clipboard {
-                        let matched = &original[spec.offset..spec.offset + spec.length];
-                        self.clipboards.insert(name.clone(), matched.to_string());
+                        if !name.is_empty() {
+                            let matched = &original[spec.offset..spec.offset + spec.length];
+                            self.clipboards.insert(name.clone(), matched.to_string());
+                        }
                     }
 
                     Edit {
@@ -485,5 +490,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.resulting_content, "111 BBB 333");
+    }
+
+    #[test]
+    fn test_empty_clipboard_name_treated_as_none() {
+        // LLMs sometimes pass "" instead of omitting fromClipboard
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("hello"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("hello".to_string()),
+                    new_text: Some("world".to_string()),
+                    to_clipboard: Some("".to_string()), // empty string
+                    from_clipboard: Some("".to_string()), // empty string
+                    reindent: None,
+                }],
+            )
+            .unwrap(); // Should not error on empty clipboard names
+
+        assert_eq!(plan.resulting_content, "world");
+        // Empty string clipboard should not be stored
+        assert!(!planner.clipboards().contains_key(""));
     }
 }
