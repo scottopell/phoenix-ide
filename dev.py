@@ -427,17 +427,31 @@ def cmd_check():
 # =============================================================================
 
 
-def detect_prod_env() -> str | None:
-    """Detect production environment: 'native' (Linux) or 'lima' (macOS+VM)."""
+def detect_prod_env() -> str:
+    """Detect production environment: 'native', 'lima', or 'local'.
+
+    Returns:
+        'native': Linux with systemd - full production deployment
+        'lima': Lima VM with KVM support - isolated VM deployment
+        'local': Fallback - run prod binary locally without systemd
+    """
     if sys.platform == "linux":
-        return "native"
+        # Check if systemd is available for native deployment
+        if check_systemd_available():
+            return "native"
+        # No systemd, fall back to local mode
+        return "local"
+
     if sys.platform == "darwin":
-        if lima_is_running():
-            return "lima"
-        if lima_vm_exists():
+        # Check if Lima VM exists and has KVM support
+        if lima_vm_exists() and os.path.exists("/dev/kvm"):
             lima_ensure_running()
             return "lima"
-    return None
+        # No Lima or no KVM, fall back to local mode
+        return "local"
+
+    # Other platforms: local mode
+    return "local"
 
 
 # Production build worktree location
@@ -766,12 +780,18 @@ def cmd_prod_deploy(version: str | None = None, ai_gateway: bool = False):
     """Build and deploy to production (auto-detects environment)."""
     env = detect_prod_env()
     if env == "native":
+        print("📦 Detected: Linux with systemd (native deployment)")
         native_prod_deploy(version, ai_gateway)
     elif env == "lima":
+        print("📦 Detected: Lima VM with KVM support")
         lima_prod_deploy(ai_gateway)
+    elif env == "local":
+        print("📦 Detected: Container/no-systemd environment (local mode)")
+        print("    Running production build locally without systemd")
+        print()
+        prod_local_run(ai_gateway)
     else:
-        print("No Linux environment available.", file=sys.stderr)
-        print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
+        print("ERROR: Unknown environment", file=sys.stderr)
         sys.exit(1)
 
 
@@ -787,9 +807,23 @@ def cmd_prod_status():
         native_prod_status()
     elif env == "lima":
         lima_prod_status()
+    elif env == "local":
+        # Check if prod-local process is running (looks for prod build worktree binary)
+        prod_binary_path = PROD_BUILD_WORKTREE / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
+        result = subprocess.run(
+            ["pgrep", "-f", str(prod_binary_path)],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            pids = result.stdout.decode().strip().split('\n')
+            print(f"Production (local mode): running (PID {pids[0]})")
+            print(f"  Port: 8032")
+            print(f"  Database: {Path.home() / '.phoenix-ide' / 'prod-local.db'}")
+        else:
+            print("Production (local mode): not running")
+            print("  Start with: ./dev.py prod deploy [--ai-gateway]")
     else:
-        print("No Linux environment available.", file=sys.stderr)
-        print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
+        print("ERROR: Unknown environment", file=sys.stderr)
         sys.exit(1)
 
 
@@ -800,9 +834,19 @@ def cmd_prod_stop():
         native_prod_stop()
     elif env == "lima":
         lima_prod_stop()
+    elif env == "local":
+        # Stop local prod process (looks for prod build worktree binary)
+        prod_binary_path = PROD_BUILD_WORKTREE / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
+        result = subprocess.run(
+            ["pkill", "-f", str(prod_binary_path)],
+            capture_output=True
+        )
+        if result.returncode == 0 or result.returncode == 144:
+            print("✓ Stopped production (local mode)")
+        else:
+            print("Production (local mode) not running")
     else:
-        print("No Linux environment available.", file=sys.stderr)
-        print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
+        print("ERROR: Unknown environment", file=sys.stderr)
         sys.exit(1)
 
 
