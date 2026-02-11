@@ -466,9 +466,14 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
       )}
 
       {/* Patch file summary (REQ-PF-014) */}
-      {name === 'patch' && resultText && containsUnifiedDiff(resultText) && onOpenFile && (
-        <PatchFileSummary patchOutput={resultText} onFileClick={onOpenFile} />
-      )}
+      {/* Check display_data.diff first (new format), then fall back to resultText (old format) */}
+      {name === 'patch' && onOpenFile && (() => {
+        const patchDiff = (result?.display_data as { diff?: string })?.diff;
+        const diffContent = patchDiff || resultText;
+        return diffContent && containsUnifiedDiff(diffContent) ? (
+          <PatchFileSummary patchOutput={diffContent} onFileClick={onOpenFile} />
+        ) : null;
+      })()}
 
       {/* Sub-agent summary (when subagents complete and update this tool result) */}
       {result?.display_data && isSubAgentSummaryData(result.display_data) && (
