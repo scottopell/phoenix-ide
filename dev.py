@@ -27,7 +27,7 @@ LOG_FILE = ROOT / "phoenix.log"
 PROD_SERVICE_NAME = "phoenix-ide"
 PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
-PROD_PORT = 7331
+PROD_PORT = 8031  # In workspaces-compatible 8000-8050 range
 
 # Lima VM configuration
 LIMA_VM_NAME = "phoenix-ide"
@@ -659,6 +659,62 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         sys.exit(1)
 
 
+def prod_local_run(ai_gateway: bool = False):
+    """Run production build locally without systemd.
+
+    Builds in separate worktree, runs on different ports for isolation.
+    Ideal for testing production builds while doing concurrent dev work.
+    """
+    # Build production binary
+    binary = prod_build(version=None)
+
+    # Authenticate AI Gateway if needed
+    if ai_gateway:
+        config = get_ai_gateway_config()
+        print("\n=== AI Gateway Authentication ===")
+        if not check_ai_gateway_auth():
+            print("No valid ddtool authentication found.")
+            if not prompt_ai_gateway_auth():
+                print("ERROR: AI Gateway authentication required.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("✓ Using existing ddtool authentication")
+
+    # Set up environment
+    env = os.environ.copy()
+    env["PHOENIX_PORT"] = "9000"  # Different from dev port (8023)
+    env["PHOENIX_DB_PATH"] = str(Path.home() / ".phoenix-ide" / "prod-local.db")
+
+    if ai_gateway:
+        env["AI_GATEWAY_ENABLED"] = "true"
+        env["AI_GATEWAY_URL"] = config['url']
+        env["AI_GATEWAY_DATACENTER"] = config['datacenter']
+        env["AI_GATEWAY_SERVICE"] = config['service']
+        env["AI_GATEWAY_SOURCE"] = "phoenix-ide"
+        env["AI_GATEWAY_ORG_ID"] = "2"
+    else:
+        # Check for API key
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("ERROR: ANTHROPIC_API_KEY not set.", file=sys.stderr)
+            print("Set it in your environment or use --ai-gateway flag.", file=sys.stderr)
+            sys.exit(1)
+        env["ANTHROPIC_API_KEY"] = api_key
+
+    print(f"\n✓ Production binary ready: {binary}")
+    print(f"  Port: 9000")
+    print(f"  Database: {env['PHOENIX_DB_PATH']}")
+    print(f"  LLM Mode: {'AI Gateway' if ai_gateway else 'Direct API'}")
+    print(f"\nStarting production server...")
+    print("Press Ctrl+C to stop\n")
+
+    # Run the binary
+    try:
+        subprocess.run([str(binary)], env=env, check=True)
+    except KeyboardInterrupt:
+        print("\n\nStopped.")
+
+
 def native_prod_status():
     """Show production service status (native Linux)."""
     # Check if service exists
@@ -717,6 +773,11 @@ def cmd_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         print("No Linux environment available.", file=sys.stderr)
         print("Run './dev.py lima create' to set up a Lima VM.", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_prod_local(ai_gateway: bool = False):
+    """Run production build locally without systemd."""
+    prod_local_run(ai_gateway)
 
 
 def cmd_prod_status():
@@ -1165,6 +1226,8 @@ def main():
     deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
     deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
     deploy_parser.add_argument("--ai-gateway", action="store_true", help="Enable Datadog AI Gateway mode")
+    local_parser = prod_sub.add_parser("local", help="Run production build locally (no systemd)")
+    local_parser.add_argument("--ai-gateway", action="store_true", help="Enable Datadog AI Gateway mode")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
 
@@ -1198,6 +1261,8 @@ def main():
             cmd_prod_build(args.version)
         elif args.prod_command == "deploy":
             cmd_prod_deploy(args.version, ai_gateway=args.ai_gateway)
+        elif args.prod_command == "local":
+            cmd_prod_local(ai_gateway=args.ai_gateway)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":
