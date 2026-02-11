@@ -1,7 +1,7 @@
 ---
 created: 2025-02-10
 priority: p2
-status: ready
+status: done
 ---
 
 # Inline Patch Diff Preview
