@@ -397,7 +397,7 @@ def cmd_status():
 
 
 def cmd_check():
-    """Run lint, format check, and tests."""
+    """Run lint, format check, tests, and task validation."""
     print("Running clippy...")
     result = subprocess.run(["cargo", "clippy", "--", "-D", "warnings"], cwd=ROOT)
     if result.returncode != 0:
@@ -418,7 +418,92 @@ def cmd_check():
     if result.returncode != 0:
         sys.exit(result.returncode)
 
+    print("\nValidating task specs...")
+    if not cmd_tasks_validate():
+        sys.exit(1)
+
     print("\n✓ All checks passed")
+
+
+# =============================================================================
+# Task Validation
+# =============================================================================
+
+VALID_STATUSES = {"ready", "in-progress", "pending", "blocked", "done", "wont-do", "brainstorming"}
+VALID_PRIORITIES = {"p0", "p1", "p2", "p3", "p4"}
+
+
+def cmd_tasks_validate() -> bool:
+    """Validate all task files conform to the frontmatter convention.
+
+    Returns True if all tasks pass, False otherwise.
+    """
+    import re
+
+    tasks_dir = ROOT / "tasks"
+    if not tasks_dir.exists():
+        print("No tasks/ directory found, skipping.")
+        return True
+
+    errors = []
+    task_files = sorted(tasks_dir.glob("*.md"))
+    template = tasks_dir / "_TEMPLATE.md"
+
+    for path in task_files:
+        if path == template:
+            continue
+
+        name = path.name
+        content = path.read_text()
+
+        # Check YAML frontmatter exists
+        if not content.startswith("---\n"):
+            errors.append(f"{name}: missing YAML frontmatter (must start with ---)")
+            continue
+
+        # Extract frontmatter
+        end = content.find("\n---\n", 4)
+        if end == -1:
+            errors.append(f"{name}: malformed YAML frontmatter (no closing ---)")
+            continue
+
+        frontmatter = content[4:end]
+        fields = {}
+        for line in frontmatter.strip().split("\n"):
+            if ":" in line:
+                key, _, value = line.partition(":")
+                fields[key.strip()] = value.strip()
+
+        # Check required fields
+        if "status" not in fields:
+            errors.append(f"{name}: missing 'status' field")
+        elif fields["status"] not in VALID_STATUSES:
+            errors.append(
+                f"{name}: invalid status '{fields['status']}' "
+                f"(valid: {', '.join(sorted(VALID_STATUSES))})"
+            )
+
+        if "priority" not in fields:
+            errors.append(f"{name}: missing 'priority' field")
+        elif fields["priority"] not in VALID_PRIORITIES:
+            errors.append(
+                f"{name}: invalid priority '{fields['priority']}' "
+                f"(valid: {', '.join(sorted(VALID_PRIORITIES))})"
+            )
+
+        if "created" not in fields:
+            errors.append(f"{name}: missing 'created' field")
+        elif not re.match(r"^\d{4}-\d{2}-\d{2}$", fields["created"]):
+            errors.append(f"{name}: invalid 'created' date format (expected YYYY-MM-DD)")
+
+    if errors:
+        print(f"✗ {len(errors)} task validation error(s):")
+        for err in errors:
+            print(f"  - {err}")
+        return False
+
+    print(f"✓ {len(task_files) - 1} task files validated")  # -1 for template
+    return True
 
 
 
@@ -1282,6 +1367,11 @@ def main():
     lima_sub.add_parser("shell", help="Open shell as phoenix-user")
     lima_sub.add_parser("destroy", help="Delete Lima VM")
 
+    # tasks
+    tasks_parser = sub.add_parser("tasks", help="Task management")
+    tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
+    tasks_sub.add_parser("validate", help="Validate task file frontmatter")
+
     # ai-gateway
     ai_parser = sub.add_parser("ai-gateway", help="Test Datadog AI Gateway")
     ai_sub = ai_parser.add_subparsers(dest="ai_command", required=True)
@@ -1318,6 +1408,10 @@ def main():
             cmd_lima_shell()
         elif args.lima_command == "destroy":
             cmd_lima_destroy()
+    elif args.command == "tasks":
+        if args.tasks_command == "validate":
+            if not cmd_tasks_validate():
+                sys.exit(1)
     elif args.command == "ai-gateway":
         if args.ai_command == "test":
             cmd_ai_gateway_test()
