@@ -627,6 +627,20 @@ body {
   text-decoration: underline;
 }
 
+/* Clickable file paths in agent messages */
+.file-path-link {
+  color: var(--accent-blue);
+  cursor: pointer;
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent-blue);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.file-path-link:hover {
+  color: #60a5fa;
+  border-bottom-style: solid;
+}
+
 /* Images in messages */
 .message-images {
   display: flex;

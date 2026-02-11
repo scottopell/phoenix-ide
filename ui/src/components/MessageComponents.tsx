@@ -12,7 +12,7 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -21,6 +21,7 @@ import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAg
 import { api } from '../api';
 import type { QueuedMessage } from '../hooks';
 import { escapeHtml } from '../utils';
+import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 
@@ -218,22 +219,67 @@ export function AgentMessage({
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
+                    // Custom code block rendering with syntax highlighting
+                    // Inline code with file paths becomes clickable
                     code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) => {
                       const match = /language-(\w+)/.exec(className || '');
-                      return !inline && match ? (
-                        <SyntaxHighlighter
-                          style={oneDark}
-                          language={match[1]}
-                          PreTag="div"
-                          {...props}
-                        >
-                          {String(children).replace(/\n$/, '')}
-                        </SyntaxHighlighter>
-                      ) : (
+                      if (!inline && match) {
+                        return (
+                          <SyntaxHighlighter
+                            style={oneDark}
+                            language={match[1]}
+                            PreTag="div"
+                            {...props}
+                          >
+                            {String(children).replace(/\n$/, '')}
+                          </SyntaxHighlighter>
+                        );
+                      }
+                      // For inline code, check if it looks like a file path and make it clickable
+                      const text = String(children);
+                      const fileClickHandler = onOpenFile
+                        ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
+                        : undefined;
+                      const linkified = linkifyText(text, fileClickHandler);
+                      // If linkifyText returned something other than plain text, it found a file path
+                      if (linkified !== text && fileClickHandler) {
+                        return <>{linkified}</>;
+                      }
+                      return (
                         <code className={className} {...props}>
                           {children}
                         </code>
                       );
+                    },
+                    // Custom paragraph rendering with clickable file paths
+                    p: ({ children }) => {
+                      const fileClickHandler = onOpenFile
+                        ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
+                        : undefined;
+                      const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
+                        return React.Children.toArray(nodes).flatMap((child) => {
+                          if (typeof child === 'string') {
+                            return linkifyText(child, fileClickHandler);
+                          }
+                          return child;
+                        });
+                      };
+                      return <p>{processChildren(children)}</p>;
+                    },
+                    // Custom list item rendering with clickable file paths
+                    li: ({ children }) => {
+                      const fileClickHandler = onOpenFile
+                        ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
+                        : undefined;
+                      const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
+                        return React.Children.toArray(nodes).flatMap((child) => {
+                          if (typeof child === 'string') {
+                            return linkifyText(child, fileClickHandler);
+                          }
+                          return child;
+                        });
+                      };
+                      return <li>{processChildren(children)}</li>;
                     },
                   }}
                 >
