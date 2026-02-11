@@ -347,8 +347,12 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
     resultContent = result.content as ToolResultContent;
   }
 
-  const resultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
+  const rawResultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
   const isError = resultContent?.is_error || !!resultContent?.error;
+  
+  // For patch tool, use the diff from display_data instead of the generic success message
+  const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
+  const resultText = patchDiff || rawResultText;
   const resultLength = resultText.length;
   
   // Check if this is an image result
