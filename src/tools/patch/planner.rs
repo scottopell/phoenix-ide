@@ -6,9 +6,8 @@
 
 use super::matching::find_unique_match;
 use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
-use similar::{ChangeTag, TextDiff};
+use similar::TextDiff;
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::path::Path;
 
 /// Pure patch planner - no IO operations
@@ -229,28 +228,10 @@ fn apply_reindent(text: &str, reindent: &Reindent) -> Result<String, PatchError>
 /// Generate a unified diff between old and new content
 fn generate_diff(path: &str, old: &str, new: &str) -> String {
     let diff = TextDiff::from_lines(old, new);
-    let mut output = String::new();
-
-    let _ = writeln!(output, "--- a/{path}");
-    let _ = writeln!(output, "+++ b/{path}");
-
-    for (idx, group) in diff.grouped_ops(3).iter().enumerate() {
-        if idx > 0 {
-            output.push('\n');
-        }
-        for op in group {
-            for change in diff.iter_changes(op) {
-                let tag = match change.tag() {
-                    ChangeTag::Delete => "-",
-                    ChangeTag::Insert => "+",
-                    ChangeTag::Equal => " ",
-                };
-                let _ = write!(output, "{tag}{change}");
-            }
-        }
-    }
-
-    output
+    diff.unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
 }
 
 /// Check if content appears to be auto-generated
