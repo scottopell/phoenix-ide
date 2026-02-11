@@ -315,20 +315,28 @@ impl AIGatewayService {
                     })
                     .collect();
 
-                result.push(OpenAIMessage {
-                    role: "assistant".to_string(),
-                    content: if text_parts.is_empty() {
-                        None
-                    } else {
-                        Some(OpenAIContent::Text(text_parts.join("\n")))
-                    },
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    tool_call_id: None,
-                });
+                let content = if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(OpenAIContent::Text(text_parts.join("\n")))
+                };
+
+                let tool_calls_opt = if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                };
+
+                // Only push assistant message if it has content or tool calls
+                // (skip when message only contains ToolResult blocks)
+                if content.is_some() || tool_calls_opt.is_some() {
+                    result.push(OpenAIMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        tool_calls: tool_calls_opt,
+                        tool_call_id: None,
+                    });
+                }
 
                 // Tool results become separate messages with role "tool"
                 for block in &msg.content {
@@ -385,8 +393,18 @@ impl AIGatewayService {
         // Add tool calls
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in tool_calls {
-                let input = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                if tc.function.name.is_empty() {
+                    return Err(LlmError::unknown(
+                        "AI Gateway returned tool call with empty function name",
+                    ));
+                }
+
+                let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                    LlmError::unknown(format!(
+                        "Invalid JSON in tool call arguments: {}",
+                        e
+                    ))
+                })?;
 
                 content.push(ContentBlock::ToolUse {
                     id: tc.id,
@@ -480,5 +498,22 @@ impl LlmService for AIGatewayService {
     fn max_image_dimension(&self) -> Option<u32> {
         // Depends on the model; return None for now
         None
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+    use crate::llm::openai::OpenAIResponse;
+    use crate::llm::types::LlmMessage;
+
+    pub fn convert_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
+        AIGatewayService::convert_message(msg)
+    }
+
+    pub fn normalize_response(
+        resp: OpenAIResponse,
+    ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
+        AIGatewayService::normalize_response(resp)
     }
 }

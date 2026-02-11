@@ -168,33 +168,41 @@ impl AnthropicService {
         }
     }
 
-    fn normalize_response(resp: AnthropicResponse) -> LlmResponse {
-        let content: Vec<ContentBlock> = resp
-            .content
-            .into_iter()
-            .map(|block| match block {
-                AnthropicContentBlock::Text { text } => ContentBlock::Text { text },
+    fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
+        let mut content = Vec::new();
+
+        for block in resp.content {
+            match block {
+                AnthropicContentBlock::Text { text } => {
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text { text });
+                    }
+                }
                 AnthropicContentBlock::ToolUse { id, name, input } => {
-                    ContentBlock::ToolUse { id, name, input }
+                    content.push(ContentBlock::ToolUse { id, name, input });
                 }
                 AnthropicContentBlock::Image { .. } => {
-                    // Images shouldn't appear in responses
-                    ContentBlock::Text {
-                        text: "[image]".to_string(),
-                    }
+                    return Err(LlmError::unknown(
+                        "Unexpected image block in Anthropic response",
+                    ));
                 }
                 AnthropicContentBlock::ToolResult { .. } => {
-                    // Tool results shouldn't appear in responses
-                    ContentBlock::Text {
-                        text: "[tool result]".to_string(),
-                    }
+                    return Err(LlmError::unknown(
+                        "Unexpected tool_result block in Anthropic response",
+                    ));
                 }
-            })
-            .collect();
+            }
+        }
+
+        if content.is_empty() {
+            return Err(LlmError::unknown(
+                "Anthropic returned empty response (no content or tool calls)",
+            ));
+        }
 
         let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
-        LlmResponse {
+        Ok(LlmResponse {
             content,
             end_turn,
             usage: Usage {
@@ -203,7 +211,7 @@ impl AnthropicService {
                 cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
                 cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
             },
-        }
+        })
     }
 
     fn classify_error(status: reqwest::StatusCode, body: &str) -> LlmError {
@@ -269,7 +277,7 @@ impl LlmService for AnthropicService {
             LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
         })?;
 
-        Ok(Self::normalize_response(anthropic_response))
+        Self::normalize_response(anthropic_response)
     }
 
     fn model_id(&self) -> &str {
@@ -311,14 +319,14 @@ struct CacheControl {
 }
 
 #[derive(Debug, Serialize)]
-struct AnthropicMessage {
-    role: String,
-    content: Vec<AnthropicContentBlock>,
+pub(crate) struct AnthropicMessage {
+    pub(crate) role: String,
+    pub(crate) content: Vec<AnthropicContentBlock>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicContentBlock {
+pub(crate) enum AnthropicContentBlock {
     Text {
         text: String,
     },
@@ -339,10 +347,10 @@ enum AnthropicContentBlock {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct AnthropicImageSource {
-    r#type: String,
-    media_type: String,
-    data: String,
+pub(crate) struct AnthropicImageSource {
+    pub(crate) r#type: String,
+    pub(crate) media_type: String,
+    pub(crate) data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,17 +361,33 @@ struct AnthropicTool {
 }
 
 #[derive(Debug, Deserialize)]
-struct AnthropicResponse {
-    content: Vec<AnthropicContentBlock>,
-    stop_reason: Option<String>,
-    usage: AnthropicUsage,
+pub(crate) struct AnthropicResponse {
+    pub(crate) content: Vec<AnthropicContentBlock>,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) usage: AnthropicUsage,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(clippy::struct_field_names)] // matches Anthropic API
-struct AnthropicUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_creation_input_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
+pub(crate) struct AnthropicUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_input_tokens: Option<u64>,
+    pub(crate) cache_read_input_tokens: Option<u64>,
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+    use crate::llm::types::LlmMessage;
+
+    pub fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
+        AnthropicService::translate_message(msg)
+    }
+
+    pub fn normalize_response(
+        resp: AnthropicResponse,
+    ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
+        AnthropicService::normalize_response(resp)
+    }
 }

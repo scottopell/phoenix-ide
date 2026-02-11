@@ -369,11 +369,17 @@ impl OpenAIService {
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in tool_calls {
                 if tc.function.name.is_empty() {
-                    continue;
+                    return Err(LlmError::unknown(
+                        "OpenAI returned tool call with empty function name",
+                    ));
                 }
 
-                let input = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                    LlmError::unknown(format!(
+                        "Invalid JSON in tool call arguments: {}",
+                        e
+                    ))
+                })?;
 
                 content.push(ContentBlock::ToolUse {
                     id: tc.id,
@@ -871,36 +877,52 @@ struct ResponsesApiTool {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsesApiResponse {
-    status: String,
-    output: Vec<ResponsesApiOutput>,
-    usage: ResponsesApiUsage,
+pub(crate) struct ResponsesApiResponse {
+    pub(crate) status: String,
+    pub(crate) output: Vec<ResponsesApiOutput>,
+    pub(crate) usage: ResponsesApiUsage,
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsesApiOutput {
-    r#type: String,
+pub(crate) struct ResponsesApiOutput {
+    pub(crate) r#type: String,
     /// For message outputs
     #[serde(default)]
-    content: Option<Vec<ResponsesApiContent>>,
+    pub(crate) content: Option<Vec<ResponsesApiContent>>,
     /// For `function_call` outputs
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    arguments: Option<String>,
+    pub(crate) arguments: Option<String>,
     #[serde(default)]
-    call_id: Option<String>,
+    pub(crate) call_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsesApiContent {
-    r#type: String,
+pub(crate) struct ResponsesApiContent {
+    pub(crate) r#type: String,
     #[serde(default)]
-    text: Option<String>,
+    pub(crate) text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsesApiUsage {
-    input_tokens: u32,
-    output_tokens: u32,
+pub(crate) struct ResponsesApiUsage {
+    pub(crate) input_tokens: u32,
+    pub(crate) output_tokens: u32,
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+    use crate::llm::types::LlmMessage;
+
+    pub fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
+        OpenAIService::translate_message(msg)
+    }
+
+    pub fn normalize_response(
+        resp: OpenAIResponse,
+    ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
+        OpenAIService::normalize_response(resp)
+    }
 }

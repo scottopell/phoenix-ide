@@ -7,6 +7,8 @@ mod anthropic;
 mod error;
 mod models;
 mod openai;
+#[cfg(test)]
+mod proptests;
 mod registry;
 mod types;
 
