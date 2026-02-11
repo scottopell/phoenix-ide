@@ -863,6 +863,10 @@ def cmd_prod_build(version: str | None = None):
 
 def cmd_prod_deploy(version: str | None = None, ai_gateway: bool = False):
     """Build and deploy to production (auto-detects environment)."""
+    print("Running pre-deploy checks...\n")
+    cmd_check()
+    print()
+
     env = detect_prod_env()
     if env == "native":
         print("📦 Detected: Linux with systemd (native deployment)")
