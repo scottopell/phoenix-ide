@@ -1,6 +1,6 @@
 # Task 542: Use Dynamic Home Directory for New Conversations
 
-**Status**: Open
+**Status**: Closed
 **Priority**: Medium
 **Created**: 2026-02-11
 
