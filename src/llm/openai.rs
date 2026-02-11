@@ -383,6 +383,12 @@ impl OpenAIService {
             }
         }
 
+        if content.is_empty() {
+            return Err(LlmError::unknown(
+                "OpenAI returned empty response (no content or tool calls)".to_string(),
+            ));
+        }
+
         let end_turn = choice.finish_reason == Some("stop".to_string());
 
         Ok(LlmResponse {

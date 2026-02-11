@@ -396,6 +396,12 @@ impl AIGatewayService {
             }
         }
 
+        if content.is_empty() {
+            return Err(LlmError::unknown(
+                "AI Gateway returned empty response (no content or tool calls)".to_string(),
+            ));
+        }
+
         let end_turn = choice.finish_reason.as_deref() == Some("stop");
 
         let usage = Usage {
