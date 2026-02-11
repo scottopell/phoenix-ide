@@ -232,7 +232,7 @@ fn generate_diff(path: &str, old: &str, new: &str) -> String {
     let mut output = String::new();
 
     let _ = writeln!(output, "--- a/{path}");
-    let _ = writeln!(output, "--- b/{path}");
+    let _ = writeln!(output, "+++ b/{path}");
 
     for (idx, group) in diff.grouped_ops(3).iter().enumerate() {
         if idx > 0 {
