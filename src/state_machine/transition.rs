@@ -227,7 +227,7 @@ pub fn transition(
         (
             ConvState::LlmRequesting { attempt },
             Event::LlmError {
-                message,
+                message: _,
                 error_kind,
                 ..
             },
