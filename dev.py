@@ -444,6 +444,19 @@ def detect_prod_env() -> str | None:
 PROD_BUILD_WORKTREE = ROOT.parent / ".phoenix-ide-build"
 
 
+def check_systemd_available() -> bool:
+    """Check if systemd is available as the init system."""
+    try:
+        # Check if PID 1 is systemd
+        result = subprocess.run(
+            ["ps", "-p", "1", "-o", "comm="],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0 and "systemd" in result.stdout.strip()
+    except:
+        return False
+
+
 def prod_build(version: str | None = None) -> Path:
     """Build a production binary from a git tag or HEAD.
     
@@ -499,9 +512,11 @@ def prod_build(version: str | None = None) -> Path:
     
     # Build Rust with musl target
     print("Building Rust (musl, release)...")
+    build_env = os.environ.copy()
+    build_env["CC_x86_64_unknown_linux_musl"] = "x86_64-linux-musl-gcc"
     subprocess.run(
         ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
-        cwd=worktree, check=True
+        cwd=worktree, check=True, env=build_env
     )
     
     # Strip the binary
@@ -558,6 +573,17 @@ WantedBy=multi-user.target
 
 def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
     """Build and deploy to production (native Linux)."""
+    # Check if systemd is available
+    if not check_systemd_available():
+        print("ERROR: systemd is not available on this system.", file=sys.stderr)
+        print("Production deployment requires systemd for service management.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("This system is running in a container or non-systemd environment.", file=sys.stderr)
+        print("Options:", file=sys.stderr)
+        print("  - Use './dev.py up' for development mode instead", file=sys.stderr)
+        print("  - Use './dev.py lima create' to set up a Lima VM with systemd", file=sys.stderr)
+        sys.exit(1)
+
     # Build
     binary = prod_build(version)
     
