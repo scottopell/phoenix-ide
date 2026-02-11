@@ -1,7 +1,7 @@
-//! Datadog AI Gateway integration.
+//! AI Gateway integration.
 //!
 //! Provides unified access to multiple LLM providers (OpenAI, Anthropic, Gemini, self-hosted)
-//! through Datadog's internal AI Gateway service.
+//! through an internal AI Gateway service.
 //!
 //! Authentication uses `ddtool` for service tokens. The gateway is OpenAI-compatible,
 //! with provider routing via model name prefixes (e.g., "anthropic/claude-sonnet-4-20250514").
@@ -43,7 +43,7 @@ struct CachedToken {
     expires_at: Instant,
 }
 
-/// Datadog AI Gateway service.
+/// AI Gateway service.
 ///
 /// Routes requests to multiple LLM providers through a unified OpenAI-compatible API.
 pub struct AIGatewayService {
@@ -63,7 +63,7 @@ impl AIGatewayService {
     /// * `api_name` - API-specific model name (used for requests)
     /// * `provider_prefix` - Provider prefix for routing ("anthropic", "openai", etc.)
     /// * `source` - Application identifier for telemetry (e.g., "phoenix-ide")
-    /// * `org_id` - Datadog organization ID (use "2" for staging)
+    /// * `org_id` - Organization ID (use "2" for staging)
     pub fn new(
         _model: &'static str,
         api_name: &'static str,

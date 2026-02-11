@@ -14,7 +14,7 @@ pub struct LlmConfig {
     pub fireworks_api_key: Option<String>,
     /// exe.dev gateway URL (e.g., `http://169.254.169.254/gateway/llm`)
     pub gateway: Option<String>,
-    /// Enable Datadog AI Gateway (internal unified LLM proxy)
+    /// Enable AI Gateway (internal unified LLM proxy)
     pub ai_gateway_enabled: bool,
     /// Source identifier for AI Gateway telemetry (e.g., "phoenix-ide")
     pub ai_gateway_source: String,

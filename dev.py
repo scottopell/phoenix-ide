@@ -39,7 +39,7 @@ LIMA_ENV_FILE = "/etc/phoenix-ide/env"
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
 
-# Datadog AI Gateway configuration (must be set in environment)
+# AI Gateway configuration (must be set in environment)
 def get_ai_gateway_config():
     """Get AI Gateway config from environment variables (required)."""
     url = os.environ.get('AI_GATEWAY_URL')
@@ -1358,9 +1358,9 @@ def main():
     build_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
     deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
     deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
-    deploy_parser.add_argument("--ai-gateway", action="store_true", help="Enable Datadog AI Gateway mode")
+    deploy_parser.add_argument("--ai-gateway", action="store_true", help="Enable AI Gateway mode")
     local_parser = prod_sub.add_parser("local", help="Run production build locally (no systemd)")
-    local_parser.add_argument("--ai-gateway", action="store_true", help="Enable Datadog AI Gateway mode")
+    local_parser.add_argument("--ai-gateway", action="store_true", help="Enable AI Gateway mode")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
 
@@ -1375,12 +1375,6 @@ def main():
     tasks_parser = sub.add_parser("tasks", help="Task management")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
     tasks_sub.add_parser("validate", help="Validate task file frontmatter")
-
-    # ai-gateway
-    ai_parser = sub.add_parser("ai-gateway", help="Test Datadog AI Gateway")
-    ai_sub = ai_parser.add_subparsers(dest="ai_command", required=True)
-    ai_sub.add_parser("test", help="Test AI Gateway connectivity")
-    ai_sub.add_parser("env", help="Print env vars for AI Gateway mode")
 
     args = parser.parse_args()
 
@@ -1416,64 +1410,6 @@ def main():
         if args.tasks_command == "validate":
             if not cmd_tasks_validate():
                 sys.exit(1)
-    elif args.command == "ai-gateway":
-        if args.ai_command == "test":
-            cmd_ai_gateway_test()
-        elif args.ai_command == "env":
-            cmd_ai_gateway_env()
-
-
-def cmd_ai_gateway_test():
-    """Test AI Gateway connectivity."""
-    print("🔍 Testing Datadog AI Gateway...")
-    config = get_ai_gateway_config()
-
-    # Get token
-    print("  Getting token from ddtool...")
-    try:
-        result = subprocess.run(
-            ["ddtool", "auth", "token", config['service'], "--datacenter", config['datacenter']],
-            capture_output=True, text=True, check=True, timeout=30
-        )
-        token = result.stdout.strip()
-        if not token:
-            print("  ❌ ddtool returned empty token")
-            sys.exit(1)
-        print(f"  ✓ Token: {token[:30]}...")
-    except FileNotFoundError:
-        print("  ❌ ddtool not found. Install: https://github.com/DataDog/devtools")
-        sys.exit(1)
-    except Exception as e:
-        print(f"  ❌ Failed to get token: {e}")
-        sys.exit(1)
-
-    # Test connectivity
-    print(f"  Testing {config['url']}/v1/models...")
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            f"{config['url']}/v1/models",
-            headers={"Authorization": f"Bearer {token}", "source": "phoenix-ide-test", "org-id": "2"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            models = data.get("data", [])
-            print(f"  ✓ Connected! {len(models)} models available")
-    except Exception as e:
-        print(f"  ❌ Connection failed: {e}")
-        sys.exit(1)
-
-    print("✅ AI Gateway is working!")
-
-
-def cmd_ai_gateway_env():
-    """Print environment variables for AI Gateway mode."""
-    print("# Add these to your environment to enable AI Gateway:")
-    print("export AI_GATEWAY_ENABLED=true")
-    print("export AI_GATEWAY_SOURCE=phoenix-ide")
-    print("export AI_GATEWAY_ORG_ID=2")
-    print("")
-    print("# Then run: ./dev.py up")
 
 
 if __name__ == "__main__":
