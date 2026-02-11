@@ -682,7 +682,7 @@ def prod_local_run(ai_gateway: bool = False):
 
     # Set up environment
     env = os.environ.copy()
-    env["PHOENIX_PORT"] = "9000"  # Different from dev port (8023)
+    env["PHOENIX_PORT"] = "8032"  # Workspaces-compatible, different from dev (8023) and prod (8031)
     env["PHOENIX_DB_PATH"] = str(Path.home() / ".phoenix-ide" / "prod-local.db")
 
     if ai_gateway:
@@ -702,7 +702,7 @@ def prod_local_run(ai_gateway: bool = False):
         env["ANTHROPIC_API_KEY"] = api_key
 
     print(f"\n✓ Production binary ready: {binary}")
-    print(f"  Port: 9000")
+    print(f"  Port: {env['PHOENIX_PORT']}")
     print(f"  Database: {env['PHOENIX_DB_PATH']}")
     print(f"  LLM Mode: {'AI Gateway' if ai_gateway else 'Direct API'}")
     print(f"\nStarting production server...")
