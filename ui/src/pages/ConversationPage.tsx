@@ -489,6 +489,7 @@ export function ConversationPage() {
         connectionAttempt={connectionInfo.attempt}
         nextRetryIn={connectionInfo.nextRetryIn}
         contextWindowUsed={contextWindowUsed}
+        onRetryNow={connectionInfo.retryNow}
       />
 
       <FileBrowser

@@ -1796,6 +1796,22 @@ pre:hover .copy-btn {
   flex: 1;
 }
 
+.offline-banner-retry {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  color: white;
+  padding: 2px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.offline-banner-retry:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: white;
+}
+
 /* Message Status Indicators */
 .message-status {
   font-size: 14px;

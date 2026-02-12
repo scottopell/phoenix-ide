@@ -14,6 +14,7 @@ interface StateBarProps {
   connectionAttempt: number;
   nextRetryIn: number | null;
   contextWindowUsed: number;
+  onRetryNow?: () => void;
 }
 
 export function StateBar({
@@ -24,6 +25,7 @@ export function StateBar({
   connectionAttempt,
   nextRetryIn,
   contextWindowUsed,
+  onRetryNow,
 }: StateBarProps) {
   let dotClass = 'dot';
   let stateText = '';
@@ -157,6 +159,11 @@ export function StateBar({
           <span className="offline-banner-text">
             Connection lost. Reconnecting in {nextRetryIn}s...
           </span>
+          {onRetryNow && (
+            <button className="offline-banner-retry" onClick={onRetryNow}>
+              Retry now
+            </button>
+          )}
         </div>
       )}
     </>

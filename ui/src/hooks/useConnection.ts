@@ -18,6 +18,7 @@ export interface ConnectionInfo {
   attempt: number;
   nextRetryIn: number | null;  // Seconds until next retry (for countdown)
   lastSequenceId: number | null;
+  retryNow: () => void;
 }
 
 interface UseConnectionOptions {
@@ -250,6 +251,17 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
     };
   }, []); // No dependencies - handlers use refs
 
+  // Handle visibility change - retry immediately when user tabs back
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        dispatchRef.current({ type: 'BROWSER_ONLINE' });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, []);
+
   // Connect when conversationId changes
   useEffect(() => {
     if (conversationId) {
@@ -265,10 +277,16 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
     };
   }, [conversationId]); // Only depends on conversationId - dispatch accessed via ref
 
+  // Expose manual retry (reuses BROWSER_ONLINE to cancel timers + open SSE)
+  const retryNow = useCallback(() => {
+    dispatchRef.current({ type: 'BROWSER_ONLINE' });
+  }, []);
+
   return {
     state: machineState.state,
     attempt: machineState.attempt,
     nextRetryIn: countdownSeconds,
     lastSequenceId,
+    retryNow,
   };
 }
