@@ -1,6 +1,6 @@
 //! AI Gateway integration.
 //!
-//! Provides unified access to multiple LLM providers (OpenAI, Anthropic, Gemini, self-hosted)
+//! Provides unified access to multiple LLM providers (`OpenAI`, Anthropic, Gemini, self-hosted)
 //! through an internal AI Gateway service.
 //!
 //! Authentication uses `ddtool` for service tokens. The gateway is OpenAI-compatible,
@@ -109,16 +109,16 @@ impl AIGatewayService {
             ])
             .output()
             .map_err(|e| {
-                LlmError::network(format!("Failed to execute ddtool: {}", e))
+                LlmError::network(format!("Failed to execute ddtool: {e}"))
             })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(LlmError::auth(format!("ddtool failed: {}", stderr)));
+            return Err(LlmError::auth(format!("ddtool failed: {stderr}")));
         }
 
         let token = String::from_utf8(output.stdout)
-            .map_err(|e| LlmError::network(format!("Invalid token UTF-8: {}", e)))?
+            .map_err(|e| LlmError::network(format!("Invalid token UTF-8: {e}")))?
             .trim()
             .to_string();
 
@@ -143,7 +143,7 @@ impl AIGatewayService {
         format!("{}/{}", self.provider_prefix, self.model)
     }
 
-    /// Translate our internal LlmRequest to OpenAI-compatible format.
+    /// Translate our internal `LlmRequest` to OpenAI-compatible format.
     fn translate_request(&self, request: &LlmRequest) -> OpenAIRequest {
         let mut messages = Vec::new();
 
@@ -207,7 +207,8 @@ impl AIGatewayService {
         }
     }
 
-    /// Convert a single message to OpenAI format.
+    /// Convert a single message to `OpenAI` format.
+    #[allow(clippy::too_many_lines)]
     fn convert_message(msg: &crate::llm::LlmMessage) -> Vec<OpenAIMessage> {
         use crate::llm::openai::{OpenAIContent, OpenAIContentPart, OpenAIImageUrl};
         use crate::llm::types::ImageSource;
@@ -251,7 +252,7 @@ impl AIGatewayService {
                         for (media_type, data) in images {
                             parts.push(OpenAIContentPart::ImageUrl {
                                 image_url: OpenAIImageUrl {
-                                    url: format!("data:{};base64,{}", media_type, data),
+                                    url: format!("data:{media_type};base64,{data}"),
                                 },
                             });
                         }
@@ -360,7 +361,7 @@ impl AIGatewayService {
         result
     }
 
-    /// Normalize OpenAI response to our internal format.
+    /// Normalize `OpenAI` response to our internal format.
     fn normalize_response(resp: OpenAIResponse) -> Result<LlmResponse, LlmError> {
         let choice = resp.choices.into_iter().next().ok_or_else(|| {
             LlmError::unknown("AI Gateway returned no choices in response".to_string())
@@ -401,8 +402,7 @@ impl AIGatewayService {
 
                 let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
                     LlmError::unknown(format!(
-                        "Invalid JSON in tool call arguments: {}",
-                        e
+                        "Invalid JSON in tool call arguments: {e}"
                     ))
                 })?;
 
@@ -423,8 +423,8 @@ impl AIGatewayService {
         let end_turn = choice.finish_reason.as_deref() == Some("stop");
 
         let usage = Usage {
-            input_tokens: resp.usage.prompt_tokens as u64,
-            output_tokens: resp.usage.completion_tokens as u64,
+            input_tokens: u64::from(resp.usage.prompt_tokens),
+            output_tokens: u64::from(resp.usage.completion_tokens),
             cache_creation_tokens: 0, // AI Gateway doesn't expose cache metrics via OpenAI format
             cache_read_tokens: 0,
         };
@@ -439,11 +439,11 @@ impl AIGatewayService {
     /// Classify HTTP error responses.
     fn classify_error(status: reqwest::StatusCode, body: &str) -> LlmError {
         match status.as_u16() {
-            401 | 403 => LlmError::auth(format!("Authentication failed: {}", body)),
-            429 => LlmError::rate_limit(format!("Rate limited: {}", body)),
-            400 => LlmError::invalid_request(format!("Invalid request: {}", body)),
-            500..=599 => LlmError::server_error(format!("Server error: {}", body)),
-            _ => LlmError::unknown(format!("HTTP {}: {}", status, body)),
+            401 | 403 => LlmError::auth(format!("Authentication failed: {body}")),
+            429 => LlmError::rate_limit(format!("Rate limited: {body}")),
+            400 => LlmError::invalid_request(format!("Invalid request: {body}")),
+            500..=599 => LlmError::server_error(format!("Server error: {body}")),
+            _ => LlmError::unknown(format!("HTTP {status}: {body}")),
         }
     }
 }
@@ -453,21 +453,21 @@ impl LlmService for AIGatewayService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let token = self.get_token()?;
         let base_url = get_base_url();
-        let url = format!("{}/v1/chat/completions", base_url);
+        let url = format!("{base_url}/v1/chat/completions");
 
         let openai_request = self.translate_request(request);
 
         let response = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .header("source", &self.source)
             .header("org-id", &self.org_id)
             .header("Content-Type", "application/json")
             .json(&openai_request)
             .send()
             .await
-            .map_err(|e| LlmError::network(format!("Request failed: {}", e)))?;
+            .map_err(|e| LlmError::network(format!("Request failed: {e}")))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -479,7 +479,7 @@ impl LlmService for AIGatewayService {
         }
 
         let openai_response: OpenAIResponse = response.json().await.map_err(|e| {
-            LlmError::unknown(format!("Failed to parse AI Gateway response: {}", e))
+            LlmError::unknown(format!("Failed to parse AI Gateway response: {e}"))
         })?;
 
         Self::normalize_response(openai_response)

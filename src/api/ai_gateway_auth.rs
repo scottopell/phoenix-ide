@@ -55,7 +55,7 @@ pub struct AuthStatusResponse {
 }
 
 impl AuthStatusResponse {
-    fn from_status(status: &AuthStatus, process: &Option<DdtoolProcess>) -> Self {
+    fn from_status(status: &AuthStatus, process: Option<&DdtoolProcess>) -> Self {
         match status {
             AuthStatus::NotRequired => Self {
                 status: "not_required".to_string(),
@@ -76,7 +76,7 @@ impl AuthStatusResponse {
                 error: None,
             },
             AuthStatus::InProgress => {
-                let (url, code) = process.as_ref().map_or((None, None), |p| {
+                let (url, code) = process.map_or((None, None), |p| {
                     (Some(p.oauth_url.clone()), Some(p.device_code.clone()))
                 });
                 Self {
@@ -113,7 +113,7 @@ fn check_auth_exists() -> bool {
 
     // Try to get a token - if successful, we're authenticated
     let output = Command::new("ddtool")
-        .args(&[
+        .args([
             "auth",
             "token",
             &service_name,
@@ -154,7 +154,7 @@ fn parse_ddtool_output(output: &str) -> Option<(String, String)> {
                 if word.contains('-') && word.len() >= 7 {
                     // Format: XXX-XXX-XXX
                     let parts: Vec<&str> = word.split('-').collect();
-                    if parts.len() >= 2 && parts.iter().all(|p| p.chars().all(|c| c.is_alphanumeric())) {
+                    if parts.len() >= 2 && parts.iter().all(|p| p.chars().all(char::is_alphanumeric)) {
                         device_code = Some(word.to_string());
                         break;
                     }
@@ -188,11 +188,12 @@ pub async fn get_auth_status(
     }
 
     let auth_state = state.auth_state.lock().unwrap();
-    let response = AuthStatusResponse::from_status(&auth_state.status, &auth_state.process);
+    let response = AuthStatusResponse::from_status(&auth_state.status, auth_state.process.as_ref());
     (StatusCode::OK, Json(response))
 }
 
 /// POST /api/ai-gateway/initiate-auth
+#[allow(clippy::too_many_lines)]
 pub async fn initiate_auth(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -230,9 +231,9 @@ pub async fn initiate_auth(
         .expect("AI_GATEWAY_SERVICE must be set when using AI Gateway mode");
 
     // Spawn ddtool via script command to provide PTY (ddtool hangs with pipes)
-    let ddtool_cmd = format!("ddtool auth token {} --datacenter {}", service_name, datacenter);
+    let ddtool_cmd = format!("ddtool auth token {service_name} --datacenter {datacenter}");
     let mut child = match Command::new("script")
-        .args(&["-q", "-c", &ddtool_cmd, "/dev/null"])
+        .args(["-q", "-c", &ddtool_cmd, "/dev/null"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -246,26 +247,23 @@ pub async fn initiate_auth(
                     status: "failed".to_string(),
                     oauth_url: None,
                     device_code: None,
-                    error: Some(format!("Failed to spawn ddtool: {}. Is ddtool installed?", e)),
+                    error: Some(format!("Failed to spawn ddtool: {e}. Is ddtool installed?")),
                 }),
             );
         }
     };
 
     // Read initial output to get OAuth URL and device code
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AuthStatusResponse {
-                    status: "failed".to_string(),
-                    oauth_url: None,
-                    device_code: None,
-                    error: Some("Failed to capture ddtool stdout".to_string()),
-                }),
-            );
-        }
+    let Some(stdout) = child.stdout.take() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuthStatusResponse {
+                status: "failed".to_string(),
+                oauth_url: None,
+                device_code: None,
+                error: Some("Failed to capture ddtool stdout".to_string()),
+            }),
+        );
     };
 
     // Read stdout with a timeout using a thread
@@ -288,7 +286,7 @@ pub async fn initiate_auth(
 
             while start.elapsed() < Duration::from_millis(500) && output.len() < 2048 {
                 match stdout.read(&mut buf) {
-                    Ok(0) => break, // EOF
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         output.extend_from_slice(&buf[..n]);
                         // If we see "Waiting", we have everything
@@ -296,7 +294,6 @@ pub async fn initiate_auth(
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
                 // Small sleep to avoid busy loop
                 std::thread::sleep(Duration::from_millis(10));
@@ -306,27 +303,7 @@ pub async fn initiate_auth(
         });
 
         // Wait up to 2 seconds for output
-        match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(out) => out,
-            Err(_) => {
-                let _ = child.kill();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AuthStatusResponse {
-                        status: "failed".to_string(),
-                        oauth_url: None,
-                        device_code: None,
-                        error: Some("Timeout reading ddtool output".to_string()),
-                    }),
-                );
-            }
-        }
-    };
-
-    // Parse OAuth URL and device code
-    let (oauth_url, device_code) = match parse_ddtool_output(&output) {
-        Some(result) => result,
-        None => {
+        let Ok(out) = rx.recv_timeout(Duration::from_secs(2)) else {
             let _ = child.kill();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -334,10 +311,25 @@ pub async fn initiate_auth(
                     status: "failed".to_string(),
                     oauth_url: None,
                     device_code: None,
-                    error: Some("Failed to parse OAuth URL and device code from ddtool output".to_string()),
+                    error: Some("Timeout reading ddtool output".to_string()),
                 }),
             );
-        }
+        };
+        out
+    };
+
+    // Parse OAuth URL and device code
+    let Some((oauth_url, device_code)) = parse_ddtool_output(&output) else {
+        let _ = child.kill();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuthStatusResponse {
+                status: "failed".to_string(),
+                oauth_url: None,
+                device_code: None,
+                error: Some("Failed to parse OAuth URL and device code from ddtool output".to_string()),
+            }),
+        );
     };
 
     // Store process state
@@ -364,6 +356,7 @@ pub async fn initiate_auth(
 }
 
 /// GET /api/ai-gateway/poll-auth
+#[allow(clippy::too_many_lines)]
 pub async fn poll_auth(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -383,34 +376,30 @@ pub async fn poll_auth(
     let mut auth_state = state.auth_state.lock().unwrap();
 
     // Check if process exists
-    let process = match auth_state.process.as_mut() {
-        Some(p) => p,
-        None => {
-            // No process, check if auth already exists
-            if check_auth_exists() {
-                auth_state.status = AuthStatus::Authenticated;
-                return (
-                    StatusCode::OK,
-                    Json(AuthStatusResponse {
-                        status: "authenticated".to_string(),
-                        oauth_url: None,
-                        device_code: None,
-                        error: None,
-                    }),
-                );
-            } else {
-                auth_state.status = AuthStatus::Required;
-                return (
-                    StatusCode::OK,
-                    Json(AuthStatusResponse {
-                        status: "required".to_string(),
-                        oauth_url: None,
-                        device_code: None,
-                        error: None,
-                    }),
-                );
-            }
+    let Some(process) = auth_state.process.as_mut() else {
+        // No process, check if auth already exists
+        if check_auth_exists() {
+            auth_state.status = AuthStatus::Authenticated;
+            return (
+                StatusCode::OK,
+                Json(AuthStatusResponse {
+                    status: "authenticated".to_string(),
+                    oauth_url: None,
+                    device_code: None,
+                    error: None,
+                }),
+            );
         }
+        auth_state.status = AuthStatus::Required;
+        return (
+            StatusCode::OK,
+            Json(AuthStatusResponse {
+                status: "required".to_string(),
+                oauth_url: None,
+                device_code: None,
+                error: None,
+            }),
+        );
     };
 
     // Check timeout
@@ -480,7 +469,7 @@ pub async fn poll_auth(
             )
         }
         Err(e) => {
-            auth_state.status = AuthStatus::Failed(format!("Failed to check process status: {}", e));
+            auth_state.status = AuthStatus::Failed(format!("Failed to check process status: {e}"));
             auth_state.process = None;
             (
                 StatusCode::OK,
@@ -488,7 +477,7 @@ pub async fn poll_auth(
                     status: "failed".to_string(),
                     oauth_url: None,
                     device_code: None,
-                    error: Some(format!("Failed to check process status: {}", e)),
+                    error: Some(format!("Failed to check process status: {e}")),
                 }),
             )
         }
@@ -499,9 +488,7 @@ pub async fn poll_auth(
 pub fn init_auth_state() -> AuthState {
     let mut state = AuthState::new();
 
-    if !is_ai_gateway_enabled() {
-        state.status = AuthStatus::NotRequired;
-    } else {
+    if is_ai_gateway_enabled() {
         // Check if already authenticated
         // Note: check_auth_exists() now returns false to skip the check during init
         // to avoid blocking server startup. Auth status will be checked lazily.
@@ -510,6 +497,8 @@ pub fn init_auth_state() -> AuthState {
         } else {
             AuthStatus::Required
         };
+    } else {
+        state.status = AuthStatus::NotRequired;
     }
 
     state

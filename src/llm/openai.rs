@@ -283,7 +283,7 @@ impl OpenAIService {
                 for (media_type, data) in images {
                     parts.push(OpenAIContentPart::ImageUrl {
                         image_url: OpenAIImageUrl {
-                            url: format!("data:{};base64,{}", media_type, data),
+                            url: format!("data:{media_type};base64,{data}"),
                         },
                     });
                 }
@@ -376,8 +376,7 @@ impl OpenAIService {
 
                 let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
                     LlmError::unknown(format!(
-                        "Invalid JSON in tool call arguments: {}",
-                        e
+                        "Invalid JSON in tool call arguments: {e}"
                     ))
                 })?;
 

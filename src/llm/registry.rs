@@ -97,7 +97,7 @@ impl ModelRegistry {
     ) -> Option<Arc<dyn LlmService>> {
         // AI Gateway mode takes precedence
         if config.ai_gateway_enabled {
-            return Self::create_ai_gateway_service(model_def, config);
+            return Some(Self::create_ai_gateway_service(model_def, config));
         }
 
         // In exe.dev gateway mode, use "implicit" as the API key
@@ -133,14 +133,13 @@ impl ModelRegistry {
     fn create_ai_gateway_service(
         model_def: &super::ModelDef,
         config: &LlmConfig,
-    ) -> Option<Arc<dyn LlmService>> {
+    ) -> Arc<dyn LlmService> {
         use super::AIGatewayService;
 
         // Determine provider prefix for model routing
         let provider_prefix = match model_def.provider {
             Provider::Anthropic => "anthropic",
-            Provider::OpenAI => "openai",
-            Provider::Fireworks => "openai", // Fireworks uses OpenAI-compatible API
+            Provider::OpenAI | Provider::Fireworks => "openai",
         };
 
         let service = AIGatewayService::new(
@@ -152,7 +151,7 @@ impl ModelRegistry {
         );
 
         // Wrap with logging
-        Some(Arc::new(LoggingService::new(service)))
+        Arc::new(LoggingService::new(service))
     }
 
     /// Get a model by ID
