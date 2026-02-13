@@ -29,14 +29,23 @@ pub struct AppState {
 impl AppState {
     /// Create new application state and start the sub-agent handler
     pub async fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
+        tracing::info!("AppState::new() - ENTERED");
+
+        tracing::info!("AppState::new() - About to call RuntimeManager::new()");
         let runtime = Arc::new(RuntimeManager::new(db.clone(), llm_registry.clone()));
+        tracing::info!("AppState::new() - RuntimeManager::new() completed");
 
         // Start the sub-agent spawn/cancel handler
+        tracing::info!("AppState::new() - About to call start_sub_agent_handler().await");
         runtime.start_sub_agent_handler().await;
+        tracing::info!("AppState::new() - start_sub_agent_handler() completed");
 
         // Initialize AI Gateway auth state
-        let auth_state = Arc::new(Mutex::new(ai_gateway_auth::init_auth_state()));
+        tracing::info!("AppState::new() - About to initialize AI Gateway auth state");
+        let auth_state = Arc::new(Mutex::new(ai_gateway_auth::init_auth_state().await));
+        tracing::info!("AppState::new() - AI Gateway auth state initialized");
 
+        tracing::info!("AppState::new() - About to return Self");
         Self {
             runtime,
             llm_registry,

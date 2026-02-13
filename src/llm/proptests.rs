@@ -11,9 +11,7 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 
 use super::ai_gateway;
-use super::anthropic::{
-    self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage,
-};
+use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
     self, OpenAIChoice, OpenAIContent, OpenAIFunctionCall, OpenAIMessage, OpenAIResponse,
     OpenAIToolCall, OpenAIUsage,
@@ -27,8 +25,7 @@ use proptest::prelude::*;
 
 /// Non-empty text block
 fn arb_text_block() -> impl Strategy<Value = ContentBlock> {
-    "[a-zA-Z0-9 _.!?,]{1,100}"
-        .prop_map(|text| ContentBlock::Text { text })
+    "[a-zA-Z0-9 _.!?,]{1,100}".prop_map(|text| ContentBlock::Text { text })
 }
 
 /// Image block with base64 source
@@ -48,9 +45,9 @@ fn arb_image_block() -> impl Strategy<Value = ContentBlock> {
 /// Tool use block with non-empty id/name and valid JSON input
 fn arb_tool_use_block() -> impl Strategy<Value = ContentBlock> {
     (
-        "[a-z0-9_]{5,20}",  // id
-        "[a-z_]{3,20}",     // name
-        arb_json_value(),    // input
+        "[a-z0-9_]{5,20}", // id
+        "[a-z_]{3,20}",    // name
+        arb_json_value(),  // input
     )
         .prop_map(|(id, name, input)| ContentBlock::ToolUse { id, name, input })
 }
@@ -58,15 +55,17 @@ fn arb_tool_use_block() -> impl Strategy<Value = ContentBlock> {
 /// Tool result block
 fn arb_tool_result_block() -> impl Strategy<Value = ContentBlock> {
     (
-        "[a-z0-9_]{5,20}",           // tool_use_id
-        "[a-zA-Z0-9 _.!?,]{0,100}",  // content
-        any::<bool>(),                // is_error
+        "[a-z0-9_]{5,20}",          // tool_use_id
+        "[a-zA-Z0-9 _.!?,]{0,100}", // content
+        any::<bool>(),              // is_error
     )
-        .prop_map(|(tool_use_id, content, is_error)| ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        })
+        .prop_map(
+            |(tool_use_id, content, is_error)| ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            },
+        )
 }
 
 /// Simple JSON value (no deeply nested structures)
@@ -77,14 +76,13 @@ fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
         (-1000i64..1000).prop_map(|n| serde_json::Value::Number(n.into())),
         "[a-zA-Z0-9 ]{0,50}".prop_map(|s| serde_json::Value::String(s)),
         // Small object with string values
-        proptest::collection::hash_map("[a-z_]{1,10}", "[a-zA-Z0-9 ]{0,30}", 0..5)
-            .prop_map(|m| {
-                serde_json::Value::Object(
-                    m.into_iter()
-                        .map(|(k, v)| (k, serde_json::Value::String(v)))
-                        .collect(),
-                )
-            }),
+        proptest::collection::hash_map("[a-z_]{1,10}", "[a-zA-Z0-9 ]{0,30}", 0..5).prop_map(|m| {
+            serde_json::Value::Object(
+                m.into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            )
+        }),
     ]
 }
 
@@ -122,10 +120,7 @@ fn arb_assistant_message() -> impl Strategy<Value = LlmMessage> {
 
 /// Any valid message
 fn arb_message() -> impl Strategy<Value = LlmMessage> {
-    prop_oneof![
-        arb_user_message(),
-        arb_assistant_message(),
-    ]
+    prop_oneof![arb_user_message(), arb_assistant_message(),]
 }
 
 /// Assistant message that may contain only ToolResult blocks (edge case for bug #4)

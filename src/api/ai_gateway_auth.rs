@@ -1,9 +1,4 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -27,12 +22,12 @@ impl AuthState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AuthStatus {
-    NotRequired,   // AI_GATEWAY_ENABLED=false
-    Authenticated, // Token exists and valid
-    Required,      // Needs authentication
-    InProgress,    // ddtool running, waiting for user
+    NotRequired,    // AI_GATEWAY_ENABLED=false
+    Authenticated,  // Token exists and valid
+    Required,       // Needs authentication
+    InProgress,     // ddtool running, waiting for user
     Failed(String), // Error occurred
 }
 
@@ -105,31 +100,51 @@ fn is_ai_gateway_enabled() -> bool {
 }
 
 /// Check if ddtool is already authenticated by trying to get a token
-fn check_auth_exists() -> bool {
+async fn check_auth_exists() -> bool {
+    use std::time::Duration;
+    use tokio::process::Command as TokioCommand;
+
     let datacenter = std::env::var("AI_GATEWAY_DATACENTER")
         .expect("AI_GATEWAY_DATACENTER must be set when using AI Gateway mode");
     let service_name = std::env::var("AI_GATEWAY_SERVICE")
         .expect("AI_GATEWAY_SERVICE must be set when using AI Gateway mode");
 
+    tracing::debug!("check_auth_exists() - Checking ddtool auth status with 2s timeout");
+
     // Try to get a token - if successful, we're authenticated
-    let output = Command::new("ddtool")
-        .args([
-            "auth",
-            "token",
-            &service_name,
-            "--datacenter",
-            &datacenter,
-        ])
-        .output();
+    // Use 2s timeout because ddtool can hang if not authenticated
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        TokioCommand::new("ddtool")
+            .args(["auth", "token", &service_name, "--datacenter", &datacenter])
+            .output(),
+    )
+    .await;
 
     match output {
-        Ok(out) if out.status.success() => {
+        Ok(Ok(out)) if out.status.success() => {
             // Check if output looks like a JWT token (starts with eyJ...)
             let token = String::from_utf8_lossy(&out.stdout);
             let token = token.trim();
-            !token.is_empty() && token.starts_with("eyJ")
+            let is_authenticated = !token.is_empty() && token.starts_with("eyJ");
+            tracing::debug!(
+                "check_auth_exists() - ddtool returned success, authenticated: {}",
+                is_authenticated
+            );
+            is_authenticated
         }
-        _ => false,
+        Ok(Ok(_)) => {
+            tracing::debug!("check_auth_exists() - ddtool returned non-success status");
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("check_auth_exists() - ddtool execution failed: {}", e);
+            false
+        }
+        Err(_) => {
+            tracing::warn!("check_auth_exists() - ddtool timed out after 2s");
+            false
+        }
     }
 }
 
@@ -154,11 +169,17 @@ fn parse_ddtool_output(output: &str) -> Option<(String, String)> {
                 if word.contains('-') && word.len() >= 7 {
                     // Format: XXX-XXX-XXX
                     let parts: Vec<&str> = word.split('-').collect();
-                    if parts.len() >= 2 && parts.iter().all(|p| p.chars().all(char::is_alphanumeric)) {
+                    if parts.len() >= 2
+                        && parts.iter().all(|p| p.chars().all(char::is_alphanumeric))
+                    {
                         device_code = Some(word.to_string());
                         break;
                     }
-                } else if word.len() >= 6 && word.chars().all(|c| c.is_alphanumeric() && c.is_uppercase()) {
+                } else if word.len() >= 6
+                    && word
+                        .chars()
+                        .all(|c| c.is_alphanumeric() && c.is_uppercase())
+                {
                     // Format: ABCDEFGHI
                     device_code = Some(word.to_string());
                     break;
@@ -171,9 +192,7 @@ fn parse_ddtool_output(output: &str) -> Option<(String, String)> {
 }
 
 /// GET /api/ai-gateway/auth-status
-pub async fn get_auth_status(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn get_auth_status(State(state): State<AppState>) -> impl IntoResponse {
     // Check if AI Gateway is enabled
     if !is_ai_gateway_enabled() {
         return (
@@ -194,9 +213,7 @@ pub async fn get_auth_status(
 
 /// POST /api/ai-gateway/initiate-auth
 #[allow(clippy::too_many_lines)]
-pub async fn initiate_auth(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn initiate_auth(State(state): State<AppState>) -> impl IntoResponse {
     // Check if AI Gateway is enabled
     if !is_ai_gateway_enabled() {
         return (
@@ -211,7 +228,7 @@ pub async fn initiate_auth(
     }
 
     // Check if already authenticated (quick check - outputs token immediately)
-    if check_auth_exists() {
+    if check_auth_exists().await {
         let mut auth_state = state.auth_state.lock().unwrap();
         auth_state.status = AuthStatus::Authenticated;
         return (
@@ -327,7 +344,9 @@ pub async fn initiate_auth(
                 status: "failed".to_string(),
                 oauth_url: None,
                 device_code: None,
-                error: Some("Failed to parse OAuth URL and device code from ddtool output".to_string()),
+                error: Some(
+                    "Failed to parse OAuth URL and device code from ddtool output".to_string(),
+                ),
             }),
         );
     };
@@ -357,9 +376,7 @@ pub async fn initiate_auth(
 
 /// GET /api/ai-gateway/poll-auth
 #[allow(clippy::too_many_lines)]
-pub async fn poll_auth(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn poll_auth(State(state): State<AppState>) -> impl IntoResponse {
     // Check if AI Gateway is enabled
     if !is_ai_gateway_enabled() {
         return (
@@ -373,12 +390,16 @@ pub async fn poll_auth(
         );
     }
 
-    let mut auth_state = state.auth_state.lock().unwrap();
+    // Check if process exists (peek without holding lock across await)
+    let has_process = {
+        let auth_state = state.auth_state.lock().unwrap();
+        auth_state.process.is_some()
+    };
 
-    // Check if process exists
-    let Some(process) = auth_state.process.as_mut() else {
+    if !has_process {
         // No process, check if auth already exists
-        if check_auth_exists() {
+        if check_auth_exists().await {
+            let mut auth_state = state.auth_state.lock().unwrap();
             auth_state.status = AuthStatus::Authenticated;
             return (
                 StatusCode::OK,
@@ -390,6 +411,23 @@ pub async fn poll_auth(
                 }),
             );
         }
+        let mut auth_state = state.auth_state.lock().unwrap();
+        auth_state.status = AuthStatus::Required;
+        return (
+            StatusCode::OK,
+            Json(AuthStatusResponse {
+                status: "required".to_string(),
+                oauth_url: None,
+                device_code: None,
+                error: None,
+            }),
+        );
+    }
+
+    let mut auth_state = state.auth_state.lock().unwrap();
+    let Some(process) = auth_state.process.as_mut() else {
+        // Race condition: process was removed between check and lock
+        // Fall back to required status
         auth_state.status = AuthStatus::Required;
         return (
             StatusCode::OK,
@@ -405,7 +443,8 @@ pub async fn poll_auth(
     // Check timeout
     if process.started_at.elapsed() > AUTH_TIMEOUT {
         let _ = process.child.kill();
-        auth_state.status = AuthStatus::Failed("Authentication timed out after 5 minutes".to_string());
+        auth_state.status =
+            AuthStatus::Failed("Authentication timed out after 5 minutes".to_string());
         auth_state.process = None;
         return (
             StatusCode::OK,
@@ -485,21 +524,29 @@ pub async fn poll_auth(
 }
 
 /// Initialize auth state based on environment
-pub fn init_auth_state() -> AuthState {
+pub async fn init_auth_state() -> AuthState {
+    tracing::debug!("init_auth_state() - ENTERED");
+
     let mut state = AuthState::new();
 
     if is_ai_gateway_enabled() {
-        // Check if already authenticated
-        // Note: check_auth_exists() now returns false to skip the check during init
-        // to avoid blocking server startup. Auth status will be checked lazily.
-        state.status = if check_auth_exists() {
+        tracing::debug!("init_auth_state() - AI Gateway enabled, checking auth status");
+        // Check if already authenticated (with timeout to avoid blocking startup)
+        state.status = if check_auth_exists().await {
+            tracing::info!("init_auth_state() - Already authenticated");
             AuthStatus::Authenticated
         } else {
+            tracing::info!("init_auth_state() - Authentication required");
             AuthStatus::Required
         };
     } else {
+        tracing::debug!("init_auth_state() - AI Gateway not enabled");
         state.status = AuthStatus::NotRequired;
     }
 
+    tracing::debug!(
+        "init_auth_state() - Returning state with status: {:?}",
+        state.status
+    );
     state
 }

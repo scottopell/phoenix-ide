@@ -20,8 +20,7 @@ const TOKEN_TTL: Duration = Duration::from_secs(7200); // 2 hours
 
 /// Get AI Gateway base URL from environment (required when AI Gateway is enabled)
 fn get_base_url() -> String {
-    std::env::var("AI_GATEWAY_URL")
-        .expect("AI_GATEWAY_URL must be set when using AI Gateway mode")
+    std::env::var("AI_GATEWAY_URL").expect("AI_GATEWAY_URL must be set when using AI Gateway mode")
 }
 
 /// Get ddtool datacenter from environment (required when AI Gateway is enabled)
@@ -100,17 +99,9 @@ impl AIGatewayService {
         let datacenter = get_datacenter();
 
         let output = Command::new("ddtool")
-            .args([
-                "auth",
-                "token",
-                &service_name,
-                "--datacenter",
-                &datacenter,
-            ])
+            .args(["auth", "token", &service_name, "--datacenter", &datacenter])
             .output()
-            .map_err(|e| {
-                LlmError::network(format!("Failed to execute ddtool: {e}"))
-            })?;
+            .map_err(|e| LlmError::network(format!("Failed to execute ddtool: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -401,9 +392,7 @@ impl AIGatewayService {
                 }
 
                 let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
-                    LlmError::unknown(format!(
-                        "Invalid JSON in tool call arguments: {e}"
-                    ))
+                    LlmError::unknown(format!("Invalid JSON in tool call arguments: {e}"))
                 })?;
 
                 content.push(ContentBlock::ToolUse {
@@ -478,9 +467,10 @@ impl LlmService for AIGatewayService {
             return Err(Self::classify_error(status, &body));
         }
 
-        let openai_response: OpenAIResponse = response.json().await.map_err(|e| {
-            LlmError::unknown(format!("Failed to parse AI Gateway response: {e}"))
-        })?;
+        let openai_response: OpenAIResponse = response
+            .json()
+            .await
+            .map_err(|e| LlmError::unknown(format!("Failed to parse AI Gateway response: {e}")))?;
 
         Self::normalize_response(openai_response)
     }

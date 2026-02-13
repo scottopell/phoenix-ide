@@ -375,9 +375,7 @@ impl OpenAIService {
                 }
 
                 let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
-                    LlmError::unknown(format!(
-                        "Invalid JSON in tool call arguments: {e}"
-                    ))
+                    LlmError::unknown(format!("Invalid JSON in tool call arguments: {e}"))
                 })?;
 
                 content.push(ContentBlock::ToolUse {

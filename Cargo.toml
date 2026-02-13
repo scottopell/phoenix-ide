@@ -71,3 +71,6 @@ unused_extern_crates = "deny"
 unused_allocation = "deny"
 unused_assignments = "deny"
 unused_comparisons = "deny"
+
+[profile.release]
+debug = true  # Include debug symbols for production debugging
