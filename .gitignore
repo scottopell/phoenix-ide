@@ -2,6 +2,7 @@
 .phoenix.pid
 .vite.pid
 phoenix.log
+__pycache__/
 
 # UI
 ui/node_modules
