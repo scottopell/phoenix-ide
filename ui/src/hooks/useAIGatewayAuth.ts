@@ -38,6 +38,7 @@ export function useAIGatewayAuth() {
 
       return () => clearInterval(interval);
     }
+    return undefined;
   }, [authState?.status]);
 
   const initiateAuth = useCallback(async () => {

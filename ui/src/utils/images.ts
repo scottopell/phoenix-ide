@@ -8,7 +8,7 @@ export async function fileToBase64(file: File): Promise<ImageData> {
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
-      const base64 = result.split(',')[1];
+      const base64 = result.split(',')[1] ?? '';
       resolve({ data: base64, media_type: file.type });
     };
     reader.onerror = () => reject(new Error('Failed to read file'));

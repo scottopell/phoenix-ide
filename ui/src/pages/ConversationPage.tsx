@@ -136,9 +136,9 @@ export function ConversationPage() {
             setBreadcrumbs(initData.breadcrumbs.map(b => ({
               type: b.type,
               label: b.label,
-              toolId: b.tool_id,
-              sequenceId: b.sequence_id,
-              preview: b.preview,
+              toolId: b.tool_id as string | undefined,
+              sequenceId: b.sequence_id as number | undefined,
+              preview: b.preview as string | undefined,
             })));
           }
           // Also update from state if agent is still working
@@ -506,7 +506,7 @@ export function ConversationPage() {
           rootDir={proseReaderFile.rootDir}
           onClose={handleCloseProseReader}
           onSendNotes={handleSendNotes}
-          patchContext={proseReaderFile.patchContext}
+          patchContext={proseReaderFile.patchContext ?? undefined}
         />
       )}
     </div>

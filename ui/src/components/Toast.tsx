@@ -8,7 +8,7 @@ export interface ToastMessage {
   id: string;
   type: ToastType;
   message: string;
-  duration?: number;
+  duration: number | undefined;
 }
 
 interface ToastProps {
@@ -34,10 +34,11 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
       const timer = setTimeout(() => {
         setIsLeaving(true);
         setTimeout(() => onDismiss(toast.id), 300);
-      }, toast.duration || 5000);
-      
+      }, toast.duration ?? 5000);
+
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [toast, onDismiss]);
 
   const handleDismiss = () => {

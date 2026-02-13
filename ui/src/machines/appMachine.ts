@@ -158,23 +158,23 @@ export function transition(
           // Calculate retry delay
           const currentRetry = state.sync.type === 'error' ? state.sync.retryIn : 0;
           const retryIndex = RETRY_DELAYS.findIndex(d => d > currentRetry);
-          const nextDelay = RETRY_DELAYS[retryIndex === -1 ? RETRY_DELAYS.length - 1 : retryIndex];
-          
+          const nextDelay = RETRY_DELAYS[retryIndex === -1 ? RETRY_DELAYS.length - 1 : retryIndex] ?? RETRY_DELAYS[RETRY_DELAYS.length - 1]!;
+
           return {
             state: {
               ...state,
-              sync: { 
-                type: 'error', 
+              sync: {
+                type: 'error',
                 message: event.message,
-                retryIn: nextDelay 
+                retryIn: nextDelay
               }
             },
             effects: [
               { type: 'SCHEDULE_RETRY', delayMs: nextDelay },
-              { 
-                type: 'NOTIFY_USER', 
+              {
+                type: 'NOTIFY_USER',
                 message: `Sync failed: ${event.message}. Retrying in ${Math.round(nextDelay / 1000)}s`,
-                level: 'warning' 
+                level: 'warning'
               }
             ]
           };

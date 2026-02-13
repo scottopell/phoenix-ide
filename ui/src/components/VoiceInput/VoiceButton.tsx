@@ -6,7 +6,7 @@ import './VoiceInput.css';
 interface VoiceButtonProps {
   state: VoiceState;
   onClick: () => void;
-  disabled?: boolean;
+  disabled?: boolean | undefined;
 }
 
 export function VoiceButton({ state, onClick, disabled }: VoiceButtonProps) {

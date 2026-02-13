@@ -31,6 +31,7 @@ export function ConfirmDialog({
       document.addEventListener('keydown', handleEscape);
       return () => document.removeEventListener('keydown', handleEscape);
     }
+    return undefined;
   }, [visible, onCancel]);
 
   if (!visible) return null;

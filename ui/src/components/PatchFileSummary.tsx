@@ -33,7 +33,7 @@ export function extractFileChanges(patchOutput: string): FileChanges[] {
   for (const line of lines) {
     // Match file header: +++ b/path/to/file.ext or +++ path/to/file.ext
     const fileMatch = line.match(/^\+{3}\s+(?:b\/)?(.+)$/);
-    if (fileMatch) {
+    if (fileMatch?.[1]) {
       currentFile = fileMatch[1];
       if (!fileChangesMap.has(currentFile)) {
         fileChangesMap.set(currentFile, new Set());
@@ -43,7 +43,7 @@ export function extractFileChanges(patchOutput: string): FileChanges[] {
 
     // Parse hunk headers: @@ -start,count +start,count @@
     const hunkHeader = line.match(/@@ -\d+,?\d* \+(\d+),?\d* @@/);
-    if (hunkHeader && currentFile) {
+    if (hunkHeader?.[1] && currentFile) {
       currentLine = parseInt(hunkHeader[1], 10) - 1;
       continue;
     }

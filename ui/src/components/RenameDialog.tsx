@@ -5,7 +5,7 @@ interface RenameDialogProps {
   currentName: string;
   onRename: (newName: string) => void;
   onCancel: () => void;
-  error?: string;
+  error: string | undefined;
 }
 
 export function RenameDialog({
@@ -34,6 +34,7 @@ export function RenameDialog({
       document.addEventListener('keydown', handleEscape);
       return () => document.removeEventListener('keydown', handleEscape);
     }
+    return undefined;
   }, [visible, onCancel]);
 
   const handleSubmit = (e: React.FormEvent) => {

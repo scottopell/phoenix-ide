@@ -196,14 +196,17 @@ export function ConversationListPage() {
 
   // Pull-to-refresh handlers
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    if (window.scrollY === 0) {
-      pullStartY.current = e.touches[0].clientY;
+    const touch = e.touches[0];
+    if (window.scrollY === 0 && touch) {
+      pullStartY.current = touch.clientY;
     }
   }, []);
 
   const handleTouchMove = useCallback((e: React.TouchEvent) => {
     if (pullStartY.current === null || refreshing) return;
-    const pullDistance = e.touches[0].clientY - pullStartY.current;
+    const touch = e.touches[0];
+    if (!touch) return;
+    const pullDistance = touch.clientY - pullStartY.current;
     if (pullDistance > 80 && window.scrollY === 0) {
       pullStartY.current = null;
       setRefreshing(true);
@@ -293,7 +296,7 @@ export function ConversationListPage() {
       <RenameDialog
         visible={renameTarget !== null}
         currentName={renameTarget?.slug ?? ''}
-        error={renameError}
+        error={renameError ?? undefined}
         onRename={handleRename}
         onCancel={() => {
           setRenameTarget(null);

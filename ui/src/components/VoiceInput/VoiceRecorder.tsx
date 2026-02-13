@@ -154,8 +154,9 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
       
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
-        const transcript = result[0].transcript;
-        
+        if (!result) continue;
+        const transcript = result[0]?.transcript ?? '';
+
         if (result.isFinal) {
           // Clear interim and commit final text
           if (lastInterimRef.current && onInterim) {

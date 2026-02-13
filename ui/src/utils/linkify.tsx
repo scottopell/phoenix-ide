@@ -25,8 +25,8 @@ const FILE_PATH_REGEX = /(?:^|(?<=[\s`"'(\[]))(?:(?:\/[\w.-]+)+|(?:\.\.?\/[\w./-
 export interface LinkifySegment {
   type: 'text' | 'link' | 'file';
   content: string;
-  href?: string;
-  filePath?: string;
+  href: string | undefined;
+  filePath: string | undefined;
 }
 
 interface MatchInfo {
@@ -88,6 +88,8 @@ export function parseLinks(text: string): LinkifySegment[] {
       results.push({
         type: 'text',
         content: text.slice(lastIndex, m.index),
+        href: undefined,
+        filePath: undefined,
       });
     }
 
@@ -97,11 +99,13 @@ export function parseLinks(text: string): LinkifySegment[] {
         type: 'link',
         content: m.content,
         href: m.href,
+        filePath: undefined,
       });
     } else {
       results.push({
         type: 'file',
         content: m.content,
+        href: undefined,
         filePath: m.filePath,
       });
     }
@@ -114,6 +118,8 @@ export function parseLinks(text: string): LinkifySegment[] {
     results.push({
       type: 'text',
       content: text.slice(lastIndex),
+      href: undefined,
+      filePath: undefined,
     });
   }
 
@@ -136,7 +142,7 @@ export function linkifyText(
   }
 
   // If there's only one text segment with no links, return plain text
-  if (segments.length === 1 && segments[0].type === 'text') {
+  if (segments.length === 1 && segments[0]?.type === 'text') {
     return text;
   }
 

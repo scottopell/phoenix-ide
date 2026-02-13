@@ -37,15 +37,15 @@ export interface ReviewNote {
 
 interface PatchContext {
   modifiedLines: Set<number>;
-  firstModifiedLine?: number;
+  firstModifiedLine?: number | undefined;
 }
 
-interface ProseReaderProps {
+export interface ProseReaderProps {
   filePath: string;
   rootDir: string;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
-  patchContext?: PatchContext;
+  patchContext?: PatchContext | undefined;
 }
 
 // API function
@@ -108,9 +108,10 @@ function useLongPress(
   }, []);
 
   const start = useCallback((e: React.TouchEvent | React.MouseEvent, lineNumber: number, lineContent: string) => {
-    const pos = 'touches' in e 
-      ? { x: e.touches[0].clientX, y: e.touches[0].clientY }
-      : { x: e.clientX, y: e.clientY };
+    const touch = 'touches' in e ? e.touches[0] : undefined;
+    const pos = touch
+      ? { x: touch.clientX, y: touch.clientY }
+      : { x: (e as React.MouseEvent).clientX, y: (e as React.MouseEvent).clientY };
     
     startPosRef.current = pos;
     lineDataRef.current = { lineNumber, lineContent };
@@ -128,9 +129,10 @@ function useLongPress(
   const move = useCallback((e: React.TouchEvent | React.MouseEvent) => {
     if (!startPosRef.current) return;
 
-    const pos = 'touches' in e
-      ? { x: e.touches[0].clientX, y: e.touches[0].clientY }
-      : { x: e.clientX, y: e.clientY };
+    const touch = 'touches' in e ? e.touches[0] : undefined;
+    const pos = touch
+      ? { x: touch.clientX, y: touch.clientY }
+      : { x: (e as React.MouseEvent).clientX, y: (e as React.MouseEvent).clientY };
 
     const deltaX = Math.abs(pos.x - startPosRef.current.x);
     const deltaY = Math.abs(pos.y - startPosRef.current.y);
@@ -159,10 +161,10 @@ function SelectableLine({
 }: {
   lineNumber: number;
   content: string;
-  isModified?: boolean;
-  isHighlighted?: boolean;
+  isModified?: boolean | undefined;
+  isHighlighted?: boolean | undefined;
   onLongPress: (lineNumber: number, lineContent: string) => void;
-  lineRef?: (el: HTMLDivElement | null) => void;
+  lineRef?: ((el: HTMLDivElement | null) => void) | undefined;
 }) {
   const { start, move, end } = useLongPress(onLongPress);
 
@@ -255,6 +257,7 @@ export function ProseReader({
       }, 100);
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [content, patchContext?.firstModifiedLine]);
 
   // Focus note input when dialog opens
@@ -270,6 +273,7 @@ export function ProseReader({
       const timer = setTimeout(() => setHighlightedLine(null), 2000);
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [highlightedLine]);
 
   // Handle long press to annotate
@@ -507,7 +511,7 @@ export function ProseReader({
               </h3>
             );
           },
-          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) => {
+          code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode }) => {
             const match = /language-(\w+)/.exec(className || '');
             return !inline && match ? (
               <SyntaxHighlighter

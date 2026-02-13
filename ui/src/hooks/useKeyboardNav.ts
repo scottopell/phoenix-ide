@@ -107,10 +107,12 @@ export function useKeyboardNav(options: KeyboardNavOptions = {}) {
           if (selectedIndex >= 0 && selectedIndex < items.length) {
             e.preventDefault();
             const item = items[selectedIndex];
-            if (onSelect) {
-              onSelect(item);
-            } else if (item.slug) {
-              navigate(`/c/${item.slug}`);
+            if (item) {
+              if (onSelect) {
+                onSelect(item);
+              } else if (item.slug) {
+                navigate(`/c/${item.slug}`);
+              }
             }
           }
           break;
@@ -145,8 +147,9 @@ export function useKeyboardNav(options: KeyboardNavOptions = {}) {
 
   // Scroll selected item into view
   useEffect(() => {
-    if (selectedIndex >= 0 && items[selectedIndex]) {
-      const el = document.querySelector(`[data-id="${items[selectedIndex].id}"]`);
+    const selectedItem = selectedIndex >= 0 ? items[selectedIndex] : undefined;
+    if (selectedItem) {
+      const el = document.querySelector(`[data-id="${selectedItem.id}"]`);
       el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
   }, [selectedIndex, items]);

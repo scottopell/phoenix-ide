@@ -14,7 +14,7 @@ interface MessageListProps {
   convState: string;
   stateData: ConversationState | null;
   onRetry: (localId: string) => void;
-  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 }
 
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"

@@ -48,31 +48,31 @@ const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
   switch (name) {
     case 'bash': {
-      const cmd = String(input.command || '');
+      const cmd = String(input['command'] || '');
       // Use server-provided display string if available (has cd prefix stripped)
       const displayCmd = displayOverride || cmd;
       return { display: `$ ${displayCmd}`, isMultiline: cmd.includes('\n') };
     }
     case 'think': {
-      const thoughts = String(input.thoughts || '');
+      const thoughts = String(input['thoughts'] || '');
       return { display: thoughts, isMultiline: thoughts.includes('\n') };
     }
     case 'patch': {
-      const path = String(input.path || '');
-      const patches = input.patches as Array<{ operation?: string }> | undefined;
+      const path = String(input['path'] || '');
+      const patches = input['patches'] as Array<{ operation?: string }> | undefined;
       const op = patches?.[0]?.operation || 'modify';
       const count = patches?.length || 1;
       const summary = count > 1 ? `${path}: ${count} patches` : `${path}: ${op}`;
       return { display: summary, isMultiline: false };
     }
     case 'keyword_search': {
-      const query = String(input.query || '');
-      const terms = (input.search_terms as string[]) || [];
+      const query = String(input['query'] || '');
+      const terms = (input['search_terms'] as string[]) || [];
       const termsStr = terms.length > 0 ? terms.slice(0, 3).join(', ') + (terms.length > 3 ? '...' : '') : '';
       return { display: termsStr ? `"${query}" [${termsStr}]` : query, isMultiline: false };
     }
     case 'read_image': {
-      const path = String(input.path || '');
+      const path = String(input['path'] || '');
       return { display: path, isMultiline: false };
     }
     default: {
@@ -176,7 +176,7 @@ export function AgentMessage({
 }: {
   message: Message;
   toolResults: Map<string, Message>;
-  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
@@ -221,7 +221,7 @@ export function AgentMessage({
                   components={{
                     // Custom code block rendering with syntax highlighting
                     // Inline code with file paths becomes clickable
-                    code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) => {
+                    code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode }) => {
                       const match = /language-(\w+)/.exec(className || '');
                       if (!inline && match) {
                         return (
@@ -310,8 +310,8 @@ export function AgentMessage({
 
 interface ToolUseBlockProps {
   block: ContentBlock;
-  result?: Message;
-  onOpenFile?: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  result: Message | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 }
 
 // Helper to parse image data from read_image tool result
@@ -388,8 +388,8 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
   const isShortOutput = resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
 
   // Get the raw input for copying (not the formatted display)
-  const rawInput = name === 'bash' ? String(input.command || '') : 
-                   name === 'think' ? String(input.thoughts || '') :
+  const rawInput = name === 'bash' ? String(input['command'] || '') :
+                   name === 'think' ? String(input['thoughts'] || '') :
                    JSON.stringify(input, null, 2);
 
   return (
@@ -502,8 +502,8 @@ function isSubAgentSummaryData(data: unknown): data is SubAgentSummaryData {
   return (
     typeof data === 'object' &&
     data !== null &&
-    (data as Record<string, unknown>).type === 'subagent_summary' &&
-    Array.isArray((data as Record<string, unknown>).results)
+    (data as Record<string, unknown>)['type'] === 'subagent_summary' &&
+    Array.isArray((data as Record<string, unknown>)['results'])
   );
 }
 
