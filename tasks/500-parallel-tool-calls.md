@@ -90,10 +90,16 @@ Event::ToolAborted {
 | `spawn_agents` | Yes | Independent sub-agent tasks |
 | `fetch` (external) | Yes | Independent network requests |
 
+**Confirmed:** The LLM does NOT signal parallelizability - this is entirely our decision as the tool executor. Options:
+
+1. **Tool-level metadata:** `impl ToolInput { fn is_parallelizable(&self) -> bool }`
+2. **Conflict detection:** Analyze tool inputs for overlapping resources (e.g., same file paths)
+3. **Conservative default:** Only parallelize obviously-safe tools (think, keyword_search, read_image)
+
 **Open Questions:**
-- Does the LLM signal parallelizability, or do we infer it?
 - Can we detect conflicting operations (e.g., two patches to same file)?
-- Should we have tool-level metadata: `{ parallelizable: bool, conflicts_with: [paths] }`?
+- Should `bash` ever be parallelized? (race conditions, shared state)
+- How granular should conflict detection be? (file-level? directory-level?)
 
 ### P2: State Machine Representation
 
@@ -136,12 +142,13 @@ ToolExecuting {
 
 3. **Independent completion:** Tools complete independently, LLM sees partial results
    - Most complex
-   - Unclear if Claude API supports this
+   - ~~Unclear if Claude API supports this~~ **Confirmed supported** - APIs accept results in any order
 
-**Questions:**
-- What does Claude API expect for parallel tool results?
-- Can we send `tool_result` messages out-of-order?
-- Does the LLM handle partial success gracefully?
+**API Findings:** Both Anthropic and OpenAI APIs accept tool results in any order. Each result is matched by `tool_use_id`, so ordering is irrelevant. This means option 3 (independent completion) is fully viable from an API perspective.
+
+**Remaining Questions:**
+- What's the best UX? Show results as they arrive, or wait for batch?
+- How should errors in one tool affect display of siblings?
 
 ### P4: Cancellation Complexity
 
@@ -230,23 +237,9 @@ enum ToolExecState {
 **Pros:** Clear synchronization points, predictable ordering.
 **Cons:** Adds batching complexity, may not match LLM's expectations.
 
-### Solution 2: LLM-Driven Parallelization Hints
+### ~~Solution 2: LLM-Driven Parallelization Hints~~ (Not Viable)
 
-Extend the tool call parsing to detect LLM-provided parallelization signals.
-
-```rust
-struct ToolCall {
-    id: String,
-    input: ToolInput,
-    // LLM-provided hint (e.g., from thinking block or special field)
-    parallel_group: Option<String>,
-}
-```
-
-Tools with same `parallel_group` execute together; different groups are sequential barriers.
-
-**Pros:** LLM controls scheduling, adapts to task semantics.
-**Cons:** Requires LLM cooperation, unclear if Claude supports this.
+**Ruled out by API research.** Neither Anthropic nor OpenAI APIs provide parallelization hints or grouping signals. The LLM simply emits tool calls; execution strategy is entirely client-side.
 
 ### Solution 3: Conservative Inference
 
@@ -281,21 +274,97 @@ Partition tool list into: `[safe-parallel-batch, unsafe-serial, safe-parallel-ba
 
 ---
 
+## API Research Findings
+
+### Key Insight: Execution Order is Client's Decision
+
+Neither Anthropic nor OpenAI APIs prescribe execution order. They simply:
+1. Return N tool calls in a single response
+2. Expect N tool results back before the next turn
+3. Match results to calls via unique `tool_use_id`
+
+**Tool results can be returned in any order** - the APIs don't care about ordering.
+
+### Anthropic API
+
+**Request structure:**
+```json
+{
+  "content": [
+    { "type": "tool_use", "id": "call_1", "name": "bash", "input": {...} },
+    { "type": "tool_use", "id": "call_2", "name": "bash", "input": {...} },
+    { "type": "text", "text": "Let me check both..." }
+  ]
+}
+```
+
+**Response with results:**
+```json
+{
+  "role": "user",
+  "content": [
+    { "type": "tool_result", "tool_use_id": "call_2", "content": "..." },
+    { "type": "tool_result", "tool_use_id": "call_1", "content": "..." }
+  ]
+}
+```
+
+Note: Results sent in reverse order - API accepts this.
+
+**`parallel_tool_use` parameter:** Controls whether the *model* can emit multiple tool calls in one turn. Does NOT affect execution - that's entirely client-side.
+
+### OpenAI Chat Completions API
+
+**Response structure:**
+```json
+{
+  "choices": [{
+    "message": {
+      "tool_calls": [
+        { "id": "call_1", "function": { "name": "bash", "arguments": "..." } },
+        { "id": "call_2", "function": { "name": "bash", "arguments": "..." } }
+      ]
+    }
+  }]
+}
+```
+
+**Submitting results:** Each tool result is a separate message with `role: "tool"` and `tool_call_id`. Order doesn't matter.
+
+### OpenAI Responses API (Codex models)
+
+Uses `function_call` outputs and `function_call_output` inputs. Same principle - results matched by `call_id`, order irrelevant.
+
+### Implications for Design
+
+1. **Solution 2 (LLM-Driven Hints) is not viable** - APIs don't provide parallelization signals
+2. **P3 (Completion Semantics)** - "Independent completion" is fully supported by APIs
+3. **P1 (Classification)** - Must be solved client-side, either via:
+   - Tool metadata (`is_parallelizable()`)
+   - Runtime conflict detection
+   - Conservative heuristics
+
+---
+
 ## Open Research Questions
 
-1. **Claude API behavior:** Does Claude expect tool results in order? Does it use `parallel_tool_use` parameter?
-2. **Claude Code implementation:** How does Claude Code 2.1.37 implement this internally?
-3. **Anthropic guidance:** Any documentation on parallel tool execution best practices?
+1. ~~**Claude API behavior:** Does Claude expect tool results in order?~~ **ANSWERED:** No, order doesn't matter.
+2. ~~**Does it use `parallel_tool_use` parameter?**~~ **ANSWERED:** Controls model output, not execution.
+3. **Claude Code implementation:** How does Claude Code 2.1.37 implement parallel execution internally?
+4. **Conflict detection:** Can we statically detect conflicting operations (e.g., two patches to same file)?
+5. **Error propagation:** What's the best UX for "sibling tool call errored"?
 
 ---
 
 ## Next Steps
 
-- [ ] Research Claude API parallel tool use capabilities
+- [x] Research Claude API parallel tool use capabilities
 - [ ] Prototype parallel execution for read-only tools only
 - [ ] Design `notify_tool_executing` changes for parallel UI
 - [ ] Write property tests for parallel completion scenarios
 - [ ] Analyze cancellation edge cases in detail
+- [ ] Add `is_parallelizable()` method to `ToolInput` enum
+- [ ] Design conflict detection for `bash` and `patch` tools
 
 ---
 
