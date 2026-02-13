@@ -512,31 +512,32 @@ def cmd_tasks_validate() -> bool:
 # =============================================================================
 
 
-def detect_prod_env() -> str:
-    """Detect production environment: 'native', 'lima', or 'local'.
+def detect_prod_env() -> str | None:
+    """Detect production environment: 'native', 'lima', 'daemon', or None.
 
     Returns:
         'native': Linux with systemd - full production deployment
-        'lima': Lima VM with KVM support - isolated VM deployment
-        'local': Fallback - run prod binary locally without systemd
+        'lima': macOS with Lima VM - isolated VM deployment
+        'daemon': Fallback - background daemon in ~/.phoenix-ide/
+        None: macOS without Lima (error condition)
     """
-    if sys.platform == "linux":
-        # Check if systemd is available for native deployment
-        if check_systemd_available():
-            return "native"
-        # No systemd, fall back to local mode
-        return "local"
-
     if sys.platform == "darwin":
-        # Check if Lima VM exists and has KVM support
-        if lima_vm_exists() and os.path.exists("/dev/kvm"):
+        # macOS: ONLY check for Lima VM, never use daemon mode
+        if lima_vm_exists():
             lima_ensure_running()
             return "lima"
-        # No Lima or no KVM, fall back to local mode
-        return "local"
+        # No Lima = fail with helpful message, don't silently fall back
+        return None
 
-    # Other platforms: local mode
-    return "local"
+    elif sys.platform == "linux":
+        # Linux: systemd preferred, daemon fallback
+        if check_systemd_available():
+            return "native"
+        return "daemon"
+
+    else:
+        # Other platforms: daemon mode only
+        return "daemon"
 
 
 # Production build worktree location
@@ -556,11 +557,15 @@ def check_systemd_available() -> bool:
         return False
 
 
-def prod_build(version: str | None = None) -> Path:
+def prod_build(version: str | None = None, strip: bool = True) -> Path:
     """Build a production binary from a git tag or HEAD.
-    
+
     Uses a separate git worktree to avoid disturbing the main working directory.
     Returns path to the built binary.
+
+    Args:
+        version: Git tag or None for HEAD
+        strip: Whether to strip debug symbols (default True, False for debugging)
     """
     # Determine what to build
     if version:
@@ -618,14 +623,18 @@ def prod_build(version: str | None = None) -> Path:
         cwd=worktree, check=True, env=build_env
     )
     
-    # Strip the binary
     binary = worktree / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
-    print("Stripping binary...")
-    subprocess.run(["strip", str(binary)], check=True)
-    
+
+    # Strip the binary (unless debugging)
+    if strip:
+        print("Stripping binary...")
+        subprocess.run(["strip", str(binary)], check=True)
+    else:
+        print("Keeping debug symbols (unstripped)...")
+
     size_mb = binary.stat().st_size / (1024 * 1024)
     print(f"Built: {binary} ({size_mb:.1f} MB)")
-    
+
     return binary
 
 
@@ -758,14 +767,14 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         sys.exit(1)
 
 
-def prod_local_run(ai_gateway: bool = False):
-    """Run production build locally without systemd.
+def prod_daemon_deploy(ai_gateway: bool = False):
+    """Deploy as background daemon in ~/.phoenix-ide/ (no systemd).
 
-    Builds in separate worktree, runs on different ports for isolation.
-    Ideal for testing production builds while doing concurrent dev work.
+    Used when systemd is not available (containers, non-systemd Linux).
+    Daemonizes the process and returns to shell immediately.
     """
-    # Build production binary
-    binary = prod_build(version=None)
+    # Build binary (keep debug symbols for debugging)
+    binary = prod_build(version=None, strip=False)
 
     # Authenticate AI Gateway if needed
     if ai_gateway:
@@ -781,8 +790,16 @@ def prod_local_run(ai_gateway: bool = False):
 
     # Set up environment
     env = os.environ.copy()
-    env["PHOENIX_PORT"] = "8032"  # Workspaces-compatible, different from dev (8023) and prod (8031)
-    env["PHOENIX_DB_PATH"] = str(Path.home() / ".phoenix-ide" / "prod-local.db")
+    env["PHOENIX_PORT"] = str(PROD_PORT)  # Use prod port (8031)
+
+    prod_dir = Path.home() / ".phoenix-ide"
+    prod_dir.mkdir(parents=True, exist_ok=True)
+
+    prod_db_path = prod_dir / "prod.db"  # Consistent with native/lima
+    prod_log_path = prod_dir / "prod.log"
+    prod_pid_path = prod_dir / "prod.pid"
+
+    env["PHOENIX_DB_PATH"] = str(prod_db_path)
 
     if ai_gateway:
         env["AI_GATEWAY_ENABLED"] = "true"
@@ -792,7 +809,6 @@ def prod_local_run(ai_gateway: bool = False):
         env["AI_GATEWAY_SOURCE"] = "phoenix-ide"
         env["AI_GATEWAY_ORG_ID"] = "2"
     else:
-        # Check for API key
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             print("ERROR: ANTHROPIC_API_KEY not set.", file=sys.stderr)
@@ -800,18 +816,133 @@ def prod_local_run(ai_gateway: bool = False):
             sys.exit(1)
         env["ANTHROPIC_API_KEY"] = api_key
 
-    print(f"\n✓ Production binary ready: {binary}")
-    print(f"  Port: {env['PHOENIX_PORT']}")
-    print(f"  Database: {env['PHOENIX_DB_PATH']}")
-    print(f"  LLM Mode: {'AI Gateway' if ai_gateway else 'Direct API'}")
-    print(f"\nStarting production server...")
-    print("Press Ctrl+C to stop\n")
+    # Stop existing daemon if running
+    if prod_pid_path.exists():
+        try:
+            with open(prod_pid_path) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 15)  # SIGTERM
+            time.sleep(1)
+        except (ProcessLookupError, ValueError):
+            pass  # Process already dead or invalid PID
+        prod_pid_path.unlink(missing_ok=True)
 
-    # Run the binary
+    # Start daemonized process
+    with open(prod_log_path, "w") as log:
+        proc = subprocess.Popen(
+            [str(binary)],
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True  # Daemonize: detach from terminal
+        )
+
+    # Save PID
+    with open(prod_pid_path, "w") as f:
+        f.write(str(proc.pid))
+
+    # Verify startup
+    time.sleep(2)
+    if proc.poll() is not None:
+        print("ERROR: Server failed to start. Check logs:", file=sys.stderr)
+        print(f"  {prod_log_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Health check
     try:
-        subprocess.run([str(binary)], env=env, check=True)
-    except KeyboardInterrupt:
-        print("\n\nStopped.")
+        import urllib.request
+        with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=5) as resp:
+            version_text = resp.read().decode().strip()
+            version_info = {"version": version_text}
+    except Exception as e:
+        print(f"WARNING: Server started but health check failed: {e}", file=sys.stderr)
+        version_info = {"version": "unknown"}
+
+    print(f"\n✓ Deployed daemon to production")
+    print(f"  Version: {version_info.get('version', 'unknown')}")
+    print(f"  Port: {PROD_PORT}")
+    print(f"  Database: {prod_db_path}")
+    print(f"  Logs: {prod_log_path}")
+    print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
+    print(f"  LLM Mode: {'AI Gateway' if ai_gateway else 'Direct API'}")
+    print()
+    print("Use './dev.py prod status' to check status")
+    print("Use './dev.py prod stop' to stop the server")
+
+
+def prod_daemon_status():
+    """Show daemon deployment status."""
+    prod_dir = Path.home() / ".phoenix-ide"
+    prod_pid_path = prod_dir / "prod.pid"
+    prod_log_path = prod_dir / "prod.log"
+
+    if not prod_pid_path.exists():
+        print("Status: Not running (no PID file)")
+        return
+
+    try:
+        with open(prod_pid_path) as f:
+            pid = int(f.read().strip())
+
+        # Check if process exists
+        os.kill(pid, 0)  # Signal 0 = check existence
+        print(f"Status: Running (PID {pid})")
+
+        # Try to get version from health endpoint
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
+                version_text = resp.read().decode().strip()
+                print(f"  Version: {version_text}")
+                print(f"  Port: {PROD_PORT}")
+                print(f"  Health: OK")
+        except Exception as e:
+            print(f"  Health: Unreachable ({type(e).__name__}: {e})")
+
+        print(f"  Logs: {prod_log_path}")
+
+    except ProcessLookupError:
+        print(f"Status: Dead (PID {pid} not found)")
+        print("Run './dev.py prod deploy' to restart")
+    except (ValueError, FileNotFoundError):
+        print("Status: Unknown (invalid PID file)")
+
+
+def prod_daemon_stop():
+    """Stop daemon deployment."""
+    prod_dir = Path.home() / ".phoenix-ide"
+    prod_pid_path = prod_dir / "prod.pid"
+
+    if not prod_pid_path.exists():
+        print("No daemon running (no PID file)")
+        return
+
+    try:
+        with open(prod_pid_path) as f:
+            pid = int(f.read().strip())
+
+        print(f"Stopping daemon (PID {pid})...")
+        os.kill(pid, 15)  # SIGTERM
+
+        # Wait for graceful shutdown
+        for _ in range(10):
+            time.sleep(0.5)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        else:
+            print("Graceful shutdown timed out, forcing...")
+            os.kill(pid, 9)  # SIGKILL
+
+        prod_pid_path.unlink(missing_ok=True)
+        print("✓ Stopped")
+
+    except ProcessLookupError:
+        print(f"Process {pid} not found (already stopped)")
+        prod_pid_path.unlink(missing_ok=True)
+    except (ValueError, FileNotFoundError):
+        print("Invalid or missing PID file")
 
 
 def native_prod_status():
@@ -868,74 +999,73 @@ def cmd_prod_deploy(version: str | None = None, ai_gateway: bool = False):
     print()
 
     env = detect_prod_env()
+
     if env == "native":
         print("📦 Detected: Linux with systemd (native deployment)")
         native_prod_deploy(version, ai_gateway)
+
     elif env == "lima":
-        print("📦 Detected: Lima VM with KVM support")
+        print("📦 Detected: macOS with Lima VM")
         lima_prod_deploy(ai_gateway)
-    elif env == "local":
-        print("📦 Detected: Container/no-systemd environment (local mode)")
-        print("    Running production build locally without systemd")
+
+    elif env == "daemon":
+        print("📦 Detected: No systemd (daemon mode)")
+        print("    Running production build as background daemon")
         print()
-        prod_local_run(ai_gateway)
-    else:
-        print("ERROR: Unknown environment", file=sys.stderr)
+        prod_daemon_deploy(ai_gateway)
+
+    elif env is None:
+        # macOS without Lima
+        print("ERROR: Lima VM not found", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Phoenix IDE requires Lima VM for production deployment on macOS.", file=sys.stderr)
+        print("Lima provides an isolated Linux environment with systemd.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("To set up Lima VM:", file=sys.stderr)
+        print("  1. Install Lima: brew install lima", file=sys.stderr)
+        print("  2. Create VM: ./dev.py lima create", file=sys.stderr)
+        print("  3. Deploy: ./dev.py prod deploy", file=sys.stderr)
         sys.exit(1)
 
-
-def cmd_prod_local(ai_gateway: bool = False):
-    """Run production build locally without systemd."""
-    prod_local_run(ai_gateway)
+    else:
+        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_prod_status():
     """Show production status (auto-detects environment)."""
     env = detect_prod_env()
+
     if env == "native":
         native_prod_status()
     elif env == "lima":
         lima_prod_status()
-    elif env == "local":
-        # Check if prod-local process is running (looks for prod build worktree binary)
-        prod_binary_path = PROD_BUILD_WORKTREE / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
-        result = subprocess.run(
-            ["pgrep", "-f", str(prod_binary_path)],
-            capture_output=True
-        )
-        if result.returncode == 0:
-            pids = result.stdout.decode().strip().split('\n')
-            print(f"Production (local mode): running (PID {pids[0]})")
-            print(f"  Port: 8032")
-            print(f"  Database: {Path.home() / '.phoenix-ide' / 'prod-local.db'}")
-        else:
-            print("Production (local mode): not running")
-            print("  Start with: ./dev.py prod deploy [--ai-gateway]")
+    elif env == "daemon":
+        prod_daemon_status()
+    elif env is None:
+        print("ERROR: Lima VM not found. Cannot check status.", file=sys.stderr)
+        print("Run './dev.py lima create' to set up Lima VM.", file=sys.stderr)
+        sys.exit(1)
     else:
-        print("ERROR: Unknown environment", file=sys.stderr)
+        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
         sys.exit(1)
 
 
 def cmd_prod_stop():
     """Stop production service (auto-detects environment)."""
     env = detect_prod_env()
+
     if env == "native":
         native_prod_stop()
     elif env == "lima":
         lima_prod_stop()
-    elif env == "local":
-        # Stop local prod process (looks for prod build worktree binary)
-        prod_binary_path = PROD_BUILD_WORKTREE / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
-        result = subprocess.run(
-            ["pkill", "-f", str(prod_binary_path)],
-            capture_output=True
-        )
-        if result.returncode == 0 or result.returncode == 144:
-            print("✓ Stopped production (local mode)")
-        else:
-            print("Production (local mode) not running")
+    elif env == "daemon":
+        prod_daemon_stop()
+    elif env is None:
+        print("ERROR: Lima VM not found. Cannot stop.", file=sys.stderr)
+        sys.exit(1)
     else:
-        print("ERROR: Unknown environment", file=sys.stderr)
+        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1359,8 +1489,6 @@ def main():
     deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
     deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
     deploy_parser.add_argument("--ai-gateway", action="store_true", help="Enable AI Gateway mode")
-    local_parser = prod_sub.add_parser("local", help="Run production build locally (no systemd)")
-    local_parser.add_argument("--ai-gateway", action="store_true", help="Enable AI Gateway mode")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
 
@@ -1393,8 +1521,6 @@ def main():
             cmd_prod_build(args.version)
         elif args.prod_command == "deploy":
             cmd_prod_deploy(args.version, ai_gateway=args.ai_gateway)
-        elif args.prod_command == "local":
-            cmd_prod_local(ai_gateway=args.ai_gateway)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":
