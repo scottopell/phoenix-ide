@@ -12,7 +12,7 @@ export function StorageStatus({ conversationCount }: { conversationCount: number
         const { usage } = await cacheDB.getStorageInfo();
         setCachedMB(usage / (1024 * 1024));
       } catch (err) {
-        // Storage API not available
+        console.warn('Storage API not available:', err);
       }
     };
     checkStorage();
