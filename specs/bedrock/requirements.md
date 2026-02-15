@@ -313,3 +313,92 @@ THE SYSTEM SHALL NOT provide request_mode_upgrade tool to sub-agents
 AND sub-agents cannot change their mode
 
 **Rationale:** Sub-agents are autonomous and less supervised than the parent conversation. Forcing Restricted mode (when available) limits blast radius. Only the parent conversation, with direct user oversight, can operate in Unrestricted mode.
+
+---
+
+### REQ-BED-019: Context Continuation Threshold
+
+WHEN LLM response indicates context usage >= 90% of model's context window
+AND conversation uses threshold-based continuation behavior
+THE SYSTEM SHALL trigger continuation flow
+AND NOT execute any tools requested in that response
+
+WHEN calculating context usage
+THE SYSTEM SHALL use total tokens from LLM response usage data
+AND compare against model-specific context window size
+
+**Rationale:** Users need graceful handling when conversations grow long. Triggering at 90% leaves room (~20k tokens on 200k models) for the continuation summary while avoiding hard failures. Rejecting tools at the threshold boundary prevents context overflow.
+
+---
+
+### REQ-BED-020: Continuation Summary Generation
+
+WHEN continuation flow is triggered
+THE SYSTEM SHALL request a session summary from the LLM
+AND the request SHALL NOT include any tool capabilities
+AND the request SHALL mention any tools that were requested but not executed
+
+WHEN continuation summary is received
+THE SYSTEM SHALL store it as a continuation message
+AND transition to context exhausted state
+
+WHEN continuation request fails after standard retries
+THE SYSTEM SHALL transition to context exhausted state
+AND use a fallback summary indicating the failure
+
+**Rationale:** The summary preserves session context for users to seed a new conversation. Mentioning rejected tools acknowledges what the agent intended. Failures shouldn't block users from moving on.
+
+---
+
+### REQ-BED-021: Context Exhausted State
+
+WHEN conversation enters context exhausted state
+THE SYSTEM SHALL reject new user messages with explanatory error
+AND display the continuation summary prominently
+AND offer action to start new conversation
+
+WHEN user starts new conversation from exhausted conversation
+THE SYSTEM SHALL optionally pre-populate with continuation summary
+AND preserve link to original conversation for reference
+
+**Rationale:** Clear terminal state prevents confusion. Optional summary seeding enables continuity without forcing it.
+
+---
+
+### REQ-BED-022: Model-Specific Context Limits
+
+WHEN determining context threshold
+THE SYSTEM SHALL use the context window size for the conversation's model
+AND support models with different limits
+
+WHEN model context window is unknown
+THE SYSTEM SHALL use the smallest known model limit as default
+
+**Rationale:** Models have varying context capacities. Conservative defaults ensure safe behavior with unknown models.
+
+---
+
+### REQ-BED-023: Context Warning Indicator
+
+WHEN context usage exceeds 80% of model's context window
+THE SYSTEM SHALL display a warning indicator to the user
+AND offer option to trigger continuation manually
+
+WHEN user manually triggers continuation
+THE SYSTEM SHALL behave identically to automatic continuation at threshold
+
+**Rationale:** Users may want to wrap up conversations naturally before hitting the hard limit. Early warning with manual trigger gives control.
+
+---
+
+### REQ-BED-024: Sub-Agent Context Exhaustion
+
+WHEN sub-agent context usage reaches threshold
+THE SYSTEM SHALL fail the sub-agent immediately
+AND NOT trigger continuation flow for sub-agents
+AND report failure to parent conversation
+
+WHEN parent receives sub-agent context exhaustion failure
+THE SYSTEM SHALL allow parent to spawn replacement sub-agent with refined task
+
+**Rationale:** Sub-agents are short-lived workers that shouldn't run long enough to exhaust context. If they do, failing fast lets the parent adapt rather than generating summaries nobody will read.

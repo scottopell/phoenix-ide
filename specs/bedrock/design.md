@@ -418,6 +418,293 @@ fn cancellation_produces_synthetic_results_for_all_pending_tools(
 - Sub-agent spawning, result submission, aggregation
 - Server restart recovery
 
+## Context Continuation (REQ-BED-019 through REQ-BED-024)
+
+### Context Exhaustion Behavior
+
+Conversations have a behavior mode that determines how context exhaustion is handled:
+
+```rust
+enum ContextExhaustionBehavior {
+    /// Normal conversations: trigger continuation at 90% threshold
+    ThresholdBasedContinuation,
+    /// Sub-agents: fail immediately (no continuation flow)
+    IntentionallyUnhandled,
+}
+
+struct ConvContext {
+    // ... existing fields ...
+    context_exhaustion_behavior: ContextExhaustionBehavior,
+}
+```
+
+Set at conversation creation:
+- User-initiated conversations: `ThresholdBasedContinuation`
+- Sub-agents: `IntentionallyUnhandled`
+
+### New States
+
+```rust
+enum ConvState {
+    // ... existing states ...
+    
+    /// Awaiting continuation summary from LLM (tool-less request in flight)
+    AwaitingContinuation {
+        /// Tool calls that were requested but not executed
+        rejected_tool_calls: Vec<ToolCall>,
+        /// Usage data from the triggering response
+        trigger_usage: UsageData,
+        /// Retry attempt for the continuation request
+        attempt: u32,
+    },
+    
+    /// Context window exhausted - conversation is read-only
+    ContextExhausted {
+        /// The continuation summary
+        summary: String,
+        /// Final context usage when exhausted
+        final_usage: UsageData,
+    },
+}
+```
+
+### New Events
+
+```rust
+enum Event {
+    // ... existing events ...
+    
+    /// Continuation summary received from LLM
+    ContinuationResponse {
+        summary: String,
+        usage: UsageData,
+    },
+    
+    /// Continuation request failed after retries
+    ContinuationFailed {
+        error: String,
+    },
+    
+    /// User manually triggered continuation (REQ-BED-023)
+    UserTriggerContinuation,
+}
+```
+
+### New Effects
+
+```rust
+enum Effect {
+    // ... existing effects ...
+    
+    /// Request continuation summary from LLM (no tools)
+    RequestContinuation {
+        rejected_tool_calls: Vec<ToolCall>,
+    },
+    
+    /// Notify client of context exhaustion
+    NotifyContextExhausted {
+        summary: String,
+    },
+}
+```
+
+### Threshold Check Location
+
+The check happens in `transition()` at the `(LlmRequesting, LlmResponse)` arm, BEFORE entering `ToolExecuting`:
+
+```rust
+(ConvState::LlmRequesting { .. }, Event::LlmResponse { content, tool_calls, usage, .. }) => {
+    let usage_data = usage_to_data(&usage);
+    
+    // REQ-BED-019: Check context threshold BEFORE tool execution
+    if should_trigger_continuation(&usage_data, &context.model_info) {
+        match context.context_exhaustion_behavior {
+            ContextExhaustionBehavior::ThresholdBasedContinuation => {
+                // Persist agent message (what LLM said), then request continuation
+                return Ok(TransitionResult::new(ConvState::AwaitingContinuation {
+                    rejected_tool_calls: tool_calls,
+                    trigger_usage: usage_data.clone(),
+                    attempt: 1,
+                })
+                .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::RequestContinuation { rejected_tool_calls: tool_calls }));
+            }
+            ContextExhaustionBehavior::IntentionallyUnhandled => {
+                // REQ-BED-024: Sub-agents fail immediately
+                return Ok(TransitionResult::new(ConvState::Failed {
+                    error: "Context window exhausted".to_string(),
+                    error_kind: ErrorKind::ContextExhausted,
+                })
+                .with_effect(Effect::NotifyParent { 
+                    outcome: SubAgentOutcome::Failure { 
+                        error: "Context window exhausted".to_string(),
+                        error_kind: ErrorKind::ContextExhausted,
+                    }
+                }));
+            }
+        }
+    }
+    
+    // Normal flow continues...
+    if tool_calls.is_empty() {
+        // ...
+    } else {
+        // -> ToolExecuting
+    }
+}
+```
+
+### Continuation Prompt
+
+The continuation prompt includes context about rejected tools:
+
+```rust
+const CONTINUATION_PROMPT: &str = r#"
+The conversation context is nearly full. Please provide a brief continuation summary that could seed a new conversation.
+
+Include:
+1. Current task status (if any)
+2. Key files or concepts discussed
+3. Suggested next steps
+
+Keep your response concise.
+"#;
+
+fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
+    let mut prompt = CONTINUATION_PROMPT.to_string();
+    
+    if !rejected_tool_calls.is_empty() {
+        prompt.push_str("\n\nNote: The following tool calls were requested but not executed due to context limits:\n");
+        for tool in rejected_tool_calls {
+            prompt.push_str(&format!("- {}\n", tool.name()));
+        }
+    }
+    
+    prompt
+}
+```
+
+### Continuation Transitions
+
+```rust
+// Continuation response received
+(ConvState::AwaitingContinuation { trigger_usage, .. }, Event::ContinuationResponse { summary, usage }) => {
+    let final_usage = UsageData {
+        input_tokens: trigger_usage.input_tokens + usage.input_tokens,
+        output_tokens: trigger_usage.output_tokens + usage.output_tokens,
+    };
+    
+    Ok(TransitionResult::new(ConvState::ContextExhausted {
+        summary: summary.clone(),
+        final_usage,
+    })
+    .with_effect(Effect::persist_continuation_message(summary))
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::NotifyContextExhausted { summary }))
+}
+
+// Continuation failed after retries
+(ConvState::AwaitingContinuation { trigger_usage, .. }, Event::ContinuationFailed { .. }) => {
+    let fallback = "Context limit reached. The continuation summary could not be generated. \
+                    Please start a new conversation.".to_string();
+    
+    Ok(TransitionResult::new(ConvState::ContextExhausted {
+        summary: fallback.clone(),
+        final_usage: trigger_usage,
+    })
+    .with_effect(Effect::persist_continuation_message(fallback.clone()))
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
+}
+
+// User cancels during continuation
+(ConvState::AwaitingContinuation { trigger_usage, .. }, Event::UserCancel) => {
+    let cancelled = "Continuation cancelled by user.".to_string();
+    
+    Ok(TransitionResult::new(ConvState::ContextExhausted {
+        summary: cancelled.clone(),
+        final_usage: trigger_usage,
+    })
+    .with_effect(Effect::persist_continuation_message(cancelled.clone()))
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::NotifyContextExhausted { summary: cancelled }))
+}
+
+// Context exhausted rejects user messages
+(ConvState::ContextExhausted { .. }, Event::UserMessage { .. }) => {
+    Err(TransitionError::ContextExhausted)
+}
+```
+
+### Manual Continuation Trigger (REQ-BED-023)
+
+Users can trigger continuation from Idle state when warning threshold (80%) is reached:
+
+```rust
+// User manually triggers continuation
+(ConvState::Idle, Event::UserTriggerContinuation) => {
+    Ok(TransitionResult::new(ConvState::AwaitingContinuation {
+        rejected_tool_calls: vec![],  // No rejected tools for manual trigger
+        trigger_usage: context.last_usage.clone(),
+        attempt: 1,
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::RequestContinuation { rejected_tool_calls: vec![] }))
+}
+```
+
+### Constants
+
+```rust
+/// Threshold as fraction of context window (REQ-BED-019)
+pub const CONTINUATION_THRESHOLD: f64 = 0.90;
+
+/// Warning threshold for UI indicator (REQ-BED-023)
+pub const WARNING_THRESHOLD: f64 = 0.80;
+
+/// Threshold check function
+fn should_trigger_continuation(usage: &UsageData, model: &ModelInfo) -> bool {
+    let used = usage.input_tokens + usage.output_tokens;
+    let threshold = (model.context_window as f64 * CONTINUATION_THRESHOLD) as u64;
+    used >= threshold
+}
+```
+
+### ErrorKind Extension
+
+```rust
+enum ErrorKind {
+    // ... existing variants ...
+    ContextExhausted,  // REQ-BED-024: For sub-agent context failure
+}
+```
+
+### Database Changes
+
+```sql
+-- New message type for continuation summaries
+-- (message_type TEXT already supports arbitrary values)
+-- Use 'continuation' as the type
+
+-- New conversation state
+-- (state TEXT already supports arbitrary values)
+-- Use 'context_exhausted' as the state
+```
+
+### State Transition Matrix Additions
+
+| Current State | Event | Next State | Effects |
+|--------------|-------|------------|----------|
+| LlmRequesting | LlmResponse (>= 90%, ThresholdBased) | AwaitingContinuation | PersistMessage, PersistState, RequestContinuation |
+| LlmRequesting | LlmResponse (>= 90%, Unhandled) | Failed | NotifyParent |
+| AwaitingContinuation | ContinuationResponse | ContextExhausted | PersistMessage, PersistState, NotifyContextExhausted |
+| AwaitingContinuation | ContinuationFailed | ContextExhausted | PersistMessage (fallback), PersistState, NotifyContextExhausted |
+| AwaitingContinuation | UserCancel | ContextExhausted | PersistMessage (cancelled), PersistState, NotifyContextExhausted |
+| ContextExhausted | UserMessage | **REJECT** | Return error "context exhausted" |
+| ContextExhausted | * | ContextExhausted | No-op |
+| Idle | UserTriggerContinuation | AwaitingContinuation | PersistState, RequestContinuation |
+
 ## File Organization
 
 ```
