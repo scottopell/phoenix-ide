@@ -3,6 +3,7 @@
 //! UX layer to catch common LLM mistakes before execution.
 //! NOT a security boundary - just helpful guardrails.
 
+use brush_parser::ast::{AndOr, AndOrList, Command, Pipeline, SimpleCommand};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Error returned when a command is blocked
@@ -43,8 +44,10 @@ pub fn check(script: &str) -> Result<(), CheckError> {
 /// LLMs commonly emit commands like `cd /path && actual_command`. For UI display,
 /// we want to show `actual_command` since the `cd` prefix is boilerplate.
 ///
-/// This uses tree-sitter to properly parse the command structure rather than
-/// fragile regex matching.
+/// This uses brush-parser for semantic awareness of `&&` vs `||` operators:
+/// - `&&` means "run next if previous succeeded" - safe to strip cd prefix
+/// - `||` means "run next if previous failed" - NOT safe to strip, shows fallback
+/// - `;` means "run sequentially" - safe to strip cd prefix
 ///
 /// Examples:
 /// - `cd /foo && cargo test` -> `cargo test`
@@ -52,85 +55,167 @@ pub fn check(script: &str) -> Result<(), CheckError> {
 /// - `cd /a; cd /b && cmd` -> `cmd`
 /// - `cargo test` -> `cargo test` (unchanged)
 /// - `cd /foo` -> `cd /foo` (no follow-up command)
-pub fn display_command(script: &str) -> &str {
-    let Some(tree) = parse_script(script) else {
-        return script;
-    };
+/// - `cat file || echo "not found"` -> `cat file || echo "not found"` (preserve || chains)
+/// - `cd /app && cat file || echo "not found"` -> `cat file || echo "not found"` (strip cd only)
+pub fn display_command(script: &str) -> String {
+    // Try brush-parser first for semantic awareness
+    if let Some(simplified) = simplify_with_brush(script) {
+        return simplified;
+    }
+    // Fallback: return original unchanged
+    script.to_string()
+}
 
-    // Find the last non-cd command in the script
-    let source = script.as_bytes();
-    if let Some(interesting) = find_interesting_command(tree.root_node(), source) {
-        interesting
-    } else {
-        script
+/// Parse script with brush-parser and simplify by stripping cd prefixes
+/// only when semantically safe (followed by && or ;).
+fn simplify_with_brush(script: &str) -> Option<String> {
+    use brush_parser::ast::SeparatorOperator;
+    use brush_parser::{Parser, ParserOptions, SourceInfo};
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(script);
+    let mut parser = Parser::new(cursor, &ParserOptions::default(), &SourceInfo::default());
+    let program = parser.parse_program().ok()?;
+
+    // Process each complete command list
+    // A CompoundList contains multiple items separated by ; or &
+    // Each item is (AndOrList, SeparatorOperator)
+    let mut results: Vec<String> = Vec::new();
+
+    for complete_cmd in &program.complete_commands {
+        let items: &Vec<_> = &complete_cmd.0;
+
+        // Process the list of items, where items are separated by ; or &
+        // We can strip cd commands when followed by ; (Sequence), because
+        // both commands run regardless, so cd success/failure doesn't gate the next
+        let mut i = 0;
+        while i < items.len() {
+            let item = &items[i];
+            let and_or_list = &item.0;
+            let separator = &item.1;
+
+            // Check if this entire AndOrList is just a cd command
+            if is_cd_and_or_list(and_or_list) {
+                // If followed by ; (Sequence), safe to skip
+                // If followed by & (Async), also safe to skip (runs in parallel)
+                match separator {
+                    SeparatorOperator::Sequence | SeparatorOperator::Async => {
+                        // Safe to skip - next command runs regardless
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Process the AndOrList with && and || awareness
+            let simplified = simplify_and_or_list(and_or_list);
+            if !simplified.is_empty() {
+                results.push(simplified);
+            }
+            i += 1;
+        }
+    }
+
+    if results.is_empty() {
+        // Everything was cd commands - return original
+        return Some(script.to_string());
+    }
+
+    Some(results.join("; "))
+}
+
+/// Check if an `AndOrList` is just a simple cd command (no && or || chains)
+fn is_cd_and_or_list(list: &AndOrList) -> bool {
+    // Must have no additional && or || operations
+    if !list.additional.is_empty() {
+        return false;
+    }
+    // The first (and only) pipeline must be a cd command
+    is_cd_pipeline(&list.first)
+}
+
+/// Simplify an `AndOrList` by stripping leading cd commands that are followed by `&&`.
+/// Returns the simplified command string.
+fn simplify_and_or_list(list: &AndOrList) -> String {
+    // Collect (operator, pipeline) pairs
+    // The first pipeline has an implicit "start" operator
+    // Additional pipelines have And or Or operators
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Start, // First command in the list
+        And,   // &&
+        Or,    // ||
+    }
+
+    let mut items: Vec<(Op, &Pipeline)> = Vec::new();
+    items.push((Op::Start, &list.first));
+
+    for and_or in &list.additional {
+        match and_or {
+            AndOr::And(pipeline) => items.push((Op::And, pipeline)),
+            AndOr::Or(pipeline) => items.push((Op::Or, pipeline)),
+        }
+    }
+
+    // Now filter: strip cd commands that are followed by && or at Start
+    // BUT keep cd commands that are followed by ||
+    let mut result_items: Vec<(Op, &Pipeline)> = Vec::new();
+
+    for (i, (op, pipeline)) in items.iter().enumerate() {
+        let is_cd = is_cd_pipeline(pipeline);
+
+        // Check what operator connects this to the NEXT command
+        let next_op = items.get(i + 1).map(|(o, _)| *o);
+
+        // cd followed by && (or at start before &&): safe to skip
+        // The cd succeeds → next runs (what we want to show)
+        // The cd fails → nothing runs anyway
+        if is_cd && matches!(next_op, Some(Op::And | Op::Start)) {
+            continue;
+        }
+
+        // Keep non-cd commands, cd followed by ||, and cd at the end
+        result_items.push((*op, pipeline));
+    }
+
+    if result_items.is_empty() {
+        return String::new();
+    }
+
+    // Reconstruct the command string
+    let mut output = String::new();
+    for (i, (op, pipeline)) in result_items.iter().enumerate() {
+        if i > 0 {
+            match op {
+                Op::Start => {} // Shouldn't happen after first
+                Op::And => output.push_str(" && "),
+                Op::Or => output.push_str(" || "),
+            }
+        }
+        output.push_str(&pipeline.to_string());
+    }
+
+    output
+}
+
+/// Check if a pipeline is a simple `cd` command
+fn is_cd_pipeline(pipeline: &Pipeline) -> bool {
+    // A cd pipeline should have exactly one command and it should be a simple `cd` command
+    if pipeline.seq.len() != 1 {
+        return false;
+    }
+
+    match &pipeline.seq[0] {
+        Command::Simple(simple) => is_cd_simple_command(simple),
+        _ => false,
     }
 }
 
-/// Recursively find the last non-cd command in the AST.
-/// Returns the text slice of that command.
-fn find_interesting_command<'a>(node: Node, source: &'a [u8]) -> Option<&'a str> {
-    let kind = node.kind();
-
-    // For a "list" (commands joined by && or ||), check children right-to-left
-    // to find the last interesting command
-    if kind == "list" {
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            if let Some(result) = find_interesting_command(child, source) {
-                return Some(result);
-            }
-        }
-        return None;
-    }
-
-    // For a "program" (the root), check children left-to-right but prefer
-    // later non-cd commands over earlier ones
-    if kind == "program" {
-        let mut cursor = node.walk();
-        let mut last_interesting: Option<&str> = None;
-        for child in node.children(&mut cursor) {
-            if let Some(result) = find_interesting_command(child, source) {
-                last_interesting = Some(result);
-            }
-        }
-        return last_interesting;
-    }
-
-    // For a command, check if it's a "cd" command
-    if kind == "command" {
-        if is_cd_command(node, source) {
-            return None;
-        }
-        // This is an interesting command - return its text
-        return node.utf8_text(source).ok();
-    }
-
-    // For pipelines, return the whole pipeline text (it's interesting)
-    if kind == "pipeline" {
-        return node.utf8_text(source).ok();
-    }
-
-    // For other node types, recurse into children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(result) = find_interesting_command(child, source) {
-            return Some(result);
-        }
-    }
-
-    None
-}
-
-/// Check if a command node is a `cd` command
-fn is_cd_command(node: Node, source: &[u8]) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "command_name" {
-            if let Ok(text) = child.utf8_text(source) {
-                return text == "cd";
-            }
-        }
+/// Check if a `SimpleCommand` is a `cd` command
+fn is_cd_simple_command(cmd: &SimpleCommand) -> bool {
+    if let Some(word) = &cmd.word_or_name {
+        return word.to_string() == "cd";
     }
     false
 }
@@ -601,18 +686,19 @@ mod tests {
 
     #[test]
     fn test_display_complex_chain() {
-        // cd /path && actual && more -> shows the last interesting command
+        // cd /path && actual && more -> strips cd prefix, shows the rest
         assert_eq!(
             display_command("cd /path && echo hello && ls -la"),
-            "ls -la"
+            "echo hello && ls -la"
         );
     }
 
     #[test]
     fn test_display_with_pipes() {
+        // Note: brush-parser's Display impl doesn't add space around pipe
         assert_eq!(
             display_command("cd /foo && cat file.txt | grep pattern"),
-            "cat file.txt | grep pattern"
+            "cat file.txt |grep pattern"
         );
     }
 
@@ -627,5 +713,38 @@ mod tests {
             display_command("cd /a; cd /b; cd /c; actual_command arg"),
             "actual_command arg"
         );
+    }
+
+    // ==================== || Chain Tests (REQ-1) ====================
+
+    #[test]
+    fn test_display_or_chain_preserves_primary() {
+        // For `cmd1 || cmd2`, the primary command is cmd1
+        // We should show the whole thing, not just the fallback
+        let result = display_command(r#"cat /path/to/file || echo "FILE NOT FOUND""#);
+        assert!(
+            result.contains("cat"),
+            "Should preserve primary command 'cat', got: {}",
+            result
+        );
+        assert!(
+            result.contains("||"),
+            "Should preserve || operator, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_display_cd_and_or_chain() {
+        // cd && (cmd || fallback) → cmd || fallback (strip cd only)
+        let result = display_command(r#"cd /app && cat file || echo "not found""#);
+        assert_eq!(result, r#"cat file || echo "not found""#);
+    }
+
+    #[test]
+    fn test_display_or_only_unchanged() {
+        // Pure || chain without cd should be unchanged
+        let result = display_command("command1 || command2 || command3");
+        assert_eq!(result, "command1 || command2 || command3");
     }
 }

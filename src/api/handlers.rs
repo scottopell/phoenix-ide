@@ -140,7 +140,7 @@ pub(super) fn enrich_message_json(json: &mut Value) {
 
             if let Some(ref command) = command {
                 // Add the display field with the cleaned command
-                let display_str = display_command(command).to_string();
+                let display_str = display_command(command);
                 tracing::debug!(
                     command = %command,
                     display = %display_str,
