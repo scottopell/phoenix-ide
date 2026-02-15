@@ -945,6 +945,66 @@ def prod_daemon_stop():
         print("Invalid or missing PID file")
 
 
+def get_systemd_override_dir() -> Path:
+    """Get the systemd drop-in override directory for phoenix-ide."""
+    return Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service.d")
+
+
+def list_systemd_overrides() -> list[tuple[str, str]]:
+    """List all systemd drop-in overrides. Returns [(filename, content), ...]."""
+    override_dir = get_systemd_override_dir()
+    if not override_dir.exists():
+        return []
+    
+    overrides = []
+    for conf in sorted(override_dir.glob("*.conf")):
+        try:
+            content = conf.read_text().strip()
+            overrides.append((conf.name, content))
+        except Exception:
+            overrides.append((conf.name, "<unreadable>"))
+    return overrides
+
+
+def native_prod_override_set(name: str, value: str):
+    """Set a systemd environment override."""
+    override_dir = get_systemd_override_dir()
+    conf_file = override_dir / f"{name}.conf"
+    content = f"[Service]\nEnvironment={name}={value}\n"
+    
+    subprocess.run(["sudo", "mkdir", "-p", str(override_dir)], check=True)
+    # Write via sudo tee
+    proc = subprocess.run(
+        ["sudo", "tee", str(conf_file)],
+        input=content.encode(),
+        capture_output=True
+    )
+    if proc.returncode != 0:
+        print(f"ERROR: Failed to write {conf_file}", file=sys.stderr)
+        sys.exit(1)
+    
+    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    subprocess.run(["sudo", "systemctl", "restart", PROD_SERVICE_NAME], check=True)
+    print(f"✓ Set {name}={value}")
+    print(f"  Service restarted")
+
+
+def native_prod_override_unset(name: str):
+    """Remove a systemd environment override."""
+    override_dir = get_systemd_override_dir()
+    conf_file = override_dir / f"{name}.conf"
+    
+    if not conf_file.exists():
+        print(f"No override '{name}' found")
+        return
+    
+    subprocess.run(["sudo", "rm", str(conf_file)], check=True)
+    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    subprocess.run(["sudo", "systemctl", "restart", PROD_SERVICE_NAME], check=True)
+    print(f"✓ Removed {name} override")
+    print(f"  Service restarted")
+
+
 def native_prod_status():
     """Show production service status (native Linux)."""
     # Check if service exists
@@ -976,6 +1036,17 @@ def native_prod_status():
             print(f"  Health: not responding")
     else:
         print(f"Production: {status}")
+    
+    # Show systemd overrides
+    overrides = list_systemd_overrides()
+    if overrides:
+        print(f"  Overrides:")
+        for filename, content in overrides:
+            # Extract the key=value from the content
+            for line in content.split('\n'):
+                if line.startswith('Environment='):
+                    env_val = line.replace('Environment=', '')
+                    print(f"    {filename}: {env_val}")
 
 
 def native_prod_stop():
@@ -1063,6 +1134,42 @@ def cmd_prod_stop():
         prod_daemon_stop()
     elif env is None:
         print("ERROR: Lima VM not found. Cannot stop.", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_prod_override_set(name: str, value: str):
+    """Set a systemd environment override (native Linux only)."""
+    env = detect_prod_env()
+    
+    if env == "native":
+        native_prod_override_set(name, value)
+    elif env == "lima":
+        print("ERROR: Overrides not yet supported for Lima deployments", file=sys.stderr)
+        print("SSH into the VM and edit the service file directly.", file=sys.stderr)
+        sys.exit(1)
+    elif env == "daemon":
+        print("ERROR: Overrides not supported for daemon mode", file=sys.stderr)
+        print("Stop the daemon and restart with environment variables set.", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_prod_override_unset(name: str):
+    """Remove a systemd environment override (native Linux only)."""
+    env = detect_prod_env()
+    
+    if env == "native":
+        native_prod_override_unset(name)
+    elif env == "lima":
+        print("ERROR: Overrides not yet supported for Lima deployments", file=sys.stderr)
+        sys.exit(1)
+    elif env == "daemon":
+        print("ERROR: Overrides not supported for daemon mode", file=sys.stderr)
         sys.exit(1)
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
@@ -1491,6 +1598,12 @@ def main():
     deploy_parser.add_argument("--ai-gateway", action="store_true", help="Enable AI Gateway mode")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
+    # Override management
+    override_set_parser = prod_sub.add_parser("set", help="Set systemd environment override")
+    override_set_parser.add_argument("name", help="Environment variable name (e.g., RUST_LOG)")
+    override_set_parser.add_argument("value", help="Environment variable value (e.g., debug)")
+    override_unset_parser = prod_sub.add_parser("unset", help="Remove systemd environment override")
+    override_unset_parser.add_argument("name", help="Environment variable name to remove")
 
     # lima
     lima_parser = sub.add_parser("lima", help="Lima VM management")
@@ -1525,6 +1638,10 @@ def main():
             cmd_prod_status()
         elif args.prod_command == "stop":
             cmd_prod_stop()
+        elif args.prod_command == "set":
+            cmd_prod_override_set(args.name, args.value)
+        elif args.prod_command == "unset":
+            cmd_prod_override_unset(args.name)
     elif args.command == "lima":
         if args.lima_command == "create":
             cmd_lima_create()
