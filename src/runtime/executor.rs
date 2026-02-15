@@ -105,6 +105,18 @@ where
     pub async fn run(mut self) {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
+        // Check if we need to resume an interrupted operation
+        // This handles crash recovery for in-flight LLM requests
+        if let ConvState::LlmRequesting { .. } = &self.state {
+            tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
+            if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
+                tracing::error!(error = %e, "Failed to resume LLM request");
+                let _ = self.broadcast_tx.send(SseEvent::Error {
+                    message: format!("Failed to resume: {e}"),
+                });
+            }
+        }
+
         // Process events in a loop - no recursion
         loop {
             tokio::select! {

@@ -10,6 +10,7 @@
 //! REQ-BED-009: Sub-Agent Isolation
 
 mod executor;
+mod recovery;
 pub mod traits;
 
 #[cfg(test)]
@@ -393,9 +394,13 @@ impl RuntimeManager {
             ))
         };
 
+        // Determine initial state: check if conversation needs auto-continuation
+        // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
+        let (initial_state, needs_auto_continue) = self.determine_resume_state(conversation_id)?;
+
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
-            ConvState::Idle, // Always resume from idle (REQ-BED-007)
+            initial_state,
             storage,
             llm_client,
             tool_executor,
@@ -406,6 +411,11 @@ impl RuntimeManager {
             broadcast_tx.clone(),
         )
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone());
+
+        // Log if we're auto-continuing (the executor handles the actual LLM request)
+        if needs_auto_continue {
+            tracing::info!(conv_id = %conversation_id, "Will auto-continue interrupted conversation");
+        }
 
         // Start runtime in background
         let conv_id = conversation_id.to_string();
@@ -448,6 +458,36 @@ impl RuntimeManager {
     ) -> Result<broadcast::Receiver<SseEvent>, String> {
         let handle = self.get_or_create(conversation_id).await?;
         Ok(handle.broadcast_tx.subscribe())
+    }
+
+    /// Determine the resume state for a conversation.
+    ///
+    /// Delegates to `recovery::should_auto_continue` for the actual logic.
+    /// See that module for comprehensive tests.
+    fn determine_resume_state(&self, conversation_id: &str) -> Result<(ConvState, bool), String> {
+        let messages = self
+            .db
+            .get_messages(conversation_id)
+            .map_err(|e| e.to_string())?;
+
+        let decision = recovery::should_auto_continue(&messages);
+
+        tracing::debug!(
+            conv_id = %conversation_id,
+            msg_count = messages.len(),
+            reason = ?decision.reason,
+            needs_auto_continue = decision.needs_auto_continue,
+            "determine_resume_state"
+        );
+
+        if decision.needs_auto_continue {
+            tracing::info!(
+                conv_id = %conversation_id,
+                "Detected interrupted conversation - will auto-continue"
+            );
+        }
+
+        Ok((decision.state, decision.needs_auto_continue))
     }
 
     /// Get the database handle
