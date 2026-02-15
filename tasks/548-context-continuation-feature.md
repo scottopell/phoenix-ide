@@ -202,14 +202,13 @@ ALTER TYPE message_type ADD VALUE 'continuation';
 - [ ] Model-specific thresholds (128k vs 200k models)
 - [ ] Sub-agents handle their own context exhaustion independently
 
-## Open Questions
-
-1. **Continuation during tool execution**: What if we hit threshold mid-tool-chain? Options:
-   - Complete current tool chain, then continue
-   - Abort remaining tools, continue immediately
-   - Leaning toward: Cancel pending tools to avoid further exhaustion, but needs more thought
-
 ## Design Decisions
+
+### Tool Chain Interruption
+
+If context threshold is exceeded mid-tool-chain, **cancel remaining tools** and trigger continuation. The existing cancellation machinery produces synthetic "cancelled" tool results that render cleanly to the LLM—no special handling needed beyond invoking the same cancel path.
+
+This prevents tools from pushing context over the hard limit while maintaining message chain integrity.
 
 ### Sub-Agent Context
 
