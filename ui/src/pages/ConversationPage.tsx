@@ -11,6 +11,7 @@ import { useDraft, useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
+import { ErrorBanner } from '../components/ErrorBanner';
 import type { Breadcrumb } from '../types';
 
 export function ConversationPage() {
@@ -462,6 +463,12 @@ export function ConversationPage() {
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
       />
+      {convState === 'error' && stateData?.message && (
+        <ErrorBanner
+          message={stateData.message}
+          onRetry={() => handleSend('continue', [])}
+        />
+      )}
       <InputArea
         draft={draft}
         setDraft={setDraft}

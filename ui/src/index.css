@@ -4166,3 +4166,93 @@ html * {
   font-style: italic;
   color: #6c5700;
 }
+
+/* ============================================
+   Error Banner - Prominent error display
+   ============================================ */
+
+.error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 20px;
+  margin: 16px;
+  background: var(--bg-error, #2d1f1f);
+  border: 1px solid var(--border-error, #5c2d2d);
+  border-radius: 8px;
+  color: var(--text-error, #f5a5a5);
+}
+
+.error-banner-icon {
+  flex-shrink: 0;
+  color: var(--error-icon, #ef4444);
+  margin-top: 2px;
+}
+
+.error-banner-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.error-banner-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text-error-title, #fca5a5);
+  margin-bottom: 4px;
+}
+
+.error-banner-details {
+  font-size: 14px;
+  color: var(--text-error-details, #d4a5a5);
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+.error-banner-hint {
+  font-size: 13px;
+  color: var(--text-muted, #888);
+  font-style: italic;
+}
+
+.error-banner-retry {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  background: var(--accent-color, #3b82f6);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.error-banner-retry:hover {
+  background: var(--accent-hover, #2563eb);
+}
+
+.error-banner-retry:active {
+  transform: scale(0.98);
+}
+
+/* Light theme adjustments */
+[data-theme="light"] .error-banner {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+[data-theme="light"] .error-banner-title {
+  color: #b91c1c;
+}
+
+[data-theme="light"] .error-banner-details {
+  color: #dc2626;
+}
+
+[data-theme="light"] .error-banner-icon {
+  color: #dc2626;
+}

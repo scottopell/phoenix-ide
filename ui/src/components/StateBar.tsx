@@ -68,7 +68,8 @@ export function StateBar({
           stateText = 'ready';
         } else if (convState === 'error') {
           dotClass += ' error';
-          stateText = stateData?.message || 'error';
+          // Just show 'error' - full message is in the ErrorBanner
+          stateText = 'error';
         } else {
           dotClass += ' working';
           stateText = getStateDescription(convState, stateData);
