@@ -1367,4 +1367,101 @@ mod tests {
         // (buffered since parent isn't in AwaitingSubAgents)
         // This is a basic smoke test - full integration would require more setup
     }
+
+    /// Test that tool output containing "[command cancelled]" does NOT trigger ToolAborted
+    /// when the cancellation token was NOT signaled.
+    ///
+    /// This is a regression test for a bug where the executor checked the output string
+    /// instead of the cancellation token state, causing spurious ToolAborted events that
+    /// violated the state machine contract (ToolAborted is only valid from CancellingTool).
+    #[tokio::test]
+    async fn test_cancelled_output_without_token_sends_tool_complete() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::{broadcast, mpsc};
+
+        // LLM returns a single tool call
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"command": "echo test"}),
+            )],
+            end_turn: false,
+            usage: Usage::default(),
+        });
+        // After tool completes, LLM returns text
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("Done")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
+
+        // Tool executor returns output containing "[command cancelled]" string
+        // BUT the cancellation token is NOT signaled (this is the key)
+        let tools = Arc::new(MockToolExecutor::new().with_tool(
+            "bash",
+            ToolOutput::error("[command cancelled]"), // The problematic string!
+        ));
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm,
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        );
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // Send user message
+        event_tx
+            .send(Event::UserMessage {
+                text: "Run command".to_string(),
+                images: vec![],
+                message_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
+            })
+            .await
+            .unwrap();
+
+        // Wait for completion with timeout
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut agent_done = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await {
+                Ok(Ok(SseEvent::AgentDone)) => {
+                    agent_done = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        // Should complete successfully (not get stuck)
+        assert!(
+            agent_done,
+            "Should receive AgentDone - tool output containing '[command cancelled]' \
+             without token signal should produce ToolComplete, not ToolAborted"
+        );
+
+        // Verify conversation completed normally - check final state via storage
+        let messages = storage.get_messages("test-conv").await.unwrap();
+        assert!(
+            messages.len() >= 3,
+            "Should have user message, tool result, and agent response"
+        );
+    }
 }

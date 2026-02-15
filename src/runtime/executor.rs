@@ -445,6 +445,8 @@ where
                 // Create cancellation token for this tool execution
                 let cancel_token = CancellationToken::new();
                 self.tool_cancel_token = Some(cancel_token.clone());
+                // Clone token to check cancellation state after tool completes
+                let cancel_token_check = cancel_token.clone();
 
                 // Create ToolContext for this invocation
                 let tool_ctx = ToolContext::new(
@@ -470,22 +472,26 @@ where
                         .execute(&tool_name, tool_input, tool_ctx)
                         .await;
 
+                    // Check if the tool was cancelled via the cancellation token.
+                    // IMPORTANT: We check the token state, NOT the output string.
+                    // The state machine only accepts ToolAborted from CancellingTool state,
+                    // which is entered when AbortTool effect cancels the token.
+                    // Checking output strings would cause spurious ToolAborted events
+                    // that violate the state machine contract.
+                    if cancel_token_check.is_cancelled() {
+                        tracing::info!(tool_id = %tool_use_id, "Tool cancelled (token signaled)");
+                        let _ = event_tx.send(Event::ToolAborted { tool_use_id }).await;
+                        return;
+                    }
+
                     let result = match output {
-                        Some(out) => {
-                            // Check if the tool was cancelled
-                            if out.output.contains("[command cancelled]") {
-                                tracing::info!(tool_id = %tool_use_id, "Tool cancelled");
-                                let _ = event_tx.send(Event::ToolAborted { tool_use_id }).await;
-                                return;
-                            }
-                            ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                success: out.success,
-                                output: out.output,
-                                is_error: !out.success,
-                                display_data: out.display_data,
-                            }
-                        }
+                        Some(out) => ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            success: out.success,
+                            output: out.output,
+                            is_error: !out.success,
+                            display_data: out.display_data,
+                        },
                         None => ToolResult::error(
                             tool_use_id.clone(),
                             format!("Unknown tool: {tool_name}"),
