@@ -973,6 +973,21 @@ def native_prod_override_set(name: str, value: str):
     content = f"[Service]\nEnvironment={name}={value}\n"
     
     subprocess.run(["sudo", "mkdir", "-p", str(override_dir)], check=True)
+    
+    # Remove any existing conf files that set the same variable
+    # (prevents conflicts from differently-named files)
+    if override_dir.exists():
+        for existing in override_dir.glob("*.conf"):
+            if existing.name == f"{name}.conf":
+                continue  # Will be overwritten anyway
+            try:
+                existing_content = existing.read_text()
+                if f"Environment={name}=" in existing_content:
+                    subprocess.run(["sudo", "rm", str(existing)], check=True)
+                    print(f"  Removed conflicting override: {existing.name}")
+            except Exception:
+                pass
+    
     # Write via sudo tee
     proc = subprocess.run(
         ["sudo", "tee", str(conf_file)],

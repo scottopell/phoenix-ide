@@ -40,6 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Log at all levels to verify logging configuration
+    tracing::trace!("Logging initialized - TRACE level");
+    tracing::debug!("Logging initialized - DEBUG level");
+    tracing::info!("Logging initialized - INFO level");
+    tracing::warn!("Logging initialized - WARN level (this is not an error, just a config check)");
+
     // Configuration
     let db_path = std::env::var("PHOENIX_DB_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
