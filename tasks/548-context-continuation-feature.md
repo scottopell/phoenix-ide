@@ -8,7 +8,7 @@ status: ready
 
 ## Summary
 
-Implement graceful conversation termination when context window approaches capacity. At 95% usage, trigger a continuation flow that summarizes the session and guides the user to start a fresh conversation.
+Implement graceful conversation termination when context window approaches capacity. At 90% usage, trigger a continuation flow that summarizes the session and guides the user to start a fresh conversation.
 
 ## Context
 
@@ -31,15 +31,15 @@ This feature extends **specs/bedrock/requirements.md**. Add the following requir
 
 ### REQ-BED-019: Context Continuation Threshold
 
-WHEN LLM response indicates context usage >= 95% of model's context window
+WHEN LLM response indicates context usage >= 90% of model's context window
 THE SYSTEM SHALL trigger continuation flow
 AND prevent further user messages
 
 WHEN calculating context usage
-THE SYSTEM SHALL use `input_tokens + output_tokens` from LLM response
+THE SYSTEM SHALL use total tokens from LLM response usage data
 AND compare against model-specific context window size
 
-**Rationale:** 95% threshold leaves room for the continuation prompt and response while avoiding hard failures.
+**Rationale:** 90% threshold leaves comfortable room (~20k tokens on 200k models) for the continuation prompt and response while avoiding hard failures.
 
 ---
 
@@ -47,15 +47,11 @@ AND compare against model-specific context window size
 
 WHEN continuation flow is triggered
 THE SYSTEM SHALL send a tool-less LLM request with continuation prompt
-AND the prompt SHALL request:
-  - Current task summary (with project-specific identifiers)
-  - Most relevant files (3-5)
-  - Recommended follow-up actions
-  - Any blocked/pending work
+AND the prompt SHALL request a concise summary of the session
 
 WHEN continuation response is received
-THE SYSTEM SHALL store it as `MessageType::Continuation`
-AND transition to `ContextExhausted` state
+THE SYSTEM SHALL store it as a continuation message
+AND transition to ContextExhausted state
 
 **Rationale:** The summary preserves session context for the user to seed a new conversation.
 
@@ -63,16 +59,16 @@ AND transition to `ContextExhausted` state
 
 ### REQ-BED-021: Context Exhausted State
 
-WHEN conversation enters `ContextExhausted` state
+WHEN conversation enters ContextExhausted state
 THE SYSTEM SHALL reject new user messages with explanatory error
 AND display the continuation summary prominently
 AND offer "Start New Conversation" action
 
 WHEN user starts new conversation from exhausted conversation
-THE SYSTEM SHALL pre-populate with continuation summary (optional)
+THE SYSTEM SHALL optionally pre-populate with continuation summary (user choice)
 AND preserve link to parent conversation for reference
 
-**Rationale:** Clear terminal state prevents confusion. Summary seeding enables continuity.
+**Rationale:** Clear terminal state prevents confusion. Optional summary seeding enables continuity without forcing it.
 
 ---
 
@@ -83,9 +79,22 @@ THE SYSTEM SHALL use the context window size for the conversation's model
 AND support models with different limits (128k, 200k, etc.)
 
 WHEN model context window is unknown
-THE SYSTEM SHALL default to conservative limit (128k)
+THE SYSTEM SHALL default to the smallest known model limit
 
-**Rationale:** Different models have different capacities. The system already tracks this in `ModelInfo.context_window`.
+**Rationale:** Different models have different capacities. Defaulting to the smallest known limit ensures safe behavior with unknown models.
+
+---
+
+### REQ-BED-023: Context Warning Indicator
+
+WHEN context usage exceeds 80% of model's context window
+THE SYSTEM SHALL display a warning indicator in the context usage display
+AND offer user option to trigger continuation manually
+
+WHEN user manually triggers continuation
+THE SYSTEM SHALL behave identically to automatic continuation at threshold
+
+**Rationale:** Users may want to wrap up a conversation naturally before hitting the hard limit. Early warning with manual trigger gives control.
 
 ---
 
@@ -117,7 +126,7 @@ ContextContinuation {
 
 | Current State | Event | Condition | Next State |
 |--------------|-------|-----------|------------|
-| LlmRequesting | LlmResponse | usage >= 95% threshold | *trigger continuation* |
+| LlmRequesting | LlmResponse | usage >= 90% threshold | *trigger continuation* |
 | LlmRequesting | ContextContinuation | - | ContextExhausted |
 | ContextExhausted | UserMessage | - | **REJECT** "context exhausted" |
 | ContextExhausted | * | - | ContextExhausted (no-op) |
@@ -138,23 +147,12 @@ Effect::NotifyContextExhausted { summary: String }
 
 ```rust
 /// Threshold as fraction of context window
-pub const CONTINUATION_THRESHOLD: f64 = 0.95;
+pub const CONTINUATION_THRESHOLD: f64 = 0.90;
+pub const WARNING_THRESHOLD: f64 = 0.80;
 
-/// The continuation prompt
+/// The continuation prompt (specifics TBD - keep generic for now)
 pub const CONTINUATION_PROMPT: &str = r#"
-The conversation context is nearly full. Please provide a continuation summary:
-
-1. **Current Task**: What were we working on? Include specific identifiers (issue IDs, file paths, function names).
-
-2. **Key Files**: List the 3-5 most relevant files for this task.
-
-3. **Progress**: What's been accomplished? What's remaining?
-
-4. **Next Steps**: What should be done next? Any blockers?
-
-5. **Context to Preserve**: Any important decisions, constraints, or discoveries that shouldn't be lost.
-
-Keep the summary concise but complete - it will seed the next conversation.
+The conversation context is nearly full. Please provide a brief continuation summary that could seed a new conversation.
 "#;
 ```
 
@@ -177,7 +175,7 @@ If threshold exceeded:
 
 ### UI Changes
 
-1. **StateBar**: Show warning color when > 80%, critical when > 95%
+1. **Context indicator**: Show warning state at > 80% with manual continuation trigger, critical at > 90%
 2. **ContextExhausted banner**: Display summary, "Start New Conversation" button
 3. **Input disabled**: Grey out with explanatory text
 4. **New conversation seeding**: Option to copy summary to new conversation
@@ -202,20 +200,29 @@ ALTER TYPE message_type ADD VALUE 'continuation';
 - [ ] UI shows exhausted state with summary
 - [ ] "Start New Conversation" button works
 - [ ] Model-specific thresholds (128k vs 200k models)
-- [ ] Works correctly for sub-agents (they have parent's context budget?)
+- [ ] Sub-agents handle their own context exhaustion independently
 
 ## Open Questions
 
-1. **Sub-agent context**: Do sub-agents share parent's context budget, or have their own? If shared, parent might exhaust while sub-agent is running.
-
-2. **Threshold configurability**: Should users be able to adjust the 95% threshold? Probably not MVP.
-
-3. **Continuation during tool execution**: What if we hit threshold mid-tool-chain? Options:
+1. **Continuation during tool execution**: What if we hit threshold mid-tool-chain? Options:
    - Complete current tool chain, then continue
    - Abort remaining tools, continue immediately
-   - Recommendation: Complete the chain, then continue
+   - Leaning toward: Cancel pending tools to avoid further exhaustion, but needs more thought
 
-4. **Pre-emptive warning**: Should we warn at 80%? 90%? Just indicator color change, or explicit message?
+## Design Decisions
+
+### Sub-Agent Context
+
+Sub-agents have **independent context budgets**. Each sub-agent tracks its own context usage against its own model's limit. If a sub-agent exhausts context:
+- It fails with a context exhaustion error (similar to other fatal errors)
+- Parent receives the failure as a sub-agent result
+- Parent's context is unaffected
+
+This is simpler than shared budgets and avoids race conditions.
+
+### State Persistence
+
+`ContextExhausted` is a persisted conversation state in the database. On server restart, conversations restore to their persisted state naturally—no special recovery logic needed.
 
 ## Related
 
