@@ -108,14 +108,34 @@ impl Conversation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
+    /// Authentication failed (401, 403) - not retryable
     Auth,
+    /// Rate limited (429) - retryable with backoff
     RateLimit,
+    /// Network issues, connection failures - retryable
     Network,
+    /// Bad request (400) - not retryable
     InvalidRequest,
+    /// Server error (5xx) - retryable
+    ServerError,
+    /// Request timed out - retryable
     TimedOut,
+    /// Operation was cancelled - not retryable
     Cancelled,
+    /// Sub-agent failed - not retryable
     SubAgentError,
+    /// Unknown error - not retryable (conservative default)
     Unknown,
+}
+
+impl ErrorKind {
+    /// Returns true if this error type should trigger automatic retry
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut
+        )
+    }
 }
 
 /// Tool execution result
@@ -421,5 +441,66 @@ pub struct UsageData {
 impl UsageData {
     pub fn context_window_used(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
+    }
+}
+
+#[cfg(test)]
+mod error_kind_tests {
+    use super::*;
+
+    #[test]
+    fn test_retryable_errors() {
+        // These should be retryable
+        assert!(
+            ErrorKind::Network.is_retryable(),
+            "Network errors should be retryable"
+        );
+        assert!(
+            ErrorKind::RateLimit.is_retryable(),
+            "Rate limit errors should be retryable"
+        );
+        assert!(
+            ErrorKind::ServerError.is_retryable(),
+            "Server errors (5xx) should be retryable"
+        );
+        assert!(
+            ErrorKind::TimedOut.is_retryable(),
+            "Timeout errors should be retryable"
+        );
+    }
+
+    #[test]
+    fn test_non_retryable_errors() {
+        // These should NOT be retryable
+        assert!(
+            !ErrorKind::Auth.is_retryable(),
+            "Auth errors should not be retryable"
+        );
+        assert!(
+            !ErrorKind::InvalidRequest.is_retryable(),
+            "Invalid request errors should not be retryable"
+        );
+        assert!(
+            !ErrorKind::Cancelled.is_retryable(),
+            "Cancelled errors should not be retryable"
+        );
+        assert!(
+            !ErrorKind::SubAgentError.is_retryable(),
+            "SubAgent errors should not be retryable"
+        );
+        assert!(
+            !ErrorKind::Unknown.is_retryable(),
+            "Unknown errors should not be retryable (conservative)"
+        );
+    }
+
+    #[test]
+    fn test_error_kind_serialization() {
+        // Ensure ServerError serializes correctly (for DB/SSE compatibility)
+        let json = serde_json::to_string(&ErrorKind::ServerError).unwrap();
+        assert_eq!(json, "\"server_error\"");
+
+        let parsed: ErrorKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ErrorKind::ServerError);
     }
 }

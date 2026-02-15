@@ -854,20 +854,18 @@ fn notify_awaiting_sub_agents(pending: &[PendingSubAgent], completed: &[SubAgent
 
 #[allow(dead_code)] // Conversion utility
 pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
+    // Explicit match arms to ensure new error kinds are handled (no catch-all)
     match kind {
         crate::llm::LlmErrorKind::Auth => ErrorKind::Auth,
         crate::llm::LlmErrorKind::RateLimit => ErrorKind::RateLimit,
         crate::llm::LlmErrorKind::Network => ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => ErrorKind::InvalidRequest,
-        _ => ErrorKind::Unknown,
+        crate::llm::LlmErrorKind::ServerError => ErrorKind::ServerError,
+        crate::llm::LlmErrorKind::Unknown => ErrorKind::Unknown,
     }
 }
 
-impl ErrorKind {
-    fn is_retryable(&self) -> bool {
-        matches!(self, ErrorKind::Network | ErrorKind::RateLimit)
-    }
-}
+// ErrorKind::is_retryable() is now defined in db/schema.rs
 
 #[cfg(test)]
 mod tests {

@@ -67,6 +67,7 @@ fn arb_error_kind() -> impl Strategy<Value = ErrorKind> {
     prop_oneof![
         Just(ErrorKind::Network),
         Just(ErrorKind::RateLimit),
+        Just(ErrorKind::ServerError),
         Just(ErrorKind::Auth),
         Just(ErrorKind::InvalidRequest),
         Just(ErrorKind::Unknown),

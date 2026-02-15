@@ -768,11 +768,60 @@ where
 }
 
 fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind {
+    // Explicit match arms to ensure new error kinds are handled (no catch-all)
     match kind {
         crate::llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
         crate::llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
         crate::llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
-        _ => crate::db::ErrorKind::Unknown,
+        crate::llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
+        crate::llm::LlmErrorKind::Unknown => crate::db::ErrorKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+    use crate::llm::LlmErrorKind;
+
+    #[test]
+    fn test_llm_error_to_db_error_mapping() {
+        // Test all mappings are explicit and correct
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::Auth),
+            crate::db::ErrorKind::Auth
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::RateLimit),
+            crate::db::ErrorKind::RateLimit
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::Network),
+            crate::db::ErrorKind::Network
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::InvalidRequest),
+            crate::db::ErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::ServerError),
+            crate::db::ErrorKind::ServerError,
+            "ServerError must map to ServerError, not Unknown!"
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::Unknown),
+            crate::db::ErrorKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_server_error_is_retryable_after_mapping() {
+        // This is the critical test - ServerError from LLM must be retryable
+        let llm_error = LlmErrorKind::ServerError;
+        let db_error = llm_error_to_db_error(llm_error);
+        assert!(
+            db_error.is_retryable(),
+            "ServerError must be retryable after mapping to db::ErrorKind"
+        );
     }
 }
