@@ -100,9 +100,19 @@ THE SYSTEM SHALL behave identically to automatic continuation at threshold
 
 ## State Machine Changes
 
-### New State
+### New States
 
 ```rust
+/// Awaiting continuation summary from LLM (tool-less request in flight)
+AwaitingContinuation {
+    /// The LLM response that triggered continuation (for context)
+    trigger_response: AgentMessageContent,
+    /// Tool calls that were requested but not executed
+    rejected_tool_calls: Vec<ToolCall>,
+    /// Usage data from the triggering response
+    trigger_usage: UsageData,
+}
+
 /// Context window exhausted - conversation is read-only
 ContextExhausted {
     /// The continuation summary from the LLM
@@ -112,13 +122,18 @@ ContextExhausted {
 }
 ```
 
-### New Event
+### New Events
 
 ```rust
-/// Context threshold exceeded, continuation response received
-ContextContinuation {
+/// Continuation summary received from LLM
+ContinuationResponse {
     summary: String,
     usage: UsageData,
+}
+
+/// Continuation request failed after retries
+ContinuationFailed {
+    error: String,
 }
 ```
 
@@ -126,8 +141,11 @@ ContextContinuation {
 
 | Current State | Event | Condition | Next State |
 |--------------|-------|-----------|------------|
-| LlmRequesting | LlmResponse | usage >= 90% threshold | *trigger continuation* |
-| LlmRequesting | ContextContinuation | - | ContextExhausted |
+| LlmRequesting | LlmResponse | usage >= 90% AND mode = ThresholdBasedContinuation | AwaitingContinuation |
+| LlmRequesting | LlmResponse | usage >= 90% AND mode = IntentionallyUnhandled | Failed (ContextExhausted) |
+| AwaitingContinuation | ContinuationResponse | - | ContextExhausted |
+| AwaitingContinuation | ContinuationFailed | - | ContextExhausted (fallback summary) |
+| AwaitingContinuation | UserCancel | - | ContextExhausted ("Cancelled") |
 | ContextExhausted | UserMessage | - | **REJECT** "context exhausted" |
 | ContextExhausted | * | - | ContextExhausted (no-op) |
 
@@ -135,10 +153,29 @@ ContextContinuation {
 
 ```rust
 /// Request continuation summary from LLM (no tools)
-Effect::RequestContinuation
+Effect::RequestContinuation {
+    /// Tool calls that were requested but not executed (for summary context)
+    rejected_tool_calls: Vec<ToolCall>,
+}
 
 /// Notify client of context exhaustion
 Effect::NotifyContextExhausted { summary: String }
+```
+
+### ConvContext Addition
+
+```rust
+struct ConvContext {
+    // ... existing fields ...
+    
+    /// How this conversation handles context exhaustion
+    context_exhaustion_behavior: ContextExhaustionBehavior,
+}
+
+enum ContextExhaustionBehavior {
+    ThresholdBasedContinuation,
+    IntentionallyUnhandled,
+}
 ```
 
 ## Implementation Notes
@@ -192,36 +229,153 @@ ALTER TYPE message_type ADD VALUE 'continuation';
 
 ## Acceptance Criteria
 
-- [ ] Threshold check after every LLM response
+### Core Flow
+- [ ] Threshold check after every LLM response (in transition function)
+- [ ] Check happens BEFORE entering ToolExecuting (tools are rejected, not cancelled)
 - [ ] Continuation prompt sent when threshold exceeded
 - [ ] Summary stored as continuation message type
 - [ ] State machine transitions to ContextExhausted
-- [ ] User messages rejected with clear error
-- [ ] UI shows exhausted state with summary
+- [ ] User messages rejected with clear error in ContextExhausted state
+
+### Failure Handling
+- [ ] If continuation LLM request fails, use fallback summary
+- [ ] Fallback still transitions to ContextExhausted (user not blocked)
+
+### Context Exhaustion Behavior Modes
+- [ ] Normal conversations use `ThresholdBasedContinuation`
+- [ ] Sub-agents use `IntentionallyUnhandled`
+- [ ] Sub-agents fail with `ErrorKind::ContextExhausted` instead of continuation flow
+- [ ] Parent receives sub-agent failure and can spawn replacement
+
+### UI
+- [ ] UI shows exhausted state with summary prominently
 - [ ] "Start New Conversation" button works
+- [ ] Optional: pre-populate new conversation with continuation summary
+- [ ] Warning indicator at 80% with manual trigger option
+
+### Model Support
 - [ ] Model-specific thresholds (128k vs 200k models)
-- [ ] Sub-agents handle their own context exhaustion independently
+- [ ] Unknown models default to smallest known limit (conservative)
 
 ## Design Decisions
 
-### Tool Chain Interruption
+### Context Check Timing: After LlmResponse Only
 
-If context threshold is exceeded mid-tool-chain, **cancel remaining tools** and trigger continuation. The existing cancellation machinery produces synthetic "cancelled" tool results that render cleanly to the LLM—no special handling needed beyond invoking the same cancel path.
+Context threshold is checked **after receiving `LlmResponse`**, before any tools execute. If threshold exceeded:
 
-This prevents tools from pushing context over the hard limit while maintaining message chain integrity.
+1. **Do NOT enter `ToolExecuting`** — skip the normal tool path entirely
+2. Persist the `LlmResponse` content as an agent message (preserves what LLM said)
+3. Emit `Effect::RequestContinuation` (tool-less LLM request)
+4. Transition to a new `AwaitingContinuation` state
 
-### Sub-Agent Context
+This means tools requested in that response are **rejected, not cancelled**. The LLM's tool_calls are acknowledged in the continuation summary ("I was about to run bash and patch, but context is full...").
 
-Sub-agents have **independent context budgets**. Each sub-agent tracks its own context usage against its own model's limit. If a sub-agent exhausts context:
-- It fails with a context exhaustion error (similar to other fatal errors)
-- Parent receives the failure as a sub-agent result
-- Parent's context is unaffected
+**Why this is simpler:**
+- No mid-execution interruption
+- No synthetic cancelled tool results
+- Clear decision point: we check once, at the response boundary
+- The continuation prompt can mention what was requested but not executed
 
-This is simpler than shared budgets and avoids race conditions.
+**Implementation location:** In `transition()`, the `(LlmRequesting, LlmResponse)` arm checks `usage` against threshold BEFORE the `if tool_calls.is_empty()` branch.
+
+### Context Exhaustion Behavior Enum
+
+Conversations have a `ContextExhaustionBehavior` that defines how they handle approaching context limits:
+
+```rust
+enum ContextExhaustionBehavior {
+    /// Normal conversations: trigger continuation at 90% threshold
+    ThresholdBasedContinuation,
+    /// Sub-agents: fail immediately on context exhaustion (no continuation flow)
+    IntentionallyUnhandled,
+}
+```
+
+**Normal conversations** (user-initiated) use `ThresholdBasedContinuation`:
+- At 90%: trigger continuation flow
+- Graceful summary, read-only state, "Start New" button
+
+**Sub-agents** use `IntentionallyUnhandled`:
+- No continuation flow — sub-agents shouldn't run long enough to exhaust context
+- If a sub-agent somehow hits 90%, it fails with `ErrorKind::ContextExhausted`
+- Parent receives failure as `SubAgentResult::Failure`
+- Parent can handle by spawning a fresh sub-agent with refined task
+
+This is stored in `ConvContext` and set at conversation creation time.
+
+### Continuation Request Failure Handling
+
+The continuation LLM request is a tool-less summary request. It can fail.
+
+**If continuation request fails (after standard retries):**
+1. Transition to `ContextExhausted` anyway
+2. Use a **fallback summary**: "Context limit reached. The continuation summary could not be generated. Please start a new conversation."
+3. Log the failure for debugging
+4. User still sees the "Start New Conversation" button
+
+**Rationale:** The conversation is unrecoverable regardless. A failed summary shouldn't block the user from moving on.
 
 ### State Persistence
 
 `ContextExhausted` is a persisted conversation state in the database. On server restart, conversations restore to their persisted state naturally—no special recovery logic needed.
+
+## Migration: Existing Conversations Near Threshold
+
+When this feature ships, existing conversations may already be at 80-95% context usage. Three options:
+
+### Option A: Check on Next LlmResponse Only (Recommended)
+
+**Behavior:** Existing conversations continue normally. Threshold check happens on the NEXT `LlmResponse` after upgrade.
+
+**Pros:**
+- Zero migration complexity
+- Natural flow — users finish what they're doing, hit threshold organically
+- No surprise state changes on startup
+
+**Cons:**
+- A conversation at 89% might get one more exchange before continuation triggers
+- Extremely full conversations (>95%) might fail on next request
+
+**Risk:** Low. The 90% threshold leaves buffer for one more exchange.
+
+---
+
+### Option B: Check All Active Conversations on Startup
+
+**Behavior:** On server start, scan all conversations. Any at ≥90% immediately transition to `ContextExhausted` with a generic summary.
+
+**Pros:**
+- Proactive — no risk of over-limit failures
+- Clean state across the board
+
+**Cons:**
+- Disruptive — users return to find conversations marked exhausted
+- Generic summary (can't call LLM during migration)
+- Migration logic that only runs once
+
+**Risk:** Medium. User confusion if conversation suddenly read-only.
+
+---
+
+### Option C: Retroactive Continuation on First Access
+
+**Behavior:** When user opens a conversation post-upgrade, check context. If ≥90%, trigger continuation flow before allowing interaction.
+
+**Pros:**
+- User sees the continuation happen (not magic state change)
+- Gets real LLM-generated summary
+- Lazy — only migrates accessed conversations
+
+**Cons:**
+- Blocks conversation loading with LLM request
+- Complex: need "migration pending" state
+- Race conditions if user sends message during migration
+
+**Risk:** High complexity for marginal benefit.
+
+---
+
+**Recommendation:** Option A. The 90% threshold provides sufficient buffer. Conversations at 85-89% get one more natural exchange. Conversations already over 95% are rare and will fail gracefully on next attempt (standard error handling applies).
 
 ## Related
 
