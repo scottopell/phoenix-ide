@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 priority: p1
 created: 2025-02-15
 ---
