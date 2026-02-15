@@ -138,11 +138,16 @@ pub(super) fn enrich_message_json(json: &mut Value) {
                 .and_then(|c| c.as_str())
                 .map(ToString::to_string);
 
-            if let Some(command) = command {
+            if let Some(ref command) = command {
                 // Add the display field with the cleaned command
-                let display = display_command(&command).to_string();
+                let display_str = display_command(command).to_string();
+                tracing::debug!(
+                    command = %command,
+                    display = %display_str,
+                    "bash display_command transformation"
+                );
                 if let Some(obj) = block.as_object_mut() {
-                    obj.insert("display".to_string(), Value::String(display));
+                    obj.insert("display".to_string(), Value::String(display_str));
                 }
             }
         }
