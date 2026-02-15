@@ -57,6 +57,15 @@ pub enum Effect {
         /// `tool_use_id` of `spawn_agents` call - used to update its `display_data`
         spawn_tool_id: Option<String>,
     },
+
+    /// Request continuation summary from LLM (no tools) - REQ-BED-020
+    RequestContinuation {
+        /// Tool calls that were requested but not executed
+        rejected_tool_calls: Vec<ToolCall>,
+    },
+
+    /// Notify client of context exhaustion - REQ-BED-021
+    NotifyContextExhausted { summary: String },
 }
 
 impl Effect {
@@ -149,6 +158,17 @@ impl Effect {
 
     pub fn execute_tool(tool: ToolCall) -> Self {
         Effect::ExecuteTool { tool }
+    }
+
+    /// Create a continuation message effect
+    pub fn persist_continuation_message(summary: impl Into<String>) -> Self {
+        let summary = summary.into();
+        Effect::PersistMessage {
+            content: MessageContent::continuation(summary.clone()),
+            display_data: Some(serde_json::json!({ "summary": summary })),
+            usage_data: None,
+            message_id: uuid::Uuid::new_v4().to_string(),
+        }
     }
 }
 

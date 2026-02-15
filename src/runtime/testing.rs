@@ -433,7 +433,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let llm = Arc::new(self.llm.unwrap_or_else(|| MockLlmClient::new("test-model")));
         let tools = Arc::new(self.tools.unwrap_or_else(MockToolExecutor::new));
 
-        let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model");
+        let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, broadcast_rx) = broadcast::channel(128);
 
@@ -720,7 +720,7 @@ mod tests {
         let tools = Arc::new(MockToolExecutor::new());
         let request_started = llm.request_started.clone();
 
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
 
@@ -835,7 +835,7 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
 
@@ -929,7 +929,7 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
 
@@ -1004,7 +1004,7 @@ mod tests {
         use crate::state_machine::{transition, Effect};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model");
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
 
         // State: executing tool with 2 more remaining
         let state = ConvState::ToolExecuting {
@@ -1090,7 +1090,8 @@ mod tests {
         use std::path::PathBuf;
 
         // Create sub-agent context
-        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
+        let context =
+            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
 
         // Start from LlmRequesting
         let state = ConvState::LlmRequesting { attempt: 1 };
@@ -1139,7 +1140,8 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Effect, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
+        let context =
+            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1186,7 +1188,8 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Effect, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
+        let context =
+            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
 
         // Can be in various states when cancelled
         let states = [
@@ -1229,7 +1232,8 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model");
+        let context =
+            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1276,7 +1280,7 @@ mod tests {
         use std::path::PathBuf;
 
         // Parent context (not sub-agent)
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model");
+        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1329,7 +1333,7 @@ mod tests {
 
         let tools = Arc::new(MockToolExecutor::new());
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model");
+        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
 
@@ -1407,7 +1411,7 @@ mod tests {
         ));
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model");
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
 

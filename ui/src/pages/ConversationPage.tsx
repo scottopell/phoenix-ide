@@ -28,6 +28,8 @@ export function ConversationPage() {
   const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [contextWindowUsed, setContextWindowUsed] = useState(0);
+  const [modelContextWindow, setModelContextWindow] = useState(200_000); // Default fallback
+  const [contextExhaustedSummary, setContextExhaustedSummary] = useState<string | null>(null);
 
   
   // File browser and prose reader state
@@ -132,6 +134,9 @@ export function ConversationPage() {
           if (initData.context_window_size !== undefined) {
             setContextWindowUsed(initData.context_window_size);
           }
+          if (initData.model_context_window !== undefined) {
+            setModelContextWindow(initData.model_context_window);
+          }
           // Set breadcrumbs from server (reconstructed from message history)
           if (initData.breadcrumbs && initData.breadcrumbs.length > 0) {
             setBreadcrumbs(initData.breadcrumbs.map(b => ({
@@ -193,8 +198,13 @@ export function ConversationPage() {
           void _stateType; // Used newState above instead
           setConvState(newState);
           setStateData(Object.keys(rest).length > 0 ? rest as ConversationState : null);
-          setAgentWorking(!['idle', 'error', 'completed', 'failed'].includes(newState));
+          setAgentWorking(!['idle', 'error', 'completed', 'failed', 'context_exhausted'].includes(newState));
           updateBreadcrumbsFromState(newState, rest as ConversationState);
+          
+          // Handle context exhaustion (REQ-BED-021)
+          if (newState === 'context_exhausted' && 'summary' in stateChangeData.state) {
+            setContextExhaustedSummary((stateChangeData.state as { summary?: string }).summary || null);
+          }
           break;
         }
 
@@ -388,6 +398,17 @@ export function ConversationPage() {
     }
   };
 
+  // Manual continuation trigger (REQ-BED-023)
+  const handleTriggerContinuation = async () => {
+    if (!conversationId || convState !== 'idle') return;
+
+    try {
+      await api.triggerContinuation(conversationId);
+    } catch (err) {
+      console.error('Failed to trigger continuation:', err);
+    }
+  };
+
   const handleOpenFileBrowser = useCallback(() => {
     setShowFileBrowser(true);
   }, []);
@@ -469,6 +490,26 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
         />
       )}
+      {convState === 'context_exhausted' && contextExhaustedSummary && (
+        <div className="context-exhausted-banner">
+          <div className="context-exhausted-header">
+            <span className="context-exhausted-icon">⚠️</span>
+            <span className="context-exhausted-title">Context Window Full</span>
+          </div>
+          <div className="context-exhausted-summary">
+            <p>This conversation has reached its context limit. Copy the summary below to continue in a new conversation:</p>
+            <pre className="context-exhausted-content">{contextExhaustedSummary}</pre>
+            <button 
+              className="context-exhausted-copy"
+              onClick={() => {
+                navigator.clipboard.writeText(contextExhaustedSummary);
+              }}
+            >
+              Copy Summary
+            </button>
+          </div>
+        </div>
+      )}
       <InputArea
         draft={draft}
         setDraft={setDraft}
@@ -496,7 +537,9 @@ export function ConversationPage() {
         connectionAttempt={connectionInfo.attempt}
         nextRetryIn={connectionInfo.nextRetryIn}
         contextWindowUsed={contextWindowUsed}
+        modelContextWindow={modelContextWindow}
         onRetryNow={connectionInfo.retryNow}
+        onTriggerContinuation={handleTriggerContinuation}
       />
 
       <FileBrowser

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 // ============================================================================
 
 fn test_context() -> ConvContext {
-    ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model")
+    ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
 }
 
 // ============================================================================

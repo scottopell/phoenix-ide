@@ -80,7 +80,10 @@ pub enum SseEvent {
         messages: Vec<serde_json::Value>,
         agent_working: bool,
         last_sequence_id: i64,
+        /// Current context window usage in tokens
         context_window_size: u64,
+        /// Model's maximum context window in tokens (for calculating percentage)
+        model_context_window: usize,
         breadcrumbs: Vec<serde_json::Value>,
     },
     Message {
@@ -221,7 +224,13 @@ impl RuntimeManager {
         }
 
         // 3. Create sub-agent context
-        let conv_context = ConvContext::sub_agent(&conv.id, PathBuf::from(&conv.cwd), &model_id);
+        let context_window = self.llm_registry.context_window(&model_id);
+        let conv_context = ConvContext::sub_agent(
+            &conv.id,
+            PathBuf::from(&conv.cwd),
+            &model_id,
+            context_window,
+        );
 
         // 4. Create channels for the sub-agent runtime
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -348,24 +357,17 @@ impl RuntimeManager {
 
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
         let is_sub_agent = conv.parent_conversation_id.is_some();
+        let model_id = conv
+            .model
+            .as_deref()
+            .unwrap_or(self.llm_registry.default_model_id());
+        let context_window = self.llm_registry.context_window(model_id);
         let context = if is_sub_agent {
             // Sub-agent being resumed - we don't have the original task
             // This is an edge case that shouldn't happen in normal operation
-            ConvContext::sub_agent(
-                &conv.id,
-                PathBuf::from(&conv.cwd),
-                conv.model
-                    .as_deref()
-                    .unwrap_or(self.llm_registry.default_model_id()),
-            )
+            ConvContext::sub_agent(&conv.id, PathBuf::from(&conv.cwd), model_id, context_window)
         } else {
-            ConvContext::new(
-                &conv.id,
-                PathBuf::from(&conv.cwd),
-                conv.model
-                    .as_deref()
-                    .unwrap_or(self.llm_registry.default_model_id()),
-            )
+            ConvContext::new(&conv.id, PathBuf::from(&conv.cwd), model_id, context_window)
         };
 
         let (event_tx, event_rx) = mpsc::channel(32);

@@ -706,6 +706,25 @@ where
 
                 Ok(None)
             }
+
+            Effect::RequestContinuation {
+                rejected_tool_calls,
+            } => {
+                // REQ-BED-020: Request continuation summary (tool-less LLM request)
+                self.request_continuation(rejected_tool_calls);
+                Ok(None)
+            }
+
+            Effect::NotifyContextExhausted { summary } => {
+                // REQ-BED-021: Notify client of context exhaustion
+                let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                    state: serde_json::json!({
+                        "type": "context_exhausted",
+                        "summary": summary
+                    }),
+                });
+                Ok(None)
+            }
         }
     }
 
@@ -763,13 +782,126 @@ where
                     });
                 }
 
-                // Ignore system and error messages
-                MessageContent::System(_) | MessageContent::Error(_) => {}
+                // Ignore system, error, and continuation messages
+                MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_) => {}
             }
         }
 
         Ok(messages)
     }
+
+    /// Request continuation summary from LLM (REQ-BED-020)
+    #[allow(clippy::needless_pass_by_value)] // Consistent with Effect signature
+    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>) {
+        let llm_client = Arc::clone(&self.llm_client);
+        let storage = self.storage.clone();
+        let event_tx = self.event_tx.clone();
+        let conv_id = self.context.conversation_id.clone();
+
+        // Build continuation prompt
+        let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
+
+        // Create cancellation token for the continuation request
+        let cancel_token = CancellationToken::new();
+        self.llm_cancel_token = Some(cancel_token.clone());
+
+        tokio::spawn(async move {
+            // Build messages from history and add continuation request
+            let mut messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to build messages for continuation");
+                    let _ = event_tx.send(Event::ContinuationFailed { error: e }).await;
+                    return;
+                }
+            };
+
+            // Add the continuation request as a user message
+            messages.push(LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(&continuation_prompt)],
+            });
+
+            // Build a tool-less request
+            let request = LlmRequest {
+                messages,
+                system: vec![SystemContent::new(
+                    "You are wrapping up a conversation that has reached its context limit. \
+                    Provide a concise summary to help continue in a new conversation.",
+                )],
+                tools: vec![],          // No tools for continuation
+                max_tokens: Some(2000), // Limit summary length
+            };
+
+            // Make the request
+            let result: Result<crate::llm::LlmResponse, crate::llm::LlmError> = tokio::select! {
+                result = llm_client.complete(&request) => result,
+                () = cancel_token.cancelled() => {
+                    tracing::info!("Continuation request cancelled");
+                    let _ = event_tx.send(Event::ContinuationFailed {
+                        error: "Cancelled by user".to_string(),
+                    }).await;
+                    return;
+                }
+            };
+
+            match result {
+                Ok(response) => {
+                    // Extract the text content as summary
+                    let summary = response
+                        .content
+                        .iter()
+                        .filter_map(|block| {
+                            if let ContentBlock::Text { text } = block {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let _ = event_tx.send(Event::ContinuationResponse { summary }).await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Continuation LLM request failed");
+                    let _ = event_tx
+                        .send(Event::ContinuationFailed {
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// Build the continuation prompt (REQ-BED-020)
+fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
+    let mut prompt = String::from(
+        "The conversation context is nearly full. Please provide a brief continuation summary \
+        that could seed a new conversation.\n\n\
+        Include:\n\
+        1. Current task status and progress\n\
+        2. Key files, concepts, or decisions discussed\n\
+        3. Suggested next steps to continue the work\n\n\
+        Keep your response concise and actionable.",
+    );
+
+    if !rejected_tool_calls.is_empty() {
+        use std::fmt::Write;
+        prompt.push_str(
+            "\n\nNote: The following tool calls were requested but not executed due to context limits:\n",
+        );
+        for tool in rejected_tool_calls {
+            let _ = writeln!(prompt, "- {}", tool.name());
+        }
+        prompt.push_str("Include these pending actions in your summary.");
+    }
+
+    prompt
 }
 
 fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind {

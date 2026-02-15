@@ -124,6 +124,8 @@ pub enum ErrorKind {
     Cancelled,
     /// Sub-agent failed - not retryable
     SubAgentError,
+    /// Context window exhausted - not retryable
+    ContextExhausted,
     /// Unknown error - not retryable (conservative default)
     Unknown,
 }
@@ -276,6 +278,12 @@ pub struct ErrorContent {
     pub message: String,
 }
 
+/// Continuation summary content (REQ-BED-021)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContinuationContent {
+    pub summary: String,
+}
+
 /// Typed message content
 ///
 /// This enum provides type safety for message content while maintaining
@@ -288,6 +296,7 @@ pub enum MessageContent {
     Tool(ToolContent),
     System(SystemContent),
     Error(ErrorContent),
+    Continuation(ContinuationContent),
 }
 
 impl MessageContent {
@@ -299,6 +308,7 @@ impl MessageContent {
             Self::Tool(_) => MessageType::Tool,
             Self::System(_) => MessageType::System,
             Self::Error(_) => MessageType::Error,
+            Self::Continuation(_) => MessageType::Continuation,
         }
     }
 
@@ -310,6 +320,7 @@ impl MessageContent {
             Self::Tool(c) => serde_json::to_value(c).unwrap_or(Value::Null),
             Self::System(c) => serde_json::to_value(c).unwrap_or(Value::Null),
             Self::Error(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+            Self::Continuation(c) => serde_json::to_value(c).unwrap_or(Value::Null),
         }
     }
 
@@ -331,6 +342,9 @@ impl MessageContent {
             MessageType::Error => serde_json::from_value(value)
                 .map(Self::Error)
                 .map_err(|e| format!("Invalid error content: {e}")),
+            MessageType::Continuation => serde_json::from_value(value)
+                .map(Self::Continuation)
+                .map_err(|e| format!("Invalid continuation content: {e}")),
         }
     }
 
@@ -371,6 +385,13 @@ impl MessageContent {
             message: message.into(),
         })
     }
+
+    /// Create continuation summary content
+    pub fn continuation(summary: impl Into<String>) -> Self {
+        Self::Continuation(ContinuationContent {
+            summary: summary.into(),
+        })
+    }
 }
 
 // Custom Serialize for MessageContent - just serializes the inner value
@@ -385,6 +406,7 @@ impl Serialize for MessageContent {
             Self::Tool(c) => c.serialize(serializer),
             Self::System(c) => c.serialize(serializer),
             Self::Error(c) => c.serialize(serializer),
+            Self::Continuation(c) => c.serialize(serializer),
         }
     }
 }
@@ -412,6 +434,7 @@ pub enum MessageType {
     Tool,
     System,
     Error,
+    Continuation,
 }
 
 impl fmt::Display for MessageType {
@@ -422,6 +445,7 @@ impl fmt::Display for MessageType {
             MessageType::Tool => write!(f, "tool"),
             MessageType::System => write!(f, "system"),
             MessageType::Error => write!(f, "error"),
+            MessageType::Continuation => write!(f, "continuation"),
         }
     }
 }
@@ -486,6 +510,10 @@ mod error_kind_tests {
         );
         assert!(
             !ErrorKind::SubAgentError.is_retryable(),
+            "Sub-agent errors should not be retryable"
+        );
+        assert!(
+            !ErrorKind::ContextExhausted.is_retryable(),
             "SubAgent errors should not be retryable"
         );
         assert!(

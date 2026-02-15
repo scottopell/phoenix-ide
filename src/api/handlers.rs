@@ -63,6 +63,10 @@ pub fn create_router(state: AppState) -> Router {
         // User actions (REQ-API-004)
         .route("/api/conversations/:id/chat", post(send_chat))
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
+        .route(
+            "/api/conversations/:id/trigger-continuation",
+            post(trigger_continuation),
+        )
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -641,6 +645,13 @@ async fn stream_conversation(
         .await
         .map_err(AppError::Internal)?;
 
+    // Get model's context window for percentage calculation
+    let model_id = conversation
+        .model
+        .as_deref()
+        .unwrap_or(state.llm_registry.default_model_id());
+    let model_context_window = state.llm_registry.context_window(model_id);
+
     // Create init event
     // Note: messages are enriched with display info above via enrich_message_for_api
     // which handles backwards compatibility for older messages without display field
@@ -650,6 +661,7 @@ async fn stream_conversation(
         agent_working: conversation.is_agent_working(),
         last_sequence_id,
         context_window_size,
+        model_context_window,
         breadcrumbs: json_breadcrumbs,
     };
 
@@ -713,6 +725,20 @@ async fn cancel_conversation(
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(CancelResponse { ok: true }))
+}
+
+/// Manually trigger context continuation (REQ-BED-023)
+async fn trigger_continuation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    state
+        .runtime
+        .send_event(&id, Event::UserTriggerContinuation)
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 // ============================================================

@@ -169,6 +169,19 @@ impl ModelRegistry {
         &self.default_model
     }
 
+    /// Get the context window size for a model (REQ-BED-022)
+    #[allow(clippy::unused_self)] // Instance method for API consistency
+    pub fn context_window(&self, model_id: &str) -> usize {
+        // Look up in the static model definitions
+        for model_def in super::all_models() {
+            if model_def.id == model_id {
+                return model_def.context_window;
+            }
+        }
+        // Default to smallest known limit for unknown models
+        crate::state_machine::state::DEFAULT_CONTEXT_WINDOW
+    }
+
     /// List all available model IDs
     pub fn available_models(&self) -> Vec<String> {
         let mut models: Vec<_> = self.services.keys().cloned().collect();

@@ -63,4 +63,16 @@ pub enum Event {
         agent_id: String,
         outcome: SubAgentOutcome,
     },
+
+    // Context continuation events (REQ-BED-019 through REQ-BED-024)
+    /// Continuation summary received from LLM
+    ContinuationResponse {
+        summary: String,
+    },
+    /// Continuation request failed after retries
+    ContinuationFailed {
+        error: String,
+    },
+    /// User manually triggered continuation (REQ-BED-023)
+    UserTriggerContinuation,
 }

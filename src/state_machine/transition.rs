@@ -7,7 +7,7 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::state::{PendingSubAgent, SubAgentResult};
+use super::state::{ContextExhaustionBehavior, PendingSubAgent, SubAgentResult, ToolCall};
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
@@ -51,6 +51,8 @@ pub enum TransitionError {
     AgentBusy,
     #[error("Cancellation in progress")]
     CancellationInProgress,
+    #[error("Context window exhausted, please start a new conversation")]
+    ContextExhausted,
     #[error("Invalid transition: {0}")]
     InvalidTransition(String),
 }
@@ -121,6 +123,13 @@ pub fn transition(
             },
         ) => {
             let usage_data = usage_to_data(&usage);
+
+            // REQ-BED-019: Check context threshold BEFORE tool execution
+            if should_trigger_continuation(&usage_data, context.context_window) {
+                return Ok(handle_context_exhaustion(
+                    context, content, tool_calls, usage_data,
+                ));
+            }
 
             if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
@@ -784,6 +793,140 @@ pub fn transition(
         }
 
         // ============================================================
+        // Context Continuation (REQ-BED-019 through REQ-BED-024)
+        // ============================================================
+
+        // ContinuationResponse -> ContextExhausted
+        (ConvState::AwaitingContinuation { .. }, Event::ContinuationResponse { summary }) => {
+            Ok(TransitionResult::new(ConvState::ContextExhausted {
+                summary: summary.clone(),
+            })
+            .with_effect(Effect::persist_continuation_message(&summary))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyContextExhausted { summary }))
+        }
+
+        // ContinuationFailed -> ContextExhausted with fallback summary
+        (ConvState::AwaitingContinuation { .. }, Event::ContinuationFailed { error }) => {
+            let fallback = format!(
+                "Context limit reached. The continuation summary could not be generated: {error}. \
+                Please start a new conversation."
+            );
+            Ok(TransitionResult::new(ConvState::ContextExhausted {
+                summary: fallback.clone(),
+            })
+            .with_effect(Effect::persist_continuation_message(&fallback))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
+        }
+
+        // UserCancel during continuation -> ContextExhausted with cancelled message
+        (ConvState::AwaitingContinuation { .. }, Event::UserCancel) => {
+            let cancelled =
+                "Continuation cancelled by user. Please start a new conversation.".to_string();
+            Ok(TransitionResult::new(ConvState::ContextExhausted {
+                summary: cancelled.clone(),
+            })
+            .with_effect(Effect::persist_continuation_message(&cancelled))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyContextExhausted { summary: cancelled }))
+        }
+
+        // LlmError during continuation - retry or fail
+        (
+            ConvState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            },
+            Event::LlmError {
+                message: _,
+                error_kind,
+                ..
+            },
+        ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
+            let new_attempt = attempt + 1;
+            let delay = retry_delay(new_attempt);
+
+            Ok(TransitionResult::new(ConvState::AwaitingContinuation {
+                rejected_tool_calls: rejected_tool_calls.clone(),
+                attempt: new_attempt,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::ScheduleRetry {
+                delay,
+                attempt: new_attempt,
+            })
+            .with_effect(Effect::notify_state_change(
+                "awaiting_continuation",
+                json!({
+                    "attempt": new_attempt,
+                    "max_attempts": MAX_RETRY_ATTEMPTS,
+                    "message": format!("Retrying continuation... (attempt {new_attempt})")
+                }),
+            )))
+        }
+
+        // LlmError during continuation - retries exhausted
+        (ConvState::AwaitingContinuation { .. }, Event::LlmError { message, .. }) => {
+            let fallback = format!(
+                "Context limit reached. The continuation summary could not be generated: {message}. \
+                Please start a new conversation."
+            );
+            Ok(TransitionResult::new(ConvState::ContextExhausted {
+                summary: fallback.clone(),
+            })
+            .with_effect(Effect::persist_continuation_message(&fallback))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
+        }
+
+        // RetryTimeout during continuation - retry the request
+        (
+            ConvState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            },
+            Event::RetryTimeout {
+                attempt: timeout_attempt,
+            },
+        ) if *attempt == timeout_attempt => {
+            Ok(TransitionResult::new(ConvState::AwaitingContinuation {
+                rejected_tool_calls: rejected_tool_calls.clone(),
+                attempt: *attempt,
+            })
+            .with_effect(Effect::RequestContinuation {
+                rejected_tool_calls: rejected_tool_calls.clone(),
+            }))
+        }
+
+        // ContextExhausted rejects user messages (REQ-BED-021)
+        (ConvState::ContextExhausted { .. }, Event::UserMessage { .. }) => {
+            Err(TransitionError::ContextExhausted)
+        }
+
+        // ContextExhausted is terminal - ignore other events
+        (state @ ConvState::ContextExhausted { .. }, _event) => {
+            // Log but don't error - terminal states ignore events
+            Ok(TransitionResult::new(state.clone()))
+        }
+
+        // UserTriggerContinuation from Idle (REQ-BED-023)
+        (ConvState::Idle, Event::UserTriggerContinuation) => {
+            Ok(TransitionResult::new(ConvState::AwaitingContinuation {
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change(
+                "awaiting_continuation",
+                json!({ "manual_trigger": true }),
+            ))
+            .with_effect(Effect::RequestContinuation {
+                rejected_tool_calls: vec![],
+            }))
+        }
+
+        // ============================================================
         // Invalid Transitions
         // ============================================================
         (state, event) => Err(TransitionError::InvalidTransition(format!(
@@ -823,6 +966,75 @@ fn usage_to_data(usage: &crate::llm::Usage) -> UsageData {
         output_tokens: usage.output_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
+    }
+}
+
+/// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
+const CONTINUATION_THRESHOLD: f64 = 0.90;
+
+/// Check if context usage has exceeded the continuation threshold (REQ-BED-019)
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
+    let used = usage.context_window_used();
+    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
+    used >= threshold
+}
+
+/// Handle context exhaustion based on conversation type (REQ-BED-019, REQ-BED-024)
+fn handle_context_exhaustion(
+    ctx: &ConvContext,
+    blocks: Vec<crate::llm::ContentBlock>,
+    tool_calls: Vec<ToolCall>,
+    usage_data: UsageData,
+) -> TransitionResult {
+    use crate::state_machine::state::SubAgentOutcome;
+
+    match ctx.context_exhaustion_behavior {
+        ContextExhaustionBehavior::ThresholdBasedContinuation => {
+            // Normal conversation: trigger continuation flow
+            TransitionResult::new(ConvState::AwaitingContinuation {
+                rejected_tool_calls: tool_calls.clone(),
+                attempt: 1,
+            })
+            .with_effect(Effect::persist_agent_message(
+                blocks,
+                Some(usage_data),
+                &ctx.working_dir,
+            ))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change(
+                "awaiting_continuation",
+                json!({
+                    "rejected_tools": tool_calls.iter().map(ToolCall::name).collect::<Vec<_>>()
+                }),
+            ))
+            .with_effect(Effect::RequestContinuation {
+                rejected_tool_calls: tool_calls,
+            })
+        }
+        ContextExhaustionBehavior::IntentionallyUnhandled => {
+            // REQ-BED-024: Sub-agent fails immediately
+            TransitionResult::new(ConvState::Failed {
+                error: "Context window exhausted before result submission".to_string(),
+                error_kind: ErrorKind::ContextExhausted,
+            })
+            .with_effect(Effect::persist_agent_message(
+                blocks,
+                Some(usage_data),
+                &ctx.working_dir,
+            ))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyParent {
+                outcome: SubAgentOutcome::Failure {
+                    error: "Context window exhausted before result submission".to_string(),
+                    error_kind: ErrorKind::ContextExhausted,
+                },
+            })
+        }
     }
 }
 
@@ -893,7 +1105,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model")
+        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
     }
 
     #[test]

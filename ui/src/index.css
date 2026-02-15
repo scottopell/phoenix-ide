@@ -1942,6 +1942,7 @@ pre:hover .copy-btn {
   align-items: center;
   gap: 6px;
   cursor: help;
+  position: relative;
 }
 
 .context-bar {
@@ -1979,6 +1980,124 @@ pre:hover .copy-btn {
 
 .context-indicator.critical .context-label {
   color: var(--accent-red);
+}
+
+/* Context indicator menu (REQ-BED-023) */
+.context-bar-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.context-menu-indicator {
+  font-size: 8px;
+  color: var(--text-muted);
+  margin-left: 2px;
+}
+
+.context-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 1000;
+  min-width: 200px;
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  text-align: left;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.context-menu-item:hover {
+  background: var(--bg-primary);
+}
+
+.context-menu-hint {
+  padding: 6px 12px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-color);
+}
+
+/* Context exhausted banner (REQ-BED-021) */
+.context-exhausted-banner {
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent-yellow);
+  border-radius: 8px;
+  margin: 16px;
+  overflow: hidden;
+}
+
+.context-exhausted-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: rgba(var(--accent-yellow-rgb, 234, 179, 8), 0.1);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.context-exhausted-icon {
+  font-size: 18px;
+}
+
+.context-exhausted-title {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.context-exhausted-summary {
+  padding: 16px;
+}
+
+.context-exhausted-summary p {
+  margin: 0 0 12px 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.context-exhausted-content {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  color: var(--text-primary);
+}
+
+.context-exhausted-copy {
+  padding: 8px 16px;
+  background: var(--accent-blue);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.context-exhausted-copy:hover {
+  background: var(--accent-blue-hover, #2563eb);
 }
 
 /* Directory Picker */

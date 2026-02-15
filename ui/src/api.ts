@@ -106,7 +106,10 @@ export interface SseInitData {
   messages: Message[];
   agent_working: boolean;
   last_sequence_id: number;
+  /** Current context window usage in tokens */
   context_window_size?: number;
+  /** Model's maximum context window in tokens */
+  model_context_window?: number;
   breadcrumbs?: SseBreadcrumb[];
 }
 
@@ -213,6 +216,15 @@ export const api = {
       method: 'POST',
     });
     if (!resp.ok) throw new Error('Failed to cancel');
+    return resp.json();
+  },
+
+  /** Manually trigger context continuation (REQ-BED-023) */
+  async triggerContinuation(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/trigger-continuation`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to trigger continuation');
     return resp.json();
   },
 

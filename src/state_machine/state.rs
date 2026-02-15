@@ -301,6 +301,20 @@ pub enum ConvState {
         message: String,
         error_kind: ErrorKind,
     },
+
+    /// Awaiting continuation summary from LLM (tool-less request in flight)
+    AwaitingContinuation {
+        /// Tool calls that were requested but not executed
+        rejected_tool_calls: Vec<ToolCall>,
+        /// Retry attempt for the continuation request
+        attempt: u32,
+    },
+
+    /// Context window exhausted - conversation is read-only
+    ContextExhausted {
+        /// The continuation summary
+        summary: String,
+    },
 }
 
 impl ConvState {
@@ -357,6 +371,16 @@ pub struct SubAgentSpec {
     pub timeout: Option<Duration>,
 }
 
+/// How a conversation handles approaching context limits
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextExhaustionBehavior {
+    /// Normal conversations: trigger continuation at 90% threshold
+    #[default]
+    ThresholdBasedContinuation,
+    /// Sub-agents: fail immediately (no continuation flow)
+    IntentionallyUnhandled,
+}
+
 /// Context for a conversation (immutable configuration)
 #[derive(Debug, Clone)]
 pub struct ConvContext {
@@ -366,19 +390,29 @@ pub struct ConvContext {
     pub model_id: String,
     /// Whether this is a sub-agent conversation
     pub is_sub_agent: bool,
+    /// Model's context window size in tokens
+    pub context_window: usize,
+    /// How this conversation handles context exhaustion
+    pub context_exhaustion_behavior: ContextExhaustionBehavior,
 }
+
+/// Default context window for unknown models (conservative)
+pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
 impl ConvContext {
     pub fn new(
         conversation_id: impl Into<String>,
         working_dir: PathBuf,
         model_id: impl Into<String>,
+        context_window: usize,
     ) -> Self {
         Self {
             conversation_id: conversation_id.into(),
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: false,
+            context_window,
+            context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
         }
     }
 
@@ -387,12 +421,15 @@ impl ConvContext {
         conversation_id: impl Into<String>,
         working_dir: PathBuf,
         model_id: impl Into<String>,
+        context_window: usize,
     ) -> Self {
         Self {
             conversation_id: conversation_id.into(),
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: true,
+            context_window,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
         }
     }
 }

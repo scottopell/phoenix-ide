@@ -1,10 +1,12 @@
+import { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import type { Conversation, ConversationState } from '../api';
 import type { ConnectionState } from '../hooks';
 import { getStateDescription } from '../utils';
 
-// Claude models all have 200k context window
-const MAX_CONTEXT_TOKENS = 200_000;
+// Thresholds (match backend constants)
+const WARNING_THRESHOLD = 0.80;
+const CONTINUATION_THRESHOLD = 0.90;
 
 interface StateBarProps {
   conversation: Conversation | null;
@@ -14,7 +16,11 @@ interface StateBarProps {
   connectionAttempt: number;
   nextRetryIn: number | null;
   contextWindowUsed: number;
+  /** Model's maximum context window in tokens */
+  modelContextWindow: number;
   onRetryNow?: () => void;
+  /** Callback to manually trigger continuation */
+  onTriggerContinuation?: () => void;
 }
 
 export function StateBar({
@@ -25,8 +31,25 @@ export function StateBar({
   connectionAttempt,
   nextRetryIn,
   contextWindowUsed,
+  modelContextWindow,
   onRetryNow,
+  onTriggerContinuation,
 }: StateBarProps) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [menuOpen]);
+
   let dotClass = 'dot';
   let stateText = '';
 
@@ -68,8 +91,13 @@ export function StateBar({
           stateText = 'ready';
         } else if (convState === 'error') {
           dotClass += ' error';
-          // Just show 'error' - full message is in the ErrorBanner
           stateText = 'error';
+        } else if (convState === 'context_exhausted') {
+          dotClass += ' error';
+          stateText = 'context full';
+        } else if (convState === 'awaiting_continuation') {
+          dotClass += ' working';
+          stateText = 'summarizing...';
         } else {
           dotClass += ' working';
           stateText = getStateDescription(convState, stateData);
@@ -84,10 +112,11 @@ export function StateBar({
 
   const showOfflineBanner = connectionState === 'offline' && nextRetryIn !== null;
 
-  // Context window indicator
-  const contextPercent = Math.min((contextWindowUsed / MAX_CONTEXT_TOKENS) * 100, 100);
-  const contextWarning = contextPercent >= 80;
-  const contextCritical = contextPercent >= 95;
+  // Context window indicator - use model-specific limit
+  const maxTokens = modelContextWindow || 200_000; // Fallback for legacy
+  const contextPercent = Math.min((contextWindowUsed / maxTokens) * 100, 100);
+  const contextWarning = contextPercent / 100 >= WARNING_THRESHOLD;
+  const contextCritical = contextPercent / 100 >= CONTINUATION_THRESHOLD;
 
   let contextClass = 'context-indicator';
   if (contextCritical) {
@@ -103,13 +132,21 @@ export function StateBar({
     return n.toString();
   };
 
-  const tooltipText = `${formatTokens(contextWindowUsed)} / ${formatTokens(MAX_CONTEXT_TOKENS)} tokens (${contextPercent.toFixed(1)}%)`;
+  const tooltipText = `${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%)`;
 
   // Format cwd for display - show last 2 path components
   const formatCwd = (cwd: string): string => {
     const parts = cwd.split('/').filter(Boolean);
     if (parts.length <= 2) return cwd;
     return '.../' + parts.slice(-2).join('/');
+  };
+
+  // Show menu trigger only when warning threshold reached and in idle state
+  const canTriggerContinuation = contextWarning && convState === 'idle' && onTriggerContinuation;
+
+  const handleTriggerContinuation = () => {
+    setMenuOpen(false);
+    onTriggerContinuation?.();
   };
 
   return (
@@ -142,14 +179,40 @@ export function StateBar({
             <span id="state-text">{stateText}</span>
           </div>
           {conversation && contextWindowUsed > 0 && (
-            <div className={contextClass} title={tooltipText}>
-              <div className="context-bar">
-                <div 
-                  className="context-fill" 
-                  style={{ width: `${contextPercent}%` }}
-                />
+            <div 
+              className={contextClass} 
+              title={tooltipText}
+              ref={menuRef}
+            >
+              <div 
+                className="context-bar-wrapper"
+                onClick={() => canTriggerContinuation && setMenuOpen(!menuOpen)}
+                style={{ cursor: canTriggerContinuation ? 'pointer' : 'default' }}
+              >
+                <div className="context-bar">
+                  <div 
+                    className="context-fill" 
+                    style={{ width: `${contextPercent}%` }}
+                  />
+                </div>
+                <span className="context-label">{formatTokens(contextWindowUsed)}</span>
+                {canTriggerContinuation && (
+                  <span className="context-menu-indicator">▼</span>
+                )}
               </div>
-              <span className="context-label">{formatTokens(contextWindowUsed)}</span>
+              {menuOpen && canTriggerContinuation && (
+                <div className="context-menu">
+                  <button 
+                    className="context-menu-item"
+                    onClick={handleTriggerContinuation}
+                  >
+                    End & summarize conversation
+                  </button>
+                  <div className="context-menu-hint">
+                    Creates a summary to continue in a new conversation
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

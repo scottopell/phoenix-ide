@@ -41,6 +41,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             agent_working,
             last_sequence_id,
             context_window_size,
+            model_context_window,
             breadcrumbs,
         } => {
             // Messages are already enriched with display info at creation time
@@ -53,6 +54,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                     "agent_working": agent_working,
                     "last_sequence_id": last_sequence_id,
                     "context_window_size": context_window_size,
+                    "model_context_window": model_context_window,
                     "breadcrumbs": breadcrumbs
                 }),
             )
