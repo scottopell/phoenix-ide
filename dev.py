@@ -254,6 +254,9 @@ def start_phoenix(port: int, release: bool = True):
     env["LLM_GATEWAY"] = get_llm_gateway()
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
+    # Default to debug logging in dev, can be overridden via RUST_LOG env var
+    if "RUST_LOG" not in env:
+        env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
 
     with open(LOG_FILE, "w") as log:
         proc = subprocess.Popen(

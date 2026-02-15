@@ -125,7 +125,11 @@ pub fn transition(
             if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
                 Ok(TransitionResult::new(ConvState::Idle)
-                    .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                    .with_effect(Effect::persist_agent_message(
+                        content,
+                        Some(usage_data),
+                        &context.working_dir,
+                    ))
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_agent_done()))
             } else if context.is_sub_agent {
@@ -148,7 +152,11 @@ pub fn transition(
                             Ok(TransitionResult::new(ConvState::Completed {
                                 result: input.result.clone(),
                             })
-                            .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                            .with_effect(Effect::persist_agent_message(
+                                content,
+                                Some(usage_data),
+                                &context.working_dir,
+                            ))
                             .with_effect(Effect::PersistState)
                             .with_effect(Effect::NotifyParent {
                                 outcome: SubAgentOutcome::Success {
@@ -162,7 +170,11 @@ pub fn transition(
                                 error: input.error.clone(),
                                 error_kind: ErrorKind::SubAgentError,
                             })
-                            .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                            .with_effect(Effect::persist_agent_message(
+                                content,
+                                Some(usage_data),
+                                &context.working_dir,
+                            ))
                             .with_effect(Effect::PersistState)
                             .with_effect(Effect::NotifyParent {
                                 outcome: SubAgentOutcome::Failure {
@@ -185,7 +197,11 @@ pub fn transition(
                         persisted_tool_ids: HashSet::new(),
                         pending_sub_agents: vec![],
                     })
-                    .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                    .with_effect(Effect::persist_agent_message(
+                        content,
+                        Some(usage_data),
+                        &context.working_dir,
+                    ))
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_tool_executing(
                         first.name(),
@@ -207,7 +223,11 @@ pub fn transition(
                     persisted_tool_ids: HashSet::new(),
                     pending_sub_agents: vec![],
                 })
-                .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
+                .with_effect(Effect::persist_agent_message(
+                    content,
+                    Some(usage_data),
+                    &context.working_dir,
+                ))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_tool_executing(
                     first.name(),

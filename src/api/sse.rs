@@ -2,7 +2,6 @@
 //!
 //! REQ-API-005: Real-time Streaming
 
-use super::handlers::enrich_message_json;
 use crate::runtime::SseEvent;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
@@ -44,20 +43,13 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             context_window_size,
             breadcrumbs,
         } => {
-            // Enrich all messages with bash display info
-            let enriched_messages: Vec<_> = messages
-                .into_iter()
-                .map(|mut m| {
-                    enrich_message_json(&mut m);
-                    m
-                })
-                .collect();
+            // Messages are already enriched with display info at creation time
             (
                 "init",
                 json!({
                     "type": "init",
                     "conversation": conversation,
-                    "messages": enriched_messages,
+                    "messages": messages,
                     "agent_working": agent_working,
                     "last_sequence_id": last_sequence_id,
                     "context_window_size": context_window_size,
@@ -66,14 +58,12 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             )
         }
         SseEvent::Message { message } => {
-            // Enrich single message with bash display info
-            let mut enriched = message;
-            enrich_message_json(&mut enriched);
+            // Message is already enriched with display info at creation time
             (
                 "message",
                 json!({
                     "type": "message",
-                    "message": enriched
+                    "message": message
                 }),
             )
         }

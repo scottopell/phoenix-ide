@@ -16,7 +16,7 @@ use crate::db::{ImageData, Message, MessageContent, MessageType};
 use crate::llm::ContentBlock;
 use crate::runtime::SseEvent;
 use crate::state_machine::Event;
-use crate::tools::bash_check::display_command;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -97,57 +97,64 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Transform a message for API output, enriching bash `tool_use` blocks with display info.
 ///
-/// For bash commands like `cd /path && cargo test`, the LLM emits the full command,
-/// but for UI display we want to show just `cargo test`. This adds a `display` field
-/// to bash `tool_use` blocks with the cleaned-up command.
+/// Transform a message for API output by merging `display_data` into content blocks.
+///
+/// For agent messages with bash `tool_use` blocks, the `display` field shows a
+/// simplified command (with cd prefixes stripped when they match cwd).
+/// The `display_data` is pre-computed at message creation time and stored in DB.
 fn enrich_message_for_api(msg: &Message) -> Value {
     let mut json = serde_json::to_value(msg).unwrap_or(Value::Null);
 
-    // Only process agent messages (which contain tool_use blocks)
+    // Only process agent messages with display_data
     if msg.message_type != MessageType::Agent {
         return json;
     }
 
-    enrich_message_json(&mut json);
+    if let Some(display_data) = &msg.display_data {
+        merge_display_data_into_content(&mut json, display_data);
+    }
+
     json
 }
 
-/// Enrich an already-serialized message JSON with bash display info.
-/// Used for SSE streaming where messages come pre-serialized.
-pub(super) fn enrich_message_json(json: &mut Value) {
-    // Only process if this looks like an agent message
-    if json.get("message_type").and_then(|t| t.as_str()) != Some("agent") {
+/// Merge pre-computed `display_data` into content blocks.
+///
+/// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
+fn merge_display_data_into_content(json: &mut Value, display_data: &Value) {
+    // Build a map from tool_use_id -> display
+    let bash_displays: std::collections::HashMap<String, String> = display_data
+        .get("bash")
+        .and_then(|b| b.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let id = item.get("tool_use_id")?.as_str()?;
+                    let display = item.get("display")?.as_str()?;
+                    Some((id.to_string(), display.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if bash_displays.is_empty() {
         return;
     }
 
-    // Get mutable access to the content array
+    // Merge into content blocks
     if let Some(content) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
         for block in content.iter_mut() {
-            // Check if this is a bash tool_use block
-            let is_bash = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+            let is_bash_tool_use = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
                 && block.get("name").and_then(|n| n.as_str()) == Some("bash");
 
-            if !is_bash {
+            if !is_bash_tool_use {
                 continue;
             }
 
-            // Extract the command from input (need to clone to avoid borrow issues)
-            let command = block
-                .get("input")
-                .and_then(|i| i.get("command"))
-                .and_then(|c| c.as_str())
-                .map(ToString::to_string);
-
-            if let Some(ref command) = command {
-                // Add the display field with the cleaned command
-                let display_str = display_command(command);
-                tracing::debug!(
-                    command = %command,
-                    display = %display_str,
-                    "bash display_command transformation"
-                );
-                if let Some(obj) = block.as_object_mut() {
-                    obj.insert("display".to_string(), Value::String(display_str));
+            if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                if let Some(display) = bash_displays.get(id) {
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("display".to_string(), Value::String(display.clone()));
+                    }
                 }
             }
         }
@@ -635,6 +642,8 @@ async fn stream_conversation(
         .map_err(AppError::Internal)?;
 
     // Create init event
+    // Note: messages are enriched with display info above via enrich_message_for_api
+    // which handles backwards compatibility for older messages without display field
     let init_event = SseEvent::Init {
         conversation: serde_json::to_value(&conversation).unwrap_or(Value::Null),
         messages: json_msgs,

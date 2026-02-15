@@ -2,6 +2,7 @@
 
 use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
+
 use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
 use crate::state_machine::state::{ToolCall, ToolInput};
@@ -332,7 +333,7 @@ where
                     )
                     .await?;
 
-                // Broadcast to clients
+                // Broadcast to clients (display_data already computed at effect creation)
                 let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
                 let _ = self
                     .broadcast_tx
@@ -564,6 +565,7 @@ where
                         )
                         .await?;
 
+                    // Tool results don't contain bash tool_use blocks, no enrichment needed
                     let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
                     let _ = self
                         .broadcast_tx
@@ -657,6 +659,8 @@ where
                         // This allows the frontend to update its message state
                         match self.storage.get_message_by_id(&message_id).await {
                             Ok(updated_msg) => {
+                                // This is a tool result message, not an agent message
+                                // No bash enrichment needed
                                 let msg_json =
                                     serde_json::to_value(&updated_msg).unwrap_or(Value::Null);
                                 let _ = self
@@ -693,7 +697,7 @@ where
                         )
                         .await?;
 
-                    // Broadcast the new message
+                    // Broadcast the new message (tool message, no bash enrichment needed)
                     let msg_json = serde_json::to_value(&message).unwrap_or(Value::Null);
                     let _ = self
                         .broadcast_tx
@@ -704,6 +708,7 @@ where
             }
         }
     }
+
     /// Build LLM messages from conversation history (instance method)
     #[allow(dead_code)] // May be useful for non-spawned code paths
     async fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {

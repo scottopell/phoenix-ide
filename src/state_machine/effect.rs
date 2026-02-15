@@ -3,7 +3,9 @@
 use crate::db::{ImageData, MessageContent, ToolResult, UsageData};
 use crate::llm::ContentBlock;
 use crate::state_machine::state::{SubAgentOutcome, SubAgentResult, ToolCall};
+use crate::tools::bash_check::display_command;
 use serde_json::Value;
+use std::path::Path;
 use std::time::Duration;
 
 /// Effects to be executed after state transition
@@ -79,10 +81,19 @@ impl Effect {
         }
     }
 
-    pub fn persist_agent_message(blocks: Vec<ContentBlock>, usage: Option<UsageData>) -> Self {
+    /// Create an agent message effect with display data computed for bash commands.
+    ///
+    /// The `cwd` parameter is used to determine whether to strip cd prefixes from
+    /// bash commands in the display (REQ-BASH-011).
+    pub fn persist_agent_message(
+        blocks: Vec<ContentBlock>,
+        usage: Option<UsageData>,
+        cwd: &Path,
+    ) -> Self {
+        let display_data = compute_bash_display_data(&blocks, cwd);
         Effect::PersistMessage {
             content: MessageContent::agent(blocks),
-            display_data: None,
+            display_data,
             usage_data: usage,
             message_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -138,5 +149,37 @@ impl Effect {
 
     pub fn execute_tool(tool: ToolCall) -> Self {
         Effect::ExecuteTool { tool }
+    }
+}
+
+/// Compute display data for bash commands in content blocks.
+///
+/// For each bash `tool_use` block, computes a simplified display string
+/// using `display_command()` which strips cd prefixes when they match cwd.
+///
+/// Returns `Some(json)` with display info if there are bash commands,
+/// `None` otherwise.
+fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<Value> {
+    let cwd_str = cwd.to_string_lossy();
+    let mut bash_displays: Vec<Value> = Vec::new();
+
+    for block in blocks {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            if name == "bash" {
+                if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
+                    let display = display_command(command, &cwd_str);
+                    bash_displays.push(serde_json::json!({
+                        "tool_use_id": id,
+                        "display": display
+                    }));
+                }
+            }
+        }
+    }
+
+    if bash_displays.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "bash": bash_displays }))
     }
 }
