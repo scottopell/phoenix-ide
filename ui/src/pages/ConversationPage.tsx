@@ -131,6 +131,11 @@ export function ConversationPage() {
           void _initType; // Destructured to extract remaining state data
           setStateData(Object.keys(initStateData).length > 0 ? initStateData as ConversationState : null);
           setAgentWorking(initData.agent_working || false);
+          
+          // Initialize context exhausted summary if loading an exhausted conversation
+          if (initState.type === 'context_exhausted' && 'summary' in initState) {
+            setContextExhaustedSummary((initState as { summary?: string }).summary || null);
+          }
           if (initData.context_window_size !== undefined) {
             setContextWindowUsed(initData.context_window_size);
           }
