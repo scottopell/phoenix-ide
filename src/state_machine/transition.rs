@@ -1264,4 +1264,180 @@ mod tests {
             "Should fail with InvalidTransition due to duplicate persist"
         );
     }
+
+    // ========================================================================
+    // Context Exhaustion Tests (REQ-BED-019 through REQ-BED-024)
+    // ========================================================================
+
+    #[test]
+    fn test_threshold_boundary_below() {
+        // 89.9% should NOT trigger continuation
+        let usage = UsageData {
+            input_tokens: 89_900,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            !should_trigger_continuation(&usage, 100_000),
+            "89.9% should not trigger continuation"
+        );
+    }
+
+    #[test]
+    fn test_threshold_boundary_at() {
+        // Exactly 90% SHOULD trigger continuation
+        let usage = UsageData {
+            input_tokens: 90_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(&usage, 100_000),
+            "90% should trigger continuation"
+        );
+    }
+
+    #[test]
+    fn test_threshold_boundary_above() {
+        // 90.1% should trigger continuation
+        let usage = UsageData {
+            input_tokens: 90_100,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(&usage, 100_000),
+            "90.1% should trigger continuation"
+        );
+    }
+
+    #[test]
+    fn test_threshold_with_output_tokens() {
+        // 45k input + 45k output = 90k total >= 90% of 100k
+        let usage = UsageData {
+            input_tokens: 45_000,
+            output_tokens: 45_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(&usage, 100_000),
+            "Combined tokens should count toward threshold"
+        );
+    }
+
+    #[test]
+    fn test_subagent_context_exhaustion_fails_immediately() {
+        use crate::llm::ContentBlock;
+        use crate::state_machine::state::ContextExhaustionBehavior;
+
+        // Create a sub-agent context
+        let subagent_ctx = ConvContext {
+            conversation_id: "subagent-1".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 100_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+        };
+
+        let result = handle_context_exhaustion(
+            &subagent_ctx,
+            vec![ContentBlock::text("response")],
+            vec![], // no tools
+            UsageData {
+                input_tokens: 95_000,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+        );
+
+        // Sub-agent should go to Failed, not AwaitingContinuation
+        assert!(
+            matches!(
+                result.new_state,
+                ConvState::Failed {
+                    error_kind: ErrorKind::ContextExhausted,
+                    ..
+                }
+            ),
+            "Sub-agent should fail immediately, got {:?}",
+            result.new_state
+        );
+
+        // Should notify parent
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Sub-agent should notify parent of failure"
+        );
+
+        // Should NOT request continuation
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestContinuation { .. })),
+            "Sub-agent should NOT request continuation"
+        );
+    }
+
+    #[test]
+    fn test_parent_context_exhaustion_triggers_continuation() {
+        use crate::llm::ContentBlock;
+        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
+
+        let parent_ctx = test_context(); // Uses ThresholdBasedContinuation
+
+        let tool_calls = vec![ToolCall::new(
+            "tool-1",
+            ToolInput::Bash(BashInput {
+                command: "echo test".to_string(),
+                mode: BashMode::Default,
+            }),
+        )];
+
+        let result = handle_context_exhaustion(
+            &parent_ctx,
+            vec![ContentBlock::text("response")],
+            tool_calls.clone(),
+            UsageData {
+                input_tokens: 95_000,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+        );
+
+        // Parent should go to AwaitingContinuation
+        assert!(
+            matches!(result.new_state, ConvState::AwaitingContinuation { .. }),
+            "Parent should enter AwaitingContinuation, got {:?}",
+            result.new_state
+        );
+
+        // Should request continuation with rejected tools
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::RequestContinuation { rejected_tool_calls } if rejected_tool_calls.len() == 1
+            )),
+            "Parent should request continuation with rejected tools"
+        );
+
+        // Should NOT notify parent (it's not a sub-agent)
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Parent conversation should NOT notify parent"
+        );
+    }
 }

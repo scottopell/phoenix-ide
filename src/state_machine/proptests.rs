@@ -128,6 +128,25 @@ fn arb_awaiting_llm_state() -> impl Strategy<Value = ConvState> {
     Just(ConvState::AwaitingLlm)
 }
 
+fn arb_awaiting_continuation_state() -> impl Strategy<Value = ConvState> {
+    (proptest::collection::vec(arb_tool_call(), 0..3), 1u32..5).prop_map(
+        |(rejected_tool_calls, attempt)| ConvState::AwaitingContinuation {
+            rejected_tool_calls,
+            attempt,
+        },
+    )
+}
+
+fn arb_context_exhausted_state() -> impl Strategy<Value = ConvState> {
+    // Include empty, normal, and long summaries with various characters
+    prop_oneof![
+        Just(String::new()),
+        "[a-zA-Z0-9 .,!?\n]{1,100}",
+        "[\x00-\x7F]{1,500}", // ASCII including control chars
+    ]
+    .prop_map(|summary| ConvState::ContextExhausted { summary })
+}
+
 fn arb_state() -> impl Strategy<Value = ConvState> {
     prop_oneof![
         arb_idle_state(),
@@ -137,6 +156,8 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_cancelling_llm_state(),
         arb_cancelling_tool_state(),
         arb_awaiting_llm_state(),
+        arb_awaiting_continuation_state(),
+        arb_context_exhausted_state(),
     ]
 }
 
@@ -372,6 +393,47 @@ proptest! {
             result.is_err(),
             "Busy state should reject messages, got {:?}",
             result
+        );
+    }
+
+    // Invariant 5b: ContextExhausted rejects user messages (REQ-BED-021)
+    #[test]
+    fn prop_context_exhausted_rejects_messages(
+        state in arb_context_exhausted_state(),
+        text in "[a-zA-Z ]{1,30}"
+    ) {
+        let event = Event::UserMessage {
+            text,
+            images: vec![],
+            message_id: uuid::Uuid::new_v4().to_string(),
+            user_agent: None,
+        };
+        let result = transition(&state, &test_context(), event);
+        prop_assert!(
+            matches!(result, Err(TransitionError::ContextExhausted)),
+            "ContextExhausted should reject messages with ContextExhausted error, got {:?}",
+            result
+        );
+    }
+
+    // Invariant 5c: ContextExhausted is stable (ignores non-message events)
+    #[test]
+    fn prop_context_exhausted_stable(
+        summary in "[a-zA-Z0-9 ]{0,50}",
+        event in arb_event().prop_filter("not UserMessage", |e| !matches!(e, Event::UserMessage { .. }))
+    ) {
+        let state = ConvState::ContextExhausted { summary: summary.clone() };
+        let result = transition(&state, &test_context(), event);
+        prop_assert!(
+            result.is_ok(),
+            "ContextExhausted should accept non-message events, got {:?}",
+            result
+        );
+        let new_state = result.unwrap().new_state;
+        prop_assert!(
+            matches!(&new_state, ConvState::ContextExhausted { summary: s } if *s == summary),
+            "ContextExhausted should remain unchanged, got {:?}",
+            new_state
         );
     }
 

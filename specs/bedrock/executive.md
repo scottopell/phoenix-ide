@@ -30,11 +30,11 @@ Implements Elm Architecture: pure `transition(state, event) -> (new_state, effec
 | **REQ-BED-016:** Mode Downgrade | ❌ Not Started | Immediate user-initiated downgrade |
 | **REQ-BED-017:** Mode Communication | ❌ Not Started | Synthetic messages, error responses |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Sub-agents always Restricted (when available) |
-| **REQ-BED-019:** Context Continuation Threshold | ❌ Not Started | Check at 90%, reject tools, trigger continuation |
-| **REQ-BED-020:** Continuation Summary Generation | ❌ Not Started | Tool-less LLM request, fallback on failure |
-| **REQ-BED-021:** Context Exhausted State | ❌ Not Started | Read-only terminal state |
-| **REQ-BED-022:** Model-Specific Context Limits | ❌ Not Started | Per-model thresholds, conservative default |
-| **REQ-BED-023:** Context Warning Indicator | ❌ Not Started | 80% warning, manual trigger option |
-| **REQ-BED-024:** Sub-Agent Context Exhaustion | ❌ Not Started | Fail immediately, no continuation flow |
+| **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
+| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Tool-less LLM request, fallback on failure |
+| **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
+| **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
+| **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |
+| **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
 
-**Progress:** 13 of 24 complete
+**Progress:** 19 of 24 complete
