@@ -436,9 +436,74 @@ def cmd_check():
 VALID_STATUSES = {"ready", "in-progress", "pending", "blocked", "done", "wont-do", "brainstorming"}
 VALID_PRIORITIES = {"p0", "p1", "p2", "p3", "p4"}
 
+# Task filename pattern: NNN-pX-status-slug.md
+# Example: 001-p2-done-refactor-executor.md
+TASK_FILENAME_PATTERN = r"^(\d{3})-(p[0-4])-(" + "|".join(VALID_STATUSES) + r")-(.+)\.md$"
+
+
+def parse_task_file(path: Path) -> dict | None:
+    """Parse a task file and return its metadata, or None if invalid.
+
+    Returns dict with: number, priority, status, slug, fields (from frontmatter)
+    """
+    import re
+
+    content = path.read_text()
+
+    # Check YAML frontmatter exists
+    if not content.startswith("---\n"):
+        return None
+
+    # Extract frontmatter
+    end = content.find("\n---\n", 4)
+    if end == -1:
+        return None
+
+    frontmatter = content[4:end]
+    fields = {}
+    for line in frontmatter.strip().split("\n"):
+        if ":" in line:
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+
+    # Parse filename
+    name = path.name
+    match = re.match(TASK_FILENAME_PATTERN, name)
+    if match:
+        return {
+            "path": path,
+            "number": match.group(1),
+            "file_priority": match.group(2),
+            "file_status": match.group(3),
+            "slug": match.group(4),
+            "fields": fields,
+        }
+
+    # Try old format: NNN-slug.md
+    old_match = re.match(r"^(\d{3})-(.+)\.md$", name)
+    if old_match:
+        return {
+            "path": path,
+            "number": old_match.group(1),
+            "file_priority": None,
+            "file_status": None,
+            "slug": old_match.group(2),
+            "fields": fields,
+        }
+
+    return None
+
+
+def get_expected_filename(number: str, priority: str, status: str, slug: str) -> str:
+    """Generate the expected filename from task metadata."""
+    return f"{number}-{priority}-{status}-{slug}.md"
+
 
 def cmd_tasks_validate() -> bool:
-    """Validate all task files conform to the frontmatter convention.
+    """Validate all task files conform to the naming and frontmatter conventions.
+
+    Filename format: NNN-pX-status-slug.md
+    Example: 001-p2-done-refactor-executor.md
 
     Returns True if all tasks pass, False otherwise.
     """
@@ -500,13 +565,79 @@ def cmd_tasks_validate() -> bool:
         elif not re.match(r"^\d{4}-\d{2}-\d{2}$", fields["created"]):
             errors.append(f"{name}: invalid 'created' date format (expected YYYY-MM-DD)")
 
+        # Check filename matches frontmatter
+        task = parse_task_file(path)
+        if task and fields.get("status") and fields.get("priority"):
+            expected = get_expected_filename(
+                task["number"], fields["priority"], fields["status"], task["slug"]
+            )
+            if name != expected:
+                errors.append(f"{name}: filename doesn't match frontmatter, expected: {expected}")
+
     if errors:
         print(f"✗ {len(errors)} task validation error(s):")
         for err in errors:
             print(f"  - {err}")
+        print("\nRun './dev.py tasks fix' to auto-rename files.")
         return False
 
     print(f"✓ {len(task_files) - 1} task files validated")  # -1 for template
+    return True
+
+
+def cmd_tasks_fix() -> bool:
+    """Auto-rename task files to match their frontmatter.
+
+    Returns True if all files are now correct, False on errors.
+    """
+    tasks_dir = ROOT / "tasks"
+    if not tasks_dir.exists():
+        print("No tasks/ directory found.")
+        return True
+
+    task_files = sorted(tasks_dir.glob("*.md"))
+    template = tasks_dir / "_TEMPLATE.md"
+    renamed = 0
+    errors = []
+
+    for path in task_files:
+        if path == template:
+            continue
+
+        task = parse_task_file(path)
+        if not task:
+            errors.append(f"{path.name}: could not parse file")
+            continue
+
+        fields = task["fields"]
+        if not fields.get("status") or not fields.get("priority"):
+            errors.append(f"{path.name}: missing status or priority in frontmatter")
+            continue
+
+        expected = get_expected_filename(
+            task["number"], fields["priority"], fields["status"], task["slug"]
+        )
+
+        if path.name != expected:
+            new_path = tasks_dir / expected
+            if new_path.exists():
+                errors.append(f"{path.name}: cannot rename to {expected}, file exists")
+                continue
+
+            path.rename(new_path)
+            print(f"  {path.name} -> {expected}")
+            renamed += 1
+
+    if errors:
+        print(f"\n✗ {len(errors)} error(s):")
+        for err in errors:
+            print(f"  - {err}")
+        return False
+
+    if renamed:
+        print(f"\n✓ Renamed {renamed} file(s)")
+    else:
+        print("✓ All files already correctly named")
     return True
 
 
@@ -1756,7 +1887,8 @@ def main():
     # tasks
     tasks_parser = sub.add_parser("tasks", help="Task management")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
-    tasks_sub.add_parser("validate", help="Validate task file frontmatter")
+    tasks_sub.add_parser("validate", help="Validate task file naming and frontmatter")
+    tasks_sub.add_parser("fix", help="Auto-rename task files to match frontmatter")
 
     args = parser.parse_args()
 
@@ -1793,6 +1925,9 @@ def main():
     elif args.command == "tasks":
         if args.tasks_command == "validate":
             if not cmd_tasks_validate():
+                sys.exit(1)
+        elif args.tasks_command == "fix":
+            if not cmd_tasks_fix():
                 sys.exit(1)
 
 

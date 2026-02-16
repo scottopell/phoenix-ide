@@ -1,59 +1,118 @@
 # Agent Instructions for phoenix-ide
 
-## Task Tracking
+## What Is This?
 
-Tasks are tracked in `tasks/NNN-slug.md` files with YAML frontmatter.
+LLM-powered coding agent. Rust backend (axum, SQLite) + React frontend (TypeScript, XState).
 
-```bash
-# List ready tasks
-grep -l "status: ready" tasks/*.md
+The core is a **state machine-driven conversation runtime**: messages flow through deterministic state transitions, tools execute as effects, and everything persists to SQLite for crash recovery.
 
-# Create a new task: copy template, use next available number
-cp tasks/_TEMPLATE.md tasks/NNN-short-slug.md
+## Architecture
 
-# Close a task: edit the file, change status to done
-# status: ready  ->  status: done
 ```
-
-No tooling required - the markdown files are the system.
+src/
+  runtime/       # Conversation lifecycle, state machine executor
+  state_machine/ # Pure state transitions (Elm architecture)
+  tools/         # bash, patch, browser, keyword_search, think, etc.
+  llm/           # Provider abstraction (Anthropic, OpenAI, AI Gateway)
+  api/           # HTTP handlers, SSE streaming
+  db/            # SQLite persistence
+ui/src/
+  components/    # React components
+  machines/      # XState state machines
+  hooks/         # Custom React hooks
+specs/           # Tool specifications (read before modifying tools!)
+tasks/           # Task tracking
+```
 
 ---
 
-## ⚠️ CRITICAL: Issue Discovery Protocol
+## Task Tracking
 
-**When you encounter ANY issue during your work—whether or not it's related to your current task—you MUST take action.**
+**Format:** `NNN-pX-status-slug.md` (e.g., `042-p1-ready-fix-bug.md`)
 
-### The Rule
+- `NNN`: Task number | `pX`: Priority (p0 highest) | `status`: ready, in-progress, done, blocked, etc.
 
-> **Finding a bug is not the end. Finding a bug is the beginning of a task.**
-
-Do NOT:
-- Note an issue and move on
-- Say "this is unrelated to current changes" and ignore it
-- Delete regression files to make tests pass
-- Work around problems without documenting them
-
-Do:
-- **Immediately create a task** in `tasks/` documenting the issue
-- Include reproduction steps, error messages, and context
-- Assign appropriate priority (p1-p3)
-- Then continue with your original work
-
-### Why This Matters
-
-Issues discovered incidentally are often forgotten. The cost of creating a task is ~30 seconds. The cost of rediscovering an issue later is much higher. When in doubt, create the task.
-
-### Example
-
-Bad:
-```
-"There's a flaky test here. This isn't related to our changes—let me run it again."
+```bash
+ls tasks/*-ready-*.md              # List ready tasks
+./dev.py tasks fix                 # Sync filenames to frontmatter
+./dev.py tasks validate            # Check consistency (runs in ./dev.py check)
 ```
 
-Good:
+Filename MUST match frontmatter. `./dev.py check` enforces this.
+
+---
+
+## Issue Discovery Protocol
+
+> **Finding a bug is the beginning of a task, not an observation to note and move on.**
+
+When you encounter ANY issue—related to your current work or not:
+1. **Create a task** in `tasks/` with reproduction steps and context
+2. Then continue with your original work
+
+Do NOT delete regression files, work around problems silently, or say "this is unrelated."
+
+---
+
+## Development
+
+**Always use `./dev.py`** — it configures LLM gateway automatically.
+
+```bash
+./dev.py up          # Build and start Phoenix + Vite
+./dev.py down        # Stop all servers
+./dev.py restart     # Rebuild Rust, restart Phoenix (Vite keeps running)
+./dev.py status      # Check what's running
+./dev.py check       # clippy + fmt + tests + task validation
 ```
-"There's a flaky test here. Creating tasks/009-fix-flaky-xyz-test.md before continuing."
+
+**Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust) or auto-reload (UI) → `./dev.py check` → commit
+
+Each git worktree gets unique ports and database automatically.
+
+⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py`.
+
+---
+
+## Testing
+
+```bash
+cargo test                       # All tests
+cargo test state_machine         # Filter by module/name
+cargo test -- --nocapture        # See println! output
 ```
+
+Property tests live in `**/proptests.rs` files. Run with `cargo test proptests`.
+
+---
+
+## Adding a New Tool
+
+See [`src/tools/think.rs`](src/tools/think.rs) as the simplest example.
+
+1. Create `src/tools/your_tool.rs` implementing the `Tool` trait:
+   - `name()` — tool identifier
+   - `description()` — shown to LLM
+   - `input_schema()` — JSON schema for parameters
+   - `run()` — async execution, returns `ToolOutput`
+
+2. Register in `src/tools.rs` → `ToolRegistry::new_with_options()`
+
+3. Add spec in `specs/your-tool/executive.md` (see existing specs for format)
+
+**Before modifying any existing tool**, read its spec in `specs/<tool>/executive.md`.
+
+---
+
+## Production
+
+```bash
+./dev.py prod deploy [version]   # Build + install systemd service
+./dev.py prod status             # Show status
+./dev.py prod stop               # Stop service
+```
+
+Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
 
 ---
 
@@ -61,121 +120,12 @@ Good:
 
 ### Module Organization
 
-Use named module files (e.g., `foo.rs` + `foo/` subdirectory) instead of `foo/mod.rs`. This is enforced by the `mod_module_files` clippy lint.
+Use `foo.rs` + `foo/` subdirectory, NOT `foo/mod.rs`. Enforced by clippy.
 
-✅ Correct:
 ```
-src/
-  tools.rs           # Module entry point
-  tools/
-    bash.rs          # Submodule
-    patch.rs         # Submodule with its own children
-    patch/
-      planner.rs     # Nested submodule
+✅ src/tools.rs + src/tools/bash.rs
+❌ src/tools/mod.rs + src/tools/bash.rs
 ```
-
-❌ Wrong:
-```
-src/
-  tools/
-    mod.rs           # Legacy style - forbidden
-    bash.rs
-```
-
-The modern style is preferred because:
-- File names are more descriptive in editor tabs
-- Easier to navigate in file trees
-- Rust 2018 edition recommendation
-
----
-
-## Development Commands
-
-**Always use `./dev.py` for development tasks.** It handles LLM gateway configuration automatically.
-
-```bash
-# Server management
-./dev.py up            # Build and start Phoenix + Vite dev servers
-./dev.py down          # Stop all servers
-./dev.py restart       # Rebuild Rust and restart Phoenix (Vite stays for hot reload)
-./dev.py status        # Check what's running
-
-# Code quality
-./dev.py check         # Run clippy + fmt check + tests
-```
-
-### Development Workflow
-
-1. **Start development:** `./dev.py up`
-   - Builds Rust backend
-   - Starts Phoenix server and Vite dev server
-   - Ports are auto-assigned based on worktree path (supports multiple worktrees)
-   - Each worktree gets its own database
-
-2. **After Rust changes:** `./dev.py restart`
-   - Rebuilds and restarts Phoenix
-   - Vite keeps running (UI hot reloads automatically)
-
-3. **After UI changes:** Nothing needed!
-   - Vite hot reloads automatically
-
-4. **Before committing:** `./dev.py check`
-
-5. **When done:** `./dev.py down`
-
-6. **Check configuration:** `./dev.py status`
-   - Shows worktree hash, ports, database path
-
-### Multi-Worktree Support
-
-Each git worktree automatically gets:
-- Unique ports (based on path hash)
-- Separate database file
-- Lock file to prevent conflicts
-
-You can run multiple instances in different worktrees simultaneously.
-
-### ⚠️ Do NOT start the server manually
-
-Do NOT use `cargo run` or start the binary directly. The server requires the LLM gateway
-configuration which `./dev.py up` provides automatically from `/exe.dev/shelley.json`.
-
-If you see API key errors, you're not using dev.py.
-
----
-
-## Production Deployment
-
-```bash
-# Build and deploy
-./dev.py prod build [version]   # Build from git tag or HEAD
-./dev.py prod deploy [version]  # Build + install systemd service + start
-./dev.py prod status            # Show production service status  
-./dev.py prod stop              # Stop production service
-```
-
-### How it works
-
-- **Embedded UI**: React UI is embedded in the binary using `rust-embed`
-- **Static binary**: Uses musl target for fully static ~9MB binary
-- **Git worktree**: Builds in `~/.phoenix-ide-build` to avoid disturbing main worktree
-- **Systemd service**: `phoenix-ide` runs on port 7331, database at `~/.phoenix-ide/prod.db`
-
-### Example workflows
-
-```bash
-# Deploy current HEAD
-./dev.py prod deploy
-
-# Tag and deploy a release
-git tag v0.1.0
-./dev.py prod deploy v0.1.0
-
-# Roll back
-./dev.py prod deploy v0.0.9
-```
-
-Binaries are built on-demand from git tags—no need to store release artifacts.
 
 ---
 
@@ -183,52 +133,35 @@ Binaries are built on-demand from git tags—no need to store release artifacts.
 
 ### Information Density, Not Minimalism
 
-Subtle UI ≠ hiding information. A subtle UI is **information-dense**—it communicates clearly without wasting visual elements on redundant information.
-
-**Do:**
-- Show status inline where it's needed (e.g., `DIR ✓ ~/project` tells you validity and value in one glance)
-- Use symbols and color to convey state without adding words
-- Provide feedback for every user action—creation, validation, errors
-- Progressive disclosure: show essentials by default, details on demand
-
-**Don't:**
-- Add labels that repeat what's already obvious from context
-- Use modals or separate screens when inline feedback works
-- Hide state that users need to make decisions
-- Leave users guessing ("did that work?")
+- Show status inline (e.g., `DIR ✓ ~/project` — validity and value in one glance)
+- Use symbols and color to convey state without words
+- Progressive disclosure: essentials visible, details on demand
 
 ### Input-First Design
 
-The primary action should dominate the interface. For a chat app, that's the message input.
-
-- Center the input, make it prominent
-- Settings and configuration are secondary—collapsed by default
-- Remember user preferences (last directory, model) so they rarely need to change them
-- Typing and sending should require zero configuration for the common case
+- Primary action (message input) dominates the interface
+- Settings collapsed by default
+- Remember user preferences (last directory, model)
 
 ### Feedback Patterns
 
-| State | Visual Pattern |
-|-------|----------------|
-| Valid/Success | Green `✓`, green border |
-| Will be created/Warning | Yellow `+`, yellow border |
-| Invalid/Error | Red `✗`, red border |
-| Loading/Checking | Muted `...` or spinner |
+| State | Pattern |
+|-------|--------|
+| Valid/Success | Green `✓` |
+| Will be created | Yellow `+` |
+| Invalid/Error | Red `✗` |
+| Loading | Muted `...` |
 
-Status indicators go **inline** with the value they describe, not in separate status bars or toasts.
+Status indicators go **inline** with the value they describe.
 
 ### Animation
 
-- Transitions should be quick (150-250ms) and purposeful
-- Expand/collapse uses smooth height animation
-- No animations that block user input
-- Avoid bounces, overshoots, or playful effects—this is a professional tool
+- Quick (150-250ms) and purposeful
+- No bounces or playful effects—professional tool
+- Never block user input
 
 ### The Test
 
-Before adding any UI element, ask:
-1. What information does this communicate?
-2. Is that information already available elsewhere on screen?
-3. Does the user need this information to complete their task?
+Before adding UI: (1) What info does this communicate? (2) Is it already shown elsewhere? (3) Does the user need it?
 
-If #2 is yes or #3 is no, don't add it.
+If #2=yes or #3=no, don't add it.
