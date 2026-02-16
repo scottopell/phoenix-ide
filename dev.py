@@ -5,6 +5,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import dataclasses
 import fcntl
 import getpass
 import hashlib
@@ -641,7 +642,45 @@ def prod_build(version: str | None = None, strip: bool = True) -> Path:
     return binary
 
 
-def prod_get_systemd_socket() -> str:
+# =============================================================================
+# Systemd Unit Generation (shared by native and Lima)
+# =============================================================================
+
+@dataclasses.dataclass
+class SystemdConfig:
+    """Configuration for systemd unit generation.
+    
+    Using a dataclass ensures native and Lima deployments use identical
+    unit file structure - they can only differ in these explicit parameters.
+    """
+    user: str
+    db_path: str
+    install_dir: str
+    port: int
+    # For Lima: uses EnvironmentFile for API key; for native: uses LLM_GATEWAY env var
+    env_file: str | None = None
+    llm_gateway: str | None = None
+
+
+# Configs for each deployment target
+NATIVE_SYSTEMD_CONFIG = SystemdConfig(
+    user="exedev",
+    db_path=str(PROD_DB_PATH),
+    install_dir=str(PROD_INSTALL_DIR),
+    port=PROD_PORT,
+    llm_gateway=None,  # Set at deploy time via get_llm_gateway()
+)
+
+LIMA_SYSTEMD_CONFIG = SystemdConfig(
+    user="phoenix-user",
+    db_path="/home/phoenix-user/.phoenix-ide/prod.db",
+    install_dir="/opt/phoenix-ide",
+    port=PROD_PORT,
+    env_file=LIMA_ENV_FILE,
+)
+
+
+def generate_systemd_socket(config: SystemdConfig) -> str:
     """Generate systemd socket unit file content.
     
     The socket unit owns the listening socket and keeps it open during
@@ -653,7 +692,7 @@ Documentation=https://github.com/phoenix-ide/phoenix-ide
 
 [Socket]
 # Production port - socket stays open during service restarts
-ListenStream={PROD_PORT}
+ListenStream={config.port}
 # Disable Nagle's algorithm for lower latency (SSE, interactive)
 NoDelay=true
 # Allow connections to queue during restart
@@ -664,31 +703,33 @@ WantedBy=sockets.target
 """
 
 
-def prod_get_systemd_unit(version: str, use_ai_gateway: bool = False) -> str:
+def generate_systemd_service(config: SystemdConfig, version: str, use_ai_gateway: bool = False) -> str:
     """Generate systemd service unit file content.
     
     This unit requires the socket unit (phoenix-ide.socket) which provides
     the listening socket via systemd socket activation.
     """
-    # Note: PHOENIX_PORT is not needed - socket activation provides the listener
     env_lines = [
-        f"Environment=PHOENIX_DB_PATH={PROD_DB_PATH}",
+        f"Environment=PHOENIX_DB_PATH={config.db_path}",
         f"Environment=PHOENIX_VERSION={version}",
     ]
 
     if use_ai_gateway:
-        config = get_ai_gateway_config()
+        ai_config = get_ai_gateway_config()
         env_lines.extend([
             "Environment=AI_GATEWAY_ENABLED=true",
-            f"Environment=AI_GATEWAY_URL={config['url']}",
-            f"Environment=AI_GATEWAY_DATACENTER={config['datacenter']}",
-            f"Environment=AI_GATEWAY_SERVICE={config['service']}",
+            f"Environment=AI_GATEWAY_URL={ai_config['url']}",
+            f"Environment=AI_GATEWAY_DATACENTER={ai_config['datacenter']}",
+            f"Environment=AI_GATEWAY_SERVICE={ai_config['service']}",
             "Environment=AI_GATEWAY_SOURCE=phoenix-ide",
             "Environment=AI_GATEWAY_ORG_ID=2",
         ])
-    else:
-        # Use LLM gateway or API keys
-        env_lines.append(f"Environment=LLM_GATEWAY={get_llm_gateway()}")
+    elif config.env_file:
+        # Lima mode: use EnvironmentFile for API key
+        env_lines.insert(0, f"EnvironmentFile={config.env_file}")
+    elif config.llm_gateway:
+        # Native mode: use LLM_GATEWAY directly
+        env_lines.append(f"Environment=LLM_GATEWAY={config.llm_gateway}")
 
     env_section = "\n".join(env_lines)
 
@@ -701,9 +742,9 @@ After=network.target phoenix-ide.socket
 
 [Service]
 Type=simple
-User=exedev
+User={config.user}
 {env_section}
-ExecStart={PROD_INSTALL_DIR}/phoenix-ide
+ExecStart={config.install_dir}/phoenix-ide
 # SIGHUP triggers graceful shutdown; systemd restarts with same socket
 ExecReload=/bin/kill -HUP $MAINPID
 # Restart always (including after SIGHUP which exits 0)
@@ -765,9 +806,12 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         else:
             print("✓ Using existing ddtool authentication")
 
+    # Configure for native deployment
+    config = dataclasses.replace(NATIVE_SYSTEMD_CONFIG, llm_gateway=get_llm_gateway())
+
     # Install systemd socket unit (for socket activation)
     print("Installing systemd socket unit...")
-    socket_content = prod_get_systemd_socket()
+    socket_content = generate_systemd_socket(config)
     socket_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket")
     
     proc = subprocess.run(
@@ -781,7 +825,7 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
 
     # Install systemd service unit
     print("Installing systemd service unit...")
-    unit_content = prod_get_systemd_unit(version, use_ai_gateway=ai_gateway)
+    unit_content = generate_systemd_service(config, version, use_ai_gateway=ai_gateway)
     unit_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
     
     proc = subprocess.run(
@@ -1427,46 +1471,6 @@ def prompt_ai_gateway_auth():
         return False
 
 
-def lima_get_systemd_unit(version: str, use_ai_gateway: bool = False) -> str:
-    """Generate systemd unit file for the Lima VM deployment."""
-    env_lines = [
-        f"Environment=PHOENIX_PORT={PROD_PORT}",
-        "Environment=PHOENIX_DB_PATH=/home/phoenix-user/.phoenix-ide/prod.db",
-        f"Environment=PHOENIX_VERSION={version}",
-    ]
-
-    if use_ai_gateway:
-        config = get_ai_gateway_config()
-        env_lines.extend([
-            "Environment=AI_GATEWAY_ENABLED=true",
-            f"Environment=AI_GATEWAY_URL={config['url']}",
-            f"Environment=AI_GATEWAY_DATACENTER={config['datacenter']}",
-            f"Environment=AI_GATEWAY_SERVICE={config['service']}",
-            "Environment=AI_GATEWAY_SOURCE=phoenix-ide",
-            "Environment=AI_GATEWAY_ORG_ID=2",
-        ])
-    else:
-        env_lines.insert(0, f"EnvironmentFile={LIMA_ENV_FILE}")
-
-    env_section = "\n".join(env_lines)
-
-    return f"""[Unit]
-Description=Phoenix IDE
-After=network.target
-
-[Service]
-Type=simple
-User=phoenix-user
-{env_section}
-ExecStart=/opt/phoenix-ide/phoenix-ide
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
 def cmd_lima_create():
     """Create and provision the Lima VM."""
     # Check limactl exists
@@ -1577,28 +1581,55 @@ def lima_prod_deploy(ai_gateway: bool = False):
     )
     version = f"dev-{result.stdout.strip()}" if result.returncode == 0 else "dev-unknown"
 
-    # Install systemd unit
-    print("\nInstalling systemd service...")
-    unit_content = lima_get_systemd_unit(version, use_ai_gateway=ai_gateway)
+    # Use shared systemd config for Lima
+    config = LIMA_SYSTEMD_CONFIG
+
+    # Install systemd socket unit (for socket activation)
+    print("\nInstalling systemd socket unit...")
+    socket_content = generate_systemd_socket(config)
+    subprocess.run(
+        ["limactl", "shell", LIMA_VM_NAME, "--",
+         "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket"],
+        input=socket_content.encode(), check=True, capture_output=True,
+    )
+
+    # Install systemd service unit
+    print("Installing systemd service unit...")
+    unit_content = generate_systemd_service(config, version, use_ai_gateway=ai_gateway)
     subprocess.run(
         ["limactl", "shell", LIMA_VM_NAME, "--",
          "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.service"],
         input=unit_content.encode(), check=True, capture_output=True,
     )
-    lima_shell("sudo systemctl daemon-reload")
-    lima_shell(f"sudo systemctl enable {PROD_SERVICE_NAME}")
-    lima_shell(f"sudo systemctl restart {PROD_SERVICE_NAME}")
 
-    time.sleep(1)
+    lima_shell("sudo systemctl daemon-reload")
+    lima_shell(f"sudo systemctl enable {PROD_SERVICE_NAME}.socket")
+    lima_shell(f"sudo systemctl enable {PROD_SERVICE_NAME}")
+
+    # Check if service is already running
+    result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
+    if result.stdout.strip() == "active":
+        # Service running - send SIGHUP for zero-downtime upgrade
+        print("Sending reload signal (SIGHUP) for zero-downtime upgrade...")
+        lima_shell(f"sudo systemctl reload {PROD_SERVICE_NAME}")
+    else:
+        # Service not running - start socket and service
+        print("Starting socket and service...")
+        lima_shell(f"sudo systemctl start {PROD_SERVICE_NAME}.socket")
+        lima_shell(f"sudo systemctl start {PROD_SERVICE_NAME}")
+
+    time.sleep(2)
 
     # Verify
     result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
     status = result.stdout.strip()
     if status == "active":
-        print(f"\nDeployed {version} to Lima VM")
-        print(f"  URL: http://localhost:{PROD_PORT}")
+        print(f"\n✓ Deployed {version} to Lima VM")
+        print(f"  Service: {PROD_SERVICE_NAME}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
     else:
-        print(f"\nService failed to start (status: {status})", file=sys.stderr)
+        print(f"\n✗ Service failed to start (status: {status})", file=sys.stderr)
         lima_shell(f"sudo journalctl -u {PROD_SERVICE_NAME} -n 20 --no-pager")
         sys.exit(1)
 
