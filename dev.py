@@ -641,10 +641,37 @@ def prod_build(version: str | None = None, strip: bool = True) -> Path:
     return binary
 
 
+def prod_get_systemd_socket() -> str:
+    """Generate systemd socket unit file content.
+    
+    The socket unit owns the listening socket and keeps it open during
+    service restarts, enabling zero-downtime upgrades.
+    """
+    return f"""[Unit]
+Description=Phoenix IDE Socket
+Documentation=https://github.com/phoenix-ide/phoenix-ide
+
+[Socket]
+# Production port - socket stays open during service restarts
+ListenStream={PROD_PORT}
+# Disable Nagle's algorithm for lower latency (SSE, interactive)
+NoDelay=true
+# Allow connections to queue during restart
+Backlog=128
+
+[Install]
+WantedBy=sockets.target
+"""
+
+
 def prod_get_systemd_unit(version: str, use_ai_gateway: bool = False) -> str:
-    """Generate systemd unit file content."""
+    """Generate systemd service unit file content.
+    
+    This unit requires the socket unit (phoenix-ide.socket) which provides
+    the listening socket via systemd socket activation.
+    """
+    # Note: PHOENIX_PORT is not needed - socket activation provides the listener
     env_lines = [
-        f"Environment=PHOENIX_PORT={PROD_PORT}",
         f"Environment=PHOENIX_DB_PATH={PROD_DB_PATH}",
         f"Environment=PHOENIX_VERSION={version}",
     ]
@@ -667,16 +694,22 @@ def prod_get_systemd_unit(version: str, use_ai_gateway: bool = False) -> str:
 
     return f"""[Unit]
 Description=Phoenix IDE
-After=network.target
+Documentation=https://github.com/phoenix-ide/phoenix-ide
+# Socket must be ready before service starts
+Requires=phoenix-ide.socket
+After=network.target phoenix-ide.socket
 
 [Service]
 Type=simple
 User=exedev
 {env_section}
 ExecStart={PROD_INSTALL_DIR}/phoenix-ide
+# SIGHUP triggers graceful shutdown; systemd restarts with same socket
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5
+# Restart always (including after SIGHUP which exits 0)
+Restart=always
+RestartSec=1
+# Give connections time to drain during graceful shutdown
 TimeoutStopSec=30
 
 [Install]
@@ -732,44 +765,83 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         else:
             print("✓ Using existing ddtool authentication")
 
-    # Install systemd service
-    print("Installing systemd service...")
+    # Install systemd socket unit (for socket activation)
+    print("Installing systemd socket unit...")
+    socket_content = prod_get_systemd_socket()
+    socket_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket")
+    
+    proc = subprocess.run(
+        ["sudo", "tee", str(socket_file)],
+        input=socket_content.encode(),
+        capture_output=True
+    )
+    if proc.returncode != 0:
+        print(f"Failed to write socket unit: {proc.stderr.decode()}", file=sys.stderr)
+        sys.exit(1)
+
+    # Install systemd service unit
+    print("Installing systemd service unit...")
     unit_content = prod_get_systemd_unit(version, use_ai_gateway=ai_gateway)
     unit_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
     
-    # Write via sudo
     proc = subprocess.run(
         ["sudo", "tee", str(unit_file)],
         input=unit_content.encode(),
         capture_output=True
     )
     if proc.returncode != 0:
-        print(f"Failed to write systemd unit: {proc.stderr.decode()}", file=sys.stderr)
+        print(f"Failed to write service unit: {proc.stderr.decode()}", file=sys.stderr)
         sys.exit(1)
     
-    # Reload systemd and trigger hot reload
+    # Reload systemd
     subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    
+    # Enable both socket and service
+    subprocess.run(["sudo", "systemctl", "enable", f"{PROD_SERVICE_NAME}.socket"], check=True)
     subprocess.run(["sudo", "systemctl", "enable", PROD_SERVICE_NAME], check=True)
     
-    # Check if service is running - if so, reload (SIGHUP); if not, start
-    result = subprocess.run(
+    # Check current state
+    socket_active = subprocess.run(
+        ["systemctl", "is-active", f"{PROD_SERVICE_NAME}.socket"],
+        capture_output=True, text=True
+    ).stdout.strip() == "active"
+    
+    service_active = subprocess.run(
         ["systemctl", "is-active", PROD_SERVICE_NAME],
         capture_output=True, text=True
-    )
+    ).stdout.strip() == "active"
     
-    if result.stdout.strip() == "active":
+    if service_active:
         # Service running - send SIGHUP for hot reload
-        print("Sending reload signal (SIGHUP)...")
+        # With socket activation, this triggers graceful shutdown -> systemd restart
+        print("Sending reload signal (SIGHUP) for zero-downtime upgrade...")
         subprocess.run(["sudo", "systemctl", "reload", PROD_SERVICE_NAME], check=True)
-        print(f"\n✓ Deployed {version} to production")
-        print(f"  Service: {PROD_SERVICE_NAME}")
-        print(f"  Port: {PROD_PORT}")
-        print(f"  Database: {PROD_DB_PATH}")
-        print(f"\n  Reload signal sent - service is restarting in place.")
-        print(f"  Clients will reconnect automatically.")
+        
+        # Wait briefly for restart
+        time.sleep(2)
+        
+        # Verify it came back up
+        result = subprocess.run(
+            ["systemctl", "is-active", PROD_SERVICE_NAME],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip() == "active":
+            print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
+            print(f"  Service: {PROD_SERVICE_NAME}")
+            print(f"  Port: {PROD_PORT}")
+            print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
+            print(f"  Database: {PROD_DB_PATH}")
+        else:
+            print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
     else:
-        # Service not running - start it
-        print("Starting service...")
+        # Service not running - start socket first, then service
+        print("Starting socket and service...")
+        
+        # Stop any existing (non-socket-activated) service first
+        subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME], capture_output=True)
+        
+        # Start the socket (service will be started on first connection or explicitly)
+        subprocess.run(["sudo", "systemctl", "start", f"{PROD_SERVICE_NAME}.socket"], check=True)
         subprocess.run(["sudo", "systemctl", "start", PROD_SERVICE_NAME], check=True)
         time.sleep(1)
         
@@ -782,6 +854,7 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
             print(f"\n✓ Deployed {version} to production")
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
+            print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
             print(f"  Database: {PROD_DB_PATH}")
         else:
             print(f"\n✗ Service failed to start", file=sys.stderr)

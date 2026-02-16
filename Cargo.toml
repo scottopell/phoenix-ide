@@ -51,6 +51,7 @@ tree-sitter-bash = "0.25.1"
 # Browser automation
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 brush-parser = "0.3.0"
+listenfd = "1.0.2"
 
 [dev-dependencies]
 tempfile = "3"

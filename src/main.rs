@@ -103,13 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = create_router(state).layer(cors).layer(compression);
 
-    // Get listener (either inherited from previous process or bind fresh)
+    // Get listener (either from systemd socket activation or bind fresh)
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = hot_restart::get_listener(addr).await?;
-    tracing::info!("Phoenix IDE server listening on {}", listener.local_addr()?);
-
-    // Store the listener FD before axum consumes it (needed for hot restart)
-    hot_restart::store_listener_fd(&listener);
+    tracing::info!(
+        addr = %listener.local_addr()?,
+        socket_activated = hot_restart::is_socket_activated(),
+        "Phoenix IDE server listening"
+    );
 
     // Run server with graceful shutdown on signals
     let server = axum::serve(listener, app);
