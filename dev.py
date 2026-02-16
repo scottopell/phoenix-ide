@@ -712,8 +712,9 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
     print(f"Installing to {PROD_INSTALL_DIR}...")
     subprocess.run(["sudo", "mkdir", "-p", str(PROD_INSTALL_DIR)], check=True)
     
-    # Copy binary
+    # Copy binary (remove first to handle "text file busy" when process is running)
     dest = PROD_INSTALL_DIR / "phoenix-ide"
+    subprocess.run(["sudo", "rm", "-f", str(dest)], check=True)
     subprocess.run(["sudo", "cp", str(binary), str(dest)], check=True)
     subprocess.run(["sudo", "chmod", "+x", str(dest)], check=True)
     
