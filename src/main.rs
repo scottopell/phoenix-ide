@@ -108,13 +108,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = hot_restart::get_listener(addr).await?;
     tracing::info!("Phoenix IDE server listening on {}", listener.local_addr()?);
 
-    // Set up signal handlers for hot restart
-    let server = axum::serve(listener, app);
+    // Store the listener FD before axum consumes it (needed for hot restart)
+    hot_restart::store_listener_fd(&listener);
 
-    // Run server with graceful shutdown on SIGHUP
+    // Run server with graceful shutdown on signals
+    let server = axum::serve(listener, app);
     server
         .with_graceful_shutdown(hot_restart::shutdown_signal())
         .await?;
+
+    // After graceful shutdown, check if we should hot restart
+    // (This does not return if hot restart is performed)
+    hot_restart::maybe_perform_hot_restart();
 
     Ok(())
 }

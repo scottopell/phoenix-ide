@@ -9,11 +9,18 @@
 //! maintaining the same PID and never dropping the TCP listener.
 
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tokio::net::TcpListener;
 
 /// Environment variable for passing listener FD across exec boundary
 const LISTEN_FD_ENV: &str = "PHOENIX_LISTEN_FD";
+
+/// Stored listener FD for hot restart (set before axum consumes the listener)
+static LISTENER_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Flag indicating SIGHUP was received and we should exec after graceful shutdown
+static HOT_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Get a TCP listener, either inherited from a previous process or freshly bound.
 pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -26,13 +33,48 @@ pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     }
 }
 
+/// Store the listener's raw FD for later use in hot restart.
+/// Must be called before passing the listener to `axum::serve`.
+pub fn store_listener_fd(listener: &TcpListener) {
+    let fd = listener.as_raw_fd();
+    LISTENER_FD.store(fd, Ordering::SeqCst);
+    tracing::debug!(fd, "Stored listener FD for potential hot restart");
+}
+
+/// Check if hot restart was requested and perform it if so.
+/// Call this after the server has shut down gracefully.
+/// Does not return if hot restart is performed.
+pub fn maybe_perform_hot_restart() {
+    if !HOT_RESTART_REQUESTED.load(Ordering::SeqCst) {
+        tracing::info!("Normal shutdown (no hot restart requested)");
+        return;
+    }
+
+    let fd = LISTENER_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        tracing::error!("Hot restart requested but no listener FD stored - performing normal exit");
+        return;
+    }
+
+    tracing::info!(fd, "Performing hot restart");
+
+    if let Err(e) = prepare_listener_for_exec(fd) {
+        tracing::error!(error = %e, "Failed to prepare listener for exec - performing normal exit");
+        return;
+    }
+
+    // This only returns if execve fails
+    let Err(e) = perform_hot_restart(fd);
+    tracing::error!(error = %e, "execve failed - performing normal exit");
+}
+
 /// Try to inherit a listener from a previous process via `PHOENIX_LISTEN_FD`.
 fn try_inherit_listener() -> std::io::Result<Option<TcpListener>> {
     let Ok(fd_str) = std::env::var(LISTEN_FD_ENV) else {
         return Ok(None);
     };
 
-    let fd: i32 = fd_str.parse().map_err(|e| {
+    let fd: RawFd = fd_str.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid {LISTEN_FD_ENV} value '{fd_str}': {e}"),
@@ -63,12 +105,8 @@ pub async fn shutdown_signal() {
 
     tokio::select! {
         _ = sighup.recv() => {
-            tracing::info!("Received SIGHUP - initiating hot restart");
-            // Hot restart will be performed after graceful shutdown completes
-            // The actual exec happens in a separate flow (see perform_hot_restart)
-
-            // For now, just trigger shutdown - Phase 3 will add the exec logic
-            tracing::warn!("Hot restart not yet implemented - performing normal restart");
+            tracing::info!("Received SIGHUP - will perform hot restart after graceful shutdown");
+            HOT_RESTART_REQUESTED.store(true, Ordering::SeqCst);
         }
         _ = sigterm.recv() => {
             tracing::info!("Received SIGTERM - shutting down");
@@ -81,23 +119,20 @@ pub async fn shutdown_signal() {
 
 /// Prepare a listener for inheritance across exec boundary.
 /// Clears `FD_CLOEXEC` so the FD survives `execve()`.
-#[allow(dead_code)] // Will be used in Phase 3
-pub fn prepare_listener_for_exec(listener: &TcpListener) -> std::io::Result<i32> {
+fn prepare_listener_for_exec(fd: RawFd) -> std::io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-
-    let fd = listener.as_raw_fd();
 
     // Clear FD_CLOEXEC so the FD survives exec
     fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| std::io::Error::other(format!("Failed to clear FD_CLOEXEC: {e}")))?;
 
-    Ok(fd)
+    tracing::debug!(fd, "Cleared FD_CLOEXEC on listener");
+    Ok(())
 }
 
-/// Perform hot restart by exec'ing the new binary.
+/// Perform hot restart by exec'ing the current binary.
 /// This function does not return on success.
-#[allow(dead_code)] // Will be used in Phase 3
-pub fn perform_hot_restart(listener_fd: i32) -> std::io::Result<std::convert::Infallible> {
+fn perform_hot_restart(listener_fd: RawFd) -> std::io::Result<std::convert::Infallible> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
