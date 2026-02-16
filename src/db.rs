@@ -345,10 +345,12 @@ impl Database {
         // First, repair any orphaned tool_use blocks
         Self::repair_orphaned_tool_use_internal(&conn, &now)?;
 
-        // Then reset all non-idle conversations to idle
+        // Reset non-terminal conversations to idle.
+        // Terminal states (context_exhausted) should NOT be reset - they represent
+        // completed conversations that cannot accept new messages.
         conn.execute(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') != 'idle'",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted')",
             params![idle_state, now.to_rfc3339()],
         )?;
         Ok(())
@@ -613,13 +615,9 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 }
 
 fn parse_message_type(s: &str) -> MessageType {
-    match s {
-        "user" => MessageType::User,
-        "agent" => MessageType::Agent,
-        "tool" => MessageType::Tool,
-        "error" => MessageType::Error,
-        _ => MessageType::System,
-    }
+    // Use serde to ensure we stay in sync with MessageType's Deserialize impl
+    // The JSON string format "type" matches our snake_case serde config
+    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(MessageType::System)
 }
 
 fn parse_datetime(s: &str) -> DateTime<Utc> {
@@ -693,6 +691,44 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    #[test]
+    fn test_reset_preserves_context_exhausted_state() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Create a conversation with context_exhausted state
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .unwrap();
+
+        // Manually set state to context_exhausted
+        let exhausted_state = ConvState::ContextExhausted {
+            summary: "Test summary".to_string(),
+        };
+        db.update_conversation_state("conv-1", &exhausted_state)
+            .unwrap();
+
+        // Verify state is set
+        let conv_before = db.get_conversation("conv-1").unwrap();
+        assert!(
+            matches!(conv_before.state, ConvState::ContextExhausted { .. }),
+            "State should be ContextExhausted before reset"
+        );
+
+        // Run reset
+        db.reset_all_to_idle().unwrap();
+
+        // Verify context_exhausted state is preserved (not reset to idle)
+        let conv_after = db.get_conversation("conv-1").unwrap();
+        assert!(
+            matches!(conv_after.state, ConvState::ContextExhausted { .. }),
+            "ContextExhausted state should be preserved after reset"
+        );
+
+        // Verify the summary is intact
+        if let ConvState::ContextExhausted { summary } = conv_after.state {
+            assert_eq!(summary, "Test summary");
+        }
     }
 
     #[test]
