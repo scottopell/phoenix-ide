@@ -674,8 +674,10 @@ Type=simple
 User=exedev
 {env_section}
 ExecStart={PROD_INSTALL_DIR}/phoenix-ide
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -706,10 +708,7 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         )
         version = f"dev-{result.stdout.strip()}"
     
-    # Stop service if running (binary may be in use)
-    subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME], capture_output=True)
-    
-    # Create install directory
+    # Create install directory (service keeps running - we'll reload after copy)
     print(f"Installing to {PROD_INSTALL_DIR}...")
     subprocess.run(["sudo", "mkdir", "-p", str(PROD_INSTALL_DIR)], check=True)
     
@@ -747,27 +746,46 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
         print(f"Failed to write systemd unit: {proc.stderr.decode()}", file=sys.stderr)
         sys.exit(1)
     
-    # Reload and restart
+    # Reload systemd and trigger hot reload
     subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
     subprocess.run(["sudo", "systemctl", "enable", PROD_SERVICE_NAME], check=True)
-    subprocess.run(["sudo", "systemctl", "restart", PROD_SERVICE_NAME], check=True)
     
-    time.sleep(1)
-    
-    # Check status
+    # Check if service is running - if so, reload (SIGHUP); if not, start
     result = subprocess.run(
         ["systemctl", "is-active", PROD_SERVICE_NAME],
         capture_output=True, text=True
     )
+    
     if result.stdout.strip() == "active":
+        # Service running - send SIGHUP for hot reload
+        print("Sending reload signal (SIGHUP)...")
+        subprocess.run(["sudo", "systemctl", "reload", PROD_SERVICE_NAME], check=True)
         print(f"\n✓ Deployed {version} to production")
         print(f"  Service: {PROD_SERVICE_NAME}")
         print(f"  Port: {PROD_PORT}")
         print(f"  Database: {PROD_DB_PATH}")
+        print(f"\n  Reload signal sent - service is restarting in place.")
+        print(f"  Clients will reconnect automatically.")
     else:
-        print(f"\n✗ Service failed to start", file=sys.stderr)
-        subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
-        sys.exit(1)
+        # Service not running - start it
+        print("Starting service...")
+        subprocess.run(["sudo", "systemctl", "start", PROD_SERVICE_NAME], check=True)
+        time.sleep(1)
+        
+        # Verify it started
+        result = subprocess.run(
+            ["systemctl", "is-active", PROD_SERVICE_NAME],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip() == "active":
+            print(f"\n✓ Deployed {version} to production")
+            print(f"  Service: {PROD_SERVICE_NAME}")
+            print(f"  Port: {PROD_PORT}")
+            print(f"  Database: {PROD_DB_PATH}")
+        else:
+            print(f"\n✗ Service failed to start", file=sys.stderr)
+            subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
+            sys.exit(1)
 
 
 def prod_daemon_deploy(ai_gateway: bool = False):

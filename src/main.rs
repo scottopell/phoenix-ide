@@ -18,11 +18,14 @@ use llm::{LlmConfig, ModelRegistry};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod hot_restart;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,12 +103,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = create_router(state).layer(cors).layer(compression);
 
-    // Start server
+    // Get listener (either inherited from previous process or bind fresh)
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("Phoenix IDE server listening on {}", addr);
+    let listener = hot_restart::get_listener(addr).await?;
+    tracing::info!("Phoenix IDE server listening on {}", listener.local_addr()?);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Set up signal handlers for hot restart
+    let server = axum::serve(listener, app);
+
+    // Run server with graceful shutdown on SIGHUP
+    server
+        .with_graceful_shutdown(hot_restart::shutdown_signal())
+        .await?;
 
     Ok(())
 }
