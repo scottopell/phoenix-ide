@@ -929,10 +929,13 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
     let path_str = path.to_string_lossy();
-    if !(!home.is_empty() && path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
+    if (home.is_empty() || !path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
         return Json(MkdirResponse {
             created: false,
-            error: Some(format!("Can only create directories under {} or /tmp", if home.is_empty() { "$HOME" } else { &home })),
+            error: Some(format!(
+                "Can only create directories under {} or /tmp",
+                if home.is_empty() { "$HOME" } else { &home }
+            )),
         });
     }
 

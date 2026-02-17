@@ -217,9 +217,9 @@ fn is_cd_to_cwd_pipeline(pipeline: &Pipeline, cwd: &str) -> bool {
 }
 
 /// Check if a `SimpleCommand` is a `cd` command to the given cwd
-fn is_cd_to_cwd_simple_command(cmd: &SimpleCommand, cwd: &str) -> bool {
+fn is_cd_to_cwd_simple_command(command: &SimpleCommand, cwd: &str) -> bool {
     // Check if command name is "cd"
-    let is_cd = cmd
+    let is_cd = command
         .word_or_name
         .as_ref()
         .is_some_and(|w| w.to_string() == "cd");
@@ -229,7 +229,7 @@ fn is_cd_to_cwd_simple_command(cmd: &SimpleCommand, cwd: &str) -> bool {
     }
 
     // Extract the cd target path from the suffix
-    let target = cmd
+    let target = command
         .suffix
         .as_ref()
         .and_then(|s| s.0.first())

@@ -92,18 +92,20 @@ pub fn transition(
         ),
 
         // Busy states + UserMessage -> Reject (REQ-BED-002)
-        (ConvState::AwaitingLlm, Event::UserMessage { .. })
-        | (ConvState::LlmRequesting { .. }, Event::UserMessage { .. })
-        | (ConvState::ToolExecuting { .. }, Event::UserMessage { .. })
-        | (ConvState::AwaitingSubAgents { .. }, Event::UserMessage { .. }) => {
-            Err(TransitionError::AgentBusy)
-        }
+        (
+            ConvState::AwaitingLlm
+            | ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::AwaitingSubAgents { .. },
+            Event::UserMessage { .. },
+        ) => Err(TransitionError::AgentBusy),
 
-        (ConvState::CancellingLlm, Event::UserMessage { .. })
-        | (ConvState::CancellingTool { .. }, Event::UserMessage { .. })
-        | (ConvState::CancellingSubAgents { .. }, Event::UserMessage { .. }) => {
-            Err(TransitionError::CancellationInProgress)
-        }
+        (
+            ConvState::CancellingLlm
+            | ConvState::CancellingTool { .. }
+            | ConvState::CancellingSubAgents { .. },
+            Event::UserMessage { .. },
+        ) => Err(TransitionError::CancellationInProgress),
 
         // ============================================================
         // LLM Response Processing (REQ-BED-003)

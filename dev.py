@@ -1503,9 +1503,9 @@ def lima_ensure_running():
     subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
 
 
-def lima_has_api_key() -> bool:
-    """Check if API key is configured in the VM."""
-    result = lima_shell_quiet(f"test -f {LIMA_ENV_FILE} && grep -q ANTHROPIC_API_KEY {LIMA_ENV_FILE}", check=False)
+def lima_has_llm_config() -> bool:
+    """Check if LLM config (API key or gateway) is configured in the VM."""
+    result = lima_shell_quiet(f"test -f {LIMA_ENV_FILE} && grep -qE '(ANTHROPIC_API_KEY|LLM_GATEWAY)' {LIMA_ENV_FILE}", check=False)
     return result.returncode == 0
 
 
@@ -1623,9 +1623,9 @@ def lima_prod_deploy():
     lima_shell(f"sudo cp {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
     lima_shell("sudo chmod +x /opt/phoenix-ide/phoenix-ide")
 
-    # API key
-    if not lima_has_api_key():
-        print("\nNo API key configured in VM.")
+    # LLM config (API key or gateway)
+    if not lima_has_llm_config():
+        print("\nNo LLM config in VM (no API key or LLM_GATEWAY).")
         lima_prompt_api_key()
 
     # Get version string
@@ -1710,11 +1710,11 @@ def lima_prod_status():
     svc_status = result.stdout.strip()
     print(f"  Service: {svc_status}")
 
-    # API key
-    if lima_has_api_key():
-        print("  API key: configured")
+    # LLM config
+    if lima_has_llm_config():
+        print("  LLM config: configured")
     else:
-        print("  API key: not set")
+        print("  LLM config: not set")
 
     # Health check from host
     if svc_status == "active":
