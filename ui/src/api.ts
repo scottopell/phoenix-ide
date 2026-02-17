@@ -277,6 +277,12 @@ export const api = {
     return resp.json();
   },
 
+  async getEnv(): Promise<{ home_dir: string }> {
+    const resp = await fetch('/api/env');
+    if (!resp.ok) throw new Error('Failed to get environment info');
+    return resp.json();
+  },
+
   streamConversation(
     convId: string,
     onEvent: (eventType: SseEventType, data: SseEventData) => void

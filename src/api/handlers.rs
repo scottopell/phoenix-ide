@@ -85,6 +85,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/files/read", get(read_file))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
+        // Environment info
+        .route("/api/env", get(get_env))
         // Version
         .route("/version", get(get_version))
         .with_state(state)
@@ -922,12 +924,15 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
         });
     }
 
-    // Don't allow creating directories outside of /home or /tmp
+    // Don't allow creating directories outside of user's home or /tmp
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     let path_str = path.to_string_lossy();
-    if !path_str.starts_with("/home/") && !path_str.starts_with("/tmp/") {
+    if !(!home.is_empty() && path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
         return Json(MkdirResponse {
             created: false,
-            error: Some("Can only create directories under /home or /tmp".to_string()),
+            error: Some(format!("Can only create directories under {} or /tmp", if home.is_empty() { "$HOME" } else { &home })),
         });
     }
 
@@ -1131,6 +1136,17 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
         models,
         default: state.llm_registry.default_model_id().to_string(),
     })
+}
+
+// ============================================================
+// Environment Info
+// ============================================================
+
+async fn get_env() -> Json<serde_json::Value> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    Json(serde_json::json!({ "home_dir": home }))
 }
 
 // ============================================================

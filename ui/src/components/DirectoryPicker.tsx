@@ -125,7 +125,7 @@ export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
           className={`path-input ${pathStatus.type}`}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="/home/exedev/my-project"
+          placeholder="/path/to/project"
         />
         <span className={`status-icon ${status.className}`} title={status.title}>
           {status.icon}

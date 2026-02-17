@@ -208,6 +208,10 @@ def ensure_ui_deps():
 
 def build_rust(release: bool = True):
     """Build the Rust backend."""
+    # RustEmbed requires ui/dist to exist at compile time, even if empty.
+    # In dev mode Vite serves assets, so an empty dir is fine.
+    (UI_DIR / "dist").mkdir(exist_ok=True)
+
     args = ["cargo", "build"]
     if release:
         args.append("--release")

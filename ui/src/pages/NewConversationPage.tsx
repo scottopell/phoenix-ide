@@ -70,8 +70,9 @@ export function NewConversationPage() {
   const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  
-  const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '/home/exedev');
+
+  const [homeDir, setHomeDir] = useState<string>('');
+  const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
   const [dirStatus, setDirStatus] = useState<DirStatus>('checking');
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
@@ -80,16 +81,23 @@ export function NewConversationPage() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  
+
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
 
-  // Load models
+  // Load models and environment info
   useEffect(() => {
     api.listModels().then(modelsData => {
       setModels(modelsData);
       if (!selectedModel) setSelectedModel(modelsData.default);
+    }).catch(console.error);
+    api.getEnv().then(env => {
+      setHomeDir(env.home_dir);
+      // Only set default cwd if nothing was saved in localStorage
+      if (!localStorage.getItem(LAST_CWD_KEY)) {
+        setCwd(env.home_dir);
+      }
     }).catch(console.error);
   }, [selectedModel]);
 
@@ -225,7 +233,9 @@ export function NewConversationPage() {
   const canSend = hasContent && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
 
   const { icon: dirStatusIcon, class: dirStatusClass } = DIR_STATUS_CONFIG[dirStatus];
-  const cwdDisplay = cwd.trim().replace(/^\/home\/exedev\/?/, '~/') || '~/';
+  const cwdDisplay = (homeDir && cwd.trim().startsWith(homeDir))
+    ? '~/' + cwd.trim().slice(homeDir.length).replace(/^\//, '')
+    : cwd.trim() || '~/';
   const modelDisplay = models?.models.find(m => m.id === selectedModel)?.id.replace(/-sonnet|-opus/g, '') || '...';
   const buttonText = creating ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
   const textareaValue = interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft;
