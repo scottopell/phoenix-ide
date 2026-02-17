@@ -211,10 +211,9 @@ THE SYSTEM SHALL send current state and recent messages
 WHEN LLM response includes usage data
 THE SYSTEM SHALL track context window consumption
 
-WHEN context approaches model limit
-THE SYSTEM SHALL notify user of approaching limit
-
 **Rationale:** Users need visibility into context usage to manage long conversations effectively.
+
+> **Note:** User notification at approaching limits is handled by REQ-BED-023 (Context Warning Indicator).
 
 ---
 
@@ -396,9 +395,6 @@ THE SYSTEM SHALL behave identically to automatic continuation at threshold
 WHEN sub-agent context usage reaches threshold
 THE SYSTEM SHALL fail the sub-agent immediately
 AND NOT trigger continuation flow for sub-agents
-AND report failure to parent conversation
+AND report failure to parent conversation as "context exhausted before result submission"
 
-WHEN parent receives sub-agent context exhaustion failure
-THE SYSTEM SHALL allow parent to spawn replacement sub-agent with refined task
-
-**Rationale:** Sub-agents are short-lived workers that shouldn't run long enough to exhaust context. If they do, failing fast lets the parent adapt rather than generating summaries nobody will read.
+**Rationale:** Sub-agents are short-lived workers that shouldn't run long enough to exhaust context. If they do, failing fast surfaces the failure to the parent agent which can naturally decide how to proceed (retry with refined task, work around it, etc.).

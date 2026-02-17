@@ -237,6 +237,38 @@ Error { .. } + UserMessage { .. } => {
 }
 ```
 
+## Mode Upgrade Tool (REQ-BED-015)
+
+The `request_mode_upgrade` tool allows agents to request transition from Restricted to Unrestricted mode:
+
+```rust
+struct RequestModeUpgradeTool;
+
+impl Tool for RequestModeUpgradeTool {
+    fn name(&self) -> &str { "request_mode_upgrade" }
+    
+    fn schema(&self) -> Schema {
+        json!({
+            "type": "object",
+            "required": ["reason"],
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Explanation of why write access is needed"
+                }
+            }
+        })
+    }
+}
+```
+
+**Behavior:**
+- Called in Unrestricted mode: Returns error "Already in Unrestricted mode"
+- Called in Restricted mode: Pauses execution, awaits user decision, returns result after user responds
+- Not available to sub-agents (REQ-BED-018)
+
+---
+
 ## Sub-Agent Result Submission (REQ-BED-008, REQ-BED-009)
 
 Sub-agents have a special tool to submit their final result:

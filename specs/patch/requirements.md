@@ -137,3 +137,20 @@ THE SYSTEM SHALL reject the operation
 AND suggest breaking into smaller patches
 
 **Rationale:** Large patches risk context window issues and are harder to review. Incremental edits are preferred.
+
+---
+
+### REQ-PATCH-009: Mode-Based Availability
+
+WHEN conversation is in Restricted mode
+THE SYSTEM SHALL disable the patch tool entirely
+AND return error: "Patch tool is disabled in Restricted mode. Use request_mode_upgrade to request write access."
+
+WHEN conversation is in Unrestricted mode
+THE SYSTEM SHALL enable full patch tool functionality
+
+WHEN mode changes from Unrestricted to Restricted
+THE SYSTEM SHALL immediately disable patch tool
+AND NOT affect any in-flight operations (mode change waits for idle)
+
+**Rationale:** Patch writes files and must be disabled in read-only mode. Phoenix-level enforcement provides clear, actionable error messages guiding agents to request appropriate permissions.
