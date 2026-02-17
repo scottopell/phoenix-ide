@@ -40,22 +40,6 @@ LIMA_ENV_FILE = "/etc/phoenix-ide/env"
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
 
-# AI Gateway configuration (must be set in environment)
-def get_ai_gateway_config():
-    """Get AI Gateway config from environment variables (required)."""
-    url = os.environ.get('AI_GATEWAY_URL')
-    datacenter = os.environ.get('AI_GATEWAY_DATACENTER')
-    service = os.environ.get('AI_GATEWAY_SERVICE')
-
-    if not all([url, datacenter, service]):
-        print("ERROR: AI Gateway requires these environment variables:", file=sys.stderr)
-        print("  AI_GATEWAY_URL", file=sys.stderr)
-        print("  AI_GATEWAY_DATACENTER", file=sys.stderr)
-        print("  AI_GATEWAY_SERVICE", file=sys.stderr)
-        sys.exit(1)
-
-    return {'url': url, 'datacenter': datacenter, 'service': service}
-
 # Base ports - offset added based on worktree path hash
 # Both ports must stay within exposed ranges: 6000-6010, 8000-8050, 8080, 8443
 BASE_PHOENIX_PORT = 8000  # API will use 8000-8024
@@ -67,7 +51,9 @@ DB_DIR = Path.home() / ".phoenix-ide"
 
 
 def get_llm_gateway() -> str:
-    """Get LLM gateway URL from exe.dev config or default."""
+    """Get LLM gateway URL from env, exe.dev config, or default."""
+    if val := os.environ.get("LLM_GATEWAY"):
+        return val
     if EXE_DEV_CONFIG.exists():
         try:
             config = json.loads(EXE_DEV_CONFIG.read_text())
@@ -834,9 +820,9 @@ WantedBy=sockets.target
 """
 
 
-def generate_systemd_service(config: SystemdConfig, version: str, use_ai_gateway: bool = False) -> str:
+def generate_systemd_service(config: SystemdConfig, version: str) -> str:
     """Generate systemd service unit file content.
-    
+
     This unit requires the socket unit (phoenix-ide.socket) which provides
     the listening socket via systemd socket activation.
     """
@@ -845,17 +831,7 @@ def generate_systemd_service(config: SystemdConfig, version: str, use_ai_gateway
         f"Environment=PHOENIX_VERSION={version}",
     ]
 
-    if use_ai_gateway:
-        ai_config = get_ai_gateway_config()
-        env_lines.extend([
-            "Environment=AI_GATEWAY_ENABLED=true",
-            f"Environment=AI_GATEWAY_URL={ai_config['url']}",
-            f"Environment=AI_GATEWAY_DATACENTER={ai_config['datacenter']}",
-            f"Environment=AI_GATEWAY_SERVICE={ai_config['service']}",
-            "Environment=AI_GATEWAY_SOURCE=phoenix-ide",
-            "Environment=AI_GATEWAY_ORG_ID=2",
-        ])
-    elif config.env_file:
+    if config.env_file:
         # Lima mode: use EnvironmentFile for API key
         env_lines.insert(0, f"EnvironmentFile={config.env_file}")
     elif config.llm_gateway:
@@ -889,7 +865,7 @@ WantedBy=multi-user.target
 """
 
 
-def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
+def native_prod_deploy(version: str | None = None):
     """Build and deploy to production (native Linux)."""
     # Check if systemd is available
     if not check_systemd_available():
@@ -926,17 +902,6 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
     # Ensure database directory exists
     PROD_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    # Authenticate AI Gateway if needed (similar to lima_prompt_api_key pattern)
-    if ai_gateway:
-        print("\n=== AI Gateway Authentication ===")
-        if not check_ai_gateway_auth():
-            print("No valid ddtool authentication found.")
-            if not prompt_ai_gateway_auth():
-                print("ERROR: AI Gateway authentication required for deployment.", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("✓ Using existing ddtool authentication")
-
     # Configure for native deployment
     config = dataclasses.replace(NATIVE_SYSTEMD_CONFIG, llm_gateway=get_llm_gateway())
 
@@ -956,9 +921,9 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
 
     # Install systemd service unit
     print("Installing systemd service unit...")
-    unit_content = generate_systemd_service(config, version, use_ai_gateway=ai_gateway)
+    unit_content = generate_systemd_service(config, version)
     unit_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
-    
+
     proc = subprocess.run(
         ["sudo", "tee", str(unit_file)],
         input=unit_content.encode(),
@@ -1037,7 +1002,7 @@ def native_prod_deploy(version: str | None = None, ai_gateway: bool = False):
             sys.exit(1)
 
 
-def prod_daemon_deploy(ai_gateway: bool = False):
+def prod_daemon_deploy():
     """Deploy as background daemon in ~/.phoenix-ide/ (no systemd).
 
     Used when systemd is not available (containers, non-systemd Linux).
@@ -1045,18 +1010,6 @@ def prod_daemon_deploy(ai_gateway: bool = False):
     """
     # Build binary (keep debug symbols for debugging)
     binary = prod_build(version=None, strip=False)
-
-    # Authenticate AI Gateway if needed
-    if ai_gateway:
-        config = get_ai_gateway_config()
-        print("\n=== AI Gateway Authentication ===")
-        if not check_ai_gateway_auth():
-            print("No valid ddtool authentication found.")
-            if not prompt_ai_gateway_auth():
-                print("ERROR: AI Gateway authentication required.", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("✓ Using existing ddtool authentication")
 
     # Set up environment
     env = os.environ.copy()
@@ -1071,20 +1024,12 @@ def prod_daemon_deploy(ai_gateway: bool = False):
 
     env["PHOENIX_DB_PATH"] = str(prod_db_path)
 
-    if ai_gateway:
-        env["AI_GATEWAY_ENABLED"] = "true"
-        env["AI_GATEWAY_URL"] = config['url']
-        env["AI_GATEWAY_DATACENTER"] = config['datacenter']
-        env["AI_GATEWAY_SERVICE"] = config['service']
-        env["AI_GATEWAY_SOURCE"] = "phoenix-ide"
-        env["AI_GATEWAY_ORG_ID"] = "2"
-    else:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            print("ERROR: ANTHROPIC_API_KEY not set.", file=sys.stderr)
-            print("Set it in your environment or use --ai-gateway flag.", file=sys.stderr)
-            sys.exit(1)
-        env["ANTHROPIC_API_KEY"] = api_key
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY not set.", file=sys.stderr)
+        print("Set it in your environment before deploying.", file=sys.stderr)
+        sys.exit(1)
+    env["ANTHROPIC_API_KEY"] = api_key
 
     # Stop existing daemon if running
     if prod_pid_path.exists():
@@ -1134,7 +1079,8 @@ def prod_daemon_deploy(ai_gateway: bool = False):
     print(f"  Database: {prod_db_path}")
     print(f"  Logs: {prod_log_path}")
     print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
-    print(f"  LLM Mode: {'AI Gateway' if ai_gateway else 'Direct API'}")
+    llm_mode = "exe.dev gateway" if os.environ.get("LLM_GATEWAY") else "Direct API"
+    print(f"  LLM Mode: {llm_mode}")
     print()
     print("Use './dev.py prod status' to check status")
     print("Use './dev.py prod stop' to stop the server")
@@ -1348,7 +1294,7 @@ def cmd_prod_build(version: str | None = None):
     prod_build(version)
 
 
-def cmd_prod_deploy(version: str | None = None, ai_gateway: bool = False):
+def cmd_prod_deploy(version: str | None = None):
     """Build and deploy to production (auto-detects environment)."""
     print("Running pre-deploy checks...\n")
     cmd_check()
@@ -1358,17 +1304,17 @@ def cmd_prod_deploy(version: str | None = None, ai_gateway: bool = False):
 
     if env == "native":
         print("📦 Detected: Linux with systemd (native deployment)")
-        native_prod_deploy(version, ai_gateway)
+        native_prod_deploy(version)
 
     elif env == "lima":
         print("📦 Detected: macOS with Lima VM")
-        lima_prod_deploy(ai_gateway)
+        lima_prod_deploy()
 
     elif env == "daemon":
         print("📦 Detected: No systemd (daemon mode)")
         print("    Running production build as background daemon")
         print()
-        prod_daemon_deploy(ai_gateway)
+        prod_daemon_deploy()
 
     elif env is None:
         # macOS without Lima
@@ -1561,47 +1507,6 @@ def lima_prompt_api_key():
     print("API key saved.")
 
 
-def check_ai_gateway_auth() -> bool:
-    """Check if ddtool is already authenticated."""
-    config = get_ai_gateway_config()
-    try:
-        result = subprocess.run(
-            ["ddtool", "auth", "token", config['service'],
-             "--datacenter", config['datacenter']],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.returncode == 0 and result.stdout.strip()
-    except:
-        return False
-
-
-def prompt_ai_gateway_auth():
-    """Prompt user to authenticate ddtool interactively.
-
-    Similar to lima_prompt_api_key(), but runs ddtool command.
-    This happens during deployment, not at runtime.
-    """
-    print("\n🔐 AI Gateway requires authentication via ddtool.")
-    print("This will open a browser window for OAuth authentication.")
-
-    config = get_ai_gateway_config()
-    try:
-        # Run ddtool interactively (inherits stdin/stdout)
-        subprocess.run(
-            ["ddtool", "auth", "token", config['service'],
-             "--datacenter", config['datacenter']],
-            check=True
-        )
-        print("✓ Authentication successful!")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"✗ Authentication failed: {e}", file=sys.stderr)
-        return False
-    except FileNotFoundError:
-        print("✗ ddtool not found. Install: https://github.com/DataDog/devtools", file=sys.stderr)
-        return False
-
-
 def cmd_lima_create():
     """Create and provision the Lima VM."""
     # Check limactl exists
@@ -1646,7 +1551,7 @@ def cmd_lima_create():
     print(f"\nVM '{LIMA_VM_NAME}' is ready.")
 
 
-def lima_prod_deploy(ai_gateway: bool = False):
+def lima_prod_deploy():
     """Build and deploy phoenix-ide inside the Lima VM."""
     lima_ensure_running()
 
@@ -1689,21 +1594,10 @@ def lima_prod_deploy(ai_gateway: bool = False):
     lima_shell(f"sudo cp {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
     lima_shell("sudo chmod +x /opt/phoenix-ide/phoenix-ide")
 
-    # Authenticate AI Gateway if needed (on host machine, not in VM)
-    if ai_gateway:
-        print("\n=== AI Gateway Authentication ===")
-        if not check_ai_gateway_auth():
-            print("No valid ddtool authentication found on host.")
-            if not prompt_ai_gateway_auth():
-                print("ERROR: AI Gateway authentication required for deployment.", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("✓ Using existing ddtool authentication")
-    else:
-        # API key (only needed for non-AI Gateway mode)
-        if not lima_has_api_key():
-            print("\nNo API key configured in VM.")
-            lima_prompt_api_key()
+    # API key
+    if not lima_has_api_key():
+        print("\nNo API key configured in VM.")
+        lima_prompt_api_key()
 
     # Get version string
     result = subprocess.run(
@@ -1726,7 +1620,7 @@ def lima_prod_deploy(ai_gateway: bool = False):
 
     # Install systemd service unit
     print("Installing systemd service unit...")
-    unit_content = generate_systemd_service(config, version, use_ai_gateway=ai_gateway)
+    unit_content = generate_systemd_service(config, version)
     subprocess.run(
         ["limactl", "shell", LIMA_VM_NAME, "--",
          "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.service"],
@@ -1867,7 +1761,6 @@ def main():
     build_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
     deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
     deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
-    deploy_parser.add_argument("--ai-gateway", action="store_true", help="Enable AI Gateway mode")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     # Override management
@@ -1906,7 +1799,7 @@ def main():
         if args.prod_command == "build":
             cmd_prod_build(args.version)
         elif args.prod_command == "deploy":
-            cmd_prod_deploy(args.version, ai_gateway=args.ai_gateway)
+            cmd_prod_deploy(args.version)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":

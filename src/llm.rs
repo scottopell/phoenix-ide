@@ -2,7 +2,6 @@
 //!
 //! Provides a common interface for interacting with various LLM providers.
 
-mod ai_gateway;
 mod anthropic;
 mod error;
 mod models;
@@ -12,7 +11,6 @@ mod proptests;
 mod registry;
 mod types;
 
-pub use ai_gateway::AIGatewayService;
 pub use anthropic::AnthropicService;
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ModelDef, Provider};

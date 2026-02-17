@@ -13,7 +13,7 @@ src/
   runtime/       # Conversation lifecycle, state machine executor
   state_machine/ # Pure state transitions (Elm architecture)
   tools/         # bash, patch, browser, keyword_search, think, etc.
-  llm/           # Provider abstraction (Anthropic, OpenAI, AI Gateway)
+  llm/           # Provider abstraction (Anthropic, OpenAI, Fireworks)
   api/           # HTTP handlers, SSE streaming
   db/            # SQLite persistence
 ui/src/

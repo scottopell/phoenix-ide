@@ -10,7 +10,6 @@
 
 #![allow(clippy::redundant_closure_for_method_calls)]
 
-use super::ai_gateway;
 use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
     self, OpenAIChoice, OpenAIContent, OpenAIFunctionCall, OpenAIMessage, OpenAIResponse,
@@ -123,14 +122,6 @@ fn arb_message() -> impl Strategy<Value = LlmMessage> {
     prop_oneof![arb_user_message(), arb_assistant_message(),]
 }
 
-/// Assistant message that may contain only ToolResult blocks (edge case for bug #4)
-fn arb_assistant_with_tool_results_only() -> impl Strategy<Value = LlmMessage> {
-    proptest::collection::vec(arb_tool_result_block(), 1..4).prop_map(|content| LlmMessage {
-        role: MessageRole::Assistant,
-        content,
-    })
-}
-
 // ============================================================================
 // Strategies — provider-specific response generators
 // ============================================================================
@@ -205,16 +196,6 @@ proptest! {
         prop_assert!(result.is_err(), "Expected error for empty OpenAI response");
     }
 
-    /// Empty AI Gateway response → Err
-    #[test]
-    fn prop_ai_gateway_normalize_rejects_empty(
-        finish_reason in proptest::option::of("[a-z_]{3,10}")
-    ) {
-        let resp = make_openai_response(None, None, finish_reason);
-        let result = ai_gateway::test_helpers::normalize_response(resp);
-        prop_assert!(result.is_err(), "Expected error for empty AI Gateway response");
-    }
-
     /// Empty Anthropic response → Err
     #[test]
     fn prop_anthropic_normalize_rejects_empty(
@@ -245,14 +226,6 @@ proptest! {
         );
         if let Ok(resp) = openai::test_helpers::normalize_response(openai_resp) {
             prop_assert!(!resp.content.is_empty(), "OpenAI Ok response had empty content");
-        }
-
-        // AI Gateway (same format)
-        let gw_resp = make_openai_response(
-            Some(text.clone()), None, Some("stop".to_string()),
-        );
-        if let Ok(resp) = ai_gateway::test_helpers::normalize_response(gw_resp) {
-            prop_assert!(!resp.content.is_empty(), "AI Gateway Ok response had empty content");
         }
 
         // Anthropic
@@ -363,12 +336,6 @@ proptest! {
 
             let result = openai::test_helpers::normalize_response(resp);
             prop_assert!(result.is_err(), "Expected error for invalid JSON args: {}", invalid);
-
-            // Also check AI Gateway
-            let tc2 = make_openai_tool_call(&id, &name, invalid);
-            let resp2 = make_openai_response(None, Some(vec![tc2]), Some("tool_calls".to_string()));
-            let result2 = ai_gateway::test_helpers::normalize_response(resp2);
-            prop_assert!(result2.is_err(), "AI Gateway should reject invalid JSON args: {}", invalid);
         }
     }
 }
@@ -404,42 +371,6 @@ proptest! {
                 "OpenAI message has neither content, tool_calls, nor tool_call_id: role={}",
                 m.role,
             );
-        }
-    }
-
-    /// Same invariant for AI Gateway
-    #[test]
-    fn prop_ai_gateway_convert_messages_have_content_or_tool_id(
-        msg in arb_message(),
-    ) {
-        let messages = ai_gateway::test_helpers::convert_message(&msg);
-        for m in &messages {
-            let has_content = m.content.is_some();
-            let has_tool_calls = m.tool_calls.is_some();
-            let has_tool_call_id = m.tool_call_id.is_some();
-            prop_assert!(
-                has_content || has_tool_calls || has_tool_call_id,
-                "AI Gateway message has neither content, tool_calls, nor tool_call_id: role={}",
-                m.role,
-            );
-        }
-    }
-
-    /// Assistant message with only ToolResult blocks → no message with both content=None and tool_calls=None
-    /// (catches bug #4)
-    #[test]
-    fn prop_ai_gateway_assistant_message_not_both_none(
-        msg in arb_assistant_with_tool_results_only(),
-    ) {
-        let messages = ai_gateway::test_helpers::convert_message(&msg);
-        for m in &messages {
-            if m.role == "assistant" {
-                let both_none = m.content.is_none() && m.tool_calls.is_none();
-                prop_assert!(
-                    !both_none,
-                    "AI Gateway produced assistant message with content=None and tool_calls=None",
-                );
-            }
         }
     }
 }
@@ -557,53 +488,7 @@ proptest! {
 }
 
 // ============================================================================
-// Group F — Cross-provider consistency
-// ============================================================================
-
-proptest! {
-
-
-    /// AI Gateway and OpenAI produce same text content for same input message
-    #[test]
-    fn prop_gateway_and_openai_translate_same_text(
-        msg in arb_assistant_message(),
-    ) {
-        let openai_msgs = openai::test_helpers::translate_message(&msg);
-        let gw_msgs = ai_gateway::test_helpers::convert_message(&msg);
-
-        // Extract text content from both
-        let openai_text: Vec<String> = openai_msgs.iter().filter_map(|m| {
-            if m.role == "assistant" {
-                match &m.content {
-                    Some(OpenAIContent::Text(t)) => Some(t.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }).collect();
-
-        let gw_text: Vec<String> = gw_msgs.iter().filter_map(|m| {
-            if m.role == "assistant" {
-                match &m.content {
-                    Some(OpenAIContent::Text(t)) => Some(t.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }).collect();
-
-        prop_assert_eq!(
-            openai_text,
-            gw_text,
-            "Text content differs between OpenAI and AI Gateway translation"
-        );
-    }
-}
-
-// ============================================================================
-// Group G — Serialization safety
+// Group F — Serialization safety
 // ============================================================================
 
 proptest! {
@@ -619,13 +504,6 @@ proptest! {
         for m in &openai_msgs {
             let result = serde_json::to_value(m);
             prop_assert!(result.is_ok(), "OpenAI message failed to serialize: {:?}", result.err());
-        }
-
-        // AI Gateway translation
-        let gw_msgs = ai_gateway::test_helpers::convert_message(&msg);
-        for m in &gw_msgs {
-            let result = serde_json::to_value(m);
-            prop_assert!(result.is_ok(), "AI Gateway message failed to serialize: {:?}", result.err());
         }
     }
 }
