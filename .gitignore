@@ -1,13 +1,17 @@
 /target
 .phoenix.pid
 .vite.pid
-phoenix.log
 __pycache__/
+
+# Logs
+*.log
+
+# Local dev certs
+certs/
 
 # UI
 ui/node_modules
 ui/dist
-static/dist/
 static/dist/
 
 # Tools
