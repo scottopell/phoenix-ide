@@ -8,7 +8,7 @@ const apiPort = process.env.VITE_API_PORT || '8000';
 export default defineConfig({
   plugins: [react()],
   server: {
-    allowedHosts: ['meteor-rain.exe.xyz', '.workspace.infra.dog'],
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: `http://localhost:${apiPort}`,
