@@ -4,10 +4,11 @@ import { api, Conversation, Message, ConversationState, SseEventType, SseEventDa
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
+import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowser } from '../components/FileBrowser';
 import { ProseReader } from '../components/ProseReader';
-import { useDraft, useMessageQueue, useConnection } from '../hooks';
+import { useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
@@ -44,13 +45,11 @@ export function ConversationPage() {
   } | null>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
+  const inputRef = useRef<InputAreaHandle>(null);
 
   // App state for offline support
   const { isOnline, queueOperation } = useAppMachine();
 
-  // Draft management
-  const [draft, setDraft, clearDraft] = useDraft(conversationId);
-  
   // Image attachments (not persisted - cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
 
@@ -371,9 +370,6 @@ export function ConversationPage() {
   const handleSend = (text: string, attachedImages: ImageData[]) => {
     if (!conversationId) return;
 
-    clearDraft();
-    setImages([]);
-
     const msg = enqueue(text, attachedImages);
 
     if (isConnected) {
@@ -428,13 +424,9 @@ export function ConversationPage() {
   }, []);
 
   const handleSendNotes = useCallback((formattedNotes: string) => {
-    if (draft.trim()) {
-      setDraft(draft + '\n\n' + formattedNotes);
-    } else {
-      setDraft(formattedNotes);
-    }
+    inputRef.current?.appendToDraft(formattedNotes);
     setProseReaderFile(null);
-  }, [draft, setDraft]);
+  }, []);
 
   const handleOpenFileFromPatch = useCallback((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
     const rootDir = conversation?.cwd || '/';
@@ -516,8 +508,8 @@ export function ConversationPage() {
         </div>
       )}
       <InputArea
-        draft={draft}
-        setDraft={setDraft}
+        ref={inputRef}
+        conversationId={conversationId}
         images={images}
         setImages={setImages}
         canSend={canSend}

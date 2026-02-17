@@ -1,14 +1,18 @@
-import { useRef, useEffect, useCallback, useState, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { useRef, useEffect, useCallback, useState, forwardRef, useImperativeHandle, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { FolderOpen } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
+import { useDraft } from '../hooks';
 import type { ImageData } from '../api';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 
+export interface InputAreaHandle {
+  appendToDraft: (text: string) => void;
+}
+
 interface InputAreaProps {
-  draft: string;
-  setDraft: (text: string) => void;
+  conversationId: string | undefined;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
   canSend: boolean;
@@ -22,11 +26,8 @@ interface InputAreaProps {
   onOpenFileBrowser?: () => void;
 }
 
-
-
-export function InputArea({
-  draft,
-  setDraft,
+export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
+  conversationId,
   images,
   setImages,
   canSend,
@@ -38,10 +39,17 @@ export function InputArea({
   onCancel,
   onRetry,
   onOpenFileBrowser,
-}: InputAreaProps) {
+}, ref) {
+  const [draft, setDraft, clearDraft] = useDraft(conversationId);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const voiceSupported = isWebSpeechSupported();
+
+  useImperativeHandle(ref, () => ({
+    appendToDraft: (text: string) => {
+      setDraft(draft.trim() ? draft + '\n\n' + text : text);
+    },
+  }), [draft, setDraft]);
   
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useState<string | null>(null); // null = not recording
@@ -108,10 +116,10 @@ export function InputArea({
       // End recording state
       setVoiceBase(null);
       setVoiceInterim('');
-      setDraft(''); // Clear draft too since we're sending
+      clearDraft();
     } else {
       text = draft.trim();
-      setDraft('');
+      clearDraft();
     }
     
     // Can send if there's text OR images
@@ -273,4 +281,4 @@ export function InputArea({
       </div>
     </footer>
   );
-}
+});
