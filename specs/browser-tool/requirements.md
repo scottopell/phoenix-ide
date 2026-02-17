@@ -243,6 +243,31 @@ THE SYSTEM SHALL indicate which context (page, service worker) produced each mes
 
 ---
 
+### REQ-BT-024: Capture Network Requests
+
+THE SYSTEM SHALL capture HTTP network requests made by the page
+
+THE SYSTEM SHALL provide a way to retrieve recent network requests with:
+- Request URL
+- HTTP method
+- Response status code
+- Response content type
+- Timing information (request start, response received)
+
+THE SYSTEM SHALL provide a way to clear captured network requests
+
+WHEN a request fails (network error, timeout, CORS blocked)
+THE SYSTEM SHALL capture the failure reason
+
+WHEN output exceeds a size threshold
+THE SYSTEM SHALL write requests to a file and return the file path
+
+**Rationale:** Network request visibility is essential for debugging API integrations and understanding application behavior. Agents need to verify that requests are made correctly and responses are received as expected, complementing console logs for comprehensive debugging.
+
+**User Stories:** US-1, US-2
+
+---
+
 ## Requirements Traceability
 
 | Requirement | User Story | MVP |
@@ -260,3 +285,4 @@ THE SYSTEM SHALL indicate which context (page, service worker) produced each mes
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
 | REQ-BT-023: Multi-Context Console | US-3 | ❌ |
+| REQ-BT-024: Capture Network Requests | US-1, US-2 | ❌ |

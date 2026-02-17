@@ -40,6 +40,7 @@ Core tools wrap chromiumoxide's Page API: navigation, JavaScript evaluation, scr
 | **REQ-BT-021:** Network Request Source | ❌ Not Started | PWA-specific |
 | **REQ-BT-022:** Offline Mode Simulation | ❌ Not Started | PWA-specific |
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
+| **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
 **MVP Progress:** 1 of 9 complete (REQ-BT-006 exists)  
-**Total Progress:** 1 of 13 complete
+**Total Progress:** 1 of 14 complete
