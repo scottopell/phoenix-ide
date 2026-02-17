@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, memo } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 import type { Message, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -20,7 +20,7 @@ interface MessageListProps {
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
 const SCROLL_THRESHOLD = 100;
 
-export const MessageList = memo(function MessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile }: MessageListProps) {
+export function MessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile }: MessageListProps) {
   const mainRef = useRef<HTMLElement>(null);
   const isPinnedToBottom = useRef(true); // Start pinned to bottom
   const prevMessagesLength = useRef(messages.length);
@@ -134,4 +134,4 @@ export const MessageList = memo(function MessageList({ messages, queuedMessages,
       </section>
     </main>
   );
-});
+}
