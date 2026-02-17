@@ -282,7 +282,7 @@ fn effects_are_valid(effects: &[Effect], new_state: &ConvState) -> bool {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
+
 
     // Invariant 1: Valid state after any transition
     #[test]

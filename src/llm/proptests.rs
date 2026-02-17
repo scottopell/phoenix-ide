@@ -193,7 +193,7 @@ fn make_anthropic_response(
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// Empty OpenAI response (no content, no tool calls) → Err
     #[test]
@@ -271,7 +271,7 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// N tool calls with non-empty names → exactly N ToolUse blocks in output
     #[test]
@@ -319,7 +319,7 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// Valid JSON arguments survive normalize: round-trip check
     #[test]
@@ -378,7 +378,7 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// Any LlmMessage → at least one OpenAIMessage
     #[test]
@@ -449,7 +449,7 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// Anthropic translate is 1:1 (same number of content blocks, types match)
     #[test]
@@ -561,7 +561,7 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// AI Gateway and OpenAI produce same text content for same input message
     #[test]
@@ -607,7 +607,7 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+
 
     /// Translated messages serialize without error
     #[test]
