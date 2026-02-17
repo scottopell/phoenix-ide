@@ -261,14 +261,25 @@ Before execution, commands are parsed and checked for dangerous patterns.
 
 ### Architecture
 
+Uses `brush-parser` (pure Rust bash parser) to parse scripts into a typed AST, then recursively walks the AST to find and check all `SimpleCommand` nodes.
+
 ```rust
 // src/tools/bash_check.rs
 
+use brush_parser::{Parser, ParserOptions, SourceInfo};
+use brush_parser::ast::{Command, CompoundCommand, CompoundList, Pipeline, SimpleCommand};
+
 pub fn check(script: &str) -> Result<(), CheckError> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_bash::LANGUAGE.into())?;
-    let tree = parser.parse(script, None)?;
-    check_node(tree.root_node(), script.as_bytes())
+    let cursor = Cursor::new(script);
+    let mut parser = Parser::new(cursor, &ParserOptions::default(), &SourceInfo::default());
+    let program = parser.parse_program().map_err(|_| CheckError {
+        message: "Failed to parse script".into(),
+    })?;
+    
+    for complete_cmd in &program.complete_commands {
+        check_compound_list(complete_cmd)?;
+    }
+    Ok(())
 }
 ```
 
@@ -276,9 +287,9 @@ pub fn check(script: &str) -> Result<(), CheckError> {
 
 | Check | Blocked Patterns | Allowed |
 |-------|-----------------|----------|
-| `no_blind_git_add` | `git add -A`, `git add .`, `git add --all`, `git add *` | `git add file.rs` |
-| `no_force_push` | `git push --force`, `git push -f` | `git push --force-with-lease` |
-| `no_dangerous_rm` | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `rm -rf *` | `rm -rf node_modules` |
+| `check_git_add` | `git add -A`, `git add .`, `git add --all`, `git add *` | `git add file.rs` |
+| `check_git_push` | `git push --force`, `git push -f` | `git push --force-with-lease` |
+| `check_rm_command` | `rm -rf /`, `rm -rf ~`, `rm -rf .git`, `rm -rf *` | `rm -rf node_modules` |
 
 ### Sudo Handling
 
@@ -291,19 +302,81 @@ let args = if args.first() == Some(&"sudo".to_string()) {
 };
 ```
 
-### Pipeline/Compound Command Handling
+### AST Traversal
 
-The parser walks the full AST, checking each command node:
+The brush-parser AST is hierarchical. Commands can be nested within:
+- **Pipelines** (`cmd1 | cmd2`)
+- **And/Or chains** (`cmd1 && cmd2`, `cmd1 || cmd2`)
+- **Compound commands** (loops, conditionals, subshells, brace groups)
+
+The checker recursively descends through all these structures:
+
 ```rust
-fn check_node(node: Node, source: &[u8]) -> Result<(), CheckError> {
-    if node.kind() == "command" {
-        check_command(node, source)?;
-    }
-    // Recurse into children (handles &&, ||, pipes, etc.)
-    for child in node.children(&mut cursor) {
-        check_node(child, source)?;
+fn check_compound_list(list: &CompoundList) -> Result<(), CheckError> {
+    for item in &list.0 {
+        check_and_or_list(&item.0)?;
     }
     Ok(())
+}
+
+fn check_and_or_list(list: &AndOrList) -> Result<(), CheckError> {
+    check_pipeline(&list.first)?;
+    for and_or in &list.additional {
+        match and_or {
+            AndOr::And(pipeline) | AndOr::Or(pipeline) => check_pipeline(pipeline)?,
+        }
+    }
+    Ok(())
+}
+
+fn check_pipeline(pipeline: &Pipeline) -> Result<(), CheckError> {
+    for cmd in &pipeline.seq {
+        check_command(cmd)?;
+    }
+    Ok(())
+}
+
+fn check_command(cmd: &Command) -> Result<(), CheckError> {
+    match cmd {
+        Command::Simple(simple) => check_simple_command(simple),
+        Command::Compound(compound, _) => check_compound_command(compound),
+        Command::Function(func) => check_compound_command(&func.body.0),
+        Command::ExtendedTest(_) => Ok(()),
+    }
+}
+
+fn check_compound_command(cmd: &CompoundCommand) -> Result<(), CheckError> {
+    match cmd {
+        CompoundCommand::BraceGroup(bg) => check_compound_list(&bg.body),
+        CompoundCommand::Subshell(sub) => check_compound_list(&sub.body),
+        CompoundCommand::ForClause(fc) => check_compound_list(&fc.body.list),
+        CompoundCommand::WhileClause(wc) | CompoundCommand::UntilClause(wc) => {
+            check_compound_list(&wc.0)?;
+            check_compound_list(&wc.1.list)
+        }
+        CompoundCommand::IfClause(ic) => {
+            check_compound_list(&ic.condition)?;
+            check_compound_list(&ic.then)?;
+            if let Some(elses) = &ic.elses {
+                for else_clause in elses {
+                    if let Some(cond) = &else_clause.condition {
+                        check_compound_list(cond)?;
+                    }
+                    check_compound_list(&else_clause.body)?;
+                }
+            }
+            Ok(())
+        }
+        CompoundCommand::CaseClause(cc) => {
+            for item in &cc.items {
+                if let Some(body) = &item.body {
+                    check_compound_list(body)?;
+                }
+            }
+            Ok(())
+        }
+        CompoundCommand::Arithmetic(_) | CompoundCommand::ArithmeticForClause(_) => Ok(()),
+    }
 }
 ```
 

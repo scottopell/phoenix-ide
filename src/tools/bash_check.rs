@@ -3,8 +3,12 @@
 //! UX layer to catch common LLM mistakes before execution.
 //! NOT a security boundary - just helpful guardrails.
 
-use brush_parser::ast::{AndOr, AndOrList, Command, Pipeline, SimpleCommand};
-use tree_sitter::{Node, Parser, Tree};
+use brush_parser::ast::{
+    AndOr, AndOrList, Command, CommandPrefixOrSuffixItem, CompoundCommand, CompoundList, Pipeline,
+    SimpleCommand,
+};
+use brush_parser::{Parser, ParserOptions, SourceInfo};
+use std::io::Cursor;
 
 /// Error returned when a command is blocked
 #[derive(Debug)]
@@ -20,23 +24,19 @@ impl std::fmt::Display for CheckError {
 
 impl std::error::Error for CheckError {}
 
-/// Parse a bash script into a tree-sitter AST.
-fn parse_script(script: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .ok()?;
-    parser.parse(script, None)
-}
-
 /// Check a bash script for potentially dangerous patterns.
 /// Returns Ok(()) if safe to run, Err with helpful message if blocked.
 pub fn check(script: &str) -> Result<(), CheckError> {
-    let tree = parse_script(script).ok_or_else(|| CheckError {
+    let cursor = Cursor::new(script);
+    let mut parser = Parser::new(cursor, &ParserOptions::default(), &SourceInfo::default());
+    let program = parser.parse_program().map_err(|_| CheckError {
         message: "Failed to parse script".into(),
     })?;
 
-    check_node(tree.root_node(), script.as_bytes())
+    for complete_cmd in &program.complete_commands {
+        check_compound_list(complete_cmd)?;
+    }
+    Ok(())
 }
 
 /// Extract the "interesting" part of a bash command for display purposes.
@@ -72,8 +72,6 @@ pub fn display_command(script: &str, cwd: &str) -> String {
 /// only when semantically safe (followed by && or ;) AND the cd target matches cwd.
 fn simplify_with_brush(script: &str, cwd: &str) -> Option<String> {
     use brush_parser::ast::SeparatorOperator;
-    use brush_parser::{Parser, ParserOptions, SourceInfo};
-    use std::io::Cursor;
 
     let cursor = Cursor::new(script);
     let mut parser = Parser::new(cursor, &ParserOptions::default(), &SourceInfo::default());
@@ -293,24 +291,81 @@ fn paths_match(target: &str, cwd: &str) -> bool {
 }
 
 /// Recursively check all nodes in the AST
-fn check_node(node: Node, source: &[u8]) -> Result<(), CheckError> {
-    // Check if this is a command node
-    if node.kind() == "command" {
-        check_command(node, source)?;
+/// Check a `CompoundList` (sequence of commands separated by ; or &)
+fn check_compound_list(list: &CompoundList) -> Result<(), CheckError> {
+    for item in &list.0 {
+        check_and_or_list(&item.0)?;
     }
-
-    // Recurse into children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        check_node(child, source)?;
-    }
-
     Ok(())
 }
 
-/// Check a single command node for dangerous patterns
-fn check_command(node: Node, source: &[u8]) -> Result<(), CheckError> {
-    let args = collect_command_args(node, source);
+/// Check an `AndOrList` (commands connected by && or ||)
+fn check_and_or_list(list: &AndOrList) -> Result<(), CheckError> {
+    check_pipeline(&list.first)?;
+    for and_or in &list.additional {
+        match and_or {
+            AndOr::And(pipeline) | AndOr::Or(pipeline) => check_pipeline(pipeline)?,
+        }
+    }
+    Ok(())
+}
+
+/// Check a Pipeline (commands connected by |)
+fn check_pipeline(pipeline: &Pipeline) -> Result<(), CheckError> {
+    for cmd in &pipeline.seq {
+        check_command(cmd)?;
+    }
+    Ok(())
+}
+
+/// Check a single Command node
+fn check_command(cmd: &Command) -> Result<(), CheckError> {
+    match cmd {
+        Command::Simple(simple) => check_simple_command(simple),
+        Command::Compound(compound, _redirects) => check_compound_command(compound),
+        Command::Function(func) => check_compound_command(&func.body.0),
+        Command::ExtendedTest(_) => Ok(()), // [[ ... ]] doesn't execute commands
+    }
+}
+
+/// Check a `CompoundCommand` (loops, conditionals, subshells, brace groups)
+fn check_compound_command(cmd: &CompoundCommand) -> Result<(), CheckError> {
+    match cmd {
+        CompoundCommand::BraceGroup(bg) => check_compound_list(&bg.list),
+        CompoundCommand::Subshell(sub) => check_compound_list(&sub.list),
+        CompoundCommand::ForClause(fc) => check_compound_list(&fc.body.list),
+        CompoundCommand::WhileClause(wc) | CompoundCommand::UntilClause(wc) => {
+            check_compound_list(&wc.0)?; // condition
+            check_compound_list(&wc.1.list) // body
+        }
+        CompoundCommand::IfClause(ic) => {
+            check_compound_list(&ic.condition)?;
+            check_compound_list(&ic.then)?;
+            if let Some(elses) = &ic.elses {
+                for else_clause in elses {
+                    if let Some(cond) = &else_clause.condition {
+                        check_compound_list(cond)?;
+                    }
+                    check_compound_list(&else_clause.body)?;
+                }
+            }
+            Ok(())
+        }
+        CompoundCommand::CaseClause(cc) => {
+            for item in &cc.cases {
+                if let Some(cmd) = &item.cmd {
+                    check_compound_list(cmd)?;
+                }
+            }
+            Ok(())
+        }
+        CompoundCommand::Arithmetic(_) | CompoundCommand::ArithmeticForClause(_) => Ok(()),
+    }
+}
+
+/// Check a `SimpleCommand` for dangerous patterns
+fn check_simple_command(cmd: &SimpleCommand) -> Result<(), CheckError> {
+    let args = collect_simple_command_args(cmd);
     if args.is_empty() {
         return Ok(());
     }
@@ -334,22 +389,22 @@ fn check_command(node: Node, source: &[u8]) -> Result<(), CheckError> {
     }
 }
 
-/// Collect all argument strings from a command node
-fn collect_command_args(node: Node, source: &[u8]) -> Vec<String> {
+/// Collect all argument strings from a `SimpleCommand`
+fn collect_simple_command_args(cmd: &SimpleCommand) -> Vec<String> {
     let mut args = Vec::new();
-    let mut cursor = node.walk();
 
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "command_name" | "word" | "string" | "raw_string" | "concatenation"
-            | "simple_expansion" | "expansion" => {
-                if let Ok(text) = child.utf8_text(source) {
-                    // Strip quotes from strings
-                    let text = text.trim_matches('"').trim_matches('\'');
-                    args.push(text.to_string());
-                }
+    // Command name
+    if let Some(word) = &cmd.word_or_name {
+        args.push(word.to_string());
+    }
+
+    // Command suffix (arguments)
+    if let Some(suffix) = &cmd.suffix {
+        for item in &suffix.0 {
+            if let CommandPrefixOrSuffixItem::Word(word) = item {
+                args.push(word.to_string());
             }
-            _ => {}
+            // Skip redirects (CommandPrefixOrSuffixItem::IoRedirect)
         }
     }
 

@@ -181,3 +181,33 @@ THE SYSTEM SHALL NOT store per-conversation state
 AND tool instance SHALL be reusable across conversations
 
 **Rationale:** Stateless tools with context injection eliminate the possibility of using stale or incorrect conversation state. All context flows through a single, validated parameter created at call time.
+
+---
+
+### REQ-BASH-011: Display Command Simplification
+
+WHEN bash tool result is displayed in the UI
+THE SYSTEM SHALL simplify the command for display by removing boilerplate prefixes
+AND provide a `display` field alongside the original `command`
+
+WHEN command contains `cd <path> && <rest>`
+AND `<path>` matches the conversation's working directory
+THE SYSTEM SHALL display only `<rest>` (strip the redundant cd)
+
+WHEN command contains `cd <path> && <rest>`
+AND `<path>` does NOT match the conversation's working directory
+THE SYSTEM SHALL display the full command unchanged
+
+WHEN command contains `cd <path>; <rest>` (semicolon separator)
+AND `<path>` matches the conversation's working directory
+THE SYSTEM SHALL display only `<rest>`
+
+WHEN command contains `||` (or operator)
+THE SYSTEM SHALL preserve the full command including fallback
+AND NOT strip any prefix before `||`
+
+WHEN command contains mixed operators like `cd <path> && cmd || fallback`
+AND `<path>` matches the conversation's working directory
+THE SYSTEM SHALL display `cmd || fallback` (strip only the matching cd)
+
+**Rationale:** LLMs often emit `cd /path && actual_command` patterns. Stripping redundant cd prefixes reduces visual noise in the UI. However, stripping cd when it changes to a *different* directory would be misleading—users need to see that the command ran elsewhere. The `||` operator indicates error handling that users should see; stripping the primary command would hide important context about what was attempted.

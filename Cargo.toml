@@ -45,8 +45,6 @@ similar = "2"  # For generating diffs
 
 # Process management
 nix = { version = "0.29", features = ["signal", "process"] }
-tree-sitter = "0.26.5"
-tree-sitter-bash = "0.25.1"
 
 # Browser automation
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
