@@ -22,7 +22,10 @@ ui/src/
   hooks/         # Custom React hooks
 specs/           # Tool specifications (read before modifying tools!)
 tasks/           # Task tracking
+phoenix-client.py  # CLI client — interact with the app without a browser
 ```
+
+`phoenix-client.py` is a standalone CLI for the Phoenix API (spec: `specs/simple_client/`). LLM agents should prefer it over browser automation for testing conversations.
 
 ---
 
@@ -66,7 +69,9 @@ Do NOT delete regression files, work around problems silently, or say "this is u
 ./dev.py check       # clippy + fmt + tests + task validation
 ```
 
-**Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust) or auto-reload (UI) → `./dev.py check` → commit
+**Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust changes) or save (UI auto-reloads via Vite) → `./dev.py check` → commit
+
+In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.
 
 Each git worktree gets unique ports and database automatically.
 
