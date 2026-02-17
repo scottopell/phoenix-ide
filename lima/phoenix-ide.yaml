@@ -1,10 +1,8 @@
 vmType: vz
 
-vmOpts:
-  vz:
-    rosetta:
-      enabled: true
-      binfmt: true
+rosetta:
+  enabled: true
+  binfmt: true
 
 images:
   - location: "https://dl01.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-42-1.1.aarch64.qcow2"

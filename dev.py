@@ -39,6 +39,7 @@ LIMA_ENV_FILE = "/etc/phoenix-ide/env"
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
+LOCAL_AI_PROXY = "http://127.0.0.1:8462"
 
 # Base ports - offset added based on worktree path hash
 # Both ports must stay within exposed ranges: 6000-6010, 8000-8050, 8080, 8443
@@ -50,16 +51,40 @@ PORT_RANGE = 25           # Reduced to fit both in 8000-8050 range
 DB_DIR = Path.home() / ".phoenix-ide"
 
 
-def get_llm_gateway() -> str:
-    """Get LLM gateway URL from env, exe.dev config, or default."""
-    if val := os.environ.get("LLM_GATEWAY"):
-        return val
+def _gateway_is_reachable(url: str) -> bool:
+    """Probe a gateway with a quick HTTP request. Any response means it's up."""
+    import urllib.request
+    import urllib.error
+    try:
+        urllib.request.urlopen(url, timeout=0.5)
+        return True
+    except urllib.error.HTTPError:
+        return True  # 404, 405, etc. — server is listening
+    except Exception:
+        return False
+
+
+def _discover_gateway_candidates() -> list[str]:
+    """Build an ordered list of gateway URLs to try."""
+    candidates = [LOCAL_AI_PROXY]
     if EXE_DEV_CONFIG.exists():
         try:
             config = json.loads(EXE_DEV_CONFIG.read_text())
-            return config.get("llm_gateway", DEFAULT_GATEWAY)
+            if gw := config.get("llm_gateway"):
+                candidates.append(gw)
         except (json.JSONDecodeError, KeyError):
             pass
+    candidates.append(DEFAULT_GATEWAY)
+    return candidates
+
+
+def get_llm_gateway() -> str:
+    """Get LLM gateway URL from env or by probing candidates."""
+    if val := os.environ.get("LLM_GATEWAY"):
+        return val
+    for url in _discover_gateway_candidates():
+        if _gateway_is_reachable(url):
+            return url
     return DEFAULT_GATEWAY
 
 
