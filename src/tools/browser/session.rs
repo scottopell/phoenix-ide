@@ -8,10 +8,12 @@
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
     cdp::js_protocol::runtime::EventConsoleApiCalled,
+    fetcher::{BrowserFetcher, BrowserFetcherOptions},
     Page,
 };
 use futures::StreamExt;
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -77,15 +79,23 @@ pub struct BrowserSession {
 }
 
 impl BrowserSession {
-    /// Create a new browser session
-    async fn new(conversation_id: &str) -> Result<Self, BrowserError> {
-        // Configure Chrome launch
+    /// Directory where the fetcher caches downloaded Chrome binaries
+    pub(crate) fn fetcher_cache_dir() -> PathBuf {
+        let base = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
+        base.join(".cache/phoenix-ide/chromium")
+    }
+
+    /// Build a `BrowserConfig` with optional explicit Chrome executable path
+    fn browser_config(
+        conversation_id: &str,
+        executable: Option<&Path>,
+    ) -> Result<BrowserConfig, BrowserError> {
         let user_data_dir = format!("/tmp/phoenix-chrome-{conversation_id}");
 
-        let config = BrowserConfig::builder()
-            .new_headless_mode() // Uses --headless=new for modern headless
-            .no_sandbox() // Required for running as root / in containers
-            .arg("--disable-gpu") // No GPU in server environment
+        let mut builder = BrowserConfig::builder()
+            .new_headless_mode()
+            .no_sandbox()
+            .arg("--disable-gpu")
             .arg("--disable-software-rasterizer")
             .user_data_dir(&user_data_dir)
             .viewport(chromiumoxide::handler::viewport::Viewport {
@@ -95,26 +105,36 @@ impl BrowserSession {
                 emulating_mobile: false,
                 is_landscape: true,
                 has_touch: false,
-            })
-            .build()
-            .map_err(|e| BrowserError::LaunchFailed(e.clone()))?;
+            });
 
-        // Launch browser
+        if let Some(path) = executable {
+            builder = builder.chrome_executable(path);
+        }
+
+        builder
+            .build()
+            .map_err(|e| BrowserError::LaunchFailed(e.clone()))
+    }
+
+    /// Launch browser and create a session
+    async fn launch_and_init(
+        conversation_id: &str,
+        executable: Option<&Path>,
+    ) -> Result<Self, BrowserError> {
+        let config = Self::browser_config(conversation_id, executable)?;
+
         let (browser, mut handler) = Browser::launch(config)
             .await
             .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
 
-        // Spawn handler task
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
-                // Handle CDP events - logging for now
                 if let Err(e) = event {
                     tracing::warn!("CDP handler error: {e}");
                 }
             }
         });
 
-        // Create initial page
         let page = browser
             .new_page("about:blank")
             .await
@@ -123,11 +143,51 @@ impl BrowserSession {
         Ok(Self {
             browser,
             handler_task,
-            console_task: None, // Set up later via setup_console_listener
+            console_task: None,
             page,
             console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
             last_activity: Instant::now(),
         })
+    }
+
+    /// Create a new browser session.
+    ///
+    /// Tries system Chrome first (zero download). On failure, downloads a
+    /// compatible Chromium via `BrowserFetcher` and caches it for future runs.
+    async fn new(conversation_id: &str) -> Result<Self, BrowserError> {
+        // 1. Try system Chrome (no explicit executable — chromiumoxide finds it)
+        match Self::launch_and_init(conversation_id, None).await {
+            Ok(session) => return Ok(session),
+            Err(e) => {
+                tracing::info!("System Chrome not available ({e}), trying fetcher...");
+            }
+        }
+
+        // 2. Download / use cached Chrome via fetcher
+        let cache_dir = Self::fetcher_cache_dir();
+        tracing::info!("Downloading Chrome to {cache_dir:?} (first run only)...");
+
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            BrowserError::LaunchFailed(format!(
+                "Failed to create cache dir {}: {e}",
+                cache_dir.display()
+            ))
+        })?;
+
+        let fetcher_opts = BrowserFetcherOptions::builder()
+            .with_path(&cache_dir)
+            .build()
+            .map_err(|e| BrowserError::LaunchFailed(format!("Fetcher config error: {e}")))?;
+
+        let fetcher = BrowserFetcher::new(fetcher_opts);
+        let info = fetcher
+            .fetch()
+            .await
+            .map_err(|e| BrowserError::LaunchFailed(format!("Chrome download failed: {e:#}")))?;
+
+        tracing::info!("Using Chrome at {:?}", info.executable_path);
+
+        Self::launch_and_init(conversation_id, Some(&info.executable_path)).await
     }
 
     /// Set up console log listener (called after session is wrapped in Arc<RwLock>)

@@ -1,7 +1,6 @@
 //! End-to-end tests for browser tools
 //!
-//! These tests require Chrome/Chromium to be installed.
-//! They will be skipped automatically if no browser is found.
+//! Chrome/Chromium is auto-downloaded via the fetcher if not in PATH.
 
 use super::session::BrowserSessionManager;
 use super::tools::*;
@@ -13,19 +12,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-/// Check if Chrome is available on the system
+/// Check if Chrome is available or obtainable.
+///
+/// With the `_fetcher-rustls-tokio` feature, `BrowserSession::new()` will
+/// auto-download Chromium when no system browser is found. Always returns
+/// true so the fetcher gets exercised. Tests will fail with a clear error
+/// if download is truly impossible (no network).
 fn chrome_available() -> bool {
-    which::which("google-chrome")
-        .or_else(|_| which::which("chromium-browser"))
-        .or_else(|_| which::which("chromium"))
-        .is_ok()
+    true
 }
 
 /// Skip macro for tests that require Chrome
 macro_rules! require_chrome {
     () => {
         if !chrome_available() {
-            eprintln!("Skipping test: Chrome/Chromium not found in PATH");
+            eprintln!("Skipping test: Chrome/Chromium not available");
             return;
         }
     };
