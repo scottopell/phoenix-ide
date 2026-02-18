@@ -799,10 +799,11 @@ def prod_build(version: str | None = None, strip: bool = True) -> Path:
     worktree = PROD_BUILD_WORKTREE
     
     if worktree.exists():
-        # Update existing worktree to the target ref
+        # Update existing worktree to the target ref.
+        # Use reset --hard so build artifacts (Cargo.lock, package-lock.json, etc.)
+        # left by a previous build don't block the checkout.
         print(f"Updating build worktree to {ref}...")
-        subprocess.run(["git", "fetch", "origin"], cwd=worktree, check=True, capture_output=True)
-        subprocess.run(["git", "checkout", ref], cwd=worktree, check=True, capture_output=True)
+        subprocess.run(["git", "reset", "--hard", ref], cwd=worktree, check=True, capture_output=True)
     else:
         # Create new worktree
         print(f"Creating build worktree at {worktree}...")
