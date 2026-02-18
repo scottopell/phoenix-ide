@@ -818,7 +818,7 @@ NATIVE_SYSTEMD_CONFIG = SystemdConfig(
 )
 
 LIMA_SYSTEMD_CONFIG = SystemdConfig(
-    user="phoenix-user",
+    user="phoenix-ide",
     db_path="/mnt/phoenix-data/prod.db",
     install_dir="/opt/phoenix-ide",
     port=PROD_PORT,
@@ -1443,7 +1443,7 @@ def cmd_prod_override_unset(name: str):
 def lima_shell(cmd: str, check=True) -> subprocess.CompletedProcess:
     """Run a command inside the Lima VM via bash -lc (loads .bashrc for Rust PATH)."""
     return subprocess.run(
-        ["limactl", "shell", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
+        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
         check=check,
     )
 
@@ -1451,7 +1451,7 @@ def lima_shell(cmd: str, check=True) -> subprocess.CompletedProcess:
 def lima_shell_quiet(cmd: str, check=True) -> subprocess.CompletedProcess:
     """Run a command inside the Lima VM, capturing output."""
     return subprocess.run(
-        ["limactl", "shell", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
+        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
         check=check, capture_output=True, text=True,
     )
 
@@ -1529,7 +1529,7 @@ def lima_prompt_api_key():
         return
     env_content = f"ANTHROPIC_API_KEY={key.strip()}\n"
     subprocess.run(
-        ["limactl", "shell", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
+        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
         input=env_content.encode(), check=True, capture_output=True,
     )
     lima_shell(f"sudo chmod 600 {LIMA_ENV_FILE}")
@@ -1549,7 +1549,7 @@ def lima_configure_llm() -> None:
                         .replace("://localhost", "://host.lima.internal")
             env_content = f"LLM_GATEWAY={vm_url}\n"
             subprocess.run(
-                ["limactl", "shell", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
+                ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
                 input=env_content.encode(), check=True, capture_output=True,
             )
             lima_shell(f"sudo chmod 600 {LIMA_ENV_FILE}")
@@ -1622,7 +1622,7 @@ def lima_prod_deploy():
     tar_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, cwd=ROOT)
     # Suppress tar warnings about macOS extended header keywords on the receiving side
     subprocess.run(
-        ["limactl", "shell", LIMA_VM_NAME, "--",
+        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--",
          "tar", "xf", "-", "-C", LIMA_BUILD_DIR,
          "--warning=no-unknown-keyword"],
         stdin=tar_proc.stdout, check=True,
@@ -1665,7 +1665,7 @@ def lima_prod_deploy():
     print("\nInstalling systemd socket unit...")
     socket_content = generate_systemd_socket(config)
     subprocess.run(
-        ["limactl", "shell", LIMA_VM_NAME, "--",
+        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--",
          "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket"],
         input=socket_content.encode(), check=True, capture_output=True,
     )
@@ -1674,7 +1674,7 @@ def lima_prod_deploy():
     print("Installing systemd service unit...")
     unit_content = generate_systemd_service(config, version)
     subprocess.run(
-        ["limactl", "shell", LIMA_VM_NAME, "--",
+        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--",
          "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.service"],
         input=unit_content.encode(), check=True, capture_output=True,
     )
@@ -1757,11 +1757,10 @@ def lima_prod_stop():
 
 
 def cmd_lima_shell():
-    """Open an interactive shell as phoenix-user in the Lima VM."""
+    """Open an interactive shell in the Lima VM."""
     lima_ensure_running()
     os.execvp("limactl", [
-        "limactl", "shell", LIMA_VM_NAME, "--",
-        "sudo", "-u", "phoenix-user", "-i",
+        "limactl", "shell", "--workdir", "/", LIMA_VM_NAME,
     ])
 
 
@@ -1826,7 +1825,7 @@ def main():
     lima_parser = sub.add_parser("lima", help="Lima VM management")
     lima_sub = lima_parser.add_subparsers(dest="lima_command", required=True)
     lima_sub.add_parser("create", help="Create and provision Lima VM")
-    lima_sub.add_parser("shell", help="Open shell as phoenix-user")
+    lima_sub.add_parser("shell", help="Open shell in Lima VM")
     lima_sub.add_parser("destroy", help="Delete Lima VM")
 
     # tasks

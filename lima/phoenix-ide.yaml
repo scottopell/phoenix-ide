@@ -14,9 +14,16 @@ cpus: 4
 memory: "8GiB"
 disk: "50GiB"
 
+user:
+  name: "phoenix-ide"
+
+containerd:
+  system: false
+  user: false
+
 portForwards:
-  - guestPort: 7331
-    hostPort: 7331
+  - guestPort: 8031
+    hostPort: 8031
 
 mounts:
   - location: "~/.phoenix-ide/lima"
@@ -29,18 +36,12 @@ provision:
       #!/bin/bash
       set -eux
 
-      # Passwordless sudo for lima and phoenix-user
-      echo "lima ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lima
-      echo "phoenix-user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/phoenix-user
-
-      # Create phoenix-user (skip subordinate UID/GID allocation — not running containers)
-      id phoenix-user &>/dev/null || useradd -M -s /bin/bash -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 phoenix-user
-      mkdir -p /home/phoenix-user /home/phoenix-user/projects
-      chown phoenix-user:phoenix-user /home/phoenix-user /home/phoenix-user/projects
+      # Passwordless sudo for the default user
+      echo "phoenix-ide ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/phoenix-ide
 
       # Service directories
       mkdir -p /opt/phoenix-ide /opt/phoenix-build /etc/phoenix-ide
-      chown phoenix-user:phoenix-user /opt/phoenix-ide /opt/phoenix-build
+      chown phoenix-ide:phoenix-ide /opt/phoenix-ide /opt/phoenix-build
 
       # SELinux permissive — dev VM, not worth fighting /opt context labels
       setenforce 0
