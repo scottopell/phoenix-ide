@@ -819,7 +819,7 @@ NATIVE_SYSTEMD_CONFIG = SystemdConfig(
 
 LIMA_SYSTEMD_CONFIG = SystemdConfig(
     user="phoenix-user",
-    db_path="/home/phoenix-user/.phoenix-ide/prod.db",
+    db_path="/mnt/phoenix-data/prod.db",
     install_dir="/opt/phoenix-ide",
     port=PROD_PORT,
     env_file=LIMA_ENV_FILE,
@@ -1536,6 +1536,31 @@ def lima_prompt_api_key():
     print("API key saved.")
 
 
+def lima_configure_llm() -> None:
+    """Auto-detect host LLM gateway and write VM env file, or prompt for API key."""
+    if lima_has_llm_config():
+        return
+
+    # Probe candidates on the host
+    for url in _discover_gateway_candidates():
+        if _gateway_is_reachable(url):
+            # Translate host loopback to Lima's host-reachable address
+            vm_url = url.replace("://127.0.0.1", "://host.lima.internal") \
+                        .replace("://localhost", "://host.lima.internal")
+            env_content = f"LLM_GATEWAY={vm_url}\n"
+            subprocess.run(
+                ["limactl", "shell", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
+                input=env_content.encode(), check=True, capture_output=True,
+            )
+            lima_shell(f"sudo chmod 600 {LIMA_ENV_FILE}")
+            print(f"  LLM gateway: {vm_url} (auto-detected from host)")
+            return
+
+    # No gateway found — fall back to API key prompt
+    print("\nNo LLM gateway detected on host.")
+    lima_prompt_api_key()
+
+
 def cmd_lima_create():
     """Create and provision the Lima VM."""
     # Check limactl exists
@@ -1623,10 +1648,8 @@ def lima_prod_deploy():
     lima_shell(f"sudo cp {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
     lima_shell("sudo chmod +x /opt/phoenix-ide/phoenix-ide")
 
-    # LLM config (API key or gateway)
-    if not lima_has_llm_config():
-        print("\nNo LLM config in VM (no API key or LLM_GATEWAY).")
-        lima_prompt_api_key()
+    # LLM config — auto-detect gateway or prompt for API key
+    lima_configure_llm()
 
     # Get version string
     result = subprocess.run(

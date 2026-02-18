@@ -18,7 +18,10 @@ portForwards:
   - guestPort: 7331
     hostPort: 7331
 
-mounts: []
+mounts:
+  - location: "~/.phoenix-ide/lima"
+    mountPoint: "/mnt/phoenix-data"
+    writable: true
 
 provision:
   - mode: system
