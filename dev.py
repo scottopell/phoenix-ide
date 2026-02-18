@@ -1505,7 +1505,7 @@ def lima_ensure_running():
 
 def lima_has_llm_config() -> bool:
     """Check if LLM config (API key or gateway) is configured in the VM."""
-    result = lima_shell_quiet(f"test -f {LIMA_ENV_FILE} && grep -qE '(ANTHROPIC_API_KEY|LLM_GATEWAY)' {LIMA_ENV_FILE}", check=False)
+    result = lima_shell_quiet(f"test -f {LIMA_ENV_FILE} && sudo grep -qE '(ANTHROPIC_API_KEY|LLM_GATEWAY)' {LIMA_ENV_FILE}", check=False)
     return result.returncode == 0
 
 
