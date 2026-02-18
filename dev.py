@@ -1393,6 +1393,17 @@ def cmd_prod_deploy(version: str | None = None):
 
     elif env == "lima":
         print("📦 Detected: macOS with Lima VM")
+        # Lima clones the repo independently, so unpushed commits won't be visible.
+        unpushed = subprocess.run(
+            ["git", "log", "@{u}..", "--oneline"],
+            cwd=ROOT, capture_output=True, text=True
+        )
+        if unpushed.stdout.strip():
+            print("ERROR: unpushed commits will not be visible inside Lima VM:", file=sys.stderr)
+            for line in unpushed.stdout.strip().splitlines():
+                print(f"  {line}", file=sys.stderr)
+            print("Run 'git push' first.", file=sys.stderr)
+            sys.exit(1)
         lima_prod_deploy()
 
     elif env == "daemon":
