@@ -801,6 +801,7 @@ def prod_build(version: str | None = None, strip: bool = True) -> Path:
     if worktree.exists():
         # Update existing worktree to the target ref
         print(f"Updating build worktree to {ref}...")
+        subprocess.run(["git", "fetch", "origin"], cwd=worktree, check=True, capture_output=True)
         subprocess.run(["git", "checkout", ref], cwd=worktree, check=True, capture_output=True)
     else:
         # Create new worktree
