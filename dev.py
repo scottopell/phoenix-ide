@@ -593,18 +593,55 @@ def cmd_tasks_validate() -> bool:
         print(f"✗ {len(errors)} task validation error(s):")
         for err in errors:
             print(f"  - {err}")
-        print("\nRun './dev.py tasks fix' to auto-rename files.")
+        print("\nRun './dev.py tasks fix' to auto-fix (injects missing 'created', renames files).")
         return False
 
     print(f"✓ {len(task_files) - 1} task files validated")  # -1 for template
     return True
 
 
+def infer_created_date(path: Path) -> str:
+    """Infer a creation date for a task file.
+
+    Priority:
+    1. Earliest git commit date for the file
+    2. File mtime (on-disk creation approximation)
+    3. Today's date
+    """
+    import subprocess
+    from datetime import date, datetime
+
+    # 1. Earliest git commit touching this file
+    try:
+        result = subprocess.run(
+            ["git", "log", "--follow", "--diff-filter=A", "--format=%as", str(path)],
+            capture_output=True,
+            text=True,
+            cwd=path.parent,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+    except Exception:
+        pass
+
+    # 2. File mtime
+    try:
+        mtime = path.stat().st_mtime
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # 3. Today
+    return date.today().isoformat()
+
+
 def cmd_tasks_fix() -> bool:
-    """Auto-rename task files to match their frontmatter.
+    """Auto-fix task files: inject missing 'created' fields and rename to match frontmatter.
 
     Returns True if all files are now correct, False on errors.
     """
+    import re
+
     tasks_dir = ROOT / "tasks"
     if not tasks_dir.exists():
         print("No tasks/ directory found.")
@@ -613,6 +650,7 @@ def cmd_tasks_fix() -> bool:
     task_files = sorted(tasks_dir.glob("*.md"))
     template = tasks_dir / "_TEMPLATE.md"
     renamed = 0
+    patched = 0
     errors = []
 
     for path in task_files:
@@ -625,6 +663,18 @@ def cmd_tasks_fix() -> bool:
             continue
 
         fields = task["fields"]
+
+        # Inject missing 'created' field into frontmatter
+        if "created" not in fields or not re.match(r"^\d{4}-\d{2}-\d{2}$", fields.get("created", "")):
+            created = infer_created_date(path)
+            content = path.read_text()
+            # Insert after the opening --- line
+            content = content.replace("---\n", f"---\ncreated: {created}\n", 1)
+            path.write_text(content)
+            print(f"  {path.name}: added created: {created}")
+            fields["created"] = created
+            patched += 1
+
         if not fields.get("status") or not fields.get("priority"):
             errors.append(f"{path.name}: missing status or priority in frontmatter")
             continue
@@ -649,8 +699,13 @@ def cmd_tasks_fix() -> bool:
             print(f"  - {err}")
         return False
 
-    if renamed:
-        print(f"\n✓ Renamed {renamed} file(s)")
+    if patched or renamed:
+        parts = []
+        if patched:
+            parts.append(f"patched {patched} file(s)")
+        if renamed:
+            parts.append(f"renamed {renamed} file(s)")
+        print(f"\n✓ {', '.join(parts).capitalize()}")
     else:
         print("✓ All files already correctly named")
     return True
