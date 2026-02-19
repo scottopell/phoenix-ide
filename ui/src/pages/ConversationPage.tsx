@@ -31,6 +31,7 @@ export function ConversationPage() {
   const [contextWindowUsed, setContextWindowUsed] = useState(0);
   const [modelContextWindow, setModelContextWindow] = useState(200_000); // Default fallback
   const [contextExhaustedSummary, setContextExhaustedSummary] = useState<string | null>(null);
+  const [systemPrompt, setSystemPrompt] = useState<string | undefined>(undefined);
 
   
   // File browser and prose reader state
@@ -313,6 +314,14 @@ export function ConversationPage() {
     };
   }, [slug, navigate]);
 
+  // Fetch system prompt once when conversation is loaded
+  useEffect(() => {
+    if (!conversationId) return;
+    api.getSystemPrompt(conversationId)
+      .then(setSystemPrompt)
+      .catch((err) => console.warn('Failed to load system prompt:', err));
+  }, [conversationId]);
+
   // Refs for queue callbacks to avoid effect re-runs
   const markSentRef = useRef(markSent);
   const markFailedRef = useRef(markFailed);
@@ -480,6 +489,7 @@ export function ConversationPage() {
         stateData={stateData}
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
+        systemPrompt={systemPrompt}
       />
       {convState === 'error' && stateData?.message && (
         <ErrorBanner

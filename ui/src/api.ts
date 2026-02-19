@@ -191,6 +191,12 @@ export const api = {
     return resp.json();
   },
 
+  async getSystemPrompt(convId: string): Promise<string> {
+    const resp = await fetch(`/api/conversations/${convId}/system-prompt`);
+    if (!resp.ok) throw new Error('Failed to fetch system prompt');
+    return (await resp.json()).system_prompt;
+  },
+
   async validateCwd(path: string): Promise<{ valid: boolean; error?: string }> {
     const resp = await fetch(`/api/validate-cwd?path=${encodeURIComponent(path)}`);
     return resp.json();

@@ -162,6 +162,12 @@ pub struct ModelsResponse {
     pub default: String,
 }
 
+/// Response containing the current system prompt for a conversation
+#[derive(Debug, Serialize)]
+pub struct SystemPromptResponse {
+    pub system_prompt: String,
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

@@ -441,6 +441,67 @@ body {
   gap: 8px;
 }
 
+/* System Prompt Block */
+.system-prompt-block {
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--text-muted);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.system-prompt-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  cursor: pointer;
+  background: var(--bg-secondary);
+  user-select: none;
+}
+
+.system-prompt-header:hover {
+  background: var(--bg-tertiary);
+}
+
+.system-prompt-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.system-prompt-toggle {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.system-prompt-preview {
+  padding: 6px 10px 8px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.system-prompt-content {
+  margin: 0;
+  padding: 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow-y: auto;
+  border-top: 1px solid var(--border-color);
+}
+
 /* Message Styles */
 .message {
   padding: 8px;

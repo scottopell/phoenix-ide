@@ -8,7 +8,7 @@ use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
     FileEntry, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    ReadFileResponse, RenameRequest, SuccessResponse, ValidateCwdResponse,
+    ReadFileResponse, RenameRequest, SuccessResponse, SystemPromptResponse, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ImageData, Message, MessageContent, MessageType};
@@ -74,6 +74,11 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
+        // System prompt inspection
+        .route(
+            "/api/conversations/:id/system-prompt",
+            get(get_system_prompt),
+        )
         // Slug resolution (REQ-API-007)
         .route("/api/conversations/by-slug/:slug", get(get_by_slug))
         // Directory browser (REQ-API-008)
@@ -366,6 +371,22 @@ async fn get_conversation(
         agent_working: conversation.is_agent_working(),
         context_window_size,
     }))
+}
+
+async fn get_system_prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SystemPromptResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let cwd = std::path::PathBuf::from(&conversation.cwd);
+    let system_prompt = crate::system_prompt::build_system_prompt(&cwd, false);
+
+    Ok(Json(SystemPromptResponse { system_prompt }))
 }
 
 // ============================================================
