@@ -194,13 +194,30 @@ impl AnthropicService {
             }
         }
 
-        if content.is_empty() {
-            return Err(LlmError::unknown(
-                "Anthropic returned empty response (no content or tool calls)",
-            ));
-        }
-
         let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
+
+        if content.is_empty() {
+            if end_turn {
+                // Valid: model finished with nothing more to say (common after think/tool use)
+                tracing::debug!(
+                    "Anthropic returned empty content with end_turn — treating as clean completion"
+                );
+                return Ok(LlmResponse {
+                    content: vec![],
+                    end_turn: true,
+                    usage: Usage {
+                        input_tokens: resp.usage.input_tokens,
+                        output_tokens: resp.usage.output_tokens,
+                        cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
+                        cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
+                    },
+                });
+            }
+            return Err(LlmError::unknown(format!(
+                "Anthropic returned empty response (no content or tool calls, stop_reason={:?})",
+                resp.stop_reason
+            )));
+        }
 
         Ok(LlmResponse {
             content,
