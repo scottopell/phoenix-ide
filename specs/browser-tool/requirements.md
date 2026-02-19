@@ -37,13 +37,13 @@ As an AI agent testing PWAs, I need to verify service worker registration, cachi
 
 ### REQ-BT-001: Navigate to URLs
 
-THE SYSTEM SHALL navigate to a specified URL and wait for the page to be ready for interaction
+The `browser_navigate` tool SHALL navigate to a specified URL and wait for the page to be ready for interaction
 
 WHEN navigation fails (network error, DNS failure, timeout, HTTP error)
-THE SYSTEM SHALL return a clear error message indicating the failure type
+`browser_navigate` SHALL return a clear error message indicating the failure type
 
 WHEN the URL triggers a file download instead of navigation
-THE SYSTEM SHALL report the download completion and file location
+`browser_navigate` SHALL report the download completion and file location
 
 **Rationale:** Navigation is the foundation of all browser automation. Agents need reliable feedback about whether navigation succeeded and when the page is ready.
 
@@ -53,18 +53,18 @@ THE SYSTEM SHALL report the download completion and file location
 
 ### REQ-BT-002: Execute JavaScript
 
-THE SYSTEM SHALL execute JavaScript expressions in the page context and return results
+The `browser_eval` tool SHALL execute JavaScript expressions in the page context and return results
 
 WHEN the expression returns a Promise
-THE SYSTEM SHALL await the Promise and return the resolved value (configurable)
+`browser_eval` SHALL await the Promise and return the resolved value (configurable via the `await` parameter)
 
 WHEN execution throws an exception
-THE SYSTEM SHALL return the error message and context
+`browser_eval` SHALL return the error message and context
 
-WHEN the result is large
-THE SYSTEM SHALL write output to a file and return the file path
+WHEN the result exceeds 4096 bytes
+`browser_eval` SHALL write output to a temp file and return the file path
 
-**Rationale:** JavaScript execution is the universal interface for page interaction. Rather than providing separate tools for click/type/scroll/wait, a flexible JS eval tool handles all interactions with one capability.
+**Rationale:** JavaScript execution is the universal interface for reading page state and complex interactions. For clicks and typing, prefer `browser_click` and `browser_type` which reliably trigger framework event handlers.
 
 **User Stories:** US-1, US-2
 
@@ -72,19 +72,17 @@ THE SYSTEM SHALL write output to a file and return the file path
 
 ### REQ-BT-003: Take Screenshots
 
-THE SYSTEM SHALL capture screenshots of the current viewport
+The `browser_take_screenshot` tool SHALL capture a screenshot of the current viewport and save it to a known file path
 
 WHEN a CSS selector is provided
-THE SYSTEM SHALL capture only the specified element
+`browser_take_screenshot` SHALL capture only the matching element
 
-THE SYSTEM SHALL return the screenshot as base64-encoded image data suitable for LLM vision input
+THE SYSTEM SHALL make the screenshot visible to the agent by passing the saved path to `read_image`
 
-WHEN the image exceeds LLM size limits
+WHEN the image exceeds LLM vision size limits
 THE SYSTEM SHALL resize the image to fit within limits
 
-THE SYSTEM SHALL save screenshots to a known location for later retrieval
-
-**Rationale:** Visual verification is essential for web development. Screenshots provide evidence of current state and enable agents to see what they've built.
+**Rationale:** Visual verification is essential for web development. Screenshots provide evidence of current state. The two-step pattern (`browser_take_screenshot` then `read_image`) is intentional: the screenshot is saved for later retrieval even if the agent does not immediately inspect it.
 
 **User Stories:** US-1, US-2
 
@@ -92,16 +90,16 @@ THE SYSTEM SHALL save screenshots to a known location for later retrieval
 
 ### REQ-BT-004: Capture Console Logs
 
-THE SYSTEM SHALL capture console messages (log, warn, error, info) from the page context
+THE SYSTEM SHALL automatically capture console messages (log, warn, error, info) from the page context throughout the browser session
 
-THE SYSTEM SHALL provide a way to retrieve recent console logs
+The `browser_recent_console_logs` tool SHALL retrieve recent captured log entries, newest first, up to a configurable limit (default: 100)
 
-THE SYSTEM SHALL provide a way to clear captured logs
+The `browser_clear_console_logs` tool SHALL discard all captured log entries, resetting the buffer
 
-WHEN output exceeds a size threshold
-THE SYSTEM SHALL write logs to a file and return the file path
+WHEN output from `browser_recent_console_logs` exceeds 4096 bytes
+`browser_recent_console_logs` SHALL write the full output to a temp file and return the file path
 
-**Rationale:** Console output is the primary debugging channel for web applications. Agents need visibility into errors and diagnostic output.
+**Rationale:** Console output is the primary debugging channel for web applications. Agents need visibility into errors and diagnostic output without having to inject logging instrumentation manually.
 
 **User Stories:** US-1, US-2
 
@@ -109,11 +107,11 @@ THE SYSTEM SHALL write logs to a file and return the file path
 
 ### REQ-BT-005: Resize Viewport
 
-THE SYSTEM SHALL resize the browser viewport to specified dimensions
+The `browser_resize` tool SHALL resize the browser viewport to specified width and height in pixels
 
-THE SYSTEM SHALL use a sensible default viewport size (e.g., 1280x720)
+THE SYSTEM SHALL use a default viewport of 1280×720 pixels when a session starts
 
-**Rationale:** Responsive design verification requires testing at different viewport sizes. Agents need control over viewport dimensions.
+**Rationale:** Responsive design verification requires testing at different viewport sizes. Common reference points: 375px wide for mobile, 768px for tablet, 1280px for desktop.
 
 **User Stories:** US-1
 
@@ -121,14 +119,14 @@ THE SYSTEM SHALL use a sensible default viewport size (e.g., 1280x720)
 
 ### REQ-BT-006: Read Image Files
 
-THE SYSTEM SHALL read image files from disk and return them as base64-encoded data for LLM vision input
+The `read_image` tool SHALL read an image file from disk and make its contents visible to the agent for visual analysis
 
-WHEN the image exceeds LLM size limits
-THE SYSTEM SHALL resize the image to fit within limits
+WHEN the image exceeds LLM vision size limits
+`read_image` SHALL resize the image to fit within limits
 
-THE SYSTEM SHALL support common image formats (PNG, JPEG, GIF, WebP)
+`read_image` SHALL support PNG, JPEG, GIF, and WebP formats
 
-**Rationale:** Agents may need to analyze existing images (screenshots from disk, user-provided images) in addition to taking new screenshots.
+**Rationale:** Agents use `read_image` both to view screenshots taken by `browser_take_screenshot` and to analyze any other image file on disk (e.g. user-provided images, generated assets).
 
 **User Stories:** US-1, US-2
 
@@ -153,17 +151,17 @@ THE SYSTEM SHALL use the cached browser without downloading again
 
 ### REQ-BT-008: Reliable Element Clicking
 
-THE SYSTEM SHALL provide a dedicated tool for clicking page elements by CSS selector
+The `browser_click` tool SHALL click a page element identified by CSS selector using CDP-level mouse events
 
 WHEN the target element does not exist
-THE SYSTEM SHALL return a clear error indicating the element was not found
+`browser_click` SHALL return a clear error indicating the element was not found
 
-WHEN the target element may not yet be present
-THE SYSTEM SHALL support waiting for the element to appear before clicking
+WHEN the `wait` parameter is set to true
+`browser_click` SHALL wait for the element to appear in the DOM before clicking
 
-THE SYSTEM SHALL reliably trigger event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
+`browser_click` SHALL reliably trigger event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
 
-**Rationale:** Clicking elements is a fundamental interaction that must work reliably across all web frameworks. JavaScript-level click simulation can fail to trigger framework-managed event handlers; a dedicated tool avoids this pitfall.
+**Rationale:** Clicking elements is a fundamental interaction that must work reliably across all web frameworks. JavaScript `.click()` can fail to trigger React/Vue synthetic event handlers; CDP-level mouse events do not have this limitation.
 
 **User Stories:** US-2
 
@@ -171,16 +169,17 @@ THE SYSTEM SHALL reliably trigger event handlers regardless of the UI framework 
 
 ### REQ-BT-009: Reliable Text Input
 
-THE SYSTEM SHALL provide a dedicated tool for typing text into input elements by CSS selector
+The `browser_type` tool SHALL type text into an input element identified by CSS selector using CDP-level keyboard events
 
 WHEN the target element does not exist
-THE SYSTEM SHALL return a clear error indicating the element was not found
+`browser_type` SHALL return a clear error indicating the element was not found
 
-THE SYSTEM SHALL support replacing existing field content as well as appending to it
+WHEN the `clear` parameter is set to true
+`browser_type` SHALL replace existing field content; otherwise it appends
 
-THE SYSTEM SHALL reliably trigger input event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
+`browser_type` SHALL reliably trigger input and change event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
 
-**Rationale:** Form input must fire the key and input events that frameworks listen to. Setting the value property directly does not trigger React/Vue synthetic events; a dedicated tool ensures event handlers are invoked correctly.
+**Rationale:** Directly setting an element's value property does not fire the synthetic events that React/Vue listen to. CDP-level keyboard events correctly trigger all framework event handlers.
 
 **User Stories:** US-2
 
@@ -188,16 +187,15 @@ THE SYSTEM SHALL reliably trigger input event handlers regardless of the UI fram
 
 ### REQ-BT-013: Wait for Async Page Elements
 
-WHEN page content appears asynchronously after navigation or user interaction
-THE SYSTEM SHALL provide a way to wait for a specific element to become present in the DOM
+The `browser_wait_for_selector` tool SHALL poll the page until a CSS selector matches an element in the DOM
 
-WHEN the element must be visible (not merely present in DOM)
-THE SYSTEM SHALL support waiting for the element to become visually visible
+WHEN the `visible` parameter is set to true
+`browser_wait_for_selector` SHALL additionally wait for the element to be visually visible (not just present in DOM)
 
-WHEN the element does not appear within the specified time
-THE SYSTEM SHALL return a clear timeout error
+WHEN the element does not appear within the timeout (default: 30 seconds)
+`browser_wait_for_selector` SHALL return a clear timeout error
 
-**Rationale:** Modern web apps load content asynchronously. Agents need to wait for expected elements before interacting with them, rather than polling manually with JavaScript.
+**Rationale:** Modern web apps load content asynchronously. Agents should use `browser_wait_for_selector` rather than manually polling with `browser_eval` — it is more concise and handles the polling loop internally.
 
 **User Stories:** US-1, US-2
 
@@ -205,19 +203,16 @@ THE SYSTEM SHALL return a clear timeout error
 
 ### REQ-BT-014: Accurate Console Log Object Representation
 
-WHEN console messages include objects or arrays
-THE SYSTEM SHALL represent the logged values using their actual content, not generic type labels
+WHEN `console.log()` is called with an object
+THE SYSTEM SHALL represent the object as `{key: value, ...}` using its actual properties, not the generic label "Object"
 
-WHEN an object's properties are available for inspection
-THE SYSTEM SHALL show the key-value pairs in a readable format
+WHEN `console.log()` is called with an array
+THE SYSTEM SHALL represent the array as `[value, value, ...]` using its actual elements
 
-WHEN an array's elements are available
-THE SYSTEM SHALL show the element values in order
+WHEN an object or array has more properties than fit in the preview
+THE SYSTEM SHALL include a `…` overflow indicator in the representation
 
-WHEN a logged value's full content exceeds a reasonable display size
-THE SYSTEM SHALL indicate that the representation is abbreviated
-
-**Rationale:** "Object" is not a useful representation of `{userId: 123, status: 'active'}`. Agents debugging applications need to see actual values to understand program state.
+**Rationale:** "Object" is not a useful representation of `{userId: 123, status: 'active'}`. Agents debugging applications need to see actual values to understand program state without resorting to manual `JSON.stringify` calls.
 
 **User Stories:** US-1, US-2
 
@@ -225,18 +220,16 @@ THE SYSTEM SHALL indicate that the representation is abbreviated
 
 ### REQ-BT-015: Access to Full Console Log Content
 
-WHEN a console log entry's text representation exceeds the per-entry display limit
-THE SYSTEM SHALL include the truncated text with a visible truncation indicator
-AND THE SYSTEM SHALL preserve the full content internally for retrieval
+WHEN a single console log entry's text representation exceeds the per-entry display limit
+`browser_recent_console_logs` SHALL include the truncated text with a visible `…` truncation indicator
 
-WHEN retrieved console log output exceeds the inline size threshold
-THE SYSTEM SHALL write the full content to a file and return the file path
-AND the file SHALL contain complete, untruncated entries
+WHEN the total output from `browser_recent_console_logs` exceeds 4096 bytes (whether due to many entries or large individual entries)
+`browser_recent_console_logs` SHALL write the complete output to a temp file and return only the file path
 
-WHEN the agent reads the file path returned by the console log tool
-THE SYSTEM SHALL provide the full untruncated content of all entries in that retrieval
+WHEN `browser_recent_console_logs` returns a file path instead of inline content
+THE SYSTEM SHALL ensure the file contains all entries in full, without per-entry truncation, so the agent can read it using `bash` or similar
 
-**Rationale:** Console logs can contain large serialized objects critical for debugging. Truncation prevents context bloat, but the agent must always be able to recover the full content via a follow-up action — otherwise useful debugging information is silently lost.
+**Rationale:** Console logs can contain large serialized objects critical for debugging. Inline truncation prevents context bloat, but the agent must always be able to recover full content — the file path escape hatch ensures nothing is permanently lost. Per-entry truncation must happen only at display time, not at capture time, so the file always contains complete data.
 
 **User Stories:** US-1, US-2
 
