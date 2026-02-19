@@ -48,8 +48,9 @@ const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 /**
  * Strip model artifacts from think tool thoughts:
  * - Remove optional opening <thinking> wrapper
- * - Truncate at </thinking> — everything after it is hallucinated XML
- *   (the model sometimes emits legacy XML tool calls after the closing tag)
+ * - Truncate at </thinking> — everything after it is XML the model wrote
+ *   as a narration of its next action (observed on claude-haiku-4-5-20251001).
+ *   The actual tool call happens separately via the JSON API; this is just text.
  */
 function cleanThoughts(raw: string): string {
   let text = raw.replace(/^\s*<thinking>\s*/i, '');
