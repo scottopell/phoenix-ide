@@ -489,7 +489,7 @@ export function ConversationPage() {
         stateData={stateData}
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
-        systemPrompt={systemPrompt}
+        {...(systemPrompt !== undefined && { systemPrompt })}
       />
       {convState === 'error' && stateData?.message && (
         <ErrorBanner
