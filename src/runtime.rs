@@ -357,17 +357,19 @@ impl RuntimeManager {
 
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
         let is_sub_agent = conv.parent_conversation_id.is_some();
+
+        // Resolve model once: use conversation's stored model, or fall back to registry default
         let model_id = conv
             .model
-            .as_deref()
-            .unwrap_or(self.llm_registry.default_model_id());
-        let context_window = self.llm_registry.context_window(model_id);
+            .clone()
+            .unwrap_or_else(|| self.llm_registry.default_model_id().to_string());
+        let context_window = self.llm_registry.context_window(&model_id);
         let context = if is_sub_agent {
             // Sub-agent being resumed - we don't have the original task
             // This is an edge case that shouldn't happen in normal operation
-            ConvContext::sub_agent(&conv.id, PathBuf::from(&conv.cwd), model_id, context_window)
+            ConvContext::sub_agent(&conv.id, PathBuf::from(&conv.cwd), &model_id, context_window)
         } else {
-            ConvContext::new(&conv.id, PathBuf::from(&conv.cwd), model_id, context_window)
+            ConvContext::new(&conv.id, PathBuf::from(&conv.cwd), &model_id, context_window)
         };
 
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -377,9 +379,7 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(
             self.llm_registry.clone(),
-            conv.model
-                .clone()
-                .unwrap_or_else(|| self.llm_registry.default_model_id().to_string()),
+            model_id,
         );
 
         // Use appropriate tool registry based on whether this is a sub-agent

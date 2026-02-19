@@ -249,6 +249,16 @@ async fn create_conversation(
         ));
     }
 
+    // Validate requested model exists in the registry
+    if let Some(ref model) = req.model {
+        if state.llm_registry.get(model).is_none() {
+            let available = state.llm_registry.available_models().join(", ");
+            return Err(AppError::BadRequest(format!(
+                "Model '{model}' is not available. Available models: {available}"
+            )));
+        }
+    }
+
     // Idempotency check: if message_id already exists, find and return that conversation
     if state.db.message_exists(&req.message_id).unwrap_or(false) {
         tracing::info!(

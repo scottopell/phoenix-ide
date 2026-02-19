@@ -246,8 +246,12 @@ impl LlmClient for RegistryLlmClient {
         let llm = self
             .registry
             .get(&self.model_id)
-            .or_else(|| self.registry.default())
-            .ok_or_else(|| LlmError::network("No LLM available"))?;
+            .ok_or_else(|| {
+                LlmError::network(format!(
+                    "Model '{}' is not available in the registry",
+                    self.model_id
+                ))
+            })?;
         llm.complete(request).await
     }
 
