@@ -1,6 +1,6 @@
 ---
 title: browser_eval returns undefined for valid JavaScript expressions
-status: ready
+status: done
 priority: p1
 created: 2026-02-16
 ---
