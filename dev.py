@@ -1107,12 +1107,15 @@ def prod_daemon_deploy():
 
     env["PHOENIX_DB_PATH"] = str(prod_db_path)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set.", file=sys.stderr)
-        print("Set it in your environment before deploying.", file=sys.stderr)
-        sys.exit(1)
-    env["ANTHROPIC_API_KEY"] = api_key
+    gateway = get_llm_gateway()
+    if gateway:
+        env["LLM_GATEWAY"] = gateway
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("ERROR: No LLM gateway reachable and ANTHROPIC_API_KEY not set.", file=sys.stderr)
+            sys.exit(1)
+        env["ANTHROPIC_API_KEY"] = api_key
 
     # Stop existing daemon if running
     if prod_pid_path.exists():
@@ -1162,7 +1165,7 @@ def prod_daemon_deploy():
     print(f"  Database: {prod_db_path}")
     print(f"  Logs: {prod_log_path}")
     print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
-    llm_mode = "exe.dev gateway" if os.environ.get("LLM_GATEWAY") else "Direct API"
+    llm_mode = f"gateway ({gateway})" if gateway else "Direct API (ANTHROPIC_API_KEY)"
     print(f"  LLM Mode: {llm_mode}")
     print()
     print("Use './dev.py prod status' to check status")
