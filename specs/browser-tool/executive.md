@@ -2,35 +2,39 @@
 
 ## Requirements Summary
 
-The Phoenix Browser Tool enables AI agents to interact with web pages during development, testing, and debugging. It addresses three user stories: web development (navigate, screenshot, debug), automated testing (interact via JavaScript, capture evidence), and specialized PWA testing (service workers, offline mode).
+The Phoenix Browser Tool enables AI agents to interact with web pages during development, testing, and debugging. Three user stories drive the scope: web development (navigate, screenshot, debug), automated testing (interact via click/type/JS, capture evidence), and PWA testing (service workers, offline mode — post-MVP).
 
-The MVP covers 90% of use cases with six core capabilities: navigation with error handling, JavaScript execution for universal page interaction, screenshot capture with LLM vision support, console log access for debugging, viewport resizing for responsive testing, and image file reading. An implicit session model eliminates browser lifecycle management burden from agents.
-
-Post-MVP extends to PWA-specific needs: service worker inspection, network source identification, offline simulation, and multi-context console capture.
+The core set covers navigation, JavaScript evaluation, screenshots, viewport control, console log capture with accurate object representation, and dedicated click/type/wait tools that reliably trigger framework event handlers. Browser availability is automatic — if no system browser is found, a compatible Chromium is downloaded and cached transparently. Post-MVP scope covers PWA-specific inspection (service workers, network sources, offline simulation) and network request capture.
 
 ## Technical Summary
 
-Built using `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access - conversation ID is derived internally, making it impossible to use wrong session.
+Built using the `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access — conversation ID is derived internally, preventing cross-session contamination.
 
-`BrowserSessionManager` (owned by Runtime) maps conversation IDs to Chrome instances. Sessions auto-start on first `browser()` call, auto-cleanup after 30-minute idle timeout. Cleanup hooks fire on conversation delete and server shutdown.
+`BrowserSessionManager` maps conversation IDs to Chrome instances. Sessions auto-start on first `browser()` call and auto-clean after 30-minute idle. When no system Chrome is present, `BrowserFetcher` downloads a compatible binary to `~/.cache/phoenix-ide/chromium/` and caches it for future runs.
 
-Core tools wrap chromiumoxide's Page API: navigation, JavaScript evaluation, screenshots, viewport control. Console logs captured via CDP event subscription. Large outputs redirect to files. Screenshots resized for LLM vision limits.
+Console logs are captured via CDP event subscription. Objects and arrays are represented using the CDP preview field (key-value pairs) rather than generic type labels. Large output (>4096 bytes total) writes to a temp file with the path returned inline. Per-entry content is stored in full in the buffer (up to a memory-protection cap) and truncated only at retrieval time, ensuring the file escape hatch always contains complete entries.
 
 ## Status Summary
 
-### MVP Requirements
+### Core Requirements
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-BT-001:** Navigate to URLs | ❌ Not Started | - |
-| **REQ-BT-002:** Execute JavaScript | ❌ Not Started | - |
-| **REQ-BT-003:** Take Screenshots | ❌ Not Started | - |
-| **REQ-BT-004:** Capture Console Logs | ❌ Not Started | - |
-| **REQ-BT-005:** Resize Viewport | ❌ Not Started | - |
-| **REQ-BT-006:** Read Image Files | ✅ Complete | Existing `read_image` tool |
-| **REQ-BT-010:** Implicit Session Model | ❌ Not Started | BrowserSessionManager |
-| **REQ-BT-011:** State Persistence | ❌ Not Started | Session guard pattern |
-| **REQ-BT-012:** Stateless Tools with Context | 🔄 In Progress | ToolContext refactor (shared with bash) |
+| **REQ-BT-001:** Navigate to URLs | ✅ Complete | `browser_navigate` tool |
+| **REQ-BT-002:** Execute JavaScript | ✅ Complete | `browser_eval` tool |
+| **REQ-BT-003:** Take Screenshots | ✅ Complete | `browser_take_screenshot` + `read_image` |
+| **REQ-BT-004:** Capture Console Logs | ✅ Complete | CDP event subscription |
+| **REQ-BT-005:** Resize Viewport | ✅ Complete | `browser_resize` tool |
+| **REQ-BT-006:** Read Image Files | ✅ Complete | `read_image` tool |
+| **REQ-BT-007:** Reliable Browser Availability | ✅ Complete | `chromiumoxide` fetcher; caches to `~/.cache/phoenix-ide/chromium/` |
+| **REQ-BT-008:** Reliable Element Clicking | ✅ Complete | `browser_click` tool; CDP-level events |
+| **REQ-BT-009:** Reliable Text Input | ✅ Complete | `browser_type` tool; CDP-level keyboard events |
+| **REQ-BT-010:** Implicit Session Model | ✅ Complete | `BrowserSessionManager` |
+| **REQ-BT-011:** State Persistence | ✅ Complete | Session guard pattern |
+| **REQ-BT-012:** Stateless Tools with Context | ✅ Complete | `ToolContext.browser()` |
+| **REQ-BT-013:** Wait for Async Page Elements | ✅ Complete | `browser_wait_for_selector` tool |
+| **REQ-BT-014:** Accurate Console Log Object Representation | ✅ Complete | CDP preview field; objects show `{k: v}`, arrays show `[v]` |
+| **REQ-BT-015:** Access to Full Console Log Content | 🟡 Partial | File escape hatch exists for total output; per-entry truncation currently at capture time (loses data). Fix: truncate at retrieval only. |
 
 ### Post-MVP Requirements
 
@@ -42,5 +46,5 @@ Core tools wrap chromiumoxide's Page API: navigation, JavaScript evaluation, scr
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
 | **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
-**MVP Progress:** 1 of 9 complete (REQ-BT-006 exists)  
-**Total Progress:** 1 of 14 complete
+**Core Progress:** 14 of 15 complete (REQ-BT-015 partial)
+**Total Progress:** 14 of 20 complete

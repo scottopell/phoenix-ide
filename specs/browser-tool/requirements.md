@@ -134,6 +134,114 @@ THE SYSTEM SHALL support common image formats (PNG, JPEG, GIF, WebP)
 
 ---
 
+### REQ-BT-007: Reliable Browser Availability
+
+WHEN browser tools are first invoked in a conversation
+THE SYSTEM SHALL make a browser available without requiring manual installation
+
+WHEN no browser is found in the system
+THE SYSTEM SHALL automatically obtain a compatible browser and cache it for future use
+
+WHEN a browser has been previously obtained
+THE SYSTEM SHALL use the cached browser without downloading again
+
+**Rationale:** Agents should not fail silently or require setup steps to use browser tools. Browser availability should be automatic and transparent.
+
+**User Stories:** US-1, US-2, US-3
+
+---
+
+### REQ-BT-008: Reliable Element Clicking
+
+THE SYSTEM SHALL provide a dedicated tool for clicking page elements by CSS selector
+
+WHEN the target element does not exist
+THE SYSTEM SHALL return a clear error indicating the element was not found
+
+WHEN the target element may not yet be present
+THE SYSTEM SHALL support waiting for the element to appear before clicking
+
+THE SYSTEM SHALL reliably trigger event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
+
+**Rationale:** Clicking elements is a fundamental interaction that must work reliably across all web frameworks. JavaScript-level click simulation can fail to trigger framework-managed event handlers; a dedicated tool avoids this pitfall.
+
+**User Stories:** US-2
+
+---
+
+### REQ-BT-009: Reliable Text Input
+
+THE SYSTEM SHALL provide a dedicated tool for typing text into input elements by CSS selector
+
+WHEN the target element does not exist
+THE SYSTEM SHALL return a clear error indicating the element was not found
+
+THE SYSTEM SHALL support replacing existing field content as well as appending to it
+
+THE SYSTEM SHALL reliably trigger input event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
+
+**Rationale:** Form input must fire the key and input events that frameworks listen to. Setting the value property directly does not trigger React/Vue synthetic events; a dedicated tool ensures event handlers are invoked correctly.
+
+**User Stories:** US-2
+
+---
+
+### REQ-BT-013: Wait for Async Page Elements
+
+WHEN page content appears asynchronously after navigation or user interaction
+THE SYSTEM SHALL provide a way to wait for a specific element to become present in the DOM
+
+WHEN the element must be visible (not merely present in DOM)
+THE SYSTEM SHALL support waiting for the element to become visually visible
+
+WHEN the element does not appear within the specified time
+THE SYSTEM SHALL return a clear timeout error
+
+**Rationale:** Modern web apps load content asynchronously. Agents need to wait for expected elements before interacting with them, rather than polling manually with JavaScript.
+
+**User Stories:** US-1, US-2
+
+---
+
+### REQ-BT-014: Accurate Console Log Object Representation
+
+WHEN console messages include objects or arrays
+THE SYSTEM SHALL represent the logged values using their actual content, not generic type labels
+
+WHEN an object's properties are available for inspection
+THE SYSTEM SHALL show the key-value pairs in a readable format
+
+WHEN an array's elements are available
+THE SYSTEM SHALL show the element values in order
+
+WHEN a logged value's full content exceeds a reasonable display size
+THE SYSTEM SHALL indicate that the representation is abbreviated
+
+**Rationale:** "Object" is not a useful representation of `{userId: 123, status: 'active'}`. Agents debugging applications need to see actual values to understand program state.
+
+**User Stories:** US-1, US-2
+
+---
+
+### REQ-BT-015: Access to Full Console Log Content
+
+WHEN a console log entry's text representation exceeds the per-entry display limit
+THE SYSTEM SHALL include the truncated text with a visible truncation indicator
+AND THE SYSTEM SHALL preserve the full content internally for retrieval
+
+WHEN retrieved console log output exceeds the inline size threshold
+THE SYSTEM SHALL write the full content to a file and return the file path
+AND the file SHALL contain complete, untruncated entries
+
+WHEN the agent reads the file path returned by the console log tool
+THE SYSTEM SHALL provide the full untruncated content of all entries in that retrieval
+
+**Rationale:** Console logs can contain large serialized objects critical for debugging. Truncation prevents context bloat, but the agent must always be able to recover the full content via a follow-up action — otherwise useful debugging information is silently lost.
+
+**User Stories:** US-1, US-2
+
+---
+
 ## Session Management Requirements
 
 ### REQ-BT-010: Implicit Session Model
@@ -278,9 +386,15 @@ THE SYSTEM SHALL write requests to a file and return the file path
 | REQ-BT-004: Capture Console Logs | US-1, US-2 | ✅ |
 | REQ-BT-005: Resize Viewport | US-1 | ✅ |
 | REQ-BT-006: Read Image Files | US-1, US-2 | ✅ |
+| REQ-BT-007: Reliable Browser Availability | US-1, US-2, US-3 | ✅ |
+| REQ-BT-008: Reliable Element Clicking | US-2 | ✅ |
+| REQ-BT-009: Reliable Text Input | US-2 | ✅ |
 | REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 | ✅ |
 | REQ-BT-011: State Persistence | US-2 | ✅ |
 | REQ-BT-012: Stateless Tools with Context | US-1, US-2, US-3 | ✅ |
+| REQ-BT-013: Wait for Async Page Elements | US-1, US-2 | ✅ |
+| REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 | ✅ |
+| REQ-BT-015: Access to Full Console Log Content | US-1, US-2 | 🟡 |
 | REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
