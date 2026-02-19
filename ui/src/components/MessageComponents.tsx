@@ -45,6 +45,21 @@ export function formatMessageTime(isoStr: string): string {
 // Thresholds for auto-expanding output
 const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 
+/**
+ * Strip model artifacts from think tool thoughts:
+ * - Remove optional opening <thinking> wrapper
+ * - Truncate at </thinking> — everything after it is hallucinated XML
+ *   (the model sometimes emits legacy XML tool calls after the closing tag)
+ */
+function cleanThoughts(raw: string): string {
+  let text = raw.replace(/^\s*<thinking>\s*/i, '');
+  const closingIdx = text.search(/<\/thinking>/i);
+  if (closingIdx !== -1) {
+    text = text.slice(0, closingIdx);
+  }
+  return text.trim();
+}
+
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
   switch (name) {
     case 'bash': {
@@ -54,7 +69,7 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
       return { display: `$ ${displayCmd}`, isMultiline: cmd.includes('\n') };
     }
     case 'think': {
-      const thoughts = String(input['thoughts'] || '');
+      const thoughts = cleanThoughts(String(input['thoughts'] || ''));
       return { display: thoughts, isMultiline: thoughts.includes('\n') };
     }
     case 'patch': {
