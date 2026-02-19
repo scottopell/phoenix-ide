@@ -367,9 +367,19 @@ impl RuntimeManager {
         let context = if is_sub_agent {
             // Sub-agent being resumed - we don't have the original task
             // This is an edge case that shouldn't happen in normal operation
-            ConvContext::sub_agent(&conv.id, PathBuf::from(&conv.cwd), &model_id, context_window)
+            ConvContext::sub_agent(
+                &conv.id,
+                PathBuf::from(&conv.cwd),
+                &model_id,
+                context_window,
+            )
         } else {
-            ConvContext::new(&conv.id, PathBuf::from(&conv.cwd), &model_id, context_window)
+            ConvContext::new(
+                &conv.id,
+                PathBuf::from(&conv.cwd),
+                &model_id,
+                context_window,
+            )
         };
 
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -377,10 +387,7 @@ impl RuntimeManager {
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(
-            self.llm_registry.clone(),
-            model_id,
-        );
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
 
         // Use appropriate tool registry based on whether this is a sub-agent
         #[allow(deprecated)]

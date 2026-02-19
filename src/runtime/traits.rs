@@ -243,15 +243,12 @@ impl RegistryLlmClient {
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let llm = self
-            .registry
-            .get(&self.model_id)
-            .ok_or_else(|| {
-                LlmError::network(format!(
-                    "Model '{}' is not available in the registry",
-                    self.model_id
-                ))
-            })?;
+        let llm = self.registry.get(&self.model_id).ok_or_else(|| {
+            LlmError::network(format!(
+                "Model '{}' is not available in the registry",
+                self.model_id
+            ))
+        })?;
         llm.complete(request).await
     }
 
