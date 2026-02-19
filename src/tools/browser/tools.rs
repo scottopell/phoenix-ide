@@ -336,8 +336,13 @@ impl Tool for BrowserTakeScreenshotTool {
 }
 
 // ============================================================================
-// browser_recent_console_logs (REQ-BT-004)
+// browser_recent_console_logs (REQ-BT-004, REQ-BT-015)
 // ============================================================================
+
+/// Maximum characters per entry shown inline in the tool result.
+/// Protects the LLM context window. Full content is written untruncated
+/// when the file escape hatch fires (REQ-BT-015).
+const DISPLAY_ENTRY_LEN: usize = 500;
 
 #[derive(Debug, Deserialize)]
 struct ConsoleLogsInput {
@@ -387,28 +392,43 @@ impl Tool for BrowserRecentConsoleLogsTool {
 
         let guard = session.read().await;
 
-        // Get recent logs (lock the console_logs mutex)
-        let logs: Vec<_> = {
+        // Collect raw entries once; build display and full variants separately.
+        let raw_entries: Vec<_> = {
             let console_logs = guard.console_logs.lock().unwrap();
             console_logs
                 .iter()
                 .rev()
                 .take(input.limit)
-                .map(|entry| {
-                    json!({
-                        "level": entry.level,
-                        "text": entry.text,
-                    })
-                })
+                .map(|entry| (entry.level.clone(), entry.text.clone()))
                 .collect()
         };
 
-        let json_str = serde_json::to_string_pretty(&logs).unwrap_or_else(|_| "[]".to_string());
+        // Display version: per-entry truncation for LLM context safety
+        let display_logs: Vec<_> = raw_entries
+            .iter()
+            .map(|(level, text)| {
+                let display_text = crate::tools::browser::session::truncate_unicode_safe(
+                    text.clone(),
+                    DISPLAY_ENTRY_LEN,
+                );
+                json!({"level": level, "text": display_text})
+            })
+            .collect();
+
+        let json_str =
+            serde_json::to_string_pretty(&display_logs).unwrap_or_else(|_| "[]".to_string());
 
         if json_str.len() > 4096 {
-            // Write to temp file
+            // File escape hatch: write FULL untruncated entries so the agent
+            // can retrieve complete content via bash/cat (REQ-BT-015)
+            let full_logs: Vec<_> = raw_entries
+                .iter()
+                .map(|(level, text)| json!({"level": level, "text": text}))
+                .collect();
+            let full_json =
+                serde_json::to_string_pretty(&full_logs).unwrap_or_else(|_| "[]".to_string());
             let path = format!("/tmp/phoenix-console-logs-{}.json", uuid::Uuid::new_v4());
-            if let Err(e) = tokio::fs::write(&path, &json_str).await {
+            if let Err(e) = tokio::fs::write(&path, &full_json).await {
                 return ToolOutput::error(format!("Failed to write logs: {e}"));
             }
             ToolOutput::success(format!("Logs written to {path} (use `cat` to view)"))

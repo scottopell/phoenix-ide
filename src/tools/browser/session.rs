@@ -78,6 +78,11 @@ pub struct BrowserSession {
     pub last_activity: Instant,
 }
 
+/// Maximum bytes stored per console arg in the capture buffer.
+/// This is a memory-protection cap only — display truncation happens
+/// at retrieval time in `browser_recent_console_logs`, not here.
+const MAX_CAPTURE_ARG_BYTES: usize = 10_000;
+
 /// Extract a human-readable string from a CDP `RemoteObject` console arg.
 ///
 /// Priority:
@@ -85,13 +90,16 @@ pub struct BrowserSession {
 /// 2. `preview` field — for objects/arrays, reconstructs a `{k: v}` or `[v]` representation
 /// 3. `description` field — fallback string representation (e.g. "Object", "Array(3)")
 /// 4. `unserializable_value` — for `undefined`, `NaN`, `Infinity`, etc.
+///
+/// Output is truncated to `MAX_ARG_TEXT_LEN` characters.
 pub(crate) fn extract_console_arg_text(arg: &RemoteObject) -> String {
     // 1. JSON value present (primitives and some serializable objects)
     if let Some(value) = &arg.value {
-        return match value {
+        let raw = match value {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
+        return cap_for_memory(raw);
     }
 
     // 2. Preview: reconstruct a readable representation for objects/arrays
@@ -116,24 +124,47 @@ pub(crate) fn extract_console_arg_text(arg: &RemoteObject) -> String {
             .collect();
 
         let overflow = if preview.overflow { ", …" } else { "" };
-        return if is_array {
+        let raw = if is_array {
             format!("[{}{}]", props.join(", "), overflow)
         } else {
             format!("{{{}{}}}", props.join(", "), overflow)
         };
+        return cap_for_memory(raw);
     }
 
     // 3. Description fallback ("Object", "Array(3)", function source, etc.)
     if let Some(desc) = &arg.description {
-        return desc.clone();
+        return cap_for_memory(desc.clone());
     }
 
     // 4. Unserializable values (undefined, NaN, Infinity, -Infinity, etc.)
     if let Some(unser) = &arg.unserializable_value {
-        return unser.inner().clone();
+        return cap_for_memory(unser.inner().clone());
     }
 
-    String::from("[unknown]")
+    cap_for_memory(String::from("[unknown]"))
+}
+
+/// Cap a captured arg string at `MAX_CAPTURE_ARG_BYTES` to protect memory.
+/// This is NOT the display truncation — see `truncate_for_display`.
+fn cap_for_memory(s: String) -> String {
+    truncate_unicode_safe(s, MAX_CAPTURE_ARG_BYTES)
+}
+
+/// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary,
+/// appending `…` if truncation occurred.
+pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Map each char to its *end* byte position; keep those that fit within max_bytes.
+    let boundary = s
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&end| end <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &s[..boundary])
 }
 
 impl BrowserSession {
@@ -505,7 +536,7 @@ impl Drop for BrowserSessionManager {
 
 #[cfg(test)]
 mod console_arg_tests {
-    use super::extract_console_arg_text;
+    use super::{extract_console_arg_text, truncate_unicode_safe, MAX_CAPTURE_ARG_BYTES};
     use chromiumoxide::cdp::js_protocol::runtime::{
         ObjectPreview, ObjectPreviewSubtype, ObjectPreviewType, PropertyPreview,
         PropertyPreviewType, RemoteObject, RemoteObjectType,
@@ -638,6 +669,63 @@ mod console_arg_tests {
         }))
         .unwrap();
         assert_eq!(extract_console_arg_text(&arg), "MyClass");
+    }
+
+    #[test]
+    fn test_short_string_not_truncated() {
+        let arg = make_arg(Some(json!("hello")), None);
+        assert_eq!(extract_console_arg_text(&arg), "hello");
+    }
+
+    #[test]
+    fn test_memory_cap_applied_at_capture() {
+        // Strings over MAX_CAPTURE_ARG_BYTES are capped in the buffer (memory protection)
+        let huge = "x".repeat(MAX_CAPTURE_ARG_BYTES + 500);
+        let arg = make_arg(Some(serde_json::Value::String(huge)), None);
+        let result = extract_console_arg_text(&arg);
+        assert!(
+            result.len() <= MAX_CAPTURE_ARG_BYTES + 4,
+            "Memory cap should apply"
+        );
+        assert!(result.ends_with('…'), "Should end with ellipsis");
+    }
+
+    #[test]
+    fn test_moderate_string_not_capped() {
+        // Strings under the display limit (500) pass through completely intact
+        let medium = "a".repeat(600);
+        let arg = make_arg(Some(serde_json::Value::String(medium.clone())), None);
+        // 600 < MAX_CAPTURE_ARG_BYTES (10_000), so no cap applied
+        assert_eq!(extract_console_arg_text(&arg), medium);
+    }
+
+    #[test]
+    fn test_truncate_unicode_safe_ascii() {
+        let s = "a".repeat(600);
+        let result = truncate_unicode_safe(s, 500);
+        assert!(result.ends_with('…'));
+        assert!(result.len() <= 504); // 500 bytes + 3-byte ellipsis
+    }
+
+    #[test]
+    fn test_truncate_unicode_safe_multibyte() {
+        // Each '€' is 3 bytes; 167 of them = 501 bytes, just over the 500-byte limit
+        let s = "€".repeat(167);
+        let result = truncate_unicode_safe(s, 500);
+        // Should cut at 166 chars (498 bytes) and append …
+        assert!(result.ends_with('…'));
+        assert!(
+            !result.contains('\u{FFFD}'),
+            "No replacement chars — unicode safe"
+        );
+        // The slice must be valid UTF-8
+        let _ = result.as_str();
+    }
+
+    #[test]
+    fn test_truncate_unicode_safe_fits_exactly() {
+        let s = "hello".to_string();
+        assert_eq!(truncate_unicode_safe(s.clone(), 5), s);
     }
 
     #[test]
