@@ -202,6 +202,330 @@ async fn test_browser_eval_local() {
     server.shutdown().await;
 }
 
+// ============================================================================
+// REQ-552: browser_eval returning undefined for valid DOM expressions
+// ============================================================================
+
+#[tokio::test]
+async fn test_eval_inner_text_not_undefined() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html>
+        <head><title>InnerText Test</title></head>
+        <body><p>Hello from innerText</p></body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-eval-innertext");
+    let nav_tool = BrowserNavigateTool;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    let eval_tool = BrowserEvalTool;
+    let result = eval_tool
+        .run(
+            json!({"expression": "document.body.innerText"}),
+            ctx.clone(),
+        )
+        .await;
+
+    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "Got undefined instead of text: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("Hello from innerText"),
+        "Expected page text, got: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_eval_inner_html_slice_not_undefined() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html><head><title>Slice Test</title></head>
+        <body><div id="content">Slice test content</div></body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-eval-htmlslice");
+    let nav_tool = BrowserNavigateTool;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    let eval_tool = BrowserEvalTool;
+    let result = eval_tool
+        .run(
+            json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
+            ctx.clone(),
+        )
+        .await;
+
+    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "Got undefined instead of HTML: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("content") || result.output.len() > 10,
+        "Expected HTML content, got: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_eval_json_stringify_dom_not_undefined() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html><head><title>JSON Test</title></head>
+        <body><p id="msg">test content</p></body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-eval-jsonstringify");
+    let nav_tool = BrowserNavigateTool;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    let eval_tool = BrowserEvalTool;
+    // This is the exact pattern from the bug report
+    let result = eval_tool
+        .run(
+            json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
+            ctx.clone(),
+        )
+        .await;
+
+    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "Got undefined instead of JSON: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("bodyText"),
+        "Expected JSON with bodyText key, got: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_eval_complex_page_inner_text() {
+    require_chrome!();
+
+    // Serve a page closer to a real React app: scripts, dynamic DOM, lots of elements
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html>
+        <head><title>Complex Page</title></head>
+        <body>
+            <div id="app">
+                <header><nav><a href="/">Home</a><a href="/about">About</a></nav></header>
+                <main>
+                    <article>
+                        <h1>Article Title</h1>
+                        <p>First paragraph with some text content for testing innerText extraction.</p>
+                        <p>Second paragraph with <strong>bold</strong> and <em>italic</em> text.</p>
+                        <ul><li>Item one</li><li>Item two</li><li>Item three</li></ul>
+                        <table><tr><th>Name</th><th>Value</th></tr><tr><td>Key</td><td>42</td></tr></table>
+                    </article>
+                    <aside>
+                        <div class="widget"><span>Widget content</span></div>
+                        <div class="widget"><span>Another widget</span></div>
+                    </aside>
+                </main>
+                <footer><p>Footer text here</p></footer>
+            </div>
+            <script>
+                // Simulate React-like dynamic behavior
+                document.getElementById('app').dataset.hydrated = 'true';
+                window.__NEXT_DATA__ = {props: {pageProps: {data: Array(100).fill({id: 1, name: 'test'})}}};
+            </script>
+        </body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-eval-complex");
+    let nav_tool = BrowserNavigateTool;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    let eval_tool = BrowserEvalTool;
+
+    // Test 1: document.body.innerText on a complex page
+    let result = eval_tool
+        .run(
+            json!({"expression": "document.body.innerText"}),
+            ctx.clone(),
+        )
+        .await;
+    assert!(result.success, "innerText eval failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "innerText returned undefined: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("Article Title"),
+        "Missing article title from innerText: {}",
+        result.output
+    );
+
+    // Test 2: innerHTML.slice on complex page
+    let result = eval_tool
+        .run(
+            json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
+            ctx.clone(),
+        )
+        .await;
+    assert!(result.success, "innerHTML.slice failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "innerHTML.slice returned undefined: {}",
+        result.output
+    );
+
+    // Test 3: JSON.stringify of DOM properties
+    let result = eval_tool
+        .run(
+            json!({"expression": "JSON.stringify({title: document.title, bodyLen: document.body.innerText.length, hydrated: document.getElementById('app').dataset.hydrated})"}),
+            ctx.clone(),
+        )
+        .await;
+    assert!(result.success, "JSON.stringify failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "JSON.stringify returned undefined: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("Complex Page"),
+        "Missing title in JSON: {}",
+        result.output
+    );
+
+    // Test 4: Reading script-set global variable
+    let result = eval_tool
+        .run(
+            json!({"expression": "JSON.stringify(window.__NEXT_DATA__.props.pageProps.data.length)"}),
+            ctx.clone(),
+        )
+        .await;
+    assert!(result.success, "Global var eval failed: {}", result.output);
+    assert!(
+        result.output.contains("100"),
+        "Expected 100 items, got: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_eval_await_false_returns_value() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html><head><title>Await Test</title></head>
+        <body><p>Content</p></body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-eval-await-false");
+    let nav_tool = BrowserNavigateTool;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    let eval_tool = BrowserEvalTool;
+
+    // With await: false, synchronous expressions should still work
+    let result = eval_tool
+        .run(
+            json!({"expression": "document.title", "await": false}),
+            ctx.clone(),
+        )
+        .await;
+    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(
+        result.output.contains("Await Test"),
+        "Expected title, got: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_eval_promise_chain_awaited() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html><head><title>Promise Test</title></head>
+        <body><script>
+            window.getData = () => new Promise(resolve => setTimeout(() => resolve({status: 'ok', count: 42}), 100));
+        </script></body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-eval-promise");
+    let nav_tool = BrowserNavigateTool;
+    nav_tool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    let eval_tool = BrowserEvalTool;
+
+    // Promise-returning expression should be awaited and return the resolved value
+    let result = eval_tool
+        .run(
+            json!({"expression": "window.getData().then(d => JSON.stringify(d))"}),
+            ctx.clone(),
+        )
+        .await;
+    assert!(result.success, "Promise eval failed: {}", result.output);
+    assert!(
+        !result.output.contains("undefined"),
+        "Promise returned undefined: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("ok") && result.output.contains("42"),
+        "Expected resolved data, got: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_browser_console_logs_local() {
     require_chrome!();

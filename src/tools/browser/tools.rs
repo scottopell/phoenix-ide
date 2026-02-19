@@ -10,6 +10,7 @@ use super::session::BrowserSession;
 use crate::tools::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::page::ScreenshotParams;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -179,23 +180,37 @@ impl Tool for BrowserEvalTool {
         let mut guard = session.write().await;
         guard.last_activity = std::time::Instant::now();
 
-        // Evaluate JavaScript with timeout
-        let expr = if input.r#await {
-            // Wrap in async IIFE to await promises
-            format!("(async () => {{ return {}; }})()", input.expression)
-        } else {
-            input.expression.clone()
-        };
+        // Evaluate JavaScript with timeout.
+        // Use EvaluateParams directly instead of wrapping in an async IIFE —
+        // the IIFE approach returns a Promise that CDP must await AND serialize,
+        // which may silently fail on complex pages. Direct evaluation with
+        // await_promise set via CDP is more reliable and explicit.
+        let params = EvaluateParams::builder()
+            .expression(&input.expression)
+            .await_promise(input.r#await)
+            .build()
+            .unwrap();
 
-        let result = tokio::time::timeout(timeout, guard.page.evaluate(expr)).await;
+        let result = tokio::time::timeout(timeout, guard.page.evaluate(params)).await;
 
         match result {
             Ok(Ok(eval_result)) => {
-                let json_str = match eval_result.value() {
-                    Some(v) => {
-                        serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string())
-                    }
-                    None => "undefined".to_string(),
+                let json_str = if let Some(v) = eval_result.value() {
+                    serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string())
+                } else {
+                    // Log the full RemoteObject so we can diagnose why value is None
+                    let obj = eval_result.object();
+                    tracing::warn!(
+                        r#type = ?obj.r#type,
+                        subtype = ?obj.subtype,
+                        class_name = ?obj.class_name,
+                        description = ?obj.description,
+                        has_object_id = obj.object_id.is_some(),
+                        expression = %input.expression,
+                        await_mode = input.r#await,
+                        "browser_eval: value() returned None"
+                    );
+                    "undefined".to_string()
                 };
 
                 // Check if output is large
