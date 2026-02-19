@@ -4238,51 +4238,62 @@ html * {
    Error Banner - Prominent error display
    ============================================ */
 
-.error-banner {
+/* Error input area — replaces InputArea in error state */
+.error-input-area {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-error, #5c2d2d);
+}
+
+/* Error body — conversation-area feel */
+.error-body {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
-  padding: 16px 20px;
-  margin: 16px;
+  gap: 10px;
+  padding: 14px 16px 12px;
   background: var(--bg-error, #2d1f1f);
-  border: 1px solid var(--border-error, #5c2d2d);
-  border-radius: 8px;
-  color: var(--text-error, #f5a5a5);
 }
 
-.error-banner-icon {
+.error-body-icon {
   flex-shrink: 0;
   color: var(--error-icon, #ef4444);
-  margin-top: 2px;
+  margin-top: 1px;
 }
 
-.error-banner-content {
+.error-body-content {
   flex: 1;
   min-width: 0;
 }
 
-.error-banner-title {
+.error-body-title {
   font-weight: 600;
-  font-size: 15px;
+  font-size: 14px;
   color: var(--text-error-title, #fca5a5);
   margin-bottom: 4px;
 }
 
-.error-banner-details {
-  font-size: 14px;
-  color: var(--text-error-details, #d4a5a5);
-  margin-bottom: 8px;
-  line-height: 1.4;
-}
-
-.error-banner-hint {
+.error-body-details {
   font-size: 13px;
-  color: var(--text-muted, #888);
-  font-style: italic;
+  color: var(--text-error-details, #d4a5a5);
+  line-height: 1.4;
+  word-break: break-word;
 }
 
-.error-banner-retry {
-  flex-shrink: 0;
+/* Action bar — mirrors #input-area bottom bar */
+.error-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+}
+
+.error-retry-btn {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -4295,31 +4306,58 @@ html * {
   font-weight: 500;
   cursor: pointer;
   transition: background 0.15s ease;
+  /* Comfortable tap target on mobile */
+  min-height: 44px;
 }
 
-.error-banner-retry:hover {
+.error-retry-btn:hover {
   background: var(--accent-hover, #2563eb);
 }
 
-.error-banner-retry:active {
+.error-retry-btn:active {
   transform: scale(0.98);
 }
 
-/* Light theme adjustments */
-[data-theme="light"] .error-banner {
-  background: #fef2f2;
-  border-color: #fecaca;
-  color: #991b1b;
+.error-dismiss-btn {
+  padding: 8px 12px;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+  min-height: 44px;
 }
 
-[data-theme="light"] .error-banner-title {
+.error-dismiss-btn:hover {
+  color: var(--text-secondary);
+  border-color: var(--text-muted);
+}
+
+.error-action-hint {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Light theme */
+[data-theme="light"] .error-body {
+  background: #fef2f2;
+}
+
+[data-theme="light"] .error-input-area {
+  border-top-color: #fecaca;
+}
+
+[data-theme="light"] .error-body-title {
   color: #b91c1c;
 }
 
-[data-theme="light"] .error-banner-details {
+[data-theme="light"] .error-body-details {
   color: #dc2626;
 }
 
-[data-theme="light"] .error-banner-icon {
+[data-theme="light"] .error-body-icon {
   color: #dc2626;
 }

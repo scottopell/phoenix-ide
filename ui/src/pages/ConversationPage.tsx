@@ -491,12 +491,6 @@ export function ConversationPage() {
         onOpenFile={handleOpenFileFromPatch}
         {...(systemPrompt !== undefined && { systemPrompt })}
       />
-      {convState === 'error' && stateData?.message && (
-        <ErrorBanner
-          message={stateData.message}
-          onRetry={() => handleSend('continue', [])}
-        />
-      )}
       {convState === 'context_exhausted' && contextExhaustedSummary && (
         <div className="context-exhausted-banner">
           <div className="context-exhausted-header">
@@ -517,6 +511,13 @@ export function ConversationPage() {
           </div>
         </div>
       )}
+      {convState === 'error' && stateData?.message ? (
+        <ErrorBanner
+          message={stateData.message}
+          onRetry={() => handleSend('continue', [])}
+          onDismiss={() => setConvState('idle')}
+        />
+      ) : (
       <InputArea
         ref={inputRef}
         conversationId={conversationId}
@@ -532,6 +533,7 @@ export function ConversationPage() {
         onRetry={handleRetry}
         onOpenFileBrowser={handleOpenFileBrowser}
       />
+      )}
       <BreadcrumbBar
         breadcrumbs={breadcrumbs}
         visible={breadcrumbs.length > 0}
