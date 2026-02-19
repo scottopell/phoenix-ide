@@ -1746,10 +1746,10 @@ def lima_prod_deploy():
     print("\nBuilding Rust (release)...")
     lima_shell(f"cd {LIMA_BUILD_DIR} && cargo build --release")
 
-    # Strip and install binary
+    # Strip and install binary (mv avoids ETXTBSY on a running executable)
     print("\nInstalling binary...")
     lima_shell(f"strip {LIMA_BUILD_DIR}/target/release/phoenix_ide")
-    lima_shell(f"sudo cp {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
+    lima_shell(f"sudo mv {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
     lima_shell("sudo chmod +x /opt/phoenix-ide/phoenix-ide")
 
     # LLM config — auto-detect gateway or prompt for API key
