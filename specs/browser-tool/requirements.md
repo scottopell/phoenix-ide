@@ -229,7 +229,7 @@ WHEN the total output from `browser_recent_console_logs` exceeds 4096 bytes (whe
 WHEN `browser_recent_console_logs` returns a file path instead of inline content
 THE SYSTEM SHALL ensure the file contains all entries in full, without per-entry truncation, so the agent can read it using `bash` or similar
 
-**Rationale:** Console logs can contain large serialized objects critical for debugging. Inline truncation prevents context bloat, but the agent must always be able to recover full content — the file path escape hatch ensures nothing is permanently lost. Per-entry truncation must happen only at display time, not at capture time, so the file always contains complete data.
+**Rationale:** Console logs can contain large serialized objects critical for debugging. Truncation exists to protect the LLM context window, not the UI. Per-entry truncation must happen only when formatting output for the tool result (what the LLM sees), not at capture time — so the internal buffer always retains full content, and the file escape hatch always contains complete untruncated data.
 
 **User Stories:** US-1, US-2
 
