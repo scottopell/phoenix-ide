@@ -170,6 +170,7 @@ impl AnthropicService {
 
     fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
         let mut content = Vec::new();
+        let raw_block_count = resp.content.len();
 
         for block in resp.content {
             match block {
@@ -197,25 +198,18 @@ impl AnthropicService {
         let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
         if content.is_empty() {
-            if end_turn {
-                // Valid: model finished with nothing more to say (common after think/tool use)
-                tracing::debug!(
-                    "Anthropic returned empty content with end_turn — treating as clean completion"
-                );
-                return Ok(LlmResponse {
-                    content: vec![],
-                    end_turn: true,
-                    usage: Usage {
-                        input_tokens: resp.usage.input_tokens,
-                        output_tokens: resp.usage.output_tokens,
-                        cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
-                        cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
-                    },
-                });
-            }
+            // Log exactly what Anthropic sent so we can diagnose the root cause.
+            // output_tokens > 0 with empty content suggests blocks were silently dropped
+            // (e.g. empty text blocks filtered above). stop_reason tells us intent.
+            tracing::warn!(
+                stop_reason = ?resp.stop_reason,
+                output_tokens = resp.usage.output_tokens,
+                raw_block_count = raw_block_count,
+                "Anthropic returned empty content after normalization"
+            );
             return Err(LlmError::unknown(format!(
-                "Anthropic returned empty response (no content or tool calls, stop_reason={:?})",
-                resp.stop_reason
+                "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
+                resp.stop_reason, resp.usage.output_tokens, raw_block_count
             )));
         }
 
