@@ -34,7 +34,7 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-012:** Stateless Tools with Context | ✅ Complete | `ToolContext.browser()` |
 | **REQ-BT-013:** Wait for Async Page Elements | ✅ Complete | `browser_wait_for_selector` tool |
 | **REQ-BT-014:** Accurate Console Log Object Representation | ✅ Complete | CDP preview field; objects show `{k: v}`, arrays show `[v]` |
-| **REQ-BT-015:** Access to Full Console Log Content | 🟡 Partial | File escape hatch exists for total output; per-entry truncation currently at capture time (loses data). Fix: truncate at retrieval only. |
+| **REQ-BT-015:** Access to Full Console Log Content | ✅ Complete | Buffer stores full content (10KB cap); display truncation at retrieval time only; file escape hatch writes untruncated entries |
 
 ### Post-MVP Requirements
 
@@ -46,5 +46,5 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
 | **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
-**Core Progress:** 14 of 15 complete (REQ-BT-015 partial)
+**Core Progress:** 15 of 15 complete
 **Total Progress:** 14 of 20 complete
