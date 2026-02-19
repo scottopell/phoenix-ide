@@ -98,6 +98,24 @@ THE SYSTEM SHALL accept either:
 
 ---
 
+### REQ-CLI-008: Model Selection
+
+WHEN user specifies `--model` flag
+THE SYSTEM SHALL pass the model ID to the create conversation request
+AND the conversation SHALL use that model instead of the server default
+
+WHEN user runs `--list-models`
+THE SYSTEM SHALL query the API for available models
+AND print each model's ID, provider, and description
+AND exit without sending a message
+
+WHEN `--model` is used with `--conversation` (continuing existing conversation)
+THE SYSTEM SHALL ignore the `--model` flag (model is fixed at creation time)
+
+**Rationale:** Agents and developers need to select specific models without using the web UI. Listing models enables discovery of what's available through the current LLM gateway.
+
+---
+
 ### REQ-CLI-007: Single File Distribution
 
 WHEN client is distributed

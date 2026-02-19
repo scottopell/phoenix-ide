@@ -37,6 +37,8 @@ Options:
   -c, --conversation TEXT   Conversation ID or slug to continue
   -d, --directory PATH      Working directory for new conversation
   -i, --image PATH          Image file to attach (can be repeated)
+  -m, --model TEXT          Model ID for new conversations (e.g. claude-4.5-sonnet)
+  --list-models             List available models and exit
   --api-url TEXT            API endpoint URL
   --timeout INTEGER         Polling timeout in seconds (default: 600)
   --poll-interval FLOAT     Polling interval in seconds (default: 1.0)
@@ -60,6 +62,27 @@ uv run phoenix-client.py -i screenshot.png "What's wrong with this error?"
 
 # Multiple images
 uv run phoenix-client.py -i before.png -i after.png "Compare these screenshots"
+```
+
+### Model Selection Examples (REQ-CLI-008)
+
+```bash
+# List available models
+uv run phoenix-client.py --list-models --api-url http://localhost:8033
+
+# New conversation with specific model
+uv run phoenix-client.py -m claude-4.5-sonnet "Analyze this codebase"
+```
+
+## Model Listing (REQ-CLI-008)
+
+```python
+def list_models(client: PhoenixClient) -> None:
+    """Fetch and display available models."""
+    data = client.get_models()
+    for m in data['models']:
+        default = " (default)" if m['id'] == data.get('default') else ""
+        click.echo(f"  {m['id']:30s} {m.get('provider', ''):10s} {m.get('description', '')}{default}")
 ```
 
 ## Main Flow

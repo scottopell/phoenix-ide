@@ -19,5 +19,6 @@ Single Python file with PEP 723 inline dependencies (httpx, click), runnable via
 | **REQ-CLI-005:** Polling Behavior | ✅ Complete | Polls until idle/error with timeout |
 | **REQ-CLI-006:** Configuration | ✅ Complete | PHOENIX_API_URL, --api-url, -c, -d |
 | **REQ-CLI-007:** Single File Distribution | ✅ Complete | PEP 723 inline deps, uv run |
+| **REQ-CLI-008:** Model Selection | ✅ Complete | --model for create, --list-models for discovery |
 
-**Progress:** 7 of 7 complete
+**Progress:** 8 of 8 complete

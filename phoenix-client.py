@@ -16,6 +16,7 @@ REQ-CLI-004: Output Format
 REQ-CLI-005: SSE Streaming (--poll for fallback)
 REQ-CLI-006: Configuration
 REQ-CLI-007: Single File Distribution (uv run)
+REQ-CLI-008: Model Selection (--model, --list-models)
 """
 
 import base64
@@ -55,12 +56,21 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()['conversation']
 
-    def create_conversation(self, cwd: str, text: str, images: list[dict]) -> dict:
+    def get_models(self) -> dict:
+        """Get available models."""
+        resp = self.http.get(f"{self.base_url}/api/models")
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_conversation(self, cwd: str, text: str, images: list[dict], model: str | None = None) -> dict:
         """Create new conversation with initial message."""
         import uuid
+        payload = {"cwd": cwd, "text": text, "images": images, "message_id": str(uuid.uuid4())}
+        if model:
+            payload["model"] = model
         resp = self.http.post(
             f"{self.base_url}/api/conversations/new",
-            json={"cwd": cwd, "text": text, "images": images, "message_id": str(uuid.uuid4())}
+            json=payload
         )
         resp.raise_for_status()
         return resp.json()['conversation']
@@ -236,39 +246,59 @@ def format_response(data: dict) -> str:
 
 
 @click.command()
-@click.argument('message')
+@click.argument('message', required=False)
 @click.option('-c', '--conversation', envvar='PHOENIX_CONVERSATION',
               help='Conversation ID or slug to continue')
 @click.option('-d', '--directory', type=click.Path(exists=True),
               help='Working directory for new conversation')
 @click.option('-i', '--image', 'images', multiple=True, type=click.Path(exists=True),
               help='Image file to attach (can be repeated)')
+@click.option('-m', '--model', default=None,
+              help='Model ID for new conversations (e.g. claude-4.5-sonnet)')
+@click.option('--list-models', is_flag=True, help='List available models and exit')
 @click.option('--api-url', envvar='PHOENIX_API_URL', default='http://localhost:8000',
               help='API endpoint URL')
 @click.option('--timeout', default=600, help='Timeout in seconds')
 @click.option('--poll-interval', default=1.0, help='Polling interval in seconds (with --poll)')
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
-def main(message, conversation, directory, images, api_url, timeout, poll_interval, poll):
+def main(message, conversation, directory, images, model, list_models, api_url, timeout, poll_interval, poll):
     """Send a message to Phoenix IDE and wait for response.
-    
+
     Uses SSE (Server-Sent Events) for real-time streaming by default.
     Use --poll for polling fallback mode.
-    
+
     Examples:
-    
+
+        # List available models
+        phoenix-client.py --list-models
+
+        # New conversation with specific model
+        phoenix-client.py -m claude-4.5-sonnet "Analyze this project"
+
         # New conversation in current directory
         phoenix-client.py "List the files here"
-        
+
         # Continue existing conversation
         phoenix-client.py -c monday-morning-blue-river "Now create a README"
-        
+
         # With image
         phoenix-client.py -i screenshot.png "What's this error?"
-        
+
         # Use polling instead of SSE
         phoenix-client.py --poll "Hello"
     """
     client = PhoenixClient(api_url)
+
+    if list_models:
+        data = client.get_models()
+        default_model = data.get('default', '')
+        for m in data['models']:
+            marker = " (default)" if m['id'] == default_model else ""
+            click.echo(f"  {m['id']:30s} {m.get('provider', ''):10s} {m.get('description', '')}{marker}")
+        return
+
+    if not message:
+        raise click.UsageError("Missing argument 'MESSAGE' (required unless using --list-models).")
 
     # Prepare images
     image_data = [encode_image(path) for path in images]
@@ -283,7 +313,7 @@ def main(message, conversation, directory, images, api_url, timeout, poll_interv
         cwd = directory or os.getcwd()
         # Create conversation with initial message
         click.echo("Sending message...", err=True)
-        conv = client.create_conversation(cwd, message, image_data)
+        conv = client.create_conversation(cwd, message, image_data, model=model)
         click.echo(f"Created conversation: {conv.get('slug', conv['id'])}", err=True)
 
     # Wait for completion (SSE or polling)
