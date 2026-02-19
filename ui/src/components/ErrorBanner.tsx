@@ -1,4 +1,4 @@
-import { AlertCircle, RefreshCw } from 'lucide-react';
+import { AlertCircle } from 'lucide-react';
 
 interface ErrorBannerProps {
   message: string;
@@ -94,8 +94,7 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
       <div className="error-action-bar">
         {isRetryable ? (
           <button className="error-retry-btn" onClick={onRetry}>
-            <RefreshCw size={14} />
-            Retry — sends &ldquo;continue&rdquo;
+            ↺ Retry — sends &ldquo;continue&rdquo;
           </button>
         ) : (
           <span className="error-action-hint">Start a new conversation to continue.</span>
