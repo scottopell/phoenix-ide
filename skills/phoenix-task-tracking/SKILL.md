@@ -1,6 +1,6 @@
 ---
 name: phoenix-task-tracking
-description: Task tracking conventions for Phoenix IDE. Covers file format, status/priority values, CLI commands, and the issue discovery protocol agents must follow.
+description: Task tracking conventions for Phoenix IDE. Use when creating a task, updating task status, filing a bug found during work, or checking what tasks are ready to work on.
 ---
 
 # Phoenix IDE Task Tracking
@@ -72,14 +72,10 @@ When you encounter ANY issue during work — even if unrelated to your current t
 
 ## Creating a task
 
-Use the next available number and follow the format:
+1. Find the next number: `ls tasks/*.md | sort | tail -5`
+2. Create `tasks/NNN-pX-ready-short-description.md` using this exact template:
 
-```bash
-# Find the highest current number
-ls tasks/*.md | sort | tail -5
-
-# Create the file
-cat > tasks/NNN-pX-ready-short-description.md << 'EOF'
+```markdown
 ---
 created: YYYY-MM-DD
 priority: pX
@@ -96,5 +92,6 @@ Why this task exists.
 
 ## Acceptance Criteria
 - [ ] ...
-EOF
 ```
+
+3. Run `./dev.py tasks validate` to confirm the file is valid before moving on.

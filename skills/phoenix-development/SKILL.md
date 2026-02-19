@@ -1,6 +1,6 @@
 ---
 name: phoenix-development
-description: Development workflow and code conventions for Phoenix IDE. Covers starting/stopping dev servers, the change-test-commit cycle, and Rust/UI code conventions.
+description: Development workflow and code conventions for Phoenix IDE. Use when making code changes, running tests, starting or stopping the dev server, or following project conventions.
 ---
 
 # Phoenix IDE Development
