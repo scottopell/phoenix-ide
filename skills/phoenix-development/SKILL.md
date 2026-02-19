@@ -1,93 +1,70 @@
 ---
 name: phoenix-development
-description: Development workflow and conventions for the Phoenix IDE project. Covers server management, code quality, task tracking, and production deployment.
+description: Development workflow and code conventions for Phoenix IDE. Covers starting/stopping dev servers, the change-test-commit cycle, and Rust/UI code conventions.
 ---
 
 # Phoenix IDE Development
 
-This skill provides the workflow and conventions for developing Phoenix IDE.
-
 ## Server Management
 
-**Always use `./dev.py` for development tasks.** It handles LLM gateway configuration automatically.
+**Always use `./dev.py` — never `cargo run` directly.** It configures the LLM gateway automatically.
 
 ```bash
-./dev.py up            # Build and start Phoenix + Vite dev servers
-./dev.py down          # Stop all servers
-./dev.py restart       # Rebuild Rust and restart Phoenix (Vite stays)
-./dev.py status        # Check what's running
-./dev.py check         # Run clippy + fmt check + tests
+./dev.py up          # Build and start Phoenix + Vite dev servers
+./dev.py down        # Stop all servers
+./dev.py restart     # Rebuild Rust and restart Phoenix (Vite stays running)
+./dev.py status      # Check what's running
+./dev.py check       # clippy + fmt + tests + task validation
 ```
 
-### Development Workflow
+### Workflow
 
-1. **Start development:** `./dev.py up`
-2. **After Rust changes:** `./dev.py restart`
-3. **After UI changes:** Nothing needed (Vite hot reloads)
-4. **Before committing:** `./dev.py check`
-5. **When done:** `./dev.py down`
+1. `./dev.py up` — start dev environment
+2. Make changes
+3. Rust change → `./dev.py restart` / UI change → nothing (Vite hot reloads)
+4. `./dev.py check` — must pass before committing
+5. `./dev.py down` — when done
 
-### ⚠️ Do NOT start the server manually
+Each git worktree gets unique ports and a separate database automatically.
 
-Do NOT use `cargo run` or start the binary directly. The server requires LLM gateway configuration which `./dev.py up` provides automatically.
-
-## Production Deployment
+## Testing
 
 ```bash
-./dev.py prod deploy [version]  # Build + install systemd service + start
-./dev.py prod status            # Show production service status
-./dev.py prod stop              # Stop production service
+cargo test                    # All tests
+cargo test state_machine      # Filter by module or test name
+cargo test -- --nocapture     # See println! output
 ```
 
-### Deployment Process
-
-1. Stop the service first if replacing: `sudo systemctl stop phoenix-ide`
-2. Deploy: `./dev.py prod deploy`
-3. Verify: `./dev.py prod status`
-
-The deploy builds from HEAD by default. Specify a git tag for tagged releases.
+Property tests live in `**/proptests.rs`. Run with `cargo test proptests`.
 
 ## Code Conventions
 
 ### Module Organization
 
-Use named module files instead of `mod.rs`:
+Use `foo.rs` + `foo/` subdirectory — NOT `foo/mod.rs`. Enforced by clippy.
 
-✅ Correct:
 ```
-src/
-  tools.rs           # Module entry point
-  tools/
-    bash.rs          # Submodule
+✅  src/tools.rs + src/tools/bash.rs
+❌  src/tools/mod.rs + src/tools/bash.rs
 ```
 
-❌ Wrong:
-```
-src/
-  tools/
-    mod.rs           # Forbidden
-```
+### Adding a New Tool
 
-## Task Tracking
+See `src/tools/think.rs` as the minimal example.
 
-Tasks are tracked in `tasks/NNN-slug.md` files with YAML frontmatter.
+1. Create `src/tools/your_tool.rs` implementing the `Tool` trait
+2. Register in `src/tools.rs` → `ToolRegistry::new_with_options()`
+3. Add spec in `specs/your-tool/executive.md`
+
+**Before modifying any existing tool**, read its spec in `specs/<tool>/executive.md`.
+
+## Testing Conversations
+
+Use `phoenix-client.py` to interact with the running server without a browser:
 
 ```bash
-./dev.py tasks ready              # List tasks ready for implementation
-./dev.py tasks close <id>         # Close a task as done
-./dev.py tasks close <id> --wont-do  # Close as won't-do
+./phoenix-client.py "List files in this directory"
+./phoenix-client.py -c <conversation-id> "Follow-up message"
 ```
 
-### Issue Discovery Protocol
-
-**When you encounter ANY issue during work, create a task immediately.**
-
-Do NOT:
-- Note an issue and move on
-- Say "this is unrelated" and ignore it
-- Work around problems without documenting
-
-Do:
-- Create a task in `tasks/` documenting the issue
-- Include reproduction steps and context
-- Then continue with original work
+Prefer this over browser automation for agent testing.
