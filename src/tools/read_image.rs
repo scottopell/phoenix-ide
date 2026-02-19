@@ -61,7 +61,7 @@ impl Tool for ReadImageTool {
     }
 
     fn description(&self) -> String {
-        "Read an image file (such as a screenshot) and encode it for sending to the LLM".to_string()
+        "View an image file (PNG, JPG, etc.). Required after browser_take_screenshot to see the screenshot content — the screenshot is saved to a temp file but not automatically visible until you call read_image on that path. Also use for any image file in the working directory.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -75,7 +75,7 @@ impl Tool for ReadImageTool {
                 },
                 "timeout": {
                     "type": "string",
-                    "description": "Timeout as a Go duration string (default: 15s)"
+                    "description": "Timeout duration (default: 15s). Examples: '5s', '1m', '500ms'"
                 }
             }
         })

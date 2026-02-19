@@ -56,7 +56,7 @@ impl Tool for BrowserNavigateTool {
     }
 
     fn description(&self) -> String {
-        "Navigate the browser to a specific URL and wait for page to load".to_string()
+        "Navigate the browser to a URL and wait for the page to load. The browser session persists across tool calls — cookies, JS state, and DOM are preserved until the conversation ends. Call this before any other browser interaction with a new URL. Prefer browser tools over bash curl/wget when you need a rendered page or JS-driven content.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -69,7 +69,7 @@ impl Tool for BrowserNavigateTool {
                 },
                 "timeout": {
                     "type": "string",
-                    "description": "Timeout as a Go duration string (default: 15s)"
+                    "description": "Timeout duration (default: 15s). Examples: '5s', '1m', '500ms'"
                 }
             },
             "required": ["url"]
@@ -134,8 +134,7 @@ impl Tool for BrowserEvalTool {
     }
 
     fn description(&self) -> String {
-        r"Evaluate JavaScript in the browser context.
-Your go-to tool for interacting with content: clicking buttons, typing, getting content, scrolling, resizing, waiting for content/selector to be ready, etc.".to_string()
+        "Evaluate JavaScript in the current page context and return the result. Use for reading page state, extracting data, or complex interactions not covered by the dedicated tools. For clicks and typing, prefer browser_click and browser_type — they use CDP-level events that reliably trigger React/Vue/Angular handlers. Large outputs (>4KB) are saved to a temp file.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -148,7 +147,7 @@ Your go-to tool for interacting with content: clicking buttons, typing, getting 
                 },
                 "timeout": {
                     "type": "string",
-                    "description": "Timeout as a Go duration string (default: 15s)"
+                    "description": "Timeout duration (default: 15s). Examples: '5s', '1m', '500ms'"
                 },
                 "await": {
                     "type": "boolean",
@@ -240,7 +239,7 @@ impl Tool for BrowserTakeScreenshotTool {
     }
 
     fn description(&self) -> String {
-        "Take a screenshot of the page or a specific element".to_string()
+        "Capture a screenshot of the current page or a specific element. The image is saved to a temp file path returned in the result. To view the screenshot content yourself, follow up with read_image on that path.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -253,7 +252,7 @@ impl Tool for BrowserTakeScreenshotTool {
                 },
                 "timeout": {
                     "type": "string",
-                    "description": "Timeout as a Go duration string (default: 15s)"
+                    "description": "Timeout duration (default: 15s). Examples: '5s', '1m', '500ms'"
                 }
             }
         })
@@ -359,7 +358,7 @@ impl Tool for BrowserRecentConsoleLogsTool {
     }
 
     fn description(&self) -> String {
-        "Get recent browser console logs".to_string()
+        "Retrieve captured browser console logs (console.log, .warn, .error, etc.). Use after page interactions to check for JS errors or debug output. Logs accumulate for the session — use browser_clear_console_logs to reset before a focused interaction.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -432,7 +431,7 @@ impl Tool for BrowserClearConsoleLogsTool {
     }
 
     fn description(&self) -> String {
-        "Clear all captured browser console logs".to_string()
+        "Clear the console log buffer. Use before a focused interaction to isolate logs from that specific action.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -482,7 +481,7 @@ impl Tool for BrowserResizeTool {
     }
 
     fn description(&self) -> String {
-        "Resize the browser viewport to a specific width and height".to_string()
+        "Resize the browser viewport. Use to test responsive layouts or match a device width (e.g. 375 for mobile, 768 for tablet, 1280 for desktop).".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -499,7 +498,7 @@ impl Tool for BrowserResizeTool {
                 },
                 "timeout": {
                     "type": "string",
-                    "description": "Timeout as a Go duration string (default: 15s)"
+                    "description": "Timeout duration (default: 15s). Examples: '5s', '1m', '500ms'"
                 }
             },
             "required": ["width", "height"]
@@ -582,7 +581,7 @@ impl Tool for BrowserWaitForSelectorTool {
     }
 
     fn description(&self) -> String {
-        "Wait for an element matching a CSS selector to appear in the page".to_string()
+        "Poll until a CSS selector appears in (or becomes visible in) the DOM. Use after navigation or interactions that trigger async content. Prefer this over manually polling with browser_eval. Set visible:true when the element may be in the DOM but hidden.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -721,8 +720,7 @@ impl Tool for BrowserClickTool {
     }
 
     fn description(&self) -> String {
-        "Click an element on the page using CDP-level mouse events (works with all frameworks)"
-            .to_string()
+        "Click an element by CSS selector using CDP-level mouse events. Prefer this over browser_eval for clicks — CDP events reliably trigger React/Vue/Angular handlers. Set wait:true to automatically wait for the element to appear before clicking.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -837,7 +835,7 @@ impl Tool for BrowserTypeTool {
     }
 
     fn description(&self) -> String {
-        "Type text into an input element using CDP-level keyboard events (works with React, Vue, Angular)".to_string()
+        "Type text into an input element using CDP-level keyboard events. Prefer this over browser_eval for form input — CDP events fire the key events that React/Vue/Angular listen to. Set clear:true to replace existing text instead of appending.".to_string()
     }
 
     fn input_schema(&self) -> Value {

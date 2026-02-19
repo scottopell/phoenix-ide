@@ -24,7 +24,7 @@ impl Tool for ThinkTool {
     }
 
     fn description(&self) -> String {
-        "Think out loud, take notes, form plans. Has no external effects.".to_string()
+        "Reason through a problem before acting: plan multi-step approaches, debug unexpected results, or evaluate trade-offs. Write freely — no side effects, not shown to the user. Use before complex commands, before editing files that need careful planning, or when reconciling conflicting information.".to_string()
     }
 
     fn input_schema(&self) -> Value {
