@@ -78,14 +78,14 @@ def _discover_gateway_candidates() -> list[str]:
     return candidates
 
 
-def get_llm_gateway() -> str:
-    """Get LLM gateway URL from env or by probing candidates."""
+def get_llm_gateway() -> str | None:
+    """Get LLM gateway URL from env or by probing candidates. Returns None if none reachable."""
     if val := os.environ.get("LLM_GATEWAY"):
         return val
     for url in _discover_gateway_candidates():
         if _gateway_is_reachable(url):
             return url
-    return DEFAULT_GATEWAY
+    return None
 
 
 def get_worktree_hash() -> str:
@@ -267,7 +267,8 @@ def start_phoenix(port: int, release: bool = True):
         sys.exit(1)
 
     env = os.environ.copy()
-    env["LLM_GATEWAY"] = get_llm_gateway()
+    if gateway := get_llm_gateway():
+        env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
     # Default to debug logging in dev, can be overridden via RUST_LOG env var
