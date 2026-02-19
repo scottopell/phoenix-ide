@@ -20,7 +20,7 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult, SseEventType, SseEventData, SseInitData, SseMessageData } from '../api';
 import { api } from '../api';
 import type { QueuedMessage } from '../hooks';
-import { escapeHtml } from '../utils';
+
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
@@ -120,7 +120,7 @@ export function UserMessage({ message }: { message: Message }) {
         <span className="message-status sent" title="Sent">✓</span>
       </div>
       <div className="message-content">
-        {escapeHtml(text)}
+        {text}
         {images.length > 0 && (
           <div className="message-images">
             {images.map((img, idx) => (
@@ -163,7 +163,7 @@ export function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage
         )}
       </div>
       <div className="message-content">
-        {escapeHtml(message.text)}
+        {message.text}
         {message.images.length > 0 && (
           <div className="message-images">
             {message.images.map((img, idx) => (

@@ -7,7 +7,7 @@
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
-    cdp::js_protocol::runtime::EventConsoleApiCalled,
+    cdp::js_protocol::runtime::{EventConsoleApiCalled, RemoteObject},
     fetcher::{BrowserFetcher, BrowserFetcherOptions},
     Page,
 };
@@ -76,6 +76,64 @@ pub struct BrowserSession {
     pub console_logs: Arc<StdMutex<VecDeque<ConsoleEntry>>>,
     /// Last activity timestamp (for idle timeout)
     pub last_activity: Instant,
+}
+
+/// Extract a human-readable string from a CDP `RemoteObject` console arg.
+///
+/// Priority:
+/// 1. `value` field — present for primitives; strings unwrapped, others JSON-serialized
+/// 2. `preview` field — for objects/arrays, reconstructs a `{k: v}` or `[v]` representation
+/// 3. `description` field — fallback string representation (e.g. "Object", "Array(3)")
+/// 4. `unserializable_value` — for `undefined`, `NaN`, `Infinity`, etc.
+pub(crate) fn extract_console_arg_text(arg: &RemoteObject) -> String {
+    // 1. JSON value present (primitives and some serializable objects)
+    if let Some(value) = &arg.value {
+        return match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+    }
+
+    // 2. Preview: reconstruct a readable representation for objects/arrays
+    if let Some(preview) = &arg.preview {
+        use chromiumoxide::cdp::js_protocol::runtime::ObjectPreviewSubtype;
+        let is_array = preview
+            .subtype
+            .as_ref()
+            .is_some_and(|s| matches!(s, ObjectPreviewSubtype::Array));
+
+        let props: Vec<String> = preview
+            .properties
+            .iter()
+            .map(|p| {
+                let val = p.value.as_deref().unwrap_or("…");
+                if is_array {
+                    val.to_string()
+                } else {
+                    format!("{}: {}", p.name, val)
+                }
+            })
+            .collect();
+
+        let overflow = if preview.overflow { ", …" } else { "" };
+        return if is_array {
+            format!("[{}{}]", props.join(", "), overflow)
+        } else {
+            format!("{{{}{}}}", props.join(", "), overflow)
+        };
+    }
+
+    // 3. Description fallback ("Object", "Array(3)", function source, etc.)
+    if let Some(desc) = &arg.description {
+        return desc.clone();
+    }
+
+    // 4. Unserializable values (undefined, NaN, Infinity, -Infinity, etc.)
+    if let Some(unser) = &arg.unserializable_value {
+        return unser.inner().clone();
+    }
+
+    String::from("[unknown]")
 }
 
 impl BrowserSession {
@@ -208,23 +266,7 @@ impl BrowserSession {
                 let text = event
                     .args
                     .iter()
-                    .map(|arg| {
-                        // Try value first (for JSON-serializable primitives)
-                        if let Some(value) = &arg.value {
-                            match value {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            }
-                        // Fall back to description (string representation of any object)
-                        } else if let Some(desc) = &arg.description {
-                            desc.clone()
-                        // Fall back to unserializable value (undefined, NaN, Infinity, etc.)
-                        } else if let Some(unser) = &arg.unserializable_value {
-                            unser.inner().clone()
-                        } else {
-                            String::from("[unknown]")
-                        }
-                    })
+                    .map(extract_console_arg_text)
                     .collect::<Vec<_>>()
                     .join(" ");
 
@@ -458,5 +500,153 @@ impl Drop for BrowserSessionManager {
         }
         // Note: sessions will be dropped automatically
         tracing::info!("BrowserSessionManager dropped - all sessions will be closed");
+    }
+}
+
+#[cfg(test)]
+mod console_arg_tests {
+    use super::extract_console_arg_text;
+    use chromiumoxide::cdp::js_protocol::runtime::{
+        ObjectPreview, ObjectPreviewSubtype, ObjectPreviewType, PropertyPreview,
+        PropertyPreviewType, RemoteObject, RemoteObjectType,
+    };
+    use serde_json::json;
+
+    fn make_arg(value: Option<serde_json::Value>, description: Option<&str>) -> RemoteObject {
+        serde_json::from_value(json!({
+            "type": "string",
+            "value": value,
+            "description": description,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_string_primitive() {
+        let arg = make_arg(Some(json!("hello world")), None);
+        assert_eq!(extract_console_arg_text(&arg), "hello world");
+    }
+
+    #[test]
+    fn test_number_primitive() {
+        let arg = make_arg(Some(json!(42)), None);
+        assert_eq!(extract_console_arg_text(&arg), "42");
+    }
+
+    #[test]
+    fn test_boolean_primitive() {
+        let arg = make_arg(Some(json!(true)), None);
+        assert_eq!(extract_console_arg_text(&arg), "true");
+    }
+
+    #[test]
+    fn test_null_value() {
+        // console.log(null): CDP sends description "null", value is absent (None after serde)
+        let arg = make_arg(None, Some("null"));
+        assert_eq!(extract_console_arg_text(&arg), "null");
+    }
+
+    #[test]
+    fn test_json_object_in_value() {
+        // When Chrome does serialize the value (e.g. simple JSON objects)
+        let arg = make_arg(Some(json!({"foo": "bar"})), None);
+        let result = extract_console_arg_text(&arg);
+        assert!(result.contains("foo"), "Expected JSON, got: {result}");
+        assert!(result.contains("bar"), "Expected JSON, got: {result}");
+    }
+
+    #[test]
+    fn test_object_with_preview() {
+        // console.log({foo: 'bar'}) — Chrome omits value but provides preview
+        let arg: RemoteObject = serde_json::from_value(json!({
+            "type": "object",
+            "description": "Object",
+            "preview": {
+                "type": "object",
+                "overflow": false,
+                "properties": [
+                    {"name": "foo", "type": "string", "value": "'bar'"}
+                ]
+            }
+        }))
+        .unwrap();
+        let result = extract_console_arg_text(&arg);
+        assert!(
+            result.contains("foo"),
+            "Expected property name, got: {result}"
+        );
+        assert!(
+            result.contains("bar"),
+            "Expected property value, got: {result}"
+        );
+        assert!(
+            result.starts_with('{'),
+            "Expected object notation: {result}"
+        );
+    }
+
+    #[test]
+    fn test_array_with_preview() {
+        // console.log([1, 2, 3])
+        let arg: RemoteObject = serde_json::from_value(json!({
+            "type": "object",
+            "subtype": "array",
+            "description": "Array(3)",
+            "preview": {
+                "type": "object",
+                "subtype": "array",
+                "overflow": false,
+                "properties": [
+                    {"name": "0", "type": "number", "value": "1"},
+                    {"name": "1", "type": "number", "value": "2"},
+                    {"name": "2", "type": "number", "value": "3"}
+                ]
+            }
+        }))
+        .unwrap();
+        let result = extract_console_arg_text(&arg);
+        assert_eq!(result, "[1, 2, 3]");
+    }
+
+    #[test]
+    fn test_object_overflow_in_preview() {
+        let arg: RemoteObject = serde_json::from_value(json!({
+            "type": "object",
+            "description": "Object",
+            "preview": {
+                "type": "object",
+                "overflow": true,
+                "properties": [
+                    {"name": "a", "type": "number", "value": "1"}
+                ]
+            }
+        }))
+        .unwrap();
+        let result = extract_console_arg_text(&arg);
+        assert!(
+            result.contains('…'),
+            "Expected overflow indicator: {result}"
+        );
+    }
+
+    #[test]
+    fn test_description_fallback_when_no_preview() {
+        // Object with no preview — falls back to description
+        let arg: RemoteObject = serde_json::from_value(json!({
+            "type": "object",
+            "description": "MyClass"
+        }))
+        .unwrap();
+        assert_eq!(extract_console_arg_text(&arg), "MyClass");
+    }
+
+    #[test]
+    fn test_unserializable_undefined() {
+        let arg: RemoteObject = serde_json::from_value(json!({
+            "type": "undefined",
+            "unserializableValue": "undefined"
+        }))
+        .unwrap();
+        assert_eq!(extract_console_arg_text(&arg), "undefined");
     }
 }

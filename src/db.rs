@@ -88,15 +88,35 @@ impl Database {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
-        conn.execute(
-            "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8)",
-            params![id, slug, cwd, parent_id, user_initiated, idle_state, now.to_rfc3339(), model],
-        )?;
+        // Retry with a random suffix on slug collision (UNIQUE constraint).
+        let mut actual_slug = slug.to_string();
+        let mut attempts = 0u8;
+        loop {
+            let result = conn.execute(
+                "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8)",
+                params![id, actual_slug, cwd, parent_id, user_initiated, idle_state, now.to_rfc3339(), model],
+            );
+            match result {
+                Ok(_) => break,
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        // Last resort: full UUID fragment
+                        actual_slug = format!("{slug}-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+                    } else {
+                        actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlite(e)),
+            }
+        }
 
         Ok(Conversation {
             id: id.to_string(),
-            slug: Some(slug.to_string()),
+            slug: Some(actual_slug),
             cwd: cwd.to_string(),
             parent_conversation_id: parent_id.map(String::from),
             user_initiated,
@@ -908,5 +928,34 @@ mod tests {
         assert!(tool_ids.contains(&"tool-1".to_string()));
         assert!(tool_ids.contains(&"tool-2".to_string()));
         assert!(tool_ids.contains(&"tool-3".to_string()));
+    }
+
+    #[test]
+    fn test_slug_collision_gets_suffix() {
+        let db = Database::open_in_memory().unwrap();
+
+        // First conversation gets the exact slug
+        let first = db
+            .create_conversation("id-1", "my-slug", "/tmp", true, None, None)
+            .unwrap();
+        assert_eq!(first.slug, Some("my-slug".to_string()));
+
+        // Second conversation with the same slug gets a suffix
+        let second = db
+            .create_conversation("id-2", "my-slug", "/tmp", true, None, None)
+            .unwrap();
+        let second_slug = second.slug.unwrap();
+        assert!(
+            second_slug.starts_with("my-slug-"),
+            "Expected suffix, got: {second_slug}"
+        );
+        assert_ne!(second_slug, "my-slug");
+
+        // Both are retrievable by ID
+        assert_eq!(
+            db.get_conversation("id-1").unwrap().slug,
+            Some("my-slug".to_string())
+        );
+        assert_eq!(db.get_conversation("id-2").unwrap().slug, Some(second_slug));
     }
 }
