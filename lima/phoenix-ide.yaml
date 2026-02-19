@@ -22,8 +22,8 @@ containerd:
   user: false
 
 portForwards:
-  - guestPort: 8031
-    hostPort: 8031
+  - guestPortRange: [8030, 8050]
+    hostPortRange: [8030, 8050]
 
 mounts:
   - location: "~/.phoenix-ide/lima"

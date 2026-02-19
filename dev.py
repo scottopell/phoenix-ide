@@ -28,7 +28,7 @@ LOG_FILE = ROOT / "phoenix.log"
 PROD_SERVICE_NAME = "phoenix-ide"
 PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
-PROD_PORT = 8031  # In workspaces-compatible 8000-8050 range
+PROD_PORT = 8031
 
 # Lima VM configuration
 LIMA_VM_NAME = "phoenix-ide"
@@ -41,11 +41,15 @@ EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
 LOCAL_AI_PROXY = "http://127.0.0.1:8462"
 
-# Base ports - offset added based on worktree path hash
-# Both ports must stay within exposed ranges: 6000-6010, 8000-8050, 8080, 8443
-BASE_PHOENIX_PORT = 8000  # API will use 8000-8024
-BASE_VITE_PORT = 8025     # Vite will use 8025-8049
-PORT_RANGE = 25           # Reduced to fit both in 8000-8050 range
+# Dev ports: 8030-8050 range, matching Lima port forwards.
+# 8031 is reserved for prod. Dev uses two blocks offset by worktree hash:
+#   Phoenix API: 8032-8040  (PORT_RANGE=9, offsets 0-8)
+#   Vite:        8041-8049  (PORT_RANGE=9, offsets 0-8)
+BASE_PHOENIX_PORT = 8032
+BASE_VITE_PORT = 8041
+PORT_RANGE = 9
+DEV_PORT_MIN = 8030
+DEV_PORT_MAX = 8050
 
 # Database directory
 DB_DIR = Path.home() / ".phoenix-ide"
@@ -78,9 +82,29 @@ def _discover_gateway_candidates() -> list[str]:
     return candidates
 
 
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Parse a KEY=VALUE env file, ignoring comments and blank lines."""
+    result = {}
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                result[k.strip()] = v.strip()
+    except (OSError, PermissionError):
+        pass
+    return result
+
+
 def get_llm_gateway() -> str | None:
-    """Get LLM gateway URL from env or by probing candidates. Returns None if none reachable."""
+    """Get LLM gateway URL from env, system env file, or by probing candidates. Returns None if none reachable."""
     if val := os.environ.get("LLM_GATEWAY"):
+        return val
+    # Check system env file (shared by prod and dev inside Lima VM)
+    env_file = _read_env_file(Path(LIMA_ENV_FILE))
+    if val := env_file.get("LLM_GATEWAY"):
         return val
     for url in _discover_gateway_candidates():
         if _gateway_is_reachable(url):
@@ -102,7 +126,18 @@ def get_port_offset() -> int:
 def get_default_ports() -> tuple[int, int]:
     """Get default Phoenix and Vite ports for this worktree."""
     offset = get_port_offset()
-    return (BASE_PHOENIX_PORT + offset, BASE_VITE_PORT + offset)
+    phoenix = BASE_PHOENIX_PORT + offset
+    vite = BASE_VITE_PORT + offset
+    for name, port in [("Phoenix", phoenix), ("Vite", vite)]:
+        if port == PROD_PORT:
+            print(f"ERROR: {name} port {port} collides with prod port {PROD_PORT}.", file=sys.stderr)
+            print(f"  Worktree hash produced offset {offset}. Use --port to override.", file=sys.stderr)
+            sys.exit(1)
+        if not (DEV_PORT_MIN <= port <= DEV_PORT_MAX):
+            print(f"ERROR: {name} port {port} outside allowed range {DEV_PORT_MIN}-{DEV_PORT_MAX}.", file=sys.stderr)
+            print(f"  Worktree hash produced offset {offset}. Use --port to override.", file=sys.stderr)
+            sys.exit(1)
+    return (phoenix, vite)
 
 
 def get_db_path() -> Path:
