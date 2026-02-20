@@ -24,7 +24,6 @@ const FILE_EXTENSIONS = 'md|markdown|rs|ts|tsx|js|jsx|py|go|json|yaml|yml|toml|t
 //   2. Relative/project paths (./foo, src/foo): Require a recognized extension to
 //      avoid false positives on plain words containing slashes.
 // Note: Uses lookbehind for proper word boundary detection
-// eslint-disable-next-line no-useless-escape
 const FILE_PATH_REGEX = new RegExp(
   '(?:^|(?<=[\\s`"\'(\\[]))' +
   '(?:' +

@@ -471,7 +471,7 @@ export function ProseReader({
           th: annotatable('th'),
           li: annotatable('li'),
           blockquote: annotatable('blockquote'),
-          code: ({ inline, className, children, node: _node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
+          code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
             const match = /language-(\w+)/.exec(className || '');
             return !inline && match ? (
               <SyntaxHighlighter
