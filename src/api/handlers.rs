@@ -194,6 +194,7 @@ async fn list_conversations(
         .runtime
         .db()
         .list_conversations()
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let json_convs: Vec<Value> = conversations
@@ -213,6 +214,7 @@ async fn list_archived_conversations(
         .runtime
         .db()
         .list_archived_conversations()
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let json_convs: Vec<Value> = conversations
@@ -260,14 +262,24 @@ async fn create_conversation(
     }
 
     // Idempotency check: if message_id already exists, find and return that conversation
-    if state.db.message_exists(&req.message_id).unwrap_or(false) {
+    if state
+        .db
+        .message_exists(&req.message_id)
+        .await
+        .unwrap_or(false)
+    {
         tracing::info!(
             message_id = %req.message_id,
             "Duplicate create request detected, returning existing conversation"
         );
         // Find the conversation for this message
-        if let Ok(msg) = state.db.get_message_by_id(&req.message_id) {
-            if let Ok(conv) = state.runtime.db().get_conversation(&msg.conversation_id) {
+        if let Ok(msg) = state.db.get_message_by_id(&req.message_id).await {
+            if let Ok(conv) = state
+                .runtime
+                .db()
+                .get_conversation(&msg.conversation_id)
+                .await
+            {
                 return Ok(Json(ConversationResponse {
                     conversation: serde_json::to_value(conv).unwrap_or(Value::Null),
                 }));
@@ -308,6 +320,7 @@ async fn create_conversation(
             None,                 // no parent
             req.model.as_deref(), // selected model
         )
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     // Convert images
@@ -357,12 +370,13 @@ async fn get_conversation(
         .runtime
         .db()
         .get_conversation(&id)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let messages = if let Some(after) = query.after_sequence {
-        state.runtime.db().get_messages_after(&id, after)
+        state.runtime.db().get_messages_after(&id, after).await
     } else {
-        state.runtime.db().get_messages(&id)
+        state.runtime.db().get_messages(&id).await
     }
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -391,6 +405,7 @@ async fn get_system_prompt(
         .runtime
         .db()
         .get_conversation(&id)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
@@ -639,17 +654,23 @@ async fn stream_conversation(
         .runtime
         .db()
         .get_conversation(&id)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     // Get messages (filtered by after if provided)
     let messages = if let Some(after) = query.after {
-        state.runtime.db().get_messages_after(&id, after)
+        state.runtime.db().get_messages_after(&id, after).await
     } else {
-        state.runtime.db().get_messages(&id)
+        state.runtime.db().get_messages(&id).await
     }
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let last_sequence_id = state.runtime.db().get_last_sequence_id(&id).unwrap_or(0);
+    let last_sequence_id = state
+        .runtime
+        .db()
+        .get_last_sequence_id(&id)
+        .await
+        .unwrap_or(0);
 
     let context_window_size = messages
         .iter()
@@ -706,7 +727,12 @@ async fn send_chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
     // Idempotency check: if message_id already exists, return success without creating duplicate
-    if state.db.message_exists(&req.message_id).unwrap_or(false) {
+    if state
+        .db
+        .message_exists(&req.message_id)
+        .await
+        .unwrap_or(false)
+    {
         tracing::info!(
             conversation_id = %id,
             message_id = %req.message_id,
@@ -781,6 +807,7 @@ async fn archive_conversation(
         .runtime
         .db()
         .archive_conversation(&id)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     Ok(Json(SuccessResponse { success: true }))
@@ -794,6 +821,7 @@ async fn unarchive_conversation(
         .runtime
         .db()
         .unarchive_conversation(&id)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     Ok(Json(SuccessResponse { success: true }))
@@ -807,6 +835,7 @@ async fn delete_conversation(
         .runtime
         .db()
         .delete_conversation(&id)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     Ok(Json(SuccessResponse { success: true }))
@@ -821,6 +850,7 @@ async fn rename_conversation(
         .runtime
         .db()
         .rename_conversation(&id, &req.name)
+        .await
         .map_err(|e| match e {
             crate::db::DbError::SlugExists(_) => {
                 AppError::BadRequest("Slug already exists".to_string())
@@ -832,6 +862,7 @@ async fn rename_conversation(
         .runtime
         .db()
         .get_conversation(&id)
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(ConversationResponse {
@@ -851,12 +882,14 @@ async fn get_by_slug(
         .runtime
         .db()
         .get_conversation_by_slug(&slug)
+        .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let messages = state
         .runtime
         .db()
         .get_messages(&conversation.id)
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();

@@ -67,10 +67,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize database
     tracing::info!(path = %db_path, "Opening database");
-    let db = Database::open(&db_path)?;
+    let db = Database::open(&db_path).await?;
 
     // Reset all conversations to idle on startup (REQ-BED-007)
-    db.reset_all_to_idle()?;
+    db.reset_all_to_idle().await?;
 
     // Initialize LLM registry
     let llm_config = LlmConfig::from_env();

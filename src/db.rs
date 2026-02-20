@@ -8,15 +8,15 @@ pub use schema::*;
 use schema::{MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
+use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
     ConversationNotFound(String),
     #[error("Message not found: {0}")]
@@ -32,42 +32,54 @@ pub type DbResult<T> = Result<T, DbError>;
 /// Thread-safe database handle
 #[derive(Clone)]
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    pool: SqlitePool,
 }
 
 impl Database {
     /// Open or create database at the given path
-    pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
-        let conn = Connection::open(path)?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        db.run_migrations()?;
+    pub async fn open(path: &str) -> DbResult<Self> {
+        let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        let db = Self { pool };
+        db.run_migrations().await?;
         Ok(db)
     }
 
     /// Open an in-memory database (for testing)
     #[allow(dead_code)] // Used in tests
-    pub fn open_in_memory() -> DbResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        db.run_migrations()?;
+    pub async fn open_in_memory() -> DbResult<Self> {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        // In-memory SQLite DBs are per-connection, so limit to 1 connection
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        let db = Self { pool };
+        db.run_migrations().await?;
         Ok(db)
     }
 
-    fn run_migrations(&self) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(SCHEMA)?;
-        // Run typed state migration (idempotent - only affects non-JSON states)
-        conn.execute_batch(MIGRATION_TYPED_STATE)?;
+    async fn run_migrations(&self) -> DbResult<()> {
+        sqlx::raw_sql(SCHEMA).execute(&self.pool).await?;
+        sqlx::raw_sql(MIGRATION_TYPED_STATE)
+            .execute(&self.pool)
+            .await?;
 
         // Try to add model column - ignore error if it already exists
-        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN model TEXT", []);
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN model TEXT")
+            .execute(&self.pool)
+            .await;
 
         // Rename id -> message_id for searchability (ignore error if already done)
-        let _ = conn.execute_batch(MIGRATION_RENAME_MESSAGE_ID);
+        let _ = sqlx::raw_sql(MIGRATION_RENAME_MESSAGE_ID)
+            .execute(&self.pool)
+            .await;
 
         Ok(())
     }
@@ -75,7 +87,7 @@ impl Database {
     // ==================== Conversation Operations ====================
 
     /// Create a new conversation
-    pub fn create_conversation(
+    pub async fn create_conversation(
         &self,
         id: &str,
         slug: &str,
@@ -84,24 +96,32 @@ impl Database {
         parent_id: Option<&str>,
         model: Option<&str>,
     ) -> DbResult<Conversation> {
-        let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
+        let now_str = now.to_rfc3339();
 
         // Retry with a random suffix on slug collision (UNIQUE constraint).
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
         loop {
-            let result = conn.execute(
+            let result = sqlx::query(
                 "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8)",
-                params![id, actual_slug, cwd, parent_id, user_initiated, idle_state, now.to_rfc3339(), model],
-            );
+            )
+            .bind(id)
+            .bind(&actual_slug)
+            .bind(cwd)
+            .bind(parent_id)
+            .bind(user_initiated)
+            .bind(&idle_state)
+            .bind(&now_str)
+            .bind(model)
+            .execute(&self.pool)
+            .await;
+
             match result {
                 Ok(_) => break,
-                Err(rusqlite::Error::SqliteFailure(err, _))
-                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
+                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
                     attempts += 1;
                     if attempts >= 10 {
                         // Last resort: full UUID fragment
@@ -110,7 +130,7 @@ impl Database {
                         actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
                     }
                 }
-                Err(e) => return Err(DbError::Sqlite(e)),
+                Err(e) => return Err(DbError::Sqlx(e)),
             }
         }
 
@@ -131,225 +151,169 @@ impl Database {
     }
 
     /// Get conversation by ID
-    pub fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+    pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
+        sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c WHERE c.id = ?1"
-        )?;
-
-        stmt.query_row(params![id], |row| {
-            let state_json: String = row.get(5)?;
-            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
-            Ok(Conversation {
-                id: row.get(0)?,
-                slug: row.get(1)?,
-                cwd: row.get(2)?,
-                parent_conversation_id: row.get(3)?,
-                user_initiated: row.get(4)?,
-                state,
-                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
-                created_at: parse_datetime(&row.get::<_, String>(7)?),
-                updated_at: parse_datetime(&row.get::<_, String>(8)?),
-                archived: row.get(9)?,
-                model: row.get(10)?,
-                message_count: row.get(11)?,
-            })
-        })
+             FROM conversations c WHERE c.id = ?1",
+        )
+        .bind(id)
+        .try_map(parse_conversation_row)
+        .fetch_one(&self.pool)
+        .await
         .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => DbError::ConversationNotFound(id.to_string()),
-            other => DbError::Sqlite(other),
+            sqlx::Error::RowNotFound => DbError::ConversationNotFound(id.to_string()),
+            other => DbError::Sqlx(other),
         })
     }
 
     /// Get conversation by slug
-    pub fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+    pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
+        sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c WHERE c.slug = ?1"
-        )?;
-
-        stmt.query_row(params![slug], |row| {
-            let state_json: String = row.get(5)?;
-            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
-            Ok(Conversation {
-                id: row.get(0)?,
-                slug: row.get(1)?,
-                cwd: row.get(2)?,
-                parent_conversation_id: row.get(3)?,
-                user_initiated: row.get(4)?,
-                state,
-                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
-                created_at: parse_datetime(&row.get::<_, String>(7)?),
-                updated_at: parse_datetime(&row.get::<_, String>(8)?),
-                archived: row.get(9)?,
-                model: row.get(10)?,
-                message_count: row.get(11)?,
-            })
-        })
+             FROM conversations c WHERE c.slug = ?1",
+        )
+        .bind(slug)
+        .try_map(parse_conversation_row)
+        .fetch_one(&self.pool)
+        .await
         .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => DbError::ConversationNotFound(slug.to_string()),
-            other => DbError::Sqlite(other),
+            sqlx::Error::RowNotFound => DbError::ConversationNotFound(slug.to_string()),
+            other => DbError::Sqlx(other),
         })
     }
 
     /// List active (non-archived) user-initiated conversations
-    pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state, 
+    pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
-             ORDER BY c.updated_at DESC"
-        )?;
+             ORDER BY c.updated_at DESC",
+        )
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await?;
 
-        let rows = stmt.query_map([], |row| {
-            let state_json: String = row.get(5)?;
-            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
-            Ok(Conversation {
-                id: row.get(0)?,
-                slug: row.get(1)?,
-                cwd: row.get(2)?,
-                parent_conversation_id: row.get(3)?,
-                user_initiated: row.get(4)?,
-                state,
-                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
-                created_at: parse_datetime(&row.get::<_, String>(7)?),
-                updated_at: parse_datetime(&row.get::<_, String>(8)?),
-                archived: row.get(9)?,
-                model: row.get(10)?,
-                message_count: row.get(11)?,
-            })
-        })?;
-
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+        Ok(rows)
     }
 
     /// List archived conversations
-    pub fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+    pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
+        let rows = sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
-             ORDER BY c.updated_at DESC"
-        )?;
+             ORDER BY c.updated_at DESC",
+        )
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await?;
 
-        let rows = stmt.query_map([], |row| {
-            let state_json: String = row.get(5)?;
-            let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
-            Ok(Conversation {
-                id: row.get(0)?,
-                slug: row.get(1)?,
-                cwd: row.get(2)?,
-                parent_conversation_id: row.get(3)?,
-                user_initiated: row.get(4)?,
-                state,
-                state_updated_at: parse_datetime(&row.get::<_, String>(6)?),
-                created_at: parse_datetime(&row.get::<_, String>(7)?),
-                updated_at: parse_datetime(&row.get::<_, String>(8)?),
-                archived: row.get(9)?,
-                model: row.get(10)?,
-                message_count: row.get(11)?,
-            })
-        })?;
-
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+        Ok(rows)
     }
 
     /// Update conversation state
-    pub fn update_conversation_state(&self, id: &str, state: &ConvState) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
+    pub async fn update_conversation_state(&self, id: &str, state: &ConvState) -> DbResult<()> {
         let now = Utc::now();
         let state_json = serde_json::to_string(state).unwrap();
 
-        let updated = conn.execute(
+        let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
-            params![state_json, now.to_rfc3339(), id],
-        )?;
+        )
+        .bind(&state_json)
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
 
-        if updated == 0 {
+        if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
     }
 
     /// Archive a conversation
-    pub fn archive_conversation(&self, id: &str) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
+    pub async fn archive_conversation(&self, id: &str) -> DbResult<()> {
         let now = Utc::now();
 
-        let updated = conn.execute(
-            "UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2",
-            params![now.to_rfc3339(), id],
-        )?;
+        let result =
+            sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2")
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
 
-        if updated == 0 {
+        if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
     }
 
     /// Unarchive a conversation
-    pub fn unarchive_conversation(&self, id: &str) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
+    pub async fn unarchive_conversation(&self, id: &str) -> DbResult<()> {
         let now = Utc::now();
 
-        let updated = conn.execute(
-            "UPDATE conversations SET archived = 0, updated_at = ?1 WHERE id = ?2",
-            params![now.to_rfc3339(), id],
-        )?;
+        let result =
+            sqlx::query("UPDATE conversations SET archived = 0, updated_at = ?1 WHERE id = ?2")
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
 
-        if updated == 0 {
+        if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
     }
 
     /// Delete a conversation and all its messages
-    pub fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
-
+    pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
         // Messages are deleted by CASCADE
-        let deleted = conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
-        if deleted == 0 {
+        if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
     }
 
     /// Rename conversation (update slug)
-    pub fn rename_conversation(&self, id: &str, new_slug: &str) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
+    pub async fn rename_conversation(&self, id: &str, new_slug: &str) -> DbResult<()> {
         let now = Utc::now();
 
         // Check if slug already exists
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1 AND id != ?2)",
-            params![new_slug, id],
-            |row| row.get(0),
-        )?;
+        let row =
+            sqlx::query("SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1 AND id != ?2)")
+                .bind(new_slug)
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        let exists: bool = row.get(0);
 
         if exists {
             return Err(DbError::SlugExists(new_slug.to_string()));
         }
 
-        let updated = conn.execute(
-            "UPDATE conversations SET slug = ?1, updated_at = ?2 WHERE id = ?3",
-            params![new_slug, now.to_rfc3339(), id],
-        )?;
+        let result =
+            sqlx::query("UPDATE conversations SET slug = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(new_slug)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
 
-        if updated == 0 {
+        if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
@@ -357,51 +321,57 @@ impl Database {
 
     /// Reset all conversations to idle on server restart.
     /// Also repairs any orphaned `tool_use` by injecting synthetic `tool_result`.
-    pub fn reset_all_to_idle(&self) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
+    pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
         // First, repair any orphaned tool_use blocks
-        Self::repair_orphaned_tool_use_internal(&conn, &now)?;
+        self.repair_orphaned_tool_use(&now).await?;
 
         // Reset non-terminal conversations to idle.
         // Terminal states (context_exhausted) should NOT be reset - they represent
         // completed conversations that cannot accept new messages.
-        conn.execute(
+        sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
              WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted')",
-            params![idle_state, now.to_rfc3339()],
-        )?;
+        )
+        .bind(&idle_state)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
     /// Scan all conversations for orphaned `tool_use` and inject synthetic `tool_result`.
     /// An orphaned `tool_use` is an agent message containing `tool_use` blocks where
     /// not all `tool_use` IDs have a corresponding `tool_result` in the following messages.
-    fn repair_orphaned_tool_use_internal(conn: &Connection, now: &DateTime<Utc>) -> DbResult<()> {
+    async fn repair_orphaned_tool_use(&self, now: &DateTime<Utc>) -> DbResult<()> {
         use crate::llm::ContentBlock;
 
         // Get all conversations
-        let mut conv_stmt = conn.prepare("SELECT id FROM conversations")?;
-        let conv_ids: Vec<String> = conv_stmt
-            .query_map([], |row| row.get(0))?
-            .filter_map(Result::ok)
-            .collect();
+        let conv_rows: Vec<String> = sqlx::query("SELECT id FROM conversations")
+            .try_map(|row: SqliteRow| row.try_get("id"))
+            .fetch_all(&self.pool)
+            .await?;
 
-        for conv_id in conv_ids {
+        for conv_id in conv_rows {
             // Get all messages for this conversation in order
-            let mut msg_stmt = conn.prepare(
-                "SELECT message_id, sequence_id, message_type, content 
+            let messages: Vec<(String, i64, String, String)> = sqlx::query(
+                "SELECT message_id, sequence_id, message_type, content
                  FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
-            )?;
-
-            let messages: Vec<(String, i64, String, String)> = msg_stmt
-                .query_map(params![conv_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?
-                .filter_map(Result::ok)
-                .collect();
+            )
+            .bind(&conv_id)
+            .try_map(|row: SqliteRow| {
+                Ok((
+                    row.try_get("message_id")?,
+                    row.try_get("sequence_id")?,
+                    row.try_get("message_type")?,
+                    row.try_get("content")?,
+                ))
+            })
+            .fetch_all(&self.pool)
+            .await?;
 
             // Find orphaned tool_use IDs
             let mut pending_tool_ids: Vec<String> = Vec::new();
@@ -439,11 +409,17 @@ impl Database {
                 let content_json =
                     serde_json::to_string(&tool_content).unwrap_or_else(|_| "{}".to_string());
 
-                conn.execute(
+                sqlx::query(
                     "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
                      VALUES (?1, ?2, ?3, 'tool', ?4, ?5)",
-                    params![msg_id, conv_id, max_sequence_id, content_json, now.to_rfc3339()],
-                )?;
+                )
+                .bind(&msg_id)
+                .bind(&conv_id)
+                .bind(max_sequence_id)
+                .bind(&content_json)
+                .bind(now.to_rfc3339())
+                .execute(&self.pool)
+                .await?;
 
                 tracing::info!(
                     conv_id = %conv_id,
@@ -463,7 +439,7 @@ impl Database {
     /// The `message_id` is the canonical identifier for this message, typically
     /// generated by the client for user messages (enabling idempotent retries)
     /// or by the server for agent/tool messages.
-    pub fn add_message(
+    pub async fn add_message(
         &self,
         message_id: &str,
         conversation_id: &str,
@@ -471,41 +447,43 @@ impl Database {
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
-        let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         let msg_type = content.message_type();
 
         // Get next sequence ID
-        let sequence_id: i64 = conn.query_row(
+        let row = sqlx::query(
             "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
-            params![conversation_id],
-            |row| row.get(0),
-        )?;
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let sequence_id: i64 = row.get(0);
 
         let content_str = serde_json::to_string(&content.to_json()).unwrap();
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
-        conn.execute(
+        sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                message_id,
-                conversation_id,
-                sequence_id,
-                msg_type.to_string(),
-                content_str,
-                display_str,
-                usage_str,
-                now.to_rfc3339(),
-            ],
-        )?;
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(sequence_id)
+        .bind(msg_type.to_string())
+        .bind(&content_str)
+        .bind(&display_str)
+        .bind(&usage_str)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
 
         // Update conversation timestamp
-        conn.execute(
-            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
-            params![now.to_rfc3339(), conversation_id],
-        )?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(Message {
             message_id: message_id.to_string(),
@@ -520,98 +498,123 @@ impl Database {
     }
 
     /// Get messages for a conversation
-    pub fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+    pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
+        let rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
-             FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC"
-        )?;
+             FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
 
-        let rows = stmt.query_map(params![conversation_id], parse_message_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+        Ok(rows)
     }
 
     /// Get messages after a sequence ID
-    pub fn get_messages_after(
+    pub async fn get_messages_after(
         &self,
         conversation_id: &str,
         after_sequence: i64,
     ) -> DbResult<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
-             FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC"
-        )?;
+             FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .bind(after_sequence)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
 
-        let rows = stmt.query_map(params![conversation_id, after_sequence], parse_message_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+        Ok(rows)
     }
 
     /// Get a message by its `message_id`
-    pub fn get_message_by_id(&self, message_id: &str) -> DbResult<Message> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+    pub async fn get_message_by_id(&self, message_id: &str) -> DbResult<Message> {
+        sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
-             FROM messages WHERE message_id = ?1"
-        )?;
-
-        stmt.query_row(params![message_id], parse_message_row)
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    DbError::MessageNotFound(message_id.to_string())
-                }
-                other => DbError::Sqlite(other),
-            })
+             FROM messages WHERE message_id = ?1",
+        )
+        .bind(message_id)
+        .try_map(parse_message_row)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DbError::MessageNotFound(message_id.to_string()),
+            other => DbError::Sqlx(other),
+        })
     }
 
     /// Check if a message with the given `message_id` already exists
     /// Used for idempotent message sends - returns true if duplicate
-    pub fn message_exists(&self, message_id: &str) -> DbResult<bool> {
-        let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
-            params![message_id],
-            |row| row.get(0),
-        )?;
+    pub async fn message_exists(&self, message_id: &str) -> DbResult<bool> {
+        let row = sqlx::query("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+            .bind(message_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let count: i64 = row.get(0);
         Ok(count > 0)
     }
 
     /// Get the last sequence ID for a conversation
-    pub fn get_last_sequence_id(&self, conversation_id: &str) -> DbResult<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
+    pub async fn get_last_sequence_id(&self, conversation_id: &str) -> DbResult<i64> {
+        let row = sqlx::query(
             "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
-            params![conversation_id],
-            |row| row.get(0),
         )
-        .map_err(DbError::from)
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get(0))
     }
 
     /// Update `display_data` for an existing message
     /// Used to enrich tool results with additional data after execution (e.g., subagent outcomes)
-    pub fn update_message_display_data(
+    pub async fn update_message_display_data(
         &self,
         message_id: &str,
         display_data: &serde_json::Value,
     ) -> DbResult<()> {
-        let conn = self.conn.lock().unwrap();
         let display_str = serde_json::to_string(display_data)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let rows_affected = conn.execute(
-            "UPDATE messages SET display_data = ?1 WHERE message_id = ?2",
-            params![display_str, message_id],
-        )?;
-        if rows_affected == 0 {
+        let result = sqlx::query("UPDATE messages SET display_data = ?1 WHERE message_id = ?2")
+            .bind(&display_str)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
             return Err(DbError::MessageNotFound(message_id.to_string()));
         }
         Ok(())
     }
 }
 
+/// Parse a conversation row from the database
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
+    let state_json: String = row.try_get("state")?;
+    let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
+    Ok(Conversation {
+        id: row.try_get("id")?,
+        slug: row.try_get("slug")?,
+        cwd: row.try_get("cwd")?,
+        parent_conversation_id: row.try_get("parent_conversation_id")?,
+        user_initiated: row.try_get("user_initiated")?,
+        state,
+        state_updated_at: parse_datetime(&row.try_get::<String, _>("state_updated_at")?),
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
+        archived: row.try_get("archived")?,
+        model: row.try_get("model")?,
+        message_count: row.try_get("message_count")?,
+    })
+}
+
 /// Parse a message row from the database
-fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
-    let msg_type = parse_message_type(&row.get::<_, String>(3)?);
-    let content_str: String = row.get(4)?;
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
+    let msg_type = parse_message_type(&row.try_get::<String, _>("message_type")?);
+    let content_str: String = row.try_get("content")?;
     let content_value: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
 
     // Parse content using the message type as discriminator
@@ -619,18 +622,18 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         .unwrap_or_else(|_| MessageContent::error(format!("Failed to parse {msg_type} message")));
 
     Ok(Message {
-        message_id: row.get(0)?,
-        conversation_id: row.get(1)?,
-        sequence_id: row.get(2)?,
+        message_id: row.try_get("message_id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        sequence_id: row.try_get("sequence_id")?,
         message_type: msg_type,
         content,
         display_data: row
-            .get::<_, Option<String>>(5)?
+            .try_get::<Option<String>, _>("display_data")?
             .map(|s| serde_json::from_str(&s).unwrap_or_default()),
         usage_data: row
-            .get::<_, Option<String>>(6)?
+            .try_get::<Option<String>, _>("usage_data")?
             .and_then(|s| serde_json::from_str(&s).ok()),
-        created_at: parse_datetime(&row.get::<_, String>(7)?),
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
     })
 }
 
@@ -648,12 +651,13 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_create_and_get_conversation() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_create_and_get_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
 
         let conv = db
             .create_conversation("test-id", "test-slug", "/tmp/test", true, None, None)
+            .await
             .unwrap();
 
         assert_eq!(conv.id, "test-id");
@@ -661,17 +665,18 @@ mod tests {
         assert_eq!(conv.cwd, "/tmp/test");
         assert!(matches!(conv.state, ConvState::Idle));
 
-        let fetched = db.get_conversation("test-id").unwrap();
+        let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
     }
 
-    #[test]
-    fn test_add_and_get_messages() {
+    #[tokio::test]
+    async fn test_add_and_get_messages() {
         use crate::llm::ContentBlock;
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
             .unwrap();
 
         let msg1 = db
@@ -682,6 +687,7 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
 
         let msg2 = db
@@ -692,6 +698,7 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
 
         assert_eq!(msg1.sequence_id, 1);
@@ -699,7 +706,7 @@ mod tests {
         assert_eq!(msg1.message_type, MessageType::User);
         assert_eq!(msg2.message_type, MessageType::Agent);
 
-        let messages = db.get_messages("conv-1").unwrap();
+        let messages = db.get_messages("conv-1").await.unwrap();
         assert_eq!(messages.len(), 2);
 
         // Verify content is properly typed
@@ -708,17 +715,18 @@ mod tests {
             _ => panic!("Expected User content"),
         }
 
-        let after = db.get_messages_after("conv-1", 1).unwrap();
+        let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
     }
 
-    #[test]
-    fn test_reset_preserves_context_exhausted_state() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_reset_preserves_context_exhausted_state() {
+        let db = Database::open_in_memory().await.unwrap();
 
         // Create a conversation with context_exhausted state
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
             .unwrap();
 
         // Manually set state to context_exhausted
@@ -726,20 +734,21 @@ mod tests {
             summary: "Test summary".to_string(),
         };
         db.update_conversation_state("conv-1", &exhausted_state)
+            .await
             .unwrap();
 
         // Verify state is set
-        let conv_before = db.get_conversation("conv-1").unwrap();
+        let conv_before = db.get_conversation("conv-1").await.unwrap();
         assert!(
             matches!(conv_before.state, ConvState::ContextExhausted { .. }),
             "State should be ContextExhausted before reset"
         );
 
         // Run reset
-        db.reset_all_to_idle().unwrap();
+        db.reset_all_to_idle().await.unwrap();
 
         // Verify context_exhausted state is preserved (not reset to idle)
-        let conv_after = db.get_conversation("conv-1").unwrap();
+        let conv_after = db.get_conversation("conv-1").await.unwrap();
         assert!(
             matches!(conv_after.state, ConvState::ContextExhausted { .. }),
             "ContextExhausted state should be preserved after reset"
@@ -751,14 +760,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_reset_repairs_orphaned_tool_use() {
+    #[tokio::test]
+    async fn test_reset_repairs_orphaned_tool_use() {
         use crate::llm::ContentBlock;
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
 
         // Create a conversation
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
             .unwrap();
 
         // Add user message
@@ -769,6 +779,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // Add agent message with tool_use (simulating LLM response)
@@ -782,19 +793,20 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // NO tool_result added - simulating crash during tool execution
 
         // Verify we have an orphaned tool_use
-        let messages_before = db.get_messages("conv-1").unwrap();
+        let messages_before = db.get_messages("conv-1").await.unwrap();
         assert_eq!(messages_before.len(), 2);
 
         // Run reset (which should repair orphans)
-        db.reset_all_to_idle().unwrap();
+        db.reset_all_to_idle().await.unwrap();
 
         // Verify synthetic tool_result was injected
-        let messages_after = db.get_messages("conv-1").unwrap();
+        let messages_after = db.get_messages("conv-1").await.unwrap();
         assert_eq!(
             messages_after.len(),
             3,
@@ -814,13 +826,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_reset_does_not_duplicate_complete_exchanges() {
+    #[tokio::test]
+    async fn test_reset_does_not_duplicate_complete_exchanges() {
         use crate::llm::ContentBlock;
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
             .unwrap();
 
         // Add a complete exchange: user -> agent(tool_use) -> tool_result
@@ -831,6 +844,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         db.add_message(
@@ -844,6 +858,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         db.add_message(
@@ -853,13 +868,14 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // Run reset
-        db.reset_all_to_idle().unwrap();
+        db.reset_all_to_idle().await.unwrap();
 
         // Should still have exactly 3 messages (no synthetic added)
-        let messages = db.get_messages("conv-1").unwrap();
+        let messages = db.get_messages("conv-1").await.unwrap();
         assert_eq!(
             messages.len(),
             3,
@@ -867,13 +883,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reset_repairs_multiple_orphaned_tools() {
+    #[tokio::test]
+    async fn test_reset_repairs_multiple_orphaned_tools() {
         use crate::llm::ContentBlock;
 
-        let db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
             .unwrap();
 
         // Agent message with multiple tool_use blocks
@@ -888,6 +905,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // Only tool-1 completed before crash
@@ -898,13 +916,14 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // Run reset
-        db.reset_all_to_idle().unwrap();
+        db.reset_all_to_idle().await.unwrap();
 
         // Should have 2 synthetic results for tool-2 and tool-3
-        let messages = db.get_messages("conv-1").unwrap();
+        let messages = db.get_messages("conv-1").await.unwrap();
         assert_eq!(
             messages.len(),
             4,
@@ -930,19 +949,21 @@ mod tests {
         assert!(tool_ids.contains(&"tool-3".to_string()));
     }
 
-    #[test]
-    fn test_slug_collision_gets_suffix() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_slug_collision_gets_suffix() {
+        let db = Database::open_in_memory().await.unwrap();
 
         // First conversation gets the exact slug
         let first = db
             .create_conversation("id-1", "my-slug", "/tmp", true, None, None)
+            .await
             .unwrap();
         assert_eq!(first.slug, Some("my-slug".to_string()));
 
         // Second conversation with the same slug gets a suffix
         let second = db
             .create_conversation("id-2", "my-slug", "/tmp", true, None, None)
+            .await
             .unwrap();
         let second_slug = second.slug.unwrap();
         assert!(
@@ -953,9 +974,12 @@ mod tests {
 
         // Both are retrievable by ID
         assert_eq!(
-            db.get_conversation("id-1").unwrap().slug,
+            db.get_conversation("id-1").await.unwrap().slug,
             Some("my-slug".to_string())
         );
-        assert_eq!(db.get_conversation("id-2").unwrap().slug, Some(second_slug));
+        assert_eq!(
+            db.get_conversation("id-2").await.unwrap().slug,
+            Some(second_slug)
+        );
     }
 }

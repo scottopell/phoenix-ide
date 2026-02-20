@@ -187,16 +187,21 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<Message, String> {
         self.db
             .add_message(message_id, conv_id, content, display_data, usage_data)
+            .await
             .map_err(|e| e.to_string())
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
-        self.db.get_messages(conv_id).map_err(|e| e.to_string())
+        self.db
+            .get_messages(conv_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
         self.db
             .get_message_by_id(message_id)
+            .await
             .map_err(|e| e.to_string())
     }
 
@@ -207,6 +212,7 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_message_display_data(message_id, display_data)
+            .await
             .map_err(|e| e.to_string())
     }
 }
@@ -216,6 +222,7 @@ impl StateStore for DatabaseStorage {
     async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
         self.db
             .update_conversation_state(conv_id, state)
+            .await
             .map_err(|e| e.to_string())
     }
 
@@ -223,6 +230,7 @@ impl StateStore for DatabaseStorage {
         let conv = self
             .db
             .get_conversation(conv_id)
+            .await
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
     }

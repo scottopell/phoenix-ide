@@ -178,14 +178,18 @@ impl RuntimeManager {
 
         // 1. Create conversation in DB
         let slug = format!("sub-{}", &spec.agent_id[..8]);
-        let conv = match self.db.create_conversation(
-            &spec.agent_id,
-            &slug,
-            &spec.cwd,
-            false, // user_initiated = false
-            Some(&parent_conversation_id),
-            Some(&model_id), // inherit parent's model
-        ) {
+        let conv = match self
+            .db
+            .create_conversation(
+                &spec.agent_id,
+                &slug,
+                &spec.cwd,
+                false, // user_initiated = false
+                Some(&parent_conversation_id),
+                Some(&model_id), // inherit parent's model
+            )
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create sub-agent conversation");
@@ -209,6 +213,7 @@ impl RuntimeManager {
         if let Err(e) = self
             .db
             .add_message(&message_id, &conv.id, &content, None, None)
+            .await
         {
             tracing::error!(error = %e, "Failed to add initial message");
             let _ = parent_event_tx
@@ -353,6 +358,7 @@ impl RuntimeManager {
         let conv = self
             .db
             .get_conversation(conversation_id)
+            .await
             .map_err(|e| e.to_string())?;
 
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
@@ -405,7 +411,8 @@ impl RuntimeManager {
 
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
-        let (initial_state, needs_auto_continue) = self.determine_resume_state(conversation_id)?;
+        let (initial_state, needs_auto_continue) =
+            self.determine_resume_state(conversation_id).await?;
 
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
@@ -473,10 +480,14 @@ impl RuntimeManager {
     ///
     /// Delegates to `recovery::should_auto_continue` for the actual logic.
     /// See that module for comprehensive tests.
-    fn determine_resume_state(&self, conversation_id: &str) -> Result<(ConvState, bool), String> {
+    async fn determine_resume_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(ConvState, bool), String> {
         let messages = self
             .db
             .get_messages(conversation_id)
+            .await
             .map_err(|e| e.to_string())?;
 
         let decision = recovery::should_auto_continue(&messages);
