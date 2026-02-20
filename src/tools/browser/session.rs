@@ -181,6 +181,10 @@ impl BrowserSession {
     ) -> Result<BrowserConfig, BrowserError> {
         let user_data_dir = format!("/tmp/phoenix-chrome-{conversation_id}");
 
+        // Remove stale user data directory to avoid Chrome SingletonLock conflicts
+        // (e.g. from a previous crash or test run that didn't clean up)
+        let _ = std::fs::remove_dir_all(&user_data_dir);
+
         let mut builder = BrowserConfig::builder()
             .new_headless_mode()
             .no_sandbox()
@@ -537,10 +541,7 @@ impl Drop for BrowserSessionManager {
 #[cfg(test)]
 mod console_arg_tests {
     use super::{extract_console_arg_text, truncate_unicode_safe, MAX_CAPTURE_ARG_BYTES};
-    use chromiumoxide::cdp::js_protocol::runtime::{
-        ObjectPreview, ObjectPreviewSubtype, ObjectPreviewType, PropertyPreview,
-        PropertyPreviewType, RemoteObject, RemoteObjectType,
-    };
+    use chromiumoxide::cdp::js_protocol::runtime::RemoteObject;
     use serde_json::json;
 
     fn make_arg(value: Option<serde_json::Value>, description: Option<&str>) -> RemoteObject {
