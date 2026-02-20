@@ -1,4 +1,3 @@
-// @ts-expect-error - lucide-react types may not resolve correctly for all icons
 import { Mic, MicOff, Loader2 } from 'lucide-react';
 import type { VoiceState } from './VoiceRecorder';
 import './VoiceInput.css';

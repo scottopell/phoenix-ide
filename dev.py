@@ -468,6 +468,11 @@ def cmd_check():
     if result.returncode != 0:
         sys.exit(result.returncode)
 
+    print("\nRunning UI typecheck...")
+    result = subprocess.run(["npx", "tsc", "-b", "--noEmit"], cwd=UI_DIR)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
     print("\nRunning UI lint...")
     result = subprocess.run(["npm", "run", "lint"], cwd=UI_DIR)
     if result.returncode != 0:

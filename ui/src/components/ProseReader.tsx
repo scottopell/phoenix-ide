@@ -10,8 +10,10 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter, createElement } from 'react-syntax-highlighter';
+import type { createElementProps } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateUUID } from '../utils/uuid';
 import {
@@ -418,7 +420,7 @@ export function ProseReader({
           lineContent={line}
           onAnnotate={handleLongPress}
           className="prose-line"
-          isModified={patchContext?.modifiedLines.has(lineNumber)}
+          isModified={patchContext?.modifiedLines.has(lineNumber) ?? false}
           isHighlighted={highlightedLine === lineNumber}
           lineRef={(el) => {
             if (el) lineRefs.current.set(lineNumber, el);
@@ -449,7 +451,7 @@ export function ProseReader({
             lineContent={String(children).slice(0, 200)}
             onAnnotate={handleLongPress}
             className="prose-block"
-            isModified={patchContext?.modifiedLines.has(ln)}
+            isModified={patchContext?.modifiedLines.has(ln) ?? false}
             isHighlighted={highlightedLine === ln}
             lineRef={(el) => { if (el) lineRefs.current.set(ln, el); }}
             {...props}
@@ -471,7 +473,7 @@ export function ProseReader({
           th: annotatable('th'),
           li: annotatable('li'),
           blockquote: annotatable('blockquote'),
-          code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
+          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode; [key: string]: unknown }) => {
             const match = /language-(\w+)/.exec(className || '');
             return !inline && match ? (
               <SyntaxHighlighter
@@ -488,7 +490,7 @@ export function ProseReader({
               </code>
             );
           },
-        }}
+        } as unknown as Components}
       >
         {content}
       </ReactMarkdown>
@@ -567,7 +569,7 @@ export function ProseReader({
               style={oneDark}
               language={language}
               showLineNumbers
-              renderer={({ rows, stylesheet, useInlineStyles }: { rows: Array<{ type: string; tagName?: string; properties?: Record<string, unknown>; children?: unknown[] }>; stylesheet: Record<string, React.CSSProperties>; useInlineStyles: boolean }) => {
+              renderer={({ rows, stylesheet, useInlineStyles }: rendererProps) => {
                 const lines = content?.split('\n') || [];
                 return (
                   <>
@@ -581,11 +583,11 @@ export function ProseReader({
                           lineContent={lines[idx] || ''}
                           onAnnotate={handleLongPress}
                           className="prose-code-line"
-                          isModified={patchContext?.modifiedLines.has(lineNumber)}
+                          isModified={patchContext?.modifiedLines.has(lineNumber) ?? false}
                           isHighlighted={highlightedLine === lineNumber}
                           lineRef={(el) => { if (el) lineRefs.current.set(lineNumber, el); }}
                         >
-                          {createElement({ node, stylesheet, useInlineStyles, key: `t-${idx}` })}
+                          {createElement({ node, stylesheet, useInlineStyles, key: `t-${idx}` } as createElementProps)}
                         </AnnotatableBlock>
                       );
                     })}
