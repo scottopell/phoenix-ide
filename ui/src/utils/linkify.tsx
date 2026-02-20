@@ -12,15 +12,34 @@ import React from 'react';
 // eslint-disable-next-line no-useless-escape
 const URL_REGEX = /https?:\/\/[^\s<>"'`\]\)]+[^\s<>"'`\]\).,:;!?]/g;
 
+// File extension whitelist for relative/project paths (where we need the extension
+// to avoid false positives). Absolute paths starting with / don't need this.
+const FILE_EXTENSIONS = 'md|markdown|rs|ts|tsx|js|jsx|py|go|json|yaml|yml|toml|txt|css|scss|html|htm|vue|svelte|sh|bash|sql|graphql|proto|xml|ini|env|conf|cfg|lock|c|h|cpp|hpp|java|kt|swift|rb|php|ex|exs|hs|ml|zig|scala|mod|sum';
+
 // Regex for matching file paths that look like real files
-// Matches:
-//   - Absolute paths: /home/user/file.md
-//   - Relative paths: ./file.md, ../dir/file.md  
-//   - Project paths: src/api/mod.rs (must contain / and have extension)
-// Must have a recognized extension to avoid false positives
+// Two strategies:
+//   1. Absolute paths (/...): Match any multi-segment path. The leading / is strong
+//      enough signal — no extension required. Catches Dockerfile, Makefile, .gitignore,
+//      go.mod, directories, etc.
+//   2. Relative/project paths (./foo, src/foo): Require a recognized extension to
+//      avoid false positives on plain words containing slashes.
 // Note: Uses lookbehind for proper word boundary detection
 // eslint-disable-next-line no-useless-escape
-const FILE_PATH_REGEX = /(?:^|(?<=[\s`"'(\[]))(?:(?:\/[\w.-]+)+|(?:\.\.?\/[\w./-]+)|(?:[\w.-]+\/[\w./-]+))\.(?:md|markdown|rs|ts|tsx|js|jsx|py|go|json|yaml|yml|toml|txt|css|scss|html|htm|vue|svelte|sh|bash|sql|graphql|proto|xml|ini|env|conf|cfg|lock|c|h|cpp|hpp|java|kt|swift|rb|php|ex|exs|hs|ml|zig|scala)(?=[\s`"')\],:;!?]|$)/g;
+const FILE_PATH_REGEX = new RegExp(
+  '(?:^|(?<=[\\s`"\'(\\[]))' +
+  '(?:' +
+    // Absolute paths: /foo/bar (at least two segments, no extension required)
+    '(?:\\/[\\w.-]+(?:\\/[\\w.-]+)+)' +
+    '|' +
+    // Relative paths with extension: ./file.ext, ../dir/file.ext
+    '(?:\\.\\.\\/[\\w./-]+|\\.\\/[\\w./-]+)\\.(?:' + FILE_EXTENSIONS + ')' +
+    '|' +
+    // Project paths with extension: src/api/mod.rs
+    '(?:[\\w.-]+\\/[\\w./-]+)\\.(?:' + FILE_EXTENSIONS + ')' +
+  ')' +
+  '(?=[\\s`"\'\\)\\],:;!?]|$)',
+  'g'
+);
 
 export interface LinkifySegment {
   type: 'text' | 'link' | 'file';

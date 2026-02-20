@@ -11,7 +11,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { Prism as SyntaxHighlighter, createElement } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateUUID } from '../utils/uuid';
 import {
@@ -20,6 +20,7 @@ import {
   Loader2,
   AlertCircle,
   MessageSquare,
+  MessageSquarePlus,
   Trash2,
   Send,
   ChevronDown,
@@ -150,40 +151,67 @@ function useLongPress(
   return { start, move, end };
 }
 
-// Line wrapper component for gesture handling
-function SelectableLine({
+// Polymorphic annotation wrapper — handles long-press, hover button, modified/highlighted state
+interface AnnotatableBlockProps {
+  as?: React.ElementType;
+  lineNumber: number;
+  lineContent: string;
+  onAnnotate: (lineNumber: number, lineContent: string) => void;
+  isModified?: boolean;
+  isHighlighted?: boolean;
+  lineRef?: (el: HTMLElement | null) => void;
+  className?: string;
+  children?: React.ReactNode;
+  [key: string]: unknown;
+}
+
+function AnnotatableBlock({
+  as: Tag = 'div',
   lineNumber,
-  content,
+  lineContent,
+  onAnnotate,
   isModified,
   isHighlighted,
-  onLongPress,
   lineRef,
-}: {
-  lineNumber: number;
-  content: string;
-  isModified?: boolean | undefined;
-  isHighlighted?: boolean | undefined;
-  onLongPress: (lineNumber: number, lineContent: string) => void;
-  lineRef?: ((el: HTMLDivElement | null) => void) | undefined;
-}) {
-  const { start, move, end } = useLongPress(onLongPress);
+  className,
+  children,
+  ...rest
+}: AnnotatableBlockProps) {
+  const { start, move, end } = useLongPress(onAnnotate);
+  const cls = [
+    'annotatable',
+    className,
+    isModified && 'annotatable--modified',
+    isHighlighted && 'annotatable--highlighted',
+  ].filter(Boolean).join(' ');
 
   return (
-    <div
-      ref={lineRef}
-      className={`prose-reader-line ${isModified ? 'prose-reader-line--modified' : ''} ${isHighlighted ? 'prose-reader-line--highlighted' : ''}`}
-      onTouchStart={(e) => start(e, lineNumber, content)}
+    <Tag
+      ref={(el: HTMLElement | null) => lineRef?.(el)}
+      className={cls}
+      onTouchStart={(e: React.TouchEvent) => start(e, lineNumber, lineContent)}
       onTouchMove={move}
       onTouchEnd={end}
-      onMouseDown={(e) => start(e, lineNumber, content)}
+      onMouseDown={(e: React.MouseEvent) => start(e, lineNumber, lineContent)}
       onMouseMove={move}
       onMouseUp={end}
       onMouseLeave={end}
       data-line={lineNumber}
+      {...rest}
     >
-      <span className="prose-reader-line-number">{lineNumber}</span>
-      <span className="prose-reader-line-content">{content || '\u00A0'}</span>
-    </div>
+      {children}
+      <button
+        className="annotatable__btn"
+        onClick={(e: React.MouseEvent) => {
+          e.stopPropagation();
+          onAnnotate(lineNumber, lineContent);
+        }}
+        aria-label={`Add note to line ${lineNumber}`}
+        title="Add note"
+      >
+        <MessageSquarePlus size={14} />
+      </button>
+    </Tag>
   );
 }
 
@@ -206,7 +234,7 @@ export function ProseReader({
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
-  const lineRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
 
   // Compute absolute path
@@ -281,9 +309,6 @@ export function ProseReader({
     setAnnotatingLine({ lineNumber, lineContent });
     setNoteInput('');
   }, []);
-
-  // Long press handlers for markdown blocks - call hook at component level
-  const longPressHandlers = useLongPress(handleLongPress);
 
   // Add a note
   const handleAddNote = useCallback(() => {
@@ -379,139 +404,74 @@ export function ProseReader({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [annotatingLine, showCloseConfirm, handleAddNote, handleClose]);
 
-  // Render lines for code/text files
+  // Render lines for text files
   const renderLines = useMemo(() => {
     if (!content) return null;
     const lines = content.split('\n');
 
     return lines.map((line, index) => {
       const lineNumber = index + 1;
-      const isModified = patchContext?.modifiedLines.has(lineNumber);
-      const isHighlightedLine = highlightedLine === lineNumber;
-
       return (
-        <SelectableLine
+        <AnnotatableBlock
           key={lineNumber}
           lineNumber={lineNumber}
-          content={line}
-          isModified={isModified}
-          isHighlighted={isHighlightedLine}
-          onLongPress={handleLongPress}
+          lineContent={line}
+          onAnnotate={handleLongPress}
+          className="prose-line"
+          isModified={patchContext?.modifiedLines.has(lineNumber)}
+          isHighlighted={highlightedLine === lineNumber}
           lineRef={(el) => {
             if (el) lineRefs.current.set(lineNumber, el);
             else lineRefs.current.delete(lineNumber);
           }}
-        />
+        >
+          <span className="prose-line__number">{lineNumber}</span>
+          <span className="prose-line__content">{line || '\u00A0'}</span>
+        </AnnotatableBlock>
       );
     });
   }, [content, patchContext?.modifiedLines, highlightedLine, handleLongPress]);
 
-  // Render markdown with selectable paragraphs
+  // Render markdown with annotatable blocks via factory
   const renderMarkdown = useMemo(() => {
     if (!content || fileType !== 'markdown') return null;
 
-    // Track line numbers for markdown blocks
-    let lineCounter = 0;
+    // Factory: wrap any block-level tag in AnnotatableBlock
+    // Uses HAST node.position for StrictMode-safe line numbers (no mutable counter)
+    // Destructures `node` to prevent ReactMarkdown's HAST AST leaking onto DOM
+    const annotatable = (Tag: React.ElementType) =>
+      ({ children, node, ...props }: { children?: React.ReactNode; node?: { position?: { start?: { line?: number } } }; [key: string]: unknown }) => {
+        const ln = node?.position?.start?.line ?? 0;
+        return (
+          <AnnotatableBlock
+            as={Tag}
+            lineNumber={ln}
+            lineContent={String(children).slice(0, 200)}
+            onAnnotate={handleLongPress}
+            className="prose-block"
+            isModified={patchContext?.modifiedLines.has(ln)}
+            isHighlighted={highlightedLine === ln}
+            lineRef={(el) => { if (el) lineRefs.current.set(ln, el); }}
+            {...props}
+          >
+            {children}
+          </AnnotatableBlock>
+        );
+      };
 
     return (
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          // Wrap each block element with long-press handlers
-          p: ({ children, ...props }) => {
-            lineCounter++;
-            const lineNumber = lineCounter;
-            const lineContent = String(children).slice(0, 200);
-            const { start, move, end } = longPressHandlers;
-            const isModified = patchContext?.modifiedLines.has(lineNumber);
-            const isHighlightedLine = highlightedLine === lineNumber;
-
-            return (
-              <p
-                {...props}
-                className={`prose-reader-block ${isModified ? 'prose-reader-line--modified' : ''} ${isHighlightedLine ? 'prose-reader-line--highlighted' : ''}`}
-                onTouchStart={(e) => start(e, lineNumber, lineContent)}
-                onTouchMove={move}
-                onTouchEnd={end}
-                onMouseDown={(e) => start(e, lineNumber, lineContent)}
-                onMouseMove={move}
-                onMouseUp={end}
-                onMouseLeave={end}
-                ref={(el) => {
-                  if (el) lineRefs.current.set(lineNumber, el);
-                }}
-              >
-                {children}
-              </p>
-            );
-          },
-          h1: ({ children, ...props }) => {
-            lineCounter++;
-            const lineNumber = lineCounter;
-            const lineContent = String(children);
-            const { start, move, end } = longPressHandlers;
-
-            return (
-              <h1
-                {...props}
-                className="prose-reader-block"
-                onTouchStart={(e) => start(e, lineNumber, lineContent)}
-                onTouchMove={move}
-                onTouchEnd={end}
-                onMouseDown={(e) => start(e, lineNumber, lineContent)}
-                onMouseMove={move}
-                onMouseUp={end}
-                onMouseLeave={end}
-              >
-                {children}
-              </h1>
-            );
-          },
-          h2: ({ children, ...props }) => {
-            lineCounter++;
-            const lineNumber = lineCounter;
-            const lineContent = String(children);
-            const { start, move, end } = longPressHandlers;
-
-            return (
-              <h2
-                {...props}
-                className="prose-reader-block"
-                onTouchStart={(e) => start(e, lineNumber, lineContent)}
-                onTouchMove={move}
-                onTouchEnd={end}
-                onMouseDown={(e) => start(e, lineNumber, lineContent)}
-                onMouseMove={move}
-                onMouseUp={end}
-                onMouseLeave={end}
-              >
-                {children}
-              </h2>
-            );
-          },
-          h3: ({ children, ...props }) => {
-            lineCounter++;
-            const lineNumber = lineCounter;
-            const lineContent = String(children);
-            const { start, move, end } = longPressHandlers;
-
-            return (
-              <h3
-                {...props}
-                className="prose-reader-block"
-                onTouchStart={(e) => start(e, lineNumber, lineContent)}
-                onTouchMove={move}
-                onTouchEnd={end}
-                onMouseDown={(e) => start(e, lineNumber, lineContent)}
-                onMouseMove={move}
-                onMouseUp={end}
-                onMouseLeave={end}
-              >
-                {children}
-              </h3>
-            );
-          },
-          code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode }) => {
+          p: annotatable('p'),
+          h1: annotatable('h1'),
+          h2: annotatable('h2'),
+          h3: annotatable('h3'),
+          td: annotatable('td'),
+          th: annotatable('th'),
+          li: annotatable('li'),
+          blockquote: annotatable('blockquote'),
+          code: ({ inline, className, children, node: _node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
             const match = /language-(\w+)/.exec(className || '');
             return !inline && match ? (
               <SyntaxHighlighter
@@ -533,7 +493,7 @@ export function ProseReader({
         {content}
       </ReactMarkdown>
     );
-  }, [content, fileType, patchContext?.modifiedLines, highlightedLine, longPressHandlers]);
+  }, [content, fileType, patchContext?.modifiedLines, highlightedLine, handleLongPress]);
 
   // Get file name from path
   const fileName = filePath.split('/').pop() || filePath;
@@ -575,8 +535,8 @@ export function ProseReader({
         </div>
       </div>
 
-      {/* Patch context banner (REQ-PF-014) */}
-      {patchContext && (
+      {/* Patch context banner (REQ-PF-014) — only show when there are actual changes */}
+      {patchContext && patchContext.modifiedLines.size > 0 && (
         <div className="prose-reader-banner">
           <span className="prose-reader-banner-text">
             Viewing {fileName}: {patchContext.modifiedLines.size} change{patchContext.modifiedLines.size !== 1 ? 's' : ''} from patch
@@ -607,36 +567,31 @@ export function ProseReader({
               style={oneDark}
               language={language}
               showLineNumbers
-              wrapLines
-              lineProps={(lineNumber) => ({
-                style: {
-                  display: 'block',
-                  backgroundColor: patchContext?.modifiedLines.has(lineNumber)
-                    ? 'rgba(255, 236, 156, 0.3)'
-                    : highlightedLine === lineNumber
-                    ? 'rgba(59, 130, 246, 0.3)'
-                    : undefined,
-                  borderLeft: patchContext?.modifiedLines.has(lineNumber)
-                    ? '3px solid #f0ad4e'
-                    : undefined,
-                },
-                onTouchStart: (e: React.TouchEvent) => {
-                  const lineContent = (content?.split('\n')[lineNumber - 1] || '');
-                  longPressHandlers.start(e, lineNumber, lineContent);
-                },
-                onTouchMove: longPressHandlers.move,
-                onTouchEnd: longPressHandlers.end,
-                onMouseDown: (e: React.MouseEvent) => {
-                  const lineContent = (content?.split('\n')[lineNumber - 1] || '');
-                  longPressHandlers.start(e, lineNumber, lineContent);
-                },
-                onMouseMove: longPressHandlers.move,
-                onMouseUp: longPressHandlers.end,
-                onMouseLeave: longPressHandlers.end,
-                ref: (el: HTMLDivElement | null) => {
-                  if (el) lineRefs.current.set(lineNumber, el);
-                },
-              })}
+              renderer={({ rows, stylesheet, useInlineStyles }: { rows: Array<{ type: string; tagName?: string; properties?: Record<string, unknown>; children?: unknown[] }>; stylesheet: Record<string, React.CSSProperties>; useInlineStyles: boolean }) => {
+                const lines = content?.split('\n') || [];
+                return (
+                  <>
+                    {rows.map((node, idx) => {
+                      const lineNumber = idx + 1;
+                      return (
+                        <AnnotatableBlock
+                          key={lineNumber}
+                          as="div"
+                          lineNumber={lineNumber}
+                          lineContent={lines[idx] || ''}
+                          onAnnotate={handleLongPress}
+                          className="prose-code-line"
+                          isModified={patchContext?.modifiedLines.has(lineNumber)}
+                          isHighlighted={highlightedLine === lineNumber}
+                          lineRef={(el) => { if (el) lineRefs.current.set(lineNumber, el); }}
+                        >
+                          {createElement({ node, stylesheet, useInlineStyles, key: `t-${idx}` })}
+                        </AnnotatableBlock>
+                      );
+                    })}
+                  </>
+                );
+              }}
             >
               {content || ''}
             </SyntaxHighlighter>

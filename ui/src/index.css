@@ -3261,24 +3261,23 @@ html * {
   line-height: 1.5;
 }
 
-.prose-reader-line {
-  display: flex;
-  min-height: 24px;
+/* === Annotatable (shared annotation behavior) === */
+.annotatable {
+  position: relative;
   transition: background-color 0.15s;
-  user-select: none;
-  -webkit-user-select: none;
+}
+.annotatable:hover { background: var(--bg-tertiary); }
+/* Disable text selection on touch devices only — desktop users need to copy code */
+@media (hover: none) {
+  .annotatable { user-select: none; -webkit-user-select: none; }
 }
 
-.prose-reader-line:hover {
-  background: var(--bg-tertiary);
-}
-
-.prose-reader-line--modified {
+.annotatable--modified {
   background-color: rgba(255, 236, 156, 0.3) !important;
   border-left: 3px solid #f0ad4e;
 }
 
-.prose-reader-line--highlighted {
+.annotatable--highlighted {
   background-color: rgba(59, 130, 246, 0.3) !important;
   animation: highlight-fade 2s ease-out;
 }
@@ -3288,7 +3287,36 @@ html * {
   100% { background-color: transparent; }
 }
 
-.prose-reader-line-number {
+.annotatable__btn {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s, color 0.15s, background-color 0.15s;
+  z-index: 1;
+}
+.annotatable:hover > .annotatable__btn { opacity: 1; pointer-events: auto; }
+.annotatable__btn:hover {
+  color: var(--accent-blue);
+  background: var(--bg-tertiary);
+  border-color: var(--accent-blue);
+}
+@media (hover: none) { .annotatable__btn { display: none; } }
+
+/* === View-specific layout (compose with .annotatable) === */
+.prose-line { display: flex; min-height: 24px; }
+.prose-line__number {
   width: 48px;
   padding: 0 12px;
   text-align: right;
@@ -3297,13 +3325,14 @@ html * {
   flex-shrink: 0;
   font-size: 12px;
 }
-
-.prose-reader-line-content {
+.prose-line__content {
   flex: 1;
   padding: 0 16px;
   white-space: pre;
   overflow-x: auto;
 }
+
+.prose-code-line { display: block; }
 
 /* Markdown display */
 .prose-reader-markdown {
@@ -3361,15 +3390,10 @@ html * {
   color: var(--text-secondary);
 }
 
-.prose-reader-block {
+.prose-block {
   padding: 4px 8px;
   border-radius: 4px;
-  transition: background-color 0.15s;
   cursor: default;
-}
-
-.prose-reader-block:hover {
-  background: var(--bg-tertiary);
 }
 
 /* Code display */

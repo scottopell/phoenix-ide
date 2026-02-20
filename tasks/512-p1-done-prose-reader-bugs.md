@@ -1,7 +1,7 @@
 ---
 created: 2026-02-11
 priority: p1
-status: ready
+status: done
 ---
 
 # P0: Prose Reader Spec - Critical UX Bugs
@@ -35,3 +35,11 @@ On desktop, there is no clear/visible way to discover how to trigger the 'add no
 
 - Bug #1: Comment UI is unavailable or fails silently on table elements
 - Bug #2: Possible fixes include toolbar button, right-click context menu, or keyboard shortcut hint
+
+## Implementation (2026-02-19)
+
+Resolved via AnnotatableBlock refactor:
+- **Bug #1 (table annotations):** Table cells (td/th) now use the same `AnnotatableBlock` component via the `annotatable()` factory, getting full long-press + hover button support.
+- **Bug #2 (desktop discoverability):** All three views (text, code, markdown) now show a hover-reveal annotation button via `.annotatable__btn`. Code view previously couldn't show buttons due to `lineProps` API limitations — switched to custom `renderer` prop.
+- All 6 copy-pasted markdown renderers replaced with a single factory function (~150 lines removed).
+- CSS consolidated from `.prose-reader-line`/`.prose-reader-block`/`.prose-reader-annotate-btn` to unified `.annotatable` BEM set.

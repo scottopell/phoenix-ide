@@ -1,7 +1,7 @@
 ---
 created: 2026-02-11
 priority: p2
-status: ready
+status: done
 ---
 
 # Prose Reader - Trigger Requirements Analysis
@@ -36,3 +36,10 @@ Both bugs are spec compliance issues, not just implementation bugs.
 
 - Related to task 512 (prose reader bugs)
 - See requirements.md and design.md for current spec language
+
+## Implementation (2026-02-19)
+
+Resolved via AnnotatableBlock refactor (same change as task 512):
+- Desktop annotation trigger: hover-reveal button (`.annotatable__btn`) on all annotatable elements
+- Code view now uses custom `renderer` prop instead of `lineProps`, enabling child React elements (the button)
+- Mobile: long-press gesture unchanged, button hidden via `@media (hover: none)`
