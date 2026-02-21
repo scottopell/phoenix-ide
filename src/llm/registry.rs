@@ -2,7 +2,7 @@
 
 #![allow(dead_code)] // new_empty() used in tests
 
-use super::{all_models, LlmService, LoggingService, Provider};
+use super::{all_models, discover_models, LlmService, LoggingService, Provider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -65,6 +65,65 @@ impl ModelRegistry {
                     Some("claude-4.5-sonnet".to_string())
                 } else {
                     // Fall back to first available model
+                    services.keys().next().cloned()
+                }
+            })
+            .unwrap_or_else(|| "claude-4.5-sonnet".to_string());
+
+        Self {
+            services,
+            default_model,
+        }
+    }
+
+    /// Create registry with dynamic model discovery from gateway
+    ///
+    /// When gateway is configured, queries provider endpoints for available models.
+    /// Falls back to hardcoded models if discovery fails.
+    pub async fn new_with_discovery(config: &LlmConfig) -> Self {
+        // If no gateway, use sync version
+        if config.gateway.is_none() {
+            return Self::new(config);
+        }
+
+        let gateway_url = config.gateway.as_ref().unwrap();
+        tracing::info!("Discovering models from gateway: {}", gateway_url);
+
+        // Try to discover models from gateway
+        let discovered = discover_models(gateway_url).await;
+
+        if discovered.is_empty() {
+            tracing::warn!(
+                "Gateway model discovery returned no models, falling back to hardcoded list"
+            );
+            return Self::new(config);
+        }
+
+        tracing::info!("Discovered {} models from gateway", discovered.len());
+
+        // Build services map from discovered models
+        // For now, only register models we have hardcoded definitions for
+        // TODO: Create services dynamically for any discovered model
+        let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
+
+        for model_def in all_models() {
+            // Check if this model was discovered
+            if discovered.contains_key(model_def.id) || discovered.contains_key(model_def.api_name)
+            {
+                if let Some(service) = Self::try_create_model(model_def, config) {
+                    services.insert(model_def.id.to_string(), service);
+                }
+            }
+        }
+
+        // Determine default model
+        let default_model = config
+            .default_model
+            .clone()
+            .or_else(|| {
+                if services.contains_key("claude-4.5-sonnet") {
+                    Some("claude-4.5-sonnet".to_string())
+                } else {
                     services.keys().next().cloned()
                 }
             })

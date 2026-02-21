@@ -72,9 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
 
-    // Initialize LLM registry
+    // Initialize LLM registry with model discovery
     let llm_config = LlmConfig::from_env();
-    let llm_registry = Arc::new(ModelRegistry::new(&llm_config));
+    let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
 
     if llm_registry.has_models() {
         tracing::info!(

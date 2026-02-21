@@ -3,6 +3,7 @@
 //! Provides a common interface for interacting with various LLM providers.
 
 mod anthropic;
+mod discovery;
 mod error;
 mod models;
 mod openai;
@@ -12,6 +13,7 @@ mod registry;
 mod types;
 
 pub use anthropic::AnthropicService;
+pub use discovery::discover_models;
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ModelDef, Provider};
 pub use openai::OpenAIService;
