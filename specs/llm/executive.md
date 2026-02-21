@@ -14,12 +14,12 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 |-------------|--------|-------|
 | **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
 | **REQ-LLM-002:** Gateway Support | ✅ Complete | Gateway URL construction for Anthropic |
-| **REQ-LLM-003:** Model Registry | 🔄 In Progress | ModelRegistry with available_models() - hardcoded only |
-| **REQ-LLM-003a:** Model Discovery | ⏳ Not Started | Dynamic discovery from gateway not implemented |
+| **REQ-LLM-003:** Model Registry | ✅ Complete | ModelRegistry with available_models() |
+| **REQ-LLM-003a:** Model Discovery | ✅ Complete | Queries gateway endpoints, falls back to hardcoded |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
 | **REQ-LLM-006:** Error Classification | ✅ Complete | LlmErrorKind with is_retryable() |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-008:** Request Logging | ✅ Complete | LoggingService wrapper with tracing |
 
-**Progress:** 7 of 9 complete (REQ-LLM-003 in progress, REQ-LLM-003a not started)
+**Progress:** 9 of 9 complete
