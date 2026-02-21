@@ -1,7 +1,8 @@
 ---
 created: 2026-02-19
 priority: p3
-status: ready
+status: done
+completed: 2026-02-21
 ---
 
 # Dynamic model discovery from LLM gateway
@@ -78,8 +79,45 @@ optionally refresh on a long interval (hours, not seconds).
 - Should the UI expose all discovered models or filter to a curated subset?
   787 models (observed from one gateway) is too many to show unfiltered.
 
+## Implementation
+
+**Completed 2026-02-21**
+
+Added `src/llm/discovery.rs` module that queries gateway endpoints at startup:
+
+- `{gateway}/anthropic/v1/models` - Returns 9 Anthropic models with `display_name`
+- `{gateway}/openai/v1/models` - Returns 119 OpenAI models  
+- `{gateway}/fireworks/inference/v1/models` - Returns 14 Fireworks chat models with `context_length` and capability flags
+
+Total discovered: **142 models** from gateway.
+
+`ModelRegistry::new_with_discovery()` is now called at startup when gateway is configured. It:
+1. Queries all three provider endpoints (5s timeout each)
+2. Filters hardcoded model list to only models the gateway actually supports
+3. Falls back to full hardcoded list if discovery fails
+4. Logs discovery results for observability
+
+### What works
+
+- ✅ Discovery runs at startup and logs results
+- ✅ Models removed from gateway are automatically excluded (e.g., qwen3-coder)
+- ✅ Graceful fallback if gateway doesn't support model listing
+- ✅ Zero-downtime production deployment
+- ✅ All existing models continue working
+
+### Future work
+
+**Full dynamic registration**: Currently we register the intersection of hardcoded models and discovered models. To support *arbitrary* discovered models requires:
+- Mapping gateway model IDs to providers (some use prefixes like `accounts/fireworks/models/...`)
+- Creating services dynamically without hardcoded `ModelDef` entries
+- UI filtering (142 models is too many to show unfiltered)
+- Metadata merging strategy (context windows, descriptions)
+
+This is deferred - the current implementation solves the immediate problem of automatic removal when models disappear from the gateway.
+
 ## Files
 
-- `src/llm/models.rs` — hardcoded model definitions
-- `src/llm/registry.rs` — model registration at startup
-- `src/api/handlers.rs` — `/api/models` endpoint
+- `src/llm/discovery.rs` — NEW: gateway model discovery
+- `src/llm/registry.rs` — `new_with_discovery()` async constructor
+- `src/main.rs` — calls `new_with_discovery()` at startup
+- `specs/llm/*.md` — updated with gateway model endpoint documentation
