@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles provider-specific translation internally. When exe.dev gateway is configured, all models are registered as available since the gateway manages API keys; otherwise only models with locally configured API keys are available. Requests use a common format (system prompt, messages, tools) that gets translated per-provider. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified as retryable (network, rate limit) or non-retryable (auth) to enable appropriate state machine handling.
+The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles provider-specific translation internally. When exe.dev gateway is configured, Phoenix queries provider model listing endpoints (`/anthropic/v1/models`, `/openai/v1/models`, `/fireworks/inference/v1/models`) at startup to discover available models dynamically, merging gateway data with hardcoded metadata for context windows and descriptions. If gateway doesn't support model listing, Phoenix falls back to hardcoded models. In direct API mode, only models with configured API keys are registered. Requests use a common format (system prompt, messages, tools) that gets translated per-provider. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified as retryable (network, rate limit) or non-retryable (auth) to enable appropriate state machine handling.
 
 ## Technical Summary
 
@@ -14,11 +14,12 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 |-------------|--------|-------|
 | **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
 | **REQ-LLM-002:** Gateway Support | ✅ Complete | Gateway URL construction for Anthropic |
-| **REQ-LLM-003:** Model Registry | ✅ Complete | ModelRegistry with available_models() |
+| **REQ-LLM-003:** Model Registry | 🔄 In Progress | ModelRegistry with available_models() - hardcoded only |
+| **REQ-LLM-003a:** Model Discovery | ⏳ Not Started | Dynamic discovery from gateway not implemented |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
 | **REQ-LLM-006:** Error Classification | ✅ Complete | LlmErrorKind with is_retryable() |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-008:** Request Logging | ✅ Complete | LoggingService wrapper with tracing |
 
-**Progress:** 8 of 8 complete
+**Progress:** 7 of 9 complete (REQ-LLM-003 in progress, REQ-LLM-003a not started)

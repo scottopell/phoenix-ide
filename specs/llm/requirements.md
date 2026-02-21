@@ -40,13 +40,34 @@ THE SYSTEM SHALL enumerate available models based on configured API keys
 AND make unavailable models inaccessible
 
 WHEN server starts with gateway configured
-THE SYSTEM SHALL enumerate all supported models as available
-AND rely on gateway for API key management
+THE SYSTEM SHALL query gateway model listing endpoints at startup
+AND merge discovered models with hardcoded metadata
+AND fall back to hardcoded list if gateway doesn't support model listing
 
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
-**Rationale:** Users see only models they can actually use. Gateway mode delegates key management to exe.dev infrastructure.
+**Rationale:** Dynamic discovery from gateway enables new models to appear automatically without code changes. Hardcoded fallback ensures Phoenix works with minimal gateways or direct API mode.
+
+---
+
+### REQ-LLM-003a: Model Discovery
+
+WHEN querying gateway for model list
+THE SYSTEM SHALL request from provider-specific endpoints:
+- `{gateway}/anthropic/v1/models` (requires `anthropic-version` header)
+- `{gateway}/openai/v1/models`
+- `{gateway}/fireworks/inference/v1/models`
+
+WHEN gateway returns models
+THE SYSTEM SHALL extract model IDs and metadata (context_length, capabilities)
+AND merge with hardcoded descriptions and defaults
+
+WHEN gateway endpoint returns 404 or error
+THE SYSTEM SHALL fall back to hardcoded model list
+AND log warning about fallback
+
+**Rationale:** Provider-specific endpoints return different metadata formats. Graceful degradation ensures Phoenix works regardless of gateway capabilities.
 
 ---
 

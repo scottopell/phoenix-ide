@@ -90,7 +90,7 @@ pub struct AnthropicService {
 impl AnthropicService {
     pub fn new(api_key: String, model: AnthropicModel, gateway: Option<&str>) -> Self {
         let base_url = match gateway {
-            Some(gw) => format!("{}/_/gateway/anthropic/v1/messages", gw),
+            Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
             None => "https://api.anthropic.com/v1/messages".to_string(),
         };
         Self { api_key, model, base_url }
@@ -116,7 +116,7 @@ pub struct OpenAiService {
 impl OpenAiService {
     pub fn new(api_key: String, model: OpenAiModel, gateway: Option<&str>) -> Self {
         let base_url = match gateway {
-            Some(gw) => format!("{}/_/gateway/openai/v1", gw),
+            Some(gw) => format!("{}/openai/v1", gw.trim_end_matches('/')),
             None => "https://api.openai.com/v1".to_string(),
         };
         Self { api_key, model, base_url }
@@ -136,7 +136,7 @@ pub struct FireworksService {
 impl FireworksService {
     pub fn new(api_key: String, model: FireworksModel, gateway: Option<&str>) -> Self {
         let base_url = match gateway {
-            Some(gw) => format!("{}/_/gateway/fireworks/inference/v1", gw),
+            Some(gw) => format!("{}/fireworks/inference/v1", gw.trim_end_matches('/')),
             None => "https://api.fireworks.ai/inference/v1".to_string(),
         };
         Self { api_key, model, base_url }
@@ -209,10 +209,55 @@ impl ModelRegistry {
 
 | Provider | Gateway Suffix | Direct URL |
 |----------|---------------|------------|
-| Anthropic | `/_/gateway/anthropic/v1/messages` | `https://api.anthropic.com/v1/messages` |
-| OpenAI | `/_/gateway/openai/v1` | `https://api.openai.com/v1` |
-| Fireworks | `/_/gateway/fireworks/inference/v1` | `https://api.fireworks.ai/inference/v1` |
-| Gemini | `/_/gateway/gemini/v1/models/generate` | `https://generativelanguage.googleapis.com/v1` |
+| Anthropic | `/anthropic/v1/messages` | `https://api.anthropic.com/v1/messages` |
+| OpenAI | `/openai/v1` | `https://api.openai.com/v1` |
+| Fireworks | `/fireworks/inference/v1` | `https://api.fireworks.ai/inference/v1` |
+
+The gateway uses simple path prefixes to route to providers, not `/_/gateway/` prefixes.
+
+### Model Discovery
+
+Each provider exposes a model listing endpoint through the gateway:
+
+| Provider | Model List Endpoint | Response Format | Notes |
+|----------|-------------------|-----------------|-------|
+| Anthropic | `{gateway}/anthropic/v1/models` | Anthropic native | Requires `anthropic-version: 2023-06-01` header, includes `display_name` |
+| OpenAI | `{gateway}/openai/v1/models` | OpenAI standard | Basic metadata (id, created, owned_by) |
+| Fireworks | `{gateway}/fireworks/inference/v1/models` | OpenAI-compatible | Rich metadata: `context_length`, `supports_chat`, `supports_tools` |
+
+Example responses:
+
+**Anthropic:**
+```json
+{
+  "data": [
+    {
+      "type": "model",
+      "id": "claude-sonnet-4-6",
+      "display_name": "Claude Sonnet 4.6",
+      "created_at": "2026-02-17T00:00:00Z"
+    }
+  ],
+  "has_more": false
+}
+```
+
+**Fireworks:**
+```json
+{
+  "data": [
+    {
+      "id": "accounts/fireworks/models/glm-5",
+      "object": "model",
+      "owned_by": "fireworks",
+      "created": 1770826344,
+      "context_length": 202752,
+      "supports_chat": true,
+      "supports_tools": true
+    }
+  ]
+}
+```
 
 ## Request Translation (REQ-LLM-004)
 
