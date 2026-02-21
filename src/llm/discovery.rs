@@ -29,7 +29,7 @@ struct AnthropicModelData {
     display_name: Option<String>,
 }
 
-/// OpenAI /v1/models response (also used by Fireworks)
+/// `OpenAI` /v1/models response (also used by Fireworks)
 #[derive(Debug, Deserialize)]
 struct OpenAIModelsResponse {
     data: Vec<OpenAIModelData>,
@@ -105,7 +105,7 @@ async fn discover_anthropic(
     Ok(models)
 }
 
-/// Discover OpenAI models
+/// Discover `OpenAI` models
 async fn discover_openai(
     gateway_url: &str,
 ) -> Result<HashMap<String, DiscoveredModel>, Box<dyn std::error::Error>> {
