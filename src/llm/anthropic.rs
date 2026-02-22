@@ -1,307 +1,209 @@
 //! Anthropic Claude provider implementation
 
+use super::models::ModelSpec;
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage,
 };
-use super::{LlmError, LlmService};
-use async_trait::async_trait;
+use super::LlmError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Anthropic model variants
-#[derive(Debug, Clone, Copy)]
-pub enum AnthropicModel {
-    Claude4Opus,
-    Claude4Sonnet,
-    Claude35Sonnet,
-    Claude35Haiku,
-}
+/// Complete using Anthropic Messages API
+pub async fn complete(
+    spec: &ModelSpec,
+    api_key: &str,
+    gateway: Option<&str>,
+    request: &LlmRequest,
+) -> Result<LlmResponse, LlmError> {
+    let base_url = match gateway {
+        Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
+        None => "https://api.anthropic.com/v1/messages".to_string(),
+    };
 
-impl AnthropicModel {
-    pub fn api_name(self) -> &'static str {
-        match self {
-            // Use model names from exe.dev/shelley
-            AnthropicModel::Claude4Opus => "claude-opus-4-5-20251101",
-            AnthropicModel::Claude4Sonnet => "claude-sonnet-4-5-20250929",
-            AnthropicModel::Claude35Sonnet => "claude-sonnet-4-20250514",
-            AnthropicModel::Claude35Haiku => "claude-haiku-4-5-20251001",
-        }
-    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| LlmError::unknown(format!("Failed to create HTTP client: {}", e)))?;
 
-    #[allow(dead_code)] // For future context management
-    pub fn context_window(self) -> usize {
-        match self {
-            AnthropicModel::Claude4Opus
-            | AnthropicModel::Claude4Sonnet
-            | AnthropicModel::Claude35Sonnet
-            | AnthropicModel::Claude35Haiku => 200_000,
-        }
-    }
+    let anthropic_request = translate_request(&spec.api_name, request);
 
-    pub fn model_id(self) -> &'static str {
-        match self {
-            AnthropicModel::Claude4Opus => "claude-4.5-opus",
-            AnthropicModel::Claude4Sonnet => "claude-4.5-sonnet",
-            AnthropicModel::Claude35Sonnet => "claude-3.5-sonnet",
-            AnthropicModel::Claude35Haiku => "claude-4.5-haiku",
-        }
-    }
-}
-
-/// Anthropic service implementation
-pub struct AnthropicService {
-    client: Client,
-    api_key: String,
-    model: AnthropicModel,
-    base_url: String,
-    model_id: String,
-}
-
-impl AnthropicService {
-    pub fn new(api_key: String, model: AnthropicModel, gateway: Option<&str>) -> Self {
-        let base_url = match gateway {
-            Some(gw) => {
-                // exe.dev gateway format: gateway_base + /anthropic/v1/messages
-                format!("{}/anthropic/v1/messages", gw.trim_end_matches('/'))
+    let response = client
+        .post(&base_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&anthropic_request)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                LlmError::network(format!("Request timeout: {e}"))
+            } else if e.is_connect() {
+                LlmError::network(format!("Connection failed: {e}"))
+            } else {
+                LlmError::unknown(format!("Request failed: {e}"))
             }
-            None => "https://api.anthropic.com/v1/messages".to_string(),
-        };
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self {
-            client,
-            api_key,
-            model,
-            base_url,
-            model_id: model.model_id().to_string(),
-        }
-    }
-
-    fn translate_request(&self, request: &LlmRequest) -> AnthropicRequest {
-        let system: Vec<AnthropicSystemBlock> = request
-            .system
-            .iter()
-            .map(|s| AnthropicSystemBlock {
-                r#type: "text".to_string(),
-                text: s.text.clone(),
-                cache_control: if s.cache {
-                    Some(CacheControl {
-                        r#type: "ephemeral".to_string(),
-                    })
-                } else {
-                    None
-                },
-            })
-            .collect();
-
-        let messages: Vec<AnthropicMessage> = request
-            .messages
-            .iter()
-            .map(Self::translate_message)
-            .collect();
-
-        let tools: Vec<AnthropicTool> = request
-            .tools
-            .iter()
-            .map(|t| AnthropicTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
-
-        AnthropicRequest {
-            model: self.model.api_name().to_string(),
-            max_tokens: request.max_tokens.unwrap_or(8192),
-            system,
-            messages,
-            tools: if tools.is_empty() { None } else { Some(tools) },
-        }
-    }
-
-    fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
-        let role = match msg.role {
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-        };
-
-        let content: Vec<AnthropicContentBlock> = msg
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
-                ContentBlock::Image { source } => {
-                    let ImageSource::Base64 { media_type, data } = source;
-                    AnthropicContentBlock::Image {
-                        source: AnthropicImageSource {
-                            r#type: "base64".to_string(),
-                            media_type: media_type.clone(),
-                            data: data.clone(),
-                        },
-                    }
-                }
-                ContentBlock::ToolUse { id, name, input } => AnthropicContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } => AnthropicContentBlock::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
-                    content: content.clone(),
-                    is_error: *is_error,
-                },
-            })
-            .collect();
-
-        AnthropicMessage {
-            role: role.to_string(),
-            content,
-        }
-    }
-
-    fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
-        let mut content = Vec::new();
-        let raw_block_count = resp.content.len();
-
-        for block in resp.content {
-            match block {
-                AnthropicContentBlock::Text { text } => {
-                    if !text.is_empty() {
-                        content.push(ContentBlock::Text { text });
-                    }
-                }
-                AnthropicContentBlock::ToolUse { id, name, input } => {
-                    content.push(ContentBlock::ToolUse { id, name, input });
-                }
-                AnthropicContentBlock::Image { .. } => {
-                    return Err(LlmError::unknown(
-                        "Unexpected image block in Anthropic response",
-                    ));
-                }
-                AnthropicContentBlock::ToolResult { .. } => {
-                    return Err(LlmError::unknown(
-                        "Unexpected tool_result block in Anthropic response",
-                    ));
-                }
-            }
-        }
-
-        let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
-
-        if content.is_empty() {
-            // Log exactly what Anthropic sent so we can diagnose the root cause.
-            // output_tokens > 0 with empty content suggests blocks were silently dropped
-            // (e.g. empty text blocks filtered above). stop_reason tells us intent.
-            tracing::warn!(
-                stop_reason = ?resp.stop_reason,
-                output_tokens = resp.usage.output_tokens,
-                raw_block_count = raw_block_count,
-                "Anthropic returned empty content after normalization"
-            );
-            return Err(LlmError::unknown(format!(
-                "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
-                resp.stop_reason, resp.usage.output_tokens, raw_block_count
-            )));
-        }
-
-        Ok(LlmResponse {
-            content,
-            end_turn,
-            usage: Usage {
-                input_tokens: resp.usage.input_tokens,
-                output_tokens: resp.usage.output_tokens,
-                cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
-                cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
-            },
-        })
-    }
-
-    fn classify_error(status: reqwest::StatusCode, body: &str) -> LlmError {
-        let message = body.to_string();
-        match status.as_u16() {
-            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
-            429 => {
-                let mut err = LlmError::rate_limit(format!("Rate limited: {message}"));
-                // Try to parse retry-after from response
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
-                    if let Some(retry_after) = parsed
-                        .get("error")
-                        .and_then(|e| e.get("retry_after"))
-                        .and_then(serde_json::Value::as_f64)
-                    {
-                        err = err.with_retry_after(Duration::from_secs_f64(retry_after));
-                    }
-                }
-                err
-            }
-            400 => LlmError::invalid_request(format!("Invalid request: {message}")),
-            500..=599 => LlmError::server_error(format!("Server error: {message}")),
-            _ => LlmError::unknown(format!("HTTP {status}: {message}")),
-        }
-    }
-}
-
-#[async_trait]
-impl LlmService for AnthropicService {
-    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let anthropic_request = self.translate_request(request);
-
-        let response = self
-            .client
-            .post(&self.base_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&anthropic_request)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    LlmError::network(format!("Request timeout: {e}"))
-                } else if e.is_connect() {
-                    LlmError::network(format!("Connection failed: {e}"))
-                } else {
-                    LlmError::unknown(format!("Request failed: {e}"))
-                }
-            })?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
-
-        if !status.is_success() {
-            return Err(Self::classify_error(status, &body));
-        }
-
-        let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {
-            LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
         })?;
 
-        Self::normalize_response(anthropic_response)
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
+
+    if !status.is_success() {
+        return Err(LlmError::from_http_status(status.as_u16(), body));
     }
 
-    fn model_id(&self) -> &str {
-        &self.model_id
+    let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {
+        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    })?;
+
+    normalize_response(anthropic_response)
+}
+
+fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicRequest {
+    let system: Vec<AnthropicSystemBlock> = request
+        .system
+        .iter()
+        .map(|s| AnthropicSystemBlock {
+            r#type: "text".to_string(),
+            text: s.text.clone(),
+            cache_control: if s.cache {
+                Some(CacheControl {
+                    r#type: "ephemeral".to_string(),
+                })
+            } else {
+                None
+            },
+        })
+        .collect();
+
+    let messages: Vec<AnthropicMessage> = request
+        .messages
+        .iter()
+        .map(translate_message)
+        .collect();
+
+    let tools: Vec<AnthropicTool> = request
+        .tools
+        .iter()
+        .map(|t| AnthropicTool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
+
+    AnthropicRequest {
+        model: model_api_name.to_string(),
+        max_tokens: request.max_tokens.unwrap_or(8192),
+        system,
+        messages,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+    }
+}
+
+pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
+    let role = match msg.role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+    };
+
+    let content: Vec<AnthropicContentBlock> = msg
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
+            ContentBlock::Image { source } => {
+                let ImageSource::Base64 { media_type, data } = source;
+                AnthropicContentBlock::Image {
+                    source: AnthropicImageSource {
+                        r#type: "base64".to_string(),
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    },
+                }
+            }
+            ContentBlock::ToolUse { id, name, input } => AnthropicContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => AnthropicContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+                is_error: *is_error,
+            },
+        })
+        .collect();
+
+    AnthropicMessage {
+        role: role.to_string(),
+        content,
+    }
+}
+
+pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
+    let mut content = Vec::new();
+    let raw_block_count = resp.content.len();
+
+    for block in resp.content {
+        match block {
+            AnthropicContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    content.push(ContentBlock::Text { text });
+                }
+            }
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                content.push(ContentBlock::ToolUse { id, name, input });
+            }
+            AnthropicContentBlock::Image { .. } => {
+                return Err(LlmError::invalid_response(
+                    "Unexpected image block in Anthropic response",
+                ));
+            }
+            AnthropicContentBlock::ToolResult { .. } => {
+                return Err(LlmError::invalid_response(
+                    "Unexpected tool_result block in Anthropic response",
+                ));
+            }
+        }
     }
 
-    fn context_window(&self) -> usize {
-        self.model.context_window()
+    let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
+
+    if content.is_empty() {
+        // Log exactly what Anthropic sent so we can diagnose the root cause.
+        // output_tokens > 0 with empty content suggests blocks were silently dropped
+        // (e.g. empty text blocks filtered above). stop_reason tells us intent.
+        tracing::warn!(
+            stop_reason = ?resp.stop_reason,
+            output_tokens = resp.usage.output_tokens,
+            raw_block_count = raw_block_count,
+            "Anthropic returned empty content after normalization"
+        );
+        return Err(LlmError::invalid_response(format!(
+            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
+            resp.stop_reason, resp.usage.output_tokens, raw_block_count
+        )));
     }
 
-    fn max_image_dimension(&self) -> Option<u32> {
-        Some(1568) // Anthropic's max image dimension
-    }
+    Ok(LlmResponse {
+        content,
+        end_turn,
+        usage: Usage {
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+            cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
+            cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
+        },
+    })
 }
 
 // Anthropic API types
@@ -390,15 +292,14 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    use crate::llm::types::LlmMessage;
-
-    pub fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
-        AnthropicService::translate_message(msg)
-    }
-
-    pub fn normalize_response(
+    
+    pub(crate) fn normalize_response(
         resp: AnthropicResponse,
     ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
-        AnthropicService::normalize_response(resp)
+        super::normalize_response(resp)
+    }
+    
+    pub(crate) fn translate_message(msg: &crate::llm::types::LlmMessage) -> AnthropicMessage {
+        super::translate_message(msg)
     }
 }

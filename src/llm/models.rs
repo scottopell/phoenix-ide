@@ -3,11 +3,6 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
-use super::anthropic::AnthropicModel;
-use super::openai::OpenAIModel;
-use super::{AnthropicService, LlmService, OpenAIService};
-use std::sync::Arc;
-
 /// LLM provider enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -37,348 +32,192 @@ impl Provider {
     }
 }
 
-/// Model definition with metadata
+/// API format / wire protocol
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFormat {
+    /// Anthropic Messages API
+    Anthropic,
+    /// OpenAI Chat Completions (used by OpenAI + Fireworks)
+    OpenAIChat,
+}
+
+/// Model specification with metadata
 #[derive(Debug, Clone)]
-pub struct ModelDef {
+pub struct ModelSpec {
     /// User-facing model ID (e.g., "claude-4.5-opus")
-    pub id: &'static str,
+    pub id: String,
+    /// API name used by the provider (e.g., "claude-opus-4-5-20251101")
+    pub api_name: String,
     /// Provider for this model
     pub provider: Provider,
-    /// API name used by the provider (e.g., "claude-opus-4-5-20251101")
-    #[allow(dead_code)] // Will be used when we support model updates
-    pub api_name: &'static str,
+    /// API format / wire protocol
+    pub api_format: ApiFormat,
     /// Human-readable description
-    pub description: &'static str,
+    pub description: String,
     /// Context window size in tokens
     pub context_window: usize,
     /// Recommended for most users (shown by default in UI)
     pub recommended: bool,
-    /// Factory function to create the service
-    #[allow(clippy::type_complexity)]
-    pub factory: fn(&str, Option<&str>) -> Result<Arc<dyn LlmService>, String>,
 }
 
-/// Get all available model definitions
+/// Get all available model specifications
 #[allow(clippy::too_many_lines)]
-pub fn all_models() -> &'static [ModelDef] {
-    &[
+pub fn all_models() -> Vec<ModelSpec> {
+    vec![
         // Anthropic models
-        ModelDef {
-            id: "claude-4.5-opus",
+        ModelSpec {
+            id: "claude-4.5-opus".into(),
+            api_name: "claude-opus-4-5-20251101".into(),
             provider: Provider::Anthropic,
-            api_name: "claude-opus-4-5-20251101",
-            description: "Claude Opus 4.5 (most capable, slower)",
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Opus 4.5 (most capable, slower)".into(),
             context_window: 200_000,
             recommended: true,
-            factory: |api_key, gateway| {
-                // Accept any non-empty key (including "implicit" for gateway mode)
-                if api_key.is_empty() {
-                    return Err("claude-4.5-opus requires ANTHROPIC_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(AnthropicService::new(
-                    api_key.to_string(),
-                    AnthropicModel::Claude4Opus,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "claude-4.5-sonnet",
+        ModelSpec {
+            id: "claude-4.5-sonnet".into(),
+            api_name: "claude-sonnet-4-5-20250929".into(),
             provider: Provider::Anthropic,
-            api_name: "claude-sonnet-4-5-20250929",
-            description: "Claude Sonnet 4.5 (balanced performance)",
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Sonnet 4.5 (balanced performance)".into(),
             context_window: 200_000,
             recommended: true,
-            factory: |api_key, gateway| {
-                // Accept any non-empty key (including "implicit" for gateway mode)
-                if api_key.is_empty() {
-                    return Err(
-                        "claude-4.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string()
-                    );
-                }
-                Ok(Arc::new(AnthropicService::new(
-                    api_key.to_string(),
-                    AnthropicModel::Claude4Sonnet,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "claude-3.5-sonnet",
+        ModelSpec {
+            id: "claude-3.5-sonnet".into(),
+            api_name: "claude-sonnet-4-20250514".into(),
             provider: Provider::Anthropic,
-            api_name: "claude-sonnet-4-20250514",
-            description: "Claude 3.5 Sonnet (legacy)",
+            api_format: ApiFormat::Anthropic,
+            description: "Claude 3.5 Sonnet (legacy)".into(),
             context_window: 200_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                // Accept any non-empty key (including "implicit" for gateway mode)
-                if api_key.is_empty() {
-                    return Err(
-                        "claude-3.5-sonnet requires ANTHROPIC_API_KEY or gateway".to_string()
-                    );
-                }
-                Ok(Arc::new(AnthropicService::new(
-                    api_key.to_string(),
-                    AnthropicModel::Claude35Sonnet,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "claude-4.5-haiku",
+        ModelSpec {
+            id: "claude-4.5-haiku".into(),
+            api_name: "claude-haiku-4-5-20251001".into(),
             provider: Provider::Anthropic,
-            api_name: "claude-haiku-4-5-20251001",
-            description: "Claude Haiku 4.5 (fast, efficient)",
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
             recommended: true,
-            factory: |api_key, gateway| {
-                // Accept any non-empty key (including "implicit" for gateway mode)
-                if api_key.is_empty() {
-                    return Err(
-                        "claude-4.5-haiku requires ANTHROPIC_API_KEY or gateway".to_string()
-                    );
-                }
-                Ok(Arc::new(AnthropicService::new(
-                    api_key.to_string(),
-                    AnthropicModel::Claude35Haiku,
-                    gateway,
-                )))
-            },
         },
-        // Additional providers - These work in gateway mode
-        // The gateway handles the actual API communication
-
         // OpenAI models
-        ModelDef {
-            id: "gpt-4o",
+        ModelSpec {
+            id: "gpt-4o".into(),
+            api_name: "gpt-4o".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-4o",
-            description: "GPT-4o (balanced, multimodal)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-4o (balanced, multimodal)".into(),
             context_window: 128_000,
             recommended: true,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-4o requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT4o,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "gpt-4o-mini",
+        ModelSpec {
+            id: "gpt-4o-mini".into(),
+            api_name: "gpt-4o-mini".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-4o-mini",
-            description: "GPT-4o Mini (fast, efficient)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-4o Mini (fast, efficient)".into(),
             context_window: 128_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-4o-mini requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT4oMini,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "o4-mini",
+        ModelSpec {
+            id: "o4-mini".into(),
+            api_name: "o4-mini".into(),
             provider: Provider::OpenAI,
-            api_name: "o4-mini",
-            description: "O4-Mini (reasoning model)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "O4-Mini (reasoning model)".into(),
             context_window: 200_000,
             recommended: true,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("o4-mini requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::O4Mini,
-                    gateway,
-                )))
-            },
         },
         // GPT-5 models (chat endpoint)
-        ModelDef {
-            id: "gpt-5",
+        ModelSpec {
+            id: "gpt-5".into(),
+            api_name: "gpt-5".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-5",
-            description: "GPT-5 (reasoning model)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-5 (reasoning model)".into(),
             context_window: 128_000,
             recommended: true,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-5 requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT5,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "gpt-5-mini",
+        ModelSpec {
+            id: "gpt-5-mini".into(),
+            api_name: "gpt-5-mini".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-5-mini",
-            description: "GPT-5 Mini (fast reasoning)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-5 Mini (fast reasoning)".into(),
             context_window: 128_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-5-mini requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT5Mini,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "gpt-5.1",
+        ModelSpec {
+            id: "gpt-5.1".into(),
+            api_name: "gpt-5.1".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-5.1",
-            description: "GPT-5.1 (latest GPT-5)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-5.1 (latest GPT-5)".into(),
             context_window: 128_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-5.1 requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT51,
-                    gateway,
-                )))
-            },
         },
         // GPT-5 Codex models (responses API)
-        ModelDef {
-            id: "gpt-5-codex",
+        ModelSpec {
+            id: "gpt-5-codex".into(),
+            api_name: "gpt-5-codex".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-5-codex",
-            description: "GPT-5 Codex (code generation)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-5 Codex (code generation)".into(),
             context_window: 200_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-5-codex requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT5Codex,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "gpt-5.1-codex",
+        ModelSpec {
+            id: "gpt-5.1-codex".into(),
+            api_name: "gpt-5.1-codex".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-5.1-codex",
-            description: "GPT-5.1 Codex (advanced code)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-5.1 Codex (advanced code)".into(),
             context_window: 200_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-5.1-codex requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT51Codex,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "gpt-5.2-codex",
+        ModelSpec {
+            id: "gpt-5.2-codex".into(),
+            api_name: "gpt-5.2-codex".into(),
             provider: Provider::OpenAI,
-            api_name: "gpt-5.2-codex",
-            description: "GPT-5.2 Codex (latest code model)",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GPT-5.2 Codex (latest code model)".into(),
             context_window: 200_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err("gpt-5.2-codex requires OPENAI_API_KEY or gateway".to_string());
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GPT52Codex,
-                    gateway,
-                )))
-            },
         },
         // Fireworks models
-        ModelDef {
-            id: "glm-4p7-fireworks",
+        ModelSpec {
+            id: "glm-4p7-fireworks".into(),
+            api_name: "accounts/fireworks/models/glm-4p7".into(),
             provider: Provider::Fireworks,
-            api_name: "accounts/fireworks/models/glm-4p7",
-            description: "GLM-4P7 on Fireworks",
+            api_format: ApiFormat::OpenAIChat,
+            description: "GLM-4P7 on Fireworks".into(),
             context_window: 128_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err(
-                        "glm-4p7-fireworks requires FIREWORKS_API_KEY or gateway".to_string()
-                    );
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::GLM4P7Fireworks,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "qwen3-coder-fireworks",
+        ModelSpec {
+            id: "qwen3-coder-fireworks".into(),
+            api_name: "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct".into(),
             provider: Provider::Fireworks,
-            api_name: "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
-            description: "Qwen3 Coder 480B on Fireworks",
+            api_format: ApiFormat::OpenAIChat,
+            description: "Qwen3 Coder 480B on Fireworks".into(),
             context_window: 128_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err(
-                        "qwen3-coder-fireworks requires FIREWORKS_API_KEY or gateway".to_string(),
-                    );
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::QwenCoderFireworks,
-                    gateway,
-                )))
-            },
         },
-        ModelDef {
-            id: "deepseek-v3-fireworks",
+        ModelSpec {
+            id: "deepseek-v3-fireworks".into(),
+            api_name: "accounts/fireworks/models/deepseek-v3p1".into(),
             provider: Provider::Fireworks,
-            api_name: "accounts/fireworks/models/deepseek-v3p1",
-            description: "DeepSeek V3 on Fireworks",
+            api_format: ApiFormat::OpenAIChat,
+            description: "DeepSeek V3 on Fireworks".into(),
             context_window: 128_000,
             recommended: false,
-            factory: |api_key, gateway| {
-                if api_key.is_empty() {
-                    return Err(
-                        "deepseek-v3-fireworks requires FIREWORKS_API_KEY or gateway".to_string(),
-                    );
-                }
-                Ok(Arc::new(OpenAIService::new(
-                    api_key.to_string(),
-                    OpenAIModel::DeepseekV3Fireworks,
-                    gateway,
-                )))
-            },
         },
     ]
 }
 
-/// Get the default model definition
-#[allow(dead_code)] // Public API
-pub fn default_model() -> &'static ModelDef {
-    &all_models()[1] // claude-4.5-sonnet as default
+/// Get the default model specification
+#[allow(dead_code)]
+pub fn default_model() -> ModelSpec {
+    all_models()[1].clone() // claude-4.5-sonnet as default
 }

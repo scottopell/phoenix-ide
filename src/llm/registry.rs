@@ -2,7 +2,7 @@
 
 #![allow(dead_code)] // new_empty() used in tests
 
-use super::{all_models, discover_models, LlmService, LoggingService, Provider};
+use super::{all_models, discover_models, LlmService, LlmServiceImpl, LoggingService, Provider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,9 +49,9 @@ impl ModelRegistry {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
 
         // Try to create each model from the centralized definitions
-        for model_def in all_models() {
-            if let Some(service) = Self::try_create_model(model_def, config) {
-                services.insert(model_def.id.to_string(), service);
+        for spec in all_models() {
+            if let Some(service) = Self::try_create_model(&spec, config) {
+                services.insert(spec.id.clone(), service);
             }
         }
 
@@ -106,12 +106,11 @@ impl ModelRegistry {
         // TODO: Create services dynamically for any discovered model
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
 
-        for model_def in all_models() {
+        for spec in all_models() {
             // Check if this model was discovered
-            if discovered.contains_key(model_def.id) || discovered.contains_key(model_def.api_name)
-            {
-                if let Some(service) = Self::try_create_model(model_def, config) {
-                    services.insert(model_def.id.to_string(), service);
+            if discovered.contains_key(&spec.id) || discovered.contains_key(&spec.api_name) {
+                if let Some(service) = Self::try_create_model(&spec, config) {
+                    services.insert(spec.id.clone(), service);
                 }
             }
         }
@@ -137,7 +136,7 @@ impl ModelRegistry {
 
     /// Try to create a model service, validating prerequisites
     fn try_create_model(
-        model_def: &super::ModelDef,
+        spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
         // In exe.dev gateway mode, use "implicit" as the API key
@@ -146,7 +145,7 @@ impl ModelRegistry {
             "implicit".to_string()
         } else {
             // Direct mode: require actual API key
-            match model_def.provider {
+            match spec.provider {
                 Provider::Anthropic => config.anthropic_api_key.as_ref()?,
                 Provider::OpenAI => config.openai_api_key.as_ref()?,
                 Provider::Fireworks => config.fireworks_api_key.as_ref()?,
@@ -159,14 +158,15 @@ impl ModelRegistry {
             return None;
         }
 
-        // Try to create the service using the factory
-        match (model_def.factory)(&api_key, config.gateway.as_deref()) {
-            Ok(service) => {
-                // Wrap with logging
-                Some(Arc::new(LoggingService::new(service)))
-            }
-            Err(_) => None,
-        }
+        // Create the unified service
+        let service = Arc::new(LlmServiceImpl::new(
+            spec.clone(),
+            api_key,
+            config.gateway.clone(),
+        ));
+
+        // Wrap with logging
+        Some(Arc::new(LoggingService::new(service)))
     }
 
     /// Get a model by ID
@@ -188,9 +188,9 @@ impl ModelRegistry {
     #[allow(clippy::unused_self)] // Instance method for API consistency
     pub fn context_window(&self, model_id: &str) -> usize {
         // Look up in the static model definitions
-        for model_def in super::all_models() {
-            if model_def.id == model_id {
-                return model_def.context_window;
+        for spec in super::all_models() {
+            if spec.id == model_id {
+                return spec.context_window;
             }
         }
         // Default to smallest known limit for unknown models
@@ -209,14 +209,14 @@ impl ModelRegistry {
         let mut model_infos = Vec::new();
 
         // Get info for each registered model
-        for model_def in super::all_models() {
-            if self.services.contains_key(model_def.id) {
+        for spec in super::all_models() {
+            if self.services.contains_key(&spec.id) {
                 model_infos.push(crate::api::ModelInfo {
-                    id: model_def.id.to_string(),
-                    provider: model_def.provider.display_name().to_string(),
-                    description: model_def.description.to_string(),
-                    context_window: model_def.context_window,
-                    recommended: model_def.recommended,
+                    id: spec.id.clone(),
+                    provider: spec.provider.display_name().to_string(),
+                    description: spec.description.clone(),
+                    context_window: spec.context_window,
+                    recommended: spec.recommended,
                 });
             }
         }
