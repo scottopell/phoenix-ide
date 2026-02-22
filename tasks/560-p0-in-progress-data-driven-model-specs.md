@@ -299,3 +299,33 @@ Commit `d6245ad` added `recommended: bool` field. The full refactor builds on th
 ## Estimated Effort
 
 2-3 hours focused work. The design is clear, implementation is mostly mechanical translation.
+
+## Progress Update (2026-02-22)
+
+### Completed Work
+
+All core refactoring is complete and committed (b75f3d0):
+
+- ✅ Created `ModelSpec` struct with provider + API format separation
+- ✅ Eliminated `OpenAIModel` and `AnthropicModel` enums
+- ✅ Eliminated `OpenAIService` and `AnthropicService` structs
+- ✅ Created unified `LlmServiceImpl` that dispatches by `ApiFormat`
+- ✅ Refactored `anthropic.rs` to stateless functions
+- ✅ Refactored `openai.rs` to stateless functions
+- ✅ Updated `registry.rs` to use new pattern
+- ✅ Added `LlmError::from_http_status()` helper
+- ✅ Code compiles cleanly with `cargo check`
+
+### Blockers
+
+- ⚠️ **Cargo build hangs**: Something causes `cargo build` and `cargo test` to timeout
+  - `cargo check` works fine
+  - Likely incremental compilation corruption or linking issue
+  - Needs investigation before runtime testing can proceed
+
+### Next Actions
+
+1. Debug cargo build hang (try: clean build, update deps, check for circular deps)
+2. Run full test suite
+3. Runtime test with phoenix-client.py
+4. Mark as done
