@@ -74,3 +74,68 @@ unused_comparisons = "deny"
 
 [profile.release]
 debug = true  # Include debug symbols for production debugging
+
+# Optimize heavy dependencies even in debug builds to reduce:
+# - Incremental build time
+# - Binary size (prevents debug build linker hangs)
+# - Memory pressure during linking
+# These crates are rarely debugged and benefit from release optimizations.
+
+[profile.dev.package.chromiumoxide]
+opt-level = 3
+
+[profile.dev.package.chromiumoxide_cdp]
+opt-level = 3
+
+[profile.dev.package.chromiumoxide_types]
+opt-level = 3
+
+[profile.dev.package.chromiumoxide_fetcher]
+opt-level = 3
+
+[profile.dev.package.chromiumoxide_pdl]
+opt-level = 3
+
+# Heavy async/web dependencies
+[profile.dev.package.tokio]
+opt-level = 3
+
+[profile.dev.package.reqwest]
+opt-level = 3
+
+[profile.dev.package.hyper]
+opt-level = 3
+
+
+# Compression/encoding (CPU intensive)
+[profile.dev.package.zstd]
+opt-level = 3
+
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
+[profile.dev.package.brotli]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+# Database (rarely debugged)
+[profile.dev.package.sqlx]
+opt-level = 3
+
+[profile.dev.package.sqlx-core]
+opt-level = 3
+
+[profile.dev.package.sqlx-sqlite]
+opt-level = 3
+
+# TLS/crypto (never debug these)
+[profile.dev.package.rustls]
+opt-level = 3
+
+[profile.dev.package.ring]
+opt-level = 3
+
+[profile.dev.package.rustls-webpki]
+opt-level = 3
