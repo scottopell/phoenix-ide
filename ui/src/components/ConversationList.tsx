@@ -1,17 +1,10 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { Conversation, ConversationState } from '../api';
+import type { Conversation } from '../api';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 
 import { useKeyboardNav } from '../hooks';
 
-function getConvDisplayState(state?: ConversationState): 'idle' | 'working' | 'error' {
-  if (!state || !state.type) return 'idle';
-  const t = state.type;
-  if (t === 'idle' || t === 'context_exhausted' || t === 'completed' || t === 'failed') return 'idle';
-  if (t === 'error') return 'error';
-  return 'working';
-}
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -111,7 +104,7 @@ export function ConversationList({
             >
               <div className="conv-item-main" onClick={() => handleClick(conv)}>
                 <div className="conv-item-slug">
-                  <span className={`conv-state-dot ${getConvDisplayState(conv.state)}`} />
+                  <span className={`conv-state-dot ${conv.display_state || 'idle'}`} />
                   {conv.slug}
                 </div>
                 <div className="conv-item-meta">

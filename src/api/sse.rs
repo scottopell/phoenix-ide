@@ -39,6 +39,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             conversation,
             messages,
             agent_working,
+            display_state,
             last_sequence_id,
             context_window_size,
             model_context_window,
@@ -52,6 +53,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                     "conversation": conversation,
                     "messages": messages,
                     "agent_working": agent_working,
+                    "display_state": display_state,
                     "last_sequence_id": last_sequence_id,
                     "context_window_size": context_window_size,
                     "model_context_window": model_context_window,
@@ -69,11 +71,15 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 }),
             )
         }
-        SseEvent::StateChange { state } => (
+        SseEvent::StateChange {
+            state,
+            display_state,
+        } => (
             "state_change",
             json!({
                 "type": "state_change",
-                "state": state
+                "state": state,
+                "display_state": display_state
             }),
         ),
         SseEvent::AgentDone => (

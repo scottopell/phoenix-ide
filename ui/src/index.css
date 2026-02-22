@@ -423,6 +423,10 @@ body {
   background: var(--accent-red, #ef4444);
 }
 
+.conv-state-dot.terminal {
+  background: var(--text-muted, #6b7280);
+}
+
 @keyframes state-dot-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }

@@ -511,7 +511,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::StateChange { state })) => {
+                Ok(Ok(SseEvent::StateChange { state, .. })) => {
                     if let Some(state_type) = state.get("type").and_then(|v| v.as_str()) {
                         if state_type == expected_type {
                             return true;
@@ -769,7 +769,7 @@ mod tests {
                     done = true;
                     break;
                 }
-                Ok(Ok(SseEvent::StateChange { state })) => {
+                Ok(Ok(SseEvent::StateChange { state, .. })) => {
                     if state.get("type").and_then(|v| v.as_str()) == Some("idle") {
                         done = true;
                         break;

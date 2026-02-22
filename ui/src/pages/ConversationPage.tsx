@@ -134,7 +134,7 @@ export function ConversationPage() {
           const { type: _initType, ...initStateData } = initState;
           void _initType; // Destructured to extract remaining state data
           setStateData(Object.keys(initStateData).length > 0 ? initStateData as ConversationState : null);
-          setAgentWorking(initData.agent_working || false);
+          setAgentWorking(initData.display_state === 'working');
           
           // Initialize context exhausted summary if loading an exhausted conversation
           if (initState.type === 'context_exhausted' && 'summary' in initState) {
@@ -157,7 +157,7 @@ export function ConversationPage() {
             })));
           }
           // Also update from state if agent is still working
-          if (initData.agent_working) {
+          if (initData.display_state === 'working') {
             updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
           }
           
@@ -207,7 +207,7 @@ export function ConversationPage() {
           void _stateType; // Used newState above instead
           setConvState(newState);
           setStateData(Object.keys(rest).length > 0 ? rest as ConversationState : null);
-          setAgentWorking(!['idle', 'error', 'completed', 'failed', 'context_exhausted'].includes(newState));
+          setAgentWorking(stateChangeData.display_state === 'working');
           updateBreadcrumbsFromState(newState, rest as ConversationState);
           
           // Handle context exhaustion (REQ-BED-021)
@@ -287,7 +287,7 @@ export function ConversationPage() {
             if (!cancelled) {
               setConversation(result.conversation);
               setMessages(result.messages);
-              setAgentWorking(result.agent_working);
+              setAgentWorking(result.display_state === 'working');
               setContextWindowUsed(result.context_window_size || 0);
               setConversationId(result.conversation.id);
               

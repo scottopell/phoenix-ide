@@ -126,6 +126,18 @@ fn enrich_message_for_api(msg: &Message) -> Value {
 /// Merge pre-computed `display_data` into content blocks.
 ///
 /// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
+/// Serialize a conversation to JSON with `display_state` included.
+fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
+    let mut v = serde_json::to_value(conv).unwrap_or(Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "display_state".to_string(),
+            Value::String(conv.state.display_state().as_str().to_string()),
+        );
+    }
+    v
+}
+
 fn merge_display_data_into_content(json: &mut Value, display_data: &Value) {
     // Build a map from tool_use_id -> display
     let bash_displays: std::collections::HashMap<String, String> = display_data
@@ -197,10 +209,7 @@ async fn list_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations
-        .into_iter()
-        .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-        .collect();
+    let json_convs: Vec<Value> = conversations.iter().map(conversation_to_json).collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
@@ -217,10 +226,7 @@ async fn list_archived_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations
-        .into_iter()
-        .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-        .collect();
+    let json_convs: Vec<Value> = conversations.iter().map(conversation_to_json).collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
@@ -390,9 +396,10 @@ async fn get_conversation(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: serde_json::to_value(&conversation).unwrap_or(Value::Null),
+        conversation: conversation_to_json(&conversation),
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
+        display_state: conversation.state.display_state().as_str().to_string(),
         context_window_size,
     }))
 }
@@ -705,9 +712,10 @@ async fn stream_conversation(
     // Note: messages are enriched with display info above via enrich_message_for_api
     // which handles backwards compatibility for older messages without display field
     let init_event = SseEvent::Init {
-        conversation: serde_json::to_value(&conversation).unwrap_or(Value::Null),
+        conversation: conversation_to_json(&conversation),
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
+        display_state: conversation.state.display_state().as_str().to_string(),
         last_sequence_id,
         context_window_size,
         model_context_window,
@@ -901,9 +909,10 @@ async fn get_by_slug(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: serde_json::to_value(&conversation).unwrap_or(Value::Null),
+        conversation: conversation_to_json(&conversation),
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
+        display_state: conversation.state.display_state().as_str().to_string(),
         context_window_size,
     }))
 }

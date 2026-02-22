@@ -349,9 +349,10 @@ where
 
                 // Broadcast state change with full state data
                 let state_json = serde_json::to_value(&self.state).unwrap_or(Value::Null);
-                let _ = self
-                    .broadcast_tx
-                    .send(SseEvent::StateChange { state: state_json });
+                let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                    state: state_json,
+                    display_state: self.state.display_state().as_str().to_string(),
+                });
                 Ok(None)
             }
 
@@ -541,6 +542,7 @@ where
                         if let Some(state) = data.get("state") {
                             let _ = self.broadcast_tx.send(SseEvent::StateChange {
                                 state: state.clone(),
+                                display_state: self.state.display_state().as_str().to_string(),
                             });
                         }
                     }
@@ -722,6 +724,7 @@ where
                         "type": "context_exhausted",
                         "summary": summary
                     }),
+                    display_state: self.state.display_state().as_str().to_string(),
                 });
                 Ok(None)
             }

@@ -116,8 +116,7 @@ export function Sidebar({
         </button>
         <div className="sidebar-collapsed-dots">
           {conversations.slice(0, 15).map(conv => {
-            const stateType = conv.state?.type || 'idle';
-            const displayState = ['idle', 'context_exhausted', 'completed', 'failed'].includes(stateType) ? 'idle' : stateType === 'error' ? 'error' : 'working';
+            const displayState = conv.display_state || 'idle';
             const isActive = conv.slug === activeSlug;
             return (
               <button

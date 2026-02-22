@@ -79,6 +79,8 @@ pub enum SseEvent {
         conversation: serde_json::Value,
         messages: Vec<serde_json::Value>,
         agent_working: bool,
+        /// Semantic state category for UI display (idle/working/error/terminal)
+        display_state: String,
         last_sequence_id: i64,
         /// Current context window usage in tokens
         context_window_size: u64,
@@ -92,6 +94,8 @@ pub enum SseEvent {
     StateChange {
         /// Full state as JSON object (e.g., `{"type":"awaiting_sub_agents","pending_ids":[...]}`)
         state: serde_json::Value,
+        /// Semantic state category for UI display (idle/working/error/terminal)
+        display_state: String,
     },
     AgentDone,
     Error {

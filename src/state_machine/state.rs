@@ -317,16 +317,51 @@ pub enum ConvState {
     },
 }
 
+/// Semantic state category for UI display.
+///
+/// Single source of truth for how conversation states map to visual indicators.
+/// The API serializes this so the UI never re-derives state categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayState {
+    /// Ready for user input (green dot, static)
+    Idle,
+    /// Agent is processing (yellow dot, pulsing)
+    Working,
+    /// Retryable error occurred (red dot)
+    Error,
+    /// Conversation cannot continue — context exhausted, completed, or failed (gray dot, static)
+    Terminal,
+}
+
+impl DisplayState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisplayState::Idle => "idle",
+            DisplayState::Working => "working",
+            DisplayState::Error => "error",
+            DisplayState::Terminal => "terminal",
+        }
+    }
+}
+
 impl ConvState {
     /// Check if this is a terminal state (sub-agent only - cannot transition out)
     pub fn is_terminal(&self) -> bool {
         matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
     }
 
-    /// Check if agent is currently working
-    #[allow(dead_code, clippy::unused_self)] // State query utility
-    pub fn is_working(&self) -> bool {
-        !matches!(self, ConvState::Idle | ConvState::Error { .. })
+    /// Semantic category for UI display. This is the single source of truth
+    /// for mapping raw conversation states to visual indicators.
+    pub fn display_state(&self) -> DisplayState {
+        match self {
+            ConvState::Idle => DisplayState::Idle,
+            ConvState::Error { .. } => DisplayState::Error,
+            ConvState::ContextExhausted { .. }
+            | ConvState::Completed { .. }
+            | ConvState::Failed { .. } => DisplayState::Terminal,
+            _ => DisplayState::Working,
+        }
     }
 }
 

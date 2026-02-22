@@ -98,16 +98,9 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// Check if the agent is currently working
+    /// Check if the agent is currently working (derived from `display_state`)
     pub fn is_agent_working(&self) -> bool {
-        !matches!(
-            self.state,
-            ConvState::Idle
-                | ConvState::Error { .. }
-                | ConvState::ContextExhausted { .. }
-                | ConvState::Completed { .. }
-                | ConvState::Failed { .. }
-        )
+        self.state.display_state() == crate::state_machine::state::DisplayState::Working
     }
 }
 

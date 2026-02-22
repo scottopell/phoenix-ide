@@ -43,8 +43,5 @@ function toItem(conv: Conversation): PaletteItem {
 // Re-export helper for rendering state in the component
 export function getConversationState(item: PaletteItem): string {
   const conv = item.metadata as Conversation | undefined;
-  if (!conv?.state) return 'idle';
-  const t = conv.state.type;
-  if (['idle', 'context_exhausted', 'completed', 'failed'].includes(t)) return 'idle';
-  return t === 'error' ? 'error' : 'working';
+  return conv?.display_state || 'idle';
 }

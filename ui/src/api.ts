@@ -9,6 +9,8 @@ export interface Conversation {
   updated_at: string;
   message_count: number;
   state?: ConversationState;
+  /** Semantic state category from API: idle, working, error, terminal */
+  display_state?: 'idle' | 'working' | 'error' | 'terminal';
   archived?: boolean;
 }
 
@@ -105,6 +107,8 @@ export interface SseInitData {
   conversation: Conversation;
   messages: Message[];
   agent_working: boolean;
+  /** Semantic state category from API: idle, working, error, terminal */
+  display_state?: string;
   last_sequence_id: number;
   /** Current context window usage in tokens */
   context_window_size?: number;
@@ -119,6 +123,8 @@ export interface SseMessageData {
 
 export interface SseStateChangeData {
   state: ConversationState;
+  /** Semantic state category from API: idle, working, error, terminal */
+  display_state?: string;
 }
 
 export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'disconnected';
@@ -163,7 +169,7 @@ export const api = {
     return (await resp.json()).conversation;
   },
 
-  async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; context_window_size: number }> {
+  async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; display_state: string; context_window_size: number }> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
