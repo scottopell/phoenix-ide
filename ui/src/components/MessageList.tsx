@@ -35,6 +35,7 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
   const prevMessagesLength = useRef(messages.length);
   const scrollRestored = useRef(false);
   const initialMessageCount = useRef<number | null>(null);
+  const lastScrollTop = useRef(0);
 
   // Check if user is near bottom of scroll
   const checkIfPinnedToBottom = useCallback(() => {
@@ -47,6 +48,8 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
   // Handle scroll events to track if user is pinned to bottom
   const handleScroll = useCallback(() => {
     isPinnedToBottom.current = checkIfPinnedToBottom();
+    const el = mainRef.current;
+    if (el) lastScrollTop.current = el.scrollTop;
     if (showJumpToNewest && isPinnedToBottom.current) {
       setShowJumpToNewest(false);
     }
@@ -95,10 +98,9 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
   useEffect(() => {
     if (!conversationId) return;
     const saveScroll = () => {
-      const el = mainRef.current;
-      if (!el) return;
       try {
-        localStorage.setItem(`${SCROLL_KEY_PREFIX}${conversationId}`, String(el.scrollTop));
+        // Use ref for scroll position — DOM element may be detached on unmount
+        localStorage.setItem(`${SCROLL_KEY_PREFIX}${conversationId}`, String(lastScrollTop.current));
         localStorage.setItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`, String(messages.length));
       } catch { /* storage full - degrade gracefully */ }
     };
@@ -125,6 +127,7 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
         const el = mainRef.current;
         if (!el) return;
         el.scrollTop = pos;
+        lastScrollTop.current = pos;
         isPinnedToBottom.current = checkIfPinnedToBottom();
         // Show "jump to newest" if new messages arrived while away
         if (messages.length > prevCount && !isPinnedToBottom.current) {

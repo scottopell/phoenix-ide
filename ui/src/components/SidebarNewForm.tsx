@@ -63,7 +63,7 @@ export function SidebarNewForm({ onClose, onCreated, showToast }: SidebarNewForm
   // Escape to close
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape') { e.stopPropagation(); onClose(); }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); onClose(); }
     };
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
