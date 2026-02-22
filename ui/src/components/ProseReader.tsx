@@ -49,6 +49,8 @@ export interface ProseReaderProps {
   onClose: () => void;
   onSendNotes: (notes: string) => void;
   patchContext?: PatchContext | undefined;
+  /** Render inline (no overlay) for desktop panel mode */
+  inline?: boolean;
 }
 
 // API function
@@ -224,6 +226,7 @@ export function ProseReader({
   onClose,
   onSendNotes,
   patchContext,
+  inline,
 }: ProseReaderProps) {
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -501,7 +504,7 @@ export function ProseReader({
   const fileName = filePath.split('/').pop() || filePath;
 
   return (
-    <div className="prose-reader-overlay">
+    <div className={inline ? 'prose-reader-inline' : 'prose-reader-overlay'}>
       {/* Header */}
       <div className="prose-reader-header">
         <button

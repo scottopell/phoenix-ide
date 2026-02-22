@@ -6,7 +6,7 @@ import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
-import { FileBrowser } from '../components/FileBrowser';
+import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { ProseReader } from '../components/ProseReader';
 import { useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -34,9 +34,13 @@ export function ConversationPage() {
   const [systemPrompt, setSystemPrompt] = useState<string | undefined>(undefined);
 
   
-  // File browser and prose reader state
+  // File explorer context (shared with desktop panel)
+  const fileExplorer = useFileExplorer();
+  const [isDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
+
+  // Mobile-only local state for file browser and prose reader overlays
   const [showFileBrowser, setShowFileBrowser] = useState(false);
-  const [proseReaderFile, setProseReaderFile] = useState<{
+  const [mobileProseFile, setMobileProseFile] = useState<{
     path: string;
     rootDir: string;
     patchContext?: {
@@ -425,27 +429,43 @@ export function ConversationPage() {
 
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     setShowFileBrowser(false);
-    setProseReaderFile({ path: filePath, rootDir });
-  }, []);
+    if (isDesktop) {
+      fileExplorer.openFile(filePath, rootDir);
+    } else {
+      setMobileProseFile({ path: filePath, rootDir });
+    }
+  }, [isDesktop, fileExplorer]);
 
   const handleCloseProseReader = useCallback(() => {
-    setProseReaderFile(null);
-  }, []);
+    if (isDesktop) {
+      fileExplorer.closeFile();
+    } else {
+      setMobileProseFile(null);
+    }
+  }, [isDesktop, fileExplorer]);
 
   const handleSendNotes = useCallback((formattedNotes: string) => {
     inputRef.current?.appendToDraft(formattedNotes);
-    setProseReaderFile(null);
-  }, []);
+    if (isDesktop) {
+      fileExplorer.closeFile();
+    } else {
+      setMobileProseFile(null);
+    }
+  }, [isDesktop, fileExplorer]);
 
   const handleOpenFileFromPatch = useCallback((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
     const rootDir = conversation?.cwd || '/';
     const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
-    setProseReaderFile({
-      path: fullPath,
-      rootDir,
-      patchContext: { modifiedLines, firstModifiedLine },
-    });
-  }, [conversation?.cwd]);
+    if (isDesktop) {
+      fileExplorer.openFile(fullPath, rootDir, { modifiedLines, firstModifiedLine });
+    } else {
+      setMobileProseFile({
+        path: fullPath,
+        rootDir,
+        patchContext: { modifiedLines, firstModifiedLine },
+      });
+    }
+  }, [conversation?.cwd, isDesktop, fileExplorer]);
 
   if (error) {
     return (
@@ -479,6 +499,23 @@ export function ConversationPage() {
 
   const canSend = !agentWorking;
   const isCancelling = convState.startsWith('cancelling');
+
+  // Desktop: prose reader replaces conversation content
+  if (isDesktop && fileExplorer.proseReaderState) {
+    const prs = fileExplorer.proseReaderState;
+    return (
+      <div id="app">
+        <ProseReader
+          filePath={prs.path}
+          rootDir={prs.rootDir}
+          onClose={handleCloseProseReader}
+          onSendNotes={handleSendNotes}
+          patchContext={prs.patchContext ?? undefined}
+          inline
+        />
+      </div>
+    );
+  }
 
   return (
     <div id="app">
@@ -552,7 +589,8 @@ export function ConversationPage() {
         onTriggerContinuation={handleTriggerContinuation}
       />
 
-      <FileBrowser
+      {/* Mobile file browser overlay */}
+      <FileBrowserOverlay
         isOpen={showFileBrowser}
         rootPath={conversation.cwd}
         conversationId={conversation.id}
@@ -560,13 +598,14 @@ export function ConversationPage() {
         onFileSelect={handleFileSelect}
       />
 
-      {proseReaderFile && (
+      {/* Mobile prose reader overlay */}
+      {!isDesktop && mobileProseFile && (
         <ProseReader
-          filePath={proseReaderFile.path}
-          rootDir={proseReaderFile.rootDir}
+          filePath={mobileProseFile.path}
+          rootDir={mobileProseFile.rootDir}
           onClose={handleCloseProseReader}
           onSendNotes={handleSendNotes}
-          patchContext={proseReaderFile.patchContext ?? undefined}
+          patchContext={mobileProseFile.patchContext ?? undefined}
         />
       )}
     </div>

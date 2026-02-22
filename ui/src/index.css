@@ -5123,3 +5123,218 @@ html * {
   border-radius: 4px;
   font-family: 'SF Mono', 'Fira Code', monospace;
 }
+
+/* =================================================================
+   File Explorer Panel (REQ-FE-001 through REQ-FE-010)
+   ================================================================= */
+
+/* Panel - expanded */
+.fe-panel--expanded {
+  width: 250px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  transition: width 0.2s ease;
+  overflow: hidden;
+}
+
+/* Panel - collapsed */
+.fe-panel--collapsed {
+  width: 48px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--bg-primary);
+  transition: width 0.2s ease;
+  padding-top: 8px;
+  gap: 4px;
+}
+
+/* Header */
+.fe-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.fe-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+}
+
+.fe-toggle {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  font-size: 12px;
+  line-height: 1;
+  border-radius: 4px;
+}
+
+.fe-toggle:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.fe-panel--collapsed .fe-toggle {
+  margin-top: auto;
+  margin-bottom: 12px;
+}
+
+/* Tree scroll container */
+.fe-tree-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* FileTree styles */
+.ft-root {
+  padding: 4px 0;
+}
+
+.ft-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary);
+  border-radius: 0;
+  min-height: 28px;
+  line-height: 1.3;
+  transition: background 60ms;
+}
+
+.ft-item:hover:not(.ft-item--disabled) {
+  background: var(--bg-tertiary);
+}
+
+.ft-item--disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ft-item--active {
+  background: color-mix(in srgb, var(--accent-blue) 15%, transparent);
+}
+
+.ft-item--active:hover {
+  background: color-mix(in srgb, var(--accent-blue) 20%, transparent);
+}
+
+.ft-expand-icon {
+  display: flex;
+  align-items: center;
+  width: 16px;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.ft-indent-spacer {
+  width: 16px;
+  flex-shrink: 0;
+}
+
+.ft-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ft-children {
+  /* nested items */
+}
+
+.ft-loading,
+.ft-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ft-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 16px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.ft-status--error {
+  color: var(--accent-red);
+}
+
+/* Recent files strip (collapsed panel) */
+.fe-recent-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 0;
+}
+
+.fe-recent-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 60ms;
+}
+
+.fe-recent-icon:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Prose reader inline mode (desktop, replaces conversation content) */
+.prose-reader-inline {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-primary);
+}
+
+.prose-reader-inline .prose-reader-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.prose-reader-inline .prose-reader-content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+/* Narrower file explorer at tight viewports */
+@media (max-width: 1280px) {
+  .fe-panel--expanded {
+    width: 200px;
+  }
+}

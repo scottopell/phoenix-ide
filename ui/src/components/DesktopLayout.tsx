@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useLocation } from 'react-router-dom';
 import { api } from '../api';
 import type { Conversation } from '../api';
 import { cacheDB } from '../cache';
 import { useLocalStorage } from '../hooks';
 import { Sidebar } from './Sidebar';
+import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { useToast } from '../hooks/useToast';
@@ -15,7 +16,8 @@ interface DesktopLayoutProps {
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
   const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
-  const [collapsed, setCollapsed] = useLocalStorage('sidebar-collapsed', false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useLocalStorage('sidebar-collapsed', false);
+  const [fileExplorerCollapsed, setFileExplorerCollapsed] = useLocalStorage('file-explorer-collapsed', false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const location = useLocation();
@@ -35,13 +37,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     if (loadingRef.current && silent) return;
     loadingRef.current = true;
     try {
-      // Cache first
       const cached = await cacheDB.getAllConversations();
       if (cached.length > 0) {
         setConversations(cached.filter(c => !c.archived));
         setArchivedConversations(cached.filter(c => c.archived));
       }
-      // Then fresh from network
       if (navigator.onLine) {
         const [freshActive, freshArchived] = await Promise.all([
           api.listConversations(),
@@ -60,7 +60,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     }
   }, []);
 
-  // Initial load + periodic refresh for state indicators
+  // Initial load + periodic refresh
   useEffect(() => {
     if (!isDesktop) return;
     loadConversations();
@@ -72,35 +72,49 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => clearInterval(interval);
   }, [isDesktop, loadConversations]);
 
-  // Refresh after navigating (e.g. new conversation created)
+  // Refresh after navigating
   useEffect(() => {
     if (isDesktop) loadConversations(true);
   }, [location.pathname, isDesktop, loadConversations]);
 
-  if (!isDesktop) {
-    return <>{children}</>;
-  }
-
-  // Extract active slug from URL
+  // Extract active slug and find active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;
+  const activeConversation = useMemo(
+    () => conversations.find(c => c.slug === activeSlug) ?? null,
+    [conversations, activeSlug],
+  );
+
+  if (!isDesktop) {
+    return <FileExplorerProvider>{children}</FileExplorerProvider>;
+  }
 
   return (
-    <div className="desktop-layout">
-      <Sidebar
-        collapsed={collapsed}
-        onToggle={() => setCollapsed(!collapsed)}
-        conversations={conversations}
-        archivedConversations={archivedConversations}
-        activeSlug={activeSlug}
-        onConversationCreated={() => loadConversations(true)}
-        showToast={showSuccess}
-      />
-      <div className="desktop-main">
-        {children}
+    <FileExplorerProvider>
+      <div className="desktop-layout">
+        <Sidebar
+          collapsed={sidebarCollapsed}
+          onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+          conversations={conversations}
+          archivedConversations={archivedConversations}
+          activeSlug={activeSlug}
+          onConversationCreated={() => loadConversations(true)}
+          showToast={showSuccess}
+        />
+        {activeSlug && (
+          <FileExplorerPanel
+            collapsed={fileExplorerCollapsed}
+            onToggle={() => setFileExplorerCollapsed(!fileExplorerCollapsed)}
+            rootPath={activeConversation?.cwd || '/'}
+            conversationId={activeConversation?.id}
+          />
+        )}
+        <div className="desktop-main">
+          {children}
+        </div>
+        <CommandPalette conversations={conversations} />
+        <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
-      <CommandPalette conversations={conversations} />
-      <Toast messages={toasts} onDismiss={dismissToast} />
-    </div>
+    </FileExplorerProvider>
   );
 }
