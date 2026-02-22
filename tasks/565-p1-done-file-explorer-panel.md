@@ -1,7 +1,7 @@
 ---
 id: 565
 priority: p1
-status: in-progress
+status: done
 title: File Explorer Panel Implementation
 created: 2025-02-22
 requirements:
@@ -60,14 +60,14 @@ Key concepts:
 
 ### Phase 1: Extract FileTree Component
 
-- [ ] Create `ui/src/components/FileExplorer/FileTree.tsx`
-- [ ] Extract tree rendering logic from existing `FileBrowser.tsx`:
+- [x] Create `ui/src/components/FileExplorer/FileTree.tsx`
+- [x] Extract tree rendering logic from existing `FileBrowser.tsx`:
   - Directory listing via `/api/files/list`
   - Expand/collapse directories
   - File type icons (reuse `FileIcon` component)
   - Sorting (directories first, alphabetical)
   - Click handling for files and directories
-- [ ] FileTree props interface:
+- [x] FileTree props interface:
   ```typescript
   interface FileTreeProps {
     rootPath: string;
@@ -76,44 +76,44 @@ Key concepts:
     conversationId: string;  // For expansion state persistence
   }
   ```
-- [ ] Implement per-conversation expansion state persistence (localStorage)
-- [ ] Expansion state survives conversation switching (REQ-FE-002)
+- [x] Implement per-conversation expansion state persistence (localStorage)
+- [x] Expansion state survives conversation switching (REQ-FE-002)
 
 ### Phase 2: Create Desktop Panel
 
-- [ ] Create `ui/src/components/FileExplorer/FileExplorerPanel.tsx`
-- [ ] Panel contains:
+- [x] Create `ui/src/components/FileExplorer/FileExplorerPanel.tsx`
+- [x] Panel contains:
   - Header with "Files" title and collapse toggle
   - FileTree component
   - Collapse toggle button at bottom
-- [ ] Implement collapsed state (REQ-FE-005):
+- [x] Implement collapsed state (REQ-FE-005):
   - Narrow strip (~48px)
   - Shows RecentFilesStrip
   - Expand toggle button
-- [ ] Persist collapse state to localStorage (REQ-FE-004)
+- [x] Persist collapse state to localStorage (REQ-FE-004)
 
 ### Phase 3: Recent Files Strip
 
-- [ ] Create `ui/src/components/FileExplorer/RecentFilesStrip.tsx`
-- [ ] Create `ui/src/hooks/useRecentFiles.ts`
-- [ ] Track last 5 opened files per conversation (REQ-FE-006)
-- [ ] Store in localStorage: `phoenix:recent-files:{conversationId}`
-- [ ] Display as vertical stack of file type icons
-- [ ] Click icon opens file in prose reader (without expanding panel)
+- [x] Create `ui/src/components/FileExplorer/RecentFilesStrip.tsx`
+- [x] Create `ui/src/hooks/useRecentFiles.ts`
+- [x] Track last 5 opened files per conversation (REQ-FE-006)
+- [x] Store in localStorage: `phoenix:recent-files:{conversationId}`
+- [x] Display as vertical stack of file type icons
+- [x] Click icon opens file in prose reader (without expanding panel)
 
 ### Phase 4: Update Desktop Layout
 
-- [ ] Modify `ui/src/components/DesktopLayout.tsx`
-- [ ] Add FileExplorerPanel as middle column (REQ-FE-001)
-- [ ] Layout: `[Sidebar ~280px] [FileExplorer ~250px] [Main flex:1]`
-- [ ] Both sidebar and file explorer independently collapsible (REQ-FE-007)
-- [ ] Enforce minimum main content width (~400px)
-- [ ] CSS transitions for collapse/expand
+- [x] Modify `ui/src/components/DesktopLayout.tsx`
+- [x] Add FileExplorerPanel as middle column (REQ-FE-001)
+- [x] Layout: `[Sidebar ~280px] [FileExplorer ~250px] [Main flex:1]`
+- [x] Both sidebar and file explorer independently collapsible (REQ-FE-007)
+- [x] Enforce minimum main content width (~400px)
+- [x] CSS transitions for collapse/expand
 
 ### Phase 5: FileExplorer Context
 
-- [ ] Create `ui/src/components/FileExplorer/FileExplorerContext.tsx`
-- [ ] Context provides:
+- [x] Create `ui/src/components/FileExplorer/FileExplorerContext.tsx`
+- [x] Context provides:
   ```typescript
   interface FileExplorerContextValue {
     openFile: (path: string) => void;
@@ -121,46 +121,46 @@ Key concepts:
     closeFile: () => void;
   }
   ```
-- [ ] Provider wraps DesktopLayout
-- [ ] FileExplorerPanel and main content area consume context
+- [x] Provider wraps DesktopLayout
+- [x] FileExplorerPanel and main content area consume context
 
 ### Phase 6: Prose Reader Integration
 
-- [ ] Modify `ui/src/pages/ConversationPage.tsx`
-- [ ] Lift prose reader state to context or page level
-- [ ] When file is opened:
+- [x] Modify `ui/src/pages/ConversationPage.tsx`
+- [x] Lift prose reader state to context or page level
+- [x] When file is opened:
   - Desktop: Render ProseReader in main content area (replacing conversation)
   - Sidebar and FileExplorer remain visible
-- [ ] When prose reader closes:
+- [x] When prose reader closes:
   - Return to conversation view
-- [ ] Highlight active file in FileTree (REQ-FE-009)
-- [ ] Sending notes closes prose reader and returns to conversation (REQ-FE-008)
+- [x] Highlight active file in FileTree (REQ-FE-009)
+- [x] Sending notes closes prose reader and returns to conversation (REQ-FE-008)
 
 ### Phase 7: Mobile Overlay
 
-- [ ] Create `ui/src/components/FileExplorer/FileBrowserOverlay.tsx`
-- [ ] Modal overlay that hosts FileTree (REQ-FE-010)
-- [ ] Header with path display and close button
-- [ ] Dismiss via close button or backdrop tap
-- [ ] On file select: open ProseReader overlay, close FileBrowserOverlay
-- [ ] Update file browse trigger in InputArea to use new overlay
+- [x] Create `ui/src/components/FileExplorer/FileBrowserOverlay.tsx`
+- [x] Modal overlay that hosts FileTree (REQ-FE-010)
+- [x] Header with path display and close button
+- [x] Dismiss via close button or backdrop tap
+- [x] On file select: open ProseReader overlay, close FileBrowserOverlay
+- [x] Update file browse trigger in InputArea to use new overlay
 
 ### Phase 8: Cleanup
 
-- [ ] Delete `ui/src/components/FileBrowser.tsx`
-- [ ] Update any imports that referenced FileBrowser
-- [ ] Verify mobile file browsing still works
-- [ ] Verify patch file links still open prose reader correctly
+- [x] Delete `ui/src/components/FileBrowser.tsx`
+- [x] Update any imports that referenced FileBrowser
+- [x] Verify mobile file browsing still works
+- [x] Verify patch file links still open prose reader correctly
 
 ### Phase 9: Styling
 
-- [ ] Create `ui/src/components/FileExplorer/FileExplorer.css`
-- [ ] Style expanded panel (~250px width)
-- [ ] Style collapsed panel (~48px width)
-- [ ] Style RecentFilesStrip (icon stack)
-- [ ] Active file highlight in tree
-- [ ] Loading indicators for directory expansion
-- [ ] Smooth collapse/expand transitions
+- [x] Create `ui/src/components/FileExplorer/FileExplorer.css`
+- [x] Style expanded panel (~250px width)
+- [x] Style collapsed panel (~48px width)
+- [x] Style RecentFilesStrip (icon stack)
+- [x] Active file highlight in tree
+- [x] Loading indicators for directory expansion
+- [x] Smooth collapse/expand transitions
 
 ## Files to Create
 
@@ -298,20 +298,20 @@ ui/src/hooks/
 
 Before marking this task done, verify ALL of the following:
 
-- [ ] All implementation checklist items complete
-- [ ] All 10 requirements tested per "Testing the Implementation" section
-- [ ] FileBrowser.tsx deleted, no remaining imports
-- [ ] No TypeScript errors
-- [ ] No console errors during normal operation
-- [ ] Desktop three-column layout works at 1024px+
-- [ ] Mobile file browsing works (overlay)
-- [ ] Expansion state persists per conversation
-- [ ] Recent files persist per conversation
-- [ ] Panel collapse state persists globally
-- [ ] Prose reader opens in main content on desktop
-- [ ] Prose reader opens as overlay on mobile
-- [ ] Patch file links still work (open prose reader with highlights)
-- [ ] Update `specs/file-explorer/executive.md` status for each REQ-FE-*
+- [x] All implementation checklist items complete
+- [x] All 10 requirements tested per "Testing the Implementation" section
+- [x] FileBrowser.tsx deleted, no remaining imports
+- [x] No TypeScript errors
+- [x] No console errors during normal operation
+- [x] Desktop three-column layout works at 1024px+
+- [x] Mobile file browsing works (overlay)
+- [x] Expansion state persists per conversation
+- [x] Recent files persist per conversation
+- [x] Panel collapse state persists globally
+- [x] Prose reader opens in main content on desktop
+- [x] Prose reader opens as overlay on mobile
+- [x] Patch file links still work (open prose reader with highlights)
+- [x] Update `specs/file-explorer/executive.md` status for each REQ-FE-*
 
 ## Out of Scope
 

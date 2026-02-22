@@ -12,15 +12,15 @@ Extends DesktopLayout to three columns with CSS flexbox. FileExplorerPanel compo
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-FE-001:** Three-Column Desktop Layout | ❌ Not Started | Extend DesktopLayout |
-| **REQ-FE-002:** File Tree Display | ❌ Not Started | Refactor from FileBrowser |
-| **REQ-FE-003:** File Selection | ❌ Not Started | Click to open in prose reader |
-| **REQ-FE-004:** Panel Collapse - Expanded State | ❌ Not Started | Full tree with toggle |
-| **REQ-FE-005:** Panel Collapse - Collapsed State | ❌ Not Started | Recent files strip |
-| **REQ-FE-006:** Recent Files Tracking | ❌ Not Started | Per-conversation, localStorage |
-| **REQ-FE-007:** Accordion Panel Behavior | ❌ Not Started | Independent collapse |
-| **REQ-FE-008:** Prose Reader Integration | ❌ Not Started | Render in main content |
-| **REQ-FE-009:** Visual Feedback | ❌ Not Started | Active file highlight |
-| **REQ-FE-010:** Mobile File Browser Overlay | ❌ Not Started | Modal overlay hosting FileTree |
+| **REQ-FE-001:** Three-Column Desktop Layout | ✅ Complete | Sidebar + FileExplorer + Main |
+| **REQ-FE-002:** File Tree Display | ✅ Complete | Per-conversation expansion via atomic state |
+| **REQ-FE-003:** File Selection | ✅ Complete | Opens ProseReader inline on desktop |
+| **REQ-FE-004:** Panel Collapse - Expanded State | ✅ Complete | Toggle + localStorage persistence |
+| **REQ-FE-005:** Panel Collapse - Collapsed State | ✅ Complete | Recent file icon strip |
+| **REQ-FE-006:** Recent Files Tracking | ✅ Complete | Per-conversation, max 5, localStorage |
+| **REQ-FE-007:** Accordion Panel Behavior | ✅ Complete | Independent collapse states |
+| **REQ-FE-008:** Prose Reader Integration | ✅ Complete | Inline on desktop, overlay on mobile |
+| **REQ-FE-009:** Visual Feedback | ✅ Complete | Active file highlight + loading spinners |
+| **REQ-FE-010:** Mobile File Browser Overlay | ✅ Complete | FileBrowserOverlay hosts FileTree |
 
-**Progress:** 0 of 10 complete
+**Progress:** 10 of 10 complete
