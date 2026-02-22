@@ -211,11 +211,11 @@ async fn test_eval_inner_text_not_undefined() {
     require_chrome!();
 
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
         <html>
         <head><title>InnerText Test</title></head>
         <body><p>Hello from innerText</p></body>
-        </html>"#,
+        </html>",
     )
     .await;
 
@@ -450,10 +450,10 @@ async fn test_eval_await_false_returns_value() {
     require_chrome!();
 
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
         <html><head><title>Await Test</title></head>
         <body><p>Content</p></body>
-        </html>"#,
+        </html>",
     )
     .await;
 
@@ -487,12 +487,12 @@ async fn test_eval_promise_chain_awaited() {
     require_chrome!();
 
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
         <html><head><title>Promise Test</title></head>
         <body><script>
             window.getData = () => new Promise(resolve => setTimeout(() => resolve({status: 'ok', count: 42}), 100));
         </script></body>
-        </html>"#,
+        </html>",
     )
     .await;
 
@@ -531,11 +531,11 @@ async fn test_browser_console_logs_local() {
     require_chrome!();
 
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
         <html>
         <head><title>Console Test</title></head>
         <body></body>
-        </html>"#,
+        </html>",
     )
     .await;
 
@@ -668,11 +668,11 @@ async fn test_browser_resize_local() {
     require_chrome!();
 
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
         <html>
         <head><title>Resize Test</title></head>
         <body></body>
-        </html>"#,
+        </html>",
     )
     .await;
 
@@ -713,11 +713,11 @@ async fn test_browser_session_persistence() {
     require_chrome!();
 
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
+        r"<!DOCTYPE html>
         <html>
         <head><title>Persistence Test</title></head>
         <body><script>window.testCounter = 0;</script></body>
-        </html>"#,
+        </html>",
     )
     .await;
 

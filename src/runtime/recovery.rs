@@ -457,9 +457,9 @@ mod proptests {
             // Only tool_use
             (1..=3usize).prop_flat_map(|n| {
                 proptest::collection::vec(
-                    ("[a-z]{3,8}".prop_map(|s| s.to_string())).prop_map(|name| {
+                    ("[a-z]{3,8}".prop_map(|s| s.clone())).prop_map(|name| {
                         ContentBlock::ToolUse {
-                            id: format!("tool-{}", name),
+                            id: format!("tool-{name}"),
                             name,
                             input: json!({}),
                         }
@@ -597,7 +597,7 @@ mod proptests {
 
             // Add last message with specified type
             let last_seq = messages.len() as i64 + 1;
-            messages.push(make_message(last_seq, last_type.clone(), true));
+            messages.push(make_message(last_seq, last_type, true));
 
             let decision = should_auto_continue(&messages);
 

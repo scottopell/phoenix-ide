@@ -71,13 +71,13 @@ impl LlmError {
         Self::new(LlmErrorKind::InvalidRequest, message)
     }
 
-    pub fn from_http_status(status: u16, body: String) -> Self {
+    pub fn from_http_status(status: u16, body: &str) -> Self {
         match status {
-            401 | 403 => Self::auth(format!("Authentication failed: {}", body)),
-            429 => Self::rate_limit(format!("Rate limited: {}", body)),
-            400..=499 => Self::invalid_request(format!("Bad request ({}): {}", status, body)),
-            500..=599 => Self::server_error(format!("Server error ({}): {}", status, body)),
-            _ => Self::unknown(format!("HTTP {}: {}", status, body)),
+            401 | 403 => Self::auth(format!("Authentication failed: {body}")),
+            429 => Self::rate_limit(format!("Rate limited: {body}")),
+            400..=499 => Self::invalid_request(format!("Bad request ({status}): {body}")),
+            500..=599 => Self::server_error(format!("Server error ({status}): {body}")),
+            _ => Self::unknown(format!("HTTP {status}: {body}")),
         }
     }
 }

@@ -37,7 +37,7 @@ impl Provider {
 pub enum ApiFormat {
     /// Anthropic Messages API
     Anthropic,
-    /// OpenAI Chat Completions (used by OpenAI + Fireworks)
+    /// `OpenAI` Chat Completions (used by `OpenAI` + Fireworks)
     OpenAIChat,
 }
 

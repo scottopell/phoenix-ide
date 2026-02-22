@@ -113,9 +113,8 @@ mod tests {
     #[test]
     fn test_initial_state() {
         // Note: These tests may be affected by global state from other tests,
-        // but we're checking the initial/default behavior logic.
-        // In a fresh process, both should be false.
-        assert!(!HOT_RESTART_REQUESTED.load(Ordering::SeqCst) || true); // May be set by other tests
+        // so we just verify the atomics are readable without panicking.
+        let _requested = HOT_RESTART_REQUESTED.load(Ordering::SeqCst);
     }
 
     #[test]

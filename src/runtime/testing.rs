@@ -218,10 +218,10 @@ impl ToolExecutor for DelayedMockToolExecutor {
 
         // Race between delay and cancellation
         tokio::select! {
-            _ = tokio::time::sleep(self.delay) => {
+            () = tokio::time::sleep(self.delay) => {
                 self.inner.outputs.get(name).cloned()
             }
-            _ = ctx.cancel.cancelled() => {
+            () = ctx.cancel.cancelled() => {
                 Some(ToolOutput::error("[command cancelled]"))
             }
         }
@@ -431,7 +431,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
     pub fn build(self) -> TestRuntime<MockLlmClient, MockToolExecutor> {
         let storage = Arc::new(InMemoryStorage::new());
         let llm = Arc::new(self.llm.unwrap_or_else(|| MockLlmClient::new("test-model")));
-        let tools = Arc::new(self.tools.unwrap_or_else(MockToolExecutor::new));
+        let tools = Arc::new(self.tools.unwrap_or_default());
 
         let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -493,7 +493,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
             .expect("Failed to send cancel");
     }
 
-    /// Wait for AgentDone event with timeout
+    /// Wait for `AgentDone` event with timeout
     pub async fn wait_for_done(&mut self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
@@ -697,7 +697,7 @@ mod tests {
     /// Integration test: cancel during LLM request (REQ-BED-005)
     ///
     /// LLM requests are spawned as background tasks and can be cancelled
-    /// immediately via CancellationToken.
+    /// immediately via `CancellationToken`.
     #[tokio::test]
     async fn test_cancel_during_llm_request() {
         use crate::runtime::{ConversationRuntime, SseEvent};
@@ -785,8 +785,7 @@ mod tests {
         // Should complete in < 1 second, not wait for the 5 second LLM delay
         assert!(
             elapsed < Duration::from_secs(2),
-            "Cancellation should be fast, took {:?}",
-            elapsed
+            "Cancellation should be fast, took {elapsed:?}"
         );
 
         // Should only have user message - LLM response was discarded
@@ -794,8 +793,7 @@ mod tests {
         assert_eq!(
             msgs.len(),
             1,
-            "Should only have user message, got {:?}",
-            msgs
+            "Should only have user message, got {msgs:?}"
         );
         assert_eq!(msgs[0].message_type, MessageType::User);
     }
@@ -894,8 +892,7 @@ mod tests {
         // Should complete in < 1 second, not wait for the 5 second tool delay
         assert!(
             elapsed < Duration::from_secs(2),
-            "Cancellation should be fast, took {:?}",
-            elapsed
+            "Cancellation should be fast, took {elapsed:?}"
         );
     }
 
@@ -991,8 +988,7 @@ mod tests {
         assert!(agent_done, "Should receive AgentDone event");
         assert!(
             cancel_elapsed < Duration::from_millis(200),
-            "Cancellation should complete in < 200ms, took {:?}",
-            cancel_elapsed
+            "Cancellation should complete in < 200ms, took {cancel_elapsed:?}"
         );
     }
 
@@ -1082,7 +1078,7 @@ mod tests {
     // Sub-Agent Integration Tests
     // ========================================================================
 
-    /// Test sub-agent terminal tool: submit_result transitions to Completed
+    /// Test sub-agent terminal tool: `submit_result` transitions to Completed
     #[tokio::test]
     async fn test_subagent_submit_result_transitions_to_completed() {
         use crate::state_machine::state::{SubmitResultInput, ToolCall, ToolInput};
@@ -1122,7 +1118,7 @@ mod tests {
             ConvState::Completed { result } => {
                 assert_eq!(result, "Found 3 bugs");
             }
-            other => panic!("Expected Completed, got {:?}", other),
+            other => panic!("Expected Completed, got {other:?}"),
         }
 
         // Should have NotifyParent effect
@@ -1133,7 +1129,7 @@ mod tests {
         assert!(notify, "Should have NotifyParent effect");
     }
 
-    /// Test sub-agent terminal tool: submit_error transitions to Failed
+    /// Test sub-agent terminal tool: `submit_error` transitions to Failed
     #[tokio::test]
     async fn test_subagent_submit_error_transitions_to_failed() {
         use crate::state_machine::state::{SubmitErrorInput, ToolCall, ToolInput};
@@ -1171,7 +1167,7 @@ mod tests {
                 assert_eq!(error, "File not found");
                 assert!(matches!(error_kind, crate::db::ErrorKind::SubAgentError));
             }
-            other => panic!("Expected Failed, got {:?}", other),
+            other => panic!("Expected Failed, got {other:?}"),
         }
 
         // Should have NotifyParent effect
@@ -1182,7 +1178,7 @@ mod tests {
         assert!(notify, "Should have NotifyParent effect");
     }
 
-    /// Test sub-agent cancellation: UserCancel transitions to Failed
+    /// Test sub-agent cancellation: `UserCancel` transitions to Failed
     #[tokio::test]
     async fn test_subagent_cancel_transitions_to_failed() {
         use crate::state_machine::{transition, ConvContext, Effect, Event};
@@ -1206,7 +1202,7 @@ mod tests {
                     assert!(error.contains("Cancelled"));
                     assert!(matches!(error_kind, crate::db::ErrorKind::Cancelled));
                 }
-                other => panic!("Expected Failed from {:?}, got {:?}", state, other),
+                other => panic!("Expected Failed from {state:?}, got {other:?}"),
             }
 
             // Should have NotifyParent effect
@@ -1216,8 +1212,7 @@ mod tests {
                 .any(|e| matches!(e, Effect::NotifyParent { .. }));
             assert!(
                 notify,
-                "Should have NotifyParent effect for cancel from {:?}",
-                state
+                "Should have NotifyParent effect for cancel from {state:?}"
             );
         }
     }
@@ -1372,12 +1367,12 @@ mod tests {
         // This is a basic smoke test - full integration would require more setup
     }
 
-    /// Test that tool output containing "[command cancelled]" does NOT trigger ToolAborted
+    /// Test that tool output containing "[command cancelled]" does NOT trigger `ToolAborted`
     /// when the cancellation token was NOT signaled.
     ///
     /// This is a regression test for a bug where the executor checked the output string
-    /// instead of the cancellation token state, causing spurious ToolAborted events that
-    /// violated the state machine contract (ToolAborted is only valid from CancellingTool).
+    /// instead of the cancellation token state, causing spurious `ToolAborted` events that
+    /// violated the state machine contract (`ToolAborted` is only valid from `CancellingTool`).
     #[tokio::test]
     async fn test_cancelled_output_without_token_sends_tool_complete() {
         use crate::runtime::{ConversationRuntime, SseEvent};

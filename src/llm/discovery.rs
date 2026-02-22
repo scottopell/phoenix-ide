@@ -18,7 +18,7 @@ pub struct DiscoveredModel {
 }
 
 impl DiscoveredModel {
-    /// Convert discovered model to ModelSpec
+    /// Convert discovered model to `ModelSpec`
     pub fn to_model_spec(&self) -> super::ModelSpec {
         use super::{ApiFormat, ModelSpec, Provider};
         

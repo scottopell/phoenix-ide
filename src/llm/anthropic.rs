@@ -24,7 +24,7 @@ pub async fn complete(
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
-        .map_err(|e| LlmError::unknown(format!("Failed to create HTTP client: {}", e)))?;
+        .map_err(|e| LlmError::unknown(format!("Failed to create HTTP client: {e}")))?;
 
     let anthropic_request = translate_request(&spec.api_name, request);
 
@@ -53,7 +53,7 @@ pub async fn complete(
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
-        return Err(LlmError::from_http_status(status.as_u16(), body));
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
     let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {

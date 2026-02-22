@@ -903,13 +903,11 @@ mod tests {
         let result = display_command(r#"cat /path/to/file || echo "FILE NOT FOUND""#, "/any");
         assert!(
             result.contains("cat"),
-            "Should preserve primary command 'cat', got: {}",
-            result
+            "Should preserve primary command 'cat', got: {result}"
         );
         assert!(
             result.contains("||"),
-            "Should preserve || operator, got: {}",
-            result
+            "Should preserve || operator, got: {result}"
         );
     }
 

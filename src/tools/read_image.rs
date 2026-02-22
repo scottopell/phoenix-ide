@@ -246,7 +246,7 @@ mod tests {
         let tool = ReadImageTool;
 
         for (ext, expected_type) in SUPPORTED_FORMATS {
-            let filename = format!("test.{}", ext);
+            let filename = format!("test.{ext}");
             create_test_image(dir.path(), &filename, b"fake image data");
 
             let ctx = test_context(dir.path().to_path_buf());

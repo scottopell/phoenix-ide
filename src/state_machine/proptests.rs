@@ -1305,7 +1305,7 @@ fn arb_sub_agent_outcome() -> impl Strategy<Value = SubAgentOutcome> {
     ]
 }
 
-/// Helper to create PendingSubAgent from id string
+/// Helper to create `PendingSubAgent` from id string
 fn pending_agent(id: &str) -> PendingSubAgent {
     PendingSubAgent {
         agent_id: id.to_string(),
@@ -1523,7 +1523,7 @@ proptest! {
     }
 }
 
-/// ToolExecuting with pending_sub_agents goes to AwaitingSubAgents on last tool
+/// `ToolExecuting` with `pending_sub_agents` goes to `AwaitingSubAgents` on last tool
 #[test]
 fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     let state = ConvState::ToolExecuting {
@@ -1571,7 +1571,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     }
 }
 
-/// SpawnAgentsComplete accumulates agent IDs
+/// `SpawnAgentsComplete` accumulates agent IDs
 #[test]
 fn test_spawn_agents_complete_accumulates_ids() {
     let state = ConvState::ToolExecuting {

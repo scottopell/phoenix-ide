@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Complete using OpenAI-compatible API (OpenAI or Fireworks)
+/// Complete using OpenAI-compatible API (`OpenAI` or Fireworks)
 pub async fn complete(
     spec: &ModelSpec,
     api_key: &str,

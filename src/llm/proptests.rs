@@ -73,7 +73,7 @@ fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
         Just(serde_json::Value::Null),
         any::<bool>().prop_map(serde_json::Value::Bool),
         (-1000i64..1000).prop_map(|n| serde_json::Value::Number(n.into())),
-        "[a-zA-Z0-9 ]{0,50}".prop_map(|s| serde_json::Value::String(s)),
+        "[a-zA-Z0-9 ]{0,50}".prop_map(serde_json::Value::String),
         // Small object with string values
         proptest::collection::hash_map("[a-z_]{1,10}", "[a-zA-Z0-9 ]{0,30}", 0..5).prop_map(|m| {
             serde_json::Value::Object(
@@ -126,7 +126,7 @@ fn arb_message() -> impl Strategy<Value = LlmMessage> {
 // Strategies — provider-specific response generators
 // ============================================================================
 
-/// Build an OpenAI response with given content and optional tool calls
+/// Build an `OpenAI` response with given content and optional tool calls
 fn make_openai_response(
     content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCall>>,
@@ -150,7 +150,7 @@ fn make_openai_response(
     }
 }
 
-/// Build an OpenAI tool call
+/// Build an `OpenAI` tool call
 fn make_openai_tool_call(id: &str, name: &str, arguments: &str) -> OpenAIToolCall {
     OpenAIToolCall {
         id: id.to_string(),

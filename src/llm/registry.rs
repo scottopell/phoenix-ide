@@ -216,8 +216,7 @@ impl ModelRegistry {
         // Look up in stored specs (includes both hardcoded and dynamic)
         self.specs
             .get(model_id)
-            .map(|spec| spec.context_window)
-            .unwrap_or(crate::state_machine::state::DEFAULT_CONTEXT_WINDOW)
+            .map_or(crate::state_machine::state::DEFAULT_CONTEXT_WINDOW, |spec| spec.context_window)
     }
 
     /// List all available model IDs
@@ -295,8 +294,7 @@ mod tests {
         for model_id in &models {
             assert!(
                 model_id.contains("claude"),
-                "Expected claude model, got {}",
-                model_id
+                "Expected claude model, got {model_id}"
             );
         }
     }

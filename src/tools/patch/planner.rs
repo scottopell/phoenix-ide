@@ -501,8 +501,8 @@ mod tests {
                     operation: Operation::Replace,
                     old_text: Some("hello".to_string()),
                     new_text: Some("world".to_string()),
-                    to_clipboard: Some("".to_string()), // empty string
-                    from_clipboard: Some("".to_string()), // empty string
+                    to_clipboard: Some(String::new()), // empty string
+                    from_clipboard: Some(String::new()), // empty string
                     reindent: None,
                 }],
             )

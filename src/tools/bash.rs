@@ -375,7 +375,7 @@ mod tests {
         };
 
         // Run both concurrently
-        let (result, _) = tokio::join!(tool_future, cancel_task);
+        let (result, ()) = tokio::join!(tool_future, cancel_task);
 
         // Should be cancelled, not timeout
         assert!(!result.success);
@@ -399,7 +399,7 @@ mod tests {
         let marker = format!("phoenix_test_{}", std::process::id());
 
         // Command that spawns a subprocess: bash spawns another bash which runs sleep
-        let cmd = format!("bash -c 'echo {}; sleep 1000' & wait", marker);
+        let cmd = format!("bash -c 'echo {marker}; sleep 1000' & wait");
 
         let tool_future = tool.run(json!({"command": cmd}), ctx);
 
@@ -409,7 +409,7 @@ mod tests {
             cancel.cancel();
         };
 
-        let (result, _) = tokio::join!(tool_future, cancel_task);
+        let (result, ()) = tokio::join!(tool_future, cancel_task);
         assert!(result.output.contains("cancelled"));
 
         // Give processes time to be killed
