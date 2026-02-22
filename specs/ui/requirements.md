@@ -154,27 +154,28 @@ AND disable further cancel attempts
 
 ### REQ-UI-009: New Conversation
 
-WHEN user taps "+ New" button
-THE SYSTEM SHALL show modal to select working directory
-AND validate directory exists before creation
-AND navigate to new conversation on success
+**DEPRECATED:** Replaced by REQ-UI-015 (mobile bottom sheet), REQ-UI-017 (desktop full page), and REQ-UI-018 (desktop inline sidebar).
 
-**Rationale:** Users need to start new conversations in specific project directories.
+**Deprecation Reason:** Original requirement was too generic. New conversation flows differ significantly by viewport and context, requiring separate requirements for each mode.
 
 ---
 
 ### REQ-UI-010: Responsive Layout
 
-WHEN viewport is mobile-sized
-THE SYSTEM SHALL use full-width layout
+WHEN viewport is mobile-sized (< 768px)
+THE SYSTEM SHALL use full-width single-column layout
 AND ensure touch targets are at least 44px
 AND respect safe area insets for notched devices
 
-WHEN viewport is desktop-sized
-THE SYSTEM SHALL remain usable (not require mobile)
-AND support keyboard navigation
+WHEN viewport is tablet-sized (768px - 1024px)
+THE SYSTEM SHALL use mobile layout patterns
+AND support keyboard navigation where available
 
-**Rationale:** Primary use case is mobile, but desktop must work for development and occasional use.
+WHEN viewport is desktop-sized (> 1024px)
+THE SYSTEM SHALL use sidebar layout per REQ-UI-016
+AND support full keyboard navigation
+
+**Rationale:** Phoenix serves both mobile (on-the-go monitoring) and desktop (primary development) use cases. Each viewport size gets optimized layout rather than one-size-fits-all responsive scaling.
 
 ---
 
@@ -191,3 +192,140 @@ THE SYSTEM SHALL degrade gracefully without crashing
 AND log warning to console
 
 **Rationale:** Structured storage enables reliable persistence and cleanup. Namespace prevents conflicts.
+
+---
+
+### REQ-UI-012: Conversation State Indicators
+
+WHEN displaying the conversation list
+THE SYSTEM SHALL show a visual state indicator for each conversation
+AND use distinct colors/icons for idle (green), working (yellow/pulsing), and error (red) states
+
+WHEN user views the conversation list
+THE SYSTEM SHALL enable at-a-glance identification of which conversations need attention (error) or are actively running (working)
+
+**Rationale:** Users managing multiple conversations need quick visibility into what's running, what's waiting for input, and what has failed—without opening each conversation individually.
+
+---
+
+### REQ-UI-013: Per-Conversation Scroll Position Memory
+
+WHEN user navigates away from a conversation
+THE SYSTEM SHALL persist the current scroll position for that conversation
+
+WHEN user returns to a previously viewed conversation
+THE SYSTEM SHALL restore the scroll position to where they left off
+AND NOT auto-scroll to the bottom (unless they were already at the bottom)
+
+WHEN conversation receives new messages while user is away
+THE SYSTEM SHALL still restore to saved position
+AND provide affordance to jump to newest content
+
+**Rationale:** Users reading through long conversations lose their place when switching contexts. Preserving scroll position respects user attention and reduces re-orientation friction.
+
+---
+
+### REQ-UI-014: Desktop Message Readability
+
+WHEN viewport is desktop-sized (> 768px)
+THE SYSTEM SHALL constrain message content width to a readable maximum (approximately 800px)
+AND center the constrained content within available space
+
+WHEN code blocks or wide content appear
+THE SYSTEM SHALL allow horizontal scroll within the block rather than expanding the container
+
+**Rationale:** Unconstrained line lengths on wide displays harm readability. Comfortable reading width (60-80 characters for prose) reduces eye strain during long sessions.
+
+---
+
+### REQ-UI-015: Mobile New Conversation Bottom Sheet
+
+WHEN user initiates new conversation on mobile viewport
+THE SYSTEM SHALL present a bottom sheet overlay (not full-page navigation)
+AND include directory picker, model selector, and initial message input
+AND provide "Send" button to create and navigate to conversation
+AND provide "Send in Background" option to create without navigating
+AND allow dismissal via swipe-down or backdrop tap
+
+WHEN bottom sheet is open
+THE SYSTEM SHALL keep the current view visible behind the sheet (dimmed)
+AND NOT lose context of what user was viewing
+
+WHEN user chooses "Send in Background"
+THE SYSTEM SHALL create the conversation and start agent processing
+AND close the bottom sheet
+AND keep user in current conversation
+AND show brief confirmation toast
+
+**Rationale:** Full-page navigation for new conversation breaks user's mental context. Bottom sheet maintains awareness of current state. "Send in Background" enables spawning tasks without context-switching, consistent with desktop inline sidebar mode.
+
+---
+
+### REQ-UI-016: Desktop Sidebar Layout
+
+WHEN viewport is desktop-sized (> 1024px)
+THE SYSTEM SHALL display conversation list as a persistent sidebar alongside the main content
+AND show the active conversation highlighted in the sidebar
+AND place "+ New" button at the top of the sidebar
+AND allow collapsing the sidebar to a narrow strip via toggle
+
+WHEN sidebar is visible and user clicks a conversation
+THE SYSTEM SHALL switch the main content to that conversation without full-page navigation
+
+WHEN sidebar is collapsed
+THE SYSTEM SHALL show conversation state indicators (dots) for recent conversations
+AND expand on click or hover
+
+**Rationale:** Desktop users have screen real estate to see both conversation list and active conversation simultaneously. This eliminates the multi-step navigation to switch contexts and provides ambient awareness of other conversations' states.
+
+---
+
+### REQ-UI-017: Desktop New Conversation - Full Page Mode
+
+WHEN user navigates to root route (`/`) on desktop with sidebar visible
+THE SYSTEM SHALL render the full new-conversation form in the main content area
+AND show the conversation list in the sidebar (no active highlight)
+AND display Phoenix icon at top of sidebar as click target for this view
+
+WHEN user clicks "+ New" button while on root route
+THE SYSTEM SHALL treat click as no-op (already on new conversation view)
+
+WHEN user clicks Phoenix icon in sidebar
+THE SYSTEM SHALL navigate to root route (`/`)
+
+WHEN user submits the new conversation form
+THE SYSTEM SHALL create the conversation and navigate to it
+AND highlight it in the sidebar
+
+WHEN user submits with "Send in Background" option
+THE SYSTEM SHALL create the conversation and start agent processing
+AND remain on root route for another new conversation
+AND show brief confirmation toast
+
+**Rationale:** Direct navigation to `/` indicates intentional "start fresh" flow. Full-page form provides complete settings access without space constraints. Phoenix icon provides visual anchor and alternative navigation path. Background send enables batch-spawning multiple conversations.
+
+---
+
+### REQ-UI-018: Desktop New Conversation - Inline Sidebar Mode
+
+WHEN user clicks "+ New" while viewing an existing conversation (`/c/:slug`)
+THE SYSTEM SHALL expand an inline new-conversation form at the top of the sidebar
+AND keep the current conversation visible in the main content area
+AND NOT navigate away from the current conversation
+
+WHEN inline form is visible
+THE SYSTEM SHALL provide directory picker, model selector, and message input
+AND provide "Send" button to create and navigate to conversation
+AND provide "Send in Background" option to create without navigating
+AND allow dismissal via cancel button or Escape key
+
+WHEN user submits with "Send" (default)
+THE SYSTEM SHALL create the conversation, navigate to it, and collapse the form
+
+WHEN user submits with "Send in Background"
+THE SYSTEM SHALL create the conversation and start agent processing
+AND collapse the form
+AND keep user in current conversation
+AND show brief confirmation toast
+
+**Rationale:** Users monitoring an active conversation need to spawn side tasks without losing context. Inline form enables "quick new conversation" without disrupting the current view. "Send in Background" is the power-user path for spawning work while staying focused.

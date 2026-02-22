@@ -5,6 +5,7 @@ import type { Conversation } from '../api';
 import { cacheDB } from '../cache';
 import { useLocalStorage } from '../hooks';
 import { Sidebar } from './Sidebar';
+import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { useToast } from '../hooks/useToast';
 
@@ -98,6 +99,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       <div className="desktop-main">
         {children}
       </div>
+      <CommandPalette conversations={conversations} />
       <Toast messages={toasts} onDismiss={dismissToast} />
     </div>
   );
