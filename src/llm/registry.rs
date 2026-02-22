@@ -33,6 +33,7 @@ impl LlmConfig {
 /// Registry of available LLM models
 pub struct ModelRegistry {
     services: HashMap<String, Arc<dyn LlmService>>,
+    specs: HashMap<String, super::ModelSpec>,
     default_model: String,
 }
 
@@ -41,17 +42,20 @@ impl ModelRegistry {
     pub fn new_empty() -> Self {
         Self {
             services: HashMap::new(),
+            specs: HashMap::new(),
             default_model: "test-model".to_string(),
         }
     }
 
     pub fn new(config: &LlmConfig) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
+        let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
         // Try to create each model from the centralized definitions
         for spec in all_models() {
             if let Some(service) = Self::try_create_model(&spec, config) {
                 services.insert(spec.id.clone(), service);
+                specs.insert(spec.id.clone(), spec);
             }
         }
 
@@ -72,6 +76,7 @@ impl ModelRegistry {
 
         Self {
             services,
+            specs,
             default_model,
         }
     }
@@ -101,19 +106,40 @@ impl ModelRegistry {
 
         tracing::info!("Discovered {} models from gateway", discovered.len());
 
-        // Build services map from discovered models
-        // For now, only register models we have hardcoded definitions for
-        // TODO: Create services dynamically for any discovered model
+        // Build services from both hardcoded and discovered models
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
+        let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
+        let mut registered_ids = std::collections::HashSet::new();
 
+        // First, register hardcoded models that were discovered (preserves metadata)
         for spec in all_models() {
-            // Check if this model was discovered
             if discovered.contains_key(&spec.id) || discovered.contains_key(&spec.api_name) {
                 if let Some(service) = Self::try_create_model(&spec, config) {
                     services.insert(spec.id.clone(), service);
+                    specs.insert(spec.id.clone(), spec.clone());
+                    registered_ids.insert(spec.id.clone());
                 }
             }
         }
+
+        // Then, create services for any discovered models not in hardcoded list
+        for (model_id, discovered_model) in &discovered {
+            if !registered_ids.contains(model_id) {
+                let spec = discovered_model.to_model_spec();
+                if let Some(service) = Self::try_create_model(&spec, config) {
+                    tracing::info!("Dynamically registered model: {}", model_id);
+                    services.insert(spec.id.clone(), service);
+                    specs.insert(spec.id.clone(), spec);
+                }
+            }
+        }
+
+        tracing::info!(
+            "Registered {} models ({} hardcoded, {} dynamic)",
+            services.len(),
+            registered_ids.len(),
+            services.len() - registered_ids.len()
+        );
 
         // Determine default model
         let default_model = config
@@ -130,6 +156,7 @@ impl ModelRegistry {
 
         Self {
             services,
+            specs,
             default_model,
         }
     }
@@ -185,16 +212,12 @@ impl ModelRegistry {
     }
 
     /// Get the context window size for a model (REQ-BED-022)
-    #[allow(clippy::unused_self)] // Instance method for API consistency
     pub fn context_window(&self, model_id: &str) -> usize {
-        // Look up in the static model definitions
-        for spec in super::all_models() {
-            if spec.id == model_id {
-                return spec.context_window;
-            }
-        }
-        // Default to smallest known limit for unknown models
-        crate::state_machine::state::DEFAULT_CONTEXT_WINDOW
+        // Look up in stored specs (includes both hardcoded and dynamic)
+        self.specs
+            .get(model_id)
+            .map(|spec| spec.context_window)
+            .unwrap_or(crate::state_machine::state::DEFAULT_CONTEXT_WINDOW)
     }
 
     /// List all available model IDs
@@ -208,9 +231,9 @@ impl ModelRegistry {
     pub fn available_model_info(&self) -> Vec<crate::api::ModelInfo> {
         let mut model_infos = Vec::new();
 
-        // Get info for each registered model
-        for spec in super::all_models() {
-            if self.services.contains_key(&spec.id) {
+        // Get info for each registered model from stored specs
+        for (model_id, spec) in &self.specs {
+            if self.services.contains_key(model_id) {
                 model_infos.push(crate::api::ModelInfo {
                     id: spec.id.clone(),
                     provider: spec.provider.display_name().to_string(),

@@ -17,6 +17,48 @@ pub struct DiscoveredModel {
     pub supports_tools: Option<bool>,
 }
 
+impl DiscoveredModel {
+    /// Convert discovered model to ModelSpec
+    pub fn to_model_spec(&self) -> super::ModelSpec {
+        use super::{ApiFormat, ModelSpec, Provider};
+        
+        // Infer provider from string
+        let provider = match self.provider.as_str() {
+            "Anthropic" => Provider::Anthropic,
+            "OpenAI" => Provider::OpenAI,
+            "Fireworks" => Provider::Fireworks,
+            _ => {
+                tracing::warn!("Unknown provider '{}', defaulting to OpenAI", self.provider);
+                Provider::OpenAI
+            }
+        };
+        
+        // Infer API format from provider
+        let api_format = match provider {
+            Provider::Anthropic => ApiFormat::Anthropic,
+            Provider::OpenAI | Provider::Fireworks => ApiFormat::OpenAIChat,
+        };
+        
+        // Use display_name or id for description
+        let description = self.display_name
+            .clone()
+            .unwrap_or_else(|| self.id.clone());
+        
+        // Default context window if not provided
+        let context_window = self.context_length.unwrap_or(128_000);
+        
+        ModelSpec {
+            id: self.id.clone(),
+            api_name: self.id.clone(), // Gateway models use same name
+            provider,
+            api_format,
+            description,
+            context_window,
+            recommended: false, // Discovered models not recommended by default
+        }
+    }
+}
+
 /// Anthropic /v1/models response
 #[derive(Debug, Deserialize)]
 struct AnthropicModelsResponse {

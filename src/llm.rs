@@ -10,14 +10,14 @@ mod openai;
 #[cfg(test)]
 mod proptests;
 mod registry;
+mod service;
 mod types;
 
-pub use anthropic::AnthropicService;
 pub use discovery::discover_models;
 pub use error::{LlmError, LlmErrorKind};
-pub use models::{all_models, ModelDef, Provider};
-pub use openai::OpenAIService;
+pub use models::{all_models, ApiFormat, ModelSpec, Provider};
 pub use registry::{LlmConfig, ModelRegistry};
+pub use service::LlmServiceImpl;
 pub use types::*;
 
 use async_trait::async_trait;
@@ -31,14 +31,6 @@ pub trait LlmService: Send + Sync {
 
     /// Get the model ID
     fn model_id(&self) -> &str;
-
-    /// Get the context window size in tokens
-    #[allow(dead_code)] // For future context management
-    fn context_window(&self) -> usize;
-
-    /// Get max image dimension (for resizing before send)
-    #[allow(dead_code)] // For future image resizing
-    fn max_image_dimension(&self) -> Option<u32>;
 }
 
 /// Logging wrapper for LLM services
@@ -87,13 +79,5 @@ impl LlmService for LoggingService {
 
     fn model_id(&self) -> &str {
         &self.model_id
-    }
-
-    fn context_window(&self) -> usize {
-        self.inner.context_window()
-    }
-
-    fn max_image_dimension(&self) -> Option<u32> {
-        self.inner.max_image_dimension()
     }
 }

@@ -1,6 +1,5 @@
 //! LLM error types
 
-use std::time::Duration;
 use thiserror::Error;
 
 /// LLM error with classification
@@ -9,7 +8,6 @@ use thiserror::Error;
 pub struct LlmError {
     pub kind: LlmErrorKind,
     pub message: String,
-    pub retry_after: Option<Duration>,
 }
 
 impl LlmError {
@@ -17,13 +15,7 @@ impl LlmError {
         Self {
             kind,
             message: message.into(),
-            retry_after: None,
         }
-    }
-
-    pub fn with_retry_after(mut self, duration: Duration) -> Self {
-        self.retry_after = Some(duration);
-        self
     }
 
     pub fn network(message: impl Into<String>) -> Self {
