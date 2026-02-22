@@ -8,7 +8,7 @@ import { useKeyboardNav } from '../hooks';
 function getConvDisplayState(state?: ConversationState): 'idle' | 'working' | 'error' {
   if (!state || !state.type) return 'idle';
   const t = state.type;
-  if (t === 'idle') return 'idle';
+  if (t === 'idle' || t === 'context_exhausted' || t === 'completed' || t === 'failed') return 'idle';
   if (t === 'error') return 'error';
   return 'working';
 }

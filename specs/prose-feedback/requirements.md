@@ -8,8 +8,10 @@ As a user reviewing text files (markdown documentation, source code, or plain te
 
 ### REQ-PF-001: Browse Project Files
 
-WHEN user taps the file browse button in the conversation
-THE SYSTEM SHALL display a file browser overlay
+> **Note:** File browsing UI is defined in `specs/file-explorer/`. This requirement describes the core browsing behavior; REQ-FE-001 and REQ-FE-010 define the desktop panel and mobile overlay hosts respectively.
+
+WHEN user triggers file browsing
+THE SYSTEM SHALL display the file tree rooted at the conversation's working directory
 AND show the current working directory path
 AND list all files and directories in the current directory
 AND indicate file types with icons (folder, text, code, markdown)
@@ -107,7 +109,9 @@ AND NOT allow selection
 
 ### REQ-PF-005: Open File for Review
 
-WHEN user selects a file from the file browser
+> **Note:** File selection triggers are defined in `specs/file-explorer/` (REQ-FE-003). This requirement describes prose reader behavior once a file is selected.
+
+WHEN user selects a text file
 THE SYSTEM SHALL display the file content in a full-screen reading overlay
 AND show the filename in a header bar
 AND provide a back/close button to return to the conversation
@@ -256,17 +260,20 @@ THE SYSTEM SHALL start with zero notes (fresh review session)
 
 ### REQ-PF-012: Responsive Layout
 
+> **Note:** Desktop layout is now defined in `specs/file-explorer/` (REQ-FE-001). This requirement focuses on mobile/tablet behavior and general accessibility.
+
 WHEN viewport is mobile-sized
-THE SYSTEM SHALL use full-screen overlay
+THE SYSTEM SHALL use full-screen overlay for file browser and prose reader
 AND use bottom drawer for annotation dialog and notes panel
 AND ensure touch targets are at least 44px
 
 WHEN viewport is desktop-sized
-THE SYSTEM SHALL use full-screen overlay (same as mobile)
+THE SYSTEM SHALL use File Explorer Panel layout (per `specs/file-explorer/`)
+AND render prose reader in main content area (not overlay)
 AND support mouse hover and click in addition to touch
 AND support keyboard navigation (Escape to close dialogs)
 
-**Rationale:** Primary use case is mobile review, but desktop must work for development.
+**Rationale:** Mobile uses overlays for focus. Desktop uses persistent panels for context.
 
 ---
 
