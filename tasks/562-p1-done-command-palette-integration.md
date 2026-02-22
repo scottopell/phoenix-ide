@@ -1,7 +1,7 @@
 ---
 id: 562
 priority: p1
-status: ready
+status: done
 title: Command Palette Integration
 created: 2025-02-22
 requirements:
@@ -43,8 +43,8 @@ This task wires the Command Palette into the existing app:
 
 ## Acceptance Criteria
 
-- [ ] Palette shows real conversation data from app state
-- [ ] Selecting conversation navigates correctly
-- [ ] Actions trigger correct app behaviors
-- [ ] State indicators match conversation list styling
-- [ ] No regressions to existing functionality
+- [x] Palette shows real conversation data from app state
+- [x] Selecting conversation navigates correctly
+- [x] Actions trigger correct app behaviors
+- [x] State indicators match conversation list styling (reuses .conv-state-dot)
+- [x] No regressions to existing functionality

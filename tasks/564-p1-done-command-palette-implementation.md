@@ -1,7 +1,7 @@
 ---
 id: 564
 priority: p1
-status: in-progress
+status: done
 title: Command Palette Implementation
 created: 2025-02-22
 requirements:
