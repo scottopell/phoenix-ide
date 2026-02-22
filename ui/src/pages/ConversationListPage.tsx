@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { Conversation } from '../api';
 import { cacheDB } from '../cache';
+import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
@@ -15,6 +16,7 @@ import { useToast } from '../hooks/useToast';
 
 export function ConversationListPage() {
   const navigate = useNavigate();
+  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const [showArchived, setShowArchived] = useState(false);
@@ -243,6 +245,20 @@ export function ConversationListPage() {
   const handleTouchEnd = useCallback(() => {
     pullStartY.current = null;
   }, []);
+
+  // Desktop media query listener
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1025px)');
+    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+
+  // On desktop, the sidebar handles the conversation list.
+  // Root route shows the new conversation form in main content.
+  if (isDesktop) {
+    return <NewConversationPage desktopMode />;
+  }
 
   // Show error UI if IndexedDB init failed
   if (initError) {

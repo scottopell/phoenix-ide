@@ -12,7 +12,11 @@ import type { ImageData, ModelsResponse } from '../api';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 
-export function NewConversationPage() {
+interface NewConversationPageProps {
+  desktopMode?: boolean;
+}
+
+export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
   const navigate = useNavigate();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -122,7 +126,9 @@ export function NewConversationPage() {
     e.target.value = '';
   };
 
-  const handleSend = async () => {
+  const [bgToast, setBgToast] = useState<string | null>(null);
+
+  const handleSend = async (background = false) => {
     const trimmed = draft.trim();
     if (!trimmed && images.length === 0) return;
     if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
@@ -144,7 +150,16 @@ export function NewConversationPage() {
       const conv = await api.createConversation(
         cwd.trim(), trimmed, messageId, selectedModel || undefined, images
       );
-      navigate(`/c/${conv.slug}`);
+      if (background) {
+        // Stay on page, reset form, show toast
+        setDraft('');
+        setImages([]);
+        setCreating(false);
+        setBgToast(`Started: ${conv.slug}`);
+        setTimeout(() => setBgToast(null), 4000);
+      } else {
+        navigate(`/c/${conv.slug}`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
       setCreating(false);
@@ -200,9 +215,11 @@ export function NewConversationPage() {
         style={{ display: 'none' }}
       />
       
-      <header className="new-conv-header-minimal">
-        <button className="back-link" onClick={() => navigate('/')}>← Back</button>
-      </header>
+      {!desktopMode && (
+        <header className="new-conv-header-minimal">
+          <button className="back-link" onClick={() => navigate('/')}>← Back</button>
+        </header>
+      )}
 
       <main className="new-conv-main">
         <div className="new-conv-content">
@@ -239,7 +256,12 @@ export function NewConversationPage() {
                 <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
                 {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
               </div>
-              <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>{buttonText}</button>
+              <div className="new-conv-input-right">
+                {desktopMode && (
+                  <button className="new-conv-send-bg" onClick={() => handleSend(true)} disabled={!canSend} title="Create and stay on this page">Background</button>
+                )}
+                <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
+              </div>
             </div>
           </div>
 
@@ -263,6 +285,7 @@ export function NewConversationPage() {
               <SettingsFields {...settingsProps} />
             </div>
           </div>
+          {bgToast && <div className="bg-toast">{bgToast}</div>}
         </div>
       </main>
 
@@ -287,9 +310,10 @@ export function NewConversationPage() {
             <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
             {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
           </div>
-          <button className="new-conv-send" onClick={handleSend} disabled={!canSend}>{buttonText}</button>
+          <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
         </div>
       </div>
+      {bgToast && <div className="bg-toast">{bgToast}</div>}
     </div>
   );
 }

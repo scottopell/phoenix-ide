@@ -24,6 +24,8 @@ interface ConversationListProps {
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
   onConversationClick?: (conv: Conversation) => void;
+  activeSlug?: string | null;
+  sidebarMode?: boolean;
 }
 
 export function ConversationList({
@@ -37,6 +39,8 @@ export function ConversationList({
   onDelete,
   onRename,
   onConversationClick,
+  activeSlug,
+  sidebarMode,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -63,23 +67,35 @@ export function ConversationList({
   };
 
   return (
-    <section id="conversation-list" className="view active">
-      <div className="view-header">
-        <h2>Conversations</h2>
-        <div className="view-header-actions">
-          {archivedConversations.length > 0 && (
-            <button
-              className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
-              onClick={onToggleArchived}
-            >
-              {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
+    <section id="conversation-list" className={`view active ${sidebarMode ? 'sidebar-mode' : ''}`}>
+      {!sidebarMode && (
+        <div className="view-header">
+          <h2>Conversations</h2>
+          <div className="view-header-actions">
+            {archivedConversations.length > 0 && (
+              <button
+                className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
+                onClick={onToggleArchived}
+              >
+                {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
+              </button>
+            )}
+            <button id="new-conv-btn" className="btn-primary" onClick={onNewConversation}>
+              + New
             </button>
-          )}
-          <button id="new-conv-btn" className="btn-primary" onClick={onNewConversation}>
-            + New
+          </div>
+        </div>
+      )}
+      {sidebarMode && archivedConversations.length > 0 && (
+        <div className="sidebar-archive-toggle">
+          <button
+            className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
+            onClick={onToggleArchived}
+          >
+            {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
           </button>
         </div>
-      </div>
+      )}
 
       <ul id="conv-list">
         {displayList.length === 0 ? (
@@ -90,7 +106,7 @@ export function ConversationList({
           displayList.map((conv) => (
             <li
               key={conv.id}
-              className={`conv-item ${expandedId === conv.id ? 'expanded' : ''} ${selectedId === conv.id ? 'keyboard-selected' : ''}`}
+              className={`conv-item ${expandedId === conv.id ? 'expanded' : ''} ${selectedId === conv.id ? 'keyboard-selected' : ''} ${activeSlug && conv.slug === activeSlug ? 'active' : ''}`}
               data-id={conv.id}
             >
               <div className="conv-item-main" onClick={() => handleClick(conv)}>

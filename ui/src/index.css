@@ -4562,3 +4562,399 @@ html * {
 .bottom-sheet-send {
   width: 100%;
 }
+
+/* ======================================================== */
+/* Desktop Sidebar Layout (REQ-UI-016, 017, 018)           */
+/* ======================================================== */
+
+.desktop-layout {
+  display: flex;
+  height: 100vh;
+  height: 100dvh;
+}
+
+.desktop-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* --- Expanded Sidebar --- */
+.sidebar-expanded {
+  width: 280px;
+  min-width: 280px;
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  overflow: hidden;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 8px;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  color: var(--text-primary);
+}
+
+.sidebar-brand:hover {
+  background: var(--bg-tertiary);
+}
+
+.sidebar-logo {
+  width: 24px;
+  height: 24px;
+}
+
+.sidebar-brand-text {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sidebar-header .sidebar-new-btn {
+  font-size: 13px;
+  padding: 4px 12px;
+}
+
+.sidebar-header .sidebar-new-btn.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.sidebar-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Sidebar mode overrides for ConversationList */
+.sidebar-mode {
+  padding: 0 !important;
+}
+
+.sidebar-mode #conv-list {
+  padding: 0 8px;
+}
+
+.sidebar-mode .conv-item {
+  padding: 6px;
+  border-radius: 6px;
+  border: none;
+  margin-bottom: 2px;
+}
+
+.sidebar-mode .conv-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.sidebar-mode .conv-item.active {
+  background: var(--bg-tertiary);
+  border-left: 3px solid var(--accent-blue, #3b82f6);
+}
+
+.sidebar-mode .conv-item-main {
+  padding: 4px 6px;
+}
+
+.sidebar-mode .conv-item-slug {
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+
+.sidebar-mode .conv-item-meta {
+  font-size: 11px;
+}
+
+.sidebar-mode .conv-item-meta.secondary {
+  display: none;
+}
+
+.sidebar-mode .conv-item-menu-btn {
+  padding: 4px 6px;
+  font-size: 14px;
+}
+
+.sidebar-mode .conv-item-actions {
+  padding: 4px 6px;
+}
+
+.sidebar-archive-toggle {
+  padding: 4px 12px;
+}
+
+.sidebar-archive-toggle .archive-toggle {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+.sidebar-toggle-expanded {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  width: 100%;
+}
+
+.sidebar-toggle-expanded:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* --- Collapsed Sidebar --- */
+.sidebar-collapsed {
+  width: 48px;
+  min-width: 48px;
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  padding: 8px 0;
+  gap: 4px;
+}
+
+.sidebar-icon-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 16px;
+}
+
+.sidebar-icon-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.sidebar-icon-btn.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.sidebar-logo-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.sidebar-collapsed-dots {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 0;
+  overflow-y: auto;
+}
+
+.sidebar-dot-btn {
+  width: 32px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.sidebar-dot-btn:hover {
+  background: var(--bg-tertiary);
+}
+
+.sidebar-dot-btn.active {
+  background: var(--bg-tertiary);
+}
+
+.sidebar-toggle {
+  margin-top: auto;
+}
+
+/* --- Sidebar Inline New Form (REQ-UI-018) --- */
+.sidebar-new-form {
+  padding: 8px 12px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  flex-shrink: 0;
+}
+
+.sidebar-new-form-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.sidebar-new-form-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sidebar-new-form-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.sidebar-new-form-close:hover {
+  color: var(--text-primary);
+}
+
+.sidebar-new-form-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.sidebar-new-form-fields .settings-field {
+  margin-bottom: 0;
+}
+
+.sidebar-new-form-fields .settings-field-label {
+  font-size: 11px;
+}
+
+.sidebar-new-form-fields .settings-input,
+.sidebar-new-form-fields .settings-select {
+  font-size: 13px;
+  padding: 6px 8px;
+}
+
+.sidebar-new-form-textarea {
+  width: 100%;
+  min-height: 50px;
+  max-height: 100px;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  margin-bottom: 8px;
+  box-sizing: border-box;
+}
+
+.sidebar-new-form-textarea:focus {
+  outline: none;
+  border-color: var(--accent-blue, #3b82f6);
+}
+
+.sidebar-new-form-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.sidebar-new-form-bg {
+  flex: 1;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.sidebar-new-form-send {
+  flex: 1;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+/* --- Desktop main area overrides --- */
+.desktop-main #app {
+  height: 100%;
+}
+
+.desktop-main .list-page {
+  height: 100%;
+}
+
+.desktop-main .new-conv-page {
+  height: 100%;
+}
+
+/* Background toast */
+.bg-toast {
+  position: fixed;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent-green, #22c55e);
+  color: #fff;
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+  z-index: 1000;
+  animation: bg-toast-in 200ms ease;
+}
+
+@keyframes bg-toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* Send in Background button */
+.new-conv-send-bg {
+  background: none;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.new-conv-send-bg:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.new-conv-send-bg:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.new-conv-input-right {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
