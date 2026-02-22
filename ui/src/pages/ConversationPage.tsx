@@ -489,6 +489,7 @@ export function ConversationPage() {
         stateData={stateData}
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
+        conversationId={conversationId}
         {...(systemPrompt !== undefined && { systemPrompt })}
       />
       {convState === 'context_exhausted' && contextExhaustedSummary && (

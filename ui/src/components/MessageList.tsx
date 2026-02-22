@@ -16,6 +16,7 @@ interface MessageListProps {
   onRetry: (localId: string) => void;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string;
+  conversationId?: string | undefined;
 }
 
 const PREVIEW_LENGTH = 150;
@@ -23,11 +24,17 @@ const PREVIEW_LENGTH = 150;
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
 const SCROLL_THRESHOLD = 100;
 
-export function MessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile, systemPrompt }: MessageListProps) {
+const SCROLL_KEY_PREFIX = 'phoenix:scroll:';
+const MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
+
+export function MessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile, systemPrompt, conversationId }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
+  const [showJumpToNewest, setShowJumpToNewest] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const isPinnedToBottom = useRef(true); // Start pinned to bottom
   const prevMessagesLength = useRef(messages.length);
+  const scrollRestored = useRef(false);
+  const initialMessageCount = useRef<number | null>(null);
 
   // Check if user is near bottom of scroll
   const checkIfPinnedToBottom = useCallback(() => {
@@ -40,7 +47,10 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
   // Handle scroll events to track if user is pinned to bottom
   const handleScroll = useCallback(() => {
     isPinnedToBottom.current = checkIfPinnedToBottom();
-  }, [checkIfPinnedToBottom]);
+    if (showJumpToNewest && isPinnedToBottom.current) {
+      setShowJumpToNewest(false);
+    }
+  }, [checkIfPinnedToBottom, showJumpToNewest]);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback(() => {
@@ -80,6 +90,60 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
       });
     }
   }, [convState, scrollToBottom]);
+
+  // Save scroll position on unmount / visibility change (REQ-UI-013)
+  useEffect(() => {
+    if (!conversationId) return;
+    const saveScroll = () => {
+      const el = mainRef.current;
+      if (!el) return;
+      try {
+        localStorage.setItem(`${SCROLL_KEY_PREFIX}${conversationId}`, String(el.scrollTop));
+        localStorage.setItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`, String(messages.length));
+      } catch { /* storage full - degrade gracefully */ }
+    };
+    const onVisChange = () => {
+      if (document.visibilityState === 'hidden') saveScroll();
+    };
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisChange);
+      saveScroll(); // save on unmount (route change)
+    };
+  }, [conversationId, messages.length]);
+
+  // Restore scroll position on mount after messages render (REQ-UI-013)
+  useEffect(() => {
+    if (!conversationId || messages.length === 0 || scrollRestored.current) return;
+    scrollRestored.current = true;
+    const savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
+    const savedCount = localStorage.getItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`);
+    if (savedPos !== null) {
+      const pos = parseInt(savedPos, 10);
+      const prevCount = savedCount ? parseInt(savedCount, 10) : messages.length;
+      requestAnimationFrame(() => {
+        const el = mainRef.current;
+        if (!el) return;
+        el.scrollTop = pos;
+        isPinnedToBottom.current = checkIfPinnedToBottom();
+        // Show "jump to newest" if new messages arrived while away
+        if (messages.length > prevCount && !isPinnedToBottom.current) {
+          setShowJumpToNewest(true);
+        }
+      });
+    }
+    // Record initial message count for jump-to-newest logic
+    initialMessageCount.current = messages.length;
+  }, [conversationId, messages.length, checkIfPinnedToBottom]);
+
+  // Reset scrollRestored when conversation changes
+  useEffect(() => {
+    scrollRestored.current = false;
+    setShowJumpToNewest(false);
+    initialMessageCount.current = null;
+  }, [conversationId]);
+
+
 
   // Build a map of tool_use_id -> tool result for pairing
   const toolResults = new Map<string, Message>();
@@ -157,6 +221,14 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
           )}
         </div>
       </section>
+      {showJumpToNewest && (
+        <button
+          className="jump-to-newest"
+          onClick={() => { scrollToBottom(); setShowJumpToNewest(false); }}
+        >
+          ↓ New messages
+        </button>
+      )}
     </main>
   );
 }

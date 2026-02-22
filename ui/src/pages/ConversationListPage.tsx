@@ -7,6 +7,7 @@ import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
+import { NewConversationSheet } from '../components/NewConversationSheet';
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -34,6 +35,9 @@ export function ConversationListPage() {
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+
+  // Bottom sheet for new conversation on mobile (REQ-UI-015)
+  const [showNewSheet, setShowNewSheet] = useState(false);
 
   // Listen for storage warnings
   useEffect(() => {
@@ -103,6 +107,23 @@ export function ConversationListPage() {
     }
   }, [isReady, loadConversations]);
 
+  // Periodic refresh for live state indicators (REQ-UI-012)
+  useEffect(() => {
+    if (!isReady) return;
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        // Silent refresh - don't show loading state
+        api.listConversations().then(freshActive => {
+          setConversations(freshActive);
+        }).catch(() => {/* silent */});
+        api.listArchivedConversations().then(freshArchived => {
+          setArchivedConversations(freshArchived);
+        }).catch(() => {/* silent */});
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isReady]);
+
   // Restore scroll position after data loads
   useEffect(() => {
     if (!loading && !scrollRestoredRef.current && conversations.length > 0) {
@@ -122,7 +143,12 @@ export function ConversationListPage() {
   }, [navigate]);
 
   const handleNewConversation = () => {
-    navigate('/new');
+    // Mobile: show bottom sheet. Desktop: navigate to /new page.
+    if (window.matchMedia('(max-width: 767px)').matches) {
+      setShowNewSheet(true);
+    } else {
+      navigate('/new');
+    }
   };
 
   const handleArchive = async (conv: Conversation) => {
@@ -302,6 +328,10 @@ export function ConversationListPage() {
           setRenameTarget(null);
           setRenameError(undefined);
         }}
+      />
+      <NewConversationSheet
+        isOpen={showNewSheet}
+        onClose={() => setShowNewSheet(false)}
       />
     </div>
   );
