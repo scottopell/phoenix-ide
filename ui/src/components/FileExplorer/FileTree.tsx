@@ -101,24 +101,30 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
   const [items, setItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() =>
-    loadExpansion(conversationId),
-  );
+  // Bundle conversationId + expandedPaths into a single atom so they can't desync.
+  // The save effect always sees a consistent (convId, paths) pair.
+  const [expansion, setExpansion] = useState(() => ({
+    convId: conversationId,
+    paths: loadExpansion(conversationId),
+  }));
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
   const [childItems, setChildItems] = useState<Map<string, FileItem[]>>(new Map());
 
-  // Persist expansion state
+  // When conversation changes, atomically load new expansion state
   useEffect(() => {
-    if (conversationId) {
-      saveExpansion(conversationId, expandedPaths);
-    }
-  }, [conversationId, expandedPaths]);
-
-  // Reload expansion state when conversation changes
-  useEffect(() => {
-    setExpandedPaths(loadExpansion(conversationId));
+    setExpansion({ convId: conversationId, paths: loadExpansion(conversationId) });
     setChildItems(new Map());
   }, [conversationId]);
+
+  // Persist — always correct because convId is part of the atom
+  useEffect(() => {
+    if (expansion.convId) {
+      saveExpansion(expansion.convId, expansion.paths);
+    }
+  }, [expansion]);
+
+  // Convenience alias
+  const expandedPaths = expansion.paths;
 
   // Load root directory contents
   useEffect(() => {
@@ -160,8 +166,8 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
 
   // Toggle folder expansion
   const toggleExpand = useCallback((path: string) => {
-    setExpandedPaths(prev => {
-      const next = new Set(prev);
+    setExpansion(prev => {
+      const next = new Set(prev.paths);
       if (next.has(path)) {
         next.delete(path);
       } else {
@@ -170,7 +176,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
           loadChildren(path);
         }
       }
-      return next;
+      return { ...prev, paths: next };
     });
   }, [childItems, loadChildren]);
 
