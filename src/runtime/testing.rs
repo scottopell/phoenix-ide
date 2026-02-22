@@ -790,11 +790,7 @@ mod tests {
 
         // Should only have user message - LLM response was discarded
         let msgs = storage.get_all_messages("test-conv");
-        assert_eq!(
-            msgs.len(),
-            1,
-            "Should only have user message, got {msgs:?}"
-        );
+        assert_eq!(msgs.len(), 1, "Should only have user message, got {msgs:?}");
         assert_eq!(msgs[0].message_type, MessageType::User);
     }
 

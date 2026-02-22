@@ -214,9 +214,10 @@ impl ModelRegistry {
     /// Get the context window size for a model (REQ-BED-022)
     pub fn context_window(&self, model_id: &str) -> usize {
         // Look up in stored specs (includes both hardcoded and dynamic)
-        self.specs
-            .get(model_id)
-            .map_or(crate::state_machine::state::DEFAULT_CONTEXT_WINDOW, |spec| spec.context_window)
+        self.specs.get(model_id).map_or(
+            crate::state_machine::state::DEFAULT_CONTEXT_WINDOW,
+            |spec| spec.context_window,
+        )
     }
 
     /// List all available model IDs

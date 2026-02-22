@@ -21,7 +21,7 @@ impl DiscoveredModel {
     /// Convert discovered model to `ModelSpec`
     pub fn to_model_spec(&self) -> super::ModelSpec {
         use super::{ApiFormat, ModelSpec, Provider};
-        
+
         // Infer provider from string
         let provider = match self.provider.as_str() {
             "Anthropic" => Provider::Anthropic,
@@ -32,21 +32,19 @@ impl DiscoveredModel {
                 Provider::OpenAI
             }
         };
-        
+
         // Infer API format from provider
         let api_format = match provider {
             Provider::Anthropic => ApiFormat::Anthropic,
             Provider::OpenAI | Provider::Fireworks => ApiFormat::OpenAIChat,
         };
-        
+
         // Use display_name or id for description
-        let description = self.display_name
-            .clone()
-            .unwrap_or_else(|| self.id.clone());
-        
+        let description = self.display_name.clone().unwrap_or_else(|| self.id.clone());
+
         // Default context window if not provided
         let context_window = self.context_length.unwrap_or(128_000);
-        
+
         ModelSpec {
             id: self.id.clone(),
             api_name: self.id.clone(), // Gateway models use same name

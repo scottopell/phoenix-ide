@@ -27,22 +27,11 @@ impl LlmService for LlmServiceImpl {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         match self.spec.api_format {
             ApiFormat::Anthropic => {
-                anthropic::complete(
-                    &self.spec,
-                    &self.api_key,
-                    self.gateway.as_deref(),
-                    request,
-                )
-                .await
+                anthropic::complete(&self.spec, &self.api_key, self.gateway.as_deref(), request)
+                    .await
             }
             ApiFormat::OpenAIChat => {
-                openai::complete(
-                    &self.spec,
-                    &self.api_key,
-                    self.gateway.as_deref(),
-                    request,
-                )
-                .await
+                openai::complete(&self.spec, &self.api_key, self.gateway.as_deref(), request).await
             }
         }
     }

@@ -457,12 +457,10 @@ mod proptests {
             // Only tool_use
             (1..=3usize).prop_flat_map(|n| {
                 proptest::collection::vec(
-                    ("[a-z]{3,8}".prop_map(|s| s.clone())).prop_map(|name| {
-                        ContentBlock::ToolUse {
-                            id: format!("tool-{name}"),
-                            name,
-                            input: json!({}),
-                        }
+                    ("[a-z]{3,8}".prop_map(|s| s.clone())).prop_map(|name| ContentBlock::ToolUse {
+                        id: format!("tool-{name}"),
+                        name,
+                        input: json!({}),
                     }),
                     n,
                 )

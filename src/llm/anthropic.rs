@@ -80,11 +80,7 @@ fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicReq
         })
         .collect();
 
-    let messages: Vec<AnthropicMessage> = request
-        .messages
-        .iter()
-        .map(translate_message)
-        .collect();
+    let messages: Vec<AnthropicMessage> = request.messages.iter().map(translate_message).collect();
 
     let tools: Vec<AnthropicTool> = request
         .tools
@@ -292,13 +288,13 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    
+
     pub(crate) fn normalize_response(
         resp: AnthropicResponse,
     ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
         super::normalize_response(resp)
     }
-    
+
     pub(crate) fn translate_message(msg: &crate::llm::types::LlmMessage) -> AnthropicMessage {
         super::translate_message(msg)
     }

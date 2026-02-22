@@ -47,9 +47,7 @@ fn resolve_endpoint(spec: &ModelSpec, gateway: Option<&str>) -> String {
             format!("{}/openai/v1/chat/completions", gw.trim_end_matches('/'))
         }
         // Direct Fireworks
-        (None, true, _) => {
-            "https://api.fireworks.ai/inference/v1/chat/completions".to_string()
-        }
+        (None, true, _) => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
         // Direct OpenAI responses API
         (None, false, true) => "https://api.openai.com/v1/responses".to_string(),
         // Direct OpenAI chat API
@@ -64,10 +62,7 @@ fn uses_responses_api(api_name: &str) -> bool {
 
 /// Models that use `max_completion_tokens` instead of `max_tokens`.
 fn uses_max_completion_tokens(api_name: &str) -> bool {
-    matches!(
-        api_name,
-        "o4-mini" | "gpt-5" | "gpt-5-mini" | "gpt-5.1"
-    )
+    matches!(api_name, "o4-mini" | "gpt-5" | "gpt-5-mini" | "gpt-5.1")
 }
 
 // ---------------------------------------------------------------------------
@@ -126,9 +121,8 @@ async fn complete_chat_api(
         return Err(LlmError::unknown(format!("HTTP {status} error: {body}")));
     }
 
-    let openai_response: OpenAIResponse = serde_json::from_str(&body).map_err(|e| {
-        LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
-    })?;
+    let openai_response: OpenAIResponse = serde_json::from_str(&body)
+        .map_err(|e| LlmError::unknown(format!("Failed to parse response: {e} - body: {body}")))?;
 
     normalize_response(openai_response)
 }
@@ -189,10 +183,8 @@ async fn complete_responses_api(
         return Err(LlmError::unknown(format!("HTTP {status} error: {body}")));
     }
 
-    let responses_response: ResponsesApiResponse =
-        serde_json::from_str(&body).map_err(|e| {
-            LlmError::unknown(format!("Failed to parse response: {e} - body: {body}"))
-        })?;
+    let responses_response: ResponsesApiResponse = serde_json::from_str(&body)
+        .map_err(|e| LlmError::unknown(format!("Failed to parse response: {e} - body: {body}")))?;
 
     Ok(normalize_responses_api_response(responses_response))
 }
@@ -391,10 +383,7 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
-fn translate_to_responses_request(
-    api_name: &str,
-    request: &LlmRequest,
-) -> ResponsesApiRequest {
+fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> ResponsesApiRequest {
     let mut input_items = Vec::new();
 
     // Add system prompt as instructions
@@ -818,13 +807,13 @@ pub(crate) struct ResponsesApiUsage {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    
+
     pub(crate) fn normalize_response(
         resp: OpenAIResponse,
     ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
         super::normalize_response(resp)
     }
-    
+
     pub(crate) fn translate_message(msg: &crate::llm::types::LlmMessage) -> Vec<OpenAIMessage> {
         super::translate_message(msg)
     }
