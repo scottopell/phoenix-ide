@@ -5,7 +5,7 @@ import { ImageAttachments } from '../components/ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from '../components/VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { generateUUID } from '../utils/uuid';
-import type { ModelsResponse, ImageData } from '../api';
+import type { ModelsResponse, ModelInfo, ImageData } from '../api';
 
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
@@ -22,7 +22,8 @@ const DIR_STATUS_CONFIG = {
 // Settings fields component - reused in both layouts
 function SettingsFields({
   cwd, setCwd, dirStatus, dirStatusClass,
-  selectedModel, setSelectedModel, models
+  selectedModel, setSelectedModel, models,
+  showAllModels, setShowAllModels
 }: {
   cwd: string;
   setCwd: (v: string) => void;
@@ -31,7 +32,27 @@ function SettingsFields({
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
   models: ModelsResponse | null;
+  showAllModels: boolean;
+  setShowAllModels: (v: boolean) => void;
 }) {
+  // Filter and group models
+  const filteredModels = models?.models.filter(m => showAllModels || m.recommended) || [];
+  const totalCount = models?.models.length || 0;
+  const recommendedCount = models?.models.filter(m => m.recommended).length || 0;
+  
+  // Group by provider when showing all
+  const groupedModels: Record<string, ModelInfo[]> = {};
+  if (showAllModels) {
+    filteredModels.forEach(m => {
+      const providerGroup = groupedModels[m.provider];
+      if (!providerGroup) {
+        groupedModels[m.provider] = [m];
+      } else {
+        providerGroup.push(m);
+      }
+    });
+  }
+
   return (
     <>
       <label className="settings-field">
@@ -57,10 +78,39 @@ function SettingsFields({
           onChange={(e) => setSelectedModel(e.target.value)}
           disabled={!models}
         >
-          {models?.models.map(m => (
-            <option key={m.id} value={m.id}>{m.id}</option>
-          ))}
+          {!showAllModels ? (
+            // Show only recommended models (ungrouped)
+            filteredModels.map(m => (
+              <option key={m.id} value={m.id}>
+                {m.id}
+              </option>
+            ))
+          ) : (
+            // Show all models grouped by provider
+            Object.entries(groupedModels)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([provider, providerModels]) => (
+                <optgroup key={provider} label={provider}>
+                  {providerModels.map(m => (
+                    <option key={m.id} value={m.id}>
+                      {m.recommended ? '★ ' : ''}{m.id}
+                    </option>
+                  ))}
+                </optgroup>
+              ))
+          )}
         </select>
+        <label className="model-filter-toggle">
+          <input
+            type="checkbox"
+            checked={showAllModels}
+            onChange={(e) => setShowAllModels(e.target.checked)}
+          />
+          <span>
+            Show all models ({totalCount})
+            {!showAllModels && ` · ${recommendedCount} recommended`}
+          </span>
+        </label>
       </label>
     </>
   );
@@ -81,6 +131,7 @@ export function NewConversationPage() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAllModels, setShowAllModels] = useState(false);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -240,7 +291,7 @@ export function NewConversationPage() {
   const buttonText = creating ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
   const textareaValue = interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft;
 
-  const settingsProps = { cwd, setCwd, dirStatus, dirStatusClass, selectedModel, setSelectedModel, models };
+  const settingsProps = { cwd, setCwd, dirStatus, dirStatusClass, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
 
   return (
     <div className="new-conv-page">

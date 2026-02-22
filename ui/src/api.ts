@@ -129,6 +129,7 @@ export interface ModelInfo {
   provider: string;
   description: string;
   context_window: number;
+  recommended: boolean;
 }
 
 export interface ModelsResponse {

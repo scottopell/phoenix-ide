@@ -4079,6 +4079,25 @@ html * {
   cursor: pointer;
 }
 
+.model-filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.model-filter-toggle input[type="checkbox"] {
+  cursor: pointer;
+}
+
+.model-filter-toggle:hover {
+  color: var(--text-primary);
+}
+
 /* New conversation page - restructured layout */
 .new-conv-main {
   flex: 1;
