@@ -113,33 +113,33 @@ async function sendInBackground(data: NewConvData) {
 ## Acceptance Criteria
 
 **REQ-UI-016 (Sidebar Layout):**
-- [ ] Sidebar visible on viewports > 1024px
-- [ ] Phoenix icon at top, clicking navigates to `/`
-- [ ] "+ New" button below icon
-- [ ] Conversation list with state indicators (green/yellow/red dots)
-- [ ] Active conversation highlighted
-- [ ] Clicking conversation switches main content without full-page reload
-- [ ] Sidebar collapsible to icon strip via toggle button
-- [ ] Collapsed state shows state dots for recent conversations
-- [ ] Collapse preference persisted in localStorage
+- [x] Sidebar visible on viewports > 1024px
+- [x] Phoenix icon at top, clicking navigates to `/`
+- [x] "+ New" button below icon
+- [x] Conversation list with state indicators (green/yellow/red dots)
+- [x] Active conversation highlighted
+- [x] Clicking conversation switches main content without full-page reload
+- [x] Sidebar collapsible to icon strip via toggle button
+- [x] Collapsed state shows state dots for recent conversations
+- [x] Collapse preference persisted in localStorage
 
 **REQ-UI-017 (Full Page Mode):**
-- [ ] Route `/` renders NewConversationPage in main content area
-- [ ] Sidebar visible with no active conversation highlighted
-- [ ] "+ New" click is no-op when on `/`
-- [ ] Form has Send and Send in Background buttons
-- [ ] Send creates conversation and navigates to it
-- [ ] Send in Background creates conversation, stays on `/`, shows toast
+- [x] Route `/` renders NewConversationPage in main content area
+- [x] Sidebar visible with no active conversation highlighted
+- [x] "+ New" click is no-op when on `/`
+- [x] Form has Send and Send in Background buttons
+- [x] Send creates conversation and navigates to it
+- [x] Send in Background creates conversation, stays on `/`, shows toast
 
 **REQ-UI-018 (Inline Sidebar Mode):**
-- [ ] "+ New" from `/c/:slug` expands inline form at top of sidebar
-- [ ] Current conversation remains visible in main content
-- [ ] Form has directory, model, message fields
-- [ ] Form has Send and Send in Background buttons
-- [ ] Send creates, navigates, collapses form
-- [ ] Send in Background creates, stays on current conversation, collapses form, shows toast
-- [ ] Cancel button and Escape key dismiss form without action
+- [x] "+ New" from `/c/:slug` expands inline form at top of sidebar
+- [x] Current conversation remains visible in main content
+- [x] Form has directory, model, message fields
+- [x] Form has Send and Send in Background buttons
+- [x] Send creates, navigates, collapses form
+- [x] Send in Background creates, stays on current conversation, collapses form, shows toast
+- [x] Cancel button and Escape key dismiss form without action
 
 **General:**
-- [ ] Below 1024px: no sidebar, current mobile/tablet behavior unchanged
-- [ ] No regressions to existing conversation or new conversation flows
+- [x] Below 1024px: no sidebar, current mobile/tablet behavior unchanged
+- [x] No regressions to existing conversation or new conversation flows

@@ -75,10 +75,10 @@ This task covers UI improvements that do NOT depend on the Command Palette:
 
 ## Acceptance Criteria
 
-- [ ] Conversation list shows state indicator dots with correct colors
-- [ ] State updates within 10 seconds when conversation state changes
-- [ ] Scroll position preserved when switching between conversations
-- [ ] "Jump to newest" affordance appears when returning to conversation with new messages
-- [ ] Messages readable on 1440px+ wide displays (constrained width)
-- [ ] New conversation on mobile opens as bottom sheet, not full page
-- [ ] Bottom sheet dismissible via swipe-down or backdrop tap
+- [x] Conversation list shows state indicator dots with correct colors
+- [x] State updates within 10 seconds when conversation state changes
+- [x] Scroll position preserved when switching between conversations
+- [x] "Jump to newest" affordance appears when returning to conversation with new messages
+- [x] Messages readable on 1440px+ wide displays (constrained width)
+- [x] New conversation on mobile opens as bottom sheet, not full page
+- [x] Bottom sheet dismissible via swipe-down or backdrop tap
