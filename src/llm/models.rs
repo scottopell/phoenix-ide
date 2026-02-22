@@ -51,6 +51,8 @@ pub struct ModelDef {
     pub description: &'static str,
     /// Context window size in tokens
     pub context_window: usize,
+    /// Recommended for most users (shown by default in UI)
+    pub recommended: bool,
     /// Factory function to create the service
     #[allow(clippy::type_complexity)]
     pub factory: fn(&str, Option<&str>) -> Result<Arc<dyn LlmService>, String>,
@@ -67,6 +69,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "claude-opus-4-5-20251101",
             description: "Claude Opus 4.5 (most capable, slower)",
             context_window: 200_000,
+            recommended: true,
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
@@ -85,6 +88,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "claude-sonnet-4-5-20250929",
             description: "Claude Sonnet 4.5 (balanced performance)",
             context_window: 200_000,
+            recommended: true,
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
@@ -105,6 +109,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "claude-sonnet-4-20250514",
             description: "Claude 3.5 Sonnet (legacy)",
             context_window: 200_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
@@ -125,6 +130,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "claude-haiku-4-5-20251001",
             description: "Claude Haiku 4.5 (fast, efficient)",
             context_window: 200_000,
+            recommended: true,
             factory: |api_key, gateway| {
                 // Accept any non-empty key (including "implicit" for gateway mode)
                 if api_key.is_empty() {
@@ -149,6 +155,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-4o",
             description: "GPT-4o (balanced, multimodal)",
             context_window: 128_000,
+            recommended: true,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-4o requires OPENAI_API_KEY or gateway".to_string());
@@ -166,6 +173,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-4o-mini",
             description: "GPT-4o Mini (fast, efficient)",
             context_window: 128_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-4o-mini requires OPENAI_API_KEY or gateway".to_string());
@@ -183,6 +191,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "o4-mini",
             description: "O4-Mini (reasoning model)",
             context_window: 200_000,
+            recommended: true,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("o4-mini requires OPENAI_API_KEY or gateway".to_string());
@@ -201,6 +210,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-5",
             description: "GPT-5 (reasoning model)",
             context_window: 128_000,
+            recommended: true,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-5 requires OPENAI_API_KEY or gateway".to_string());
@@ -218,6 +228,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-5-mini",
             description: "GPT-5 Mini (fast reasoning)",
             context_window: 128_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-5-mini requires OPENAI_API_KEY or gateway".to_string());
@@ -235,6 +246,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-5.1",
             description: "GPT-5.1 (latest GPT-5)",
             context_window: 128_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-5.1 requires OPENAI_API_KEY or gateway".to_string());
@@ -253,6 +265,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-5-codex",
             description: "GPT-5 Codex (code generation)",
             context_window: 200_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-5-codex requires OPENAI_API_KEY or gateway".to_string());
@@ -270,6 +283,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-5.1-codex",
             description: "GPT-5.1 Codex (advanced code)",
             context_window: 200_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-5.1-codex requires OPENAI_API_KEY or gateway".to_string());
@@ -287,6 +301,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "gpt-5.2-codex",
             description: "GPT-5.2 Codex (latest code model)",
             context_window: 200_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err("gpt-5.2-codex requires OPENAI_API_KEY or gateway".to_string());
@@ -305,6 +320,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "accounts/fireworks/models/glm-4p7",
             description: "GLM-4P7 on Fireworks",
             context_window: 128_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err(
@@ -324,6 +340,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
             description: "Qwen3 Coder 480B on Fireworks",
             context_window: 128_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err(
@@ -343,6 +360,7 @@ pub fn all_models() -> &'static [ModelDef] {
             api_name: "accounts/fireworks/models/deepseek-v3p1",
             description: "DeepSeek V3 on Fireworks",
             context_window: 128_000,
+            recommended: false,
             factory: |api_key, gateway| {
                 if api_key.is_empty() {
                     return Err(

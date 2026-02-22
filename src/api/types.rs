@@ -153,6 +153,7 @@ pub struct ModelInfo {
     pub provider: String,
     pub description: String,
     pub context_window: usize,
+    pub recommended: bool,
 }
 
 /// Response for model list

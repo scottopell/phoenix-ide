@@ -216,6 +216,7 @@ impl ModelRegistry {
                     provider: model_def.provider.display_name().to_string(),
                     description: model_def.description.to_string(),
                     context_window: model_def.context_window,
+                    recommended: model_def.recommended,
                 });
             }
         }
