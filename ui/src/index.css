@@ -2159,6 +2159,7 @@ pre:hover .copy-btn {
 
 /* Context exhausted banner (REQ-BED-021) */
 .context-exhausted-banner {
+  flex: 0 0 auto;
   background: var(--bg-secondary);
   border: 1px solid var(--accent-yellow);
   border-radius: 8px;

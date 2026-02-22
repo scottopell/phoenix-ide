@@ -555,7 +555,7 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => setConvState('idle')}
         />
-      ) : (
+      ) : convState !== 'context_exhausted' ? (
       <InputArea
         ref={inputRef}
         conversationId={conversationId}
@@ -571,7 +571,7 @@ export function ConversationPage() {
         onRetry={handleRetry}
         onOpenFileBrowser={handleOpenFileBrowser}
       />
-      )}
+      ) : null}
       <BreadcrumbBar
         breadcrumbs={breadcrumbs}
         visible={breadcrumbs.length > 0}

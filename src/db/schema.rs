@@ -100,7 +100,14 @@ pub struct Conversation {
 impl Conversation {
     /// Check if the agent is currently working
     pub fn is_agent_working(&self) -> bool {
-        !matches!(self.state, ConvState::Idle | ConvState::Error { .. })
+        !matches!(
+            self.state,
+            ConvState::Idle
+                | ConvState::Error { .. }
+                | ConvState::ContextExhausted { .. }
+                | ConvState::Completed { .. }
+                | ConvState::Failed { .. }
+        )
     }
 }
 
