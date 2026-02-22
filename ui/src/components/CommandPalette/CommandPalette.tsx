@@ -190,7 +190,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
         }
       }}
     >
-      <div className="cp-container" onKeyDown={handleKeyDown}>
+      <div className="cp-container">
         <CommandPaletteInput
           value={state.rawInput}
           mode={state.mode}
