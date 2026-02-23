@@ -38,26 +38,25 @@ fn resolve_endpoint(spec: &ModelSpec, gateway: Option<&str>) -> String {
                 gw.trim_end_matches('/')
             )
         }
-        // OpenAI responses API via gateway (codex models)
-        (Some(gw), false, true) => {
+        // OpenAI responses API via gateway
+        (Some(gw), false, _) => {
             format!("{}/openai/v1/responses", gw.trim_end_matches('/'))
-        }
-        // OpenAI chat API via gateway
-        (Some(gw), false, false) => {
-            format!("{}/openai/v1/chat/completions", gw.trim_end_matches('/'))
         }
         // Direct Fireworks
         (None, true, _) => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
         // Direct OpenAI responses API
-        (None, false, true) => "https://api.openai.com/v1/responses".to_string(),
-        // Direct OpenAI chat API
-        (None, false, false) => "https://api.openai.com/v1/chat/completions".to_string(),
+        (None, false, _) => "https://api.openai.com/v1/responses".to_string(),
     }
 }
 
-/// Codex models use the v1/responses endpoint instead of chat/completions.
+/// All non-Fireworks models use the v1/responses endpoint.
 fn uses_responses_api(api_name: &str) -> bool {
-    api_name.contains("codex")
+    !is_fireworks_model(api_name)
+}
+
+/// Fireworks models are identified by their api_name prefix.
+fn is_fireworks_model(api_name: &str) -> bool {
+    api_name.starts_with("accounts/fireworks/")
 }
 
 /// Models that use `max_completion_tokens` instead of `max_tokens`.
@@ -385,9 +384,10 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
 fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> ResponsesApiRequest {
+    use super::types::ImageSource;
+
     let mut input_items = Vec::new();
 
-    // Add system prompt as instructions
     let instructions = if request.system.is_empty() {
         None
     } else {
@@ -401,59 +401,100 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
         )
     };
 
-    // Process messages into conversation items
+    // Process each message as a unit to allow grouping text + images
     for msg in &request.messages {
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
         };
 
+        let mut text_blocks: Vec<&str> = vec![];
+        let mut image_blocks: Vec<&ImageSource> = vec![];
+        let mut tool_calls: Vec<&ContentBlock> = vec![];
+        let mut tool_results: Vec<&ContentBlock> = vec![];
+
         for block in &msg.content {
             match block {
-                ContentBlock::Text { text } => {
-                    input_items.push(ResponsesApiInputItem::Message {
-                        role: role.to_string(),
-                        content: text.clone(),
+                ContentBlock::Text { text } => text_blocks.push(text),
+                ContentBlock::Image { source } => image_blocks.push(source),
+                ContentBlock::ToolUse { .. } => tool_calls.push(block),
+                ContentBlock::ToolResult { .. } => tool_results.push(block),
+            }
+        }
+
+        // Emit single Message item for text + image content
+        if !text_blocks.is_empty() || !image_blocks.is_empty() {
+            let content = if image_blocks.is_empty() {
+                ResponsesApiMessageContent::Text(text_blocks.join("\n"))
+            } else {
+                let mut parts: Vec<ResponsesApiContentPart> = text_blocks
+                    .iter()
+                    .map(|t| ResponsesApiContentPart::InputText {
+                        text: (*t).to_string(),
+                    })
+                    .collect();
+                for source in &image_blocks {
+                    let ImageSource::Base64 { media_type, data } = source;
+                    parts.push(ResponsesApiContentPart::InputImage {
+                        image_url: format!("data:{media_type};base64,{data}"),
                     });
                 }
-                ContentBlock::ToolUse { id, name, input } => {
-                    input_items.push(ResponsesApiInputItem::FunctionCall {
-                        call_id: id.clone(),
-                        name: name.clone(),
-                        arguments: serde_json::to_string(input)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                    });
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    images,
-                    is_error,
-                } => {
-                    if !images.is_empty() {
-                        tracing::debug!(
-                            tool_use_id = %tool_use_id,
-                            n_images = images.len(),
-                            "dropping images from tool result — Responses API image support not yet implemented"
-                        );
+                ResponsesApiMessageContent::Parts(parts)
+            };
+            input_items.push(ResponsesApiInputItem::Message {
+                role: role.to_string(),
+                content,
+            });
+        }
+
+        // Emit FunctionCall items
+        for block in tool_calls {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                input_items.push(ResponsesApiInputItem::FunctionCall {
+                    call_id: id.clone(),
+                    name: name.clone(),
+                    arguments: serde_json::to_string(input)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                });
+            }
+        }
+
+        // Emit FunctionCallOutput items with image support
+        for block in tool_results {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                images,
+                is_error,
+            } = block
+            {
+                let text = if *is_error {
+                    format!("Error: {content}")
+                } else {
+                    content.clone()
+                };
+                let output = if images.is_empty() {
+                    ResponsesApiFunctionOutput::Text(text)
+                } else {
+                    let mut parts = vec![ResponsesApiOutputPart::Text { text }];
+                    for img in images {
+                        let ImageSource::Base64 { media_type, data } = img;
+                        parts.push(ResponsesApiOutputPart::ImageUrl {
+                            image_url: ResponsesApiImageUrl {
+                                url: format!("data:{media_type};base64,{data}"),
+                            },
+                        });
                     }
-                    let output = if *is_error {
-                        format!("Error: {content}")
-                    } else {
-                        content.clone()
-                    };
-                    input_items.push(ResponsesApiInputItem::FunctionCallOutput {
-                        call_id: tool_use_id.clone(),
-                        output,
-                    });
-                }
-                ContentBlock::Image { .. } => {
-                    tracing::warn!("Images not supported in Responses API");                }
+                    ResponsesApiFunctionOutput::Parts(parts)
+                };
+                input_items.push(ResponsesApiInputItem::FunctionCallOutput {
+                    call_id: tool_use_id.clone(),
+                    output,
+                });
             }
         }
     }
 
-    // Convert tools to responses API format
     let tools: Option<Vec<ResponsesApiTool>> = if request.tools.is_empty() {
         None
     } else {
@@ -744,9 +785,9 @@ struct OpenAIError {
 // Responses API types (for codex models)
 
 #[derive(Debug, Serialize)]
-struct ResponsesApiRequest {
+pub(crate) struct ResponsesApiRequest {
     model: String,
-    input: Vec<ResponsesApiInputItem>,
+    pub(crate) input: Vec<ResponsesApiInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -757,9 +798,9 @@ struct ResponsesApiRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
-enum ResponsesApiInputItem {
+pub(crate) enum ResponsesApiInputItem {
     #[serde(rename = "message")]
-    Message { role: String, content: String },
+    Message { role: String, content: ResponsesApiMessageContent },
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: String,
@@ -767,7 +808,45 @@ enum ResponsesApiInputItem {
         arguments: String,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: ResponsesApiFunctionOutput,
+    },
+}
+
+/// Message content: plain string when text-only, array of parts when images present
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ResponsesApiMessageContent {
+    Text(String),
+    Parts(Vec<ResponsesApiContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponsesApiContentPart {
+    InputText { text: String },
+    InputImage { image_url: String }, // "data:{media_type};base64,{data}"
+}
+
+/// Function call output: plain string when text-only, array of parts when images present
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ResponsesApiFunctionOutput {
+    Text(String),
+    Parts(Vec<ResponsesApiOutputPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponsesApiOutputPart {
+    Text { text: String },
+    ImageUrl { image_url: ResponsesApiImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponsesApiImageUrl {
+    pub(crate) url: String, // "data:{media_type};base64,{data}"
 }
 
 #[derive(Debug, Serialize)]
@@ -823,5 +902,12 @@ pub(crate) mod test_helpers {
 
     pub(crate) fn translate_message(msg: &crate::llm::types::LlmMessage) -> Vec<OpenAIMessage> {
         super::translate_message(msg)
+    }
+
+    pub fn translate_to_responses_request(
+        api_name: &str,
+        request: &crate::llm::types::LlmRequest,
+    ) -> ResponsesApiRequest {
+        super::translate_to_responses_request(api_name, request)
     }
 }

@@ -13,9 +13,10 @@
 use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
     self, OpenAIChoice, OpenAIContent, OpenAIFunctionCall, OpenAIMessage, OpenAIResponse,
-    OpenAIToolCall, OpenAIUsage,
+    OpenAIToolCall, OpenAIUsage, ResponsesApiContentPart, ResponsesApiFunctionOutput,
+    ResponsesApiInputItem, ResponsesApiMessageContent, ResponsesApiOutputPart,
 };
-use super::types::{ContentBlock, ImageSource, LlmMessage, MessageRole};
+use super::types::{ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole};
 use proptest::prelude::*;
 
 // ============================================================================
@@ -595,7 +596,7 @@ proptest! {
         }
     }
 
-    /// C — OpenAI: images have no effect on tool result wire format
+    /// C — OpenAI chat (Fireworks): images have no effect on tool result wire format
     #[test]
     fn prop_openai_tool_result_images_ignored(
         tool_use_id in "[a-z0-9_]{5,20}",
@@ -623,6 +624,169 @@ proptest! {
 
         let json_with = serde_json::to_value(&result_with).unwrap();
         let json_without = serde_json::to_value(&result_without).unwrap();
-        prop_assert_eq!(json_with, json_without, "OpenAI must ignore images in tool results");
+        prop_assert_eq!(json_with, json_without, "OpenAI chat must ignore images in tool results");
+    }
+}
+
+// ============================================================================
+// Group H — Responses API invariants
+// ============================================================================
+
+fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
+    LlmRequest {
+        system: vec![],
+        messages,
+        tools: vec![],
+        max_tokens: None,
+    }
+}
+
+proptest! {
+
+    /// H1 — Text-only user message → ResponsesApiMessageContent::Text
+    #[test]
+    fn prop_responses_text_only_message_is_string(
+        text in "[a-zA-Z0-9 _.!?,]{1,100}",
+    ) {
+        let msg = LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text { text: text.clone() }],
+        };
+        let req = make_llm_request(vec![msg]);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+
+        prop_assert_eq!(responses_req.input.len(), 1);
+        if let ResponsesApiInputItem::Message { content, .. } = &responses_req.input[0] {
+            prop_assert!(
+                matches!(content, ResponsesApiMessageContent::Text(_)),
+                "Expected Text content for text-only message"
+            );
+        } else {
+            prop_assert!(false, "Expected Message item");
+        }
+    }
+
+    /// H2 — User message with image → Parts containing InputImage with correct data URL
+    #[test]
+    fn prop_responses_message_with_image_uses_parts(
+        text in "[a-zA-Z0-9 _.!?,]{1,50}",
+        media_type in prop_oneof![Just("image/png".to_string()), Just("image/jpeg".to_string())],
+        data in "[a-zA-Z0-9+/]{10,50}",
+    ) {
+        let msg = LlmMessage {
+            role: MessageRole::User,
+            content: vec![
+                ContentBlock::Text { text: text.clone() },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    },
+                },
+            ],
+        };
+        let req = make_llm_request(vec![msg]);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+
+        prop_assert_eq!(responses_req.input.len(), 1);
+        if let ResponsesApiInputItem::Message { content, .. } = &responses_req.input[0] {
+            if let ResponsesApiMessageContent::Parts(parts) = content {
+                let expected_url = format!("data:{media_type};base64,{data}");
+                let has_image = parts.iter().any(|p| {
+                    matches!(p, ResponsesApiContentPart::InputImage { image_url }
+                        if image_url == &expected_url)
+                });
+                prop_assert!(has_image, "Parts must contain InputImage with correct data URL");
+            } else {
+                prop_assert!(false, "Expected Parts content for message with image");
+            }
+        } else {
+            prop_assert!(false, "Expected Message item");
+        }
+    }
+
+    /// H3 — Tool result without images → FunctionCallOutput { output: Text(_) }
+    #[test]
+    fn prop_responses_tool_result_no_images_is_text(
+        tool_use_id in "[a-z0-9_]{5,20}",
+        content in "[a-zA-Z0-9 _.!?,]{0,100}",
+        is_error in any::<bool>(),
+    ) {
+        let msg = LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content,
+                images: vec![],
+                is_error,
+            }],
+        };
+        let req = make_llm_request(vec![msg]);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+
+        prop_assert_eq!(responses_req.input.len(), 1);
+        if let ResponsesApiInputItem::FunctionCallOutput { output, .. } = &responses_req.input[0] {
+            prop_assert!(
+                matches!(output, ResponsesApiFunctionOutput::Text(_)),
+                "Expected Text output for no-image tool result"
+            );
+        } else {
+            prop_assert!(false, "Expected FunctionCallOutput item");
+        }
+    }
+
+    /// H4 — Tool result with N images → Parts(N+1): Parts[0] is Text, Parts[1..] are ImageUrl
+    ///      with correct data URLs
+    #[test]
+    fn prop_responses_tool_result_with_images_uses_parts(
+        tool_use_id in "[a-z0-9_]{5,20}",
+        content in "[a-zA-Z0-9 _.!?,]{0,100}",
+        is_error in any::<bool>(),
+        images in proptest::collection::vec(arb_image_source(), 1..3usize),
+    ) {
+        let n_images = images.len();
+        let expected_urls: Vec<String> = images
+            .iter()
+            .map(|ImageSource::Base64 { media_type, data }| {
+                format!("data:{media_type};base64,{data}")
+            })
+            .collect();
+
+        let msg = LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content,
+                images,
+                is_error,
+            }],
+        };
+        let req = make_llm_request(vec![msg]);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+
+        prop_assert_eq!(responses_req.input.len(), 1);
+        if let ResponsesApiInputItem::FunctionCallOutput { output, .. } = &responses_req.input[0] {
+            if let ResponsesApiFunctionOutput::Parts(parts) = output {
+                prop_assert_eq!(parts.len(), 1 + n_images, "Expected 1 text + {} image parts", n_images);
+                prop_assert!(
+                    matches!(&parts[0], ResponsesApiOutputPart::Text { .. }),
+                    "Parts[0] must be Text"
+                );
+                for (i, expected_url) in expected_urls.iter().enumerate() {
+                    if let ResponsesApiOutputPart::ImageUrl { image_url } = &parts[1 + i] {
+                        prop_assert_eq!(
+                            &image_url.url, expected_url,
+                            "ImageUrl data URL mismatch at index {}", i
+                        );
+                    } else {
+                        prop_assert!(false, "Parts[{}] must be ImageUrl", 1 + i);
+                    }
+                }
+            } else {
+                prop_assert!(false, "Expected Parts output for tool result with images");
+            }
+        } else {
+            prop_assert!(false, "Expected FunctionCallOutput item");
+        }
     }
 }
