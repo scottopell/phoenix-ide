@@ -49,7 +49,7 @@ fn uses_responses_api(api_name: &str) -> bool {
     !is_fireworks_model(api_name)
 }
 
-/// Fireworks models are identified by their api_name prefix.
+/// Fireworks models are identified by their `api_name` prefix.
 fn is_fireworks_model(api_name: &str) -> bool {
     api_name.starts_with("accounts/fireworks/")
 }
@@ -378,6 +378,7 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
+#[allow(clippy::too_many_lines)] // single-pass message translation; splitting would add indirection without clarity
 fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> ResponsesApiRequest {
     use super::types::ImageSource;
 
