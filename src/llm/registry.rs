@@ -122,6 +122,18 @@ impl ModelRegistry {
             }
         }
 
+        // Guard: if no hardcoded model matched anything in the discovery list, the
+        // gateway is returning an unrecognized format (e.g. provider-prefixed IDs,
+        // Vertex AI models, etc.).  Fall back to the full hardcoded list rather than
+        // poisoning the registry with hundreds of unusable dynamic entries.
+        if registered_ids.is_empty() {
+            tracing::warn!(
+                discovered = discovered.len(),
+                "No known models found in gateway discovery; falling back to hardcoded list"
+            );
+            return Self::new(config);
+        }
+
         // Then, create services for any discovered models not in hardcoded list
         for (model_id, discovered_model) in &discovered {
             if !registered_ids.contains(model_id) {
