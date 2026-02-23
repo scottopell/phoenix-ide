@@ -28,24 +28,19 @@ pub async fn complete(
 /// Determine the full endpoint URL based on provider, model, and gateway.
 fn resolve_endpoint(spec: &ModelSpec, gateway: Option<&str>) -> String {
     let is_fireworks = spec.provider == Provider::Fireworks;
-    let is_responses = uses_responses_api(&spec.api_name);
 
-    match (gateway, is_fireworks, is_responses) {
+    match (gateway, is_fireworks) {
         // Fireworks via gateway
-        (Some(gw), true, _) => {
-            format!(
-                "{}/fireworks/inference/v1/chat/completions",
-                gw.trim_end_matches('/')
-            )
-        }
-        // OpenAI responses API via gateway
-        (Some(gw), false, _) => {
-            format!("{}/openai/v1/responses", gw.trim_end_matches('/'))
-        }
+        (Some(gw), true) => format!(
+            "{}/fireworks/inference/v1/chat/completions",
+            gw.trim_end_matches('/')
+        ),
+        // OpenAI via gateway — always responses endpoint
+        (Some(gw), false) => format!("{}/openai/v1/responses", gw.trim_end_matches('/')),
         // Direct Fireworks
-        (None, true, _) => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
-        // Direct OpenAI responses API
-        (None, false, _) => "https://api.openai.com/v1/responses".to_string(),
+        (None, true) => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
+        // Direct OpenAI — always responses endpoint
+        (None, false) => "https://api.openai.com/v1/responses".to_string(),
     }
 }
 
@@ -127,10 +122,10 @@ async fn complete_chat_api(
 }
 
 // ---------------------------------------------------------------------------
-// Responses API (for codex models)
+// Responses API
 // ---------------------------------------------------------------------------
 
-/// Complete using the v1/responses API (for codex models).
+/// Complete using the v1/responses API (all non-Fireworks models).
 async fn complete_responses_api(
     spec: &ModelSpec,
     api_key: &str,
