@@ -130,12 +130,32 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                images,
                 is_error,
-            } => AnthropicContentBlock::ToolResult {
-                tool_use_id: tool_use_id.clone(),
-                content: content.clone(),
-                is_error: *is_error,
-            },
+            } => {
+                let wire_content = if images.is_empty() {
+                    serde_json::Value::String(content.clone())
+                } else {
+                    let mut blocks = vec![serde_json::json!({"type": "text", "text": content})];
+                    for img in images {
+                        let ImageSource::Base64 { media_type, data } = img;
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data
+                            }
+                        }));
+                    }
+                    serde_json::Value::Array(blocks)
+                };
+                AnthropicContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: wire_content,
+                    is_error: *is_error,
+                }
+            }
         })
         .collect();
 
@@ -249,7 +269,8 @@ pub(crate) enum AnthropicContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        /// String for text-only results; array of content blocks when images are present.
+        content: serde_json::Value,
         #[serde(default)]
         is_error: bool,
     },

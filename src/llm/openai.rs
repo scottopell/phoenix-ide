@@ -303,6 +303,7 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> Vec<OpenAIMessage> {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                images: _,
                 is_error,
             } => {
                 tool_results.push((tool_use_id.clone(), content.clone(), *is_error));
@@ -426,8 +427,16 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    images,
                     is_error,
                 } => {
+                    if !images.is_empty() {
+                        tracing::debug!(
+                            tool_use_id = %tool_use_id,
+                            n_images = images.len(),
+                            "dropping images from tool result — Responses API image support not yet implemented"
+                        );
+                    }
                     let output = if *is_error {
                         format!("Error: {content}")
                     } else {
@@ -439,8 +448,7 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
                     });
                 }
                 ContentBlock::Image { .. } => {
-                    tracing::warn!("Images not supported in Responses API");
-                }
+                    tracing::warn!("Images not supported in Responses API");                }
             }
         }
     }
@@ -559,8 +567,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
                         if item.r#type == "output_text" {
                             if let Some(text) = item.text {
                                 if !text.is_empty() {
-                                    content.push(ContentBlock::Text { text });
-                                }
+                                    content.push(ContentBlock::Text { text });                                }
                             }
                         }
                     }

@@ -30,8 +30,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default viewport dimensions
-const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
-const DEFAULT_VIEWPORT_HEIGHT: u32 = 720;
+const DEFAULT_VIEWPORT_WIDTH: u32 = 1024;
+const DEFAULT_VIEWPORT_HEIGHT: u32 = 768;
 
 #[derive(Debug, Error)]
 pub enum BrowserError {

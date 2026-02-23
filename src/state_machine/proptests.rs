@@ -60,6 +60,7 @@ fn arb_tool_result() -> impl Strategy<Value = ToolResult> {
         output,
         is_error: !success,
         display_data: None,
+        images: vec![],
     })
 }
 
@@ -371,6 +372,7 @@ proptest! {
                 output: result_output,
                 is_error: !result_success,
                 display_data: None,
+                images: vec![],
             },
         };
 
@@ -753,6 +755,7 @@ proptest! {
             output: "actual output that should be discarded".to_string(),
             is_error: false,
                 display_data: None,
+                images: vec![],
         };
 
         let result = transition(
@@ -798,6 +801,7 @@ proptest! {
                 output: "output".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         };
 
@@ -877,6 +881,7 @@ fn test_complete_tool_cycle() {
                 output: "file1 file2".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         },
     )
@@ -1019,6 +1024,7 @@ fn test_multi_tool_chain() {
                 output: "1".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         },
     )
@@ -1052,6 +1058,7 @@ fn test_multi_tool_chain() {
                 output: "2".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         },
     )
@@ -1085,6 +1092,7 @@ fn test_multi_tool_chain() {
                 output: "3".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         },
     )
@@ -1221,6 +1229,7 @@ fn test_tool_completion_advances_to_next_tool() {
                 output: "1".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         },
     )
@@ -1275,6 +1284,7 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
                 output: "done".to_string(),
                 is_error: false,
                 display_data: None,
+                images: vec![],
             },
         },
     )
@@ -1556,6 +1566,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
             output: "done".to_string(),
             is_error: false,
             display_data: None,
+            images: vec![],
         },
     };
 
@@ -1604,6 +1615,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
             output: "Spawned 2 agents".to_string(),
             is_error: false,
             display_data: None,
+            images: vec![],
         },
         spawned: vec![
             PendingSubAgent {

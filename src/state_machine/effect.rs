@@ -1,6 +1,6 @@
 //! Effects produced by state transitions
 
-use crate::db::{ImageData, MessageContent, ToolResult, UsageData};
+use crate::db::{ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData};
 use crate::llm::ContentBlock;
 use crate::state_machine::state::{SubAgentOutcome, SubAgentResult, ToolCall};
 use crate::tools::bash_check::display_command;
@@ -113,12 +113,18 @@ impl Effect {
         output: impl Into<String>,
         is_error: bool,
         display_data: Option<Value>,
+        images: Vec<ToolContentImage>,
     ) -> Self {
         let tool_use_id = tool_use_id.into();
         // Use predictable message_id so we can update display_data later (e.g., subagent results)
         let message_id = format!("{tool_use_id}-result");
         Effect::PersistMessage {
-            content: MessageContent::tool(tool_use_id, output, is_error),
+            content: MessageContent::Tool(ToolContent {
+                tool_use_id: tool_use_id.clone(),
+                content: output.into(),
+                is_error,
+                images,
+            }),
             display_data,
             usage_data: None,
             message_id,

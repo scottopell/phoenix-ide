@@ -361,6 +361,7 @@ pub fn transition(
                 &result.output,
                 result.is_error,
                 result.display_data(),
+                result.images.clone(),
             ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_tool_executing(
@@ -395,6 +396,7 @@ pub fn transition(
                         &result.output,
                         result.is_error,
                         result.display_data(),
+                        result.images.clone(),
                     ))
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))
@@ -428,6 +430,7 @@ pub fn transition(
                 &result.output,
                 result.is_error,
                 result.display_data(),
+                result.images.clone(),
             ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_awaiting_sub_agents(pending_sub_agents, &[])))
@@ -469,6 +472,7 @@ pub fn transition(
                 &result.output,
                 result.is_error,
                 result.display_data(),
+                result.images.clone(),
             ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_tool_executing(
@@ -509,6 +513,7 @@ pub fn transition(
                 &result.output,
                 result.is_error,
                 result.display_data(),
+                result.images.clone(),
             ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_awaiting_sub_agents(&all_pending, &[])))

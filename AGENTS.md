@@ -121,6 +121,80 @@ Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.p
 
 ---
 
+## Code Correctness Principles
+
+These are constraints on the technical artifact, not process guidelines. They override existing code patterns and unreviewed plan decisions. When a plan says to do something that violates these, deviate from the plan and note why.
+
+### Correct-by-construction is the governing principle
+
+Design so invalid states cannot be structurally represented. If a type permits a value that is semantically wrong, the type is wrong — fix the type, not the discipline. Runtime checks, comments, and conventions that rely on human vigilance are not substitutes.
+
+```rust
+// ❌ Bad: String is valid whether it holds JSON, base64, or a summary — wrong states representable
+pub output: String
+
+// ✅ Good: enum makes the distinction structural and compiler-enforced
+pub enum ToolOutputContent {
+    Summary(String),
+    Image { media_type: String, data: String },
+}
+```
+
+### Omission is data loss — unless the component is a typed sink
+
+If a field exists in struct A and struct B is the next layer that accepts that kind of data, threading it through is required. A component *may* be an intentional consumer/terminator of a value, but this must be enforced by its type — not by implicit omission or a comment. There must be no structural ambiguity between "forgot to thread" and "deliberately consumed."
+
+```rust
+// ❌ Bad: images: _ is structurally indistinguishable from "forgot to thread"
+ContentBlock::ToolResult { images: _, ... } => { ... }
+
+// ✅ Good: provider-specific types make the capability gap unrepresentable
+// AnthropicToolResult carries images; OpenAIToolResult structurally cannot
+```
+
+### No parallel representations of the same semantic value
+
+If data appears in two representations simultaneously, one is redundant. Redundant representations diverge and create ambiguity about which is authoritative. Each field carries data for exactly one consumer, with a non-overlapping contract.
+
+```rust
+// ❌ Bad: same image bytes in both display_data["data"] (JSON blob) and images[0].data (typed)
+// — two representations, same value, divergence risk
+
+// ✅ Good: display_data holds UI-only metadata (thumbnail URL, dimensions)
+//          images holds typed LLM-bound data
+//          Non-overlapping consumers, non-overlapping contracts
+```
+
+### Schema evolution belongs in migrations, not serde annotations
+
+`#[serde(default)]` on a JSON-in-TEXT column field is a patch around a missing migration, not a solution. It is acceptable as a backward-compat shim *during rollout*, but the migration must exist or be tracked as a task. The decision to store structured data as a JSON TEXT blob must be explicitly owned, not treated as an inert constraint to work around.
+
+```rust
+// ❌ Bad: serde(default) as the complete schema change
+#[serde(default)]
+pub images: Vec<ToolContentImage>,  // old rows silently get empty vec, no migration, no auditability
+
+// ✅ Good: migration adds typed column; serde(default) covers the rollout window only
+// See db/migrations/ — every structural change to persisted data has a migration
+```
+
+### Capability gaps are logged, not silenced
+
+When a component drops data because the backend does not support a feature, this must appear in logs at `debug` level or above. Silent omission is indistinguishable from a bug.
+
+```rust
+// ❌ Bad: images discarded, no trace in logs
+ContentBlock::ToolResult { images: _, ... } => { ... }
+
+// ✅ Good: visible in logs
+if !images.is_empty() {
+    tracing::debug!(n = images.len(), provider = "openai",
+                    "dropping images from tool result — unsupported by this provider");
+}
+```
+
+---
+
 ## Code Conventions
 
 ### Module Organization

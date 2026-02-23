@@ -51,7 +51,7 @@ fn arb_tool_use_block() -> impl Strategy<Value = ContentBlock> {
         .prop_map(|(id, name, input)| ContentBlock::ToolUse { id, name, input })
 }
 
-/// Tool result block
+/// Tool result block (no images — for use in general message tests)
 fn arb_tool_result_block() -> impl Strategy<Value = ContentBlock> {
     (
         "[a-z0-9_]{5,20}",          // tool_use_id
@@ -62,9 +62,22 @@ fn arb_tool_result_block() -> impl Strategy<Value = ContentBlock> {
             |(tool_use_id, content, is_error)| ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                images: vec![],
                 is_error,
             },
         )
+}
+
+/// Image source
+fn arb_image_source() -> impl Strategy<Value = ImageSource> {
+    (
+        prop_oneof![
+            Just("image/png".to_string()),
+            Just("image/jpeg".to_string()),
+        ],
+        "[a-zA-Z0-9+/]{10,50}",
+    )
+        .prop_map(|(media_type, data)| ImageSource::Base64 { media_type, data })
 }
 
 /// Simple JSON value (no deeply nested structures)
@@ -505,5 +518,111 @@ proptest! {
             let result = serde_json::to_value(m);
             prop_assert!(result.is_ok(), "OpenAI message failed to serialize: {:?}", result.err());
         }
+    }
+}
+
+// ============================================================================
+// Group G — ToolResult image channel invariants
+// ============================================================================
+
+proptest! {
+
+    /// A — Anthropic: no-image ToolResult → content is a JSON string (backwards compat)
+    #[test]
+    fn prop_anthropic_tool_result_no_images_string_content(
+        tool_use_id in "[a-z0-9_]{5,20}",
+        content in "[a-zA-Z0-9 _.!?,]{0,100}",
+        is_error in any::<bool>(),
+    ) {
+        let block = ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            images: vec![],
+            is_error,
+        };
+        let msg = LlmMessage { role: MessageRole::User, content: vec![block] };
+        let translated = anthropic::test_helpers::translate_message(&msg);
+        prop_assert_eq!(translated.content.len(), 1);
+        if let super::anthropic::AnthropicContentBlock::ToolResult { content: wire_content, .. } =
+            &translated.content[0]
+        {
+            prop_assert!(
+                wire_content.is_string(),
+                "Expected string content for no-image ToolResult, got: {:?}",
+                wire_content
+            );
+        } else {
+            prop_assert!(false, "Expected ToolResult block");
+        }
+    }
+
+    /// B — Anthropic: image-bearing ToolResult → content is array [text, ...images]
+    #[test]
+    fn prop_anthropic_tool_result_with_images_array_content(
+        tool_use_id in "[a-z0-9_]{5,20}",
+        content in "[a-zA-Z0-9 _.!?,]{0,100}",
+        is_error in any::<bool>(),
+        images in proptest::collection::vec(arb_image_source(), 1..3usize),
+    ) {
+        let n_images = images.len();
+        let block = ContentBlock::ToolResult {
+            tool_use_id,
+            content: content.clone(),
+            images,
+            is_error,
+        };
+        let msg = LlmMessage { role: MessageRole::User, content: vec![block] };
+        let translated = anthropic::test_helpers::translate_message(&msg);
+        prop_assert_eq!(translated.content.len(), 1);
+        if let super::anthropic::AnthropicContentBlock::ToolResult { content: wire_content, .. } =
+            &translated.content[0]
+        {
+            prop_assert!(
+                wire_content.is_array(),
+                "Expected array content for image-bearing ToolResult, got: {:?}",
+                wire_content
+            );
+            let arr = wire_content.as_array().unwrap();
+            prop_assert_eq!(arr.len(), 1 + n_images, "Expected 1 text + {} image blocks", n_images);
+            prop_assert_eq!(&arr[0]["type"], "text", "First block must be text");
+            prop_assert_eq!(&arr[0]["text"], content.as_str(), "Text content must match");
+            for block in &arr[1..] {
+                prop_assert_eq!(&block["type"], "image", "Remaining blocks must be images");
+                prop_assert_eq!(&block["source"]["type"], "base64");
+            }
+        } else {
+            prop_assert!(false, "Expected ToolResult block");
+        }
+    }
+
+    /// C — OpenAI: images have no effect on tool result wire format
+    #[test]
+    fn prop_openai_tool_result_images_ignored(
+        tool_use_id in "[a-z0-9_]{5,20}",
+        content in "[a-zA-Z0-9 _.!?,]{0,100}",
+        is_error in any::<bool>(),
+        images in proptest::collection::vec(arb_image_source(), 1..3usize),
+    ) {
+        let block_with = ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            images,
+            is_error,
+        };
+        let block_without = ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            images: vec![],
+            is_error,
+        };
+        let msg_with = LlmMessage { role: MessageRole::User, content: vec![block_with] };
+        let msg_without = LlmMessage { role: MessageRole::User, content: vec![block_without] };
+
+        let result_with = openai::test_helpers::translate_message(&msg_with);
+        let result_without = openai::test_helpers::translate_message(&msg_without);
+
+        let json_with = serde_json::to_value(&result_with).unwrap();
+        let json_without = serde_json::to_value(&result_without).unwrap();
+        prop_assert_eq!(json_with, json_without, "OpenAI must ignore images in tool results");
     }
 }

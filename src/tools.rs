@@ -34,11 +34,21 @@ use tokio_util::sync::CancellationToken;
 use crate::llm::ModelRegistry;
 pub use browser::session::BrowserSession;
 
+/// Typed image data for LLM consumption.
+#[derive(Debug, Clone)]
+pub struct ToolImage {
+    pub media_type: String,
+    pub data: String, // base64-encoded
+}
+
 /// Result from tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub success: bool,
     pub output: String,
+    /// Typed images for LLM consumption (sent as image content blocks, not text).
+    #[serde(skip)]
+    pub images: Vec<ToolImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_data: Option<Value>,
 }
@@ -48,6 +58,7 @@ impl ToolOutput {
         Self {
             success: true,
             output: output.into(),
+            images: vec![],
             display_data: None,
         }
     }
@@ -56,12 +67,19 @@ impl ToolOutput {
         Self {
             success: false,
             output: message.into(),
+            images: vec![],
             display_data: None,
         }
     }
 
     pub fn with_display(mut self, data: Value) -> Self {
         self.display_data = Some(data);
+        self
+    }
+
+    /// Attach typed images for LLM consumption.
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
         self
     }
 }

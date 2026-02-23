@@ -66,6 +66,9 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// Images to include in the tool result (`Anthropic` only; `OpenAI` drops them).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageSource>,
         #[serde(default)]
         is_error: bool,
     },
@@ -89,6 +92,7 @@ impl ContentBlock {
         }
     }
 
+    #[allow(dead_code)] // Constructor for API completeness
     pub fn tool_result(
         tool_use_id: impl Into<String>,
         content: impl Into<String>,
@@ -97,6 +101,7 @@ impl ContentBlock {
         ContentBlock::ToolResult {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
+            images: vec![],
             is_error,
         }
     }

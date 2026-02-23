@@ -196,6 +196,7 @@ mod tests {
                 tool_use_id: tool_use_id.to_string(),
                 content: output.to_string(),
                 is_error: false,
+                images: vec![],
             }),
             display_data: None,
             usage_data: None,
@@ -507,6 +508,7 @@ mod proptests {
                 tool_use_id: format!("tool-{}", seq - 1),
                 content: "tool output".to_string(),
                 is_error: false,
+                images: vec![],
             }),
             _ => MessageContent::User(UserContent {
                 text: "fallback".to_string(),

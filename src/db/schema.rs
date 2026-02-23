@@ -140,6 +140,14 @@ impl ErrorKind {
     }
 }
 
+/// Image data in a tool result message (for LLM consumption).
+/// Stored as JSON in `messages.content` alongside the text output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolContentImage {
+    pub media_type: String,
+    pub data: String,
+}
+
 /// Tool execution result
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
@@ -150,6 +158,9 @@ pub struct ToolResult {
     pub is_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_data: Option<serde_json::Value>,
+    /// Typed images for LLM consumption.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ToolContentImage>,
 }
 
 impl ToolResult {
@@ -161,6 +172,7 @@ impl ToolResult {
             output,
             is_error: false,
             display_data: None,
+            images: vec![],
         }
     }
 
@@ -171,6 +183,7 @@ impl ToolResult {
             output: error,
             is_error: true,
             display_data: None,
+            images: vec![],
         }
     }
 
@@ -181,6 +194,7 @@ impl ToolResult {
             output: message.to_string(),
             is_error: false,
             display_data: None,
+            images: vec![],
         }
     }
 
@@ -197,6 +211,7 @@ impl ToolResult {
             output,
             is_error: false,
             display_data,
+            images: vec![],
         }
     }
 }
@@ -254,6 +269,10 @@ pub struct ToolContent {
     pub tool_use_id: String,
     pub content: String,
     pub is_error: bool,
+    /// Images to send to the LLM as image content blocks (not tokenized as text).
+    /// `#[serde(default)]` ensures old DB rows (no `images` key) deserialize to empty vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ToolContentImage>,
 }
 
 impl ToolContent {
@@ -262,6 +281,7 @@ impl ToolContent {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
             is_error,
+            images: vec![],
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! REQ-TOOL: `read_image` for viewing screenshots, diagrams, etc.
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolImage, ToolOutput};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
@@ -130,14 +130,21 @@ impl Tool for ReadImageTool {
 
         let base64_data = BASE64.encode(&data);
 
-        // Return structured output for the LLM
-        let output = json!({
+        // Return text summary for LLM context; image data goes via typed channel
+        ToolOutput::success(format!(
+            "Image loaded: {} ({} bytes)",
+            path.display(),
+            data.len()
+        ))
+        .with_images(vec![ToolImage {
+            media_type: media_type.to_string(),
+            data: base64_data.clone(),
+        }])
+        .with_display(json!({
             "type": "image",
             "media_type": media_type,
             "data": base64_data,
-        });
-
-        ToolOutput::success(output.to_string())
+        }))
     }
 }
 
@@ -186,10 +193,23 @@ mod tests {
         let result = tool.run(json!({"path": "test.png"}), ctx).await;
         assert!(result.success, "Failed: {}", result.output);
 
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["type"], "image");
-        assert_eq!(output["media_type"], "image/png");
-        assert!(!output["data"].as_str().unwrap().is_empty());
+        // Output is a human-readable summary (not base64)
+        assert!(
+            result.output.starts_with("Image loaded:"),
+            "Unexpected output: {}",
+            result.output
+        );
+
+        // Image data goes through the typed images channel
+        assert_eq!(result.images.len(), 1, "Expected 1 image in images field");
+        assert_eq!(result.images[0].media_type, "image/png");
+        assert!(!result.images[0].data.is_empty());
+
+        // Display data still present for UI thumbnail rendering
+        let display = result.display_data.as_ref().expect("Expected display_data");
+        assert_eq!(display["type"], "image");
+        assert_eq!(display["media_type"], "image/png");
+        assert!(!display["data"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -253,8 +273,8 @@ mod tests {
             let result = tool.run(json!({"path": filename}), ctx).await;
             assert!(result.success, "Failed for {}: {}", ext, result.output);
 
-            let output: Value = serde_json::from_str(&result.output).unwrap();
-            assert_eq!(output["media_type"], *expected_type);
+            assert_eq!(result.images.len(), 1, "Expected image for {}", ext);
+            assert_eq!(result.images[0].media_type, *expected_type);
         }
     }
 }

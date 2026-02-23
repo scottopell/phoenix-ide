@@ -302,6 +302,7 @@ where
             output,
             is_error: false,
             display_data: None,
+            images: vec![],
         };
 
         // Send SpawnAgentsComplete event (synchronously returned, not async)
@@ -499,13 +500,25 @@ where
                     }
 
                     let result = match output {
-                        Some(out) => ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            success: out.success,
-                            output: out.output,
-                            is_error: !out.success,
-                            display_data: out.display_data,
-                        },
+                        Some(out) => {
+                            use crate::db::ToolContentImage;
+                            let images = out
+                                .images
+                                .into_iter()
+                                .map(|img| ToolContentImage {
+                                    media_type: img.media_type,
+                                    data: img.data,
+                                })
+                                .collect();
+                            ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                success: out.success,
+                                output: out.output,
+                                is_error: !out.success,
+                                display_data: out.display_data,
+                                images,
+                            }
+                        }
                         None => ToolResult::error(
                             tool_use_id.clone(),
                             format!("Unknown tool: {tool_name}"),
@@ -743,6 +756,7 @@ where
         conv_id: &str,
     ) -> Result<Vec<LlmMessage>, String> {
         use crate::db::{MessageContent, ToolContent, UserContent};
+        use crate::llm::ImageSource;
 
         let db_messages = storage.get_messages(conv_id).await?;
 
@@ -777,11 +791,26 @@ where
                     tool_use_id,
                     content,
                     is_error,
+                    images,
                 }) => {
+                    // Convert stored ToolContentImages to LLM ImageSources
+                    let image_sources: Vec<ImageSource> = images
+                        .iter()
+                        .map(|img| ImageSource::Base64 {
+                            media_type: img.media_type.clone(),
+                            data: img.data.clone(),
+                        })
+                        .collect();
+
                     // Tool results go in user message
                     messages.push(LlmMessage {
                         role: MessageRole::User,
-                        content: vec![ContentBlock::tool_result(tool_use_id, content, *is_error)],
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: content.clone(),
+                            images: image_sources,
+                            is_error: *is_error,
+                        }],
                     });
                 }
 
