@@ -449,8 +449,7 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
                 input_items.push(ResponsesApiInputItem::FunctionCall {
                     call_id: id.clone(),
                     name: name.clone(),
-                    arguments: serde_json::to_string(input)
-                        .unwrap_or_else(|_| "{}".to_string()),
+                    arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
                 });
             }
         }
@@ -604,7 +603,8 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
                         if item.r#type == "output_text" {
                             if let Some(text) = item.text {
                                 if !text.is_empty() {
-                                    content.push(ContentBlock::Text { text });                                }
+                                    content.push(ContentBlock::Text { text });
+                                }
                             }
                         }
                     }
@@ -796,7 +796,10 @@ pub(crate) struct ResponsesApiRequest {
 #[serde(tag = "type")]
 pub(crate) enum ResponsesApiInputItem {
     #[serde(rename = "message")]
-    Message { role: String, content: ResponsesApiMessageContent },
+    Message {
+        role: String,
+        content: ResponsesApiMessageContent,
+    },
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: String,
