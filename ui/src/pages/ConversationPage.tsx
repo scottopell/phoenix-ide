@@ -270,17 +270,19 @@ export function ConversationPage() {
 
     const loadConversation = async () => {
       try {
-        // Step 1: Show cached data immediately
+        // Step 1: Show cached data immediately while network fetch is in-flight
+        // (stale-while-revalidate — sidebar polling populates conversation records
+        // but never messages, so cache-only would silently show empty threads)
         const cached = await cacheDB.getConversationBySlug(slug);
         if (cached && !cancelled) {
           setConversation(cached);
           const cachedMessages = await cacheDB.getMessages(cached.id);
           setMessages(cachedMessages);
-          setConversationId(cached.id); // Triggers SSE connection
-          return;
+          // Do not start SSE yet — wait for network to give us the authoritative
+          // sequence ID so SSE resumes from the right position.
         }
 
-        // Step 2: No cache, fetch from network
+        // Step 2: Always fetch fresh data from network
         if (navigator.onLine && !cancelled) {
           try {
             const result = await api.getConversationBySlug(slug);
@@ -289,19 +291,26 @@ export function ConversationPage() {
               setMessages(result.messages);
               setAgentWorking(result.display_state === 'working');
               setContextWindowUsed(result.context_window_size || 0);
-              setConversationId(result.conversation.id);
-              
-              // Cache it
+              setConversationId(result.conversation.id); // Triggers SSE
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
             }
           } catch (err) {
             if (!cancelled) {
-              setError(err instanceof Error ? err.message : 'Failed to load conversation');
+              if (cached) {
+                // Network failed but we have cached data — start SSE with that
+                setConversationId(cached.id);
+              } else {
+                setError(err instanceof Error ? err.message : 'Failed to load conversation');
+              }
             }
           }
         } else if (!cancelled) {
-          setError('Conversation not found in cache and offline');
+          if (cached) {
+            setConversationId(cached.id); // Offline, use cache and start SSE
+          } else {
+            setError('Conversation not found in cache and offline');
+          }
         }
       } catch (err) {
         if (!cancelled) {
