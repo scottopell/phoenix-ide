@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -452,37 +453,65 @@ def cmd_status():
 
 
 def cmd_check():
-    """Run lint, format check, tests, and task validation."""
-    print("Running clippy...")
-    result = subprocess.run(["cargo", "clippy", "--", "-D", "warnings"], cwd=ROOT)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    """Run lint, format check, tests, and task validation in parallel."""
+    results = []  # (name, returncode, elapsed, output)
+    results_lock = threading.Lock()
+    t_start = time.monotonic()
 
-    print("\nChecking format...")
-    result = subprocess.run(["cargo", "fmt", "--check"], cwd=ROOT)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    def run_step(name, cmd, cwd=ROOT):
+        t0 = time.monotonic()
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        elapsed = time.monotonic() - t0
+        output = (proc.stdout + proc.stderr).strip()
+        with results_lock:
+            ok = "\u2713" if proc.returncode == 0 else "\u2717"
+            results.append((name, proc.returncode, elapsed, output))
+            print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
-    print("\nRunning Rust tests...")
-    result = subprocess.run(["cargo", "test"], cwd=ROOT)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    def lane_rust():
+        """Rust lane: clippy then test (share cargo lock)."""
+        run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
+        run_step("cargo test", ["cargo", "test"])
 
-    print("\nRunning UI typecheck...")
-    result = subprocess.run(["npx", "tsc", "-b", "--noEmit"], cwd=UI_DIR)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    def lane_fast():
+        """Fast lane: cargo fmt then task validation."""
+        run_step("cargo fmt", ["cargo", "fmt", "--check"])
+        # Task validation (Python, not a subprocess)
+        t0 = time.monotonic()
+        ok = cmd_tasks_validate(quiet=True)
+        elapsed = time.monotonic() - t0
+        with results_lock:
+            sym = "\u2713" if ok else "\u2717"
+            results.append(("task validation", 0 if ok else 1, elapsed, ""))
+            print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
-    print("\nRunning UI lint...")
-    result = subprocess.run(["npm", "run", "lint"], cwd=UI_DIR)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    print("Running 6 checks in parallel...\n")
 
-    print("\nValidating task specs...")
-    if not cmd_tasks_validate():
+    threads = [
+        threading.Thread(target=lane_rust),
+        threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
+        threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
+        threading.Thread(target=lane_fast),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total_elapsed = time.monotonic() - t_start
+    failures = [(n, out) for n, rc, _, out in results if rc != 0]
+
+    if failures:
+        print()
+        for name, output in failures:
+            print(f"\u2500\u2500 {name} {'\u2500' * (50 - len(name))}")
+            if output:
+                print(output)
+            print()
+        print(f"\u2717 {len(failures)} of {len(results)} checks failed ({total_elapsed:.1f}s)")
         sys.exit(1)
-
-    print("\n✓ All checks passed")
+    else:
+        print(f"\n\u2713 All {len(results)} checks passed ({total_elapsed:.1f}s)")
 
 
 # =============================================================================
@@ -555,7 +584,7 @@ def get_expected_filename(number: str, priority: str, status: str, slug: str) ->
     return f"{number}-{priority}-{status}-{slug}.md"
 
 
-def cmd_tasks_validate() -> bool:
+def cmd_tasks_validate(quiet: bool = False) -> bool:
     """Validate all task files conform to the naming and frontmatter conventions.
 
     Filename format: NNN-pX-status-slug.md
@@ -631,13 +660,15 @@ def cmd_tasks_validate() -> bool:
                 errors.append(f"{name}: filename doesn't match frontmatter, expected: {expected}")
 
     if errors:
-        print(f"✗ {len(errors)} task validation error(s):")
-        for err in errors:
-            print(f"  - {err}")
-        print("\nRun './dev.py tasks fix' to auto-fix (injects missing 'created', renames files).")
+        if not quiet:
+            print(f"✗ {len(errors)} task validation error(s):")
+            for err in errors:
+                print(f"  - {err}")
+            print("\nRun './dev.py tasks fix' to auto-fix (injects missing 'created', renames files).")
         return False
 
-    print(f"✓ {len(task_files) - 1} task files validated")  # -1 for template
+    if not quiet:
+        print(f"✓ {len(task_files) - 1} task files validated")  # -1 for template
     return True
 
 
