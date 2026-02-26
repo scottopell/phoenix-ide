@@ -131,7 +131,26 @@ pub fn transition(
                 ));
             }
 
-            if tool_calls.is_empty() {
+            if tool_calls.is_empty() && context.is_sub_agent {
+                // Sub-agent returned text without calling submit_result.
+                // Treat as implicit completion — the text IS the result.
+                use crate::state_machine::state::SubAgentOutcome;
+                let result_text = extract_text_from_content(&content);
+                Ok(TransitionResult::new(ConvState::Completed {
+                    result: result_text.clone(),
+                })
+                .with_effect(Effect::persist_agent_message(
+                    content,
+                    Some(usage_data),
+                    &context.working_dir,
+                ))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::NotifyParent {
+                    outcome: SubAgentOutcome::Success {
+                        result: result_text,
+                    },
+                }))
+            } else if tool_calls.is_empty() {
                 // No tools, just text response -> Idle
                 Ok(TransitionResult::new(ConvState::Idle)
                     .with_effect(Effect::persist_agent_message(
@@ -1043,6 +1062,18 @@ fn handle_context_exhaustion(
     }
 }
 
+/// Extract concatenated text from content blocks for implicit sub-agent completion.
+fn extract_text_from_content(blocks: &[crate::llm::ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            crate::llm::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn retry_delay(attempt: u32) -> Duration {
     // Exponential backoff: 1s, 2s, 4s
     Duration::from_secs(1 << (attempt - 1))
@@ -1443,6 +1474,103 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
             "Parent conversation should NOT notify parent"
+        );
+    }
+
+    #[test]
+    fn test_subagent_text_only_response_is_implicit_completion() {
+        use crate::llm::{ContentBlock, Usage};
+        use crate::state_machine::state::ContextExhaustionBehavior;
+
+        let subagent_ctx = ConvContext {
+            conversation_id: "subagent-1".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 200_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+        };
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &subagent_ctx,
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("Here is my analysis of the codebase.")],
+                tool_calls: vec![], // No tools — LLM didn't call submit_result
+                end_turn: true,
+                usage: Usage {
+                    input_tokens: 5000,
+                    output_tokens: 500,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            },
+        )
+        .unwrap();
+
+        // Should go to Completed, NOT Idle
+        assert!(
+            matches!(result.new_state, ConvState::Completed { .. }),
+            "Sub-agent text-only response should go to Completed, got {:?}",
+            result.new_state
+        );
+
+        // Should notify parent
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Sub-agent should notify parent on implicit completion"
+        );
+
+        // Should NOT emit notify_agent_done (that's for parent conversations)
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::NotifyClient { event_type, .. } if event_type == "agent_done"
+            )),
+            "Sub-agent should NOT emit agent_done SSE event"
+        );
+    }
+
+    #[test]
+    fn test_parent_text_only_response_still_goes_idle() {
+        use crate::llm::{ContentBlock, Usage};
+
+        let parent_ctx = test_context();
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &parent_ctx,
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("Here is my response.")],
+                tool_calls: vec![],
+                end_turn: true,
+                usage: Usage {
+                    input_tokens: 5000,
+                    output_tokens: 500,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            },
+        )
+        .unwrap();
+
+        // Parent should still go to Idle
+        assert!(
+            matches!(result.new_state, ConvState::Idle),
+            "Parent text-only response should go to Idle, got {:?}",
+            result.new_state
+        );
+
+        // Should NOT notify parent (it IS the parent)
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Parent should NOT have NotifyParent effect"
         );
     }
 }
