@@ -67,7 +67,6 @@ export function getStateDescription(convState: string, stateData: ConversationSt
       return `waiting for ${pending} sub-agent${pending !== 1 ? 's' : ''}`;
     }
     case 'cancelling':
-    case 'cancelling_llm':
     case 'cancelling_tool':
     case 'cancelling_sub_agents':
       return 'cancelling...';

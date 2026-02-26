@@ -255,9 +255,6 @@ pub enum ConvState {
         pending_sub_agents: Vec<PendingSubAgent>,
     },
 
-    /// User requested cancellation of LLM request, waiting for response to discard
-    CancellingLlm,
-
     /// User requested cancellation of tool execution, waiting for abort confirmation
     CancellingTool {
         /// The tool being aborted

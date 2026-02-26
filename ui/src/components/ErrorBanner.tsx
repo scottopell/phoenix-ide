@@ -65,7 +65,7 @@ function humanizeError(message: string): { title: string; details: string | null
 
   return {
     title: 'Error',
-    details: message.length > 200 ? message.slice(0, 200) + '…' : message,
+    details: message,
   };
 }
 

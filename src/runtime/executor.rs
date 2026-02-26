@@ -35,8 +35,8 @@ where
     broadcast_tx: broadcast::Sender<SseEvent>,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
-    /// Token to cancel running LLM request
-    llm_cancel_token: Option<CancellationToken>,
+    /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection
+    llm_task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Channel to notify parent of sub-agent completion (sub-agent only)
     parent_event_tx: Option<mpsc::Sender<Event>>,
     /// Channel to request sub-agent spawning (parent only)
@@ -78,7 +78,7 @@ where
             event_tx,
             broadcast_tx,
             tool_cancel_token: None,
-            llm_cancel_token: None,
+            llm_task_handle: None,
             parent_event_tx: None,
             spawn_tx: None,
             cancel_tx: None,
@@ -358,10 +358,6 @@ where
             }
 
             Effect::RequestLlm => {
-                // Create cancellation token for this LLM request
-                let cancel_token = CancellationToken::new();
-                self.llm_cancel_token = Some(cancel_token.clone());
-
                 // Spawn LLM request as background task
                 let llm_client = self.llm_client.clone();
                 let tool_executor = self.tool_executor.clone();
@@ -375,7 +371,7 @@ where
                     _ => 1,
                 };
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     tracing::info!(
                         is_sub_agent = is_sub_agent,
                         "Making LLM request (background)"
@@ -407,45 +403,35 @@ where
                         max_tokens: Some(8192),
                     };
 
-                    // Race LLM request against cancellation
-                    tokio::select! {
-                        biased;
+                    let event = match llm_client.complete(&request).await {
+                        Ok(response) => {
+                            // Extract tool calls from content and convert to typed ToolCall
+                            let tool_calls: Vec<ToolCall> = response
+                                .tool_uses()
+                                .into_iter()
+                                .map(|(id, name, input)| {
+                                    let typed_input =
+                                        ToolInput::from_name_and_value(name, input.clone());
+                                    ToolCall::new(id.to_string(), typed_input)
+                                })
+                                .collect();
 
-                        () = cancel_token.cancelled() => {
-                            tracing::info!("LLM request cancelled");
-                            let _ = event_tx.send(Event::LlmAborted).await;
+                            Event::LlmResponse {
+                                content: response.content,
+                                tool_calls,
+                                end_turn: response.end_turn,
+                                usage: response.usage,
+                            }
                         }
-
-                        result = llm_client.complete(&request) => {
-                            let event = match result {
-                                Ok(response) => {
-                                    // Extract tool calls from content and convert to typed ToolCall
-                                    let tool_calls: Vec<ToolCall> = response
-                                        .tool_uses()
-                                        .into_iter()
-                                        .map(|(id, name, input)| {
-                                            let typed_input = ToolInput::from_name_and_value(name, input.clone());
-                                            ToolCall::new(id.to_string(), typed_input)
-                                        })
-                                        .collect();
-
-                                    Event::LlmResponse {
-                                        content: response.content,
-                                        tool_calls,
-                                        end_turn: response.end_turn,
-                                        usage: response.usage,
-                                    }
-                                }
-                                Err(e) => Event::LlmError {
-                                    message: e.message.clone(),
-                                    error_kind: llm_error_to_db_error(e.kind),
-                                    attempt: current_attempt,
-                                },
-                            };
-                            let _ = event_tx.send(event).await;
-                        }
-                    }
+                        Err(e) => Event::LlmError {
+                            message: e.message.clone(),
+                            error_kind: llm_error_to_db_error(e.kind),
+                            attempt: current_attempt,
+                        },
+                    };
+                    let _ = event_tx.send(event).await;
                 });
+                self.llm_task_handle = Some(handle);
 
                 // Return None - the event will come from the spawned task
                 Ok(None)
@@ -600,12 +586,10 @@ where
             }
 
             Effect::AbortLlm => {
-                // Signal abort to running LLM request
                 tracing::info!("Aborting LLM request");
-                if let Some(token) = self.llm_cancel_token.take() {
-                    token.cancel();
+                if let Some(handle) = self.llm_task_handle.take() {
+                    handle.abort();
                 }
-                // The spawned task will send LlmAborted event when it sees cancellation
                 Ok(None)
             }
 
@@ -835,11 +819,7 @@ where
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
 
-        // Create cancellation token for the continuation request
-        let cancel_token = CancellationToken::new();
-        self.llm_cancel_token = Some(cancel_token.clone());
-
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Build messages from history and add continuation request
             let mut messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
                 Ok(m) => m,
@@ -867,19 +847,7 @@ where
                 max_tokens: Some(2000), // Limit summary length
             };
 
-            // Make the request
-            let result: Result<crate::llm::LlmResponse, crate::llm::LlmError> = tokio::select! {
-                result = llm_client.complete(&request) => result,
-                () = cancel_token.cancelled() => {
-                    tracing::info!("Continuation request cancelled");
-                    let _ = event_tx.send(Event::ContinuationFailed {
-                        error: "Cancelled by user".to_string(),
-                    }).await;
-                    return;
-                }
-            };
-
-            match result {
+            match llm_client.complete(&request).await {
                 Ok(response) => {
                     // Extract the text content as summary
                     let summary = response
@@ -907,6 +875,7 @@ where
                 }
             }
         });
+        self.llm_task_handle = Some(handle);
     }
 }
 

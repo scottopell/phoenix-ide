@@ -106,10 +106,6 @@ fn arb_error_state() -> impl Strategy<Value = ConvState> {
     })
 }
 
-fn arb_cancelling_llm_state() -> impl Strategy<Value = ConvState> {
-    Just(ConvState::CancellingLlm)
-}
-
 fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
     (
         "[a-z]{8}",
@@ -154,7 +150,6 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_llm_requesting_state(),
         arb_tool_executing_state(),
         arb_error_state(),
-        arb_cancelling_llm_state(),
         arb_cancelling_tool_state(),
         arb_awaiting_llm_state(),
         arb_awaiting_continuation_state(),
@@ -171,11 +166,7 @@ fn arb_working_state() -> impl Strategy<Value = ConvState> {
 }
 
 fn arb_busy_state() -> impl Strategy<Value = ConvState> {
-    prop_oneof![
-        arb_working_state(),
-        Just(ConvState::CancellingLlm),
-        arb_cancelling_tool_state(),
-    ]
+    prop_oneof![arb_working_state(), arb_cancelling_tool_state(),]
 }
 
 fn arb_user_message_event() -> impl Strategy<Value = Event> {
@@ -342,7 +333,7 @@ proptest! {
         prop_assert!(
             matches!(
                 new_state,
-                ConvState::Idle | ConvState::CancellingLlm | ConvState::CancellingTool { .. }
+                ConvState::Idle | ConvState::CancellingTool { .. }
             ),
             "Should reach Idle or a cancelling state, got {:?}",
             new_state
@@ -609,48 +600,17 @@ proptest! {
         );
     }
 
-    // Invariant 14: CancellingLlm + LlmResponse/LlmAborted goes to Idle
+    // Invariant 15: LlmRequesting + UserCancel -> Idle with AbortLlm effect
     #[test]
-    fn prop_cancelling_llm_plus_response_goes_idle(_dummy in Just(())) {
-        let state = ConvState::CancellingLlm;
-        let event = Event::LlmResponse {
-            content: vec![ContentBlock::text("response")],
-            tool_calls: vec![],
-            end_turn: true,
-            usage: Usage::default(),
-        };
-
-        let result = transition(&state, &test_context(), event);
-        prop_assert!(result.is_ok());
-        prop_assert!(
-            matches!(result.unwrap().new_state, ConvState::Idle),
-            "Should go to Idle when response arrives after cancel"
-        );
-    }
-
-    // Invariant 14b: CancellingLlm + LlmAborted goes to Idle
-    #[test]
-    fn prop_cancelling_llm_plus_aborted_goes_idle(_dummy in Just(())) {
-        let state = ConvState::CancellingLlm;
-        let result = transition(&state, &test_context(), Event::LlmAborted);
-        prop_assert!(result.is_ok());
-        prop_assert!(
-            matches!(result.unwrap().new_state, ConvState::Idle),
-            "Should go to Idle when LLM request is aborted"
-        );
-    }
-
-    // Invariant 15: LlmRequesting + UserCancel -> CancellingLlm with AbortLlm effect
-    #[test]
-    fn prop_llm_cancel_goes_to_cancelling(_dummy in Just(())) {
+    fn prop_llm_cancel_goes_to_idle(_dummy in Just(())) {
         let state = ConvState::LlmRequesting { attempt: 1 };
         let result = transition(&state, &test_context(), Event::UserCancel);
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
         prop_assert!(
-            matches!(tr.new_state, ConvState::CancellingLlm),
-            "Should go to CancellingLlm"
+            matches!(tr.new_state, ConvState::Idle),
+            "Should go to Idle"
         );
         prop_assert!(
             tr.effects.iter().any(|e| matches!(e, Effect::AbortLlm)),

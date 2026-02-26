@@ -101,9 +101,7 @@ pub fn transition(
         ) => Err(TransitionError::AgentBusy),
 
         (
-            ConvState::CancellingLlm
-            | ConvState::CancellingTool { .. }
-            | ConvState::CancellingSubAgents { .. },
+            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. },
             Event::UserMessage { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
@@ -523,17 +521,11 @@ pub fn transition(
         // Cancellation (REQ-BED-005)
         // ============================================================
 
-        // LlmRequesting + UserCancel -> CancellingLlm (parent) or Failed (sub-agent)
+        // LlmRequesting + UserCancel -> Idle (fire-and-forget abort)
         (ConvState::LlmRequesting { .. }, Event::UserCancel) if !context.is_sub_agent => {
-            Ok(TransitionResult::new(ConvState::CancellingLlm)
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::AbortLlm))
-        }
-
-        // CancellingLlm + LlmResponse/LlmAborted -> Idle (discard response)
-        (ConvState::CancellingLlm, Event::LlmResponse { .. } | Event::LlmAborted) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
+                .with_effect(Effect::AbortLlm)
                 .with_effect(Effect::notify_agent_done()))
         }
 
@@ -836,6 +828,7 @@ pub fn transition(
             })
             .with_effect(Effect::persist_continuation_message(&cancelled))
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::AbortLlm)
             .with_effect(Effect::NotifyContextExhausted { summary: cancelled }))
         }
 
@@ -932,6 +925,11 @@ pub fn transition(
                 rejected_tool_calls: vec![],
             }))
         }
+
+        // ============================================================
+        // Stale abort events (race between task abort and event delivery)
+        // ============================================================
+        (ConvState::Idle, Event::LlmResponse { .. }) => Ok(TransitionResult::new(ConvState::Idle)),
 
         // ============================================================
         // Invalid Transitions

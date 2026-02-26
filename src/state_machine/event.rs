@@ -33,8 +33,6 @@ pub enum Event {
         #[allow(dead_code)] // Reserved for retry tracking
         attempt: u32,
     },
-    /// LLM request was aborted due to cancellation
-    LlmAborted,
     RetryTimeout {
         attempt: u32,
     },
