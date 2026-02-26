@@ -2234,41 +2234,14 @@ pre:hover .copy-btn {
 .directory-picker {
   display: flex;
   flex-direction: column;
-  gap: 8px;
 }
 
 .path-input-container {
   position: relative;
 }
 
-.path-input {
-  width: 100%;
-  padding: 10px 12px;
+.directory-picker input {
   padding-right: 36px;
-  background: var(--bg-primary);
-  border: 2px solid var(--border-color);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 14px;
-  font-family: 'SF Mono', Monaco, Consolas, monospace;
-  transition: border-color 0.15s;
-}
-
-.path-input:focus {
-  outline: none;
-  border-color: var(--accent-blue);
-}
-
-.path-input.exists {
-  border-color: var(--accent-green);
-}
-
-.path-input.will-create {
-  border-color: var(--accent-yellow);
-}
-
-.path-input.invalid {
-  border-color: var(--accent-red);
 }
 
 .status-icon {
@@ -2278,117 +2251,39 @@ pre:hover .copy-btn {
   transform: translateY(-50%);
   font-size: 16px;
   font-weight: bold;
+  pointer-events: none;
 }
 
-.status-icon.checking {
+.status-icon.status-checking {
   color: var(--text-muted);
   animation: pulse 1s infinite;
 }
 
-.status-icon.exists {
+.status-icon.status-ok {
   color: var(--accent-green);
 }
 
-.status-icon.will-create {
+.status-icon.status-create {
   color: var(--accent-yellow);
 }
 
-.status-icon.invalid {
+.status-icon.status-error {
   color: var(--accent-red);
-}
-
-.path-status-hint {
-  font-size: 12px;
-  padding: 4px 8px;
-  margin-top: 4px;
-  border-radius: 4px;
-}
-
-.path-status-hint.will-create {
-  color: var(--accent-yellow);
-  background: rgba(255, 193, 7, 0.1);
-}
-
-.path-status-hint.invalid {
-  color: var(--accent-red);
-  background: rgba(244, 67, 54, 0.1);
-}
-
-.picker-nav {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.picker-up-btn {
-  padding: 6px 10px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 14px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.picker-up-btn:hover:not(:disabled) {
-  background: var(--border-color);
-  color: var(--text-primary);
-}
-
-.picker-up-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.picker-breadcrumbs {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 6px 8px;
-  background: var(--bg-tertiary);
-  border-radius: 6px;
-  font-size: 12px;
-  overflow-x: auto;
-  flex: 1;
-  min-width: 0;
-}
-
-.picker-breadcrumbs::-webkit-scrollbar {
-  display: none;
-}
-
-.breadcrumb-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  padding: 2px 4px;
-  border-radius: 3px;
-  cursor: pointer;
-  font-size: 12px;
-  font-family: 'SF Mono', Monaco, Consolas, monospace;
-  white-space: nowrap;
-}
-
-.breadcrumb-btn:hover {
-  background: var(--border-color);
-  color: var(--text-primary);
-}
-
-.breadcrumb-btn.active {
-  color: var(--accent-blue);
-}
-
-.breadcrumb-sep {
-  color: var(--text-muted);
 }
 
 .directory-list {
-  max-height: 180px;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  max-height: 200px;
   overflow-y: auto;
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--bg-primary);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  margin-top: 4px;
 }
 
 .directory-entry {
@@ -2410,8 +2305,9 @@ pre:hover .copy-btn {
   border-bottom: none;
 }
 
-.directory-entry:hover {
-  background: var(--bg-secondary);
+.directory-entry:hover,
+.directory-entry.selected {
+  background: var(--bg-tertiary);
 }
 
 .directory-entry:active {
@@ -2419,7 +2315,8 @@ pre:hover .copy-btn {
 }
 
 .entry-icon {
-  font-size: 14px;
+  color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .entry-name {
@@ -2431,7 +2328,13 @@ pre:hover .copy-btn {
 
 .entry-arrow {
   color: var(--text-muted);
-  font-size: 16px;
+}
+
+.directory-list-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
 }
 
 .list-error {
@@ -2447,13 +2350,6 @@ pre:hover .copy-btn {
   text-align: center;
   font-size: 12px;
   font-style: italic;
-}
-
-/* Larger modal for directory picker */
-.modal.modal-large {
-  max-width: 400px;
-  max-height: 85vh;
-  overflow-y: auto;
 }
 
 /* Model Select */

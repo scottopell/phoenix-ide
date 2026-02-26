@@ -1,5 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Folder, ChevronRight } from 'lucide-react';
 import { api } from '../api';
+import { Skeleton } from './Skeleton';
+import type { DirStatus } from './SettingsFields';
 
 interface DirectoryEntry {
   name: string;
@@ -9,190 +12,272 @@ interface DirectoryEntry {
 interface DirectoryPickerProps {
   value: string;
   onChange: (path: string) => void;
+  onStatusChange?: (status: DirStatus) => void;
+  placeholder?: string;
+  className?: string;
 }
 
-type PathStatus = 
-  | { type: 'exists' }
-  | { type: 'will_create'; parent: string }
-  | { type: 'invalid'; error: string }
-  | { type: 'checking' };
+const STATUS_CLASS_MAP: Record<DirStatus, string> = {
+  checking: 'status-checking',
+  exists: 'status-ok',
+  'will-create': 'status-create',
+  invalid: 'status-error',
+};
 
-export function DirectoryPicker({ value, onChange }: DirectoryPickerProps) {
-  const [entries, setEntries] = useState<DirectoryEntry[]>([]);
-  const [listError, setListError] = useState<string | null>(null);
-  const [pathStatus, setPathStatus] = useState<PathStatus>({ type: 'checking' });
-  
-  // Parse path into segments for breadcrumbs
-  const pathSegments = value.split('/').filter(Boolean);
-  
-  // Find the deepest existing directory for listing
-  const [listingPath, setListingPath] = useState(value);
+const STATUS_ICON_MAP: Record<DirStatus, { icon: string; title: string }> = {
+  checking: { icon: '...', title: 'Checking path...' },
+  exists: { icon: '\u2713', title: 'Directory exists' },
+  'will-create': { icon: '+', title: 'Directory will be created' },
+  invalid: { icon: '\u2717', title: 'Invalid path' },
+};
 
-  // Check path status and load directory listing
+function parsePath(value: string): { parentPath: string; partial: string } {
+  if (!value || !value.startsWith('/')) {
+    return { parentPath: '/', partial: '' };
+  }
+  if (value.endsWith('/')) {
+    const parent = value.length > 1 ? value.slice(0, -1) : '/';
+    return { parentPath: parent, partial: '' };
+  }
+  const lastSlash = value.lastIndexOf('/');
+  const parent = value.substring(0, lastSlash) || '/';
+  const partial = value.substring(lastSlash + 1);
+  return { parentPath: parent, partial };
+}
+
+export function DirectoryPicker({ value, onChange, onStatusChange, placeholder = '/path/to/project', className = '' }: DirectoryPickerProps) {
+  const [suggestions, setSuggestions] = useState<DirectoryEntry[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState(-1);
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [pathStatus, setPathStatus] = useState<DirStatus>('checking');
+
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const blurTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+
+  // Cache fetched entries by parent path to avoid redundant API calls
+  const cachedParentRef = useRef<string>('');
+  const cachedEntriesRef = useRef<DirectoryEntry[]>([]);
+
+  // Fetch suggestions (debounced 150ms)
   useEffect(() => {
-    const checkPath = async () => {
-      setPathStatus({ type: 'checking' });
-      
-      const validation = await api.validateCwd(value);
-      
-      if (validation.valid) {
-        setPathStatus({ type: 'exists' });
-        setListingPath(value);
-        return;
+    const trimmed = value.trim();
+    if (!trimmed || !trimmed.startsWith('/')) {
+      setSuggestions([]);
+      return;
+    }
+
+    const { parentPath, partial } = parsePath(trimmed);
+
+    // If parent is cached, filter client-side immediately
+    if (parentPath === cachedParentRef.current) {
+      const filtered = partial
+        ? cachedEntriesRef.current.filter(e => e.name.toLowerCase().startsWith(partial.toLowerCase()))
+        : cachedEntriesRef.current;
+      setSuggestions(filtered);
+      setSelectedIndex(-1);
+      return;
+    }
+
+    setIsLoading(true);
+    const timeoutId = setTimeout(() => {
+      // Cancel previous in-flight request
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
       }
-      
-      // Path doesn't exist - check if parent exists (would create)
-      const parentPath = value.substring(0, value.lastIndexOf('/')) || '/';
-      const parentValidation = await api.validateCwd(parentPath);
-      
-      if (parentValidation.valid) {
-        setPathStatus({ type: 'will_create', parent: parentPath });
-        setListingPath(parentPath);
-      } else {
-        setPathStatus({ type: 'invalid', error: 'Parent directory does not exist' });
-        // Try to find deepest existing ancestor
-        let ancestor = parentPath;
-        while (ancestor !== '/') {
-          const ancestorParent = ancestor.substring(0, ancestor.lastIndexOf('/')) || '/';
-          const ancestorCheck = await api.validateCwd(ancestorParent);
-          if (ancestorCheck.valid) {
-            setListingPath(ancestorParent);
-            return;
-          }
-          ancestor = ancestorParent;
-        }
-        setListingPath('/');
-      }
-    };
-    
-    checkPath();
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      api.listDirectory(parentPath, controller.signal)
+        .then(resp => {
+          if (controller.signal.aborted) return;
+          const dirs = resp.entries.filter(e => e.is_dir);
+          cachedParentRef.current = parentPath;
+          cachedEntriesRef.current = dirs;
+          const filtered = partial
+            ? dirs.filter(e => e.name.toLowerCase().startsWith(partial.toLowerCase()))
+            : dirs;
+          setSuggestions(filtered);
+          setSelectedIndex(-1);
+          setIsLoading(false);
+        })
+        .catch(err => {
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+          setSuggestions([]);
+          setIsLoading(false);
+        });
+    }, 150);
+
+    return () => clearTimeout(timeoutId);
   }, [value]);
 
-  // Load directory entries when listing path changes
+  // Validate path (debounced 300ms)
   useEffect(() => {
-    const loadEntries = async () => {
+    const trimmed = value.trim();
+    if (!trimmed || !trimmed.startsWith('/')) {
+      setPathStatus('invalid');
+      onStatusChangeRef.current?.('invalid');
+      return;
+    }
+
+    setPathStatus('checking');
+    onStatusChangeRef.current?.('checking');
+
+    const timeoutId = setTimeout(async () => {
       try {
-        const resp = await api.listDirectory(listingPath);
-        setEntries(resp.entries.filter(e => e.is_dir));
-        setListError(null);
-      } catch (err) {
-        setListError(err instanceof Error ? err.message : 'Failed to list directory');
-        setEntries([]);
+        const validation = await api.validateCwd(trimmed);
+        if (validation.valid) {
+          setPathStatus('exists');
+          onStatusChangeRef.current?.('exists');
+        } else {
+          const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
+          const parentValidation = await api.validateCwd(parentPath);
+          const status: DirStatus = parentValidation.valid ? 'will-create' : 'invalid';
+          setPathStatus(status);
+          onStatusChangeRef.current?.(status);
+        }
+      } catch {
+        setPathStatus('invalid');
+        onStatusChangeRef.current?.('invalid');
       }
-    };
-    
-    loadEntries();
-  }, [listingPath]);
+    }, 300);
 
-  const handleBreadcrumbClick = useCallback((index: number) => {
-    const newPath = '/' + pathSegments.slice(0, index + 1).join('/');
+    return () => clearTimeout(timeoutId);
+  }, [value]);
+
+  const handleSelect = useCallback((entry: DirectoryEntry) => {
+    const trimmed = value.trim();
+    const { parentPath } = parsePath(trimmed);
+    const newPath = parentPath === '/' ? `/${entry.name}/` : `${parentPath}/${entry.name}/`;
     onChange(newPath);
-  }, [pathSegments, onChange]);
-
-  const handleEntryClick = useCallback((entry: DirectoryEntry) => {
-    const newPath = listingPath === '/' 
-      ? `/${entry.name}` 
-      : `${listingPath}/${entry.name}`;
-    onChange(newPath);
-  }, [listingPath, onChange]);
-
-  const handleGoUp = useCallback(() => {
-    const parentPath = value.substring(0, value.lastIndexOf('/')) || '/';
-    onChange(parentPath);
+    setSelectedIndex(-1);
+    // Keep focus for continued drilling
+    inputRef.current?.focus();
   }, [value, onChange]);
 
-  const statusInfo = () => {
-    switch (pathStatus.type) {
-      case 'checking':
-        return { icon: '⋯', title: 'Checking path...', className: 'checking' };
-      case 'exists':
-        return { icon: '✓', title: 'Directory exists', className: 'exists' };
-      case 'will_create':
-        return { icon: '+', title: 'Directory will be created', className: 'will-create' };
-      case 'invalid':
-        return { icon: '✗', title: pathStatus.error, className: 'invalid' };
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Escape' && showDropdown) {
+      e.preventDefault();
+      e.stopPropagation();
+      setShowDropdown(false);
+      return;
     }
-  };
 
-  const status = statusInfo();
+    if (!showDropdown) {
+      if (e.key === 'ArrowDown' && suggestions.length > 0) {
+        e.preventDefault();
+        setShowDropdown(true);
+        setSelectedIndex(0);
+      }
+      return;
+    }
+
+    if (suggestions.length === 0) return;
+
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        setSelectedIndex(prev => (prev + 1) % suggestions.length);
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        setSelectedIndex(prev => (prev - 1 + suggestions.length) % suggestions.length);
+        break;
+      case 'Enter': {
+        const enterEntry = suggestions[selectedIndex];
+        if (selectedIndex >= 0 && enterEntry) {
+          e.preventDefault();
+          handleSelect(enterEntry);
+        }
+        break;
+      }
+      case 'Tab': {
+        const tabEntry = suggestions[selectedIndex];
+        if (selectedIndex >= 0 && tabEntry) {
+          e.preventDefault();
+          handleSelect(tabEntry);
+        }
+        break;
+      }
+    }
+  }, [showDropdown, suggestions, selectedIndex, handleSelect]);
+
+  const handleFocus = useCallback(() => {
+    if (blurTimeoutRef.current) {
+      clearTimeout(blurTimeoutRef.current);
+      blurTimeoutRef.current = null;
+    }
+    setShowDropdown(true);
+  }, []);
+
+  const handleBlur = useCallback(() => {
+    blurTimeoutRef.current = setTimeout(() => {
+      setShowDropdown(false);
+      setSelectedIndex(-1);
+    }, 150);
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) abortControllerRef.current.abort();
+      if (blurTimeoutRef.current) clearTimeout(blurTimeoutRef.current);
+    };
+  }, []);
+
+  const statusClass = STATUS_CLASS_MAP[pathStatus];
+  const { icon: statusIcon, title: statusTitle } = STATUS_ICON_MAP[pathStatus];
+  const dropdownVisible = showDropdown && value.trim().startsWith('/');
 
   return (
     <div className="directory-picker">
-      {/* Path input with status */}
       <div className="path-input-container">
         <input
+          ref={inputRef}
           type="text"
-          className={`path-input ${pathStatus.type}`}
+          className={`${className} ${statusClass}`}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="/path/to/project"
+          onKeyDown={handleKeyDown}
+          onFocus={handleFocus}
+          onBlur={handleBlur}
+          placeholder={placeholder}
+          autoComplete="off"
         />
-        <span className={`status-icon ${status.className}`} title={status.title}>
-          {status.icon}
+        <span className={`status-icon ${statusClass}`} title={statusTitle}>
+          {statusIcon}
         </span>
-      </div>
-
-      {/* Status message */}
-      {pathStatus.type === 'will_create' && (
-        <div className="path-status-hint will-create">
-          📁 New folder will be created
-        </div>
-      )}
-      {pathStatus.type === 'invalid' && (
-        <div className="path-status-hint invalid">
-          {pathStatus.error}
-        </div>
-      )}
-
-      {/* Breadcrumb navigation with Up button */}
-      <div className="picker-nav">
-        <button 
-          className="picker-up-btn"
-          onClick={handleGoUp}
-          disabled={value === '/'}
-          title="Go up"
-        >
-          ↑
-        </button>
-        <div className="picker-breadcrumbs">
-          <button 
-            className="breadcrumb-btn root" 
-            onClick={() => onChange('/')}
-          >
-            /
-          </button>
-          {pathSegments.map((segment, i) => (
-            <span key={i} className="breadcrumb-segment">
-              <span className="breadcrumb-sep">/</span>
-              <button 
-                className={`breadcrumb-btn ${i === pathSegments.length - 1 ? 'active' : ''}`}
-                onClick={() => handleBreadcrumbClick(i)}
-              >
-                {segment}
-              </button>
-            </span>
-          ))}
-        </div>
-      </div>
-
-      {/* Directory listing */}
-      <div className="directory-list">
-        {listError ? (
-          <div className="list-error">{listError}</div>
-        ) : entries.length === 0 ? (
-          <div className="list-empty">No subdirectories</div>
-        ) : (
-          entries.map((entry) => (
-            <button
-              key={entry.name}
-              className="directory-entry"
-              onClick={() => handleEntryClick(entry)}
-            >
-              <span className="entry-icon">📁</span>
-              <span className="entry-name">{entry.name}</span>
-              <span className="entry-arrow">›</span>
-            </button>
-          ))
+        {dropdownVisible && (
+          <div className="directory-list">
+            {isLoading ? (
+              <div className="directory-list-loading">
+                <Skeleton width="60%" height={13} />
+                <Skeleton width="45%" height={13} />
+                <Skeleton width="55%" height={13} />
+              </div>
+            ) : suggestions.length === 0 ? (
+              <div className="list-empty">No subdirectories</div>
+            ) : (
+              suggestions.map((entry, index) => (
+                <button
+                  key={entry.name}
+                  className={`directory-entry${index === selectedIndex ? ' selected' : ''}`}
+                  onMouseDown={(e) => {
+                    e.preventDefault(); // Prevent input blur
+                    handleSelect(entry);
+                  }}
+                  tabIndex={-1}
+                >
+                  <Folder size={14} className="entry-icon" />
+                  <span className="entry-name">{entry.name}</span>
+                  <ChevronRight size={14} className="entry-arrow" />
+                </button>
+              ))
+            )}
+          </div>
         )}
       </div>
     </div>

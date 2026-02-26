@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import { SettingsFields, DIR_STATUS_CONFIG } from './SettingsFields';
+import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
 import { generateUUID } from '../utils/uuid';
 import type { ModelsResponse } from '../api';
@@ -39,23 +39,7 @@ export function SidebarNewForm({ onClose, onCreated, showToast }: SidebarNewForm
     setTimeout(() => textareaRef.current?.focus(), 100);
   }, [selectedModel]);
 
-  useEffect(() => {
-    const trimmed = cwd.trim();
-    if (!trimmed || !trimmed.startsWith('/')) { setDirStatus('invalid'); return; }
-    setDirStatus('checking');
-    const t = setTimeout(async () => {
-      try {
-        const v = await api.validateCwd(trimmed);
-        if (v.valid) { setDirStatus('exists'); }
-        else {
-          const p = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-          const pv = await api.validateCwd(p);
-          setDirStatus(pv.valid ? 'will-create' : 'invalid');
-        }
-      } catch { setDirStatus('invalid'); }
-    }, 300);
-    return () => clearTimeout(t);
-  }, [cwd]);
+  // Directory validation is handled by DirectoryPicker via onDirStatusChange
 
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
@@ -97,9 +81,8 @@ export function SidebarNewForm({ onClose, onCreated, showToast }: SidebarNewForm
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doCreate(false); }
   };
 
-  const { class: dirStatusClass } = DIR_STATUS_CONFIG[dirStatus];
   const canSend = draft.trim().length > 0 && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
-  const settingsProps = { cwd, setCwd, dirStatus, dirStatusClass, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
+  const settingsProps = { cwd, setCwd, dirStatus, onDirStatusChange: setDirStatus, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
 
   return (
     <div className="sidebar-new-form">

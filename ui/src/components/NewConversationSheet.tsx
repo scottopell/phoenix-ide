@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import { SettingsFields, DIR_STATUS_CONFIG } from './SettingsFields';
+import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
 import { generateUUID } from '../utils/uuid';
 import type { ModelsResponse } from '../api';
@@ -56,31 +56,6 @@ export function NewConversationSheet({ isOpen, onClose }: NewConversationSheetPr
       setTranslateY(0);
     }
   }, [isOpen]);
-
-  // Validate directory
-  useEffect(() => {
-    const trimmed = cwd.trim();
-    if (!trimmed || !trimmed.startsWith('/')) {
-      setDirStatus('invalid');
-      return;
-    }
-    setDirStatus('checking');
-    const timeoutId = setTimeout(async () => {
-      try {
-        const validation = await api.validateCwd(trimmed);
-        if (validation.valid) {
-          setDirStatus('exists');
-        } else {
-          const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-          const parentValidation = await api.validateCwd(parentPath);
-          setDirStatus(parentValidation.valid ? 'will-create' : 'invalid');
-        }
-      } catch {
-        setDirStatus('invalid');
-      }
-    }, 300);
-    return () => clearTimeout(timeoutId);
-  }, [cwd]);
 
   // Persist preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
@@ -172,10 +147,9 @@ export function NewConversationSheet({ isOpen, onClose }: NewConversationSheetPr
 
   if (!isOpen) return null;
 
-  const { class: dirStatusClass } = DIR_STATUS_CONFIG[dirStatus];
   const canSend = draft.trim().length > 0 && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
   const buttonText = creating ? 'Creating...' : 'Send';
-  const settingsProps = { cwd, setCwd, dirStatus, dirStatusClass, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
+  const settingsProps = { cwd, setCwd, dirStatus, onDirStatusChange: setDirStatus, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
 
   return (
     <div className="bottom-sheet-overlay" onClick={onClose}>

@@ -1,34 +1,37 @@
 import type { ModelsResponse, ModelInfo } from '../api';
+import { DirectoryPicker } from './DirectoryPicker';
 
 export type DirStatus = 'checking' | 'exists' | 'will-create' | 'invalid';
 
 export const DIR_STATUS_CONFIG = {
   checking: { icon: '...', class: 'status-checking', label: 'checking...' },
-  exists: { icon: '✓', class: 'status-ok', label: 'exists' },
+  exists: { icon: '\u2713', class: 'status-ok', label: 'exists' },
   'will-create': { icon: '+', class: 'status-create', label: 'will be created' },
-  invalid: { icon: '✗', class: 'status-error', label: 'invalid path' },
+  invalid: { icon: '\u2717', class: 'status-error', label: 'invalid path' },
 } as const;
 
 export function SettingsFields({
-  cwd, setCwd, dirStatus, dirStatusClass,
+  cwd, setCwd, dirStatus, onDirStatusChange,
   selectedModel, setSelectedModel, models,
   showAllModels, setShowAllModels
 }: {
   cwd: string;
   setCwd: (v: string) => void;
   dirStatus: DirStatus;
-  dirStatusClass: string;
+  onDirStatusChange: (status: DirStatus) => void;
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
   models: ModelsResponse | null;
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
 }) {
+  const dirStatusClass = DIR_STATUS_CONFIG[dirStatus].class;
+
   // Filter and group models
   const filteredModels = models?.models.filter(m => showAllModels || m.recommended) || [];
   const totalCount = models?.models.length || 0;
   const recommendedCount = models?.models.filter(m => m.recommended).length || 0;
-  
+
   // Group by provider when showing all
   const groupedModels: Record<string, ModelInfo[]> = {};
   if (showAllModels) {
@@ -51,12 +54,11 @@ export function SettingsFields({
             {DIR_STATUS_CONFIG[dirStatus].label}
           </span>
         </span>
-        <input
-          type="text"
-          className={`settings-input ${dirStatusClass}`}
+        <DirectoryPicker
           value={cwd}
-          onChange={(e) => setCwd(e.target.value)}
-          placeholder="/path/to/project"
+          onChange={setCwd}
+          onStatusChange={onDirStatusChange}
+          className="settings-input"
         />
       </label>
       <label className="settings-field">
@@ -82,7 +84,7 @@ export function SettingsFields({
                 <optgroup key={provider} label={provider}>
                   {providerModels.map(m => (
                     <option key={m.id} value={m.id}>
-                      {m.recommended ? '★ ' : ''}{m.id}
+                      {m.recommended ? '* ' : ''}{m.id}
                     </option>
                   ))}
                 </optgroup>

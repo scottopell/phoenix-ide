@@ -209,8 +209,8 @@ export const api = {
     return resp.json();
   },
 
-  async listDirectory(path: string): Promise<{ entries: { name: string; is_dir: boolean }[] }> {
-    const resp = await fetch(`/api/list-directory?path=${encodeURIComponent(path)}`);
+  async listDirectory(path: string, signal?: AbortSignal): Promise<{ entries: { name: string; is_dir: boolean }[] }> {
+    const resp = await fetch(`/api/list-directory?path=${encodeURIComponent(path)}`, signal ? { signal } : {});
     if (!resp.ok) throw new Error('Failed to list directory');
     return resp.json();
   },

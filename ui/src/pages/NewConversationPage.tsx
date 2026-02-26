@@ -52,32 +52,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     }).catch(console.error);
   }, [selectedModel]);
 
-  // Validate directory path
-  useEffect(() => {
-    const trimmed = cwd.trim();
-    if (!trimmed || !trimmed.startsWith('/')) {
-      setDirStatus('invalid');
-      return;
-    }
-
-    setDirStatus('checking');
-    const timeoutId = setTimeout(async () => {
-      try {
-        const validation = await api.validateCwd(trimmed);
-        if (validation.valid) {
-          setDirStatus('exists');
-        } else {
-          const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-          const parentValidation = await api.validateCwd(parentPath);
-          setDirStatus(parentValidation.valid ? 'will-create' : 'invalid');
-        }
-      } catch {
-        setDirStatus('invalid');
-      }
-    }, 300);
-
-    return () => clearTimeout(timeoutId);
-  }, [cwd]);
+  // Directory validation is handled by DirectoryPicker via onDirStatusChange
 
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
@@ -202,7 +177,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const buttonText = creating ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
   const textareaValue = interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft;
 
-  const settingsProps = { cwd, setCwd, dirStatus, dirStatusClass, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
+  const settingsProps = { cwd, setCwd, dirStatus, onDirStatusChange: setDirStatus, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
 
   return (
     <div className="new-conv-page">
