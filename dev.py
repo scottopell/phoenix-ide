@@ -1,13 +1,12 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # ///
 """Development tasks for phoenix-ide."""
 
 import argparse
 import dataclasses
 import fcntl
-import getpass
 import hashlib
 import json
 import os
@@ -31,11 +30,15 @@ PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
 PROD_PORT = 8031
 
-# Lima VM configuration
+# Lima VM configuration (dev environment only — create/shell/destroy)
 LIMA_VM_NAME = "phoenix-ide"
 LIMA_YAML = ROOT / "lima" / "phoenix-ide.yaml"
-LIMA_BUILD_DIR = "/opt/phoenix-build"
-LIMA_ENV_FILE = "/etc/phoenix-ide/env"
+
+# launchd (native macOS) configuration
+LAUNCHD_LABEL = "com.phoenix-ide.server"
+LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
+LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
 
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
@@ -83,29 +86,9 @@ def _discover_gateway_candidates() -> list[str]:
     return candidates
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
-    """Parse a KEY=VALUE env file, ignoring comments and blank lines."""
-    result = {}
-    try:
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                k, v = line.split("=", 1)
-                result[k.strip()] = v.strip()
-    except (OSError, PermissionError):
-        pass
-    return result
-
-
 def get_llm_gateway() -> str | None:
-    """Get LLM gateway URL from env, system env file, or by probing candidates. Returns None if none reachable."""
+    """Get LLM gateway URL from env or by probing candidates. Returns None if none reachable."""
     if val := os.environ.get("LLM_GATEWAY"):
-        return val
-    # Check system env file (shared by prod and dev inside Lima VM)
-    env_file = _read_env_file(Path(LIMA_ENV_FILE))
-    if val := env_file.get("LLM_GATEWAY"):
         return val
     for url in _discover_gateway_candidates():
         if _gateway_is_reachable(url):
@@ -789,22 +772,16 @@ def cmd_tasks_fix() -> bool:
 # =============================================================================
 
 
-def detect_prod_env() -> str | None:
-    """Detect production environment: 'native', 'lima', 'daemon', or None.
+def detect_prod_env() -> str:
+    """Detect production environment: 'launchd', 'native', or 'daemon'.
 
     Returns:
+        'launchd': macOS - native launchd deployment (user agent)
         'native': Linux with systemd - full production deployment
-        'lima': macOS with Lima VM - isolated VM deployment
         'daemon': Fallback - background daemon in ~/.phoenix-ide/
-        None: macOS without Lima (error condition)
     """
     if sys.platform == "darwin":
-        # macOS: ONLY check for Lima VM, never use daemon mode
-        if lima_vm_exists():
-            lima_ensure_running()
-            return "lima"
-        # No Lima = fail with helpful message, don't silently fall back
-        return None
+        return "launchd"
 
     elif sys.platform == "linux":
         # Linux: systemd preferred, daemon fallback
@@ -834,7 +811,7 @@ def check_systemd_available() -> bool:
         return False
 
 
-def prod_build(version: str | None = None, strip: bool = True) -> Path:
+def prod_build(version: str | None = None, strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:
     """Build a production binary from a git tag or HEAD.
 
     Uses a separate git worktree to avoid disturbing the main working directory.
@@ -843,6 +820,7 @@ def prod_build(version: str | None = None, strip: bool = True) -> Path:
     Args:
         version: Git tag or None for HEAD
         strip: Whether to strip debug symbols (default True, False for debugging)
+        target: Cargo build target, or None for native host architecture
     """
     # Determine what to build
     if version:
@@ -890,16 +868,19 @@ def prod_build(version: str | None = None, strip: bool = True) -> Path:
     print("Building UI...")
     subprocess.run(["npm", "run", "build"], cwd=ui_dir, check=True)
     
-    # Build Rust with musl target
-    print("Building Rust (musl, release)...")
+    # Build Rust
     build_env = os.environ.copy()
-    build_env["CC_x86_64_unknown_linux_musl"] = "x86_64-linux-musl-gcc"
-    subprocess.run(
-        ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
-        cwd=worktree, check=True, env=build_env
-    )
-    
-    binary = worktree / "target" / "x86_64-unknown-linux-musl" / "release" / "phoenix_ide"
+    cargo_cmd = ["cargo", "build", "--release"]
+    if target:
+        print(f"Building Rust ({target}, release)...")
+        cargo_cmd += ["--target", target]
+        if "musl" in target:
+            build_env["CC_x86_64_unknown_linux_musl"] = "x86_64-linux-musl-gcc"
+        binary = worktree / "target" / target / "release" / "phoenix_ide"
+    else:
+        print("Building Rust (native, release)...")
+        binary = worktree / "target" / "release" / "phoenix_ide"
+    subprocess.run(cargo_cmd, cwd=worktree, check=True, env=build_env)
 
     # Strip the binary (unless debugging)
     if strip:
@@ -943,13 +924,6 @@ NATIVE_SYSTEMD_CONFIG = SystemdConfig(
     llm_gateway=None,  # Set at deploy time via get_llm_gateway()
 )
 
-LIMA_SYSTEMD_CONFIG = SystemdConfig(
-    user="phoenix-ide",
-    db_path="/mnt/phoenix-data/prod.db",
-    install_dir="/opt/phoenix-ide",
-    port=PROD_PORT,
-    env_file=LIMA_ENV_FILE,
-)
 
 
 def generate_systemd_socket(config: SystemdConfig) -> str:
@@ -1126,6 +1100,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
             print(f"  Database: {PROD_DB_PATH}")
+            print(f"  URL: http://localhost:{PROD_PORT}")
         else:
             print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
     else:
@@ -1151,6 +1126,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
             print(f"  Database: {PROD_DB_PATH}")
+            print(f"  URL: http://localhost:{PROD_PORT}")
         else:
             print(f"\n✗ Service failed to start", file=sys.stderr)
             subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
@@ -1269,6 +1245,7 @@ def prod_daemon_status():
                 version_text = resp.read().decode().strip()
                 print(f"  Version: {version_text}")
                 print(f"  Port: {PROD_PORT}")
+                print(f"  URL: http://localhost:{PROD_PORT}")
                 print(f"  Health: OK")
         except Exception as e:
             print(f"  Health: Unreachable ({type(e).__name__}: {e})")
@@ -1414,8 +1391,9 @@ def native_prod_status():
             if part.startswith("PHOENIX_VERSION="):
                 print(f"  Version: {part.split('=', 1)[1]}")
         print(f"  Port: {PROD_PORT}")
+        print(f"  URL: http://localhost:{PROD_PORT}")
         print(f"  Database: {PROD_DB_PATH}")
-        
+
         # Check if responding
         try:
             import urllib.request
@@ -1444,12 +1422,273 @@ def native_prod_stop():
     print(f"Stopped {PROD_SERVICE_NAME}")
 
 
+# =============================================================================
+# launchd (native macOS) deployment
+# =============================================================================
+
+
+def generate_launchd_plist(version: str, llm_gateway: str | None) -> str:
+    """Generate a launchd plist for the Phoenix IDE server."""
+    env_vars = {
+        "PHOENIX_DB_PATH": str(PROD_DB_PATH),
+        "PHOENIX_PORT": str(PROD_PORT),
+        "PHOENIX_VERSION": version,
+    }
+    if llm_gateway:
+        env_vars["LLM_GATEWAY"] = llm_gateway
+
+    env_xml = "\n".join(
+        f"      <key>{k}</key>\n      <string>{v}</string>"
+        for k, v in env_vars.items()
+    )
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{LAUNCHD_LABEL}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{LAUNCHD_INSTALL_DIR / "phoenix-ide"}</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+{env_xml}
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>{LAUNCHD_LOG_PATH}</string>
+
+  <key>StandardErrorPath</key>
+  <string>{LAUNCHD_LOG_PATH}</string>
+</dict>
+</plist>
+"""
+
+
+def _launchd_stop_if_loaded():
+    """Stop and unload the launchd service if it is currently loaded."""
+    uid = os.getuid()
+    domain_target = f"gui/{uid}/{LAUNCHD_LABEL}"
+    result = subprocess.run(
+        ["launchctl", "print", domain_target],
+        capture_output=True, text=True,
+    )
+    # launchctl print returns 0 even when service doesn't exist — check output
+    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
+        return  # Not loaded, nothing to do
+    # Service is loaded — bootout stops and unloads it
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
+        capture_output=True,  # Suppress output; may warn if already stopping
+    )
+    # Brief wait for process to exit
+    time.sleep(1)
+
+
+def launchd_prod_deploy(version: str | None = None):
+    """Build and deploy to production via launchd (native macOS)."""
+    # Build native macOS binary
+    binary = prod_build(version, target=None)
+
+    # Determine version string
+    if version is None:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        version = f"dev-{result.stdout.strip()}"
+
+    # Stop existing service
+    _launchd_stop_if_loaded()
+
+    # Install binary
+    LAUNCHD_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    dest = LAUNCHD_INSTALL_DIR / "phoenix-ide"
+    # Remove first to avoid "text file busy" if somehow still running
+    dest.unlink(missing_ok=True)
+    import shutil
+    shutil.copy2(str(binary), str(dest))
+    dest.chmod(0o755)
+
+    # Ad-hoc codesign with a stable identifier so macOS remembers FDA grants
+    # across redeploys (the linker's default signature changes every build)
+    subprocess.run(
+        ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(dest)],
+        check=True,
+    )
+
+    # Detect LLM gateway
+    gateway = get_llm_gateway()
+
+    # Generate and write plist
+    plist_content = generate_launchd_plist(version, gateway)
+    LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCHD_PLIST_PATH.write_text(plist_content)
+
+    # Bootstrap (load + start) the service
+    uid = os.getuid()
+    result = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 and "already bootstrapped" not in result.stderr:
+        print(f"ERROR: launchctl bootstrap failed: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    # Health check
+    time.sleep(2)
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=5) as resp:
+            health_version = resp.read().decode().strip()
+    except Exception as e:
+        print(f"WARNING: Server started but health check failed: {e}", file=sys.stderr)
+        health_version = None
+
+    llm_mode = f"gateway ({gateway})" if gateway else "no gateway detected"
+    print(f"\n✓ Deployed {version} to production (launchd)")
+    if health_version:
+        print(f"  Version: {health_version}")
+    print(f"  Port: {PROD_PORT}")
+    print(f"  Database: {PROD_DB_PATH}")
+    print(f"  Logs: {LAUNCHD_LOG_PATH}")
+    print(f"  Binary: {dest}")
+    print(f"  LLM: {llm_mode}")
+    print(f"  URL: http://localhost:{PROD_PORT}")
+
+
+def launchd_prod_status():
+    """Show launchd service status."""
+    uid = os.getuid()
+    domain_target = f"gui/{uid}/{LAUNCHD_LABEL}"
+    result = subprocess.run(
+        ["launchctl", "print", domain_target],
+        capture_output=True, text=True,
+    )
+    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
+        print("Production: not loaded")
+        print(f"  Run './dev.py prod deploy' to start")
+        return
+
+    # Parse state and pid from launchctl print output
+    state = "unknown"
+    pid = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("state = "):
+            state = line.split("= ", 1)[1]
+        elif line.startswith("pid = "):
+            try:
+                pid = int(line.split("= ", 1)[1])
+            except ValueError:
+                pass
+
+    print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
+
+    # Health check
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
+            print(f"  Version: {resp.read().decode().strip()}")
+            print(f"  Health: OK")
+    except Exception:
+        print(f"  Health: not responding")
+
+    print(f"  Port: {PROD_PORT}")
+    print(f"  Database: {PROD_DB_PATH}")
+    print(f"  Logs: {LAUNCHD_LOG_PATH}")
+    print(f"  URL: http://localhost:{PROD_PORT}")
+
+
+def launchd_prod_stop():
+    """Stop the launchd service."""
+    _launchd_stop_if_loaded()
+    print(f"Stopped {LAUNCHD_LABEL}")
+
+
+def launchd_prod_override_set(name: str, value: str):
+    """Set an environment variable in the launchd plist and reload."""
+    import plistlib
+
+    if not LAUNCHD_PLIST_PATH.exists():
+        print("ERROR: No plist found. Run './dev.py prod deploy' first.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(LAUNCHD_PLIST_PATH, "rb") as f:
+        plist = plistlib.load(f)
+
+    if "EnvironmentVariables" not in plist:
+        plist["EnvironmentVariables"] = {}
+    plist["EnvironmentVariables"][name] = value
+
+    with open(LAUNCHD_PLIST_PATH, "wb") as f:
+        plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
+
+    # Reload service
+    _launchd_stop_if_loaded()
+    uid = os.getuid()
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
+        capture_output=True,
+    )
+    print(f"✓ Set {name}={value}")
+    print(f"  Service reloaded")
+
+
+def launchd_prod_override_unset(name: str):
+    """Remove an environment variable from the launchd plist and reload."""
+    import plistlib
+
+    if not LAUNCHD_PLIST_PATH.exists():
+        print("ERROR: No plist found. Run './dev.py prod deploy' first.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(LAUNCHD_PLIST_PATH, "rb") as f:
+        plist = plistlib.load(f)
+
+    env_vars = plist.get("EnvironmentVariables", {})
+    if name not in env_vars:
+        print(f"No override '{name}' found in plist")
+        return
+
+    del env_vars[name]
+
+    with open(LAUNCHD_PLIST_PATH, "wb") as f:
+        plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
+
+    # Reload service
+    _launchd_stop_if_loaded()
+    uid = os.getuid()
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
+        capture_output=True,
+    )
+    print(f"✓ Removed {name} override")
+    print(f"  Service reloaded")
+
+
 def cmd_prod_build(version: str | None = None):
     """Build production binary from git tag."""
-    if sys.platform != "linux":
-        print("Production builds happen inside the Lima VM during './dev.py prod deploy'.")
-        return
-    prod_build(version)
+    if sys.platform == "darwin":
+        prod_build(version, target=None)
+    elif sys.platform == "linux":
+        prod_build(version)
+    else:
+        print(f"Unsupported platform: {sys.platform}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_prod_deploy(version: str | None = None):
@@ -1460,43 +1699,17 @@ def cmd_prod_deploy(version: str | None = None):
 
     env = detect_prod_env()
 
-    if env == "native":
-        print("📦 Detected: Linux with systemd (native deployment)")
+    if env == "launchd":
+        launchd_prod_deploy(version)
+
+    elif env == "native":
         native_prod_deploy(version)
 
-    elif env == "lima":
-        print("📦 Detected: macOS with Lima VM")
-        # Lima clones the repo independently, so unpushed commits won't be visible.
-        unpushed = subprocess.run(
-            ["git", "log", "@{u}..", "--oneline"],
-            cwd=ROOT, capture_output=True, text=True
-        )
-        if unpushed.stdout.strip():
-            print("ERROR: unpushed commits will not be visible inside Lima VM:", file=sys.stderr)
-            for line in unpushed.stdout.strip().splitlines():
-                print(f"  {line}", file=sys.stderr)
-            print("Run 'git push' first.", file=sys.stderr)
-            sys.exit(1)
-        lima_prod_deploy()
-
     elif env == "daemon":
-        print("📦 Detected: No systemd (daemon mode)")
+        print("Detected: No systemd (daemon mode)")
         print("    Running production build as background daemon")
         print()
         prod_daemon_deploy()
-
-    elif env is None:
-        # macOS without Lima
-        print("ERROR: Lima VM not found", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("Phoenix IDE requires Lima VM for production deployment on macOS.", file=sys.stderr)
-        print("Lima provides an isolated Linux environment with systemd.", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("To set up Lima VM:", file=sys.stderr)
-        print("  1. Install Lima: brew install lima", file=sys.stderr)
-        print("  2. Create VM: ./dev.py lima create", file=sys.stderr)
-        print("  3. Deploy: ./dev.py prod deploy", file=sys.stderr)
-        sys.exit(1)
 
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
@@ -1507,16 +1720,12 @@ def cmd_prod_status():
     """Show production status (auto-detects environment)."""
     env = detect_prod_env()
 
-    if env == "native":
+    if env == "launchd":
+        launchd_prod_status()
+    elif env == "native":
         native_prod_status()
-    elif env == "lima":
-        lima_prod_status()
     elif env == "daemon":
         prod_daemon_status()
-    elif env is None:
-        print("ERROR: Lima VM not found. Cannot check status.", file=sys.stderr)
-        print("Run './dev.py lima create' to set up Lima VM.", file=sys.stderr)
-        sys.exit(1)
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
         sys.exit(1)
@@ -1526,30 +1735,25 @@ def cmd_prod_stop():
     """Stop production service (auto-detects environment)."""
     env = detect_prod_env()
 
-    if env == "native":
+    if env == "launchd":
+        launchd_prod_stop()
+    elif env == "native":
         native_prod_stop()
-    elif env == "lima":
-        lima_prod_stop()
     elif env == "daemon":
         prod_daemon_stop()
-    elif env is None:
-        print("ERROR: Lima VM not found. Cannot stop.", file=sys.stderr)
-        sys.exit(1)
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
         sys.exit(1)
 
 
 def cmd_prod_override_set(name: str, value: str):
-    """Set a systemd environment override (native Linux only)."""
+    """Set an environment override for the production service."""
     env = detect_prod_env()
-    
-    if env == "native":
+
+    if env == "launchd":
+        launchd_prod_override_set(name, value)
+    elif env == "native":
         native_prod_override_set(name, value)
-    elif env == "lima":
-        print("ERROR: Overrides not yet supported for Lima deployments", file=sys.stderr)
-        print("SSH into the VM and edit the service file directly.", file=sys.stderr)
-        sys.exit(1)
     elif env == "daemon":
         print("ERROR: Overrides not supported for daemon mode", file=sys.stderr)
         print("Stop the daemon and restart with environment variables set.", file=sys.stderr)
@@ -1560,14 +1764,13 @@ def cmd_prod_override_set(name: str, value: str):
 
 
 def cmd_prod_override_unset(name: str):
-    """Remove a systemd environment override (native Linux only)."""
+    """Remove an environment override from the production service."""
     env = detect_prod_env()
-    
-    if env == "native":
+
+    if env == "launchd":
+        launchd_prod_override_unset(name)
+    elif env == "native":
         native_prod_override_unset(name)
-    elif env == "lima":
-        print("ERROR: Overrides not yet supported for Lima deployments", file=sys.stderr)
-        sys.exit(1)
     elif env == "daemon":
         print("ERROR: Overrides not supported for daemon mode", file=sys.stderr)
         sys.exit(1)
@@ -1579,14 +1782,6 @@ def cmd_prod_override_unset(name: str):
 # =============================================================================
 # Lima VM Commands
 # =============================================================================
-
-def lima_shell(cmd: str, check=True) -> subprocess.CompletedProcess:
-    """Run a command inside the Lima VM via bash -lc (loads .bashrc for Rust PATH)."""
-    return subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
-        check=check,
-    )
-
 
 def lima_shell_quiet(cmd: str, check=True) -> subprocess.CompletedProcess:
     """Run a command inside the Lima VM, capturing output."""
@@ -1643,64 +1838,6 @@ def lima_ensure_running():
     subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
 
 
-def lima_has_llm_config() -> bool:
-    """Check if LLM config (API key or gateway) is configured in the VM."""
-    result = lima_shell_quiet(f"test -f {LIMA_ENV_FILE} && sudo grep -qE '(ANTHROPIC_API_KEY|LLM_GATEWAY)' {LIMA_ENV_FILE}", check=False)
-    return result.returncode == 0
-
-
-def lima_prompt_api_key():
-    """Prompt user for API key and write to VM env file.
-
-    Falls back to ANTHROPIC_API_KEY env var if no terminal is available.
-    """
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
-        print("Using ANTHROPIC_API_KEY from host environment.")
-    else:
-        try:
-            key = getpass.getpass("ANTHROPIC_API_KEY: ")
-        except EOFError:
-            print("No terminal available and ANTHROPIC_API_KEY not set in environment.", file=sys.stderr)
-            print("Set ANTHROPIC_API_KEY in your environment and re-run './dev.py prod deploy'.", file=sys.stderr)
-            return
-    if not key.strip():
-        print("No key provided, skipping.", file=sys.stderr)
-        return
-    env_content = f"ANTHROPIC_API_KEY={key.strip()}\n"
-    subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
-        input=env_content.encode(), check=True, capture_output=True,
-    )
-    lima_shell(f"sudo chmod 600 {LIMA_ENV_FILE}")
-    print("API key saved.")
-
-
-def lima_configure_llm() -> None:
-    """Auto-detect host LLM gateway and write VM env file, or prompt for API key."""
-    if lima_has_llm_config():
-        return
-
-    # Probe candidates on the host
-    for url in _discover_gateway_candidates():
-        if _gateway_is_reachable(url):
-            # Translate host loopback to Lima's host-reachable address
-            vm_url = url.replace("://127.0.0.1", "://host.lima.internal") \
-                        .replace("://localhost", "://host.lima.internal")
-            env_content = f"LLM_GATEWAY={vm_url}\n"
-            subprocess.run(
-                ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "sudo", "tee", LIMA_ENV_FILE],
-                input=env_content.encode(), check=True, capture_output=True,
-            )
-            lima_shell(f"sudo chmod 600 {LIMA_ENV_FILE}")
-            print(f"  LLM gateway: {vm_url} (auto-detected from host)")
-            return
-
-    # No gateway found — fall back to API key prompt
-    print("\nNo LLM gateway detected on host.")
-    lima_prompt_api_key()
-
-
 def cmd_lima_create():
     """Create and provision the Lima VM."""
     # Check limactl exists
@@ -1745,157 +1882,6 @@ def cmd_lima_create():
     print(f"\nVM '{LIMA_VM_NAME}' is ready.")
 
 
-def lima_prod_deploy():
-    """Build and deploy phoenix-ide inside the Lima VM."""
-    lima_ensure_running()
-
-    # Ensure build dir is writable by the Lima default user
-    lima_shell(f"sudo chown -R $(id -u):$(id -g) {LIMA_BUILD_DIR}")
-
-    # Sync source via tar pipe (--no-mac-metadata avoids macOS ._ extended attr files)
-    print("Syncing source to VM...")
-    tar_cmd = [
-        "tar", "-cf", "-", "--no-mac-metadata",
-        "--exclude=target", "--exclude=node_modules", "--exclude=.git",
-        ".",
-    ]
-    tar_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, cwd=ROOT)
-    # Suppress tar warnings about macOS extended header keywords on the receiving side
-    subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--",
-         "tar", "xf", "-", "-C", LIMA_BUILD_DIR,
-         "--warning=no-unknown-keyword"],
-        stdin=tar_proc.stdout, check=True,
-        stderr=subprocess.DEVNULL,
-    )
-    tar_proc.wait()
-    if tar_proc.returncode != 0:
-        print("Failed to create tar archive", file=sys.stderr)
-        sys.exit(1)
-    print("Source synced.")
-
-    # Build UI
-    print("\nBuilding UI...")
-    lima_shell(f"cd {LIMA_BUILD_DIR}/ui && npm install && npm run build")
-
-    # Build Rust
-    print("\nBuilding Rust (release)...")
-    lima_shell(f"cd {LIMA_BUILD_DIR} && cargo build --release")
-
-    # Strip and install binary (mv avoids ETXTBSY on a running executable)
-    print("\nInstalling binary...")
-    lima_shell(f"strip {LIMA_BUILD_DIR}/target/release/phoenix_ide")
-    lima_shell(f"sudo mv {LIMA_BUILD_DIR}/target/release/phoenix_ide /opt/phoenix-ide/phoenix-ide")
-    lima_shell("sudo chmod +x /opt/phoenix-ide/phoenix-ide")
-
-    # LLM config — auto-detect gateway or prompt for API key
-    lima_configure_llm()
-
-    # Get version string
-    result = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=ROOT, capture_output=True, text=True,
-    )
-    version = f"dev-{result.stdout.strip()}" if result.returncode == 0 else "dev-unknown"
-
-    # Use shared systemd config for Lima
-    config = LIMA_SYSTEMD_CONFIG
-
-    # Install systemd socket unit (for socket activation)
-    print("\nInstalling systemd socket unit...")
-    socket_content = generate_systemd_socket(config)
-    subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--",
-         "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket"],
-        input=socket_content.encode(), check=True, capture_output=True,
-    )
-
-    # Install systemd service unit
-    print("Installing systemd service unit...")
-    unit_content = generate_systemd_service(config, version)
-    subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--",
-         "sudo", "tee", f"/etc/systemd/system/{PROD_SERVICE_NAME}.service"],
-        input=unit_content.encode(), check=True, capture_output=True,
-    )
-
-    lima_shell("sudo systemctl daemon-reload")
-    lima_shell(f"sudo systemctl enable {PROD_SERVICE_NAME}.socket")
-    lima_shell(f"sudo systemctl enable {PROD_SERVICE_NAME}")
-
-    # Check if service is already running
-    result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
-    if result.stdout.strip() == "active":
-        # Service running - send SIGHUP for zero-downtime upgrade
-        print("Sending reload signal (SIGHUP) for zero-downtime upgrade...")
-        lima_shell(f"sudo systemctl reload {PROD_SERVICE_NAME}")
-    else:
-        # Service not running - start socket and service
-        print("Starting socket and service...")
-        lima_shell(f"sudo systemctl start {PROD_SERVICE_NAME}.socket")
-        lima_shell(f"sudo systemctl start {PROD_SERVICE_NAME}")
-
-    time.sleep(2)
-
-    # Verify
-    result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
-    status = result.stdout.strip()
-    if status == "active":
-        print(f"\n✓ Deployed {version} to Lima VM")
-        print(f"  Service: {PROD_SERVICE_NAME}")
-        print(f"  Port: {PROD_PORT}")
-        print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
-    else:
-        print(f"\n✗ Service failed to start (status: {status})", file=sys.stderr)
-        lima_shell(f"sudo journalctl -u {PROD_SERVICE_NAME} -n 20 --no-pager")
-        sys.exit(1)
-
-
-def lima_prod_status():
-    """Show Lima VM and service status."""
-    if not lima_vm_exists():
-        print(f"VM '{LIMA_VM_NAME}': not created")
-        return
-
-    if not lima_is_running():
-        print(f"VM '{LIMA_VM_NAME}': stopped")
-        return
-
-    print(f"VM '{LIMA_VM_NAME}': running")
-
-    # Kernel version
-    result = lima_shell_quiet("uname -r", check=False)
-    if result.returncode == 0:
-        print(f"  Kernel: {result.stdout.strip()}")
-
-    # Service status
-    result = lima_shell_quiet(f"systemctl is-active {PROD_SERVICE_NAME}", check=False)
-    svc_status = result.stdout.strip()
-    print(f"  Service: {svc_status}")
-
-    # LLM config
-    if lima_has_llm_config():
-        print("  LLM config: configured")
-    else:
-        print("  LLM config: not set")
-
-    # Health check from host
-    if svc_status == "active":
-        try:
-            import urllib.request
-            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
-                print(f"  Health: {resp.read().decode().strip()}")
-        except Exception:
-            print("  Health: not responding on host (port forward may not be active)")
-
-
-def lima_prod_stop():
-    """Stop the phoenix-ide service in the Lima VM."""
-    lima_ensure_running()
-    lima_shell(f"sudo systemctl stop {PROD_SERVICE_NAME}", check=False)
-    print(f"Stopped {PROD_SERVICE_NAME} in Lima VM.")
-
-
 def cmd_lima_shell():
     """Open an interactive shell in the Lima VM."""
     lima_ensure_running()
@@ -1909,10 +1895,6 @@ def cmd_lima_destroy():
     if not lima_vm_exists():
         print(f"VM '{LIMA_VM_NAME}' does not exist.")
         return
-
-    # Stop service first (ignore errors)
-    if lima_is_running():
-        lima_shell(f"sudo systemctl stop {PROD_SERVICE_NAME}", check=False)
 
     print(f"Deleting VM '{LIMA_VM_NAME}'...")
     subprocess.run(["limactl", "delete", LIMA_VM_NAME, "--force"], check=True)
@@ -1955,10 +1937,10 @@ def main():
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     # Override management
-    override_set_parser = prod_sub.add_parser("set", help="Set systemd environment override")
+    override_set_parser = prod_sub.add_parser("set", help="Set environment override")
     override_set_parser.add_argument("name", help="Environment variable name (e.g., RUST_LOG)")
     override_set_parser.add_argument("value", help="Environment variable value (e.g., debug)")
-    override_unset_parser = prod_sub.add_parser("unset", help="Remove systemd environment override")
+    override_unset_parser = prod_sub.add_parser("unset", help="Remove environment override")
     override_unset_parser.add_argument("name", help="Environment variable name to remove")
 
     # lima
