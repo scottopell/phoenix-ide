@@ -165,7 +165,7 @@ impl RuntimeManager {
 
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
-    async fn handle_spawn_request(&self, req: SubAgentSpawnRequest) {
+    async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
         let SubAgentSpawnRequest {
             spec,
             parent_conversation_id,
@@ -292,6 +292,7 @@ impl RuntimeManager {
         // 9. Start runtime task
         let conv_id = conv.id.clone();
         let task_text = spec.task.clone();
+        let manager_for_cleanup = Arc::clone(self);
         tokio::spawn(async move {
             // Send initial UserMessage event to start the conversation
             // Sub-agents generate their own message_id since they don't have a client
@@ -311,7 +312,12 @@ impl RuntimeManager {
                 task.abort();
             }
 
-            tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished");
+            // Remove the handle from runtimes so its event_tx sender is dropped.
+            // Without this the channel never closes and any other executor holding
+            // only its own internal sender would loop forever waiting for recv().
+            manager_for_cleanup.runtimes.write().await.remove(&conv_id);
+
+            tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished and cleaned up");
         });
     }
 

@@ -128,6 +128,16 @@ where
                             message: e.clone(),
                         });
                     }
+                    // Exit as soon as we reach a terminal state — don't wait for all
+                    // senders to drop (the ConversationHandle in RuntimeManager keeps
+                    // one alive indefinitely, causing sub-agent executor leaks).
+                    if self.state.is_terminal() {
+                        tracing::debug!(
+                            conv_id = %self.context.conversation_id,
+                            "Conversation reached terminal state, stopping runtime"
+                        );
+                        break;
+                    }
                 }
                 else => break,
             }
