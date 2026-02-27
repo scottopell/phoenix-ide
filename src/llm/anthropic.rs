@@ -3,6 +3,7 @@
 use super::models::ModelSpec;
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage,
+    LLM_SOURCE_HEADER,
 };
 use super::LlmError;
 use reqwest::Client;
@@ -33,6 +34,7 @@ pub async fn complete(
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
+        .header("source", LLM_SOURCE_HEADER)
         .json(&anthropic_request)
         .send()
         .await

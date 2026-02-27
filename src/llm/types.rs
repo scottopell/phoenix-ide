@@ -1,5 +1,7 @@
 //! Common types for LLM interactions
 
+pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
+
 use serde::{Deserialize, Serialize};
 
 /// LLM request

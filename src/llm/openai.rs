@@ -1,7 +1,9 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
 use super::models::{ModelSpec, Provider};
-use super::types::{ContentBlock, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage};
+use super::types::{
+    ContentBlock, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER,
+};
 use super::LlmError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -82,6 +84,7 @@ async fn complete_chat_api(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
+        .header("source", LLM_SOURCE_HEADER)
         .json(&openai_request)
         .send()
         .await
@@ -144,6 +147,7 @@ async fn complete_responses_api(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
+        .header("source", LLM_SOURCE_HEADER)
         .json(&responses_request)
         .send()
         .await
