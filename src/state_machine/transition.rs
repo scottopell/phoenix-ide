@@ -301,6 +301,34 @@ pub fn transition(
             )))
         }
 
+        // Sub-agent: LlmRequesting + LlmError (exhausted or non-retryable) -> Failed + NotifyParent
+        (
+            ConvState::LlmRequesting { attempt },
+            Event::LlmError {
+                message,
+                error_kind,
+                ..
+            },
+        ) if context.is_sub_agent => {
+            use crate::state_machine::state::SubAgentOutcome;
+            let error_message = if error_kind.is_retryable() {
+                format!("Failed after {attempt} attempts: {message}")
+            } else {
+                message
+            };
+            Ok(TransitionResult::new(ConvState::Failed {
+                error: error_message.clone(),
+                error_kind: error_kind.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyParent {
+                outcome: SubAgentOutcome::Failure {
+                    error: error_message,
+                    error_kind,
+                },
+            }))
+        }
+
         // LlmRequesting + LlmError (non-retryable or exhausted) -> Error
         (
             ConvState::LlmRequesting { attempt },
@@ -1565,6 +1593,122 @@ mod tests {
         );
 
         // Should NOT notify parent (it IS the parent)
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Parent should NOT have NotifyParent effect"
+        );
+    }
+
+    #[test]
+    fn test_subagent_llm_retries_exhausted_notifies_parent() {
+        use crate::state_machine::state::ContextExhaustionBehavior;
+
+        let subagent_ctx = ConvContext {
+            conversation_id: "subagent-1".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 200_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+        };
+
+        // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 3 },
+            &subagent_ctx,
+            Event::LlmError {
+                message: "Request timeout".to_string(),
+                error_kind: ErrorKind::Network, // retryable
+                attempt: 3,
+            },
+        )
+        .unwrap();
+
+        // Sub-agent should go to Failed, NOT Error
+        assert!(
+            matches!(result.new_state, ConvState::Failed { .. }),
+            "Sub-agent with exhausted retries should go to Failed, got {:?}",
+            result.new_state
+        );
+
+        // Should notify parent
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Sub-agent should notify parent when LLM retries are exhausted"
+        );
+    }
+
+    #[test]
+    fn test_subagent_llm_non_retryable_error_notifies_parent() {
+        use crate::state_machine::state::ContextExhaustionBehavior;
+
+        let subagent_ctx = ConvContext {
+            conversation_id: "subagent-1".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 200_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+        };
+
+        // Non-retryable error at attempt 1 → immediate failure
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &subagent_ctx,
+            Event::LlmError {
+                message: "Invalid API key".to_string(),
+                error_kind: ErrorKind::Auth, // non-retryable
+                attempt: 1,
+            },
+        )
+        .unwrap();
+
+        // Sub-agent should go to Failed, NOT Error
+        assert!(
+            matches!(result.new_state, ConvState::Failed { .. }),
+            "Sub-agent with non-retryable error should go to Failed, got {:?}",
+            result.new_state
+        );
+
+        // Should notify parent
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "Sub-agent should notify parent on non-retryable LLM error"
+        );
+    }
+
+    #[test]
+    fn test_parent_llm_retries_exhausted_still_goes_to_error() {
+        let parent_ctx = test_context();
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 3 },
+            &parent_ctx,
+            Event::LlmError {
+                message: "Request timeout".to_string(),
+                error_kind: ErrorKind::Network,
+                attempt: 3,
+            },
+        )
+        .unwrap();
+
+        // Parent should still go to Error (user can retry)
+        assert!(
+            matches!(result.new_state, ConvState::Error { .. }),
+            "Parent with exhausted retries should go to Error, got {:?}",
+            result.new_state
+        );
+
+        // Should NOT notify parent
         assert!(
             !result
                 .effects
