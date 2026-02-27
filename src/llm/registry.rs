@@ -64,15 +64,13 @@ impl ModelRegistry {
             .default_model
             .clone()
             .or_else(|| {
-                // Try claude-4.5-sonnet first (our preferred default)
-                if services.contains_key("claude-4.5-sonnet") {
-                    Some("claude-4.5-sonnet".to_string())
+                if services.contains_key("claude-sonnet-4-6") {
+                    Some("claude-sonnet-4-6".to_string())
                 } else {
-                    // Fall back to first available model
                     services.keys().next().cloned()
                 }
             })
-            .unwrap_or_else(|| "claude-4.5-sonnet".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
         Self {
             services,
@@ -111,13 +109,16 @@ impl ModelRegistry {
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
         let mut registered_ids = std::collections::HashSet::new();
 
-        // First, register hardcoded models that were discovered (preserves metadata)
+        // First, register hardcoded models that were discovered (preserves metadata).
+        // Register both id and api_name in registered_ids so the second pass doesn't
+        // double-register under the api_name string with a wrong (default) context window.
         for spec in all_models() {
             if discovered.contains_key(&spec.id) || discovered.contains_key(&spec.api_name) {
                 if let Some(service) = Self::try_create_model(&spec, config) {
                     services.insert(spec.id.clone(), service);
                     specs.insert(spec.id.clone(), spec.clone());
                     registered_ids.insert(spec.id.clone());
+                    registered_ids.insert(spec.api_name.clone());
                 }
             }
         }
@@ -325,7 +326,7 @@ mod tests {
         // All models should be available since gateway mode uses "implicit" API key
         assert!(!registry.available_models().is_empty());
         // Should have models from multiple providers
-        assert!(registry.get("claude-4.5-sonnet").is_some());
+        assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-4o").is_some());
     }
 
@@ -340,7 +341,7 @@ mod tests {
 
         let models = registry.available_models();
         assert!(!models.is_empty());
-        assert!(models.contains(&"claude-4.5-opus".to_string()));
+        assert!(models.contains(&"claude-opus-4-5".to_string()));
     }
 
     #[test]
@@ -351,8 +352,8 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
 
-        // Should default to claude-4.5-sonnet
-        assert_eq!(registry.default_model_id(), "claude-4.5-sonnet");
+        // Should default to claude-sonnet-4-6
+        assert_eq!(registry.default_model_id(), "claude-sonnet-4-6");
     }
 
     #[test]
@@ -387,9 +388,10 @@ mod tests {
         }
 
         // Check specific model
-        let opus = model_infos.iter().find(|m| m.id == "claude-opus-4-6");
-        assert!(opus.is_some());
-        let opus = opus.unwrap();
+        let opus = model_infos
+            .iter()
+            .find(|m| m.id == "claude-opus-4-6")
+            .unwrap();
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));
         assert_eq!(opus.context_window, 200_000);
