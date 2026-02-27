@@ -830,6 +830,21 @@ where
                 }
             };
 
+            // Add synthetic tool results for rejected tool calls to maintain valid conversation
+            // history. These tools were never executed because context was exhausted before
+            // they could run.
+            for rejected_tool in &rejected_tool_calls {
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: rejected_tool.id.clone(),
+                        content: "Tool execution was skipped — context limit reached before this tool could run.".to_string(),
+                        images: vec![],
+                        is_error: false,
+                    }],
+                });
+            }
+
             // Add the continuation request as a user message
             messages.push(LlmMessage {
                 role: MessageRole::User,
@@ -867,9 +882,13 @@ where
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
+                    // Send LlmError so the state machine's AwaitingContinuation retry logic fires.
+                    // The attempt field is ignored by that arm (tracked in state), so 0 is fine.
                     let _ = event_tx
-                        .send(Event::ContinuationFailed {
-                            error: e.to_string(),
+                        .send(Event::LlmError {
+                            message: e.message.clone(),
+                            error_kind: llm_error_to_db_error(e.kind),
+                            attempt: 0,
                         })
                         .await;
                 }
