@@ -63,13 +63,18 @@ def _gateway_is_reachable(url: str) -> bool:
     """Probe a gateway with a quick HTTP request. Any response means it's up."""
     import urllib.request
     import urllib.error
-    try:
-        urllib.request.urlopen(url, timeout=0.5)
-        return True
-    except urllib.error.HTTPError:
-        return True  # 404, 405, etc. — server is listening
-    except Exception:
-        return False
+    # Prefer /_proxy/status (ai-proxy health endpoint) — responds instantly without
+    # touching ddtool or upstream. Fall back to bare URL for other gateway types.
+    probe_url = f"{url.rstrip('/')}/_proxy/status"
+    for candidate in (probe_url, url):
+        try:
+            urllib.request.urlopen(candidate, timeout=0.5)
+            return True
+        except urllib.error.HTTPError:
+            return True  # 404, 405, etc. — server is listening
+        except Exception:
+            continue
+    return False
 
 
 def _discover_gateway_candidates() -> list[str]:
@@ -1562,10 +1567,8 @@ def launchd_prod_deploy(version: str | None = None):
     print(f"\n✓ Deployed {version} to production (launchd)")
     if health_version:
         print(f"  Version: {health_version}")
-    print(f"  Port: {PROD_PORT}")
     print(f"  Database: {PROD_DB_PATH}")
     print(f"  Logs: {LAUNCHD_LOG_PATH}")
-    print(f"  Binary: {dest}")
     print(f"  LLM: {llm_mode}")
     print(f"  URL: http://localhost:{PROD_PORT}")
 
