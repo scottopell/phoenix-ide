@@ -220,5 +220,8 @@ pub fn all_models() -> Vec<ModelSpec> {
 /// Get the default model specification
 #[allow(dead_code)]
 pub fn default_model() -> ModelSpec {
-    all_models()[1].clone() // claude-sonnet-4-6 as default
+    all_models()
+        .into_iter()
+        .find(|m| m.id == "claude-sonnet-4-6")
+        .expect("claude-sonnet-4-6 must be in all_models()")
 }
