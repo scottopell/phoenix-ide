@@ -587,6 +587,27 @@ impl Database {
         }
         Ok(())
     }
+
+    /// Update the `content` text field inside a tool result message's JSON.
+    /// Used to write actual sub-agent outcomes into the `spawn_agents` tool result
+    /// so that `build_llm_messages_static` feeds them to the LLM.
+    pub async fn update_tool_message_content(
+        &self,
+        message_id: &str,
+        new_content: &str,
+    ) -> DbResult<()> {
+        let result = sqlx::query(
+            "UPDATE messages SET content = json_set(content, '$.content', ?1) WHERE message_id = ?2",
+        )
+        .bind(new_content)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::MessageNotFound(message_id.to_string()));
+        }
+        Ok(())
+    }
 }
 
 /// Parse a conversation row from the database

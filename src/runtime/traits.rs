@@ -38,6 +38,15 @@ pub trait MessageStore: Send + Sync {
         message_id: &str,
         display_data: &Value,
     ) -> Result<(), String>;
+
+    /// Update the `content` text inside a tool result message's JSON.
+    /// Used to write sub-agent outcomes into the `spawn_agents` tool result before
+    /// the LLM is called, so the results appear in the conversation history.
+    async fn update_tool_message_content(
+        &self,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), String>;
 }
 
 /// Storage for conversation state
@@ -112,6 +121,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .update_message_display_data(message_id, display_data)
+            .await
+    }
+
+    async fn update_tool_message_content(
+        &self,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        (**self)
+            .update_tool_message_content(message_id, content)
             .await
     }
 }
@@ -212,6 +231,17 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_message_display_data(message_id, display_data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_tool_message_content(
+        &self,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        self.db
+            .update_tool_message_content(message_id, content)
             .await
             .map_err(|e| e.to_string())
     }

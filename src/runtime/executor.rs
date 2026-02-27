@@ -649,10 +649,47 @@ where
                     "results": results
                 });
 
-                // If we have a spawn_tool_id, update its message's display_data
-                // The message was persisted as "{spawn_tool_id}-result" by persist_tool_message
+                // If we have a spawn_tool_id, update its message's content (for LLM history)
+                // and display_data (for UI). The message was persisted as "{spawn_tool_id}-result".
                 if let Some(tool_id) = spawn_tool_id {
+                    use crate::state_machine::state::SubAgentOutcome;
                     let message_id = format!("{tool_id}-result");
+
+                    // Build a human-readable summary of sub-agent outcomes for the LLM.
+                    // This replaces the initial "Spawning N sub-agents..." acknowledgement so
+                    // build_llm_messages_static feeds the actual results to the model.
+                    let llm_content = results
+                        .iter()
+                        .map(|r| {
+                            let outcome = match &r.outcome {
+                                SubAgentOutcome::Success { result } => {
+                                    format!("Result: {result}")
+                                }
+                                SubAgentOutcome::Failure { error, .. } => {
+                                    format!("Failed: {error}")
+                                }
+                            };
+                            format!("Task: \"{}\"\n{outcome}", r.task)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let llm_content = format!(
+                        "Sub-agent results ({} completed):\n\n{llm_content}",
+                        results.len()
+                    );
+
+                    if let Err(e) = self
+                        .storage
+                        .update_tool_message_content(&message_id, &llm_content)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            message_id = %message_id,
+                            "Failed to update spawn_agents message content with sub-agent results"
+                        );
+                    }
+
                     if let Err(e) = self
                         .storage
                         .update_message_display_data(&message_id, &display_data)

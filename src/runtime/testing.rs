@@ -345,6 +345,26 @@ impl MessageStore for InMemoryStorage {
         }
         Err(format!("Message not found: {message_id}"))
     }
+
+    async fn update_tool_message_content(
+        &self,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let mut messages = self.messages.lock().unwrap();
+        for msgs in messages.values_mut() {
+            for msg in msgs.iter_mut() {
+                if msg.message_id == message_id {
+                    if let crate::db::MessageContent::Tool(ref mut tool) = msg.content {
+                        tool.content = content.to_string();
+                        return Ok(());
+                    }
+                    return Err(format!("Message {message_id} is not a tool message"));
+                }
+            }
+        }
+        Err(format!("Message not found: {message_id}"))
+    }
 }
 
 #[async_trait]
