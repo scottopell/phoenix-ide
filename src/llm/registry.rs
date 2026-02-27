@@ -158,13 +158,15 @@ impl ModelRegistry {
             .default_model
             .clone()
             .or_else(|| {
-                if services.contains_key("claude-4.5-sonnet") {
+                if services.contains_key("claude-sonnet-4-6") {
+                    Some("claude-sonnet-4-6".to_string())
+                } else if services.contains_key("claude-4.5-sonnet") {
                     Some("claude-4.5-sonnet".to_string())
                 } else {
                     services.keys().next().cloned()
                 }
             })
-            .unwrap_or_else(|| "claude-4.5-sonnet".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
         Self {
             services,
@@ -385,7 +387,7 @@ mod tests {
         }
 
         // Check specific model
-        let opus = model_infos.iter().find(|m| m.id == "claude-4.5-opus");
+        let opus = model_infos.iter().find(|m| m.id == "claude-opus-4-6");
         assert!(opus.is_some());
         let opus = opus.unwrap();
         assert_eq!(opus.provider, "Anthropic");

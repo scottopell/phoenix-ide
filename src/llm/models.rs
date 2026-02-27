@@ -65,23 +65,42 @@ pub struct ModelSpec {
 pub fn all_models() -> Vec<ModelSpec> {
     vec![
         // Anthropic models
+        // Note: 4.6 models use stable (non-dated) API IDs; id matches api_name for correct lookup.
+        ModelSpec {
+            id: "claude-opus-4-6".into(),
+            api_name: "claude-opus-4-6".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Opus 4.6 (most capable, slower)".into(),
+            context_window: 200_000,
+            recommended: true,
+        },
+        ModelSpec {
+            id: "claude-sonnet-4-6".into(),
+            api_name: "claude-sonnet-4-6".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Sonnet 4.6 (balanced performance)".into(),
+            context_window: 200_000,
+            recommended: true,
+        },
         ModelSpec {
             id: "claude-4.5-opus".into(),
             api_name: "claude-opus-4-5-20251101".into(),
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.5 (most capable, slower)".into(),
+            description: "Claude Opus 4.5 (legacy)".into(),
             context_window: 200_000,
-            recommended: true,
+            recommended: false,
         },
         ModelSpec {
             id: "claude-4.5-sonnet".into(),
             api_name: "claude-sonnet-4-5-20250929".into(),
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
-            description: "Claude Sonnet 4.5 (balanced performance)".into(),
+            description: "Claude Sonnet 4.5 (legacy)".into(),
             context_window: 200_000,
-            recommended: true,
+            recommended: false,
         },
         ModelSpec {
             id: "claude-3.5-sonnet".into(),
@@ -183,7 +202,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             api_format: ApiFormat::OpenAIChat,
             description: "GPT-5.2 Codex (latest code model)".into(),
             context_window: 200_000,
-            recommended: false,
+            recommended: true,
         },
         // Fireworks models
         ModelSpec {
@@ -219,5 +238,5 @@ pub fn all_models() -> Vec<ModelSpec> {
 /// Get the default model specification
 #[allow(dead_code)]
 pub fn default_model() -> ModelSpec {
-    all_models()[1].clone() // claude-4.5-sonnet as default
+    all_models()[1].clone() // claude-sonnet-4-6 as default
 }
