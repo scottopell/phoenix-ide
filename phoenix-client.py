@@ -36,6 +36,36 @@ class PhoenixError(Exception):
     pass
 
 
+def _detect_api_url() -> str:
+    """Detect API URL from environment or dev.py conventions.
+
+    Priority: PHOENIX_API_URL env var > dev.py port detection > default 8000.
+    """
+    env_url = os.environ.get('PHOENIX_API_URL')
+    if env_url:
+        return env_url
+
+    # Try to detect from dev.py status output (worktree-specific port)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['./dev.py', 'status'],
+            capture_output=True, text=True, timeout=5,
+            cwd=Path(__file__).parent,
+        )
+        for line in result.stdout.splitlines():
+            if 'Phoenix=' in line:
+                # Parse "Default ports: Phoenix=8033, Vite=8042"
+                for part in line.split(','):
+                    if 'Phoenix=' in part:
+                        port = part.split('Phoenix=')[1].strip().rstrip(',')
+                        return f"http://localhost:{port}"
+    except Exception:
+        pass
+
+    return "http://localhost:8000"
+
+
 class PhoenixClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip('/')
@@ -45,7 +75,7 @@ class PhoenixClient:
         """Get conversation by ID or slug."""
         # Try as slug first
         try:
-            resp = self.http.get(f"{self.base_url}/api/conversations/by-slug/{id_or_slug}")
+            resp = self.http.get(f"{self.base_url}/api/conversation-by-slug/{id_or_slug}")
             if resp.status_code == 200:
                 return resp.json()['conversation']
         except Exception:
@@ -101,40 +131,75 @@ class PhoenixClient:
         url = f"{self.base_url}/api/conversations/{conv_id}/stream"
         messages = []
         conversation = None
-        
-        with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
+        start_time = time.monotonic()
+
+        # SSE read timeout must be generous — the server may not send events
+        # for 30+ seconds during tool execution. The overall timeout is enforced
+        # by checking elapsed time after each event.
+        sse_timeout = httpx.Timeout(
+            connect=10.0,
+            read=max(timeout, 60.0),  # at least 60s between events
+            write=10.0,
+            pool=10.0,
+        )
+
+        with httpx.Client(timeout=sse_timeout) as client:
             with connect_sse(client, "GET", url) as event_source:
                 for event in event_source.iter_sse():
+                    # Check overall timeout
+                    elapsed = time.monotonic() - start_time
+                    if elapsed > timeout:
+                        raise PhoenixError(f"Timeout after {timeout:.0f}s")
+
+                    try:
+                        data = json.loads(event.data) if event.data else {}
+                    except json.JSONDecodeError:
+                        click.echo(f"Warning: malformed SSE event: {event.data[:100]}", err=True)
+                        continue
+
                     if event.event == "init":
-                        data = json.loads(event.data)
                         messages = data.get('messages', [])
                         conversation = data.get('conversation')
-                        
+
                     elif event.event == "message":
-                        data = json.loads(event.data)
                         msg = data.get('message')
                         if msg:
                             messages.append(msg)
-                            
+
                     elif event.event == "state_change":
-                        data = json.loads(event.data)
                         state = data.get('state')
+                        display_state = data.get('display_state')
+
                         if state == 'error':
                             state_data = data.get('state_data', {})
                             error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
                             raise PhoenixError(error_msg)
-                            
+
+                        if state == 'context_exhausted':
+                            state_data = data.get('state_data', {})
+                            summary = state_data.get('summary', '') if state_data else ''
+                            click.echo(f"Context exhausted: {summary}", err=True)
+                            return {
+                                'conversation': conversation,
+                                'messages': messages
+                            }
+
+                        # Terminal display state also signals completion
+                        if display_state == 'terminal':
+                            return {
+                                'conversation': conversation,
+                                'messages': messages
+                            }
+
                     elif event.event == "agent_done":
-                        # Agent finished, return collected data
                         return {
                             'conversation': conversation,
                             'messages': messages
                         }
-                        
+
                     elif event.event == "error":
-                        data = json.loads(event.data)
                         raise PhoenixError(data.get('message', 'Unknown error'))
-        
+
         # If we exit the loop without agent_done, fetch final state
         return self.get_messages(conv_id)
 
@@ -146,18 +211,19 @@ class PhoenixClient:
         while time.time() - start < timeout:
             data = self.get_messages(conv_id, last_sequence)
             state = data['conversation']['state']
-            
+
             # Handle state as either string or dict with type field
             if isinstance(state, dict):
                 state = state.get('type', 'unknown')
 
             if state == 'idle':
-                # Fetch all messages for final output
                 return self.get_messages(conv_id)
             elif state == 'error':
                 state_data = data['conversation'].get('state_data', {})
                 error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
                 raise PhoenixError(error_msg)
+            elif state == 'context_exhausted':
+                return self.get_messages(conv_id)
 
             # Update last_sequence for next poll
             if data['messages']:
@@ -179,7 +245,6 @@ def encode_image(path: str) -> dict:
     """Read and base64-encode an image file."""
     p = Path(path)
 
-    # Determine media type
     suffix = p.suffix.lower()
     media_types = {
         '.png': 'image/png',
@@ -192,7 +257,6 @@ def encode_image(path: str) -> dict:
     if not media_type:
         raise click.ClickException(f"Unsupported image format: {suffix}")
 
-    # Read and encode
     data = p.read_bytes()
     encoded = base64.b64encode(data).decode('ascii')
 
@@ -240,7 +304,28 @@ def format_response(data: dict) -> str:
             else:
                 lines.append(str(content))
 
-        lines.append("")  # Blank line between messages
+        elif msg_type == 'system':
+            lines.append("=== SYSTEM ===")
+            if isinstance(content, dict):
+                lines.append(content.get('text', str(content)))
+            else:
+                lines.append(str(content))
+
+        elif msg_type == 'error':
+            lines.append("=== ERROR ===")
+            if isinstance(content, dict):
+                lines.append(content.get('message', str(content)))
+            else:
+                lines.append(str(content))
+
+        elif msg_type == 'continuation':
+            lines.append("=== CONTEXT EXHAUSTED ===")
+            if isinstance(content, dict):
+                lines.append(content.get('text', str(content)))
+            else:
+                lines.append(str(content))
+
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -256,8 +341,8 @@ def format_response(data: dict) -> str:
 @click.option('-m', '--model', default=None,
               help='Model ID for new conversations (e.g. claude-4.5-sonnet)')
 @click.option('--list-models', is_flag=True, help='List available models and exit')
-@click.option('--api-url', envvar='PHOENIX_API_URL', default='http://localhost:8000',
-              help='API endpoint URL')
+@click.option('--api-url', default=None,
+              help='API endpoint URL (default: auto-detect from dev.py or PHOENIX_API_URL)')
 @click.option('--timeout', default=600, help='Timeout in seconds')
 @click.option('--poll-interval', default=1.0, help='Polling interval in seconds (with --poll)')
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
@@ -287,7 +372,8 @@ def main(message, conversation, directory, images, model, list_models, api_url, 
         # Use polling instead of SSE
         phoenix-client.py --poll "Hello"
     """
-    client = PhoenixClient(api_url)
+    resolved_url = api_url or _detect_api_url()
+    client = PhoenixClient(resolved_url)
 
     if list_models:
         data = client.get_models()
@@ -306,25 +392,21 @@ def main(message, conversation, directory, images, model, list_models, api_url, 
     if conversation:
         conv = client.get_conversation(conversation)
         click.echo(f"Continuing conversation: {conv.get('slug', conv['id'])}", err=True)
-        # Send message to existing conversation
         click.echo("Sending message...", err=True)
         client.send_message(conv['id'], message, image_data)
     else:
         cwd = directory or os.getcwd()
-        # Create conversation with initial message
         click.echo("Sending message...", err=True)
         conv = client.create_conversation(cwd, message, image_data, model=model)
         click.echo(f"Created conversation: {conv.get('slug', conv['id'])}", err=True)
 
-    # Wait for completion (SSE or polling)
     if poll:
         click.echo("Waiting for response (polling)...", err=True)
     else:
         click.echo("Streaming response...", err=True)
-    
+
     result = client.wait_for_response(conv['id'], timeout, poll_interval, poll)
 
-    # Format and print output
     print(format_response(result))
 
 
@@ -335,7 +417,16 @@ def main_with_error_handling():
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
     except httpx.HTTPStatusError as e:
-        click.echo(f"API Error: {e.response.status_code} - {e.response.text}", err=True)
+        click.echo(f"API error: {e.response.status_code} - {e.response.text}", err=True)
+        sys.exit(1)
+    except httpx.ConnectError:
+        click.echo("Error: cannot connect to Phoenix server. Is it running? (./dev.py up)", err=True)
+        sys.exit(1)
+    except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+        click.echo(f"Error: connection timed out ({e})", err=True)
+        sys.exit(1)
+    except httpx.HTTPError as e:
+        click.echo(f"HTTP error: {e}", err=True)
         sys.exit(1)
     except KeyboardInterrupt:
         click.echo("\nInterrupted", err=True)
