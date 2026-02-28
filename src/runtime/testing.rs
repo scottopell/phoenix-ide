@@ -11,7 +11,7 @@ use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -1012,11 +1012,37 @@ mod tests {
     /// (tests the state machine directly, not through runtime)
     #[tokio::test]
     async fn test_state_machine_cancel_produces_synthetic_results() {
-        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
-        use crate::state_machine::{transition, Effect};
+        use crate::llm::ContentBlock;
+        use crate::state_machine::state::{
+            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
+        };
+        use crate::state_machine::{transition, CheckpointData, Effect};
         use std::path::PathBuf;
 
         let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+
+        // Build AssistantMessage with tool_use blocks for all 3 tools
+        let assistant_message = AssistantMessage::new(
+            vec![
+                ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "t2".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "t3".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            None,
+            None,
+        );
 
         // State: executing tool with 2 more remaining
         let state = ConvState::ToolExecuting {
@@ -1043,8 +1069,9 @@ mod tests {
                     }),
                 ),
             ],
-            persisted_tool_ids: HashSet::new(),
+            completed_results: vec![],
             pending_sub_agents: vec![],
+            assistant_message,
         };
 
         // Phase 1: UserCancel -> CancellingTool with AbortTool
@@ -1062,7 +1089,7 @@ mod tests {
             "Should have AbortTool effect"
         );
 
-        // Phase 2: ToolAborted -> Idle with synthetic results
+        // Phase 2: ToolAborted -> Idle with PersistCheckpoint (atomic)
         let result2 = transition(
             &result.new_state,
             &context,
@@ -1074,17 +1101,18 @@ mod tests {
 
         assert!(matches!(result2.new_state, ConvState::Idle));
 
-        // Should have PersistToolResults effect with 3 synthetic results
+        // Should have PersistCheckpoint effect with 3 synthetic results
         let persist = result2
             .effects
             .iter()
-            .find(|e| matches!(e, Effect::PersistToolResults { .. }));
-        assert!(persist.is_some(), "Should have PersistToolResults effect");
+            .find(|e| matches!(e, Effect::PersistCheckpoint { .. }));
+        assert!(persist.is_some(), "Should have PersistCheckpoint effect");
 
-        if let Some(Effect::PersistToolResults { results }) = persist {
-            assert_eq!(results.len(), 3, "Should have results for all 3 tools");
+        if let Some(Effect::PersistCheckpoint { data }) = persist {
+            let CheckpointData::ToolRound { tool_results, .. } = data;
+            assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
-                results.iter().all(|r| !r.success),
+                tool_results.iter().all(|r| !r.success),
                 "All should be marked as failed/cancelled"
             );
         }

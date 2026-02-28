@@ -489,7 +489,7 @@ impl fmt::Display for MessageType {
 }
 
 /// Usage statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)] // tokens suffix is meaningful
 pub struct UsageData {
     pub input_tokens: u64,

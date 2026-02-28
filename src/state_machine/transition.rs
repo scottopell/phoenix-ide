@@ -7,11 +7,13 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::state::{ContextExhaustionBehavior, PendingSubAgent, SubAgentResult, ToolCall};
+use super::effect::{compute_bash_display_data, CheckpointData};
+use super::state::{
+    AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, SubAgentResult, ToolCall,
+};
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -218,18 +220,17 @@ pub fn transition(
                     let first = tool_calls[0].clone();
                     let rest = tool_calls[1..].to_vec();
                     let remaining_count = rest.len();
+                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let assistant_message =
+                        AssistantMessage::new(content, Some(usage_data), display_data);
 
                     Ok(TransitionResult::new(ConvState::ToolExecuting {
                         current_tool: first.clone(),
                         remaining_tools: rest,
-                        persisted_tool_ids: HashSet::new(),
+                        completed_results: vec![],
                         pending_sub_agents: vec![],
+                        assistant_message,
                     })
-                    .with_effect(Effect::persist_agent_message(
-                        content,
-                        Some(usage_data),
-                        &context.working_dir,
-                    ))
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_tool_executing(
                         first.name(),
@@ -244,18 +245,17 @@ pub fn transition(
                 let first = tool_calls[0].clone();
                 let rest = tool_calls[1..].to_vec();
                 let remaining_count = rest.len();
+                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let assistant_message =
+                    AssistantMessage::new(content, Some(usage_data), display_data);
 
                 Ok(TransitionResult::new(ConvState::ToolExecuting {
                     current_tool: first.clone(),
                     remaining_tools: rest,
-                    persisted_tool_ids: HashSet::new(),
+                    completed_results: vec![],
                     pending_sub_agents: vec![],
+                    assistant_message,
                 })
-                .with_effect(Effect::persist_agent_message(
-                    content,
-                    Some(usage_data),
-                    &context.working_dir,
-                ))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_tool_executing(
                     first.name(),
@@ -379,17 +379,18 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                persisted_tool_ids,
+                completed_results,
                 pending_sub_agents,
+                assistant_message,
             },
             Event::ToolComplete {
                 tool_use_id,
                 result,
             },
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_persisted = persisted_tool_ids.clone();
-            new_persisted.insert(result.tool_use_id.clone());
-            let completed_count = new_persisted.len();
+            let mut new_results = completed_results.clone();
+            new_results.push(result);
+            let completed_count = new_results.len();
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
@@ -398,16 +399,10 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
                 remaining_tools: new_remaining,
-                persisted_tool_ids: new_persisted,
+                completed_results: new_results,
                 pending_sub_agents: pending_sub_agents.clone(),
+                assistant_message: assistant_message.clone(),
             })
-            .with_effect(Effect::persist_tool_message(
-                &result.tool_use_id,
-                &result.output,
-                result.is_error,
-                result.display_data(),
-                result.images.clone(),
-            ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_tool_executing(
                 next_tool.name(),
@@ -423,8 +418,9 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
+                completed_results,
                 pending_sub_agents,
-                ..
+                assistant_message,
             },
             Event::ToolComplete {
                 tool_use_id,
@@ -434,15 +430,16 @@ pub fn transition(
             && remaining_tools.is_empty()
             && pending_sub_agents.is_empty() =>
         {
+            let mut all_results = completed_results.clone();
+            all_results.push(result);
+
+            // Atomic persistence: assistant message + all tool results written together
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in last-tool transition");
+
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::persist_tool_message(
-                        &result.tool_use_id,
-                        &result.output,
-                        result.is_error,
-                        result.display_data(),
-                        result.images.clone(),
-                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))
                     .with_effect(Effect::RequestLlm),
@@ -454,8 +451,9 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
+                completed_results,
                 pending_sub_agents,
-                ..
+                assistant_message,
             },
             Event::ToolComplete {
                 tool_use_id,
@@ -465,18 +463,21 @@ pub fn transition(
             && remaining_tools.is_empty()
             && !pending_sub_agents.is_empty() =>
         {
+            let mut all_results = completed_results.clone();
+            all_results.push(result);
+
+            // Atomic persistence: assistant message + all tool results written together
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect(
+                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
+                );
+
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
                 spawn_tool_id: None, // spawn_agents was earlier in the batch, tool_use_id lost
             })
-            .with_effect(Effect::persist_tool_message(
-                &result.tool_use_id,
-                &result.output,
-                result.is_error,
-                result.display_data(),
-                result.images.clone(),
-            ))
+            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
             .with_effect(notify_awaiting_sub_agents(pending_sub_agents, &[])))
         }
@@ -486,8 +487,9 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                persisted_tool_ids,
+                completed_results,
                 pending_sub_agents,
+                assistant_message,
             },
             Event::SpawnAgentsComplete {
                 tool_use_id,
@@ -495,9 +497,9 @@ pub fn transition(
                 spawned,
             },
         ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_persisted = persisted_tool_ids.clone();
-            new_persisted.insert(result.tool_use_id.clone());
-            let completed_count = new_persisted.len();
+            let mut new_results = completed_results.clone();
+            new_results.push(result);
+            let completed_count = new_results.len();
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(spawned);
@@ -509,16 +511,10 @@ pub fn transition(
             Ok(TransitionResult::new(ConvState::ToolExecuting {
                 current_tool: next_tool.clone(),
                 remaining_tools: new_remaining,
-                persisted_tool_ids: new_persisted,
+                completed_results: new_results,
                 pending_sub_agents: new_pending,
+                assistant_message: assistant_message.clone(),
             })
-            .with_effect(Effect::persist_tool_message(
-                &result.tool_use_id,
-                &result.output,
-                result.is_error,
-                result.display_data(),
-                result.images.clone(),
-            ))
             .with_effect(Effect::PersistState)
             .with_effect(notify_tool_executing(
                 next_tool.name(),
@@ -534,8 +530,9 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
+                completed_results,
                 pending_sub_agents,
-                ..
+                assistant_message,
             },
             Event::SpawnAgentsComplete {
                 tool_use_id,
@@ -546,20 +543,20 @@ pub fn transition(
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(spawned);
 
-            // spawn_agents is the last tool, so we have its tool_use_id
+            let mut all_results = completed_results.clone();
             let spawn_id = result.tool_use_id.clone();
+            all_results.push(result);
+
+            // Atomic persistence: assistant message + all tool results written together
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
+
             Ok(TransitionResult::new(ConvState::AwaitingSubAgents {
                 pending: all_pending.clone(),
                 completed_results: vec![],
                 spawn_tool_id: Some(spawn_id),
             })
-            .with_effect(Effect::persist_tool_message(
-                &result.tool_use_id,
-                &result.output,
-                result.is_error,
-                result.display_data(),
-                result.images.clone(),
-            ))
+            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
             .with_effect(notify_awaiting_sub_agents(&all_pending, &[])))
         }
@@ -606,15 +603,17 @@ pub fn transition(
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
-                persisted_tool_ids,
+                completed_results,
                 pending_sub_agents,
+                assistant_message,
             },
             Event::UserCancel,
         ) if !context.is_sub_agent => {
             let mut result = TransitionResult::new(ConvState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
                 skipped_tools: remaining_tools.clone(),
-                persisted_tool_ids: persisted_tool_ids.clone(),
+                completed_results: completed_results.clone(),
+                assistant_message: assistant_message.clone(),
             })
             .with_effect(Effect::AbortTool {
                 tool_use_id: current_tool.id.clone(),
@@ -633,36 +632,37 @@ pub fn transition(
             Ok(result)
         }
 
-        // CancellingTool + ToolAborted -> Idle with synthetic results
+        // CancellingTool + ToolAborted -> Idle with atomic checkpoint
         (
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                persisted_tool_ids,
+                completed_results,
+                assistant_message,
             },
             Event::ToolAborted {
                 tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
-            // Generate synthetic results for aborted and skipped tools only.
-            // Tools in persisted_tool_ids were already persisted via PersistMessage
-            // when each tool completed, so we don't include them here.
-            let aborted_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
-            let skipped_results: Vec<ToolResult> = skipped_tools
-                .iter()
-                .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
-                .collect();
+            // Build all results: previously completed + aborted + skipped
+            let mut all_results = completed_results.clone();
+            all_results.push(ToolResult::cancelled(
+                tool_use_id.clone(),
+                "Cancelled by user",
+            ));
+            for tool in skipped_tools {
+                all_results.push(ToolResult::cancelled(
+                    tool.id.clone(),
+                    "Skipped due to cancellation",
+                ));
+            }
 
-            let mut new_results = vec![aborted_result];
-            new_results.extend(skipped_results);
-
-            // Validate: none of the new results should be for already-persisted tools
-            validate_no_duplicate_persists(&new_results, persisted_tool_ids)?;
+            // Atomic persistence: assistant message + all tool results
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in cancellation transition");
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults {
-                    results: new_results,
-                })
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -672,7 +672,8 @@ pub fn transition(
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
-                persisted_tool_ids,
+                completed_results,
+                assistant_message,
             },
             Event::ToolComplete {
                 tool_use_id: completed_id,
@@ -680,24 +681,24 @@ pub fn transition(
             },
         ) if *tool_use_id == completed_id => {
             // Tool finished before we could abort it - still use synthetic result.
-            // Tools in persisted_tool_ids were already persisted via PersistMessage
-            // when each tool completed, so we don't include them here.
-            let cancelled_result = ToolResult::cancelled(tool_use_id.clone(), "Cancelled by user");
-            let skipped_results: Vec<ToolResult> = skipped_tools
-                .iter()
-                .map(|tool| ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation"))
-                .collect();
+            let mut all_results = completed_results.clone();
+            all_results.push(ToolResult::cancelled(
+                tool_use_id.clone(),
+                "Cancelled by user",
+            ));
+            for tool in skipped_tools {
+                all_results.push(ToolResult::cancelled(
+                    tool.id.clone(),
+                    "Skipped due to cancellation",
+                ));
+            }
 
-            let mut new_results = vec![cancelled_result];
-            new_results.extend(skipped_results);
-
-            // Validate: none of the new results should be for already-persisted tools
-            validate_no_duplicate_persists(&new_results, persisted_tool_ids)?;
+            // Atomic persistence: assistant message + all tool results
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
 
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults {
-                    results: new_results,
-                })
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -989,24 +990,8 @@ pub fn transition(
 
 // Helper functions
 
-/// Validates that none of the tool results to be persisted have IDs that are already persisted.
-/// This is a critical invariant: each `tool_use_id` must be persisted exactly once.
-fn validate_no_duplicate_persists(
-    results: &[ToolResult],
-    already_persisted: &HashSet<String>,
-) -> Result<(), TransitionError> {
-    for result in results {
-        if already_persisted.contains(&result.tool_use_id) {
-            return Err(TransitionError::InvalidTransition(format!(
-                "Attempted to persist duplicate tool result for tool_use_id: {}",
-                result.tool_use_id
-            )));
-        }
-    }
-    Ok(())
-}
-
 impl ToolResult {
+    #[allow(dead_code)] // Used in tests; normal tool rounds use PersistCheckpoint
     fn display_data(&self) -> Option<Value> {
         self.display_data.clone()
     }
@@ -1235,7 +1220,21 @@ mod tests {
 
     #[test]
     fn test_cancellation_produces_synthetic_results() {
-        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
+        use crate::llm::ContentBlock;
+        use crate::state_machine::state::{
+            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
+        };
+
+        // Build an AssistantMessage with 3 tool_use blocks matching the 3 tools
+        let assistant_message = AssistantMessage::new(
+            vec![
+                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({"command": "echo 1"})),
+                ContentBlock::tool_use("tool-2", "bash", serde_json::json!({"command": "echo 2"})),
+                ContentBlock::tool_use("tool-3", "bash", serde_json::json!({"command": "echo 3"})),
+            ],
+            None,
+            None,
+        );
 
         let result = transition(
             &ConvState::ToolExecuting {
@@ -1262,8 +1261,9 @@ mod tests {
                         }),
                     ),
                 ],
-                persisted_tool_ids: HashSet::new(),
+                completed_results: vec![],
                 pending_sub_agents: vec![],
+                assistant_message,
             },
             &test_context(),
             Event::UserCancel,
@@ -1283,7 +1283,7 @@ mod tests {
             "Should have AbortTool effect"
         );
 
-        // Phase 2: ToolAborted -> Idle with synthetic results
+        // Phase 2: ToolAborted -> Idle with PersistCheckpoint (atomic)
         let result2 = transition(
             &result.new_state,
             &test_context(),
@@ -1294,39 +1294,12 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result2.new_state, ConvState::Idle));
-        assert!(result2
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::PersistToolResults { .. })));
-    }
-
-    #[test]
-    fn test_duplicate_persist_validation_fails() {
-        #[allow(unused_imports)]
-        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
-
-        // Create a CancellingTool state where tool-1 was already persisted
-        let mut already_persisted = HashSet::new();
-        already_persisted.insert("tool-1".to_string());
-
-        let state = ConvState::CancellingTool {
-            tool_use_id: "tool-1".to_string(), // This tool would create duplicate
-            skipped_tools: vec![],
-            persisted_tool_ids: already_persisted,
-        };
-
-        // This should fail because tool-1 is in persisted_tool_ids
-        let result = transition(
-            &state,
-            &test_context(),
-            Event::ToolAborted {
-                tool_use_id: "tool-1".to_string(),
-            },
-        );
-
         assert!(
-            matches!(result, Err(TransitionError::InvalidTransition(_))),
-            "Should fail with InvalidTransition due to duplicate persist"
+            result2
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+            "Should have PersistCheckpoint effect instead of PersistToolResults"
         );
     }
 

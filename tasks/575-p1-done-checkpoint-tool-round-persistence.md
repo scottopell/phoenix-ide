@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 575
 priority: p1
-status: ready
+status: done
 slug: checkpoint-tool-round-persistence
 title: "Atomic persistence via CheckpointData::ToolRound — hold assistant message until all tools complete"
 ---
@@ -71,9 +71,43 @@ FM-4: `completed_results` and `persisted_tool_ids` were parallel representations
 
 - None (can be done independently of task 574)
 
+## Clarification: AssistantMessage Must Be a Concrete Type
+
+**Do NOT thread `Vec<ContentBlock>` + `UsageData` + `display_data` + `message_id` as
+separate fields.** Introduce `AssistantMessage` as a proper struct:
+
+```rust
+pub struct AssistantMessage {
+    pub message_id: String,
+    pub content: Vec<ContentBlock>,
+    pub usage: Option<UsageData>,
+    pub display_data: Option<serde_json::Value>,
+}
+
+impl AssistantMessage {
+    /// Returns the tool_use blocks from content. Used by CheckpointData::tool_round()
+    /// to enforce the matching-count invariant.
+    pub fn tool_uses(&self) -> Vec<&ContentBlock> {
+        self.content.iter().filter(|b| matches!(b, ContentBlock::ToolUse { .. })).collect()
+    }
+}
+```
+
+This is load-bearing for the design:
+- `ToolExecuting` holds ONE field (`assistant_message: AssistantMessage`), not four
+  loose fields that can be partially threaded or forgotten
+- `CheckpointData::tool_round()` takes `AssistantMessage` — you can't call it with
+  content blocks but no usage data, because they're bundled
+- Future tasks (577: typed effects) need `AssistantMessage` as a concrete type in
+  `LlmOutcome::Response(AssistantMessage, TokenUsage)`
+
+The whole point of this refactor is correct-by-construction. Four loose fields that
+happen to travel together is exactly the kind of implicit coupling that creates bugs.
+Bundle them into the struct now.
+
 ## Files Likely Involved
 
-- `src/state_machine/state.rs` — ToolExecuting state definition
+- `src/state_machine/state.rs` — ToolExecuting state definition, AssistantMessage struct
 - `src/state_machine/transition.rs` — LlmResponse and ToolComplete transitions
 - `src/state_machine/effect.rs` — Effect enum, CheckpointData type
 - `src/db/` — persistence layer

@@ -2,11 +2,70 @@
 
 use crate::db::{ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData};
 use crate::llm::ContentBlock;
-use crate::state_machine::state::{SubAgentOutcome, SubAgentResult, ToolCall};
+use crate::state_machine::state::{AssistantMessage, SubAgentOutcome, SubAgentResult, ToolCall};
 use crate::tools::bash_check::display_command;
 use serde_json::Value;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
+
+// ============================================================================
+// CheckpointData — atomic persistence gate (REQ-BED-007, FM-2 Prevention)
+// ============================================================================
+
+/// Data to persist atomically. The `ToolRound` variant enforces that assistant
+/// messages and tool results are always written together — half-written history
+/// is structurally unrepresentable.
+#[derive(Debug, Clone)]
+pub enum CheckpointData {
+    /// A complete tool round: assistant message + all tool results.
+    /// Constructor enforces matching counts.
+    ToolRound {
+        assistant_message: AssistantMessage,
+        tool_results: Vec<ToolResult>,
+    },
+}
+
+/// Errors from `CheckpointData` constructors
+#[derive(Debug, Clone)]
+pub enum PersistError {
+    ResultCountMismatch { tool_uses: usize, results: usize },
+}
+
+impl fmt::Display for PersistError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PersistError::ResultCountMismatch { tool_uses, results } => {
+                write!(
+                    f,
+                    "tool_use count ({tool_uses}) != tool_result count ({results})"
+                )
+            }
+        }
+    }
+}
+
+impl CheckpointData {
+    /// Construct a `ToolRound` checkpoint, enforcing that the number of
+    /// `tool_use` blocks in the assistant message matches the number of
+    /// tool results.
+    pub fn tool_round(
+        assistant_message: AssistantMessage,
+        tool_results: Vec<ToolResult>,
+    ) -> Result<Self, PersistError> {
+        let tool_use_count = assistant_message.tool_uses().len();
+        if tool_use_count != tool_results.len() {
+            return Err(PersistError::ResultCountMismatch {
+                tool_uses: tool_use_count,
+                results: tool_results.len(),
+            });
+        }
+        Ok(Self::ToolRound {
+            assistant_message,
+            tool_results,
+        })
+    }
+}
 
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
@@ -48,7 +107,12 @@ pub enum Effect {
     /// Schedule a retry
     ScheduleRetry { delay: Duration, attempt: u32 },
 
-    /// Persist multiple tool results at once
+    /// Atomically persist a complete checkpoint (REQ-BED-007, FM-2 Prevention)
+    PersistCheckpoint { data: CheckpointData },
+
+    /// Persist multiple tool results at once.
+    /// Retained for sub-agent result persistence; normal tool rounds use `PersistCheckpoint`.
+    #[allow(dead_code)]
     PersistToolResults { results: Vec<ToolResult> },
 
     /// Persist aggregated sub-agent results as a message
@@ -108,6 +172,7 @@ impl Effect {
         }
     }
 
+    #[allow(dead_code)] // Retained for test utilities; normal tool rounds use PersistCheckpoint
     pub fn persist_tool_message(
         tool_use_id: impl Into<String>,
         output: impl Into<String>,
@@ -185,7 +250,7 @@ impl Effect {
 ///
 /// Returns `Some(json)` with display info if there are bash commands,
 /// `None` otherwise.
-fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<Value> {
+pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<Value> {
     let cwd_str = cwd.to_string_lossy();
     let mut bash_displays: Vec<Value> = Vec::new();
 

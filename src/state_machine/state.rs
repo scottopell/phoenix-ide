@@ -1,10 +1,10 @@
 //! Conversation state types
 
-use crate::db::ErrorKind;
+use crate::db::{ErrorKind, ToolResult, UsageData};
+use crate::llm::ContentBlock;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -223,6 +223,45 @@ impl ToolCall {
 }
 
 // ============================================================================
+// Assistant Message — bundled representation for atomic persistence
+// ============================================================================
+
+/// An LLM assistant message held in state until persistence.
+/// Bundles content, display metadata, usage stats, and message ID so they
+/// cannot be partially threaded or forgotten.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssistantMessage {
+    pub message_id: String,
+    pub content: Vec<ContentBlock>,
+    pub usage: Option<UsageData>,
+    pub display_data: Option<Value>,
+}
+
+impl AssistantMessage {
+    pub fn new(
+        content: Vec<ContentBlock>,
+        usage: Option<UsageData>,
+        display_data: Option<Value>,
+    ) -> Self {
+        Self {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            content,
+            usage,
+            display_data,
+        }
+    }
+
+    /// Returns references to the `ToolUse` blocks in content.
+    /// Used by `CheckpointData::tool_round()` to enforce the matching-count invariant.
+    pub fn tool_uses(&self) -> Vec<&ContentBlock> {
+        self.content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .collect()
+    }
+}
+
+// ============================================================================
 // Conversation State
 // ============================================================================
 
@@ -241,28 +280,38 @@ pub enum ConvState {
     /// LLM request in flight, with retry tracking
     LlmRequesting { attempt: u32 },
 
-    /// Executing tools serially
+    /// Executing tools serially.
+    /// The assistant message is held here (NOT yet persisted) — persistence is atomic
+    /// at the end of the tool round via `CheckpointData::ToolRound` (REQ-BED-007).
     ToolExecuting {
         /// The current tool being executed
         current_tool: ToolCall,
         /// Remaining tools to execute after current completes
         remaining_tools: Vec<ToolCall>,
-        /// IDs of tools whose results have been persisted
+        /// Completed tool results — single source of truth (FM-4 Prevention).
+        /// No parallel `persisted_tool_ids` tracking set.
         #[serde(default)]
-        persisted_tool_ids: HashSet<String>,
+        completed_results: Vec<ToolResult>,
         /// Sub-agents spawned during this tool execution phase
         #[serde(default)]
         pending_sub_agents: Vec<PendingSubAgent>,
+        /// Assistant message held until all tools complete (not yet persisted)
+        #[serde(default)]
+        assistant_message: AssistantMessage,
     },
 
-    /// User requested cancellation of tool execution, waiting for abort confirmation
+    /// User requested cancellation of tool execution, waiting for abort confirmation.
+    /// Carries the assistant message and completed results so the checkpoint can
+    /// be persisted atomically on abort.
     CancellingTool {
         /// The tool being aborted
         tool_use_id: String,
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
-        /// IDs of tools whose results have been persisted (for validation)
-        persisted_tool_ids: HashSet<String>,
+        /// Tool results completed before cancellation
+        completed_results: Vec<ToolResult>,
+        /// Assistant message held for atomic persistence
+        assistant_message: AssistantMessage,
     },
 
     /// Waiting for sub-agents to complete

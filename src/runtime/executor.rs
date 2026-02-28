@@ -560,6 +560,58 @@ where
                 Ok(None)
             }
 
+            Effect::PersistCheckpoint { data } => {
+                use crate::state_machine::CheckpointData;
+                match data {
+                    CheckpointData::ToolRound {
+                        assistant_message,
+                        tool_results,
+                    } => {
+                        // Persist assistant message
+                        let agent_content = MessageContent::agent(assistant_message.content);
+                        let agent_msg = self
+                            .storage
+                            .add_message(
+                                &assistant_message.message_id,
+                                &self.context.conversation_id,
+                                &agent_content,
+                                assistant_message.display_data.as_ref(),
+                                assistant_message.usage.as_ref(),
+                            )
+                            .await?;
+                        let agent_json = serde_json::to_value(&agent_msg).unwrap_or(Value::Null);
+                        let _ = self.broadcast_tx.send(SseEvent::Message {
+                            message: agent_json,
+                        });
+
+                        // Persist all tool results
+                        for result in tool_results {
+                            let tool_content = MessageContent::tool(
+                                &result.tool_use_id,
+                                &result.output,
+                                result.is_error,
+                            );
+                            let tool_msg_id = format!("{}-result", result.tool_use_id);
+                            let tool_msg = self
+                                .storage
+                                .add_message(
+                                    &tool_msg_id,
+                                    &self.context.conversation_id,
+                                    &tool_content,
+                                    result.display_data.as_ref(),
+                                    None,
+                                )
+                                .await?;
+                            let tool_json = serde_json::to_value(&tool_msg).unwrap_or(Value::Null);
+                            let _ = self
+                                .broadcast_tx
+                                .send(SseEvent::Message { message: tool_json });
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
             Effect::PersistToolResults { results } => {
                 for result in results {
                     let content =
