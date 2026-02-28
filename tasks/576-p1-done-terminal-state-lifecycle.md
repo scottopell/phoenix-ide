@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 576
 priority: p1
-status: ready
+status: done
 slug: terminal-state-lifecycle
 title: "StepResult::Terminal forces explicit executor loop exit"
 ---

@@ -12,7 +12,7 @@ mod proptests;
 
 pub use effect::Effect;
 pub use event::Event;
-pub use state::{ConvContext, ConvState};
+pub use state::{ConvContext, ConvState, StepResult};
 pub use transition::transition;
 
 // Re-exports for atomic persistence types (used by runtime/executor)

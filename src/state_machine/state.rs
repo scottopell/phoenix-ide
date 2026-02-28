@@ -391,10 +391,52 @@ impl DisplayState {
     }
 }
 
+/// Executor lifecycle signal — forces explicit handling of terminal states (FM-5 prevention).
+///
+/// The executor loop checks this after every transition. `Terminal` means the loop
+/// must exit — no reliance on channel-drop semantics.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepResult {
+    Continue,
+    Terminal(TerminalOutcome),
+}
+
+/// Why the executor is exiting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TerminalOutcome {
+    /// Sub-agent completed successfully
+    Completed(String),
+    /// Sub-agent or conversation failed
+    Failed(String, ErrorKind),
+    /// Context window exhausted — conversation is read-only
+    ContextExhausted { summary: String },
+}
+
 impl ConvState {
     /// Check if this is a terminal state (sub-agent only - cannot transition out)
     pub fn is_terminal(&self) -> bool {
         matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
+    }
+
+    /// Structural terminal-state check for the executor loop.
+    ///
+    /// Returns `StepResult::Terminal` for states that cannot produce further transitions,
+    /// forcing the executor to exit explicitly rather than relying on channel lifecycle.
+    pub fn step_result(&self) -> StepResult {
+        match self {
+            ConvState::Completed { result } => {
+                StepResult::Terminal(TerminalOutcome::Completed(result.clone()))
+            }
+            ConvState::Failed { error, error_kind } => {
+                StepResult::Terminal(TerminalOutcome::Failed(error.clone(), error_kind.clone()))
+            }
+            ConvState::ContextExhausted { summary, .. } => {
+                StepResult::Terminal(TerminalOutcome::ContextExhausted {
+                    summary: summary.clone(),
+                })
+            }
+            _ => StepResult::Continue,
+        }
     }
 
     /// Semantic category for UI display. This is the single source of truth

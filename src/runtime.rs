@@ -352,7 +352,10 @@ impl RuntimeManager {
     }
 
     /// Get or create a runtime for a conversation
-    pub async fn get_or_create(&self, conversation_id: &str) -> Result<ConversationHandle, String> {
+    pub async fn get_or_create(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<ConversationHandle, String> {
         // Check if already running
         {
             let runtimes = self.runtimes.read().await;
@@ -445,9 +448,17 @@ impl RuntimeManager {
 
         // Start runtime in background
         let conv_id = conversation_id.to_string();
+        let manager_for_cleanup = Arc::clone(self);
         tokio::spawn(async move {
             runtime.run().await;
-            tracing::info!(conv_id = %conv_id, "Conversation runtime finished");
+
+            // Remove the handle so its event_tx sender is dropped.
+            // Without this, the channel stays open and the handle persists after
+            // the executor exits (FM-5). A new runtime will be created by
+            // get_or_create if the conversation is resumed.
+            manager_for_cleanup.runtimes.write().await.remove(&conv_id);
+
+            tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
         });
 
         let handle = ConversationHandle {
@@ -468,7 +479,11 @@ impl RuntimeManager {
     }
 
     /// Send an event to a conversation
-    pub async fn send_event(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+    pub async fn send_event(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
         handle
             .event_tx
@@ -479,7 +494,7 @@ impl RuntimeManager {
 
     /// Subscribe to conversation updates
     pub async fn subscribe(
-        &self,
+        self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<broadcast::Receiver<SseEvent>, String> {
         let handle = self.get_or_create(conversation_id).await?;
