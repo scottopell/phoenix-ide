@@ -107,14 +107,16 @@ THE SYSTEM SHALL extract tool name, ID, and JSON input for each tool
 ### REQ-LLM-006: Error Classification
 
 WHEN LLM request fails
-THE SYSTEM SHALL classify error as:
-- Retryable (network timeout, rate limit, server error)
-- Non-retryable (authentication, invalid request)
+THE SYSTEM SHALL classify error into an explicit, named category
+AND SHALL NOT use a catch-all or unknown classification
 
-WHEN error is retryable
+WHEN error is retryable (network timeout, rate limit, server error)
 THE SYSTEM SHALL include retry-after hint when available
 
-**Rationale:** Error classification enables the state machine to implement appropriate retry logic.
+WHEN a new error condition is encountered
+THE SYSTEM SHALL require an explicit classification decision before it can be handled
+
+**Rationale:** Error classification enables the state machine to implement appropriate retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent.
 
 ---
 
@@ -136,3 +138,20 @@ WHEN LLM request completes
 THE SYSTEM SHALL log model, duration, token counts, and any errors
 
 **Rationale:** Operational visibility into LLM requests for monitoring and troubleshooting.
+
+---
+
+### REQ-LLM-009: Streaming Responses
+
+WHEN LLM provider supports streaming
+THE SYSTEM SHALL deliver partial text content as it arrives from the provider
+AND accumulate tool input fragments internally until complete
+AND assemble a final structured response identical to the non-streaming path
+
+WHEN provider does not support streaming
+THE SYSTEM SHALL fall back to the non-streaming request path
+
+WHEN streaming connection is interrupted mid-response
+THE SYSTEM SHALL treat it as a retryable network error
+
+**Rationale:** Token-by-token streaming enables progressive display of LLM output (REQ-BED-025). The provider layer must deliver partial content while still producing the same final response type for the state machine.

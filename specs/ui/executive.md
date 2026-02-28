@@ -30,5 +30,6 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-UI-016:** Desktop Sidebar Layout | ✅ Complete | Task 563 |
 | **REQ-UI-017:** Desktop New Conversation - Full Page Mode | ✅ Complete | Task 563 |
 | **REQ-UI-018:** Desktop New Conversation - Inline Sidebar Mode | ✅ Complete | Task 563 |
+| **REQ-UI-019:** Streaming Text Display | ❌ Not Started | Progressive text display during LLM generation |
 
-**Progress:** 17 of 17 active requirements complete (1 deprecated)
+**Progress:** 17 of 18 active requirements complete (1 deprecated)

@@ -47,10 +47,11 @@ enum ConvState {
         pending_sub_agents: Vec<String>,  // NEW: accumulated from spawn_agents
     },
 
-    // Existing but now reachable
+    // Existing but now reachable (REQ-SA-004, REQ-SA-006)
     AwaitingSubAgents {
         pending_ids: Vec<String>,
         completed_results: Vec<SubAgentResult>,
+        deadline: Instant,  // mandatory timeout for all pending sub-agents
     },
 
     // NEW: waiting for sub-agents to acknowledge cancellation
@@ -92,32 +93,39 @@ enum SubAgentOutcome {
 }
 ```
 
-### New Effects
+### New Effects (Typed-Effect Architecture)
+
+Effects carry oneshot channels for their outcome type. See bedrock design.md for the
+full typed-effect architecture.
 
 ```rust
 enum Effect {
     // ... existing effects ...
 
-    // NEW: spawn a sub-agent conversation
+    // NEW: spawn a sub-agent conversation (REQ-SA-001, REQ-SA-006)
     SpawnSubAgent {
-        agent_id: String,
-        task: String,
-        cwd: String,
-        timeout: Option<Duration>,
+        config: SubAgentConfig,
+        reply: oneshot::Sender<SubAgentOutcome>,
     },
 
-    // NEW: cancel all pending sub-agents
+    // NEW: cancel all pending sub-agents (REQ-SA-005)
     CancelSubAgents { ids: Vec<String> },
 
     // NEW: notify parent of sub-agent completion (sub-agent only)
     NotifyParent { outcome: SubAgentOutcome },
 }
 
-// Extended error kinds
-enum ErrorKind {
-    // ... existing ...
-    TimedOut,   // NEW: sub-agent exceeded time limit
-    Cancelled,  // NEW: explicit cancellation
+struct SubAgentConfig {
+    agent_id: String,
+    task: String,
+    cwd: String,
+    timeout: Duration,  // mandatory, not Option — caller must decide (REQ-SA-006)
+}
+
+enum SubAgentOutcome {
+    Success { result: String },
+    Failure { error: String, error_kind: ErrorKind },
+    TimedOut,
 }
 ```
 
@@ -127,18 +135,19 @@ enum ErrorKind {
 
 **Problem:** Sub-agent completes while parent still in `ToolExecuting`.
 
-**Solution:** Executor buffers `SubAgentResult` events until parent reaches `AwaitingSubAgents`. This keeps the state machine simple and avoids adding SubAgentResult handling to ToolExecuting.
+**Solution:** Bounded buffer with capacity equal to sub-agent count. Results that arrive
+before `AwaitingSubAgents` fill buffer slots. Parent drains on entry. Deadlock-free
+because sub-agents send exactly once and buffer capacity equals sub-agent count.
 
 ```rust
-// In executor/runtime
-struct SubAgentResultBuffer {
-    results: Vec<SubAgentResult>,
-}
+// In executor/runtime — bounded channel, not unbounded Vec
+let (result_tx, result_rx) = mpsc::channel::<SubAgentResult>(pending_count);
+// Capacity = exact number of sub-agents. No more, no less.
 
 // When SubAgentResult arrives and parent not in AwaitingSubAgents:
-//   buffer.push(result)
+//   result_tx.send(result) — fills a buffer slot, blocks if full (shouldn't happen)
 // When parent transitions to AwaitingSubAgents:
-//   for result in buffer.drain() { send_event(result) }
+//   while let Ok(result) = result_rx.try_recv() { process(result) }
 ```
 
 ### Terminal Tool Handling (submit_result / submit_error)
@@ -256,14 +265,20 @@ async fn handle_cancel_sub_agents(ids: Vec<String>, runtime_manager: &RuntimeMan
 }
 ```
 
-### Timeout Behavior
+### Timeout Behavior (REQ-SA-006, REQ-BED-026)
 
-**Default:** No timeout if `None`. Sub-agent runs until:
+**Mandatory:** `timeout: Duration` is required on `SubAgentConfig` — not `Option`.
+The caller must make a conscious decision about how long this sub-agent should run.
+
+Sub-agent terminates when any of these occur first:
 - It calls submit_result/submit_error
 - Parent is cancelled (propagates to sub-agents)
 - Sub-agent hits unrecoverable error
+- **Timeout fires** — executor sends `UserCancel` to sub-agent, producing
+  `SubAgentOutcome::TimedOut`
 
-**Recommendation:** Callers should specify reasonable timeouts. Future: system-wide default configurable via settings.
+The deadline is stamped when the SM emits the `SpawnSubAgent` effect. The executor's
+`select!` loop races result arrival against `sleep_until(deadline)`:
 
 ### Terminal State Exclusion from Wildcard Cancel
 

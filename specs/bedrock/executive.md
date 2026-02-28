@@ -6,7 +6,7 @@ Bedrock provides the core conversation state machine for PhoenixIDE. Users inter
 
 ## Technical Summary
 
-Implements Elm Architecture: pure `transition(state, event) -> (new_state, effects)` function with all I/O isolated in effect executors. State machine tracks retry attempts in `LlmRequesting{attempt}` state, pending/completed tools in `ToolExecuting` state. Cancellation produces synthetic `ToolResult::Cancelled` for current and remaining tools. Error state includes `ErrorKind` enum for UI display. Sub-agents receive `submit_result` tool instead of `spawn_sub_agent` tool, preventing nesting. Database schema stores `state_data` JSON for state-specific fields. One runtime event loop per conversation coordinates state machine and executor. On server restart, conversations resume from idle with full message history preserved.
+Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents require mandatory `timeout: Duration` with deadline enforcement in executor `select!`. On server restart, conversations resume from idle with full message history preserved.
 
 ## Status Summary
 
@@ -36,5 +36,7 @@ Implements Elm Architecture: pure `transition(state, event) -> (new_state, effec
 | **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
 | **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |
 | **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
+| **REQ-BED-025:** Token-by-Token LLM Output | ❌ Not Started | Fire-and-forget `StreamToken` effects via SSE |
+| **REQ-BED-026:** Sub-Agent Timeout Enforcement | ❌ Not Started | Mandatory `timeout: Duration`, deadline in state |
 
-**Progress:** 19 of 24 complete
+**Progress:** 19 of 26 complete

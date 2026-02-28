@@ -16,7 +16,7 @@ RESTful API with JSON request/response bodies. SSE streaming broadcasts `init`, 
 | **REQ-API-002:** Conversation Creation | ✅ Complete | Slug: day-time-word-word format |
 | **REQ-API-003:** Message Retrieval | ✅ Complete | GET with after_sequence param |
 | **REQ-API-004:** User Actions | ✅ Complete | POST chat, cancel endpoints |
-| **REQ-API-005:** Real-time Streaming | ✅ Complete | SSE with init event and ?after |
+| **REQ-API-005:** Real-time Streaming | 🔄 In Progress | SSE with init event and ?after; token streaming and reconnection-during-stream pending |
 | **REQ-API-006:** Conversation Lifecycle | ✅ Complete | Archive, unarchive, delete, rename |
 | **REQ-API-007:** Slug Resolution | ✅ Complete | GET /api/conversation-by-slug/{slug} |
 | **REQ-API-008:** Directory Browser | ✅ Complete | validate-cwd and list-directory |

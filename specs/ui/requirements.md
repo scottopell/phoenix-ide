@@ -329,3 +329,21 @@ AND keep user in current conversation
 AND show brief confirmation toast
 
 **Rationale:** Users monitoring an active conversation need to spawn side tasks without losing context. Inline form enables "quick new conversation" without disrupting the current view. "Send in Background" is the power-user path for spawning work while staying focused.
+
+---
+
+### REQ-UI-019: Streaming Text Display
+
+WHEN LLM is generating a text response
+THE SYSTEM SHALL display partial text as it arrives, below the conversation history
+AND render the text with basic formatting as it accumulates
+
+WHEN LLM response completes and the message is saved
+THE SYSTEM SHALL replace the streaming display with the finalized rendered message
+AND the transition SHALL NOT produce visible duplication, flickering, or content loss
+
+WHEN user scrolls up during streaming
+THE SYSTEM SHALL NOT force auto-scroll back to the streaming text
+AND SHALL provide affordance to jump to live output
+
+**Rationale:** Progressive text display confirms the system is working and lets users start reading during generation. Clean transition to the finalized message ensures the streaming view is never a "different version" of the response — the saved message is always authoritative.

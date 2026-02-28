@@ -147,6 +147,7 @@ AND preserve complete message history
 WHEN LLM requests sub-agent spawn
 THE SYSTEM SHALL create independent sub-agent conversations
 AND execute them in parallel
+AND assign a time limit to each sub-agent
 
 WHEN sub-agent completes its task
 THE SYSTEM SHALL require it to call a dedicated result submission tool
@@ -160,7 +161,7 @@ WHEN any sub-agent fails or times out without submitting
 THE SYSTEM SHALL include failure information in aggregated results
 AND allow parent to handle the failure
 
-**Rationale:** Users benefit from parallel task execution for bootstrapping and complex operations. Explicit result submission provides clean completion semantics.
+**Rationale:** Users benefit from parallel task execution for bootstrapping and complex operations. Explicit result submission provides clean completion semantics. Time limits prevent indefinite resource consumption by stuck sub-agents.
 
 ---
 
@@ -398,3 +399,39 @@ AND NOT trigger continuation flow for sub-agents
 AND report failure to parent conversation as "context exhausted before result submission"
 
 **Rationale:** Sub-agents are short-lived workers that shouldn't run long enough to exhaust context. If they do, failing fast surfaces the failure to the parent agent which can naturally decide how to proceed (retry with refined task, work around it, etc.).
+
+---
+
+### REQ-BED-025: Token-by-Token LLM Output
+
+WHEN LLM is generating a text response to a user message
+THE SYSTEM SHALL display the response text to the user progressively as it is generated
+AND NOT wait for the full response before showing any text
+
+WHEN LLM generates a response that contains only tool invocations and no prose text
+THE SYSTEM SHALL NOT display streaming text
+AND SHALL continue to indicate work is in progress via the existing activity indicator
+
+WHEN text is actively streaming to the user
+THE SYSTEM SHALL update the displayed content frequently enough that the user perceives continuous output
+
+WHEN streaming stops due to completion or error
+THE SYSTEM SHALL immediately reflect the stopped state
+
+**Rationale:** Long responses on large conversation contexts can take many seconds to generate. Without progressive display, users cannot distinguish active generation from a silent hang or network failure. Seeing words appear confirms the system is working and allows the user to begin reading early.
+
+---
+
+### REQ-BED-026: Sub-Agent Timeout Enforcement
+
+WHEN sub-agent is spawned
+THE SYSTEM SHALL assign a mandatory time limit
+
+WHEN sub-agent exceeds its time limit without submitting a result
+THE SYSTEM SHALL terminate the sub-agent
+AND report timeout failure to parent conversation
+
+WHEN sub-agent timeout fires
+THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
+
+**Rationale:** Without enforced time limits, a stuck or slow sub-agent can hold the parent conversation indefinitely. Users need assurance that sub-agent work will complete or fail within a bounded time.

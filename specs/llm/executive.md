@@ -6,7 +6,7 @@ The LLM provider abstracts communication with multiple LLM APIs behind a common 
 
 ## Technical Summary
 
-Implements `LlmService` trait with `complete()` method returning `LlmResponse`. Provider implementations (Anthropic, OpenAI, Fireworks) translate common request format to provider-specific JSON and normalize responses back. Gateway URLs constructed by appending provider suffix to base gateway URL. `ModelRegistry` registers all models when gateway configured, or only models with API keys in direct mode. `LlmError` includes `LlmErrorKind` enum with `is_retryable()` method. `LoggingService` wrapper records model, duration, and token counts. Usage tracking includes input/output tokens and cache statistics for context window computation.
+Implements `LlmService` trait with `complete()` method returning `LlmResponse`. Provider implementations (Anthropic, OpenAI, Fireworks) translate common request format to provider-specific JSON and normalize responses back. Gateway URLs constructed by appending provider suffix to base gateway URL. `ModelRegistry` registers all models when gateway configured, or only models with API keys in direct mode. `LlmError` includes exhaustive `LlmErrorKind` enum (no `Unknown` variant, no catch-all) with `is_retryable()` method. `LoggingService` wrapper records model, duration, and token counts. Usage tracking includes input/output tokens and cache statistics for context window computation.
 
 ## Status Summary
 
@@ -21,5 +21,6 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-006:** Error Classification | ✅ Complete | LlmErrorKind with is_retryable() |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-008:** Request Logging | ✅ Complete | LoggingService wrapper with tracing |
+| **REQ-LLM-009:** Streaming Responses | ❌ Not Started | `complete_streaming()` on `LlmService` trait |
 
-**Progress:** 9 of 9 complete
+**Progress:** 9 of 10 complete

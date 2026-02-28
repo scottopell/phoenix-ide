@@ -47,6 +47,10 @@ pub struct Usage {
 
 ## Error Types (REQ-LLM-006)
 
+No `Unknown` variant. No `#[non_exhaustive]`. No `_ =>` in match arms. Adding a new
+HTTP status class requires adding a variant and handling it in every consumer — the
+compiler forces it.
+
 ```rust
 pub struct LlmError {
     pub kind: LlmErrorKind,
@@ -65,8 +69,11 @@ pub enum LlmErrorKind {
     Auth,
     /// Bad request (400) - not retryable
     InvalidRequest,
-    /// Unknown error
-    Unknown,
+    /// Content filter or safety block - not retryable
+    ContentFilter,
+    /// Context window exceeded - not retryable in current conversation
+    ContextWindowExceeded,
+    // No Unknown. No _.
 }
 
 impl LlmErrorKind {
@@ -75,6 +82,74 @@ impl LlmErrorKind {
     }
 }
 ```
+
+## Streaming Interface (REQ-LLM-009)
+
+The `LlmService` trait gains a streaming method alongside `complete()`:
+
+```rust
+#[async_trait]
+pub trait LlmService: Send + Sync {
+    /// Non-streaming: blocks until full response is available
+    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
+
+    /// Streaming: emits chunks via the sender, then returns the final assembled response.
+    /// The final LlmResponse is identical to what complete() would return.
+    /// Default implementation calls complete() with no streaming.
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        // Default: no streaming, just call complete()
+        self.complete(request).await
+    }
+
+    fn context_window(&self) -> usize;
+    fn max_image_dimension(&self) -> Option<u32>;
+}
+
+/// Chunks emitted during streaming. Only text deltas are forwarded to the UI;
+/// tool input fragments are accumulated internally.
+pub enum TokenChunk {
+    Text(String),
+    ToolUseStart { tool_use_id: String, tool_name: String },
+    ToolUseInput { tool_use_id: String, partial_json: String },
+    ToolUseDone { tool_use_id: String },
+}
+```
+
+### Provider Streaming Implementation
+
+Each provider reads the HTTP response body as a stream, maintaining an accumulator:
+
+- **Current block type** (`text` or `tool_use`) — declared before deltas arrive
+  (Anthropic/OpenAI Responses), or inferred from delta field (Chat Completions)
+- **Per-block text buffer** — for text blocks: forwarded via `chunk_tx` immediately;
+  for tool blocks: accumulated for final JSON parse
+- **Tool call metadata** — `id`, `name` known from block-start before any deltas
+
+On stream end: parse all accumulated tool input buffers as JSON, assemble final
+`LlmResponse` with full `ContentBlock` list and `Usage` data.
+
+### LlmOutcome (Executor Boundary Type)
+
+The executor's LLM background task produces an `LlmOutcome` for the oneshot channel.
+This is the typed boundary between provider I/O and the pure state machine:
+
+```rust
+pub enum LlmOutcome {
+    Response(AssistantMessage, TokenUsage),
+    RateLimited { retry_after: Option<Duration> },
+    ServerError { status: u16, body: String },
+    NetworkError { message: String },
+    TokenBudgetExceeded { partial: Option<AssistantMessage> },
+    Cancelled,
+}
+```
+
+The executor maps `Result<LlmResponse, LlmError>` → `LlmOutcome` via a total function
+(no `_ =>` arm). This mapping is where FM-3 prevention lives.
 
 ## Provider Implementations
 

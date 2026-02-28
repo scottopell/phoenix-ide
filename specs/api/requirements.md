@@ -82,6 +82,10 @@ THE SYSTEM SHALL send init event with current state, agent_working status, and l
 AND stream new messages as they are persisted
 AND stream state changes as they occur
 
+WHEN LLM is generating a response
+THE SYSTEM SHALL stream token events to connected clients as text is produced
+AND include a request identifier so clients can correlate tokens with the in-flight request
+
 WHEN client connects with `after` query parameter
 THE SYSTEM SHALL include only messages with sequence_id > after in init event
 AND then stream new messages normally
@@ -89,7 +93,13 @@ AND then stream new messages normally
 WHEN multiple clients connect to same conversation
 THE SYSTEM SHALL broadcast updates to all connected clients
 
-**Rationale:** Users expect real-time feedback during agent execution. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions.
+WHEN client reconnects after a connection drop during LLM generation
+THE SYSTEM SHALL show one of two consistent states:
+- The complete finalized message, if generation completed during the outage
+- An accurate in-progress state with activity indication, if generation is still running
+AND SHALL NOT show partial or duplicate content from the interrupted stream
+
+**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions. Reconnection correctness ensures dropped connections during long generations never leave users with stale or broken views.
 
 ---
 

@@ -189,8 +189,39 @@ With `after=N` parameter, init event includes only messages with `sequence_id > 
 | `init` | Initial state on connect | Conversation + messages (filtered by after) + last_sequence_id |
 | `message` | New message added | Single message |
 | `state_change` | Conversation state changed | New state + state_data |
+| `token` | Streaming text chunk (REQ-BED-025) | `{ text, request_id }` |
 | `agent_done` | Agent finished turn | None |
 | `error` | Error occurred | Error message |
+
+#### Token Streaming Events
+
+Token events are ephemeral display data — not persisted, no `sequence_id`. They are
+produced by the `StreamToken` fire-and-forget effect during LLM generation and routed
+directly to the SSE broadcast channel.
+
+```
+event: token
+data: {"text": "Let me ", "request_id": "req_abc123"}
+
+event: token
+data: {"text": "search for ", "request_id": "req_abc123"}
+```
+
+`request_id` lets the UI correlate chunks to the correct in-flight LLM request and
+discard stale tokens from a previous request that may arrive after a state transition.
+
+#### Reconnection During Streaming
+
+Token events are not persisted. On reconnect:
+
+- **If LLM call completed:** The `init` event includes the finalized `message`. Client
+  renders it directly. No partial content.
+- **If LLM call still running:** The `init` event reflects in-progress state
+  (`agent_working: true`). Client shows activity indicator. When the LLM call completes,
+  the `message` event arrives on the new connection. Chunks emitted before reconnect
+  are lost — the user sees the finalized message when complete.
+
+No changes to existing reconnection logic are needed.
 
 ### Cancel (REQ-API-004)
 
