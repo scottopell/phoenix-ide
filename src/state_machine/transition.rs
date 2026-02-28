@@ -1150,14 +1150,15 @@ fn notify_awaiting_sub_agents(pending: &[PendingSubAgent], completed: &[SubAgent
 
 #[allow(dead_code)] // Conversion utility
 pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
-    // Explicit match arms to ensure new error kinds are handled (no catch-all)
+    // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
         crate::llm::LlmErrorKind::Auth => ErrorKind::Auth,
         crate::llm::LlmErrorKind::RateLimit => ErrorKind::RateLimit,
         crate::llm::LlmErrorKind::Network => ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => ErrorKind::InvalidRequest,
         crate::llm::LlmErrorKind::ServerError => ErrorKind::ServerError,
-        crate::llm::LlmErrorKind::Unknown => ErrorKind::Unknown,
+        crate::llm::LlmErrorKind::ContentFilter => ErrorKind::ContentFilter,
+        crate::llm::LlmErrorKind::ContextWindowExceeded => ErrorKind::ContextExhausted,
     }
 }
 

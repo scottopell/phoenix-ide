@@ -78,7 +78,7 @@ async fn complete_chat_api(
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
-        .map_err(|e| LlmError::unknown(format!("Failed to create HTTP client: {e}")))?;
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let response = client
         .post(&url)
@@ -94,7 +94,7 @@ async fn complete_chat_api(
             } else if e.is_connect() {
                 LlmError::network(format!("Connection failed: {e}"))
             } else {
-                LlmError::unknown(format!("Request failed: {e}"))
+                LlmError::network(format!("Request failed: {e}"))
             }
         })?;
 
@@ -108,18 +108,21 @@ async fn complete_chat_api(
         if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
             let message = error_resp.error.message;
             return Err(match status.as_u16() {
-                401 => LlmError::auth(format!("Authentication failed: {message}")),
+                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
                 429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-                400 => LlmError::invalid_request(format!("Invalid request: {message}")),
+                400..=499 => {
+                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
+                }
                 500..=599 => LlmError::server_error(format!("Server error: {message}")),
-                _ => LlmError::unknown(format!("HTTP {status}: {message}")),
+                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
             });
         }
-        return Err(LlmError::unknown(format!("HTTP {status} error: {body}")));
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
-    let openai_response: OpenAIResponse = serde_json::from_str(&body)
-        .map_err(|e| LlmError::unknown(format!("Failed to parse response: {e} - body: {body}")))?;
+    let openai_response: OpenAIResponse = serde_json::from_str(&body).map_err(|e| {
+        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    })?;
 
     normalize_response(openai_response)
 }
@@ -141,7 +144,7 @@ async fn complete_responses_api(
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
-        .map_err(|e| LlmError::unknown(format!("Failed to create HTTP client: {e}")))?;
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let response = client
         .post(&url)
@@ -157,7 +160,7 @@ async fn complete_responses_api(
             } else if e.is_connect() {
                 LlmError::network(format!("Connection failed: {e}"))
             } else {
-                LlmError::unknown(format!("Request failed: {e}"))
+                LlmError::network(format!("Request failed: {e}"))
             }
         })?;
 
@@ -171,18 +174,21 @@ async fn complete_responses_api(
         if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
             let message = error_resp.error.message;
             return Err(match status.as_u16() {
-                401 => LlmError::auth(format!("Authentication failed: {message}")),
+                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
                 429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-                400 => LlmError::invalid_request(format!("Invalid request: {message}")),
+                400..=499 => {
+                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
+                }
                 500..=599 => LlmError::server_error(format!("Server error: {message}")),
-                _ => LlmError::unknown(format!("HTTP {status}: {message}")),
+                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
             });
         }
-        return Err(LlmError::unknown(format!("HTTP {status} error: {body}")));
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
-    let responses_response: ResponsesApiResponse = serde_json::from_str(&body)
-        .map_err(|e| LlmError::unknown(format!("Failed to parse response: {e} - body: {body}")))?;
+    let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
+        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    })?;
 
     Ok(normalize_responses_api_response(responses_response))
 }
@@ -530,7 +536,7 @@ pub(crate) fn normalize_response(resp: OpenAIResponse) -> Result<LlmResponse, Ll
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| LlmError::unknown("No choices in response"))?;
+        .ok_or_else(|| LlmError::server_error("No choices in response"))?;
 
     let mut content = Vec::new();
 
@@ -558,13 +564,13 @@ pub(crate) fn normalize_response(resp: OpenAIResponse) -> Result<LlmResponse, Ll
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
             if tc.function.name.is_empty() {
-                return Err(LlmError::unknown(
+                return Err(LlmError::server_error(
                     "OpenAI returned tool call with empty function name",
                 ));
             }
 
             let input = serde_json::from_str(&tc.function.arguments).map_err(|e| {
-                LlmError::unknown(format!("Invalid JSON in tool call arguments: {e}"))
+                LlmError::server_error(format!("Invalid JSON in tool call arguments: {e}"))
             })?;
 
             content.push(ContentBlock::ToolUse {
@@ -576,8 +582,8 @@ pub(crate) fn normalize_response(resp: OpenAIResponse) -> Result<LlmResponse, Ll
     }
 
     if content.is_empty() {
-        return Err(LlmError::unknown(
-            "OpenAI returned empty response (no content or tool calls)".to_string(),
+        return Err(LlmError::server_error(
+            "OpenAI returned empty response (no content or tool calls)",
         ));
     }
 

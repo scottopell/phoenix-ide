@@ -38,12 +38,22 @@ impl LlmError {
         Self::new(LlmErrorKind::InvalidRequest, message)
     }
 
-    pub fn unknown(message: impl Into<String>) -> Self {
-        Self::new(LlmErrorKind::Unknown, message)
+    #[allow(dead_code)] // Will be used when providers detect content filter responses
+    pub fn content_filter(message: impl Into<String>) -> Self {
+        Self::new(LlmErrorKind::ContentFilter, message)
+    }
+
+    #[allow(dead_code)] // Will be used when providers detect context window errors
+    pub fn context_window_exceeded(message: impl Into<String>) -> Self {
+        Self::new(LlmErrorKind::ContextWindowExceeded, message)
     }
 }
 
-/// Error classification for retry logic
+/// Error classification for retry logic.
+///
+/// No `Unknown` variant. No `#[non_exhaustive]`. Adding a new error class
+/// requires adding a variant here and handling it in every consumer — the
+/// compiler forces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmErrorKind {
     /// Network issues, timeouts - retryable
@@ -56,13 +66,23 @@ pub enum LlmErrorKind {
     Auth,
     /// Bad request (400) - not retryable
     InvalidRequest,
-    /// Unknown error
-    Unknown,
+    /// Content filter or safety block - not retryable
+    #[allow(dead_code)] // Will be used when providers detect content filter responses
+    ContentFilter,
+    /// Context window exceeded - not retryable in current conversation
+    #[allow(dead_code)] // Will be used when providers detect context window errors
+    ContextWindowExceeded,
 }
 
 impl LlmErrorKind {
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::Network | Self::RateLimit | Self::ServerError)
+        match self {
+            Self::Network | Self::RateLimit | Self::ServerError => true,
+            Self::Auth
+            | Self::InvalidRequest
+            | Self::ContentFilter
+            | Self::ContextWindowExceeded => false,
+        }
     }
 }
 
@@ -77,7 +97,8 @@ impl LlmError {
             429 => Self::rate_limit(format!("Rate limited: {body}")),
             400..=499 => Self::invalid_request(format!("Bad request ({status}): {body}")),
             500..=599 => Self::server_error(format!("Server error ({status}): {body}")),
-            _ => Self::unknown(format!("HTTP {status}: {body}")),
+            // Unexpected status (1xx, 3xx, etc.) — treat as retryable server error
+            _ => Self::server_error(format!("Unexpected HTTP {status}: {body}")),
         }
     }
 }

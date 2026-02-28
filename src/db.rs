@@ -5,7 +5,9 @@
 mod schema;
 
 pub use schema::*;
-use schema::{MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE};
+use schema::{
+    MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
+};
 
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
@@ -78,6 +80,11 @@ impl Database {
 
         // Rename id -> message_id for searchability (ignore error if already done)
         let _ = sqlx::raw_sql(MIGRATION_RENAME_MESSAGE_ID)
+            .execute(&self.pool)
+            .await;
+
+        // Replace "unknown" error_kind with "server_error" in stored conversation state
+        let _ = sqlx::raw_sql(MIGRATION_REMOVE_UNKNOWN_ERROR_KIND)
             .execute(&self.pool)
             .await;
 

@@ -25,7 +25,7 @@ pub async fn complete(
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
-        .map_err(|e| LlmError::unknown(format!("Failed to create HTTP client: {e}")))?;
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let anthropic_request = translate_request(&spec.api_name, request);
 
@@ -44,7 +44,7 @@ pub async fn complete(
             } else if e.is_connect() {
                 LlmError::network(format!("Connection failed: {e}"))
             } else {
-                LlmError::unknown(format!("Request failed: {e}"))
+                LlmError::network(format!("Request failed: {e}"))
             }
         })?;
 

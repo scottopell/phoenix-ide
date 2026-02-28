@@ -203,7 +203,7 @@ impl RuntimeManager {
                         agent_id: spec.agent_id,
                         outcome: SubAgentOutcome::Failure {
                             error: format!("Failed to create conversation: {e}"),
-                            error_kind: crate::db::ErrorKind::Unknown,
+                            error_kind: crate::db::ErrorKind::SubAgentError,
                         },
                     })
                     .await;
@@ -225,7 +225,7 @@ impl RuntimeManager {
                     agent_id: spec.agent_id,
                     outcome: SubAgentOutcome::Failure {
                         error: format!("Failed to add initial message: {e}"),
-                        error_kind: crate::db::ErrorKind::Unknown,
+                        error_kind: crate::db::ErrorKind::SubAgentError,
                     },
                 })
                 .await;

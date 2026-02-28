@@ -71,7 +71,11 @@ fn arb_error_kind() -> impl Strategy<Value = ErrorKind> {
         Just(ErrorKind::ServerError),
         Just(ErrorKind::Auth),
         Just(ErrorKind::InvalidRequest),
-        Just(ErrorKind::Unknown),
+        Just(ErrorKind::ContentFilter),
+        Just(ErrorKind::ContextExhausted),
+        Just(ErrorKind::TimedOut),
+        Just(ErrorKind::Cancelled),
+        Just(ErrorKind::SubAgentError),
     ]
 }
 

@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 574
 priority: p1
-status: ready
+status: done
 slug: exhaustive-error-enums
 title: "Remove Unknown from LlmErrorKind, make error classification exhaustive"
 ---

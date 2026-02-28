@@ -394,7 +394,7 @@ where
                             let _ = event_tx
                                 .send(Event::LlmError {
                                     message: e,
-                                    error_kind: crate::db::ErrorKind::Unknown,
+                                    error_kind: crate::db::ErrorKind::InvalidRequest,
                                     attempt: current_attempt,
                                 })
                                 .await;
@@ -972,14 +972,15 @@ fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
 }
 
 fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind {
-    // Explicit match arms to ensure new error kinds are handled (no catch-all)
+    // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
         crate::llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
         crate::llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
         crate::llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
         crate::llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
-        crate::llm::LlmErrorKind::Unknown => crate::db::ErrorKind::Unknown,
+        crate::llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
+        crate::llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
     }
 }
 
@@ -1010,11 +1011,15 @@ mod error_mapping_tests {
         assert_eq!(
             llm_error_to_db_error(LlmErrorKind::ServerError),
             crate::db::ErrorKind::ServerError,
-            "ServerError must map to ServerError, not Unknown!"
+            "ServerError must map to ServerError"
         );
         assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::Unknown),
-            crate::db::ErrorKind::Unknown
+            llm_error_to_db_error(LlmErrorKind::ContentFilter),
+            crate::db::ErrorKind::ContentFilter
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::ContextWindowExceeded),
+            crate::db::ErrorKind::ContextExhausted
         );
     }
 

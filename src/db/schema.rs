@@ -62,6 +62,15 @@ UPDATE conversations SET state = '{"type":"idle"}', state_data = NULL
 WHERE state NOT LIKE '{%}';
 "#;
 
+/// Migration: replace `"unknown"` `error_kind` with `"server_error"` in JSON state.
+/// The `Unknown` variant was removed from `ErrorKind`; old rows need updating
+/// so serde can deserialize them.
+pub const MIGRATION_REMOVE_UNKNOWN_ERROR_KIND: &str = r#"
+UPDATE conversations
+SET state = REPLACE(state, '"error_kind":"unknown"', '"error_kind":"server_error"')
+WHERE state LIKE '%"error_kind":"unknown"%';
+"#;
+
 /// Migration SQL to add model column
 #[allow(dead_code)] // Will be used in future
 pub const MIGRATION_ADD_MODEL: &str = r"
@@ -104,7 +113,11 @@ impl Conversation {
     }
 }
 
-/// Error classification for UI display
+/// Error classification for UI display.
+///
+/// No `Unknown` variant. Every error gets an explicit, intentional classification.
+/// Adding a new error class requires handling it in every consumer — the compiler
+/// forces it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -126,17 +139,22 @@ pub enum ErrorKind {
     SubAgentError,
     /// Context window exhausted - not retryable
     ContextExhausted,
-    /// Unknown error - not retryable (conservative default)
-    Unknown,
+    /// Content filter or safety block - not retryable
+    ContentFilter,
 }
 
 impl ErrorKind {
     /// Returns true if this error type should trigger automatic retry
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut
-        )
+        match self {
+            Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut => true,
+            Self::Auth
+            | Self::InvalidRequest
+            | Self::Cancelled
+            | Self::SubAgentError
+            | Self::ContextExhausted
+            | Self::ContentFilter => false,
+        }
     }
 }
 
@@ -534,11 +552,11 @@ mod error_kind_tests {
         );
         assert!(
             !ErrorKind::ContextExhausted.is_retryable(),
-            "SubAgent errors should not be retryable"
+            "Context exhausted errors should not be retryable"
         );
         assert!(
-            !ErrorKind::Unknown.is_retryable(),
-            "Unknown errors should not be retryable (conservative)"
+            !ErrorKind::ContentFilter.is_retryable(),
+            "Content filter errors should not be retryable"
         );
     }
 
