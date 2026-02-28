@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 578
 priority: p2
-status: ready
+status: done
 slug: subagent-mandatory-timeout
 title: "Sub-agent mandatory timeout with deadline enforcement"
 ---

@@ -22,8 +22,13 @@ use crate::system_prompt::build_system_prompt;
 use crate::tools::{BrowserSessionManager, ToolContext};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+/// Default timeout for sub-agents: 5 minutes (REQ-SA-006, FM-6 prevention).
+/// Long enough for real work, short enough to catch stuck agents.
+const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
@@ -54,8 +59,11 @@ where
     spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
     /// Channel to request sub-agent cancellation (parent only)
     cancel_tx: Option<mpsc::Sender<SubAgentCancelRequest>>,
-    /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`
+    /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`.
+    /// Pre-allocated with capacity = sub-agent count when spawning (FM-6 prevention).
     sub_agent_result_buffer: Vec<Event>,
+    /// Deadline for sub-agent completion — set when entering `AwaitingSubAgents` (REQ-SA-006)
+    sub_agent_deadline: Option<tokio::time::Instant>,
     /// Typed outcome channel — background tasks send `EffectOutcome` here.
     /// Each task gets a typed `oneshot::Sender<T>` that constrains what it can send,
     /// then the forwarder wraps the result in `EffectOutcome` for this channel.
@@ -105,6 +113,7 @@ where
             spawn_tx: None,
             cancel_tx: None,
             sub_agent_result_buffer: Vec::new(),
+            sub_agent_deadline: None,
             outcome_tx,
             outcome_rx,
         }
@@ -143,10 +152,14 @@ where
         }
 
         // Process events and outcomes in a loop - no recursion
-        // Two input sources:
-        //   event_rx  — user events + legacy executor events (continuation, sub-agent results)
-        //   outcome_rx — typed effect outcomes (LLM, tool, persist, retry)
+        // Three input sources:
+        //   event_rx    — user events + legacy executor events (continuation, sub-agent results)
+        //   outcome_rx  — typed effect outcomes (LLM, tool, persist, retry)
+        //   deadline    — sub-agent timeout (REQ-SA-006, FM-6 prevention)
         loop {
+            // Copy deadline before select to avoid borrow conflict
+            let deadline = self.sub_agent_deadline;
+
             tokio::select! {
                 Some(event) = self.event_rx.recv() => {
                     if let Err(e) = self.process_event(event).await {
@@ -169,6 +182,24 @@ where
                     if let Err(e) = self.process_outcome(outcome).await {
                         tracing::warn!(error = %e, "Outcome rejected by state machine");
                     }
+                    // FM-5 prevention: terminal states exit the loop explicitly.
+                    if let StepResult::Terminal(outcome) = self.state.step_result() {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        return;
+                    }
+                }
+                // REQ-SA-006: sub-agent deadline expired — cancel all pending agents
+                () = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if deadline.is_some() => {
+                    self.handle_sub_agent_timeout().await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -269,19 +300,39 @@ where
         // Update state
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
 
-        // Check if we just entered AwaitingSubAgents - drain the buffer
-        if !matches!(
+        let entering_awaiting = !matches!(
             old_state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
         ) && matches!(
             self.state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
-        ) {
+        );
+        let leaving_awaiting = matches!(
+            old_state,
+            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+        ) && !matches!(
+            self.state,
+            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+        );
+
+        // Drain buffer when entering AwaitingSubAgents
+        if entering_awaiting {
             let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
             if !buffered.is_empty() {
                 tracing::debug!(count = buffered.len(), "Draining buffered SubAgentResults");
                 generated_events.extend(buffered);
             }
+            // Set deadline (REQ-SA-006): timeout starts when parent enters AwaitingSubAgents
+            self.sub_agent_deadline = Some(tokio::time::Instant::now() + DEFAULT_SUBAGENT_TIMEOUT);
+            tracing::debug!(
+                timeout_secs = DEFAULT_SUBAGENT_TIMEOUT.as_secs(),
+                "Sub-agent deadline set"
+            );
+        }
+
+        // Clear deadline when leaving AwaitingSubAgents/CancellingSubAgents
+        if leaving_awaiting {
+            self.sub_agent_deadline = None;
         }
 
         // Execute effects and collect generated events
@@ -300,6 +351,55 @@ where
             self.state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
         )
+    }
+
+    /// Handle sub-agent timeout: cancel all pending agents and inject `TimedOut` results.
+    ///
+    /// Called from the executor select loop when `sub_agent_deadline` fires (REQ-SA-006).
+    async fn handle_sub_agent_timeout(&mut self) {
+        use crate::state_machine::state::SubAgentOutcome;
+
+        self.sub_agent_deadline = None;
+
+        let pending_ids: Vec<(String, String)> =
+            if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
+                pending
+                    .iter()
+                    .map(|p| (p.agent_id.clone(), p.task.clone()))
+                    .collect()
+            } else {
+                // Deadline fired but state already moved on — nothing to do
+                return;
+            };
+
+        tracing::warn!(
+            count = pending_ids.len(),
+            "Sub-agent timeout reached, cancelling pending agents"
+        );
+
+        // Cancel the actual sub-agent runtimes
+        if let Some(cancel_tx) = &self.cancel_tx {
+            let ids: Vec<String> = pending_ids.iter().map(|(id, _)| id.clone()).collect();
+            let request = SubAgentCancelRequest {
+                ids,
+                parent_conversation_id: self.context.conversation_id.clone(),
+                parent_event_tx: self.event_tx.clone(),
+            };
+            if let Err(e) = cancel_tx.send(request).await {
+                tracing::error!(error = %e, "Failed to send cancel request for timed-out agents");
+            }
+        }
+
+        // Inject TimedOut results for each pending agent — transitions state normally
+        for (agent_id, _task) in pending_ids {
+            let event = Event::SubAgentResult {
+                agent_id,
+                outcome: SubAgentOutcome::TimedOut,
+            };
+            if let Err(e) = self.process_event(event).await {
+                tracing::warn!(error = %e, "Failed to process timeout result for sub-agent");
+            }
+        }
     }
 
     /// Handle the `spawn_agents` tool specially:
@@ -336,6 +436,9 @@ where
             }));
         }
 
+        // Bounded buffer: pre-allocate with capacity = sub-agent count (FM-6 prevention)
+        self.sub_agent_result_buffer = Vec::with_capacity(input.tasks.len());
+
         // Generate agent IDs and prepare spawn specs
         let mut spawned = Vec::new();
         let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
@@ -355,7 +458,7 @@ where
                     agent_id,
                     task: task.task.clone(),
                     cwd,
-                    timeout: None, // TODO: Add timeout parameter to spawn_agents
+                    timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 };
                 let request = SubAgentSpawnRequest {
                     spec,
@@ -810,6 +913,9 @@ where
                                 }
                                 SubAgentOutcome::Failure { error, .. } => {
                                     format!("Failed: {error}")
+                                }
+                                SubAgentOutcome::TimedOut => {
+                                    "Timed out: sub-agent exceeded its time limit".to_string()
                                 }
                             };
                             format!("Task: \"{}\"\n{outcome}", r.task)

@@ -468,6 +468,8 @@ pub enum SubAgentOutcome {
         error: String,
         error_kind: ErrorKind,
     },
+    /// Sub-agent exceeded its time limit (REQ-SA-006)
+    TimedOut,
 }
 
 /// A sub-agent that is still running
@@ -491,7 +493,8 @@ pub struct SubAgentSpec {
     pub agent_id: String,
     pub task: String,
     pub cwd: String,
-    pub timeout: Option<Duration>,
+    /// Mandatory timeout — caller must make a conscious decision (REQ-SA-006)
+    pub timeout: Duration,
 }
 
 /// How a conversation handles approaching context limits

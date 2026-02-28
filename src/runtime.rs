@@ -279,15 +279,18 @@ impl RuntimeManager {
             },
         );
 
-        // 8. Set up timeout if specified
-        let timeout_task = spec.timeout.map(|duration| {
+        // 8. Set up per-agent timeout — sends UserCancel if sub-agent exceeds its limit.
+        // This is a safety net; the parent's AwaitingSubAgents deadline is the primary
+        // enforcement (REQ-SA-006). Both fire independently.
+        let timeout_duration = spec.timeout;
+        let timeout_task = {
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+                tokio::time::sleep(timeout_duration).await;
                 tracing::info!("Sub-agent timeout reached, sending cancel");
                 let _ = event_tx.send(Event::UserCancel).await;
             })
-        });
+        };
 
         // 9. Start runtime task
         let conv_id = conv.id.clone();
@@ -307,10 +310,8 @@ impl RuntimeManager {
 
             runtime.run().await;
 
-            // Cancel timeout if it exists
-            if let Some(task) = timeout_task {
-                task.abort();
-            }
+            // Cancel timeout — sub-agent finished before its limit
+            timeout_task.abort();
 
             // Remove the handle from runtimes so its event_tx sender is dropped.
             // Without this the channel never closes and any other executor holding

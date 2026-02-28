@@ -1441,6 +1441,7 @@ fn arb_sub_agent_outcome() -> impl Strategy<Value = SubAgentOutcome> {
         "[a-zA-Z ]{1,50}".prop_map(|result| SubAgentOutcome::Success { result }),
         ("[a-zA-Z ]{1,30}", arb_error_kind())
             .prop_map(|(error, error_kind)| { SubAgentOutcome::Failure { error, error_kind } }),
+        Just(SubAgentOutcome::TimedOut),
     ]
 }
 
