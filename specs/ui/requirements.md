@@ -4,6 +4,35 @@
 
 As a user on mobile or desktop, I need a responsive web interface to interact with Phoenix so that I can have conversations with the AI agent, monitor its progress, and manage my conversations—even with unreliable network connectivity.
 
+## Transparency Contract
+
+The user has delegated a complex task to an autonomous agent. The single worst outcome
+is not a failed task — it is a user who cannot determine which outcome occurred. Every
+UI requirement exists to help users confidently answer these questions.
+
+**During execution:**
+1. Is the agent still running, or has it stopped?
+2. What is it doing right now — which specific operation is in flight?
+3. How long has it been in the current operation?
+4. What has it completed so far, in what order?
+5. Are sub-agents running? Which ones finished?
+6. Has anything gone wrong that I should know about, even if execution continues?
+
+**Immediately after completion:**
+7. Did the task succeed or fail?
+8. What did the agent actually do? (All steps, in order, with results.)
+9. For each tool call: what was the input, what was the output, did it succeed?
+10. If it failed: where, and what was the error?
+
+**Days later on review:**
+11. What was the original request?
+12. What did the agent do in response?
+13. What model was used? How many tokens were consumed?
+14. Were there timeouts, retries, or partial failures?
+
+This contract is the acceptance test for UI completeness. If a question cannot be
+answered confidently from the UI, that is a missing or incomplete requirement.
+
 ## Requirements
 
 ### REQ-UI-001: Conversation List
@@ -125,8 +154,11 @@ AND NOT show duplicate messages
 
 WHEN agent is working
 THE SYSTEM SHALL show activity indicator (yellow pulsing dot)
-AND display current state description ("thinking...", "bash", etc.)
-AND show breadcrumb trail of completed steps in current turn
+AND display current state description with an explicit label for every possible state
+AND NOT use a catch-all or generic label for unrecognized states
+
+WHEN state is `llm_requesting`
+THE SYSTEM SHALL show "thinking..." with retry attempt number if retrying
 
 WHEN state is `tool_executing`
 THE SYSTEM SHALL show tool name and queue depth: "bash (+2 queued)"
@@ -134,7 +166,34 @@ THE SYSTEM SHALL show tool name and queue depth: "bash (+2 queued)"
 WHEN state is `awaiting_sub_agents`
 THE SYSTEM SHALL show sub-agent progress: "sub-agents (2/3 done)"
 
-**Rationale:** Users need confidence the system is making progress, especially during long operations.
+WHEN state is `cancelling`, `cancelling_tool`, or `cancelling_sub_agents`
+THE SYSTEM SHALL show "cancelling..."
+
+WHEN a new backend state variant is added
+THE SYSTEM SHALL require an explicit display label before it can be rendered
+
+WHEN agent is idle, in error, or in a terminal state
+THE SYSTEM SHALL NOT show the activity indicator
+
+**Rationale:** Users need confidence the system is making progress (transparency questions 1-2). Exhaustive state labels prevent silent degradation when backend states evolve. The "is the agent working?" question must have exactly one unambiguous answer derived from one source.
+
+---
+
+### REQ-UI-007a: Breadcrumb Trail
+
+WHEN agent has completed steps in the current turn
+THE SYSTEM SHALL show an ordered breadcrumb trail of completed and in-progress steps
+
+WHEN a breadcrumb represents a completed tool call
+THE SYSTEM SHALL show the tool result summary on hover, not just the tool input
+
+WHEN a breadcrumb represents an in-progress tool call
+THE SYSTEM SHALL show the tool input on hover
+
+WHEN user clicks a breadcrumb
+THE SYSTEM SHALL scroll to and highlight the corresponding message in the conversation
+
+**Rationale:** Users need to answer "what has it done so far, in what order?" (transparency question 4) and "what was the output?" (transparency question 9). Breadcrumbs are navigation handles into the conversation view, which is the full audit trail.
 
 ---
 
@@ -329,6 +388,25 @@ AND keep user in current conversation
 AND show brief confirmation toast
 
 **Rationale:** Users monitoring an active conversation need to spawn side tasks without losing context. Inline form enables "quick new conversation" without disrupting the current view. "Send in Background" is the power-user path for spawning work while staying focused.
+
+---
+
+### REQ-UI-020: Navigation Persistence
+
+WHEN user navigates away from a conversation and returns within the same session
+THE SYSTEM SHALL restore the conversation state without a full re-fetch
+AND reconnect the SSE stream from the last seen sequence ID
+AND NOT show a loading flash for recently-visited conversations
+
+WHEN user navigates back to a conversation with an active agent
+THE SYSTEM SHALL resume displaying the current state immediately
+AND pick up any missed events via sequence-based reconnection
+
+WHEN user navigates back to a conversation where streaming was in progress
+THE SYSTEM SHALL show the current agent state (streaming may have completed during absence)
+AND NOT attempt to reconstruct missed token events
+
+**Rationale:** Navigation between conversations should feel instantaneous for recently-visited conversations. The reconnection cursor (`lastSequenceId`) must survive navigation — it cannot live in component state that unmounts. Missed streaming tokens during navigation are acceptable; the finalized message will arrive via normal reconnection.
 
 ---
 
