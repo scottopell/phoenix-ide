@@ -17,7 +17,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult } from '../api';
+import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { QueuedMessage } from '../hooks';
 
 import { linkifyText } from '../utils/linkify';
@@ -633,9 +633,11 @@ function CompletedSubAgent({ result }: { result: SubAgentResult }) {
   );
 }
 
-export function SubAgentStatus({ stateData }: { stateData: ConversationState }) {
-  const pending = stateData.pending ?? [];
-  const completed = stateData.completed_results ?? [];
+type AwaitingSubAgentsState = Extract<ConversationState, { type: 'awaiting_sub_agents' }>;
+
+export function SubAgentStatus({ stateData }: { stateData: AwaitingSubAgentsState }) {
+  const pending: PendingSubAgent[] = stateData.pending;
+  const completed: SubAgentResult[] = stateData.completed_results;
   const total = pending.length + completed.length;
 
   return (

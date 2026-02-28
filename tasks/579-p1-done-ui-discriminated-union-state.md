@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 579
 priority: p1
-status: ready
+status: done
 slug: ui-discriminated-union-state
 title: "ConversationState discriminated union with satisfies never"
 ---

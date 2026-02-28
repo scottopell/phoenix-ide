@@ -2,7 +2,8 @@ import { useRef, useEffect, useCallback, useState, forwardRef, useImperativeHand
 import { FolderOpen } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
 import { useDraft } from '../hooks';
-import type { ImageData } from '../api';
+import type { ConversationState, ImageData } from '../api';
+import { isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
@@ -13,11 +14,9 @@ export interface InputAreaHandle {
 
 interface InputAreaProps {
   conversationId: string | undefined;
+  convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
-  canSend: boolean;
-  agentWorking: boolean;
-  isCancelling: boolean;
   isOffline: boolean;
   queuedMessages: QueuedMessage[];
   onSend: (text: string, images: ImageData[]) => void;
@@ -28,11 +27,9 @@ interface InputAreaProps {
 
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
   conversationId,
+  convState,
   images,
   setImages,
-  canSend,
-  agentWorking,
-  isCancelling,
   isOffline,
   queuedMessages,
   onSend,
@@ -40,6 +37,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onRetry,
   onOpenFileBrowser,
 }, ref) {
+  const agentWorking = isAgentWorking(convState);
+  const isCancelling = isCancellingState(convState);
   const [draft, setDraft, clearDraft] = useDraft(conversationId);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -124,7 +123,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     
     // Can send if there's text OR images
     if (!text && images.length === 0) return;
-    if (!canSend && !isOffline) return;
+    if (agentWorking && !isOffline) return;
     onSend(text, images);
     setImages([]); // Clear images after send
   };
@@ -171,7 +170,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const failedMessages = queuedMessages.filter(m => m.status === 'failed');
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
-  const sendEnabled = (canSend || isOffline) && hasContent;
+  const sendEnabled = (!agentWorking || isOffline) && hasContent;
 
   return (
     <footer id="input-area">

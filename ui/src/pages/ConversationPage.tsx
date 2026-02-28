@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, Conversation, Message, ConversationState, SseEventType, SseEventData, SseInitData, SseMessageData, SseStateChangeData, ImageData } from '../api';
+import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
@@ -23,14 +24,11 @@ export function ConversationPage() {
   const [conversationIdForSSE, setConversationIdForSSE] = useState<string | undefined>(undefined);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [convState, setConvState] = useState('idle');
-  const [stateData, setStateData] = useState<ConversationState | null>(null);
+  const [convState, setConvState] = useState<ConversationState>({ type: 'idle' });
   const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
-  const [agentWorking, setAgentWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [contextWindowUsed, setContextWindowUsed] = useState(0);
   const [modelContextWindow, setModelContextWindow] = useState(200_000); // Default fallback
-  const [contextExhaustedSummary, setContextExhaustedSummary] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | undefined>(undefined);
 
   
@@ -62,51 +60,55 @@ export function ConversationPage() {
   const { queuedMessages, enqueue, markSent, markFailed, retry } = useMessageQueue(conversationId);
 
   // Update breadcrumbs from state
-  const updateBreadcrumbsFromState = useCallback((state: string, data: ConversationState | null) => {
-    if (state === 'idle' || state === 'error') {
-      return;
-    }
+  const updateBreadcrumbsFromState = useCallback((state: ConversationState) => {
+    switch (state.type) {
+      case 'idle': case 'error': case 'terminal': case 'context_exhausted':
+      case 'awaiting_llm': case 'awaiting_continuation':
+      case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
+        return;
 
-    setBreadcrumbs((prev) => {
-      const updated = [...prev];
-
-      if (state === 'llm_requesting') {
-        const filtered = updated.filter((b) => b.type !== 'llm');
-        const attempt = data?.attempt || 1;
+      case 'llm_requesting': {
+        const attempt = state.attempt;
         const label = attempt > 1 ? `LLM (retry ${attempt})` : 'LLM';
-        filtered.push({ type: 'llm', label });
-        return filtered;
+        setBreadcrumbs((prev) => {
+          const filtered = prev.filter((b) => b.type !== 'llm');
+          filtered.push({ type: 'llm', label });
+          return filtered;
+        });
+        return;
       }
 
-      if (state === 'tool_executing' && data?.current_tool) {
-        const toolName = data.current_tool.input?._tool || 'tool';
-        const toolId = data.current_tool.id;
-        const remaining = data.remaining_tools?.length ?? 0;
-        const label = remaining > 0 ? `${toolName} (+${remaining})` : toolName;
-
-        if (!updated.some((b) => b.type === 'tool' && b.toolId === toolId)) {
-          updated.push({ type: 'tool', label, toolId });
-        }
-        return updated;
+      case 'tool_executing': {
+        const toolName = state.current_tool.input?._tool || 'tool';
+        const toolId = state.current_tool.id;
+        const remaining = state.remaining_tools.length;
+        const label = remaining > 0 ? `${String(toolName)} (+${remaining})` : String(toolName);
+        setBreadcrumbs((prev) => {
+          if (prev.some((b) => b.type === 'tool' && b.toolId === toolId)) return prev;
+          return [...prev, { type: 'tool', label, toolId }];
+        });
+        return;
       }
 
-      if (state === 'awaiting_sub_agents') {
-        const pending = data?.pending?.length ?? 0;
-        const completed = data?.completed_results?.length ?? 0;
+      case 'awaiting_sub_agents': {
+        const pending = state.pending.length;
+        const completed = state.completed_results.length;
         const total = pending + completed;
         const label = `sub-agents (${completed}/${total})`;
-
-        const existing = updated.find((b) => b.type === 'subagents');
-        if (existing) {
-          existing.label = label;
-        } else {
-          updated.push({ type: 'subagents', label });
-        }
-        return updated;
+        setBreadcrumbs((prev) => {
+          const updated = [...prev];
+          const existing = updated.find((b) => b.type === 'subagents');
+          if (existing) {
+            existing.label = label;
+            return updated;
+          }
+          return [...prev, { type: 'subagents', label }];
+        });
+        return;
       }
 
-      return updated;
-    });
+      default: state satisfies never;
+    }
   }, []);
 
   // Handle SSE events
@@ -116,7 +118,7 @@ export function ConversationPage() {
         case 'init': {
           const initData = data as SseInitData;
           setConversation(initData.conversation);
-          
+
           // On reconnection, we request ?after=lastSeqId and get only NEW messages.
           const newMessages = initData.messages || [];
           setMessages((prev) => {
@@ -128,18 +130,10 @@ export function ConversationPage() {
             const toAdd = newMessages.filter(m => !existingIds.has(m.sequence_id));
             return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
           });
-          
-          const initState = initData.conversation?.state || { type: 'idle' };
-          setConvState(initState.type || 'idle');
-          const { type: _initType, ...initStateData } = initState;
-          void _initType; // Destructured to extract remaining state data
-          setStateData(Object.keys(initStateData).length > 0 ? initStateData as ConversationState : null);
-          setAgentWorking(initData.display_state === 'working');
-          
-          // Initialize context exhausted summary if loading an exhausted conversation
-          if (initState.type === 'context_exhausted' && 'summary' in initState) {
-            setContextExhaustedSummary((initState as { summary?: string }).summary || null);
-          }
+
+          const initState = parseConversationState(initData.conversation?.state);
+          setConvState(initState);
+
           if (initData.context_window_size !== undefined) {
             setContextWindowUsed(initData.context_window_size);
           }
@@ -157,10 +151,8 @@ export function ConversationPage() {
             })));
           }
           // Also update from state if agent is still working
-          if (initData.display_state === 'working') {
-            updateBreadcrumbsFromState(initState.type || 'idle', initStateData as ConversationState);
-          }
-          
+          updateBreadcrumbsFromState(initState);
+
           // Update cache with fresh data from SSE
           if (initData.conversation) {
             cacheDB.putConversation(initData.conversation);
@@ -202,24 +194,14 @@ export function ConversationPage() {
 
         case 'state_change': {
           const stateChangeData = data as SseStateChangeData;
-          const newState = stateChangeData.state?.type || 'idle';
-          const { type: _stateType, ...rest } = stateChangeData.state || { type: 'idle' };
-          void _stateType; // Used newState above instead
+          const newState = parseConversationState(stateChangeData.state);
           setConvState(newState);
-          setStateData(Object.keys(rest).length > 0 ? rest as ConversationState : null);
-          setAgentWorking(stateChangeData.display_state === 'working');
-          updateBreadcrumbsFromState(newState, rest as ConversationState);
-          
-          // Handle context exhaustion (REQ-BED-021)
-          if (newState === 'context_exhausted' && 'summary' in stateChangeData.state) {
-            setContextExhaustedSummary((stateChangeData.state as { summary?: string }).summary || null);
-          }
+          updateBreadcrumbsFromState(newState);
           break;
         }
 
         case 'agent_done':
-          setAgentWorking(false);
-          setConvState('idle');
+          setConvState({ type: 'idle' });
           // Keep breadcrumbs visible to show what happened - they clear on next user message
           break;
 
@@ -289,7 +271,7 @@ export function ConversationPage() {
             if (!cancelled) {
               setConversation(result.conversation);
               setMessages(result.messages);
-              setAgentWorking(result.display_state === 'working');
+              setConvState(result.display_state === 'working' ? { type: 'awaiting_llm' } : { type: 'idle' });
               setContextWindowUsed(result.context_window_size || 0);
               setConversationId(result.conversation.id); // Triggers SSE
               await cacheDB.putConversation(result.conversation);
@@ -351,7 +333,7 @@ export function ConversationPage() {
       if (isOnline) {
         await api.sendMessage(conversationId, text, images, localId);
         markSentRef.current(localId);
-        setAgentWorking(true);
+        setConvState({ type: 'awaiting_llm' });
         setBreadcrumbs([{ type: 'user', label: 'User' }]);
       } else {
         await queueOperation({
@@ -363,7 +345,6 @@ export function ConversationPage() {
           status: 'pending'
         });
         markSentRef.current(localId);
-        setAgentWorking(false);
       }
     } catch (err) {
       console.error('Failed to send message:', err);
@@ -411,8 +392,8 @@ export function ConversationPage() {
   };
 
   const handleCancel = async () => {
-    if (!conversationId || !agentWorking) return;
-    if (convState.startsWith('cancelling')) return;
+    if (!conversationId || !isAgentWorking(convState)) return;
+    if (isCancellingState(convState)) return;
 
     try {
       await api.cancelConversation(conversationId);
@@ -423,7 +404,7 @@ export function ConversationPage() {
 
   // Manual continuation trigger (REQ-BED-023)
   const handleTriggerContinuation = async () => {
-    if (!conversationId || convState !== 'idle') return;
+    if (!conversationId || convState.type !== 'idle') return;
 
     try {
       await api.triggerContinuation(conversationId);
@@ -506,9 +487,6 @@ export function ConversationPage() {
     );
   }
 
-  const canSend = !agentWorking;
-  const isCancelling = convState.startsWith('cancelling');
-
   // Desktop: prose reader replaces conversation content
   if (isDesktop && fileExplorer.proseReaderState) {
     const prs = fileExplorer.proseReaderState;
@@ -532,13 +510,12 @@ export function ConversationPage() {
         messages={messages}
         queuedMessages={queuedMessages}
         convState={convState}
-        stateData={stateData}
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
         conversationId={conversationId}
         {...(systemPrompt !== undefined && { systemPrompt })}
       />
-      {convState === 'context_exhausted' && contextExhaustedSummary && (
+      {convState.type === 'context_exhausted' && (
         <div className="context-exhausted-banner">
           <div className="context-exhausted-header">
             <span className="context-exhausted-icon">⚠️</span>
@@ -546,11 +523,11 @@ export function ConversationPage() {
           </div>
           <div className="context-exhausted-summary">
             <p>This conversation has reached its context limit. Copy the summary below to continue in a new conversation:</p>
-            <pre className="context-exhausted-content">{contextExhaustedSummary}</pre>
-            <button 
+            <pre className="context-exhausted-content">{convState.summary}</pre>
+            <button
               className="context-exhausted-copy"
               onClick={() => {
-                navigator.clipboard.writeText(contextExhaustedSummary);
+                navigator.clipboard.writeText(convState.type === 'context_exhausted' ? convState.summary : '');
               }}
             >
               Copy Summary
@@ -558,21 +535,19 @@ export function ConversationPage() {
           </div>
         </div>
       )}
-      {convState === 'error' && stateData?.message ? (
+      {convState.type === 'error' ? (
         <ErrorBanner
-          message={stateData.message}
+          message={convState.message}
           onRetry={() => handleSend('continue', [])}
-          onDismiss={() => setConvState('idle')}
+          onDismiss={() => setConvState({ type: 'idle' })}
         />
-      ) : convState !== 'context_exhausted' ? (
+      ) : convState.type !== 'context_exhausted' ? (
       <InputArea
         ref={inputRef}
         conversationId={conversationId}
+        convState={convState}
         images={images}
         setImages={setImages}
-        canSend={canSend}
-        agentWorking={agentWorking}
-        isCancelling={isCancelling}
         isOffline={isOffline}
         queuedMessages={queuedMessages}
         onSend={handleSend}
@@ -588,7 +563,6 @@ export function ConversationPage() {
       <StateBar
         conversation={conversation}
         convState={convState}
-        stateData={stateData}
         connectionState={connectionInfo.state}
         connectionAttempt={connectionInfo.attempt}
         nextRetryIn={connectionInfo.nextRetryIn}

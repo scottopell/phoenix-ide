@@ -32,16 +32,19 @@ export interface SubAgentResult {
   outcome: SubAgentOutcome;
 }
 
-export interface ConversationState {
-  type: string;
-  attempt?: number;
-  current_tool?: ToolCall;
-  remaining_tools?: ToolCall[];
-  // Sub-agent state
-  pending?: PendingSubAgent[];
-  completed_results?: SubAgentResult[];
-  message?: string;
-}
+export type ConversationState =
+  | { type: 'idle' }
+  | { type: 'awaiting_llm' }
+  | { type: 'llm_requesting'; attempt: number }
+  | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
+  | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
+  | { type: 'awaiting_continuation'; attempt: number }
+  | { type: 'cancelling' }
+  | { type: 'cancelling_tool'; current_tool: ToolCall }
+  | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
+  | { type: 'context_exhausted'; summary: string }
+  | { type: 'error'; message: string }
+  | { type: 'terminal' };
 
 export interface ToolCall {
   id: string;

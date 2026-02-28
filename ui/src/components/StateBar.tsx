@@ -10,8 +10,7 @@ const CONTINUATION_THRESHOLD = 0.90;
 
 interface StateBarProps {
   conversation: Conversation | null;
-  convState: string;
-  stateData: ConversationState | null;
+  convState: ConversationState;
   connectionState: ConnectionState;
   connectionAttempt: number;
   nextRetryIn: number | null;
@@ -26,7 +25,6 @@ interface StateBarProps {
 export function StateBar({
   conversation,
   convState,
-  stateData,
   connectionState,
   connectionAttempt,
   nextRetryIn,
@@ -84,25 +82,31 @@ export function StateBar({
         stateText = 'reconnected';
         break;
 
-      case 'connected':
+      case 'connected': {
         // When connected, show agent state
-        if (convState === 'idle') {
-          dotClass += ' idle';
-          stateText = 'ready';
-        } else if (convState === 'error') {
-          dotClass += ' error';
-          stateText = 'error';
-        } else if (convState === 'context_exhausted') {
-          dotClass += ' error';
-          stateText = 'context full';
-        } else if (convState === 'awaiting_continuation') {
-          dotClass += ' working';
-          stateText = 'summarizing...';
-        } else {
-          dotClass += ' working';
-          stateText = getStateDescription(convState, stateData);
+        switch (convState.type) {
+          case 'idle': case 'terminal':
+            dotClass += ' idle';
+            stateText = 'ready';
+            break;
+          case 'error':
+            dotClass += ' error';
+            stateText = 'error';
+            break;
+          case 'context_exhausted':
+            dotClass += ' error';
+            stateText = 'context full';
+            break;
+          case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
+          case 'awaiting_sub_agents': case 'awaiting_continuation':
+          case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
+            dotClass += ' working';
+            stateText = getStateDescription(convState);
+            break;
+          default: convState satisfies never;
         }
         break;
+      }
 
       default:
         dotClass += ' connecting';
@@ -142,7 +146,7 @@ export function StateBar({
   };
 
   // Show menu trigger only when warning threshold reached and in idle state
-  const canTriggerContinuation = contextWarning && convState === 'idle' && onTriggerContinuation;
+  const canTriggerContinuation = contextWarning && convState.type === 'idle' && onTriggerContinuation;
 
   const handleTriggerContinuation = () => {
     setMenuOpen(false);

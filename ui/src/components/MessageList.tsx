@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import type { Message, ToolResultContent, ConversationState } from '../api';
+import type { Message, ToolResultContent, ConversationState } from '../api'; // ConversationState used in MessageListProps
 import type { QueuedMessage } from '../hooks';
 import {
   UserMessage,
@@ -11,8 +11,7 @@ import {
 interface MessageListProps {
   messages: Message[];
   queuedMessages: QueuedMessage[];
-  convState: string;
-  stateData: ConversationState | null;
+  convState: ConversationState;
   onRetry: (localId: string) => void;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string;
@@ -27,7 +26,7 @@ const SCROLL_THRESHOLD = 100;
 const SCROLL_KEY_PREFIX = 'phoenix:scroll:';
 const MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
 
-export function MessageList({ messages, queuedMessages, convState, stateData, onRetry, onOpenFile, systemPrompt, conversationId }: MessageListProps) {
+export function MessageList({ messages, queuedMessages, convState, onRetry, onOpenFile, systemPrompt, conversationId }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [showJumpToNewest, setShowJumpToNewest] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
@@ -217,8 +216,8 @@ export function MessageList({ messages, queuedMessages, convState, stateData, on
               {sendingMessages.map((msg) => (
                 <QueuedUserMessage key={msg.localId} message={msg} onRetry={onRetry} />
               ))}
-              {convState === 'awaiting_sub_agents' && stateData && (
-                <SubAgentStatus stateData={stateData} />
+              {convState.type === 'awaiting_sub_agents' && (
+                <SubAgentStatus stateData={convState} />
               )}
             </>
           )}
