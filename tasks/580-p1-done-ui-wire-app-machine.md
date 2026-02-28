@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 580
 priority: p1
-status: ready
+status: done
 slug: ui-wire-app-machine
 title: "Wire appMachine.ts as live implementation via useAppMachine.ts"
 ---
