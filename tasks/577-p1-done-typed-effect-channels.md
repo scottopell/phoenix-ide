@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 577
 priority: p1
-status: ready
+status: done
 slug: typed-effect-channels
 title: "Typed effects with oneshot channels — LlmOutcome, ToolOutcome, SubAgentOutcome, PersistOutcome"
 ---

@@ -1781,3 +1781,339 @@ fn test_spawn_agents_complete_accumulates_ids() {
 // Note: The old "No Duplicate Tool Persists" tests were removed because
 // the structural invariant is now enforced by CheckpointData::tool_round()
 // which requires tool_use count == tool_result count at construction time.
+
+// ============================================================================
+// Outcome Generators (for handle_outcome tests)
+// ============================================================================
+
+use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, PersistOutcome, ToolOutcome};
+
+fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
+    prop_oneof![
+        Just(AbortReason::CancellationRequested),
+        Just(AbortReason::Timeout),
+        Just(AbortReason::ParentCancelled),
+    ]
+}
+
+fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
+    // Use (0..8u8) selector + string to avoid Clone requirement on LlmOutcome
+    (
+        0..8u8,
+        proptest::collection::vec(arb_tool_call(), 0..3),
+        "[a-zA-Z ]{1,20}",
+    )
+        .prop_map(|(variant, tool_calls, msg)| match variant {
+            0 => {
+                let mut content = vec![ContentBlock::text("response")];
+                for tc in &tool_calls {
+                    content.push(ContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.name().to_string(),
+                        input: serde_json::json!({}),
+                    });
+                }
+                LlmOutcome::Response {
+                    content,
+                    tool_calls,
+                    end_turn: true,
+                    usage: Usage::default(),
+                }
+            }
+            1 => LlmOutcome::RateLimited { retry_after: None },
+            2 => LlmOutcome::ServerError {
+                status: 500,
+                body: msg,
+            },
+            3 => LlmOutcome::NetworkError { message: msg },
+            4 => LlmOutcome::TokenBudgetExceeded,
+            5 => LlmOutcome::AuthError { message: msg },
+            6 => LlmOutcome::RequestRejected { message: msg },
+            _ => LlmOutcome::Cancelled,
+        })
+}
+
+fn arb_tool_outcome() -> impl Strategy<Value = ToolOutcome> {
+    prop_oneof![
+        arb_tool_result().prop_map(ToolOutcome::Completed),
+        ("[a-z]{8}", arb_abort_reason()).prop_map(|(tool_use_id, reason)| ToolOutcome::Aborted {
+            tool_use_id,
+            reason,
+        }),
+        ("[a-z]{8}", "[a-zA-Z ]{1,20}")
+            .prop_map(|(tool_use_id, error)| ToolOutcome::Failed { tool_use_id, error }),
+    ]
+}
+
+fn arb_persist_outcome() -> impl Strategy<Value = PersistOutcome> {
+    // Use bool selector to avoid Clone requirement on PersistOutcome
+    (any::<bool>(), "[a-zA-Z ]{1,20}").prop_map(|(ok, error)| {
+        if ok {
+            PersistOutcome::Ok
+        } else {
+            PersistOutcome::Failed { error }
+        }
+    })
+}
+
+fn arb_effect_outcome() -> impl Strategy<Value = EffectOutcome> {
+    // Use selector to avoid Clone requirement on EffectOutcome/LlmOutcome/PersistOutcome
+    (
+        0..5u8,
+        arb_llm_outcome(),
+        arb_tool_outcome(),
+        "[a-z]{8}",
+        arb_sub_agent_outcome(),
+        arb_persist_outcome(),
+        1u32..5,
+    )
+        .prop_map(
+            |(variant, llm, tool, agent_id, sub_outcome, persist, attempt)| match variant {
+                0 => EffectOutcome::Llm(llm),
+                1 => EffectOutcome::Tool(tool),
+                2 => EffectOutcome::SubAgent {
+                    agent_id,
+                    outcome: sub_outcome,
+                },
+                3 => EffectOutcome::Persist(persist),
+                _ => EffectOutcome::RetryTimeout { attempt },
+            },
+        )
+}
+
+// ============================================================================
+// handle_outcome Property Tests
+// ============================================================================
+
+use super::transition::handle_outcome;
+
+proptest! {
+
+    // handle_outcome never panics for any (state, outcome) pair
+    #[test]
+    fn prop_handle_outcome_never_panics(
+        state in arb_state(),
+        outcome in arb_effect_outcome()
+    ) {
+        let ctx = test_context();
+        // Should return Ok or Err(InvalidOutcome), never panic
+        let _ = handle_outcome(&state, &ctx, outcome);
+    }
+
+    // handle_outcome never panics with large random outcome sequences
+    #[test]
+    fn prop_handle_outcome_sequence_never_panics(
+        outcomes in proptest::collection::vec(arb_effect_outcome(), 0..10)
+    ) {
+        let ctx = test_context();
+        let mut state = ConvState::Idle;
+
+        // Start with a UserMessage to get into an active state
+        if let Ok(result) = transition(
+            &state,
+            &ctx,
+            Event::UserMessage {
+                text: "test".to_string(),
+                images: vec![],
+                message_id: "test-msg".to_string(),
+                user_agent: None,
+            },
+        ) {
+            state = result.new_state;
+        }
+
+        for outcome in outcomes {
+            match handle_outcome(&state, &ctx, outcome) {
+                Ok(result) => {
+                    state = result.new_state;
+                    prop_assert!(is_valid_state(&state));
+                }
+                Err(_) => { /* InvalidOutcome is fine — state unchanged */ }
+            }
+        }
+    }
+
+    // PersistOutcome::Ok returns the same state unchanged
+    #[test]
+    fn prop_persist_ok_returns_same_state(state in arb_state()) {
+        let ctx = test_context();
+        let outcome = EffectOutcome::Persist(PersistOutcome::Ok);
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        prop_assert_eq!(
+            format!("{:?}", result.unwrap().new_state),
+            format!("{:?}", state),
+            "PersistOutcome::Ok should return unchanged state"
+        );
+    }
+
+    // PersistOutcome::Failed always returns InvalidOutcome
+    #[test]
+    fn prop_persist_failed_returns_invalid(
+        state in arb_state(),
+        error in "[a-zA-Z ]{1,20}"
+    ) {
+        let ctx = test_context();
+        let outcome = EffectOutcome::Persist(PersistOutcome::Failed { error });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_err());
+    }
+
+    // LlmOutcome::AuthError always produces non-retryable error (goes to Error state)
+    #[test]
+    fn prop_auth_error_is_non_retryable(
+        attempt in 1u32..5,
+        message in "[a-zA-Z ]{1,20}"
+    ) {
+        let ctx = test_context();
+        let state = ConvState::LlmRequesting { attempt };
+        let outcome = EffectOutcome::Llm(LlmOutcome::AuthError { message });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        match result.unwrap().new_state {
+            ConvState::Error { error_kind, .. } => {
+                prop_assert_eq!(error_kind, ErrorKind::Auth);
+            }
+            s => prop_assert!(false, "AuthError should go to Error state, got {:?}", s),
+        }
+    }
+
+    // LlmOutcome::RequestRejected always produces non-retryable error
+    #[test]
+    fn prop_request_rejected_is_non_retryable(
+        attempt in 1u32..5,
+        message in "[a-zA-Z ]{1,20}"
+    ) {
+        let ctx = test_context();
+        let state = ConvState::LlmRequesting { attempt };
+        let outcome = EffectOutcome::Llm(LlmOutcome::RequestRejected { message });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        match result.unwrap().new_state {
+            ConvState::Error { error_kind, .. } => {
+                prop_assert_eq!(error_kind, ErrorKind::InvalidRequest);
+            }
+            s => prop_assert!(false, "RequestRejected should go to Error state, got {:?}", s),
+        }
+    }
+
+    // LlmOutcome::NetworkError is retryable (increments attempt, not Error)
+    #[test]
+    fn prop_network_error_is_retryable(
+        attempt in 1u32..3, // < MAX_RETRY_ATTEMPTS
+        message in "[a-zA-Z ]{1,20}"
+    ) {
+        let ctx = test_context();
+        let state = ConvState::LlmRequesting { attempt };
+        let outcome = EffectOutcome::Llm(LlmOutcome::NetworkError { message });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        match result.unwrap().new_state {
+            ConvState::LlmRequesting { attempt: new_attempt } => {
+                prop_assert_eq!(new_attempt, attempt + 1);
+            }
+            s => prop_assert!(false, "NetworkError should retry, got {:?}", s),
+        }
+    }
+
+    // LlmOutcome::RateLimited is retryable
+    #[test]
+    fn prop_rate_limited_is_retryable(attempt in 1u32..3) {
+        let ctx = test_context();
+        let state = ConvState::LlmRequesting { attempt };
+        let outcome = EffectOutcome::Llm(LlmOutcome::RateLimited { retry_after: None });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        match result.unwrap().new_state {
+            ConvState::LlmRequesting { attempt: new_attempt } => {
+                prop_assert_eq!(new_attempt, attempt + 1);
+            }
+            s => prop_assert!(false, "RateLimited should retry, got {:?}", s),
+        }
+    }
+
+    // ToolOutcome::Completed with matching ID succeeds in ToolExecuting
+    #[test]
+    fn prop_tool_outcome_completed_succeeds(
+        current in arb_tool_call(),
+        remaining in proptest::collection::vec(arb_tool_call(), 0..3),
+    ) {
+        let ctx = test_context();
+        let all_ids: Vec<String> = std::iter::once(current.id.clone())
+            .chain(remaining.iter().map(|t| t.id.clone()))
+            .collect();
+        let all_id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+        let state = ConvState::ToolExecuting {
+            current_tool: current.clone(),
+            remaining_tools: remaining,
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: assistant_message_for_tools(&all_id_refs),
+        };
+        let tool_result = ToolResult {
+            tool_use_id: current.id.clone(),
+            success: true,
+            output: "done".to_string(),
+            is_error: false,
+            display_data: None,
+            images: vec![],
+        };
+        let outcome = EffectOutcome::Tool(ToolOutcome::Completed(tool_result));
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok(), "ToolOutcome::Completed should succeed: {:?}", result);
+    }
+
+    // ToolOutcome::Aborted produces ToolAborted event
+    #[test]
+    fn prop_tool_outcome_aborted_in_cancelling(
+        tool_use_id in "[a-z]{8}",
+        reason in arb_abort_reason(),
+    ) {
+        let ctx = test_context();
+        let content_blocks = vec![ContentBlock::ToolUse {
+            id: tool_use_id.clone(),
+            name: "bash".to_string(),
+            input: serde_json::json!({}),
+        }];
+        let state = ConvState::CancellingTool {
+            tool_use_id: tool_use_id.clone(),
+            skipped_tools: vec![],
+            completed_results: vec![],
+            assistant_message: AssistantMessage::new(content_blocks, None, None),
+        };
+        let outcome = EffectOutcome::Tool(ToolOutcome::Aborted {
+            tool_use_id,
+            reason,
+        });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        prop_assert!(
+            matches!(result.unwrap().new_state, ConvState::Idle),
+            "Aborted tool in CancellingTool should go to Idle"
+        );
+    }
+
+    // RetryTimeout outcome in LlmRequesting produces RequestLlm effect
+    #[test]
+    fn prop_retry_timeout_outcome_triggers_llm(attempt in 1u32..5) {
+        let ctx = test_context();
+        let state = ConvState::LlmRequesting { attempt };
+        let outcome = EffectOutcome::RetryTimeout { attempt };
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        let tr = result.unwrap();
+        prop_assert!(
+            tr.effects.iter().any(|e| matches!(e, Effect::RequestLlm)),
+            "RetryTimeout should produce RequestLlm effect"
+        );
+    }
+
+    // ToolOutcome in Idle is invalid (no active tool to complete)
+    #[test]
+    fn prop_tool_outcome_in_idle_is_invalid(outcome in arb_tool_outcome()) {
+        let ctx = test_context();
+        let state = ConvState::Idle;
+        let result = handle_outcome(&state, &ctx, EffectOutcome::Tool(outcome));
+        prop_assert!(result.is_err(), "Tool outcome in Idle should be invalid");
+    }
+}

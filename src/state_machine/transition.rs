@@ -1,4 +1,8 @@
-//! Pure state transition function
+//! Pure state transition functions
+//!
+//! Two entry points:
+//! - `transition()`: handles all events (user events + executor events)
+//! - `handle_outcome()`: handles executor-produced outcomes via typed channels
 //!
 //! REQ-BED-001: Pure State Transitions
 //! REQ-BED-002: User Message Handling
@@ -8,6 +12,7 @@
 //! REQ-BED-006: Error Recovery
 
 use super::effect::{compute_bash_display_data, CheckpointData};
+use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, SubAgentResult, ToolCall,
 };
@@ -985,6 +990,154 @@ pub fn transition(
         (state, event) => Err(TransitionError::InvalidTransition(format!(
             "No transition from {state:?} with event {event:?}"
         ))),
+    }
+}
+
+// ============================================================================
+// handle_outcome — second pure entry point for executor-produced outcomes
+// ============================================================================
+
+/// Entry point 2: Executor outcomes (from background tasks via typed channels).
+///
+/// This is the second layer of defense. Even with typed channels constraining
+/// what CAN arrive, this function rejects outcomes that are invalid for the
+/// current state. The executor logs and discards `Err` — state unchanged.
+///
+/// REQ-BED-001: Pure function — given the same inputs, always the same outputs.
+pub fn handle_outcome(
+    state: &ConvState,
+    context: &ConvContext,
+    outcome: EffectOutcome,
+) -> Result<TransitionResult, InvalidOutcome> {
+    let event = match outcome {
+        EffectOutcome::Llm(llm) => llm_outcome_to_event(llm, state),
+        EffectOutcome::Tool(tool) => tool_outcome_to_event(tool),
+        EffectOutcome::SubAgent { agent_id, outcome } => {
+            Event::SubAgentResult { agent_id, outcome }
+        }
+        EffectOutcome::Persist(persist) => {
+            return handle_persist_outcome(state, persist);
+        }
+        EffectOutcome::RetryTimeout { attempt } => Event::RetryTimeout { attempt },
+    };
+
+    transition(state, context, event).map_err(|e| InvalidOutcome {
+        reason: e.to_string(),
+    })
+}
+
+/// Convert `LlmOutcome` to the equivalent `Event` for delegation to `transition()`.
+fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
+    match outcome {
+        LlmOutcome::Response {
+            content,
+            tool_calls,
+            end_turn,
+            usage,
+        } => Event::LlmResponse {
+            content,
+            tool_calls,
+            end_turn,
+            usage,
+        },
+        LlmOutcome::RateLimited { retry_after: _ } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message: "Rate limited".to_string(),
+                error_kind: ErrorKind::RateLimit,
+                attempt,
+            }
+        }
+        LlmOutcome::ServerError { status, body } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message: format!("Server error {status}: {body}"),
+                error_kind: ErrorKind::ServerError,
+                attempt,
+            }
+        }
+        LlmOutcome::NetworkError { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::Network,
+                attempt,
+            }
+        }
+        LlmOutcome::TokenBudgetExceeded => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message: "Token budget exceeded".to_string(),
+                error_kind: ErrorKind::ContextExhausted,
+                attempt,
+            }
+        }
+        LlmOutcome::AuthError { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::Auth,
+                attempt,
+            }
+        }
+        LlmOutcome::RequestRejected { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::InvalidRequest,
+                attempt,
+            }
+        }
+        LlmOutcome::Cancelled => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message: "Request cancelled".to_string(),
+                error_kind: ErrorKind::Cancelled,
+                attempt,
+            }
+        }
+    }
+}
+
+/// Convert `ToolOutcome` to the equivalent `Event` for delegation to `transition()`.
+fn tool_outcome_to_event(outcome: ToolOutcome) -> Event {
+    match outcome {
+        ToolOutcome::Completed(result) => Event::ToolComplete {
+            tool_use_id: result.tool_use_id.clone(),
+            result,
+        },
+        ToolOutcome::Aborted {
+            tool_use_id,
+            reason: _,
+        } => Event::ToolAborted { tool_use_id },
+        ToolOutcome::Failed { tool_use_id, error } => Event::ToolComplete {
+            tool_use_id: tool_use_id.clone(),
+            result: ToolResult::error(tool_use_id, error),
+        },
+    }
+}
+
+/// Handle `PersistOutcome` directly — no Event equivalent exists.
+/// Persistence failures are logged but don't change state.
+fn handle_persist_outcome(
+    state: &ConvState,
+    outcome: PersistOutcome,
+) -> Result<TransitionResult, InvalidOutcome> {
+    match outcome {
+        PersistOutcome::Ok => Ok(TransitionResult::new(state.clone())),
+        PersistOutcome::Failed { error } => Err(InvalidOutcome {
+            reason: format!("Persistence failed: {error}"),
+        }),
+    }
+}
+
+/// Extract the current attempt number from state (for LLM error conversion).
+fn current_attempt(state: &ConvState) -> u32 {
+    match state {
+        ConvState::LlmRequesting { attempt } | ConvState::AwaitingContinuation { attempt, .. } => {
+            *attempt
+        }
+        _ => 1,
     }
 }
 

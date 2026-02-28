@@ -1,17 +1,28 @@
 //! Conversation runtime executor
+//!
+//! The executor loop receives inputs from two sources:
+//! - User events via `event_rx` (`UserMessage`, `UserCancel`, etc.) → routed to `transition()`
+//! - Effect outcomes via `outcome_rx` (`LlmOutcome`, `ToolOutcome`, etc.) → routed to `handle_outcome()`
+//!
+//! Background tasks receive typed `oneshot::Sender<T>` for their outcome type.
+//! A `Sender<ToolOutcome>` physically cannot send an `LlmOutcome`.
+//! The executor wraps received outcomes in `EffectOutcome` for `handle_outcome()`.
 
 use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 
 use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
+use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolOutcome};
 use crate::state_machine::state::{ToolCall, ToolInput};
-use crate::state_machine::{transition, ConvContext, ConvState, Effect, Event, StepResult};
+use crate::state_machine::{
+    handle_outcome, transition, ConvContext, ConvState, Effect, Event, StepResult,
+};
 use crate::system_prompt::build_system_prompt;
 use crate::tools::{BrowserSessionManager, ToolContext};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
@@ -45,6 +56,11 @@ where
     cancel_tx: Option<mpsc::Sender<SubAgentCancelRequest>>,
     /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`
     sub_agent_result_buffer: Vec<Event>,
+    /// Typed outcome channel — background tasks send `EffectOutcome` here.
+    /// Each task gets a typed `oneshot::Sender<T>` that constrains what it can send,
+    /// then the forwarder wraps the result in `EffectOutcome` for this channel.
+    outcome_tx: mpsc::Sender<EffectOutcome>,
+    outcome_rx: mpsc::Receiver<EffectOutcome>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -66,6 +82,12 @@ where
         event_tx: mpsc::Sender<Event>,
         broadcast_tx: broadcast::Sender<SseEvent>,
     ) -> Self {
+        // Outcome channel for typed effect results.
+        // Background tasks send typed outcomes (LlmOutcome, ToolOutcome, etc.)
+        // through oneshot channels, then forwarders wrap them in EffectOutcome
+        // for this unified channel.
+        let (outcome_tx, outcome_rx) = mpsc::channel::<EffectOutcome>(64);
+
         Self {
             context,
             state,
@@ -83,6 +105,8 @@ where
             spawn_tx: None,
             cancel_tx: None,
             sub_agent_result_buffer: Vec::new(),
+            outcome_tx,
+            outcome_rx,
         }
     }
 
@@ -118,7 +142,10 @@ where
             }
         }
 
-        // Process events in a loop - no recursion
+        // Process events and outcomes in a loop - no recursion
+        // Two input sources:
+        //   event_rx  — user events + legacy executor events (continuation, sub-agent results)
+        //   outcome_rx — typed effect outcomes (LLM, tool, persist, retry)
         loop {
             tokio::select! {
                 Some(event) = self.event_rx.recv() => {
@@ -129,8 +156,20 @@ where
                         });
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
-                    // No reliance on channel-drop semantics — StepResult::Terminal
-                    // forces an immediate return regardless of sender lifetime.
+                    if let StepResult::Terminal(outcome) = self.state.step_result() {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        return;
+                    }
+                }
+                Some(outcome) = self.outcome_rx.recv() => {
+                    if let Err(e) = self.process_outcome(outcome).await {
+                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                    }
+                    // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
@@ -145,6 +184,42 @@ where
         }
 
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
+    }
+
+    /// Process a typed effect outcome from a background task.
+    ///
+    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
+    /// are logged and discarded — state unchanged.
+    async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        let result = match handle_outcome(&self.state, &self.context, outcome) {
+            Ok(r) => r,
+            Err(invalid) => {
+                tracing::warn!(
+                    reason = %invalid.reason,
+                    state = ?std::mem::discriminant(&self.state),
+                    "Rejected invalid outcome — state unchanged"
+                );
+                return Err(invalid.reason);
+            }
+        };
+
+        // Apply transition result and process any generated events
+        let mut events_to_process = self.apply_transition_result(result).await?;
+
+        // Process chained events (e.g., SpawnAgentsComplete from execute_effect)
+        while let Some(event) = events_to_process.pop() {
+            let chained_result = match transition(&self.state, &self.context, event) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Chained event from outcome rejected");
+                    continue;
+                }
+            };
+            let more_events = self.apply_transition_result(chained_result).await?;
+            events_to_process.extend(more_events);
+        }
+
+        Ok(())
     }
 
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
@@ -173,38 +248,50 @@ where
                 }
             };
 
-            // Update state
-            let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
-
-            // Check if we just entered AwaitingSubAgents - drain the buffer
-            if !matches!(
-                old_state,
-                ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
-            ) && matches!(
-                self.state,
-                ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
-            ) {
-                // Just entered a state that can handle SubAgentResult events
-                // Drain the buffer and add to events to process
-                let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
-                if !buffered.is_empty() {
-                    tracing::debug!(count = buffered.len(), "Draining buffered SubAgentResults");
-                    events_to_process.extend(buffered);
-                }
-            }
-
-            // Execute effects and collect generated events
-            for effect in result.effects {
-                if let Some(generated_event) = self.execute_effect(effect).await? {
-                    events_to_process.push(generated_event);
-                }
-            }
-
-            // Note: Tool execution is now handled by Effect::ExecuteTool from the state machine,
-            // so we no longer need to check and execute tools here.
+            let generated_events = self.apply_transition_result(result).await?;
+            events_to_process.extend(generated_events);
         }
 
         Ok(())
+    }
+
+    /// Apply a `TransitionResult` from either `transition()` or `handle_outcome()`.
+    ///
+    /// Updates state, drains sub-agent buffer if entering `AwaitingSubAgents`,
+    /// dispatches effects. Returns any synchronously generated events
+    /// (e.g., from `SpawnAgentsComplete`).
+    async fn apply_transition_result(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+    ) -> Result<Vec<Event>, String> {
+        let mut generated_events = Vec::new();
+
+        // Update state
+        let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+
+        // Check if we just entered AwaitingSubAgents - drain the buffer
+        if !matches!(
+            old_state,
+            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+        ) && matches!(
+            self.state,
+            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
+        ) {
+            let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
+            if !buffered.is_empty() {
+                tracing::debug!(count = buffered.len(), "Draining buffered SubAgentResults");
+                generated_events.extend(buffered);
+            }
+        }
+
+        // Execute effects and collect generated events
+        for effect in result.effects {
+            if let Some(gen_event) = self.execute_effect(effect).await? {
+                generated_events.push(gen_event);
+            }
+        }
+
+        Ok(generated_events)
     }
 
     /// Check if the current state can handle `SubAgentResult` events
@@ -369,18 +456,17 @@ where
             }
 
             Effect::RequestLlm => {
-                // Spawn LLM request as background task
+                // Typed oneshot channel: background task gets Sender<LlmOutcome>,
+                // physically cannot send a ToolOutcome or other type.
+                let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
+                let outcome_tx = self.outcome_tx.clone();
+
                 let llm_client = self.llm_client.clone();
                 let tool_executor = self.tool_executor.clone();
                 let storage = self.storage.clone();
-                let event_tx = self.event_tx.clone();
                 let conv_id = self.context.conversation_id.clone();
                 let working_dir = self.context.working_dir.clone();
                 let is_sub_agent = self.context.is_sub_agent;
-                let current_attempt = match &self.state {
-                    ConvState::LlmRequesting { attempt } => *attempt,
-                    _ => 1,
-                };
 
                 let handle = tokio::spawn(async move {
                     tracing::info!(
@@ -392,13 +478,8 @@ where
                     let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
                         Ok(m) => m,
                         Err(e) => {
-                            let _ = event_tx
-                                .send(Event::LlmError {
-                                    message: e,
-                                    error_kind: crate::db::ErrorKind::InvalidRequest,
-                                    attempt: current_attempt,
-                                })
-                                .await;
+                            // Build error → treated as InvalidRequest
+                            let _ = llm_tx.send(LlmOutcome::NetworkError { message: e });
                             return;
                         }
                     };
@@ -414,7 +495,7 @@ where
                         max_tokens: Some(8192),
                     };
 
-                    let event = match llm_client.complete(&request).await {
+                    let llm_outcome = match llm_client.complete(&request).await {
                         Ok(response) => {
                             // Extract tool calls from content and convert to typed ToolCall
                             let tool_calls: Vec<ToolCall> = response
@@ -427,24 +508,27 @@ where
                                 })
                                 .collect();
 
-                            Event::LlmResponse {
+                            LlmOutcome::Response {
                                 content: response.content,
                                 tool_calls,
                                 end_turn: response.end_turn,
                                 usage: response.usage,
                             }
                         }
-                        Err(e) => Event::LlmError {
-                            message: e.message.clone(),
-                            error_kind: llm_error_to_db_error(e.kind),
-                            attempt: current_attempt,
-                        },
+                        Err(e) => llm_error_to_outcome(e),
                     };
-                    let _ = event_tx.send(event).await;
+                    // Send typed outcome through oneshot channel
+                    let _ = llm_tx.send(llm_outcome);
                 });
                 self.llm_task_handle = Some(handle);
 
-                // Return None - the event will come from the spawned task
+                // Forward the typed outcome to the unified outcome channel
+                tokio::spawn(async move {
+                    if let Ok(llm_outcome) = llm_rx.await {
+                        let _ = outcome_tx.send(EffectOutcome::Llm(llm_outcome)).await;
+                    }
+                });
+
                 Ok(None)
             }
 
@@ -454,10 +538,14 @@ where
                     return self.handle_spawn_agents_tool(tool).await;
                 }
 
+                // Typed oneshot channel: background task gets Sender<ToolOutcome>,
+                // physically cannot send an LlmOutcome or other type.
+                let (tool_tx, tool_rx) = oneshot::channel::<ToolOutcome>();
+                let outcome_tx = self.outcome_tx.clone();
+
                 // Create cancellation token for this tool execution
                 let cancel_token = CancellationToken::new();
                 self.tool_cancel_token = Some(cancel_token.clone());
-                // Clone token to check cancellation state after tool completes
                 let cancel_token_check = cancel_token.clone();
 
                 // Create ToolContext for this invocation
@@ -469,9 +557,7 @@ where
                     self.llm_registry.clone(),
                 );
 
-                // Spawn tool execution as background task
                 let tool_executor = self.tool_executor.clone();
-                let event_tx = self.event_tx.clone();
                 let tool_use_id = tool.id.clone();
                 let tool_name = tool.name().to_string();
                 let tool_input = tool.input.to_value();
@@ -479,7 +565,6 @@ where
                 tokio::spawn(async move {
                     tracing::info!(tool = %tool_name, id = %tool_use_id, "Executing tool (background)");
 
-                    // Execute tool with context
                     let output = tool_executor
                         .execute(&tool_name, tool_input, tool_ctx)
                         .await;
@@ -488,56 +573,61 @@ where
                     // IMPORTANT: We check the token state, NOT the output string.
                     // The state machine only accepts ToolAborted from CancellingTool state,
                     // which is entered when AbortTool effect cancels the token.
-                    // Checking output strings would cause spurious ToolAborted events
-                    // that violate the state machine contract.
-                    if cancel_token_check.is_cancelled() {
+                    let tool_outcome = if cancel_token_check.is_cancelled() {
                         tracing::info!(tool_id = %tool_use_id, "Tool cancelled (token signaled)");
-                        let _ = event_tx.send(Event::ToolAborted { tool_use_id }).await;
-                        return;
-                    }
-
-                    let result = match output {
-                        Some(out) => {
-                            use crate::db::ToolContentImage;
-                            let images = out
-                                .images
-                                .into_iter()
-                                .map(|img| ToolContentImage {
-                                    media_type: img.media_type,
-                                    data: img.data,
-                                })
-                                .collect();
-                            ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                success: out.success,
-                                output: out.output,
-                                is_error: !out.success,
-                                display_data: out.display_data,
-                                images,
-                            }
-                        }
-                        None => ToolResult::error(
-                            tool_use_id.clone(),
-                            format!("Unknown tool: {tool_name}"),
-                        ),
-                    };
-                    let _ = event_tx
-                        .send(Event::ToolComplete {
+                        ToolOutcome::Aborted {
                             tool_use_id,
-                            result,
-                        })
-                        .await;
+                            reason: crate::state_machine::AbortReason::CancellationRequested,
+                        }
+                    } else {
+                        match output {
+                            Some(out) => {
+                                use crate::db::ToolContentImage;
+                                let images = out
+                                    .images
+                                    .into_iter()
+                                    .map(|img| ToolContentImage {
+                                        media_type: img.media_type,
+                                        data: img.data,
+                                    })
+                                    .collect();
+                                ToolOutcome::Completed(ToolResult {
+                                    tool_use_id: tool_use_id.clone(),
+                                    success: out.success,
+                                    output: out.output,
+                                    is_error: !out.success,
+                                    display_data: out.display_data,
+                                    images,
+                                })
+                            }
+                            None => ToolOutcome::Failed {
+                                tool_use_id,
+                                error: format!("Unknown tool: {tool_name}"),
+                            },
+                        }
+                    };
+                    // Send typed outcome through oneshot channel
+                    let _ = tool_tx.send(tool_outcome);
                 });
 
-                // Return None - the event will come from the spawned task
+                // Forward the typed outcome to the unified outcome channel
+                tokio::spawn(async move {
+                    if let Ok(tool_outcome) = tool_rx.await {
+                        let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
+                    }
+                });
+
                 Ok(None)
             }
 
             Effect::ScheduleRetry { delay, attempt } => {
-                let event_tx = self.event_tx.clone();
+                // Typed oneshot for retry timeout
+                let outcome_tx = self.outcome_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = event_tx.send(Event::RetryTimeout { attempt }).await;
+                    let _ = outcome_tx
+                        .send(EffectOutcome::RetryTimeout { attempt })
+                        .await;
                 });
                 Ok(None)
             }
@@ -1034,6 +1124,29 @@ fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind
         crate::llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
         crate::llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
         crate::llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
+    }
+}
+
+/// Convert an LLM error into a typed `LlmOutcome`.
+/// Explicit match arms — the compiler enforces exhaustiveness.
+fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
+    use crate::llm::LlmErrorKind;
+    match error.kind {
+        LlmErrorKind::RateLimit => LlmOutcome::RateLimited { retry_after: None },
+        LlmErrorKind::ServerError => LlmOutcome::ServerError {
+            status: 500,
+            body: error.message,
+        },
+        LlmErrorKind::Network => LlmOutcome::NetworkError {
+            message: error.message,
+        },
+        LlmErrorKind::ContextWindowExceeded => LlmOutcome::TokenBudgetExceeded,
+        LlmErrorKind::Auth => LlmOutcome::AuthError {
+            message: error.message,
+        },
+        LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
+            message: error.message,
+        },
     }
 }
 
