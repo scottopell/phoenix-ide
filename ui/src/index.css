@@ -1769,107 +1769,12 @@ pre:hover .copy-btn {
   padding: 0 4px;
 }
 
-/* Embedded Subagent View */
-.subagent-embedded-view {
+/* Expanded result markdown for completed sub-agent rows */
+.subagent-expanded-result {
   border-top: 1px solid var(--border-subtle);
-  background: var(--bg-subtle);
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-.embedded-subagent-loading,
-.embedded-subagent-error {
-  padding: 16px;
-  font-size: 12px;
-  color: var(--text-muted);
-  text-align: center;
-}
-
-.embedded-subagent-error {
-  color: var(--accent-red);
-}
-
-.embedded-subagent-messages {
   padding: 8px 12px;
-}
-
-.embedded-msg {
-  padding: 6px 0;
-  font-size: 12px;
-}
-
-.embedded-msg.user {
   color: var(--text-muted);
-  padding-bottom: 8px;
-  border-bottom: 1px dashed var(--border-subtle);
-  margin-bottom: 8px;
-}
-
-.embedded-msg-label {
-  font-weight: 500;
-  margin-right: 6px;
-}
-
-.embedded-msg-text {
-  color: var(--text-primary);
-}
-
-.embedded-msg.agent {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.embedded-agent-text {
-  color: var(--text-secondary);
-  line-height: 1.4;
-}
-
-.embedded-tool-block {
-  background: var(--bg-primary);
-  border: 1px solid var(--border-subtle);
-  border-radius: 4px;
-  padding: 6px 8px;
-  margin: 4px 0;
-}
-
-.embedded-tool-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.embedded-tool-name {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.embedded-tool-status {
-  font-size: 11px;
-}
-
-.embedded-tool-status.success {
-  color: var(--accent-green);
-}
-
-.embedded-tool-status.error {
-  color: var(--accent-red);
-}
-
-.embedded-tool-output {
-  margin-top: 4px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 100px;
-  overflow-y: auto;
-}
-
-.embedded-tool-output.error {
-  color: var(--accent-red);
+  font-size: 0.85em;
 }
 
 /* Connection States */

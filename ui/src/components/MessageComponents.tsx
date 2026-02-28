@@ -12,13 +12,12 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult, SseEventType, SseEventData, SseInitData, SseMessageData } from '../api';
-import { api } from '../api';
+import type { Message, ContentBlock, ToolResultContent, ConversationState, SubAgentResult } from '../api';
 import type { QueuedMessage } from '../hooks';
 
 import { linkifyText } from '../utils/linkify';
@@ -90,6 +89,14 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
     case 'read_image': {
       const path = String(input['path'] || '');
       return { display: path, isMultiline: false };
+    }
+    case 'spawn_agents': {
+      const tasks = (input['tasks'] as Array<{ task?: string }>) || [];
+      const count = tasks.length;
+      return {
+        display: `${count} parallel task${count === 1 ? '' : 's'}`,
+        isMultiline: false,
+      };
     }
     default: {
       const str = JSON.stringify(input, null, 2);
@@ -402,6 +409,7 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
 
   const hasOutput = resultContent !== null;
   const isShortOutput = resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
+  const isSubAgentResult = !!(result?.display_data && isSubAgentSummaryData(result.display_data));
 
   // Get the raw input for copying (not the formatted display)
   const rawInput = name === 'bash' ? String(input['command'] || '') :
@@ -426,8 +434,8 @@ export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
         <CopyButton text={rawInput} title="Copy command" />
       </div>
 
-      {/* Tool output - collapsible for long outputs */}
-      {hasOutput && (
+      {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
+      {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
           {imageResult ? (
             // Image result: render as image
@@ -548,8 +556,8 @@ function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
         </span>
       </div>
       {conversationExpanded && (
-        <div className="subagent-embedded-view">
-          <EmbeddedSubagentView agentId={result.agent_id} />
+        <div className="subagent-expanded-result">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{resultText}</ReactMarkdown>
         </div>
       )}
     </div>
@@ -575,141 +583,6 @@ function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
           <SubAgentSummaryRow key={result.agent_id} result={result} />
         ))}
       </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// Embedded Subagent View (simplified message list for expanded subagent)
-// ============================================================================
-
-/** Renders a simplified view of subagent conversation messages */
-function EmbeddedSubagentView({ agentId }: { agentId: string }) {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let eventSource: EventSource | null = null;
-    let mounted = true;
-
-    // Connect to subagent's SSE stream
-    eventSource = api.streamConversation(agentId, (eventType: SseEventType, data: SseEventData) => {
-      if (!mounted) return;
-
-      switch (eventType) {
-        case 'init': {
-          const initData = data as SseInitData;
-          setMessages(initData.messages);
-          setLoading(false);
-          break;
-        }
-        case 'message': {
-          const msgData = data as SseMessageData;
-          setMessages(prev => [...prev, msgData.message]);
-          break;
-        }
-        case 'disconnected':
-          // Connection closed, likely subagent finished
-          break;
-      }
-    });
-
-    eventSource.onerror = () => {
-      if (mounted) {
-        // Don't show error for completed subagents (SSE closes normally)
-        if (loading) {
-          setError('Failed to load subagent conversation');
-        }
-        setLoading(false);
-      }
-    };
-
-    return () => {
-      mounted = false;
-      eventSource?.close();
-    };
-  }, [agentId, loading]);
-
-  if (loading) {
-    return <div className="embedded-subagent-loading">Loading conversation...</div>;
-  }
-
-  if (error) {
-    return <div className="embedded-subagent-error">{error}</div>;
-  }
-
-  // Build tool results map
-  const toolResults = new Map<string, Message>();
-  for (const msg of messages) {
-    if (msg.message_type === 'tool') {
-      const content = msg.content as ToolResultContent;
-      if (content.tool_use_id) {
-        toolResults.set(content.tool_use_id, msg);
-      }
-    }
-  }
-
-  return (
-    <div className="embedded-subagent-messages">
-      {messages.map((msg) => {
-        if (msg.message_type === 'user') {
-          // Show user messages (the task prompt)
-          const content = msg.content as { text?: string };
-          return (
-            <div key={msg.message_id} className="embedded-msg user">
-              <span className="embedded-msg-label">Task:</span>
-              <span className="embedded-msg-text">{content.text || ''}</span>
-            </div>
-          );
-        }
-
-        if (msg.message_type === 'agent') {
-          // Show agent messages with text and tool blocks
-          const blocks = Array.isArray(msg.content) ? (msg.content as ContentBlock[]) : [];
-          return (
-            <div key={msg.message_id} className="embedded-msg agent">
-              {blocks.map((block, i) => {
-                if (block.type === 'text' && block.text) {
-                  return (
-                    <div key={i} className="embedded-agent-text">
-                      {truncate(block.text, 500)}
-                    </div>
-                  );
-                }
-                if (block.type === 'tool_use') {
-                  const toolName = block.name || 'tool';
-                  const toolResult = toolResults.get(block.id || '');
-                  const resultContent = toolResult?.content as ToolResultContent | undefined;
-                  const isToolError = resultContent?.is_error || !!resultContent?.error;
-                  const toolOutput = resultContent?.content || resultContent?.result || resultContent?.error || '';
-
-                  return (
-                    <div key={block.id || i} className="embedded-tool-block">
-                      <div className="embedded-tool-header">
-                        <span className="embedded-tool-name">{toolName}</span>
-                        {toolResult && (
-                          <span className={`embedded-tool-status ${isToolError ? 'error' : 'success'}`}>
-                            {isToolError ? '✗' : '✓'}
-                          </span>
-                        )}
-                      </div>
-                      {toolOutput && (
-                        <div className={`embedded-tool-output ${isToolError ? 'error' : ''}`}>
-                          {truncate(toolOutput, 200)}
-                        </div>
-                      )}
-                    </div>
-                  );
-                }
-                return null;
-              })}
-            </div>
-          );
-        }
-
-        return null;
-      })}
     </div>
   );
 }
