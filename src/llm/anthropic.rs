@@ -255,7 +255,15 @@ pub async fn complete_streaming(
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
         for event in sse.push(&chunk) {
-            acc.process_event(&event.event_type, &event.data, chunk_tx)?;
+            if let Err(e) = acc.process_event(&event.event_type, &event.data, chunk_tx) {
+                tracing::error!(
+                    event_type = %event.event_type,
+                    data_len = event.data.len(),
+                    "SSE event processing failed; dumping parser diagnostics"
+                );
+                tracing::error!("{}", sse.diagnostic_dump());
+                return Err(e);
+            }
             if acc.done {
                 break 'outer;
             }

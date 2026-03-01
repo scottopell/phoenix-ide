@@ -43,14 +43,24 @@ pub struct SseParser {
     current_event: String,
     /// Accumulated `data:` lines for the current event (joined with `\n`).
     current_data: String,
+    /// Rolling log of raw byte chunks received (kept for diagnostics on parse errors).
+    /// Capped to avoid unbounded growth.
+    raw_chunks_log: Vec<Vec<u8>>,
+    /// Total bytes logged so far (to enforce cap).
+    raw_bytes_logged: usize,
 }
 
 impl SseParser {
+    /// Max bytes to keep in the raw chunk log (64 KB).
+    const RAW_LOG_CAP: usize = 64 * 1024;
+
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
             current_event: String::new(),
             current_data: String::new(),
+            raw_chunks_log: Vec::new(),
+            raw_bytes_logged: 0,
         }
     }
 
@@ -58,6 +68,11 @@ impl SseParser {
     ///
     /// Returns zero or more complete events extracted from the buffered data.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        // Log raw chunks for diagnostics (capped to avoid unbounded growth)
+        if self.raw_bytes_logged < Self::RAW_LOG_CAP {
+            self.raw_chunks_log.push(bytes.to_vec());
+            self.raw_bytes_logged += bytes.len();
+        }
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
 
@@ -114,6 +129,51 @@ impl SseParser {
         }
 
         events
+    }
+
+    /// Return diagnostic info about the raw chunks received.
+    /// Useful when a downstream JSON parse fails — helps distinguish
+    /// "our parser lost bytes" from "the upstream sent garbage".
+    pub fn diagnostic_dump(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "SseParser diagnostics: {} chunks, {} bytes logged",
+            self.raw_chunks_log.len(),
+            self.raw_bytes_logged,
+        );
+        // Show the last few chunks (most relevant to the error)
+        let start = self.raw_chunks_log.len().saturating_sub(5);
+        for (i, chunk) in self.raw_chunks_log[start..].iter().enumerate() {
+            let display = String::from_utf8_lossy(chunk);
+            let truncated = if display.len() > 500 {
+                format!(
+                    "{}...[truncated, {} bytes total]",
+                    &display[..500],
+                    chunk.len()
+                )
+            } else {
+                display.into_owned()
+            };
+            let _ = writeln!(
+                out,
+                "  chunk[{}]: ({} bytes) {:?}",
+                start + i,
+                chunk.len(),
+                truncated,
+            );
+        }
+        if !self.buf.is_empty() {
+            let remaining = String::from_utf8_lossy(&self.buf);
+            let _ = writeln!(
+                out,
+                "  remaining buf: ({} bytes) {:?}",
+                self.buf.len(),
+                remaining
+            );
+        }
+        out
     }
 
     /// Signal end-of-stream. Flushes any pending event even without a trailing
