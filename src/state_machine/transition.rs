@@ -84,6 +84,7 @@ pub fn transition(
             ConvState::Idle | ConvState::Error { .. },
             Event::UserMessage {
                 text,
+                llm_text,
                 images,
                 message_id,
                 user_agent,
@@ -91,7 +92,7 @@ pub fn transition(
         ) => Ok(
             TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::persist_user_message(
-                    text, images, message_id, user_agent,
+                    text, llm_text, images, message_id, user_agent,
                 ))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_llm_requesting(1))
@@ -1318,6 +1319,7 @@ mod tests {
             &test_context(),
             Event::UserMessage {
                 text: "Hello".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
@@ -1339,6 +1341,7 @@ mod tests {
             &test_context(),
             Event::UserMessage {
                 text: "Hello".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
@@ -1358,6 +1361,7 @@ mod tests {
             &test_context(),
             Event::UserMessage {
                 text: "Try again".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: "test-message-id".to_string(),
                 user_agent: None,

@@ -307,6 +307,7 @@ impl RuntimeManager {
             let _ = event_tx
                 .send(Event::UserMessage {
                     text: task_text,
+                    llm_text: None, // Sub-agent tasks are already fully specified
                     images: vec![],
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: Some("Phoenix Sub-Agent".to_string()),

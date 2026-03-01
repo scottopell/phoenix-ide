@@ -113,6 +113,7 @@ mod tests {
             content: MessageContent::User(UserContent {
                 text: text.to_string(),
                 images: vec![],
+                llm_text: None,
             }),
             display_data: None,
             usage_data: None,
@@ -490,6 +491,7 @@ mod proptests {
             MessageType::User => MessageContent::User(UserContent {
                 text: "user message".to_string(),
                 images: vec![],
+                llm_text: None,
             }),
             MessageType::Agent => {
                 if has_text {
@@ -513,6 +515,7 @@ mod proptests {
             _ => MessageContent::User(UserContent {
                 text: "fallback".to_string(),
                 images: vec![],
+                llm_text: None,
             }),
         };
 

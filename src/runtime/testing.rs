@@ -497,6 +497,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
         self.event_tx
             .send(Event::UserMessage {
                 text: text.to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
@@ -765,6 +766,7 @@ mod tests {
         event_tx
             .send(Event::UserMessage {
                 text: "Hello".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
@@ -874,6 +876,7 @@ mod tests {
         event_tx
             .send(Event::UserMessage {
                 text: "Run command".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
@@ -965,6 +968,7 @@ mod tests {
         event_tx
             .send(Event::UserMessage {
                 text: "Run slow command".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
@@ -1473,6 +1477,7 @@ mod tests {
         event_tx
             .send(Event::UserMessage {
                 text: "Run command".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,

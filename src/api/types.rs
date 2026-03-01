@@ -187,6 +187,40 @@ pub struct SystemPromptResponse {
     pub system_prompt: String,
 }
 
+/// A single file search result (REQ-IR-004)
+#[derive(Debug, Serialize)]
+pub struct FileSearchEntry {
+    /// Path relative to the conversation's working directory
+    pub path: String,
+    /// True when the file can be read as text (false = binary)
+    pub is_text_file: bool,
+}
+
+/// Response for conversation-scoped file search (REQ-IR-004)
+#[derive(Debug, Serialize)]
+pub struct FileSearchResponse {
+    pub items: Vec<FileSearchEntry>,
+}
+
+/// Query parameters for file search
+#[derive(Debug, Deserialize)]
+pub struct FileSearchQuery {
+    /// Fuzzy query string (empty = return all up to limit)
+    #[serde(default)]
+    pub q: String,
+    /// Maximum number of results (default 50)
+    pub limit: Option<usize>,
+}
+
+/// Expansion error detail returned to the frontend (REQ-IR-007)
+#[derive(Debug, Serialize)]
+pub struct ExpansionErrorResponse {
+    pub error: String,
+    pub error_type: String,
+    /// The reference token that caused the failure (e.g. `@src/missing.rs`)
+    pub reference: String,
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

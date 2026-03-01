@@ -4819,6 +4819,132 @@ html * {
 }
 
 /* =================================================================
+   Inline Autocomplete (REQ-IR-004)
+   ================================================================= */
+
+/* Wrapper positioned relative to the input area so the dropdown anchors above the textarea */
+.iac-container {
+  position: relative;
+}
+
+/* Dropdown panel */
+.iac-dropdown {
+  position: absolute;
+  bottom: 2px; /* sits just above the textarea */
+  left: 0;
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.2);
+  z-index: 500;
+  overflow: hidden;
+  animation: iac-in 100ms ease-out;
+  max-height: 240px;
+  display: flex;
+  flex-direction: column;
+}
+
+@keyframes iac-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Header row: trigger prefix + hint */
+.iac-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  flex-shrink: 0;
+}
+
+.iac-trigger-prefix {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.iac-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+/* Scrollable list */
+.iac-list {
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+/* Individual item */
+.iac-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  cursor: pointer;
+  text-align: left;
+  transition: background 60ms;
+}
+
+.iac-item:hover,
+.iac-item.selected {
+  background: var(--bg-tertiary);
+}
+
+.iac-item-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.iac-item-subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* Inline expansion error (REQ-IR-007) */
+.input-expansion-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: #ef4444;
+}
+
+.input-expansion-error-icon {
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.input-expansion-error-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* =================================================================
    Command Palette (REQ-CP-001 through REQ-CP-008)
    ================================================================= */
 

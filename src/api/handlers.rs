@@ -7,9 +7,9 @@ use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
-    FileEntry, GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse,
-    ModelsResponse, ReadFileResponse, RenameRequest, SuccessResponse, SystemPromptResponse,
-    ValidateCwdResponse,
+    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
+    GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    ReadFileResponse, RenameRequest, SuccessResponse, SystemPromptResponse, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ImageData, Message, MessageContent, MessageType};
@@ -89,6 +89,10 @@ pub fn create_router(state: AppState) -> Router {
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
         .route("/api/files/read", get(read_file))
+        .route(
+            "/api/conversations/:id/files/search",
+            get(search_conversation_files),
+        )
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
         // Environment info
@@ -238,6 +242,7 @@ async fn list_archived_conversations(
 // Conversation Creation (REQ-API-002)
 // ============================================================
 
+#[allow(clippy::too_many_lines)]
 async fn create_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateConversationRequest>,
@@ -330,6 +335,17 @@ async fn create_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
+    let working_dir_for_expand = std::path::PathBuf::from(&req.cwd);
+    let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
+        .map_err(|e| {
+            AppError::UnprocessableEntity(ExpansionErrorResponse {
+                error: e.to_string(),
+                error_type: e.error_type().to_string(),
+                reference: e.reference(),
+            })
+        })?;
+
     // Convert images
     let images: Vec<ImageData> = req
         .images
@@ -340,9 +356,14 @@ async fn create_conversation(
         })
         .collect();
 
+    // Only set llm_text when expansion actually changed the text (REQ-IR-001)
+    let initial_llm_text = (expanded_initial.llm_text != expanded_initial.display_text)
+        .then_some(expanded_initial.llm_text);
+
     // Send the initial message to the runtime
     let event = Event::UserMessage {
-        text: req.text,
+        text: expanded_initial.display_text,
+        llm_text: initial_llm_text,
         images,
         message_id: req.message_id,
         user_agent: None,
@@ -750,6 +771,23 @@ async fn send_chat(
         return Ok(Json(ChatResponse { queued: true }));
     }
 
+    // Expand `@file` inline references before sending to the LLM (REQ-IR-001, REQ-IR-007)
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let working_dir = std::path::PathBuf::from(&conversation.cwd);
+    let expanded = crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
+        AppError::UnprocessableEntity(ExpansionErrorResponse {
+            error: e.to_string(),
+            error_type: e.error_type().to_string(),
+            reference: e.reference(),
+        })
+    })?;
+
     // Convert images
     let images: Vec<ImageData> = req
         .images
@@ -760,9 +798,15 @@ async fn send_chat(
         })
         .collect();
 
-    // Send event to runtime with message_id and user_agent
+    // Only set llm_text when expansion actually changed the text (REQ-IR-001)
+    let chat_llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+
+    // Send event to runtime with message_id and user_agent.
+    // `text` carries the `display_text` (stored in DB, shown in history — REQ-IR-006).
+    // `llm_text` is the expanded form delivered to the model when present (REQ-IR-001).
     let event = Event::UserMessage {
-        text: req.text,
+        text: expanded.display_text,
+        llm_text: chat_llm_text,
         images,
         message_id: req.message_id,
         user_agent: req.user_agent,
@@ -1202,6 +1246,109 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
 }
 
 // ============================================================
+// Conversation-scoped File Search (REQ-IR-004)
+// ============================================================
+
+/// Gitignore-aware recursive file search within the conversation's working directory.
+///
+/// Uses the `ignore` crate to respect `.gitignore`, `.ignore`, and other standard
+/// exclusion files. Results are fuzzy-matched against the query when provided.
+async fn search_conversation_files(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<FileSearchQuery>,
+) -> Result<Json<FileSearchResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let root = std::path::PathBuf::from(&conversation.cwd);
+    if !root.exists() {
+        return Err(AppError::NotFound(
+            "Conversation working directory does not exist".to_string(),
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    let q = query.q.to_lowercase();
+
+    // Walk the directory tree with gitignore awareness
+    let walker = ignore::WalkBuilder::new(&root)
+        .hidden(false) // include dot-files unless gitignored
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .build();
+
+    let mut items: Vec<FileSearchEntry> = Vec::new();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+
+        // Skip directories — only return files
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+
+        let abs_path = entry.path();
+        let rel_path = abs_path
+            .strip_prefix(&root)
+            .unwrap_or(abs_path)
+            .to_string_lossy()
+            .to_string();
+
+        // Apply fuzzy filter when a query is present
+        if !q.is_empty() && !fuzzy_path_matches(&rel_path, &q) {
+            continue;
+        }
+
+        let (_, is_text_file) = detect_file_type(abs_path);
+
+        items.push(FileSearchEntry {
+            path: rel_path,
+            is_text_file,
+        });
+
+        if items.len() >= limit {
+            break;
+        }
+    }
+
+    // Sort alphabetically for stable ordering
+    items.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(Json(FileSearchResponse { items }))
+}
+
+/// Simple fuzzy match: check whether all query characters appear in order in `text`.
+fn fuzzy_path_matches(path: &str, query: &str) -> bool {
+    let path_lower = path.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    // Fast path: substring match
+    if path_lower.contains(query_lower.as_str()) {
+        return true;
+    }
+
+    // Character-sequence match (all chars in order)
+    let mut qi = query_lower.chars();
+    let mut current = qi.next();
+    for c in path_lower.chars() {
+        if Some(c) == current {
+            current = qi.next();
+        }
+        if current.is_none() {
+            return true;
+        }
+    }
+    false
+}
+
+// ============================================================
 // Model Info (REQ-API-009)
 // ============================================================
 
@@ -1330,17 +1477,27 @@ enum AppError {
     BadRequest(String),
     NotFound(String),
     Internal(String),
+    /// 422 — expansion reference validation failure (REQ-IR-007)
+    UnprocessableEntity(ExpansionErrorResponse),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-        };
-
-        let body = Json(ErrorResponse::new(message));
-        (status, body).into_response()
+        match self {
+            AppError::BadRequest(msg) => {
+                (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(msg))).into_response()
+            }
+            AppError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, Json(ErrorResponse::new(msg))).into_response()
+            }
+            AppError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(msg)),
+            )
+                .into_response(),
+            AppError::UnprocessableEntity(detail) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, Json(detail)).into_response()
+            }
+        }
     }
 }

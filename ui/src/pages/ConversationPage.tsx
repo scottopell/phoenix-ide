@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, type Conversation, type ImageData } from '../api';
+import { api, ExpansionError, type Conversation, type ImageData } from '../api';
 import { isAgentWorking, isCancellingState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
@@ -249,6 +249,13 @@ export function ConversationPage() {
           markSentRef.current(localId);
         }
       } catch (err) {
+        if (err instanceof ExpansionError) {
+          // Don't mark as failed — the user needs to fix the reference.
+          // Remove from queue so it doesn't show as a failed message.
+          markFailedRef.current(localId);
+          // Re-throw so InputArea can display inline error (REQ-IR-007)
+          throw err;
+        }
         console.error('Failed to send message:', err);
         markFailedRef.current(localId);
       } finally {
@@ -274,13 +281,14 @@ export function ConversationPage() {
     }
   }, [isConnected, conversationId, queuedMessages]);
 
-  const handleSend = (text: string, attachedImages: ImageData[]) => {
+  const handleSend = async (text: string, attachedImages: ImageData[]) => {
     if (!conversationId) return;
 
     const msg = enqueue(text, attachedImages);
 
     if (isConnected) {
-      sendMessage(msg.localId, text, attachedImages);
+      // Await so expansion errors propagate back to InputArea (REQ-IR-007)
+      await sendMessage(msg.localId, text, attachedImages);
     }
   };
 

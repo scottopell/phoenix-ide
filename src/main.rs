@@ -6,6 +6,7 @@
 mod api;
 mod db;
 mod llm;
+mod message_expander;
 mod runtime;
 mod state_machine;
 mod system_prompt;

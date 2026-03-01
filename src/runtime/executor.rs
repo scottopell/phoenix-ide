@@ -1068,7 +1068,7 @@ where
         storage: &S,
         conv_id: &str,
     ) -> Result<Vec<LlmMessage>, String> {
-        use crate::db::{MessageContent, ToolContent, UserContent};
+        use crate::db::{MessageContent, ToolContent};
         use crate::llm::ImageSource;
 
         let db_messages = storage.get_messages(conv_id).await?;
@@ -1077,11 +1077,14 @@ where
 
         for msg in db_messages {
             match &msg.content {
-                MessageContent::User(UserContent { text, images }) => {
-                    let mut content = vec![ContentBlock::text(text)];
+                MessageContent::User(user_content) => {
+                    // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
+                    // the model sees the fully resolved form while the DB stores the shorthand.
+                    let text_for_llm = user_content.llm_text();
+                    let mut content = vec![ContentBlock::text(text_for_llm)];
 
                     // Add images (REQ-BED-013)
-                    for img in images {
+                    for img in &user_content.images {
                         content.push(ContentBlock::Image {
                             source: img.to_image_source(),
                         });

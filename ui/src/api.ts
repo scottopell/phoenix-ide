@@ -152,6 +152,34 @@ export interface ModelsResponse {
   llm_configured: boolean;
 }
 
+/** A single file search result from the conversation-scoped file search API (REQ-IR-004) */
+export interface FileSearchEntry {
+  path: string;
+  is_text_file: boolean;
+}
+
+/** Expansion error returned by the server when an @reference fails (REQ-IR-007) */
+export interface ExpansionErrorDetail {
+  error: string;
+  error_type: 'file_not_found' | 'file_not_text';
+  reference: string;
+}
+
+/**
+ * Thrown by `api.sendMessage` when the server rejects a message due to an
+ * unresolvable `@` reference (HTTP 422). Callers can `instanceof` check this
+ * to distinguish expansion errors from network errors.
+ */
+export class ExpansionError extends Error {
+  readonly detail: ExpansionErrorDetail;
+
+  constructor(detail: ExpansionErrorDetail) {
+    super(`expansion:${detail.error}`);
+    this.name = 'ExpansionError';
+    this.detail = detail;
+  }
+}
+
 export const api = {
   async listConversations(): Promise<Conversation[]> {
     const resp = await fetch('/api/conversations');
@@ -203,6 +231,11 @@ export const api = {
         user_agent: navigator.userAgent,
       }),
     });
+    if (resp.status === 422) {
+      // Expansion error — surface to InputArea as inline error (REQ-IR-007)
+      const detail = await resp.json() as ExpansionErrorDetail;
+      throw new ExpansionError(detail);
+    }
     if (!resp.ok) throw new Error('Failed to send message');
     return resp.json();
   },
@@ -302,6 +335,22 @@ export const api = {
   async getEnv(): Promise<{ home_dir: string }> {
     const resp = await fetch('/api/env');
     if (!resp.ok) throw new Error('Failed to get environment info');
+    return resp.json();
+  },
+
+  /** Search files within a conversation's working directory (REQ-IR-004) */
+  async searchConversationFiles(
+    convId: string,
+    query: string,
+    limit = 50,
+    signal?: AbortSignal,
+  ): Promise<{ items: FileSearchEntry[] }> {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    const resp = await fetch(
+      `/api/conversations/${convId}/files/search?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to search files');
     return resp.json();
   },
 

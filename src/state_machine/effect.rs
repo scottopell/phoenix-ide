@@ -135,14 +135,22 @@ pub enum Effect {
 impl Effect {
     pub fn persist_user_message(
         text: impl Into<String>,
+        llm_text: Option<String>,
         images: Vec<ImageData>,
         message_id: String,
         user_agent: Option<String>,
     ) -> Self {
-        let content = if images.is_empty() {
-            MessageContent::user(text)
-        } else {
-            MessageContent::user_with_images(text, images)
+        let content = match llm_text {
+            Some(expanded) => MessageContent::User(crate::db::UserContent::with_expansion(
+                text, expanded, images,
+            )),
+            None => {
+                if images.is_empty() {
+                    MessageContent::user(text)
+                } else {
+                    MessageContent::user_with_images(text, images)
+                }
+            }
         };
         // Store user_agent in display_data for UI to show device icon
         let display_data = user_agent.map(|ua| serde_json::json!({ "user_agent": ua }));

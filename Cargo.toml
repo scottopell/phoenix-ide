@@ -47,6 +47,9 @@ similar = "2"  # For generating diffs
 # Process management
 nix = { version = "0.29", features = ["signal", "process"] }
 
+# Gitignore-aware directory walking (for file search)
+ignore = "0.4"
+
 # Browser automation
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime", "_fetcher-rustls-tokio"] }
 brush-parser = "0.3.0"

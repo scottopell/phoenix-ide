@@ -9,7 +9,11 @@ use crate::state_machine::state::{PendingSubAgent, SubAgentOutcome, ToolCall};
 pub enum Event {
     // User events
     UserMessage {
+        /// Display text — stored in DB and shown in history (REQ-IR-006).
         text: String,
+        /// Expanded text delivered to the LLM when `@` references are present (REQ-IR-001).
+        /// `None` means no expansion — `text` is used verbatim.
+        llm_text: Option<String>,
         images: Vec<ImageData>,
         /// Client-generated UUID - the canonical identifier for this message
         message_id: String,

@@ -215,6 +215,7 @@ fn arb_busy_state() -> impl Strategy<Value = ConvState> {
 fn arb_user_message_event() -> impl Strategy<Value = Event> {
     "[a-zA-Z ]{1,30}".prop_map(|text| Event::UserMessage {
         text,
+        llm_text: None,
         images: vec![],
         message_id: uuid::Uuid::new_v4().to_string(),
         user_agent: None,
@@ -366,6 +367,7 @@ proptest! {
         };
         let event = Event::UserMessage {
             text: "retry".to_string(),
+            llm_text: None,
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
@@ -436,6 +438,7 @@ proptest! {
     fn prop_busy_rejects_messages(state in arb_busy_state()) {
         let event = Event::UserMessage {
             text: "hi".to_string(),
+            llm_text: None,
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
@@ -457,6 +460,7 @@ proptest! {
     ) {
         let event = Event::UserMessage {
             text,
+            llm_text: None,
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
@@ -511,6 +515,7 @@ proptest! {
         let state = ConvState::Idle;
         let event = Event::UserMessage {
             text,
+            llm_text: None,
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
@@ -891,6 +896,7 @@ fn test_complete_tool_cycle() {
         &ctx,
         Event::UserMessage {
             text: "run ls".to_string(),
+            llm_text: None,
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
@@ -1915,6 +1921,7 @@ proptest! {
             &ctx,
             Event::UserMessage {
                 text: "test".to_string(),
+                llm_text: None,
                 images: vec![],
                 message_id: "test-msg".to_string(),
                 user_agent: None,

@@ -243,9 +243,17 @@ impl ToolResult {
 /// User message content
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserContent {
+    /// Display text — stored in DB and shown in conversation history.
+    /// For messages with `@` expansion this is the original shorthand (REQ-IR-006).
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageData>,
+    /// Expanded text delivered to the LLM (REQ-IR-001).
+    /// `None` means no expansion occurred and `text` is used verbatim for the LLM.
+    /// `Some` holds the fully resolved form (e.g. `<file path="…">…</file>` blocks).
+    /// `#[serde(default)]` handles old DB rows that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_text: Option<String>,
 }
 
 impl UserContent {
@@ -253,6 +261,7 @@ impl UserContent {
         Self {
             text: text.into(),
             images: Vec::new(),
+            llm_text: None,
         }
     }
 
@@ -260,7 +269,27 @@ impl UserContent {
         Self {
             text: text.into(),
             images,
+            llm_text: None,
         }
+    }
+
+    /// Create a user message where `display_text` is stored/shown and `llm_text`
+    /// is the expanded form delivered to the LLM (REQ-IR-001, REQ-IR-006).
+    pub fn with_expansion(
+        display_text: impl Into<String>,
+        llm_text: impl Into<String>,
+        images: Vec<ImageData>,
+    ) -> Self {
+        Self {
+            text: display_text.into(),
+            images,
+            llm_text: Some(llm_text.into()),
+        }
+    }
+
+    /// The text to deliver to the LLM: expanded form if present, display text otherwise.
+    pub fn llm_text(&self) -> &str {
+        self.llm_text.as_deref().unwrap_or(&self.text)
     }
 }
 
