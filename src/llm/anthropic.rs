@@ -476,19 +476,32 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
     if content.is_empty() {
-        // Log exactly what Anthropic sent so we can diagnose the root cause.
-        // output_tokens > 0 with empty content suggests blocks were silently dropped
-        // (e.g. empty text blocks filtered above). stop_reason tells us intent.
-        tracing::warn!(
-            stop_reason = ?resp.stop_reason,
-            output_tokens = resp.usage.output_tokens,
-            raw_block_count = raw_block_count,
-            "Anthropic returned empty content after normalization"
-        );
-        return Err(LlmError::invalid_response(format!(
-            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
-            resp.stop_reason, resp.usage.output_tokens, raw_block_count
-        )));
+        if end_turn {
+            // Valid: model completed the tool call loop with nothing further to say.
+            // Common with concise models (e.g. haiku) after a simple tool result.
+            // Emit an empty text block so the SM receives a well-formed response
+            // and transitions to idle normally.
+            tracing::debug!(
+                stop_reason = ?resp.stop_reason,
+                output_tokens = resp.usage.output_tokens,
+                raw_block_count = raw_block_count,
+                "Anthropic end_turn with empty content — treating as successful completion"
+            );
+            content.push(ContentBlock::Text {
+                text: String::new(),
+            });
+        } else {
+            tracing::warn!(
+                stop_reason = ?resp.stop_reason,
+                output_tokens = resp.usage.output_tokens,
+                raw_block_count = raw_block_count,
+                "Anthropic returned empty content after normalization"
+            );
+            return Err(LlmError::invalid_response(format!(
+                "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
+                resp.stop_reason, resp.usage.output_tokens, raw_block_count
+            )));
+        }
     }
 
     Ok(LlmResponse {
