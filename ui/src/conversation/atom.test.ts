@@ -65,6 +65,32 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer).toBeNull();
     });
 
+    it('merges delta messages on reconnect (lastSequenceId > 0)', () => {
+      const existing = makeMessage(3);
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 3,
+        messages: [existing],
+      };
+      const newMsg = makeMessage(4);
+      const payload = makeInitPayload({ messages: [newMsg], lastSequenceId: 4 });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(2);
+      expect(next.messages[0]!.sequence_id).toBe(3);
+      expect(next.messages[1]!.sequence_id).toBe(4);
+    });
+
+    it('replaces messages on fresh connect (lastSequenceId = 0)', () => {
+      const payload = makeInitPayload({ messages: [makeMessage(1), makeMessage(2)] });
+      const atom = createInitialAtom();
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(2);
+    });
+
     it('clears streaming buffer on init', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),

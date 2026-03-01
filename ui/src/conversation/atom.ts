@@ -137,6 +137,11 @@ export function conversationReducer(
     case 'sse_init': {
       const p = action.payload;
 
+      // When reconnecting with ?after=N, the server returns only delta messages (sequence_id > N).
+      // Merge with existing to preserve full history. On fresh connect (lastSequenceId=0), replace.
+      const mergedMessages =
+        atom.lastSequenceId > 0 ? [...atom.messages, ...p.messages] : p.messages;
+
       // Apply in-progress phase breadcrumb if the server breadcrumbs don't include it
       const currentCrumb = breadcrumbFromPhase(p.phase, p.lastSequenceId);
       let finalBreadcrumbs = p.breadcrumbs;
@@ -164,7 +169,7 @@ export function conversationReducer(
         ...atom,
         conversationId: p.conversation.id,
         conversation: p.conversation,
-        messages: p.messages,
+        messages: mergedMessages,
         phase: p.phase,
         breadcrumbs: finalBreadcrumbs,
         breadcrumbSequenceIds: finalBreadcrumbSeqIds,

@@ -73,8 +73,7 @@ export function ConversationPage() {
   const isConnected =
     connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
 
-  // Ref to track if we've already initiated loading for this slug (prevents double-load)
-  const loadedSlugsRef = useRef<Set<string>>(new Set());
+  // Ref to read atom state inside effects without adding it to deps
   const atomRef = useRef(atom);
   atomRef.current = atom;
 
@@ -87,14 +86,11 @@ export function ConversationPage() {
 
     setError(null);
 
-    // Returning navigation: atom already has conversationId — just reconnect SSE
+    // Returning navigation: atom already has conversationId — just reconnect SSE.
+    // Reading via ref to avoid adding `atom` to deps (would re-run on every SSE event).
     if (atomRef.current.conversationId) {
       return;
     }
-
-    // Guard against re-loading the same slug during this mount lifetime
-    if (loadedSlugsRef.current.has(slug)) return;
-    loadedSlugsRef.current.add(slug);
 
     let cancelled = false;
 
@@ -180,11 +176,6 @@ export function ConversationPage() {
       setConversationIdForSSE(undefined);
     };
   }, [atom.conversationId]);
-
-  // Reset loaded slug tracking when slug changes (navigation to new conversation)
-  useEffect(() => {
-    loadedSlugsRef.current = new Set(slug ? [slug] : []);
-  }, [slug]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
