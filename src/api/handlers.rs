@@ -9,7 +9,8 @@ use super::types::{
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    ReadFileResponse, RenameRequest, SuccessResponse, SystemPromptResponse, ValidateCwdResponse,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SystemPromptResponse, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ImageData, Message, MessageContent, MessageType};
@@ -92,6 +93,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/files/search",
             get(search_conversation_files),
+        )
+        // Skill discovery for autocomplete (REQ-IR-005)
+        .route(
+            "/api/conversations/:id/skills",
+            get(list_conversation_skills),
         )
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
@@ -1346,6 +1352,38 @@ fn fuzzy_path_matches(path: &str, query: &str) -> bool {
         }
     }
     false
+}
+
+/// Discover skills available for the conversation's working directory (REQ-IR-005).
+///
+/// Calls `discover_skills()` from `system_prompt.rs` and returns each skill's
+/// name, description, and optional `argument_hint` for frontend autocomplete.
+async fn list_conversation_skills(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SkillsResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let cwd = std::path::PathBuf::from(&conversation.cwd);
+    let skills = crate::system_prompt::discover_skills(&cwd);
+
+    let skill_entries: Vec<SkillEntry> = skills
+        .into_iter()
+        .map(|s| SkillEntry {
+            name: s.name,
+            description: s.description,
+            argument_hint: s.argument_hint,
+        })
+        .collect();
+
+    Ok(Json(SkillsResponse {
+        skills: skill_entries,
+    }))
 }
 
 // ============================================================

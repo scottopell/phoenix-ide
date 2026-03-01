@@ -4944,6 +4944,26 @@ html * {
   white-space: nowrap;
 }
 
+/* Skill argument hint ghost text (REQ-IR-005) */
+.input-skill-hint {
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-top: 1px solid var(--border-subtle, rgba(255,255,255,0.06));
+}
+
+.input-skill-hint-text::before {
+  content: 'hint: ';
+  font-style: normal;
+  font-weight: 600;
+  color: var(--accent-blue);
+  margin-right: 2px;
+}
+
 /* =================================================================
    Command Palette (REQ-CP-001 through REQ-CP-008)
    ================================================================= */

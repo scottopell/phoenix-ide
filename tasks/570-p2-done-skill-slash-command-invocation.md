@@ -1,7 +1,7 @@
 ---
 created: 2025-01-28
 priority: p2
-status: ready
+status: done
 spec: specs/inline-references/
 ---
 

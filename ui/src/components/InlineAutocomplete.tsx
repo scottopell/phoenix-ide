@@ -66,7 +66,7 @@ const TRIGGER_PREFIX: Record<AutocompleteMode, string> = {
 const MODE_HINT: Record<AutocompleteMode, string> = {
   expand: 'file will be included',
   path: 'path reference',
-  skill: 'skill',
+  skill: 'skill invocation',
 };
 
 // ============================================================================
@@ -153,11 +153,36 @@ export interface TriggerState {
  * Returns `null` when no trigger is active.
  *
  * Rules:
- *   - `@<partial>` anywhere (no whitespace in partial)          → expand mode
- *   - `<word_boundary>./<partial>` anywhere                     → path mode
+ *   - `/^<partial>` at the very start of input (no whitespace in partial) → skill mode
+ *   - `@<partial>` anywhere (no whitespace in partial)                    → expand mode
+ *   - `<word_boundary>./<partial>` anywhere                               → path mode
+ *
+ * Skill trigger is checked first: `/` at the start of the full value takes precedence.
  */
 export function detectTrigger(value: string, cursorPos: number): TriggerState | null {
   const beforeCursor = value.slice(0, cursorPos);
+
+  // ---- / skill trigger (must be at start of the full value) ------------------
+  // The cursor must still be within the first token (no whitespace after the skill name token)
+  if (value.trimStart().startsWith('/')) {
+    // Only active when the cursor is still in the first token
+    const stripped = value.trimStart();
+    const leadingSpaces = value.length - stripped.length;
+    // Trigger token spans from position 0 (or leading spaces) to first whitespace
+    const firstWhitespace = stripped.slice(1).search(/\s/);
+    const tokenEnd = firstWhitespace === -1
+      ? value.length
+      : leadingSpaces + 1 + firstWhitespace;
+    if (cursorPos <= tokenEnd) {
+      const query = stripped.slice(1, cursorPos - leadingSpaces); // text after '/'
+      return {
+        mode: 'skill',
+        query,
+        triggerStart: leadingSpaces, // position of '/'
+        triggerEnd: cursorPos,
+      };
+    }
+  }
 
   // ---- @expand trigger -------------------------------------------------------
   const atIdx = findLastTriggerChar(beforeCursor, '@');

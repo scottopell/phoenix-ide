@@ -158,10 +158,17 @@ export interface FileSearchEntry {
   is_text_file: boolean;
 }
 
-/** Expansion error returned by the server when an @reference fails (REQ-IR-007) */
+/** A single skill entry returned by the skills API (REQ-IR-005) */
+export interface SkillEntry {
+  name: string;
+  description: string;
+  argument_hint?: string | null;
+}
+
+/** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
-  error_type: 'file_not_found' | 'file_not_text';
+  error_type: 'file_not_found' | 'file_not_text' | 'skill_not_found';
   reference: string;
 }
 
@@ -335,6 +342,19 @@ export const api = {
   async getEnv(): Promise<{ home_dir: string }> {
     const resp = await fetch('/api/env');
     if (!resp.ok) throw new Error('Failed to get environment info');
+    return resp.json();
+  },
+
+  /** List skills available for a conversation's working directory (REQ-IR-005) */
+  async listConversationSkills(
+    convId: string,
+    signal?: AbortSignal,
+  ): Promise<{ skills: SkillEntry[] }> {
+    const resp = await fetch(
+      `/api/conversations/${convId}/skills`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to list skills');
     return resp.json();
   },
 

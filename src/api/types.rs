@@ -212,12 +212,27 @@ pub struct FileSearchQuery {
     pub limit: Option<usize>,
 }
 
+/// A single skill entry returned by the skills API (REQ-IR-005)
+#[derive(Debug, Serialize)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+}
+
+/// Response for the skills list endpoint (REQ-IR-005)
+#[derive(Debug, Serialize)]
+pub struct SkillsResponse {
+    pub skills: Vec<SkillEntry>,
+}
+
 /// Expansion error detail returned to the frontend (REQ-IR-007)
 #[derive(Debug, Serialize)]
 pub struct ExpansionErrorResponse {
     pub error: String,
     pub error_type: String,
-    /// The reference token that caused the failure (e.g. `@src/missing.rs`)
+    /// The reference token that caused the failure (e.g. `@src/missing.rs` or `/skill-name`)
     pub reference: String,
 }
 

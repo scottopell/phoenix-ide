@@ -12,7 +12,7 @@ import {
 import { FolderOpen } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
 import { useDraft } from '../hooks';
-import type { ConversationState, ImageData } from '../api';
+import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
 import { isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
@@ -78,19 +78,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceInterim, setVoiceInterim] = useState('');
 
   // =========================================================================
-  // Inline autocomplete state (REQ-IR-004)
+  // Inline autocomplete state (REQ-IR-004, REQ-IR-005)
   // =========================================================================
 
   /** Active trigger state — null when no trigger is open */
   const [activeTrigger, setActiveTrigger] = useState<TriggerState | null>(null);
   /** Candidate items fetched from the server */
   const [acItems, setAcItems] = useState<AutocompleteItem[]>([]);
-  /** Inline error when an @ref fails to expand (REQ-IR-007) */
+  /** Inline error when an @ref or /skill fails to expand (REQ-IR-007) */
   const [expansionError, setExpansionError] = useState<string | null>(null);
   /** Ref to abort any in-flight search request */
   const searchAbortRef = useRef<AbortController | null>(null);
   /** Debounce timer for search */
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Cached skill list for the current conversation (REQ-IR-005) */
+  const [skillItems, setSkillItems] = useState<SkillEntry[]>([]);
+  /** Argument hint ghost text shown after a skill is selected (REQ-IR-005) */
+  const [skillArgumentHint, setSkillArgumentHint] = useState<string | null>(null);
 
   // =========================================================================
   // File search (REQ-IR-004)
@@ -129,9 +133,45 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     [conversationId],
   );
 
+  // =========================================================================
+  // Skill search (REQ-IR-005)
+  // =========================================================================
+
+  /** Fetch and cache available skills for this conversation (once per session) */
+  const fetchSkillItems = useCallback(async () => {
+    if (!conversationId) return;
+    try {
+      const result = await api.listConversationSkills(conversationId);
+      setSkillItems(result.skills);
+    } catch (err) {
+      console.warn('Skill list failed:', err);
+      setSkillItems([]);
+    }
+  }, [conversationId]);
+
   // Debounced fetch when trigger/query changes
   useEffect(() => {
-    if (!activeTrigger || (activeTrigger.mode !== 'expand' && activeTrigger.mode !== 'path')) {
+    if (!activeTrigger) {
+      setAcItems([]);
+      return;
+    }
+
+    if (activeTrigger.mode === 'skill') {
+      // Skills are fetched once (cached in skillItems); map to AutocompleteItems here
+      if (skillItems.length === 0) {
+        void fetchSkillItems();
+      }
+      const items: AutocompleteItem[] = skillItems.map((s) => ({
+        id: s.name,
+        label: s.name,
+        subtitle: s.description,
+        metadata: s,
+      }));
+      setAcItems(items);
+      return;
+    }
+
+    if (activeTrigger.mode !== 'expand' && activeTrigger.mode !== 'path') {
       setAcItems([]);
       return;
     }
@@ -144,7 +184,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     return () => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     };
-  }, [activeTrigger, fetchFileItems]);
+  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems]);
+
+  // When skillItems updates after a fetch, refresh acItems if skill trigger is still active
+  useEffect(() => {
+    if (activeTrigger?.mode !== 'skill') return;
+    const items: AutocompleteItem[] = skillItems.map((s) => ({
+      id: s.name,
+      label: s.name,
+      subtitle: s.description,
+      metadata: s,
+    }));
+    setAcItems(items);
+  }, [skillItems, activeTrigger?.mode]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -183,6 +235,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       let replacement: string;
       if (activeTrigger.mode === 'expand') {
         replacement = `@${item.label}`;
+      } else if (activeTrigger.mode === 'skill') {
+        // Insert `/skill-name ` with a trailing space (REQ-IR-005)
+        replacement = `/${item.label} `;
+        // Show argument hint ghost text if the skill has one
+        const skill = item.metadata as SkillEntry | undefined;
+        if (skill?.argument_hint) {
+          setSkillArgumentHint(skill.argument_hint);
+        } else {
+          setSkillArgumentHint(null);
+        }
       } else {
         // path mode
         replacement = `./${item.label}`;
@@ -215,6 +277,21 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setActiveTrigger(null);
     setAcItems([]);
   }, []);
+
+  // Clear argument hint when the user types past the skill name or clears input
+  useEffect(() => {
+    if (skillArgumentHint === null) return;
+    const text = voiceBase !== null ? voiceBase : draft;
+    // Keep hint visible while input starts with a /skill-name pattern;
+    // dismiss it once the user has added arguments (text after the first token has content)
+    const match = /^\/\S+\s(.*)/.exec(text.trimStart());
+    if (match !== null && (match[1] ?? '').length > 0) {
+      // User has started typing arguments — dismiss the hint
+      setSkillArgumentHint(null);
+    } else if (!text.trimStart().startsWith('/')) {
+      setSkillArgumentHint(null);
+    }
+  }, [draft, voiceBase, skillArgumentHint]);
 
   // =========================================================================
   // Keyboard handling (merged with autocomplete nav)
@@ -350,9 +427,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     if (!text && images.length === 0) return;
     if (agentWorking && !isOffline) return;
 
-    // Close autocomplete on send
+    // Close autocomplete and ghost text on send
     setActiveTrigger(null);
     setAcItems([]);
+    setSkillArgumentHint(null);
 
     try {
       await onSend(text, images);
@@ -477,6 +555,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           visible={activeTrigger !== null}
         />
       </div>
+
+      {/* Skill argument hint ghost text (REQ-IR-005) */}
+      {skillArgumentHint && !expansionError && (
+        <div className="input-skill-hint" aria-live="polite">
+          <span className="input-skill-hint-text">{skillArgumentHint}</span>
+        </div>
+      )}
 
       {/* Expansion error inline indicator (REQ-IR-007) */}
       {expansionError && (

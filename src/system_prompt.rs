@@ -43,14 +43,23 @@ pub struct SkillMetadata {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    /// Optional argument hint shown in autocomplete (from `argument-hint:` frontmatter field)
+    pub argument_hint: Option<String>,
 }
 
-/// Parse `name` and `description` from SKILL.md YAML frontmatter.
+/// Parsed frontmatter fields from a SKILL.md file
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+    argument_hint: Option<String>,
+}
+
+/// Parse `name`, `description`, and optional `argument-hint` from SKILL.md YAML frontmatter.
 ///
 /// Expects the file to start with `---\n`, followed by `key: value` lines,
-/// closed by `\n---\n`. Returns `None` if either field is missing or the
+/// closed by `\n---\n`. Returns `None` if either required field is missing or the
 /// frontmatter is malformed.
-fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
+fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
     let body = content.strip_prefix("---\n")?;
     let end = body.find("\n---\n").or_else(|| {
         // Handle frontmatter at end of file with no trailing newline after ---
@@ -60,16 +69,26 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
 
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
+    let mut argument_hint: Option<String> = None;
 
     for line in frontmatter.lines() {
         if let Some(val) = line.strip_prefix("name:") {
             name = Some(val.trim().to_string());
         } else if let Some(val) = line.strip_prefix("description:") {
             description = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("argument-hint:") {
+            let hint = val.trim().to_string();
+            if !hint.is_empty() {
+                argument_hint = Some(hint);
+            }
         }
     }
 
-    Some((name?, description?))
+    Some(SkillFrontmatter {
+        name: name?,
+        description: description?,
+        argument_hint,
+    })
 }
 
 /// Discover skills by walking from `working_dir` up to the filesystem root.
@@ -95,12 +114,13 @@ pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
                     continue;
                 }
                 if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    if let Some((name, description)) = parse_skill_frontmatter(&content) {
+                    if let Some(fm) = parse_skill_frontmatter(&content) {
                         // cwd wins: only add if we haven't seen this name yet
-                        if seen_names.insert(name.clone()) {
+                        if seen_names.insert(fm.name.clone()) {
                             skills.push(SkillMetadata {
-                                name,
-                                description,
+                                name: fm.name,
+                                description: fm.description,
+                                argument_hint: fm.argument_hint,
                                 path: skill_md,
                             });
                         }
@@ -294,29 +314,37 @@ mod tests {
     #[test]
     fn test_parse_frontmatter_valid() {
         let content = "---\nname: my-skill\ndescription: Does something useful\n---\n\n# Body\n";
-        let result = parse_skill_frontmatter(content);
-        assert_eq!(
-            result,
-            Some(("my-skill".to_string(), "Does something useful".to_string()))
-        );
+        let result = parse_skill_frontmatter(content).unwrap();
+        assert_eq!(result.name, "my-skill");
+        assert_eq!(result.description, "Does something useful");
+        assert_eq!(result.argument_hint, None);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_argument_hint() {
+        let content =
+            "---\nname: my-skill\ndescription: Does something useful\nargument-hint: <file>\n---\n\n# Body\n";
+        let result = parse_skill_frontmatter(content).unwrap();
+        assert_eq!(result.name, "my-skill");
+        assert_eq!(result.argument_hint, Some("<file>".to_string()));
     }
 
     #[test]
     fn test_parse_frontmatter_missing_name() {
         let content = "---\ndescription: Does something useful\n---\n\n# Body\n";
-        assert_eq!(parse_skill_frontmatter(content), None);
+        assert!(parse_skill_frontmatter(content).is_none());
     }
 
     #[test]
     fn test_parse_frontmatter_missing_description() {
         let content = "---\nname: my-skill\n---\n\n# Body\n";
-        assert_eq!(parse_skill_frontmatter(content), None);
+        assert!(parse_skill_frontmatter(content).is_none());
     }
 
     #[test]
     fn test_parse_frontmatter_no_frontmatter() {
         let content = "# Just a markdown file\nNo frontmatter here.\n";
-        assert_eq!(parse_skill_frontmatter(content), None);
+        assert!(parse_skill_frontmatter(content).is_none());
     }
 
     #[test]
