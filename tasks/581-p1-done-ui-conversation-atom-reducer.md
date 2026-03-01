@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 581
 priority: p1
-status: ready
+status: done
 slug: ui-conversation-atom-reducer
 title: "ConversationAtom + useReducer at router-level context"
 ---

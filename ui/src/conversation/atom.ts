@@ -1,0 +1,293 @@
+import type { ConversationState, Message, Conversation } from '../api';
+import type { Breadcrumb } from '../types';
+
+export interface StreamingBuffer {
+  text: string;
+  lastSequence: number;
+  startedAt: number;
+}
+
+export type UIError =
+  | { type: 'ParseError'; raw: string }
+  | { type: 'BackendError'; message: string }
+  | { type: 'ConnectionFailed'; retriesExhausted: boolean };
+
+export interface ConversationAtom {
+  conversationId: string | null;
+  conversation: Conversation | null;
+  phase: ConversationState;
+  messages: Message[];
+  breadcrumbs: Breadcrumb[];
+  breadcrumbSequenceIds: ReadonlySet<number>;
+  contextWindow: { used: number; total: number };
+  systemPrompt: string | null;
+  lastSequenceId: number;
+  connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
+  streamingBuffer: StreamingBuffer | null;
+  uiError: UIError | null;
+}
+
+export interface InitPayload {
+  conversation: Conversation;
+  messages: Message[];
+  phase: ConversationState;
+  breadcrumbs: Breadcrumb[];
+  breadcrumbSequenceIds: ReadonlySet<number>;
+  contextWindow: { used: number; total: number };
+  lastSequenceId: number;
+}
+
+export type SSEAction =
+  | { type: 'sse_init'; payload: InitPayload }
+  | { type: 'sse_message'; message: Message; sequenceId: number }
+  | { type: 'sse_state_change'; phase: ConversationState; sequenceId?: number }
+  | { type: 'sse_agent_done'; sequenceId?: number }
+  | { type: 'sse_token'; delta: string; sequence: number }
+  | { type: 'sse_error'; error: UIError }
+  | { type: 'connection_state'; state: ConversationAtom['connectionState'] }
+  | {
+      type: 'set_initial_data';
+      conversationId: string;
+      conversation: Conversation;
+      messages: Message[];
+      phase: ConversationState;
+      contextWindow: { used: number; total: number };
+    }
+  | { type: 'set_system_prompt'; systemPrompt: string | null };
+
+export function createInitialAtom(): ConversationAtom {
+  return {
+    conversationId: null,
+    conversation: null,
+    phase: { type: 'idle' },
+    messages: [],
+    breadcrumbs: [],
+    breadcrumbSequenceIds: new Set(),
+    contextWindow: { used: 0, total: 200_000 },
+    systemPrompt: null,
+    lastSequenceId: 0,
+    connectionState: 'connecting',
+    streamingBuffer: null,
+    uiError: null,
+  };
+}
+
+export function breadcrumbFromPhase(
+  phase: ConversationState,
+  sequenceId: number
+): Breadcrumb | null {
+  switch (phase.type) {
+    case 'tool_executing': {
+      const toolName = phase.current_tool.input?._tool || 'tool';
+      const remaining = phase.remaining_tools.length;
+      const label =
+        remaining > 0 ? `${String(toolName)} (+${remaining})` : String(toolName);
+      return { type: 'tool', label, toolId: phase.current_tool.id, sequenceId };
+    }
+    case 'llm_requesting': {
+      const label = phase.attempt > 1 ? `LLM (retry ${phase.attempt})` : 'LLM';
+      return { type: 'llm', label, sequenceId };
+    }
+    case 'awaiting_sub_agents': {
+      const pending = phase.pending.length;
+      const completed = phase.completed_results.length;
+      const total = pending + completed;
+      const label = `sub-agents (${completed}/${total})`;
+      return { type: 'subagents', label, sequenceId };
+    }
+    default:
+      return null;
+  }
+}
+
+function applyBreadcrumb(
+  breadcrumbs: Breadcrumb[],
+  breadcrumbSequenceIds: ReadonlySet<number>,
+  newCrumb: Breadcrumb | null,
+  sequenceId: number | undefined
+): { breadcrumbs: Breadcrumb[]; breadcrumbSequenceIds: ReadonlySet<number> } {
+  if (!newCrumb || (sequenceId !== undefined && breadcrumbSequenceIds.has(sequenceId))) {
+    return { breadcrumbs, breadcrumbSequenceIds };
+  }
+
+  let newBreadcrumbs: Breadcrumb[];
+  if (newCrumb.type === 'llm') {
+    // Replace existing LLM breadcrumb (handles retry label update)
+    newBreadcrumbs = [...breadcrumbs.filter((b) => b.type !== 'llm'), newCrumb];
+  } else if (newCrumb.type === 'subagents') {
+    // Replace existing subagents breadcrumb (handles count update)
+    newBreadcrumbs = [...breadcrumbs.filter((b) => b.type !== 'subagents'), newCrumb];
+  } else {
+    newBreadcrumbs = [...breadcrumbs, newCrumb];
+  }
+
+  const newIds =
+    sequenceId !== undefined
+      ? new Set([...breadcrumbSequenceIds, sequenceId])
+      : breadcrumbSequenceIds;
+
+  return { breadcrumbs: newBreadcrumbs, breadcrumbSequenceIds: newIds };
+}
+
+export function conversationReducer(
+  atom: ConversationAtom,
+  action: SSEAction
+): ConversationAtom {
+  switch (action.type) {
+    case 'sse_init': {
+      const p = action.payload;
+
+      // Apply in-progress phase breadcrumb if the server breadcrumbs don't include it
+      const currentCrumb = breadcrumbFromPhase(p.phase, p.lastSequenceId);
+      let finalBreadcrumbs = p.breadcrumbs;
+      let finalBreadcrumbSeqIds = p.breadcrumbSequenceIds;
+
+      if (currentCrumb) {
+        const alreadyPresent = p.breadcrumbs.some(
+          (b) =>
+            b.type === currentCrumb.type &&
+            (b.type !== 'tool' || b.toolId === currentCrumb.toolId)
+        );
+        if (!alreadyPresent) {
+          const applied = applyBreadcrumb(
+            finalBreadcrumbs,
+            finalBreadcrumbSeqIds,
+            currentCrumb,
+            undefined
+          );
+          finalBreadcrumbs = applied.breadcrumbs;
+          finalBreadcrumbSeqIds = applied.breadcrumbSequenceIds;
+        }
+      }
+
+      return {
+        ...atom,
+        conversationId: p.conversation.id,
+        conversation: p.conversation,
+        messages: p.messages,
+        phase: p.phase,
+        breadcrumbs: finalBreadcrumbs,
+        breadcrumbSequenceIds: finalBreadcrumbSeqIds,
+        contextWindow: p.contextWindow,
+        lastSequenceId: p.lastSequenceId,
+        streamingBuffer: null,
+        uiError: null,
+      };
+    }
+
+    case 'sse_message': {
+      if (atom.lastSequenceId >= action.sequenceId) return atom;
+
+      // Support update-in-place for messages with same message_id (e.g., display_data updates)
+      const existingIdx = atom.messages.findIndex(
+        (m) => m.message_id === action.message.message_id
+      );
+      let newMessages: Message[];
+      if (existingIdx >= 0) {
+        newMessages = [...atom.messages];
+        newMessages[existingIdx] = action.message;
+      } else {
+        newMessages = [...atom.messages, action.message];
+      }
+
+      // User message resets breadcrumbs to start a fresh agent turn
+      const isUserMessage =
+        action.message.message_type === 'user' || action.message.type === 'user';
+
+      return {
+        ...atom,
+        messages: newMessages,
+        lastSequenceId: action.sequenceId,
+        streamingBuffer: null,
+        breadcrumbs: isUserMessage
+          ? [{ type: 'user', label: 'User' }]
+          : atom.breadcrumbs,
+      };
+    }
+
+    case 'sse_state_change': {
+      if (
+        action.sequenceId !== undefined &&
+        atom.lastSequenceId >= action.sequenceId
+      ) {
+        return atom;
+      }
+
+      const newCrumb = breadcrumbFromPhase(
+        action.phase,
+        action.sequenceId ?? atom.lastSequenceId
+      );
+      const { breadcrumbs, breadcrumbSequenceIds } = applyBreadcrumb(
+        atom.breadcrumbs,
+        atom.breadcrumbSequenceIds,
+        newCrumb,
+        action.sequenceId
+      );
+
+      return {
+        ...atom,
+        phase: action.phase,
+        breadcrumbs,
+        breadcrumbSequenceIds,
+        ...(action.sequenceId !== undefined
+          ? { lastSequenceId: action.sequenceId }
+          : {}),
+      };
+    }
+
+    case 'sse_agent_done': {
+      if (
+        action.sequenceId !== undefined &&
+        atom.lastSequenceId >= action.sequenceId
+      ) {
+        return atom;
+      }
+      return {
+        ...atom,
+        phase: { type: 'idle' },
+        streamingBuffer: null,
+        ...(action.sequenceId !== undefined
+          ? { lastSequenceId: action.sequenceId }
+          : {}),
+      };
+    }
+
+    case 'sse_token': {
+      if (
+        atom.streamingBuffer &&
+        atom.streamingBuffer.lastSequence >= action.sequence
+      ) {
+        return atom;
+      }
+      return {
+        ...atom,
+        streamingBuffer: {
+          text: (atom.streamingBuffer?.text ?? '') + action.delta,
+          lastSequence: action.sequence,
+          startedAt: atom.streamingBuffer?.startedAt ?? Date.now(),
+        },
+      };
+    }
+
+    case 'sse_error':
+      return { ...atom, uiError: action.error };
+
+    case 'connection_state':
+      return { ...atom, connectionState: action.state };
+
+    case 'set_initial_data':
+      // Don't overwrite if SSE has already provided authoritative data
+      if (atom.lastSequenceId > 0) return atom;
+      return {
+        ...atom,
+        conversationId: action.conversationId,
+        conversation: action.conversation,
+        messages: action.messages,
+        phase: action.phase,
+        contextWindow: action.contextWindow,
+      };
+
+    case 'set_system_prompt':
+      return { ...atom, systemPrompt: action.systemPrompt };
+  }
+}

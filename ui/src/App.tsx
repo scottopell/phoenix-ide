@@ -4,6 +4,7 @@ import { ConversationPage } from './pages/ConversationPage';
 import { NewConversationPage } from './pages/NewConversationPage';
 import { DesktopLayout } from './components/DesktopLayout';
 import { useGlobalKeyboardShortcuts } from './hooks';
+import { ConversationProvider } from './conversation';
 import './index.css';
 
 // Wrapper component to use hooks inside router context
@@ -24,7 +25,9 @@ function AppRoutes() {
 function App() {
   return (
     <BrowserRouter>
-      <AppRoutes />
+      <ConversationProvider>
+        <AppRoutes />
+      </ConversationProvider>
     </BrowserRouter>
   );
 }

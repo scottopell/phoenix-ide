@@ -1,5 +1,9 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
-import type { SseEventType, SseEventData, SseInitData, SseMessageData } from '../api';
+import { useState, useCallback, useEffect, useRef, type Dispatch } from 'react';
+import type { SseInitData, SseMessageData, SseStateChangeData } from '../api';
+import type { SSEAction, InitPayload } from '../conversation/atom';
+import type { Breadcrumb } from '../types';
+import { parseConversationState } from '../utils';
+import type { SseBreadcrumb } from '../api';
 import {
   ConnectionState,
   ConnectionMachineState,
@@ -16,23 +20,69 @@ export type { ConnectionState } from './connectionMachine';
 export interface ConnectionInfo {
   state: ConnectionState;
   attempt: number;
-  nextRetryIn: number | null;  // Seconds until next retry (for countdown)
-  lastSequenceId: number | null;
+  nextRetryIn: number | null;
   retryNow: () => void;
 }
 
 interface UseConnectionOptions {
   conversationId: string | undefined;
-  onEvent: (eventType: SseEventType, data: SseEventData) => void;
+  /** Current lastSequenceId from the conversation atom, used to build ?after= URL. */
+  lastSequenceId: number;
+  /** Dispatch SSE events directly to the conversation atom. */
+  dispatch: Dispatch<SSEAction>;
+}
+
+function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
+  return {
+    type: b.type,
+    label: b.label,
+    toolId: b.tool_id,
+    sequenceId: b.sequence_id,
+    preview: b.preview,
+  };
+}
+
+function transformInitData(raw: SseInitData): InitPayload {
+  const conversation = raw.conversation;
+  const messages = raw.messages || [];
+  const phase = parseConversationState(conversation?.state);
+
+  const breadcrumbs = (raw.breadcrumbs || []).map(transformBreadcrumb);
+  const breadcrumbSequenceIds = new Set(
+    breadcrumbs
+      .filter((b): b is Breadcrumb & { sequenceId: number } => b.sequenceId !== undefined)
+      .map((b) => b.sequenceId)
+  );
+
+  return {
+    conversation,
+    messages,
+    phase,
+    breadcrumbs,
+    breadcrumbSequenceIds,
+    contextWindow: {
+      used: raw.context_window_size ?? 0,
+      total: raw.model_context_window ?? 200_000,
+    },
+    lastSequenceId: raw.last_sequence_id ?? 0,
+  };
 }
 
 /**
  * Hook for managing SSE connection lifecycle with reconnection handling.
- * Uses a pure state machine (connectionMachine.ts) for testable state transitions.
+ *
+ * After refactor: this hook is a socket lifecycle manager only.
+ * - It receives `dispatch` from the conversation atom and calls it with SSEActions.
+ * - It receives `lastSequenceId` from the atom for reconnection URL construction.
+ * - It does NOT own lastSequenceId or maintain a seenIds set.
+ *   Deduplication is handled by the reducer's `lastSequenceId >= event.sequenceId` check.
  */
-export function useConnection({ conversationId, onEvent }: UseConnectionOptions): ConnectionInfo {
+export function useConnection({
+  conversationId,
+  lastSequenceId,
+  dispatch,
+}: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
-  const [lastSequenceId, setLastSequenceId] = useState<number | null>(null);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
 
   // Refs for values that shouldn't trigger effect re-runs
@@ -40,39 +90,31 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const reconnectedTimeoutRef = useRef<number | null>(null);
-  const lastSequenceIdRef = useRef<number | null>(null);
-  const seenIdsRef = useRef<Set<number>>(new Set());
-  const onEventRef = useRef(onEvent);
+  const lastSequenceIdRef = useRef<number>(lastSequenceId);
+  const dispatchRef = useRef(dispatch);
   const conversationIdRef = useRef(conversationId);
 
-  // Keep onEvent ref up to date
+  // Keep refs up to date
   useEffect(() => {
-    onEventRef.current = onEvent;
-  }, [onEvent]);
+    lastSequenceIdRef.current = lastSequenceId;
+  }, [lastSequenceId]);
 
-  // Keep conversationId ref up to date
+  useEffect(() => {
+    dispatchRef.current = dispatch;
+  }, [dispatch]);
+
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
 
-  // Track sequence ID from messages (for reconnection within same session)
-  const updateSequenceId = useCallback((seqId: number) => {
-    lastSequenceIdRef.current = seqId;
-    setLastSequenceId(seqId);
-  }, []);
-
-  // Get current context for state machine
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
   }), []);
 
-  // Dispatch function - we'll keep a ref to avoid effect re-runs
-  const dispatchImpl = useCallback((input: ConnectionInput) => {
+  const dispatchMachine = useCallback((input: ConnectionInput) => {
     const ctx = getContext();
     setMachineState((current) => {
       const result = transition(current, input, ctx);
-      // Execute effects after state update
-      // Using setTimeout to avoid state update during render
       if (result.effects.length > 0) {
         setTimeout(() => executeEffectsRef.current(result.effects), 0);
       }
@@ -80,13 +122,11 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
     });
   }, [getContext]);
 
-  // Stable ref to dispatch - use this in effects that shouldn't re-run on callback changes
-  const dispatchRef = useRef(dispatchImpl);
+  const dispatchMachineRef = useRef(dispatchMachine);
   useEffect(() => {
-    dispatchRef.current = dispatchImpl;
-  }, [dispatchImpl]);
+    dispatchMachineRef.current = dispatchMachine;
+  }, [dispatchMachine]);
 
-  // Execute effects from state machine transitions
   const executeEffects = useCallback((effects: ConnectionEffect[]) => {
     for (const effect of effects) {
       switch (effect.type) {
@@ -94,15 +134,13 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
           const convId = conversationIdRef.current;
           if (!convId) break;
 
-          // Close existing connection first
           if (eventSourceRef.current) {
             eventSourceRef.current.close();
             eventSourceRef.current = null;
           }
 
-          // Build URL with after parameter if we have a sequence ID
           let url = `/api/conversations/${convId}/stream`;
-          if (lastSequenceIdRef.current !== null) {
+          if (lastSequenceIdRef.current > 0) {
             url += `?after=${lastSequenceIdRef.current}`;
           }
 
@@ -110,53 +148,73 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
           eventSourceRef.current = es;
 
           es.addEventListener('init', (e) => {
-            const data = JSON.parse((e as MessageEvent).data) as SseInitData;
-
-            // Track sequence ID from init
-            if (data.last_sequence_id !== undefined) {
-              updateSequenceId(data.last_sequence_id);
+            let raw: SseInitData;
+            try {
+              raw = JSON.parse((e as MessageEvent).data) as SseInitData;
+            } catch {
+              dispatchRef.current({
+                type: 'sse_error',
+                error: { type: 'ParseError', raw: (e as MessageEvent).data },
+              });
+              return;
             }
 
-            // Track sequence IDs from messages to dedupe
-            if (data.messages) {
-              for (const msg of data.messages) {
-                seenIdsRef.current.add(msg.sequence_id);
-              }
-            }
-
-            // Signal successful connection to state machine
-            dispatchRef.current({ type: 'SSE_OPEN' });
-            onEventRef.current('init', data);
+            dispatchMachineRef.current({ type: 'SSE_OPEN' });
+            dispatchRef.current({
+              type: 'sse_init',
+              payload: transformInitData(raw),
+            });
+            dispatchRef.current({ type: 'connection_state', state: 'live' });
           });
 
           es.addEventListener('message', (e) => {
-            const data = JSON.parse((e as MessageEvent).data) as SseMessageData;
-            const msg = data.message;
-
-            if (msg) {
-              // Deduplicate by sequence_id
-              if (seenIdsRef.current.has(msg.sequence_id)) {
-                return;
-              }
-              seenIdsRef.current.add(msg.sequence_id);
-              updateSequenceId(msg.sequence_id);
+            let data: SseMessageData;
+            try {
+              data = JSON.parse((e as MessageEvent).data) as SseMessageData;
+            } catch {
+              dispatchRef.current({
+                type: 'sse_error',
+                error: { type: 'ParseError', raw: (e as MessageEvent).data },
+              });
+              return;
             }
 
-            onEventRef.current('message', data);
+            const msg = data.message;
+            if (msg) {
+              dispatchRef.current({
+                type: 'sse_message',
+                message: msg,
+                sequenceId: msg.sequence_id,
+              });
+            }
           });
 
           es.addEventListener('state_change', (e) => {
-            const data = JSON.parse((e as MessageEvent).data);
-            onEventRef.current('state_change', data);
+            let data: SseStateChangeData;
+            try {
+              data = JSON.parse((e as MessageEvent).data) as SseStateChangeData;
+            } catch {
+              dispatchRef.current({
+                type: 'sse_error',
+                error: { type: 'ParseError', raw: (e as MessageEvent).data },
+              });
+              return;
+            }
+
+            dispatchRef.current({
+              type: 'sse_state_change',
+              phase: data.state,
+              // sequenceId intentionally absent — backend doesn't provide it on state_change
+            });
           });
 
           es.addEventListener('agent_done', () => {
-            onEventRef.current('agent_done', {});
+            dispatchRef.current({ type: 'sse_agent_done' });
           });
 
           es.addEventListener('error', () => {
-            dispatchRef.current({ type: 'SSE_ERROR' });
-            onEventRef.current('disconnected', {});
+            dispatchMachineRef.current({ type: 'SSE_ERROR' });
+            dispatchRef.current({ type: 'connection_state', state: 'reconnecting' });
           });
           break;
         }
@@ -166,11 +224,11 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
             eventSourceRef.current.close();
             eventSourceRef.current = null;
           }
+          dispatchRef.current({ type: 'connection_state', state: 'connecting' });
           break;
         }
 
         case 'SCHEDULE_RETRY': {
-          // Clear existing timers
           if (retryTimeoutRef.current !== null) {
             clearTimeout(retryTimeoutRef.current);
           }
@@ -178,7 +236,6 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
             clearInterval(countdownIntervalRef.current);
           }
 
-          // Start countdown
           const seconds = Math.ceil(effect.delayMs / 1000);
           setCountdownSeconds(seconds);
 
@@ -192,11 +249,12 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
             }
           }, 1000);
 
-          // Schedule retry
           retryTimeoutRef.current = window.setTimeout(() => {
             retryTimeoutRef.current = null;
-            dispatchRef.current({ type: 'RETRY_TIMER_FIRED' });
+            dispatchMachineRef.current({ type: 'RETRY_TIMER_FIRED' });
           }, effect.delayMs);
+
+          dispatchRef.current({ type: 'connection_state', state: 'reconnecting' });
           break;
         }
 
@@ -206,7 +264,7 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
           }
           reconnectedTimeoutRef.current = window.setTimeout(() => {
             reconnectedTimeoutRef.current = null;
-            dispatchRef.current({ type: 'RECONNECTED_DISPLAY_DONE' });
+            dispatchMachineRef.current({ type: 'RECONNECTED_DISPLAY_DONE' });
           }, RECONNECTED_DISPLAY_MS);
           break;
         }
@@ -229,18 +287,16 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
         }
       }
     }
-  }, [updateSequenceId]);
+  }, []);
 
-  // Stable ref to executeEffects
   const executeEffectsRef = useRef(executeEffects);
   useEffect(() => {
     executeEffectsRef.current = executeEffects;
   }, [executeEffects]);
 
-  // Handle online/offline events
   useEffect(() => {
-    const handleOnline = () => dispatchRef.current({ type: 'BROWSER_ONLINE' });
-    const handleOffline = () => dispatchRef.current({ type: 'BROWSER_OFFLINE' });
+    const handleOnline = () => dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
+    const handleOffline = () => dispatchMachineRef.current({ type: 'BROWSER_OFFLINE' });
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -249,44 +305,38 @@ export function useConnection({ conversationId, onEvent }: UseConnectionOptions)
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, []); // No dependencies - handlers use refs
+  }, []);
 
-  // Handle visibility change - retry immediately when user tabs back
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && navigator.onLine) {
-        dispatchRef.current({ type: 'BROWSER_ONLINE' });
+        dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
       }
     };
     document.addEventListener('visibilitychange', handleVisibility);
     return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, []);
 
-  // Connect when conversationId changes
   useEffect(() => {
     if (conversationId) {
-      // Reset for new conversation
-      seenIdsRef.current.clear();
-      dispatchRef.current({ type: 'CONNECT' });
+      dispatchMachineRef.current({ type: 'CONNECT' });
     } else {
-      dispatchRef.current({ type: 'DISCONNECT' });
+      dispatchMachineRef.current({ type: 'DISCONNECT' });
     }
 
     return () => {
-      dispatchRef.current({ type: 'DISCONNECT' });
+      dispatchMachineRef.current({ type: 'DISCONNECT' });
     };
-  }, [conversationId]); // Only depends on conversationId - dispatch accessed via ref
+  }, [conversationId]);
 
-  // Expose manual retry (reuses BROWSER_ONLINE to cancel timers + open SSE)
   const retryNow = useCallback(() => {
-    dispatchRef.current({ type: 'BROWSER_ONLINE' });
+    dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
   }, []);
 
   return {
     state: machineState.state,
     attempt: machineState.attempt,
     nextRetryIn: countdownSeconds,
-    lastSequenceId,
     retryNow,
   };
 }
