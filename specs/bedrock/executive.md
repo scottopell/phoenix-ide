@@ -36,7 +36,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
 | **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |
 | **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
-| **REQ-BED-025:** Token-by-Token LLM Output | ❌ Not Started | Fire-and-forget `StreamToken` effects via SSE |
-| **REQ-BED-026:** Sub-Agent Timeout Enforcement | ❌ Not Started | Mandatory `timeout: Duration`, deadline in state |
+| **REQ-BED-025:** Token-by-Token LLM Output | ✅ Complete | Task 582. Fire-and-forget `StreamToken` effects via SSE |
+| **REQ-BED-026:** Sub-Agent Timeout Enforcement | ✅ Complete | Task 578. Mandatory `timeout: Duration`, deadline in executor `select!` |
 
-**Progress:** 19 of 26 complete
+**Progress:** 21 of 26 complete

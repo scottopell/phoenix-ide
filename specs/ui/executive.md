@@ -18,8 +18,8 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-UI-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry |
 | **REQ-UI-005:** Connection Status | ✅ Complete | Reconnection with backoff |
 | **REQ-UI-006:** Reconnection Data Integrity | ✅ Complete | Sequence-based deduplication |
-| **REQ-UI-007:** Agent Activity Indicators | 🔄 In Progress | Exhaustive state labels done; discriminated union switch pending |
-| **REQ-UI-007a:** Breadcrumb Trail | 🔄 In Progress | Basic trail done; result summaries and sequenceId dedup pending |
+| **REQ-UI-007:** Agent Activity Indicators | ✅ Complete | Task 579. Discriminated union, exhaustive switch with `satisfies never` |
+| **REQ-UI-007a:** Breadcrumb Trail | 🟡 Functional with gaps | Task 581. sequenceId dedup done; result summaries in tooltips still pending |
 | **REQ-UI-008:** Cancellation | ✅ Complete | Cancel button during agent work |
 | **REQ-UI-009:** New Conversation | ⚠️ Deprecated | Replaced by REQ-UI-015, 017, 018 |
 | **REQ-UI-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts |
@@ -31,7 +31,7 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-UI-016:** Desktop Sidebar Layout | ✅ Complete | Task 563 |
 | **REQ-UI-017:** Desktop New Conversation - Full Page Mode | ✅ Complete | Task 563 |
 | **REQ-UI-018:** Desktop New Conversation - Inline Sidebar Mode | ✅ Complete | Task 563 |
-| **REQ-UI-019:** Streaming Text Display | ❌ Not Started | Progressive text display during LLM generation |
-| **REQ-UI-020:** Navigation Persistence | ❌ Not Started | Router-level context, `lastSequenceId` survives navigation |
+| **REQ-UI-019:** Streaming Text Display | ✅ Complete | Task 582. `StreamingMessage` component, atomic swap in reducer |
+| **REQ-UI-020:** Navigation Persistence | ✅ Complete | Task 581. Router-level `ConversationProvider`, `lastSequenceId` in atom |
 
-**Progress:** 16 of 20 active requirements complete (1 deprecated, 1 split into 007+007a)
+**Progress:** 19 of 20 active requirements complete (1 deprecated, 1 functional-with-gaps)

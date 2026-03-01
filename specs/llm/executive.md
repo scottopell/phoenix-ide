@@ -21,6 +21,6 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-006:** Error Classification | ✅ Complete | LlmErrorKind with is_retryable() |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-008:** Request Logging | ✅ Complete | LoggingService wrapper with tracing |
-| **REQ-LLM-009:** Streaming Responses | ❌ Not Started | `complete_streaming()` on `LlmService` trait |
+| **REQ-LLM-009:** Streaming Responses | ✅ Complete | Task 582. `complete_streaming()` on `LlmClient` trait, Anthropic implemented, OpenAI falls back |
 
-**Progress:** 9 of 10 complete
+**Progress:** 10 of 10 complete

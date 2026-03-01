@@ -17,6 +17,6 @@ Parent state machine accumulates `pending_sub_agents` during `ToolExecuting`, tr
 | **REQ-SA-003:** Result Submission | ✅ Complete | `submit_result`/`submit_error` tools |
 | **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer, conservation invariant tested |
 | **REQ-SA-005:** Cancellation Propagation | ✅ Complete | `CancellingSubAgents` state |
-| **REQ-SA-006:** Timeout Enforcement | ❌ Not Started | Mandatory timeout, deadline in state |
+| **REQ-SA-006:** Timeout Enforcement | ✅ Complete | Task 578. `DEFAULT_SUBAGENT_TIMEOUT = 5min`, deadline in executor `select!` |
 
-**Progress:** 5 of 6 complete
+**Progress:** 6 of 6 complete
