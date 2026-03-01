@@ -10,6 +10,284 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Accumulates state across Anthropic SSE stream events to assemble the final response.
+struct StreamAccumulator {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    stop_reason: Option<String>,
+    content_blocks: Vec<(usize, AnthropicContentBlock)>,
+    // Current block being parsed
+    current_index: Option<usize>,
+    current_is_text: bool,
+    current_text: String,
+    current_tool_id: String,
+    current_tool_name: String,
+    current_tool_json: String,
+    /// Set true when `message_stop` is received — signals outer loop to stop
+    pub done: bool,
+}
+
+impl StreamAccumulator {
+    fn new() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            stop_reason: None,
+            content_blocks: Vec::new(),
+            current_index: None,
+            current_is_text: false,
+            current_text: String::new(),
+            current_tool_id: String::new(),
+            current_tool_name: String::new(),
+            current_tool_json: String::new(),
+            done: false,
+        }
+    }
+
+    /// Process one complete SSE event (`event_type` + JSON data).
+    fn process_event(
+        &mut self,
+        event_type: &str,
+        data: &str,
+        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    ) -> Result<(), LlmError> {
+        let v: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+            LlmError::invalid_response(format!("Failed to parse SSE data: {e} - data: {data}"))
+        })?;
+        match event_type {
+            "message_start" => {
+                self.input_tokens = v
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                self.cache_creation_tokens = v
+                    .pointer("/message/usage/cache_creation_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                self.cache_read_tokens = v
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+            }
+            "content_block_start" => self.on_block_start(&v),
+            "content_block_delta" => self.on_block_delta(&v, chunk_tx),
+            "content_block_stop" => self.on_block_stop(),
+            "message_delta" => {
+                if let Some(sr) = v
+                    .pointer("/delta/stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.stop_reason = Some(sr.to_string());
+                }
+                self.output_tokens = v
+                    .pointer("/usage/output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(self.output_tokens);
+            }
+            "message_stop" => self.done = true,
+            _ => {} // "ping" and unknown events ignored
+        }
+        Ok(())
+    }
+
+    fn on_block_start(&mut self, v: &serde_json::Value) {
+        let idx = usize::try_from(
+            v.get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let block_type = v
+            .pointer("/content_block/type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("text");
+        self.current_index = Some(idx);
+        self.current_is_text = block_type == "text";
+        if self.current_is_text {
+            self.current_text.clear();
+        } else {
+            self.current_tool_id = v
+                .pointer("/content_block/id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            self.current_tool_name = v
+                .pointer("/content_block/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            self.current_tool_json.clear();
+        }
+    }
+
+    fn on_block_delta(
+        &mut self,
+        v: &serde_json::Value,
+        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    ) {
+        let delta_type = v
+            .pointer("/delta/type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        match delta_type {
+            "text_delta" => {
+                if let Some(text) = v.pointer("/delta/text").and_then(serde_json::Value::as_str) {
+                    self.current_text.push_str(text);
+                    // Forward token to UI — failures are fine (ephemeral, no subscribers)
+                    let _ = chunk_tx.send(super::TokenChunk::Text(text.to_string()));
+                }
+            }
+            "input_json_delta" => {
+                if let Some(partial) = v
+                    .pointer("/delta/partial_json")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.current_tool_json.push_str(partial);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_block_stop(&mut self) {
+        let Some(idx) = self.current_index.take() else {
+            return;
+        };
+        if self.current_is_text {
+            if !self.current_text.is_empty() {
+                self.content_blocks.push((
+                    idx,
+                    AnthropicContentBlock::Text {
+                        text: self.current_text.clone(),
+                    },
+                ));
+            }
+        } else {
+            let input: serde_json::Value = serde_json::from_str(&self.current_tool_json)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            self.content_blocks.push((
+                idx,
+                AnthropicContentBlock::ToolUse {
+                    id: self.current_tool_id.clone(),
+                    name: self.current_tool_name.clone(),
+                    input,
+                },
+            ));
+        }
+    }
+
+    fn into_response(mut self) -> Result<LlmResponse, LlmError> {
+        self.content_blocks.sort_by_key(|(idx, _)| *idx);
+        normalize_response(AnthropicResponse {
+            content: self.content_blocks.into_iter().map(|(_, b)| b).collect(),
+            stop_reason: self.stop_reason,
+            usage: AnthropicUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                cache_creation_input_tokens: Some(self.cache_creation_tokens),
+                cache_read_input_tokens: Some(self.cache_read_tokens),
+            },
+        })
+    }
+}
+
+/// Complete using Anthropic Messages API with streaming.
+///
+/// Emits `TokenChunk::Text` events via `chunk_tx` as text tokens arrive,
+/// then returns the fully assembled `LlmResponse`.
+pub async fn complete_streaming(
+    spec: &ModelSpec,
+    api_key: &str,
+    gateway: Option<&str>,
+    request: &LlmRequest,
+    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+) -> Result<LlmResponse, LlmError> {
+    use futures::StreamExt;
+
+    let base_url = match gateway {
+        Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
+        None => "https://api.anthropic.com/v1/messages".to_string(),
+    };
+    let client = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut anthropic_request = translate_request(&spec.api_name, request);
+    anthropic_request.stream = Some(true);
+
+    let response = client
+        .post(&base_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .header("source", LLM_SOURCE_HEADER)
+        .json(&anthropic_request)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                LlmError::network(format!("Request timeout: {e}"))
+            } else if e.is_connect() {
+                LlmError::network(format!("Connection failed: {e}"))
+            } else {
+                LlmError::network(format!("Request failed: {e}"))
+            }
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
+    }
+
+    let mut acc = StreamAccumulator::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut current_event = String::new();
+    let mut current_data = String::new();
+    let mut stream = response.bytes_stream();
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
+        byte_buf.extend_from_slice(&chunk);
+
+        loop {
+            let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line = std::str::from_utf8(&byte_buf[..nl_pos])
+                .unwrap_or("")
+                .trim_end_matches('\r')
+                .to_string();
+            byte_buf.drain(..=nl_pos);
+
+            if line.is_empty() {
+                if !current_data.is_empty() {
+                    acc.process_event(&current_event, &current_data, chunk_tx)?;
+                    current_event.clear();
+                    current_data.clear();
+                    if acc.done {
+                        break 'outer;
+                    }
+                }
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                current_data = data.to_string();
+            } else if let Some(event) = line.strip_prefix("event: ") {
+                current_event = event.to_string();
+            }
+        }
+    }
+
+    acc.into_response()
+}
+
 /// Complete using Anthropic Messages API
 pub async fn complete(
     spec: &ModelSpec,
@@ -100,6 +378,7 @@ fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicReq
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
+        stream: None,
     }
 }
 
@@ -234,6 +513,8 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

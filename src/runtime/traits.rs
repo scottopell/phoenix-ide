@@ -63,8 +63,20 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// Complete an LLM request
+    /// Complete an LLM request (non-streaming)
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
+
+    /// Streaming completion — emits `TokenChunk::Text` events via `chunk_tx` as tokens
+    /// arrive, then returns the fully assembled `LlmResponse`.
+    /// Default implementation calls `complete()` with no streaming.
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = chunk_tx;
+        self.complete(request).await
+    }
 
     /// Get the model ID
     #[allow(dead_code)] // API completeness
@@ -150,6 +162,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         (**self).complete(request).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        (**self).complete_streaming(request, chunk_tx).await
     }
 
     fn model_id(&self) -> &str {
@@ -288,6 +308,20 @@ impl LlmClient for RegistryLlmClient {
             ))
         })?;
         llm.complete(request).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let llm = self.registry.get(&self.model_id).ok_or_else(|| {
+            LlmError::network(format!(
+                "Model '{}' is not available in the registry",
+                self.model_id
+            ))
+        })?;
+        llm.complete_streaming(request, chunk_tx).await
     }
 
     fn model_id(&self) -> &str {

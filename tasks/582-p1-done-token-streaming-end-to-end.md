@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 582
 priority: p1
-status: ready
+status: done
 slug: token-streaming-end-to-end
 title: "Token streaming end-to-end: LLM provider → SSE → UI display"
 ---

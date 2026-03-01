@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Message, ToolResultContent, ConversationState } from '../api'; // ConversationState used in MessageListProps
 import type { QueuedMessage } from '../hooks';
+import type { StreamingBuffer } from '../conversation/atom';
 import {
   UserMessage,
   QueuedUserMessage,
   AgentMessage,
   SubAgentStatus,
 } from './MessageComponents';
+import { StreamingMessage } from './StreamingMessage';
 
 interface MessageListProps {
   messages: Message[];
@@ -16,6 +18,7 @@ interface MessageListProps {
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string;
   conversationId?: string | undefined;
+  streamingBuffer?: StreamingBuffer | null;
 }
 
 const PREVIEW_LENGTH = 150;
@@ -26,7 +29,7 @@ const SCROLL_THRESHOLD = 100;
 const SCROLL_KEY_PREFIX = 'phoenix:scroll:';
 const MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
 
-export function MessageList({ messages, queuedMessages, convState, onRetry, onOpenFile, systemPrompt, conversationId }: MessageListProps) {
+export function MessageList({ messages, queuedMessages, convState, onRetry, onOpenFile, systemPrompt, conversationId, streamingBuffer }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [showJumpToNewest, setShowJumpToNewest] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
@@ -92,6 +95,19 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
       });
     }
   }, [convState, scrollToBottom]);
+
+  // Auto-scroll when streaming buffer grows (REQ-UI-019)
+  useEffect(() => {
+    if (!streamingBuffer) return;
+    if (isPinnedToBottom.current) {
+      requestAnimationFrame(() => {
+        scrollToBottom();
+      });
+    } else {
+      // User has scrolled up — show "jump to live" affordance
+      setShowJumpToNewest(true);
+    }
+  }, [streamingBuffer?.text, scrollToBottom]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save scroll position on unmount / visibility change (REQ-UI-013)
   useEffect(() => {
@@ -219,6 +235,8 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
               {convState.type === 'awaiting_sub_agents' && (
                 <SubAgentStatus stateData={convState} />
               )}
+              {/* Streaming text — cleared atomically when sse_message arrives (REQ-UI-019) */}
+              <StreamingMessage buffer={streamingBuffer ?? null} />
             </>
           )}
         </div>

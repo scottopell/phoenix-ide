@@ -97,6 +97,11 @@ pub enum SseEvent {
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
     },
+    /// Ephemeral streaming token — not persisted, no `sequence_id` (REQ-BED-025)
+    Token {
+        text: String,
+        request_id: String,
+    },
     AgentDone,
     Error {
         message: String,

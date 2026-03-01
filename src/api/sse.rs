@@ -82,6 +82,14 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 "display_state": display_state
             }),
         ),
+        SseEvent::Token { text, request_id } => (
+            "token",
+            json!({
+                "type": "token",
+                "text": text,
+                "request_id": request_id
+            }),
+        ),
         SseEvent::AgentDone => (
             "agent_done",
             json!({

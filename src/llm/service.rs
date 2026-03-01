@@ -2,8 +2,9 @@
 
 use super::models::{ApiFormat, ModelSpec};
 use super::types::{LlmRequest, LlmResponse};
-use super::{anthropic, openai, LlmError, LlmService};
+use super::{anthropic, openai, LlmError, LlmService, TokenChunk};
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
 /// Unified service implementation that dispatches by API format
 pub struct LlmServiceImpl {
@@ -32,6 +33,33 @@ impl LlmService for LlmServiceImpl {
             }
             ApiFormat::OpenAIChat => {
                 openai::complete(&self.spec, &self.api_key, self.gateway.as_deref(), request).await
+            }
+        }
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        match self.spec.api_format {
+            ApiFormat::Anthropic => {
+                anthropic::complete_streaming(
+                    &self.spec,
+                    &self.api_key,
+                    self.gateway.as_deref(),
+                    request,
+                    chunk_tx,
+                )
+                .await
+            }
+            ApiFormat::OpenAIChat => {
+                // OpenAI streaming not yet implemented — fall back to non-streaming
+                tracing::debug!(
+                    provider = "openai",
+                    "complete_streaming not implemented for OpenAI, falling back to complete()"
+                );
+                self.complete(request).await
             }
         }
     }

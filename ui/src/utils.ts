@@ -75,8 +75,11 @@ export function getStateDescription(state: ConversationState): string {
     case 'llm_requesting':
       return state.attempt > 1 ? `thinking (retry ${state.attempt})...` : 'thinking...';
     case 'tool_executing': {
-      const tool = state.current_tool.input?._tool || 'tool';
-      const remaining = state.remaining_tools.length;
+      const tool =
+        state.current_tool?.input?._tool ||
+        (state.current_tool as { name?: string } | undefined)?.name ||
+        'tool';
+      const remaining = state.remaining_tools?.length ?? 0;
       return remaining > 0 ? `${tool} (+${remaining} queued)` : String(tool);
     }
     case 'awaiting_sub_agents': {

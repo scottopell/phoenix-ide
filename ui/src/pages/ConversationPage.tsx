@@ -431,6 +431,7 @@ export function ConversationPage() {
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
         conversationId={conversationId}
+        streamingBuffer={atom.streamingBuffer}
         {...(atom.systemPrompt !== undefined && atom.systemPrompt !== null && {
           systemPrompt: atom.systemPrompt,
         })}

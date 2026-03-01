@@ -571,9 +571,37 @@ where
                 let working_dir = self.context.working_dir.clone();
                 let is_sub_agent = self.context.is_sub_agent;
 
+                // Token streaming channel (REQ-BED-025)
+                // Broadcast so the forwarding task can subscribe before the LLM task starts.
+                let (chunk_tx, chunk_rx) = broadcast::channel::<crate::llm::TokenChunk>(256);
+                let request_id = uuid::Uuid::new_v4().to_string();
+
+                // Spawn token forwarding task BEFORE the LLM task to avoid missing early tokens.
+                // Reads TokenChunk::Text events and forwards them as SseEvent::Token.
+                let broadcast_tx_for_tokens = self.broadcast_tx.clone();
+                let request_id_for_fwd = request_id.clone();
+                tokio::spawn(async move {
+                    let mut rx = chunk_rx;
+                    loop {
+                        match rx.recv().await {
+                            Ok(crate::llm::TokenChunk::Text(text)) => {
+                                let _ = broadcast_tx_for_tokens.send(SseEvent::Token {
+                                    text,
+                                    request_id: request_id_for_fwd.clone(),
+                                });
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::debug!(n, "Token forwarding lagged — some tokens dropped");
+                            }
+                        }
+                    }
+                });
+
                 let handle = tokio::spawn(async move {
                     tracing::info!(
                         is_sub_agent = is_sub_agent,
+                        request_id = %request_id,
                         "Making LLM request (background)"
                     );
 
@@ -598,7 +626,11 @@ where
                         max_tokens: Some(8192),
                     };
 
-                    let llm_outcome = match llm_client.complete(&request).await {
+                    // Use streaming — chunk_tx forwards text tokens to SSE clients.
+                    // Dropping chunk_tx here (after await) closes the channel and
+                    // terminates the forwarding task.
+                    let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await
+                    {
                         Ok(response) => {
                             // Extract tool calls from content and convert to typed ToolCall
                             let tool_calls: Vec<ToolCall> = response
@@ -620,6 +652,7 @@ where
                         }
                         Err(e) => llm_error_to_outcome(e),
                     };
+                    // chunk_tx dropped here — closes broadcast, forwarding task exits
                     // Send typed outcome through oneshot channel
                     let _ = llm_tx.send(llm_outcome);
                 });

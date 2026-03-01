@@ -212,6 +212,27 @@ export function useConnection({
             dispatchRef.current({ type: 'sse_agent_done' });
           });
 
+          // Per-connection monotonic counter for sse_token dedup.
+          // Reset on each new connection so the reducer's lastSequence check works correctly.
+          let tokenSequence = 0;
+          es.addEventListener('token', (e) => {
+            let data: { text?: string; request_id?: string };
+            try {
+              data = JSON.parse((e as MessageEvent).data) as typeof data;
+            } catch {
+              // Token parse failures are non-fatal — ephemeral events, skip silently
+              return;
+            }
+            if (data.text) {
+              tokenSequence++;
+              dispatchRef.current({
+                type: 'sse_token',
+                delta: data.text,
+                sequence: tokenSequence,
+              });
+            }
+          });
+
           es.addEventListener('error', () => {
             dispatchMachineRef.current({ type: 'SSE_ERROR' });
             dispatchRef.current({ type: 'connection_state', state: 'reconnecting' });
