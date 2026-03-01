@@ -2,7 +2,7 @@
 created: 2026-02-18
 id: 556
 priority: p2
-status: ready
+status: done
 title: Switch to ChromeHeadlessShell for smaller download
 ---
 

@@ -8,7 +8,7 @@
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
     cdp::js_protocol::runtime::{EventConsoleApiCalled, RemoteObject},
-    fetcher::{BrowserFetcher, BrowserFetcherOptions},
+    fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
     Page,
 };
 use futures::StreamExt;
@@ -269,6 +269,7 @@ impl BrowserSession {
 
         let fetcher_opts = BrowserFetcherOptions::builder()
             .with_path(&cache_dir)
+            .with_kind(BrowserKind::ChromeHeadlessShell)
             .build()
             .map_err(|e| BrowserError::LaunchFailed(format!("Fetcher config error: {e}")))?;
 
