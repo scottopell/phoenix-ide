@@ -1,7 +1,7 @@
 ---
 created: 2025-02-09
 priority: p2
-status: ready
+status: done
 ---
 
 # Preserve scroll position when navigating back to conversation list

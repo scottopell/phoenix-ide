@@ -130,8 +130,14 @@ export function ConversationListPage() {
   useEffect(() => {
     if (!loading && !scrollRestoredRef.current && conversations.length > 0) {
       const savedPosition = sessionStorage.getItem('conversationListScrollPosition');
-      if (savedPosition) {
-        window.scrollTo(0, parseInt(savedPosition, 10));
+      if (savedPosition && mainRef.current) {
+        const target = parseInt(savedPosition, 10);
+        // Use rAF to ensure the list items are painted before scrolling
+        requestAnimationFrame(() => {
+          if (mainRef.current) {
+            mainRef.current.scrollTop = target;
+          }
+        });
         sessionStorage.removeItem('conversationListScrollPosition');
       }
       scrollRestoredRef.current = true;
@@ -140,7 +146,9 @@ export function ConversationListPage() {
 
   // Save scroll position before navigating away
   const handleConversationClick = useCallback((conv: Conversation) => {
-    sessionStorage.setItem('conversationListScrollPosition', window.scrollY.toString());
+    if (mainRef.current) {
+      sessionStorage.setItem('conversationListScrollPosition', mainRef.current.scrollTop.toString());
+    }
     navigate(`/c/${conv.slug}`);
   }, [navigate]);
 
