@@ -1,7 +1,7 @@
 ---
 id: 017
 title: Fix flaky prop_clipboard_cut_paste_preserves test
-status: ready
+status: done
 priority: p3
 created: 2025-02-15
 ---

@@ -1,6 +1,6 @@
 ---
 created: 2026-03-01
-number: 583
+number: 589
 priority: p1
 status: done
 slug: openai-streaming

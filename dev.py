@@ -647,6 +647,19 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
             if name != expected:
                 errors.append(f"{name}: filename doesn't match frontmatter, expected: {expected}")
 
+    # Check for duplicate task numbers
+    from collections import defaultdict
+    number_map = defaultdict(list)
+    for path in task_files:
+        if path == template:
+            continue
+        task = parse_task_file(path)
+        if task:
+            number_map[task["number"]].append(path.name)
+    for num, files in sorted(number_map.items()):
+        if len(files) > 1:
+            errors.append(f"duplicate task number {num}: {', '.join(files)}")
+
     if errors:
         if not quiet:
             print(f"✗ {len(errors)} task validation error(s):")
