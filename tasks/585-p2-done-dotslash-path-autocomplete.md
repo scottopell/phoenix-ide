@@ -1,7 +1,7 @@
 ---
 created: 2025-01-28
 priority: p2
-status: ready
+status: done
 spec: specs/inline-references/
 ---
 
@@ -26,13 +26,17 @@ No `MessageExpander` involvement. This is entirely a frontend autocomplete assis
 
 ## Acceptance Criteria
 
-- [ ] Typing `./` anywhere in the message input opens the file autocomplete dropdown
-- [ ] Dropdown filters by fuzzy match as the user continues typing
-- [ ] Selecting a file inserts `./path/to/file` at the cursor as plain text
-- [ ] Sending a message with `./path/to/file` delivers that literal string to the LLM unchanged
-- [ ] No send-time validation or blocking occurs for `./` references
-- [ ] `./dev.py check` passes
+- [x] Typing `./` anywhere in the message input opens the file autocomplete dropdown
+- [x] Dropdown filters by fuzzy match as the user continues typing
+- [x] Selecting a file inserts `./path/to/file` at the cursor as plain text
+- [x] Sending a message with `./path/to/file` delivers that literal string to the LLM unchanged
+- [x] No send-time validation or blocking occurs for `./` references
+- [x] `./dev.py check` passes
 
 ## Dependencies
 
 Task 546 should land first (or alongside) — it builds the `InlineAutocomplete` component and the file search endpoint this task reuses.
+
+## Implementation Notes
+
+All functionality was already implemented as part of Task 546 (`@file` autocomplete). The `InlineAutocomplete` component's `detectTrigger()` already handled `./` trigger detection, the `InputArea` already called `fetchFileItems()` for both `expand` and `path` modes, and `handleAcSelect` already handled path mode by inserting `./path` as literal text. No additional code was needed.
