@@ -1,4 +1,4 @@
-import type { ConversationState, Message, Conversation } from '../api';
+import type { ConversationState, Message, Conversation, ToolResultContent } from '../api';
 import type { Breadcrumb } from '../types';
 
 export interface StreamingBuffer {
@@ -105,6 +105,21 @@ export function breadcrumbFromPhase(
   }
 }
 
+function deriveResultSummary(result: ToolResultContent): string {
+  const MAX_LEN = 80;
+  const truncate = (s: string) => (s.length > MAX_LEN ? s.slice(0, MAX_LEN - 1) + '…' : s);
+
+  const outputText = result.content ?? result.result ?? result.error ?? '';
+
+  if (result.is_error) {
+    const firstLine = outputText.split('\n').find((l) => l.trim()) ?? 'error';
+    return truncate(`error: ${firstLine.trim()}`);
+  }
+
+  const firstLine = outputText.split('\n').find((l) => l.trim()) ?? 'done';
+  return truncate(firstLine.trim());
+}
+
 function applyBreadcrumb(
   breadcrumbs: Breadcrumb[],
   breadcrumbSequenceIds: ReadonlySet<number>,
@@ -204,14 +219,31 @@ export function conversationReducer(
       const isUserMessage =
         action.message.message_type === 'user' || action.message.type === 'user';
 
+      let breadcrumbs: Breadcrumb[] = isUserMessage
+        ? [{ type: 'user', label: 'User' }]
+        : atom.breadcrumbs;
+
+      // Tool result message: update matching breadcrumb with result summary
+      if (!isUserMessage && action.message.message_type === 'tool') {
+        const toolResult = action.message.content as ToolResultContent;
+        if (toolResult.tool_use_id) {
+          const matchIdx = breadcrumbs.findIndex(
+            (b) => b.type === 'tool' && b.toolId === toolResult.tool_use_id
+          );
+          if (matchIdx >= 0) {
+            const summary = deriveResultSummary(toolResult);
+            breadcrumbs = [...breadcrumbs];
+            breadcrumbs[matchIdx] = { ...breadcrumbs[matchIdx]!, resultSummary: summary };
+          }
+        }
+      }
+
       return {
         ...atom,
         messages: newMessages,
         lastSequenceId: action.sequenceId,
         streamingBuffer: null,
-        breadcrumbs: isUserMessage
-          ? [{ type: 'user', label: 'User' }]
-          : atom.breadcrumbs,
+        breadcrumbs,
       };
     }
 

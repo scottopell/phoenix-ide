@@ -77,7 +77,8 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
             b.type === 'subagents' ? 'subagents' : '',
           ].filter(Boolean).join(' ');
 
-          const showTooltip = hoveredIndex === i && b.preview;
+          const tooltipText = b.resultSummary ?? b.preview;
+          const showTooltip = hoveredIndex === i && !!tooltipText;
 
           return (
             <span key={`${b.type}-${i}-${b.toolId || ''}`}>
@@ -92,7 +93,7 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
                 {showTooltip && (
                   <span className="breadcrumb-tooltip">
                     <strong>{b.label}</strong>
-                    <span className="breadcrumb-tooltip-preview">{b.preview}</span>
+                    <span className="breadcrumb-tooltip-preview">{tooltipText}</span>
                   </span>
                 )}
               </span>

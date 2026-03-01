@@ -193,6 +193,74 @@ describe('conversationReducer', () => {
       expect((next.messages[0]!.content as { text: string }).text).toBe('updated');
     });
 
+    it('updates resultSummary on matching tool breadcrumb when tool result arrives', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        breadcrumbs: [
+          { type: 'user', label: 'User' },
+          { type: 'tool', label: 'bash', toolId: 'toolu-abc', sequenceId: 5 },
+        ],
+      };
+      const toolResultMsg: Message = {
+        message_id: 'msg-10',
+        sequence_id: 10,
+        conversation_id: 'conv-1',
+        message_type: 'tool',
+        content: { tool_use_id: 'toolu-abc', content: 'hello world\nmore output', is_error: false } as Message['content'],
+        created_at: '2024-01-01T00:00:00Z',
+      };
+
+      const next = dispatch(atom, { type: 'sse_message', message: toolResultMsg, sequenceId: 10 });
+
+      const toolCrumb = next.breadcrumbs.find((b) => b.toolId === 'toolu-abc');
+      expect(toolCrumb?.resultSummary).toBe('hello world');
+    });
+
+    it('sets error resultSummary when tool result is an error', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        breadcrumbs: [
+          { type: 'tool', label: 'bash', toolId: 'toolu-xyz', sequenceId: 5 },
+        ],
+      };
+      const toolResultMsg: Message = {
+        message_id: 'msg-11',
+        sequence_id: 11,
+        conversation_id: 'conv-1',
+        message_type: 'tool',
+        content: {
+          tool_use_id: 'toolu-xyz',
+          content: '[command failed: exit code 1]\nsome output',
+          is_error: true,
+        } as Message['content'],
+        created_at: '2024-01-01T00:00:00Z',
+      };
+
+      const next = dispatch(atom, { type: 'sse_message', message: toolResultMsg, sequenceId: 11 });
+
+      const toolCrumb = next.breadcrumbs.find((b) => b.toolId === 'toolu-xyz');
+      expect(toolCrumb?.resultSummary).toBe('error: [command failed: exit code 1]');
+    });
+
+    it('does not modify breadcrumbs when tool_use_id has no matching breadcrumb', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        breadcrumbs: [{ type: 'tool', label: 'bash', toolId: 'toolu-other', sequenceId: 5 }],
+      };
+      const toolResultMsg: Message = {
+        message_id: 'msg-12',
+        sequence_id: 12,
+        conversation_id: 'conv-1',
+        message_type: 'tool',
+        content: { tool_use_id: 'toolu-nomatch', content: 'output' } as Message['content'],
+        created_at: '2024-01-01T00:00:00Z',
+      };
+
+      const next = dispatch(atom, { type: 'sse_message', message: toolResultMsg, sequenceId: 12 });
+
+      expect(next.breadcrumbs[0]?.resultSummary).toBeUndefined();
+    });
+
     it('resets breadcrumbs on user message', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),

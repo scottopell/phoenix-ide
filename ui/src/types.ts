@@ -6,6 +6,7 @@ export interface Breadcrumb {
   toolId?: string | undefined;
   sequenceId?: number | undefined;
   preview?: string | undefined;
+  resultSummary?: string | undefined;
 }
 
 
