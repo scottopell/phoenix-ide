@@ -441,17 +441,25 @@ export function ProseReader({
   const renderMarkdown = useMemo(() => {
     if (!content || fileType !== 'markdown') return null;
 
+    // Pre-split the raw source so annotatable blocks can extract actual line text
+    const rawLines = content.split('\n');
+
     // Factory: wrap any block-level tag in AnnotatableBlock
     // Uses HAST node.position for StrictMode-safe line numbers (no mutable counter)
     // Destructures `node` to prevent ReactMarkdown's HAST AST leaking onto DOM
     const annotatable = (Tag: React.ElementType) =>
-      ({ children, node, ...props }: { children?: React.ReactNode; node?: { position?: { start?: { line?: number } } }; [key: string]: unknown }) => {
+      ({ children, node, ...props }: { children?: React.ReactNode; node?: { position?: { start?: { line?: number }; end?: { line?: number } } }; [key: string]: unknown }) => {
         const ln = node?.position?.start?.line ?? 0;
+        // Extract raw source text using HAST position info to avoid [object Object]
+        // from calling String() on React element children.
+        const startLine = (node?.position?.start?.line ?? 1) - 1;
+        const endLine = (node?.position?.end?.line ?? startLine + 1) - 1;
+        const rawLineContent = rawLines.slice(startLine, endLine + 1).join(' ').slice(0, 200);
         return (
           <AnnotatableBlock
             as={Tag}
             lineNumber={ln}
-            lineContent={String(children).slice(0, 200)}
+            lineContent={rawLineContent}
             onAnnotate={handleLongPress}
             className="prose-block"
             isModified={patchContext?.modifiedLines.has(ln) ?? false}
