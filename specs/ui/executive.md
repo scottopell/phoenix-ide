@@ -18,8 +18,7 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-UI-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry |
 | **REQ-UI-005:** Connection Status | ✅ Complete | Reconnection with backoff |
 | **REQ-UI-006:** Reconnection Data Integrity | ✅ Complete | Sequence-based deduplication |
-| **REQ-UI-007:** Agent Activity Indicators | ✅ Complete | Task 579. Discriminated union, exhaustive switch with `satisfies never` |
-| **REQ-UI-007a:** Breadcrumb Trail | 🟡 Functional with gaps | Task 581. sequenceId dedup done; result summaries in tooltips still pending |
+| **REQ-UI-007:** Agent Activity Indicators | ✅ Complete | Tasks 579, 581. Discriminated union, exhaustive switch, sequenceId dedup |
 | **REQ-UI-008:** Cancellation | ✅ Complete | Cancel button during agent work |
 | **REQ-UI-009:** New Conversation | ⚠️ Deprecated | Replaced by REQ-UI-015, 017, 018 |
 | **REQ-UI-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts |
@@ -34,4 +33,4 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-UI-019:** Streaming Text Display | ✅ Complete | Task 582. `StreamingMessage` component, atomic swap in reducer |
 | **REQ-UI-020:** Navigation Persistence | ✅ Complete | Task 581. Router-level `ConversationProvider`, `lastSequenceId` in atom |
 
-**Progress:** 19 of 20 active requirements complete (1 deprecated, 1 functional-with-gaps)
+**Progress:** 19 of 19 active requirements complete (1 deprecated)

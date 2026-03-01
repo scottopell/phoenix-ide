@@ -177,23 +177,6 @@ THE SYSTEM SHALL NOT show the activity indicator
 
 **Rationale:** Users need confidence the system is making progress (transparency questions 1-2). Exhaustive state labels prevent silent degradation when backend states evolve. The "is the agent working?" question must have exactly one unambiguous answer derived from one source.
 
----
-
-### REQ-UI-007a: Breadcrumb Trail
-
-WHEN agent has completed steps in the current turn
-THE SYSTEM SHALL show an ordered breadcrumb trail of completed and in-progress steps
-
-WHEN a breadcrumb represents a completed tool call
-THE SYSTEM SHALL show the tool result summary on hover, not just the tool input
-
-WHEN a breadcrumb represents an in-progress tool call
-THE SYSTEM SHALL show the tool input on hover
-
-WHEN user clicks a breadcrumb
-THE SYSTEM SHALL scroll to and highlight the corresponding message in the conversation
-
-**Rationale:** Users need to answer "what has it done so far, in what order?" (transparency question 4) and "what was the output?" (transparency question 9). Breadcrumbs are navigation handles into the conversation view, which is the full audit trail.
 
 ---
 
