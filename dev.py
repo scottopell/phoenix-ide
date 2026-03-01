@@ -737,14 +737,18 @@ def cmd_tasks_fix() -> bool:
 
         fields = task["fields"]
 
-        # Inject missing 'created' field into frontmatter
+        # Fix missing or malformed 'created' field in frontmatter
         if "created" not in fields or not re.match(r"^\d{4}-\d{2}-\d{2}$", fields.get("created", "")):
             created = infer_created_date(path)
             content = path.read_text()
-            # Insert after the opening --- line
-            content = content.replace("---\n", f"---\ncreated: {created}\n", 1)
+            if re.search(r'^created:.*$', content, re.MULTILINE):
+                # Replace existing malformed value (not insert a duplicate)
+                content = re.sub(r'^created:.*$', f'created: {created}', content, count=1, flags=re.MULTILINE)
+            else:
+                # Insert after the opening --- line
+                content = content.replace("---\n", f"---\ncreated: {created}\n", 1)
             path.write_text(content)
-            print(f"  {path.name}: added created: {created}")
+            print(f"  {path.name}: fixed created: {created}")
             fields["created"] = created
             patched += 1
 
