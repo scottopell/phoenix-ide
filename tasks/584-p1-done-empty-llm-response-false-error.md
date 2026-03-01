@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 584
 priority: p1
-status: ready
+status: done
 slug: empty-llm-response-false-error
 title: "Empty LLM response after tool result treated as error instead of completion"
 ---
