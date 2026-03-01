@@ -238,9 +238,23 @@ impl ResponsesStreamAccumulator {
         data: &str,
         chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
     ) -> Result<(), LlmError> {
+        // Sentinel — not valid JSON, nothing to do.
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        // The gateway omits SSE `event:` lines; type is embedded in the JSON.
+        // Parse JSON first, then dispatch on data["type"], falling back to event_type.
         let v: serde_json::Value = serde_json::from_str(data)
             .map_err(|e| LlmError::invalid_response(format!("Failed to parse SSE data: {e}")))?;
-        match event_type {
+
+        let dispatch_type = v
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(event_type);
+
+        tracing::debug!(dispatch_type, "responses_api SSE event");
+
+        match dispatch_type {
             "response.output_text.delta" => {
                 if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
                     if !delta.is_empty() {
@@ -250,13 +264,29 @@ impl ResponsesStreamAccumulator {
             }
             "response.output_item.done" => {
                 if let Some(item) = v.get("item") {
-                    if let Ok(output) = serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
-                        self.output_items.push(output);
+                    match serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
+                        Ok(output) => {
+                            tracing::debug!(
+                                output_type = %output.r#type,
+                                "responses_api output item collected"
+                            );
+                            self.output_items.push(output);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                item = %item,
+                                "responses_api failed to deserialize output item"
+                            );
+                        }
                     }
                 }
             }
-            "response.done" => {
+            // OpenAI Responses API terminal event. Task 583 spec incorrectly named
+            // this "response.done" — the actual OpenAI spec uses "response.completed".
+            "response.completed" => {
                 if let Some(usage) = v.pointer("/response/usage") {
+                    tracing::debug!(usage = %usage, "responses_api usage extracted");
                     self.input_tokens = u32::try_from(
                         usage
                             .get("input_tokens")
@@ -271,15 +301,25 @@ impl ResponsesStreamAccumulator {
                             .unwrap_or(0),
                     )
                     .unwrap_or(0);
+                } else {
+                    tracing::warn!(data, "responses_api terminal event had no /response/usage");
                 }
                 self.done = true;
             }
-            _ => {} // response.created, response.content_part.*, etc. — ignored
+            _ => {
+                tracing::debug!(dispatch_type, "responses_api ignoring event");
+            }
         }
         Ok(())
     }
 
     fn into_response(self) -> LlmResponse {
+        tracing::debug!(
+            output_items = self.output_items.len(),
+            input_tokens = self.input_tokens,
+            output_tokens = self.output_tokens,
+            "responses_api stream accumulator finalizing"
+        );
         normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
             output: self.output_items,
