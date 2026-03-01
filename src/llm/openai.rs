@@ -23,6 +23,21 @@ pub async fn complete(
     }
 }
 
+/// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
+pub async fn complete_streaming(
+    spec: &ModelSpec,
+    api_key: &str,
+    gateway: Option<&str>,
+    request: &LlmRequest,
+    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+) -> Result<LlmResponse, LlmError> {
+    if uses_responses_api(&spec.api_name) {
+        complete_streaming_responses_api(spec, api_key, gateway, request, chunk_tx).await
+    } else {
+        complete_streaming_chat_api(spec, api_key, gateway, request, chunk_tx).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint resolution
 // ---------------------------------------------------------------------------
@@ -191,6 +206,400 @@ async fn complete_responses_api(
     })?;
 
     Ok(normalize_responses_api_response(responses_response))
+}
+
+// ---------------------------------------------------------------------------
+// Streaming — Responses API
+// ---------------------------------------------------------------------------
+
+/// Accumulates state across Responses API SSE stream events.
+struct ResponsesStreamAccumulator {
+    input_tokens: u32,
+    output_tokens: u32,
+    /// Completed output items collected from `response.output_item.done` events.
+    output_items: Vec<ResponsesApiOutput>,
+    /// Set true when `response.done` is received.
+    pub done: bool,
+}
+
+impl ResponsesStreamAccumulator {
+    fn new() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            output_items: Vec::new(),
+            done: false,
+        }
+    }
+
+    fn process_event(
+        &mut self,
+        event_type: &str,
+        data: &str,
+        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    ) -> Result<(), LlmError> {
+        let v: serde_json::Value = serde_json::from_str(data)
+            .map_err(|e| LlmError::invalid_response(format!("Failed to parse SSE data: {e}")))?;
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
+                    if !delta.is_empty() {
+                        let _ = chunk_tx.send(super::TokenChunk::Text(delta.to_string()));
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = v.get("item") {
+                    if let Ok(output) = serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
+                        self.output_items.push(output);
+                    }
+                }
+            }
+            "response.done" => {
+                if let Some(usage) = v.pointer("/response/usage") {
+                    self.input_tokens = u32::try_from(
+                        usage
+                            .get("input_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(0);
+                    self.output_tokens = u32::try_from(
+                        usage
+                            .get("output_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(0);
+                }
+                self.done = true;
+            }
+            _ => {} // response.created, response.content_part.*, etc. — ignored
+        }
+        Ok(())
+    }
+
+    fn into_response(self) -> LlmResponse {
+        normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: self.output_items,
+            usage: ResponsesApiUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+            },
+        })
+    }
+}
+
+async fn complete_streaming_responses_api(
+    spec: &ModelSpec,
+    api_key: &str,
+    gateway: Option<&str>,
+    request: &LlmRequest,
+    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+) -> Result<LlmResponse, LlmError> {
+    use futures::StreamExt;
+
+    let url = resolve_endpoint(spec, gateway);
+    let mut responses_request = translate_to_responses_request(&spec.api_name, request);
+    responses_request.stream = Some(true);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("source", LLM_SOURCE_HEADER)
+        .json(&responses_request)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                LlmError::network(format!("Request timeout: {e}"))
+            } else if e.is_connect() {
+                LlmError::network(format!("Connection failed: {e}"))
+            } else {
+                LlmError::network(format!("Request failed: {e}"))
+            }
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
+    }
+
+    let mut acc = ResponsesStreamAccumulator::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut current_event = String::new();
+    let mut current_data = String::new();
+    let mut stream = response.bytes_stream();
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
+        byte_buf.extend_from_slice(&chunk);
+
+        loop {
+            let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line = std::str::from_utf8(&byte_buf[..nl_pos])
+                .unwrap_or("")
+                .trim_end_matches('\r')
+                .to_string();
+            byte_buf.drain(..=nl_pos);
+
+            if line.is_empty() {
+                if !current_data.is_empty() {
+                    acc.process_event(&current_event, &current_data, chunk_tx)?;
+                    current_event.clear();
+                    current_data.clear();
+                    if acc.done {
+                        break 'outer;
+                    }
+                }
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                current_data = data.to_string();
+            } else if let Some(event) = line.strip_prefix("event: ") {
+                current_event = event.to_string();
+            }
+        }
+    }
+
+    Ok(acc.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming — Chat Completions API
+// ---------------------------------------------------------------------------
+
+/// Accumulates state across chat/completions SSE stream events.
+struct ChatStreamAccumulator {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    text: String,
+    /// Tool call accumulator: index → (id, name, arguments)
+    tool_calls: std::collections::BTreeMap<usize, (String, String, String)>,
+    finish_reason: Option<String>,
+}
+
+impl ChatStreamAccumulator {
+    fn new() -> Self {
+        Self {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            text: String::new(),
+            tool_calls: std::collections::BTreeMap::new(),
+            finish_reason: None,
+        }
+    }
+
+    fn process_chunk(
+        &mut self,
+        data: &str,
+        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    ) -> Result<(), LlmError> {
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        let v: serde_json::Value = serde_json::from_str(data)
+            .map_err(|e| LlmError::invalid_response(format!("Failed to parse SSE data: {e}")))?;
+
+        // Usage-only chunk (sent before [DONE] by some providers)
+        if let Some(usage) = v.get("usage") {
+            self.prompt_tokens = u32::try_from(
+                usage
+                    .get("prompt_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(u64::from(self.prompt_tokens)),
+            )
+            .unwrap_or(self.prompt_tokens);
+            self.completion_tokens = u32::try_from(
+                usage
+                    .get("completion_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(u64::from(self.completion_tokens)),
+            )
+            .unwrap_or(self.completion_tokens);
+        }
+
+        let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
+            return Ok(());
+        };
+
+        if let Some(fr) = choice
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.finish_reason = Some(fr.to_string());
+        }
+
+        let Some(delta) = choice.get("delta") else {
+            return Ok(());
+        };
+
+        // Text delta
+        if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str) {
+            if !text.is_empty() {
+                self.text.push_str(text);
+                let _ = chunk_tx.send(super::TokenChunk::Text(text.to_string()));
+            }
+        }
+
+        // Tool call deltas
+        if let Some(tcs) = delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for tc in tcs {
+                let idx = tc
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let idx = usize::try_from(idx).unwrap_or(0);
+                let entry = self.tool_calls.entry(idx).or_default();
+                if let Some(id) = tc.get("id").and_then(serde_json::Value::as_str) {
+                    entry.0 = id.to_string();
+                }
+                if let Some(name) = tc
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.1 = name.to_string();
+                }
+                if let Some(args) = tc
+                    .pointer("/function/arguments")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.2.push_str(args);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn into_response(self) -> Result<LlmResponse, LlmError> {
+        let mut content = Vec::new();
+
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text { text: self.text });
+        }
+
+        for (_, (id, name, arguments)) in self.tool_calls {
+            if name.is_empty() {
+                return Err(LlmError::server_error(
+                    "OpenAI streaming returned tool call with empty function name",
+                ));
+            }
+            let input = serde_json::from_str(&arguments).map_err(|e| {
+                LlmError::server_error(format!("Invalid JSON in tool call arguments: {e}"))
+            })?;
+            content.push(ContentBlock::ToolUse { id, name, input });
+        }
+
+        if content.is_empty() {
+            return Err(LlmError::server_error(
+                "OpenAI streaming returned empty response (no content or tool calls)",
+            ));
+        }
+
+        let end_turn = self.finish_reason.as_deref() == Some("stop");
+
+        Ok(LlmResponse {
+            content,
+            end_turn,
+            usage: Usage {
+                input_tokens: u64::from(self.prompt_tokens),
+                output_tokens: u64::from(self.completion_tokens),
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        })
+    }
+}
+
+async fn complete_streaming_chat_api(
+    spec: &ModelSpec,
+    api_key: &str,
+    gateway: Option<&str>,
+    request: &LlmRequest,
+    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+) -> Result<LlmResponse, LlmError> {
+    use futures::StreamExt;
+
+    let url = resolve_endpoint(spec, gateway);
+    let mut openai_request = translate_request(&spec.api_name, request);
+    openai_request.stream = Some(true);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("source", LLM_SOURCE_HEADER)
+        .json(&openai_request)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                LlmError::network(format!("Request timeout: {e}"))
+            } else if e.is_connect() {
+                LlmError::network(format!("Connection failed: {e}"))
+            } else {
+                LlmError::network(format!("Request failed: {e}"))
+            }
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
+    }
+
+    let mut acc = ChatStreamAccumulator::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
+        byte_buf.extend_from_slice(&chunk);
+
+        loop {
+            let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line = std::str::from_utf8(&byte_buf[..nl_pos])
+                .unwrap_or("")
+                .trim_end_matches('\r')
+                .to_string();
+            byte_buf.drain(..=nl_pos);
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    return acc.into_response();
+                }
+                acc.process_chunk(data, chunk_tx)?;
+            }
+        }
+    }
+
+    // Stream ended without [DONE] — assemble from accumulated state
+    acc.into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +932,7 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
         instructions,
         tools,
         max_output_tokens: request.max_tokens,
+        stream: None,
     }
 }
 
@@ -800,6 +1210,8 @@ pub(crate) struct ResponsesApiRequest {
     tools: Option<Vec<ResponsesApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

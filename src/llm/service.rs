@@ -54,12 +54,14 @@ impl LlmService for LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIChat => {
-                // OpenAI streaming not yet implemented — fall back to non-streaming
-                tracing::debug!(
-                    provider = "openai",
-                    "complete_streaming not implemented for OpenAI, falling back to complete()"
-                );
-                self.complete(request).await
+                openai::complete_streaming(
+                    &self.spec,
+                    &self.api_key,
+                    self.gateway.as_deref(),
+                    request,
+                    chunk_tx,
+                )
+                .await
             }
         }
     }
