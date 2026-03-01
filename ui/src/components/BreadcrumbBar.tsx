@@ -6,9 +6,37 @@ interface BreadcrumbBarProps {
   visible: boolean;
 }
 
+interface TooltipPosition {
+  /** Left edge of the tooltip box in viewport px */
+  tooltipLeft: number;
+  /** Left position of the arrow within the tooltip box in px */
+  arrowLeft: number;
+}
+
+const TOOLTIP_WIDTH = 280;
+const TOOLTIP_MARGIN = 8; // min distance from viewport edge
+
+function calcTooltipPosition(rect: DOMRect): TooltipPosition {
+  const itemCenterX = rect.left + rect.width / 2;
+  const viewportWidth = window.innerWidth;
+
+  // Ideal: center tooltip over the item
+  let tooltipLeft = itemCenterX - TOOLTIP_WIDTH / 2;
+
+  // Clamp to viewport edges
+  tooltipLeft = Math.max(TOOLTIP_MARGIN, tooltipLeft);
+  tooltipLeft = Math.min(viewportWidth - TOOLTIP_WIDTH - TOOLTIP_MARGIN, tooltipLeft);
+
+  // Arrow should always point at the item center, relative to tooltip box
+  const arrowLeft = Math.max(12, Math.min(TOOLTIP_WIDTH - 12, itemCenterX - tooltipLeft));
+
+  return { tooltipLeft, arrowLeft };
+}
+
 export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
   const barRef = useRef<HTMLElement>(null);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [tooltipPos, setTooltipPos] = useState<TooltipPosition | null>(null);
   const hoverTimeoutRef = useRef<number | null>(null);
 
   // Auto-scroll to end when breadcrumbs change
@@ -43,7 +71,8 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
     }
   };
 
-  const handleMouseEnter = (index: number) => {
+  const handleMouseEnter = (index: number, e: React.MouseEvent<HTMLSpanElement>) => {
+    const target = e.currentTarget;
     // Clear any pending hide
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
@@ -51,6 +80,8 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
     }
     // Show after 150ms delay
     hoverTimeoutRef.current = window.setTimeout(() => {
+      const rect = target.getBoundingClientRect();
+      setTooltipPos(calcTooltipPosition(rect));
       setHoveredIndex(index);
     }, 150);
   };
@@ -63,6 +94,7 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
     }
     // Hide immediately
     setHoveredIndex(null);
+    setTooltipPos(null);
   };
 
   return (
@@ -78,7 +110,7 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
           ].filter(Boolean).join(' ');
 
           const tooltipText = b.resultSummary ?? b.preview;
-          const showTooltip = hoveredIndex === i && !!tooltipText;
+          const showTooltip = hoveredIndex === i && !!tooltipText && tooltipPos !== null;
 
           return (
             <span key={`${b.type}-${i}-${b.toolId || ''}`}>
@@ -86,14 +118,21 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
                 className={classes}
                 data-index={i}
                 onClick={() => handleClick(b)}
-                onMouseEnter={() => handleMouseEnter(i)}
+                onMouseEnter={(e) => handleMouseEnter(i, e)}
                 onMouseLeave={handleMouseLeave}
               >
                 {b.label}
                 {showTooltip && (
-                  <span className="breadcrumb-tooltip">
+                  <span
+                    className="breadcrumb-tooltip"
+                    style={{ left: tooltipPos!.tooltipLeft, transform: 'none' }}
+                  >
                     <strong>{b.label}</strong>
                     <span className="breadcrumb-tooltip-preview">{tooltipText}</span>
+                    <span
+                      className="breadcrumb-tooltip-arrow"
+                      style={{ left: tooltipPos!.arrowLeft }}
+                    />
                   </span>
                 )}
               </span>

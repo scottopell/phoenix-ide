@@ -265,8 +265,8 @@ body {
 .breadcrumb-tooltip {
   position: fixed;
   bottom: calc(var(--breadcrumb-height) + 16px);
-  left: 50%;
-  transform: translateX(-50%);
+  /* left is set dynamically via inline style */
+  width: 280px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -279,22 +279,31 @@ body {
   pointer-events: none;
 }
 
-.breadcrumb-tooltip::after {
-  content: '';
+/* Arrow rendered as a real element so its left position can be set dynamically.
+   The element's `left` style is the item-center offset within the tooltip box.
+   Pseudo-elements are offset by -6px/-5px to visually center the 12px/10px triangles. */
+.breadcrumb-tooltip-arrow {
   position: absolute;
   top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
+  /* left is set dynamically via inline style */
+  width: 0;
+  height: 0;
+}
+
+.breadcrumb-tooltip-arrow::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -6px;
   border: 6px solid transparent;
   border-top-color: var(--border-color);
 }
 
-.breadcrumb-tooltip::before {
+.breadcrumb-tooltip-arrow::before {
   content: '';
   position: absolute;
-  top: calc(100% - 1px);
-  left: 50%;
-  transform: translateX(-50%);
+  top: 1px;
+  left: -5px;
   border: 5px solid transparent;
   border-top-color: var(--bg-primary);
   z-index: 1;
