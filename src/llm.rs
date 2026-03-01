@@ -11,6 +11,7 @@ mod openai;
 mod proptests;
 mod registry;
 mod service;
+pub(crate) mod sse;
 mod types;
 
 pub use discovery::{discover_models, probe_gateway};

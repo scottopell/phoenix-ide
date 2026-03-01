@@ -377,40 +377,21 @@ async fn complete_streaming_responses_api(
     }
 
     let mut acc = ResponsesStreamAccumulator::new();
-    let mut byte_buf: Vec<u8> = Vec::new();
-    let mut current_event = String::new();
-    let mut current_data = String::new();
+    let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
-        byte_buf.extend_from_slice(&chunk);
-
-        loop {
-            let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let line = std::str::from_utf8(&byte_buf[..nl_pos])
-                .unwrap_or("")
-                .trim_end_matches('\r')
-                .to_string();
-            byte_buf.drain(..=nl_pos);
-
-            if line.is_empty() {
-                if !current_data.is_empty() {
-                    acc.process_event(&current_event, &current_data, chunk_tx)?;
-                    current_event.clear();
-                    current_data.clear();
-                    if acc.done {
-                        break 'outer;
-                    }
-                }
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                current_data = data.to_string();
-            } else if let Some(event) = line.strip_prefix("event: ") {
-                current_event = event.to_string();
+        for event in sse.push(&chunk) {
+            acc.process_event(&event.event_type, &event.data, chunk_tx)?;
+            if acc.done {
+                break 'outer;
             }
         }
+    }
+
+    for event in sse.finish() {
+        acc.process_event(&event.event_type, &event.data, chunk_tx)?;
     }
 
     Ok(acc.into_response())
@@ -612,30 +593,24 @@ async fn complete_streaming_chat_api(
     }
 
     let mut acc = ChatStreamAccumulator::new();
-    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
-        byte_buf.extend_from_slice(&chunk);
-
-        loop {
-            let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let line = std::str::from_utf8(&byte_buf[..nl_pos])
-                .unwrap_or("")
-                .trim_end_matches('\r')
-                .to_string();
-            byte_buf.drain(..=nl_pos);
-
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    return acc.into_response();
-                }
-                acc.process_chunk(data, chunk_tx)?;
+        for event in sse.push(&chunk) {
+            if event.data == "[DONE]" {
+                return acc.into_response();
             }
+            acc.process_chunk(&event.data, chunk_tx)?;
         }
+    }
+
+    for event in sse.finish() {
+        if event.data == "[DONE]" {
+            return acc.into_response();
+        }
+        acc.process_chunk(&event.data, chunk_tx)?;
     }
 
     // Stream ended without [DONE] — assemble from accumulated state
