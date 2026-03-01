@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, KeyboardEvent, ClipboardEvent, ChangeEvent
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { ImageAttachments } from '../components/ImageAttachments';
+import { LlmStatusBanner } from '../components/LlmStatusBanner';
 import { SettingsFields, DIR_STATUS_CONFIG } from '../components/SettingsFields';
 import type { DirStatus } from '../components/SettingsFields';
 import { VoiceRecorder, isWebSpeechSupported } from '../components/VoiceInput';
@@ -199,7 +200,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       <main className="new-conv-main">
         <div className="new-conv-content">
           <h1 className="new-conv-title">New conversation</h1>
-          
+
+          <LlmStatusBanner models={models} />
           {error && <div className="new-conv-error">{error}</div>}
 
           {/* Mobile: settings card at top */}

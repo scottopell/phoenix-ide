@@ -141,9 +141,15 @@ export interface ModelInfo {
   recommended: boolean;
 }
 
+export type GatewayStatus = 'not_configured' | 'healthy' | 'unreachable';
+
 export interface ModelsResponse {
   models: ModelInfo[];
   default: string;
+  /** Gateway reachability status determined at startup */
+  gateway_status: GatewayStatus;
+  /** True when at least one LLM provider is configured */
+  llm_configured: boolean;
 }
 
 export const api = {

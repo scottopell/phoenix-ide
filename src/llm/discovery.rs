@@ -86,6 +86,30 @@ struct OpenAIModelData {
     supports_tools: Option<bool>,
 }
 
+/// Probe gateway reachability with a lightweight HEAD/GET request.
+///
+/// Returns `true` if the gateway responds with any HTTP status (even an error),
+/// meaning the host is up and listening. Returns `false` on network/timeout errors.
+pub async fn probe_gateway(gateway_url: &str) -> bool {
+    let url = format!("{}/_proxy/status", gateway_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(_) => {
+            tracing::debug!(url = %url, "Gateway probe succeeded");
+            true
+        }
+        Err(err) => {
+            tracing::debug!(url = %url, error = %err, "Gateway probe failed");
+            false
+        }
+    }
+}
+
 /// Discover models from the LLM gateway
 pub async fn discover_models(gateway_url: &str) -> HashMap<String, DiscoveredModel> {
     let mut models = HashMap::new();

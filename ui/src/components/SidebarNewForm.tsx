@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
+import { LlmStatusBanner } from './LlmStatusBanner';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
 import { generateUUID } from '../utils/uuid';
@@ -90,6 +91,7 @@ export function SidebarNewForm({ onClose, onCreated, showToast }: SidebarNewForm
         <span className="sidebar-new-form-title">New conversation</span>
         <button className="sidebar-new-form-close" onClick={onClose}>×</button>
       </div>
+      <LlmStatusBanner models={models} />
       {error && <div className="new-conv-error" style={{ margin: '0 0 8px', fontSize: 13 }}>{error}</div>}
       <div className="sidebar-new-form-fields">
         <SettingsFields {...settingsProps} />

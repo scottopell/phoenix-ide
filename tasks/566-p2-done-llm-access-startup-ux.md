@@ -2,7 +2,7 @@
 created: 2026-02-23
 id: 566
 priority: p2
-status: ready
+status: done
 slug: llm-access-startup-ux
 title: "Surface clear UX for all LLM access states at startup"
 ---

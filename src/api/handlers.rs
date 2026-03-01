@@ -7,12 +7,13 @@ use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
-    FileEntry, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    ReadFileResponse, RenameRequest, SuccessResponse, SystemPromptResponse, ValidateCwdResponse,
+    FileEntry, GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse,
+    ModelsResponse, ReadFileResponse, RenameRequest, SuccessResponse, SystemPromptResponse,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ImageData, Message, MessageContent, MessageType};
-use crate::llm::ContentBlock;
+use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
 use crate::state_machine::Event;
 
@@ -1208,9 +1209,20 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     // Get model metadata from registry
     let models = state.llm_registry.available_model_info();
 
+    let gateway_status = match state.llm_registry.gateway_status {
+        GatewayStatus::NotConfigured => GatewayStatusApi::NotConfigured,
+        GatewayStatus::Healthy => GatewayStatusApi::Healthy,
+        GatewayStatus::Unreachable => GatewayStatusApi::Unreachable,
+    };
+
+    let llm_configured = state.llm_registry.has_models()
+        || state.llm_registry.gateway_status != GatewayStatus::NotConfigured;
+
     Json(ModelsResponse {
         models,
         default: state.llm_registry.default_model_id().to_string(),
+        gateway_status,
+        llm_configured,
     })
 }
 

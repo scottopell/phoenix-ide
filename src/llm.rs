@@ -13,10 +13,10 @@ mod registry;
 mod service;
 mod types;
 
-pub use discovery::discover_models;
+pub use discovery::{discover_models, probe_gateway};
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ApiFormat, ModelSpec, Provider};
-pub use registry::{LlmConfig, ModelRegistry};
+pub use registry::{GatewayStatus, LlmConfig, ModelRegistry};
 pub use service::LlmServiceImpl;
 pub use types::*;
 

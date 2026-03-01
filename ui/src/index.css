@@ -3721,6 +3721,50 @@ html * {
   box-sizing: border-box;
 }
 
+/* LLM status banners (gateway unreachable / no LLM configured) */
+.llm-status-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 14px;
+  width: 100%;
+  box-sizing: border-box;
+  line-height: 1.5;
+}
+
+.llm-status-banner--warning {
+  background: rgba(234, 179, 8, 0.12);
+  color: #ca8a04;
+  border: 1px solid rgba(234, 179, 8, 0.3);
+}
+
+.llm-status-banner--unconfigured {
+  background: rgba(59, 130, 246, 0.1);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+}
+
+.llm-status-banner__icon {
+  font-weight: 700;
+  flex-shrink: 0;
+  line-height: 1.5;
+}
+
+.llm-status-banner__text {
+  flex: 1;
+}
+
+.llm-status-banner__text code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
 .new-conv-input-box {
   width: 100%;
   background: var(--bg-secondary);

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
+import { LlmStatusBanner } from './LlmStatusBanner';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
 import { generateUUID } from '../utils/uuid';
@@ -167,6 +168,7 @@ export function NewConversationSheet({ isOpen, onClose }: NewConversationSheetPr
         </div>
         <div className="bottom-sheet-content">
           <h2 className="bottom-sheet-title">New conversation</h2>
+          <LlmStatusBanner models={models} />
           {error && <div className="new-conv-error">{error}</div>}
           <div className="bottom-sheet-settings">
             <SettingsFields {...settingsProps} />

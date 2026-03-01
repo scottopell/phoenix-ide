@@ -2,9 +2,23 @@
 
 #![allow(dead_code)] // new_empty() used in tests
 
-use super::{all_models, discover_models, LlmService, LlmServiceImpl, LoggingService, Provider};
+use super::{
+    all_models, discover_models, probe_gateway, LlmService, LlmServiceImpl, LoggingService,
+    Provider,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Gateway reachability status determined at startup
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayStatus {
+    /// No gateway configured; direct API key mode
+    NotConfigured,
+    /// Gateway configured and responded successfully during startup probe
+    Healthy,
+    /// Gateway configured but unreachable or returned an error during startup probe
+    Unreachable,
+}
 
 /// Configuration for LLM providers
 #[derive(Debug, Clone, Default)]
@@ -35,6 +49,8 @@ pub struct ModelRegistry {
     services: HashMap<String, Arc<dyn LlmService>>,
     specs: HashMap<String, super::ModelSpec>,
     default_model: String,
+    /// Reachability status of the configured gateway, determined at startup
+    pub gateway_status: GatewayStatus,
 }
 
 impl ModelRegistry {
@@ -44,6 +60,7 @@ impl ModelRegistry {
             services: HashMap::new(),
             specs: HashMap::new(),
             default_model: "test-model".to_string(),
+            gateway_status: GatewayStatus::NotConfigured,
         }
     }
 
@@ -72,10 +89,20 @@ impl ModelRegistry {
             })
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
+        // In non-discovery (direct key) mode, gateway is not configured
+        let gateway_status = if config.gateway.is_some() {
+            // new() is called without an async probe; treat as not configured
+            // (new_with_discovery should be used when a gateway is present)
+            GatewayStatus::NotConfigured
+        } else {
+            GatewayStatus::NotConfigured
+        };
+
         Self {
             services,
             specs,
             default_model,
+            gateway_status,
         }
     }
 
@@ -83,14 +110,35 @@ impl ModelRegistry {
     ///
     /// When gateway is configured, queries provider endpoints for available models.
     /// Falls back to hardcoded models if discovery fails.
+    /// Always probes gateway reachability and records the result in `gateway_status`.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
-        // If no gateway, use sync version
+        // If no gateway, use direct-key mode (no probe needed)
         if config.gateway.is_none() {
             return Self::new(config);
         }
 
         let gateway_url = config.gateway.as_ref().unwrap();
         tracing::info!("Discovering models from gateway: {}", gateway_url);
+
+        // Probe gateway reachability before attempting discovery
+        let gateway_reachable = probe_gateway(gateway_url).await;
+        let gateway_status = if gateway_reachable {
+            GatewayStatus::Healthy
+        } else {
+            GatewayStatus::Unreachable
+        };
+
+        if !gateway_reachable {
+            tracing::warn!(
+                gateway = %gateway_url,
+                "Gateway unreachable during startup probe; falling back to hardcoded models"
+            );
+            // Fall back to hardcoded models, but carry the Unreachable status so the
+            // UI can show a warning banner.  Only use direct API keys if present.
+            let mut fallback = Self::new(config);
+            fallback.gateway_status = GatewayStatus::Unreachable;
+            return fallback;
+        }
 
         // Try to discover models from gateway
         let discovered = discover_models(gateway_url).await;
@@ -99,7 +147,11 @@ impl ModelRegistry {
             tracing::warn!(
                 "Gateway model discovery returned no models, falling back to hardcoded list"
             );
-            return Self::new(config);
+            let mut fallback = Self::new(config);
+            // Gateway was reachable (probe passed) but discovery returned nothing —
+            // treat as Unreachable so the UI can warn the user.
+            fallback.gateway_status = GatewayStatus::Unreachable;
+            return fallback;
         }
 
         tracing::info!("Discovered {} models from gateway", discovered.len());
@@ -132,7 +184,11 @@ impl ModelRegistry {
                 discovered = discovered.len(),
                 "No known models found in gateway discovery; falling back to hardcoded list"
             );
-            return Self::new(config);
+            let mut fallback = Self::new(config);
+            // Gateway was reachable but returned an unrecognized model format.
+            // Treat as Unreachable so the UI can warn the user.
+            fallback.gateway_status = GatewayStatus::Unreachable;
+            return fallback;
         }
 
         // Then, create services for any discovered models not in hardcoded list
@@ -173,6 +229,7 @@ impl ModelRegistry {
             services,
             specs,
             default_model,
+            gateway_status,
         }
     }
 
