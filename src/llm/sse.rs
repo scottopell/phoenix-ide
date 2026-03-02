@@ -77,23 +77,34 @@ impl SseParser {
         let mut events = Vec::new();
 
         loop {
-            let Some(nl_pos) = self.buf.iter().position(|&b| b == b'\n') else {
+            // SSE spec (WHATWG) recognises three line endings: \n, \r\n, bare \r.
+            // Find the first \r or \n.
+            let Some(eol_pos) = self.buf.iter().position(|&b| b == b'\n' || b == b'\r') else {
                 break;
             };
 
-            // Extract the line *as bytes* (excluding the \n).
-            let line_bytes = &self.buf[..nl_pos];
+            // Determine how many bytes the line ending consumes.
+            let eol_len = if self.buf[eol_pos] == b'\r' {
+                // \r\n counts as one line ending; bare \r also counts.
+                if self.buf.get(eol_pos + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                1 // bare \n
+            };
 
-            // Strip optional \r before \n.
-            let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
+            // Extract the line *as bytes* (excluding the line ending).
+            let line_bytes = &self.buf[..eol_pos];
 
             // Decode UTF-8. If the slice is invalid (should not happen with
             // well-formed SSE, but guard against gateway bugs), use lossy
             // conversion so we never silently drop an entire line.
             let line = String::from_utf8_lossy(line_bytes).into_owned();
 
-            // Drain consumed bytes (including the \n).
-            self.buf.drain(..=nl_pos);
+            // Drain consumed bytes (line content + line ending).
+            self.buf.drain(..eol_pos + eol_len);
 
             if line.is_empty() {
                 // Blank line → dispatch accumulated event (if any data present).
@@ -285,6 +296,36 @@ mod tests {
         let events = p.push(b"data: hello\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "");
+    }
+
+    #[test]
+    fn bare_cr_line_endings() {
+        let mut p = SseParser::new();
+        // Bare \r as line ending (WHATWG SSE spec requires this)
+        let events = p.push(b"event: test\rdata: hello\r\r");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "test");
+        assert_eq!(events[0].data, "hello");
+    }
+
+    #[test]
+    fn bare_cr_mixed_with_lf() {
+        let mut p = SseParser::new();
+        // Mix of bare \r and \n
+        let events = p.push(b"event: test\rdata: hello\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "test");
+        assert_eq!(events[0].data, "hello");
+    }
+
+    #[test]
+    fn bare_cr_between_events() {
+        // Simulates the exact corruption pattern: two events separated only by \r
+        let mut p = SseParser::new();
+        let events = p.push(b"data: {\"text\":\"hello\"}\r\rdata: {\"text\":\"world\"}\r\r");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, "{\"text\":\"hello\"}");
+        assert_eq!(events[1].data, "{\"text\":\"world\"}");
     }
 
     #[test]
@@ -505,6 +546,36 @@ mod proptests {
             prop_assert_eq!(
                 &lf_events, &crlf_events,
                 "CRLF vs LF produced different events",
+            );
+            prop_assert_eq!(&lf_events, &expected);
+        }
+    }
+
+    // ========================================================================
+    // Property E-bis — Bare \r equivalence
+    //
+    // Replacing \n with bare \r must produce identical events.
+    // ========================================================================
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn prop_bare_cr_equivalence(
+            (lf_bytes, expected) in arb_sse_stream(),
+        ) {
+            // Convert all \n to bare \r
+            let cr_bytes: Vec<u8> = lf_bytes.iter().map(|&b| if b == b'\n' { b'\r' } else { b }).collect();
+
+            let mut lf_parser = SseParser::new();
+            let lf_events = lf_parser.push(&lf_bytes);
+
+            let mut cr_parser = SseParser::new();
+            let cr_events = cr_parser.push(&cr_bytes);
+
+            prop_assert_eq!(
+                &lf_events, &cr_events,
+                "bare CR vs LF produced different events",
             );
             prop_assert_eq!(&lf_events, &expected);
         }
