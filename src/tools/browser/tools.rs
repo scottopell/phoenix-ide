@@ -1081,8 +1081,10 @@ impl Tool for BrowserKeyPressTool {
         "Send a key chord (key + optional modifiers) to the page using CDP-level keyboard events. \
          Use for non-printable keys and modifier shortcuts that browser_type cannot send: \
          Escape, Enter, ArrowUp/Down, Tab, F1-F12, Ctrl+P, Meta+K, etc. \
-         Events are dispatched to the page (not a specific element) so window/document \
-         keydown listeners receive them — the correct target for most app keyboard shortcuts."
+         Events target the focused element and bubble normally, so window/document \
+         capture listeners receive them. Note: browser-native shortcuts (Ctrl+P, Ctrl+W, \
+         Ctrl+T) are intercepted by Chrome before reaching the page and cannot be sent \
+         with this tool."
             .to_string()
     }
 
@@ -1128,7 +1130,11 @@ impl Tool for BrowserKeyPressTool {
         };
 
         let modifiers = modifier_mask(&input.modifiers);
-        let mod_opt = if modifiers != 0 { Some(modifiers) } else { None };
+        let mod_opt = if modifiers != 0 {
+            Some(modifiers)
+        } else {
+            None
+        };
 
         let session = match ctx.browser().await {
             Ok(s) => s,
@@ -1137,8 +1143,8 @@ impl Tool for BrowserKeyPressTool {
         let guard = session.read().await;
 
         // Send rawKeyDown + (optionally keypress for printable) + keyUp
-        let is_printable = key_str.len() == 1
-            && key_str.chars().next().is_some_and(|c| !c.is_control());
+        let is_printable =
+            key_str.len() == 1 && key_str.chars().next().is_some_and(|c| !c.is_control());
 
         let mut keydown = DispatchKeyEventParams::builder()
             .r#type(DispatchKeyEventType::RawKeyDown)
@@ -1146,7 +1152,9 @@ impl Tool for BrowserKeyPressTool {
             .code(code.clone())
             .windows_virtual_key_code(vk)
             .native_virtual_key_code(vk);
-        if let Some(m) = mod_opt { keydown = keydown.modifiers(m); }
+        if let Some(m) = mod_opt {
+            keydown = keydown.modifiers(m);
+        }
         let keydown = match keydown.build() {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
@@ -1165,7 +1173,9 @@ impl Tool for BrowserKeyPressTool {
                 .text(key_str.to_string())
                 .windows_virtual_key_code(vk)
                 .native_virtual_key_code(vk);
-            if let Some(m) = mod_opt { kp = kp.modifiers(m); }
+            if let Some(m) = mod_opt {
+                kp = kp.modifiers(m);
+            }
             let kp = match kp.build() {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(format!("Failed to build keypress: {e}")),
@@ -1181,7 +1191,9 @@ impl Tool for BrowserKeyPressTool {
             .code(code)
             .windows_virtual_key_code(vk)
             .native_virtual_key_code(vk);
-        if let Some(m) = mod_opt { keyup = keyup.modifiers(m); }
+        if let Some(m) = mod_opt {
+            keyup = keyup.modifiers(m);
+        }
         let keyup = match keyup.build() {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),

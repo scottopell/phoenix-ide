@@ -196,8 +196,12 @@ The `key` parameter SHALL accept:
 The `modifiers` parameter SHALL accept a list of modifier keys: `ctrl`, `shift`, `alt`, `meta`
 
 WHEN modifiers are specified
-`browser_key_press` SHALL hold those modifiers while dispatching the key event, producing chords such as Ctrl+P, Ctrl+Shift+Z, Meta+K
+`browser_key_press` SHALL hold those modifiers while dispatching the key event, producing chords such as Ctrl+K, Ctrl+Shift+Z, Meta+K
 
+WHEN a key chord conflicts with a browser-native shortcut (Ctrl+P=print, Ctrl+W=close tab, Ctrl+T=new tab, Ctrl+Tab=switch tab)
+`browser_key_press` SHALL NOT be able to send that chord — Chrome intercepts these before dispatching to the page
+
+**Rationale:** `browser_type` types printable text into an input element. It cannot send non-printable keys (Escape, Enter, Arrow keys) or modifier chords (Ctrl+K, Meta+K). These are needed to trigger keyboard shortcuts registered on `window` or `document` via `addEventListener('keydown', ...)` — common in React apps for command palettes, modal dismissal, and navigation. Events target the focused element and bubble normally through the DOM, so capture listeners on `window` and `document` receive them.
 WHEN no element is focused
 `browser_key_press` SHALL dispatch the event to the page root (equivalent to pressing a key with no element focused)
 

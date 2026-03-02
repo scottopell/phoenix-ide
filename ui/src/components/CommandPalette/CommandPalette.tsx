@@ -81,10 +81,16 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     [actions],
   );
 
-  // Async search effect — fires on query/mode change, debounced, abortable
+  // Async search effect — fires on query/mode change, debounced, abortable.
+  // Depends on derived primitives, NOT on state object, to avoid re-firing
+  // when SET_RESULTS updates state.results.
+  const isOpen = state.status === 'open';
+  const searchMode = state.status === 'open' ? state.mode : null;
+  const searchQuery = state.status === 'open' ? state.query : null;
+
   useEffect(() => {
-    if (state.status !== 'open' || state.mode !== 'search') return;
-    const query = state.query;
+    if (!isOpen || searchMode !== 'search') return;
+    const query = searchQuery ?? '';
 
     // Cancel previous debounce + in-flight request
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -106,7 +112,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [state, sources, actions]);
+  }, [isOpen, searchMode, searchQuery, sources, actions]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {
