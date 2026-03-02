@@ -4,31 +4,47 @@ priority: p2
 status: ready
 ---
 
-# UI phase indicators stale after tool completes
+# UI messages missing after server restart, phase indicators disconnected from visible content
 
 ## Summary
 
-After a tool (e.g. bash) completes successfully, the UI continues showing "tool running" indicators until the next SSE event arrives. This creates a contradictory state where:
+After a server restart mid-conversation (e.g. triggered by a `./dev.py prod deploy` that restarts the systemd service), the UI shows phase indicators (state bar, breadcrumb bar, Cancel button) that reflect the server's current state, but the corresponding message content is not visible. The user sees old completed messages but current status indicators, with no way to understand what's actually happening.
 
-- The tool result shows a green ✓ (completed)
-- The Cancel button is still visible (implying work in progress)
-- The breadcrumb bar shows the tool name as active
-- The state bar shows `🟡 bash` (tool executing)
+## Reproduction (observed in prod)
 
-## Context
+1. Agent runs bash: `cargo fmt && git add ... && git commit -m "fmt"` → completes with ✓
+2. Agent decides to run `./dev.py prod deploy` → this restarts the phoenix-ide systemd service
+3. New server process detects interrupted conversation, auto-continues
+4. LLM responds (102 tokens, ~5s), server starts executing new bash tool (`./dev.py prod deploy`)
+5. **User sees:** the old git commit with ✓, Cancel button, breadcrumb `bash`, state bar `🟡 bash`
+6. **User does NOT see:** the LLM's response text, the new bash tool_use block for the deploy command
 
-The phase transition from `tool_executing` → next state only happens when the server sends the next SSE event (e.g. the LLM starting to think). If there's any delay between tool completion and the next event (LLM latency, network), the UI is stuck in a stale state.
+## Root Cause
 
-The user sees a completed tool result but all status indicators say "still running." This is confusing — SSE streaming implies real-time updates, but the phase lags behind the visible content.
+The server restarted, breaking the SSE connection. On reconnection, the client either:
+- Did not replay messages that were created after the restart (sequence ID gap?)
+- Or the new messages (LLM response + tool_use) were created server-side but the SSE replay didn't include them
 
-## Possible Approaches
+Meanwhile, the `state_change` SSE events ARE being received (phase=tool_executing, tool=bash), so the status indicators update but the messages they refer to are invisible.
 
-1. **Server-side:** Send an explicit phase transition event when a tool completes (before the LLM response starts). Something like `tool_completed` → `thinking` so the UI can show an intermediate state.
-2. **Client-side:** When a tool result with success status is rendered but phase is still `tool_executing`, show a transitional indicator (e.g. `🟡 thinking...` instead of `🟡 bash`).
-3. **Hybrid:** Server sends a `tool_result` event that the client uses to update phase optimistically.
+## What the User Should See
+
+1. ✅ Completed git commit bash with ✓ (visible — correct)
+2. ❌ LLM text response deciding to deploy (MISSING)
+3. ❌ New bash block showing `./dev.py prod deploy` with in-progress spinner (MISSING)
+4. ✅ State bar `🟡 bash` (visible — correct for #3, but #3 is invisible)
+
+The phase indicators are technically correct for the server's state — the bug is that the messages aren't visible, so the indicators appear stale/wrong.
+
+## Possible Causes to Investigate
+
+1. **SSE reconnection sequence ID tracking:** Does the client correctly request replay from the last received sequence ID after a connection drop? Or does it re-request from too early/too late?
+2. **Message persistence timing:** Are the new messages (LLM response, tool_use) persisted to SQLite before the state_change event is sent? If state_change arrives first and the client re-fetches, the messages might not exist yet.
+3. **Auto-continue message visibility:** When the server auto-continues an interrupted conversation, are the new messages being broadcast on the SSE channel for that conversation?
 
 ## Acceptance Criteria
 
-- [ ] After a tool result appears with ✓, status indicators no longer show that tool as "running"
-- [ ] Intermediate state between tool completion and next LLM response is visually distinct (e.g. "thinking...")
-- [ ] Cancel button behavior is correct for the actual state
+- [ ] After server restart + auto-continue, SSE-reconnected clients see all new messages
+- [ ] Phase indicators always correspond to visible message content
+- [ ] If messages can't be delivered, phase indicators degrade gracefully (e.g. show "reconnecting..." not a stale tool name)
+- [ ] Cancel button is only shown when the user can see what they'd be cancelling
