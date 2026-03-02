@@ -982,3 +982,227 @@ impl Tool for BrowserTypeTool {
         ))
     }
 }
+
+// ============================================================================
+// browser_key_press
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct KeyPressInput {
+    key: String,
+    #[serde(default)]
+    modifiers: Vec<String>,
+}
+
+/// Map a key name to (key, code, windows_virtual_key_code).
+/// Returns None for unrecognised keys.
+fn key_info(key: &str) -> Option<(&'static str, &'static str, i64)> {
+    match key {
+        // Navigation / editing
+        "Escape" => Some(("Escape", "Escape", 27)),
+        "Enter" => Some(("Enter", "Enter", 13)),
+        "Tab" => Some(("Tab", "Tab", 9)),
+        "Backspace" => Some(("Backspace", "Backspace", 8)),
+        "Delete" => Some(("Delete", "Delete", 46)),
+        "Home" => Some(("Home", "Home", 36)),
+        "End" => Some(("End", "End", 35)),
+        "PageUp" => Some(("PageUp", "PageUp", 33)),
+        "PageDown" => Some(("PageDown", "PageDown", 34)),
+        "ArrowUp" => Some(("ArrowUp", "ArrowUp", 38)),
+        "ArrowDown" => Some(("ArrowDown", "ArrowDown", 40)),
+        "ArrowLeft" => Some(("ArrowLeft", "ArrowLeft", 37)),
+        "ArrowRight" => Some(("ArrowRight", "ArrowRight", 39)),
+        // Function keys
+        "F1" => Some(("F1", "F1", 112)),
+        "F2" => Some(("F2", "F2", 113)),
+        "F3" => Some(("F3", "F3", 114)),
+        "F4" => Some(("F4", "F4", 115)),
+        "F5" => Some(("F5", "F5", 116)),
+        "F6" => Some(("F6", "F6", 117)),
+        "F7" => Some(("F7", "F7", 118)),
+        "F8" => Some(("F8", "F8", 119)),
+        "F9" => Some(("F9", "F9", 120)),
+        "F10" => Some(("F10", "F10", 121)),
+        "F11" => Some(("F11", "F11", 122)),
+        "F12" => Some(("F12", "F12", 123)),
+        // Single printable chars a-z (lower)
+        c if c.len() == 1 => {
+            let ch = c.chars().next().unwrap();
+            match ch {
+                'a'..='z' => {
+                    let vk = ch as i64 - 'a' as i64 + 65; // A=65
+                    Some(("a", "KeyA", vk)) // key/code are computed below
+                }
+                'A'..='Z' => {
+                    let vk = ch as i64 - 'A' as i64 + 65;
+                    Some(("A", "KeyA", vk))
+                }
+                '0'..='9' => {
+                    let vk = ch as i64 - '0' as i64 + 48;
+                    Some(("0", "Digit0", vk))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Compute modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8
+fn modifier_mask(modifiers: &[String]) -> i64 {
+    let mut mask = 0i64;
+    for m in modifiers {
+        match m.to_lowercase().as_str() {
+            "alt" => mask |= 1,
+            "ctrl" | "control" => mask |= 2,
+            "meta" | "cmd" | "command" => mask |= 4,
+            "shift" => mask |= 8,
+            _ => {}
+        }
+    }
+    mask
+}
+
+pub struct BrowserKeyPressTool;
+
+#[async_trait::async_trait]
+impl Tool for BrowserKeyPressTool {
+    fn name(&self) -> &'static str {
+        "browser_key_press"
+    }
+
+    fn description(&self) -> String {
+        "Send a key chord (key + optional modifiers) to the page using CDP-level keyboard events. \
+         Use for non-printable keys and modifier shortcuts that browser_type cannot send: \
+         Escape, Enter, ArrowUp/Down, Tab, F1-F12, Ctrl+P, Meta+K, etc. \
+         Events are dispatched to the page (not a specific element) so window/document \
+         keydown listeners receive them — the correct target for most app keyboard shortcuts."
+            .to_string()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Key to press. Named keys: Escape, Enter, Tab, Backspace, Delete, Home, End, PageUp, PageDown, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, F1-F12. Single chars: a-z, 0-9."
+                },
+                "modifiers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Modifier keys to hold: ctrl, shift, alt, meta. Example: [\"ctrl\"] for Ctrl+P."
+                }
+            },
+            "required": ["key"]
+        })
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+
+        let input: KeyPressInput = match serde_json::from_value(input) {
+            Ok(i) => i,
+            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+        };
+
+        // Resolve key name — single char keys need runtime-computed key/code strings
+        let key_str = input.key.as_str();
+        let (key_name, code, vk): (String, String, i64) = match key_info(key_str) {
+            Some((kn, kc, vk)) => {
+                if key_str.len() == 1 {
+                    // Single-char: derive code at runtime (e.g. 'p' → "KeyP")
+                    let upper = key_str.to_ascii_uppercase();
+                    let code = if key_str.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+                        format!("Key{upper}")
+                    } else {
+                        format!("Digit{upper}")
+                    };
+                    (key_str.to_string(), code, vk)
+                } else {
+                    (kn.to_string(), kc.to_string(), vk)
+                }
+            }
+            None => {
+                return ToolOutput::error(format!(
+                    "Unknown key '{}'. Supported: Escape, Enter, Tab, Backspace, Delete, \
+                     Home, End, PageUp, PageDown, ArrowUp/Down/Left/Right, F1-F12, a-z, 0-9",
+                    input.key
+                ));
+            }
+        };
+
+        let modifiers = modifier_mask(&input.modifiers);
+        let mod_opt = if modifiers != 0 { Some(modifiers) } else { None };
+
+        let session = match ctx.browser().await {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
+        };
+        let guard = session.read().await;
+
+        // Send rawKeyDown + (optionally keypress for printable) + keyUp
+        let is_printable = key_str.len() == 1
+            && key_str.chars().next().map(|c| !c.is_control()).unwrap_or(false);
+
+        let mut keydown = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::RawKeyDown)
+            .key(key_name.clone())
+            .code(code.clone())
+            .windows_virtual_key_code(vk)
+            .native_virtual_key_code(vk);
+        if let Some(m) = mod_opt { keydown = keydown.modifiers(m); }
+        let keydown = match keydown.build() {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
+        };
+
+        if let Err(e) = guard.page.execute(keydown).await {
+            return ToolOutput::error(format!("Failed to dispatch keydown: {e}"));
+        }
+
+        // keypress for printable chars (browsers fire this between keydown and keyup)
+        if is_printable {
+            let mut kp = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .key(key_name.clone())
+                .code(code.clone())
+                .text(key_str.to_string())
+                .windows_virtual_key_code(vk)
+                .native_virtual_key_code(vk);
+            if let Some(m) = mod_opt { kp = kp.modifiers(m); }
+            let kp = match kp.build() {
+                Ok(p) => p,
+                Err(e) => return ToolOutput::error(format!("Failed to build keypress: {e}")),
+            };
+            if let Err(e) = guard.page.execute(kp).await {
+                return ToolOutput::error(format!("Failed to dispatch keypress: {e}"));
+            }
+        }
+
+        let mut keyup = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .key(key_name)
+            .code(code)
+            .windows_virtual_key_code(vk)
+            .native_virtual_key_code(vk);
+        if let Some(m) = mod_opt { keyup = keyup.modifiers(m); }
+        let keyup = match keyup.build() {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
+        };
+
+        if let Err(e) = guard.page.execute(keyup).await {
+            return ToolOutput::error(format!("Failed to dispatch keyup: {e}"));
+        }
+
+        let chord = if input.modifiers.is_empty() {
+            input.key.clone()
+        } else {
+            format!("{},{}", input.modifiers.join("+"), input.key)
+        };
+        ToolOutput::success(format!("Pressed {chord}"))
+    }
+}

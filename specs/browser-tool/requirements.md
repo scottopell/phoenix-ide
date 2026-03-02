@@ -185,6 +185,30 @@ WHEN the `clear` parameter is set to true
 
 ---
 
+### REQ-BT-016: Keyboard Shortcut Input
+
+The `browser_key_press` tool SHALL send a key chord to the page using CDP-level keyboard events
+
+The `key` parameter SHALL accept:
+- Named keys: `Escape`, `Enter`, `Tab`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Backspace`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F12`
+- Single printable characters: `a`–`z`, `0`–`9`
+
+The `modifiers` parameter SHALL accept a list of modifier keys: `ctrl`, `shift`, `alt`, `meta`
+
+WHEN modifiers are specified
+`browser_key_press` SHALL hold those modifiers while dispatching the key event, producing chords such as Ctrl+P, Ctrl+Shift+Z, Meta+K
+
+WHEN no element is focused
+`browser_key_press` SHALL dispatch the event to the page root (equivalent to pressing a key with no element focused)
+
+The tool SHALL fire keydown, keypress (where applicable), and keyup events in sequence so that all framework keyboard listeners receive the full event sequence
+
+**Rationale:** `browser_type` types printable text into an input element. It cannot send non-printable keys (Escape, Enter, Arrow keys) or modifier chords (Ctrl+P, Ctrl+K). These are needed to trigger keyboard shortcuts registered on `window` or `document` via `addEventListener('keydown', ...)` — common in React apps for command palettes, modal dismissal, and navigation.
+
+**User Stories:** US-2
+
+---
+
 ### REQ-BT-013: Wait for Async Page Elements
 
 The `browser_wait_for_selector` tool SHALL poll the page until a CSS selector matches an element in the DOM
@@ -388,6 +412,7 @@ THE SYSTEM SHALL write requests to a file and return the file path
 | REQ-BT-013: Wait for Async Page Elements | US-1, US-2 | ✅ |
 | REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 | ✅ |
 | REQ-BT-015: Access to Full Console Log Content | US-1, US-2 | 🟡 |
+| REQ-BT-016: Keyboard Shortcut Input | US-2 | ✅ |
 | REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |

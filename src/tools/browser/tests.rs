@@ -1723,3 +1723,159 @@ async fn test_type_password_field() {
 
     server.shutdown().await;
 }
+
+// ============================================================================
+// TDD: browser_key_press tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_key_press_escape_fires_keydown_listener() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html>
+        <head><title>Key Press Test</title></head>
+        <body>
+            <div id="result">open</div>
+            <script>
+              document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') {
+                  document.getElementById('result').textContent = 'closed';
+                }
+              });
+            </script>
+        </body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-key-escape");
+    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+
+    let result = BrowserKeyPressTool
+        .run(json!({"key": "Escape"}), ctx.clone())
+        .await;
+
+    assert!(result.success, "key_press failed: {}", result.output);
+    assert!(result.output.contains("Escape"), "Output should mention key: {}", result.output);
+
+    let eval_result = BrowserEvalTool
+        .run(json!({"expression": "document.getElementById('result').textContent"}), ctx.clone())
+        .await;
+    assert!(
+        eval_result.output.contains("closed"),
+        "Escape keydown listener not fired: {}",
+        eval_result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_key_press_ctrl_modifier_fires_capture_listener() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html>
+        <head><title>Modifier Key Test</title></head>
+        <body>
+            <div id="result">none</div>
+            <script>
+              window.addEventListener('keydown', function(e) {
+                if (e.ctrlKey && e.key === 'k') {
+                  document.getElementById('result').textContent = 'ctrl+k';
+                }
+              }, true);
+            </script>
+        </body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-key-ctrl-k");
+    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+
+    let result = BrowserKeyPressTool
+        .run(json!({"key": "k", "modifiers": ["ctrl"]}), ctx.clone())
+        .await;
+
+    assert!(result.success, "key_press failed: {}", result.output);
+
+    let eval_result = BrowserEvalTool
+        .run(json!({"expression": "document.getElementById('result').textContent"}), ctx.clone())
+        .await;
+    assert!(
+        eval_result.output.contains("ctrl+k"),
+        "Ctrl+K capture listener not fired: {}",
+        eval_result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_key_press_arrow_down() {
+    require_chrome!();
+
+    let server = TestServer::start(
+        r#"<!DOCTYPE html>
+        <html>
+        <head><title>Arrow Key Test</title></head>
+        <body>
+            <div id="result">none</div>
+            <script>
+              document.addEventListener('keydown', function(e) {
+                if (e.key === 'ArrowDown') {
+                  document.getElementById('result').textContent = 'down';
+                }
+              });
+            </script>
+        </body>
+        </html>"#,
+    )
+    .await;
+
+    let (ctx, _manager) = test_context("test-key-arrow-down");
+    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+
+    let result = BrowserKeyPressTool
+        .run(json!({"key": "ArrowDown"}), ctx.clone())
+        .await;
+
+    assert!(result.success, "key_press failed: {}", result.output);
+
+    let eval_result = BrowserEvalTool
+        .run(json!({"expression": "document.getElementById('result').textContent"}), ctx.clone())
+        .await;
+    assert!(
+        eval_result.output.contains("down"),
+        "ArrowDown keydown not received: {}",
+        eval_result.output
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_key_press_unknown_key_returns_error() {
+    require_chrome!();
+
+    let server = TestServer::start("<html><body></body></html>").await;
+    let (ctx, _manager) = test_context("test-key-unknown");
+    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+
+    let result = BrowserKeyPressTool
+        .run(json!({"key": "NotAKey"}), ctx.clone())
+        .await;
+
+    assert!(!result.success, "Should have failed for unknown key");
+    assert!(
+        result.output.to_lowercase().contains("unknown"),
+        "Should mention unknown key: {}",
+        result.output
+    );
+
+    server.shutdown().await;
+}

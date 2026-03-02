@@ -11,8 +11,7 @@ mod tools;
 mod tests;
 
 pub use session::{BrowserError, BrowserSessionManager};
-pub use tools::{
-    BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserNavigateTool,
-    BrowserRecentConsoleLogsTool, BrowserResizeTool, BrowserTakeScreenshotTool, BrowserTypeTool,
-    BrowserWaitForSelectorTool,
+pub use tools::{    BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserKeyPressTool,
+    BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
+    BrowserTakeScreenshotTool, BrowserTypeTool, BrowserWaitForSelectorTool,
 };
