@@ -33,6 +33,7 @@ use tokio::sync::RwLock;
 // The injected JavaScript helper
 // ============================================================================
 
+#[allow(clippy::doc_markdown, clippy::doc_overindented_list_items)]
 /// The JavaScript installed into every new document via `addScriptToEvaluateOnNewDocument`.
 ///
 /// Design notes:
@@ -45,6 +46,54 @@ use tokio::sync::RwLock;
 ///   to fiber order when names are stripped.
 /// - Harmless on non-React pages: the hook exists but `onCommitFiberRoot` is never
 ///   called, so `__phoenix` helpers simply return `null` / `[]`.
+///
+/// ## Hook implementation: vendored from React DevTools
+///
+/// The `__REACT_DEVTOOLS_GLOBAL_HOOK__` object installed here is derived from
+/// React's official `installHook()` function in:
+///   https://github.com/facebook/react/blob/main/packages/react-devtools-shared/src/hook.js
+///
+/// We vendor the **minimal viable subset** rather than the full 700-line function.
+/// The full function includes console patching for StrictMode, profiler module range
+/// tracking, and DCE detection — none of which we need. What we keep:
+///
+/// - `renderers: Map`         — React Fast Refresh (`@react-refresh`) iterates this
+///                              via `hook.renderers.forEach()`. Missing it crashes
+///                              Vite dev server page loads (see task 599).
+/// - `rendererInterfaces: Map` — DevTools backend populates this; we keep it as an
+///                              empty Map so code that checks it doesn't crash.
+/// - `backends: Map`          — Same reason.
+/// - `listeners: {}`          — Event emitter storage for `on`/`off`/`emit`/`sub`.
+/// - `inject(renderer)`       — React calls this to register renderers. Must return
+///                              a numeric ID and populate `renderers` Map.
+/// - `on`/`off`/`emit`/`sub`  — Event emitter methods. React and third-party tools
+///                              (Fast Refresh, DevTools backend) use these.
+/// - `getFiberRoots(id)`      — Returns a Set of fiber roots per renderer ID.
+/// - `onCommitFiberRoot`      — Called after every React render commit.
+/// - `onCommitFiberUnmount`   — Called when a fiber is unmounted.
+/// - `onPostCommitFiberRoot`  — Called after passive effects (React 18+).
+/// - `setStrictMode`          — Called during StrictMode double-renders.
+/// - `supportsFiber: true`    — React 16+ checks this flag.
+/// - `supportsFlight: true`   — React Flight (Server Components) checks this.
+/// - `checkDCE`               — React production builds call this.
+///
+/// ## How to update
+///
+/// If React changes the hook interface (rare — it's a de facto public API):
+/// 1. Read the latest hook.js at the URL above
+/// 2. Compare the returned object shape with what we construct below
+/// 3. Add any new properties React expects
+/// 4. Test against both Vite dev server (Fast Refresh) and production builds
+///
+/// ## Alternatives considered
+///
+/// - **Full `react-devtools-inline/backend`**: 206 KB minified. Includes the complete
+///   DevTools inspection protocol, profiler, etc. Overkill for our getContext/callContext
+///   use case. See task 596 design notes.
+/// - **Our original minimal stub**: Missing `renderers`, `inject`, event emitter.
+///   Crashed Vite's `@react-refresh` preamble (task 599).
+/// - **Runtime npm dependency**: Would require a build step to bundle JS into the
+///   Rust binary. The vendored approach keeps us as a single static binary.
 const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
 (function() {
   // ── Idempotency guard ──────────────────────────────────────────────────────
@@ -54,54 +103,147 @@ const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
     return;
   }
 
-  // ── Fiber root registry ────────────────────────────────────────────────────
-  // React calls `onCommitFiberRoot(rendererID, root)` after every render.
-  // We collect all roots here so the helper functions can search across them.
-  var fiberRoots = [];
-
-  // ── React DevTools hook ────────────────────────────────────────────────────
-  // React checks for this global at startup. If it exists, React registers its
-  // internals into it. We install our hook BEFORE page JS runs so React sees it.
+  // ── React DevTools hook (vendored from react-devtools-shared/src/hook.js) ──
   //
-  // We must not overwrite an existing hook that another tool (e.g. the actual
-  // React DevTools browser extension) may have installed. Instead, we wrap the
-  // existing `onCommitFiberRoot` callback if one already exists.
-  var existingHook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-  var prevOnCommit = existingHook && existingHook.onCommitFiberRoot;
-
-  var hook = existingHook || {};
-
-  // Minimal set of properties React expects on the hook object.
-  // React skips the hook entirely if `isDisabled` is true, so we never set it.
-  hook.supportsFiber = true;
-
-  // Called by React after every committed render tree.
-  hook.onCommitFiberRoot = function(rendererID, root) {
-    // Forward to any pre-existing hook handler first.
-    if (typeof prevOnCommit === 'function') {
-      try { prevOnCommit.call(hook, rendererID, root); } catch (_) {}
+  // If a hook already exists (e.g. React DevTools extension installed it),
+  // we DON'T replace it — we just add our __phoenix helpers on top.
+  // If no hook exists, we install one with the shape React expects.
+  if (!window.__REACT_DEVTOOLS_GLOBAL_HOOK__) {
+    // --- Event emitter ---
+    var listeners = {};
+    function on(event, fn) {
+      if (!listeners[event]) listeners[event] = [];
+      listeners[event].push(fn);
+    }
+    function off(event, fn) {
+      if (!listeners[event]) return;
+      var idx = listeners[event].indexOf(fn);
+      if (idx !== -1) listeners[event].splice(idx, 1);
+      if (!listeners[event].length) delete listeners[event];
+    }
+    function emit(event, data) {
+      if (listeners[event]) listeners[event].forEach(function(fn) { fn(data); });
+    }
+    function sub(event, fn) {
+      on(event, fn);
+      return function() { off(event, fn); };
     }
 
-    // Register the root so our search functions can find it.
-    // Use the current property (React may pass the same root object multiple
-    // times with a mutated `current` pointer after updates).
-    var fiber = root.current || root;
-    if (fiberRoots.indexOf(fiber) === -1) {
-      fiberRoots.push(fiber);
+    // --- Renderer tracking ---
+    // React calls inject(renderer) at startup to register itself.
+    // The returned ID is passed to all subsequent onCommitFiberRoot calls.
+    var renderers = new Map();        // ID -> renderer object
+    var rendererInterfaces = new Map(); // ID -> renderer interface (populated by DevTools backend)
+    var backends = new Map();
+    var fiberRoots = {};              // ID -> Set of fiber roots
+    var uidCounter = 0;
+
+    function inject(renderer) {
+      var id = ++uidCounter;
+      renderers.set(id, renderer);
+      emit('renderer', { id: id, renderer: renderer });
+      return id;
     }
-  };
 
-  // React also calls these; provide no-op stubs so React does not error.
-  if (!hook.inject)          { hook.inject          = function() {}; }
-  if (!hook.onCommitFiberUnmount) { hook.onCommitFiberUnmount = function() {}; }
+    function getFiberRoots(rendererID) {
+      if (!fiberRoots[rendererID]) {
+        fiberRoots[rendererID] = new Set();
+      }
+      return fiberRoots[rendererID];
+    }
 
-  window.__REACT_DEVTOOLS_GLOBAL_HOOK__ = hook;
+    // --- Lifecycle hooks called by React ---
+    function onCommitFiberRoot(rendererID, root, priorityLevel) {
+      var mountedRoots = getFiberRoots(rendererID);
+      var current = root.current;
+      var isKnownRoot = mountedRoots.has(root);
+      var isUnmounting = current.memoizedState == null ||
+                         current.memoizedState.element == null;
+      if (!isKnownRoot && !isUnmounting) {
+        mountedRoots.add(root);
+      } else if (isKnownRoot && isUnmounting) {
+        mountedRoots.delete(root);
+      }
+      var iface = rendererInterfaces.get(rendererID);
+      if (iface != null && iface.handleCommitFiberRoot) {
+        iface.handleCommitFiberRoot(root, priorityLevel);
+      }
+    }
+
+    function onCommitFiberUnmount(rendererID, fiber) {
+      var iface = rendererInterfaces.get(rendererID);
+      if (iface != null && iface.handleCommitFiberUnmount) {
+        iface.handleCommitFiberUnmount(fiber);
+      }
+    }
+
+    function onPostCommitFiberRoot(rendererID, root) {
+      var iface = rendererInterfaces.get(rendererID);
+      if (iface != null && iface.handlePostCommitFiberRoot) {
+        iface.handlePostCommitFiberRoot(root);
+      }
+    }
+
+    // --- Assemble the hook object ---
+    // This shape matches what React's installHook() returns.
+    // See: https://github.com/facebook/react/blob/main/packages/react-devtools-shared/src/hook.js
+    var hook = {
+      rendererInterfaces: rendererInterfaces,
+      listeners: listeners,
+      backends: backends,
+      renderers: renderers,            // Critical: @react-refresh calls renderers.forEach()
+      hasUnsupportedRendererAttached: false,
+      supportsFiber: true,             // React 16+ checks this
+      supportsFlight: true,            // React Flight (Server Components) checks this
+      emit: emit,
+      getFiberRoots: getFiberRoots,
+      inject: inject,
+      on: on,
+      off: off,
+      sub: sub,
+      checkDCE: function() {},         // React production builds call this
+      onCommitFiberUnmount: onCommitFiberUnmount,
+      onCommitFiberRoot: onCommitFiberRoot,
+      onPostCommitFiberRoot: onPostCommitFiberRoot,  // React 18+
+      setStrictMode: function() {},    // Called during StrictMode; we don't patch console
+      getInternalModuleRanges: function() { return []; },
+      registerInternalModuleStart: function() {},
+      registerInternalModuleStop: function() {}
+    };
+
+    // Use Object.defineProperty like the real DevTools hook does.
+    // configurable: true so tests can delete and recreate.
+    Object.defineProperty(window, '__REACT_DEVTOOLS_GLOBAL_HOOK__', {
+      configurable: true,
+      enumerable: false,
+      get: function() { return hook; }
+    });
+  }
+
+  // ── Reference to the hook (ours or pre-existing) ───────────────────────────
+  var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+
+  // ── Collect all fiber roots from the hook ─────────────────────────────────
+  // The hook stores fiber roots per renderer ID via getFiberRoots(id) -> Set.
+  // We collect all roots across all renderers for searching.
+  function getAllFiberRoots() {
+    var roots = [];
+    if (hook.getFiberRoots && hook.renderers) {
+      hook.renderers.forEach(function(renderer, id) {
+        var set = hook.getFiberRoots(id);
+        if (set) set.forEach(function(root) { roots.push(root); });
+      });
+    }
+    return roots;
+  }
 
   // ── Depth-first fiber tree search ─────────────────────────────────────────
   // Walks child → sibling links. Returns the first fiber for which `predicate`
   // returns truthy, or null if not found.
   function findFiber(root, predicate) {
-    var stack = [root];
+    // Start from root.current if available (FiberRootNode → FiberNode)
+    var start = root.current || root;
+    var stack = [start];
     while (stack.length > 0) {
       var fiber = stack.pop();
       if (!fiber) continue;
@@ -127,8 +269,9 @@ const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
   // Scan every registered fiber root for a ContextProvider (tag === 10) whose
   // `memoizedProps.value` duck-types to the requested shape.
   function findContext(keys) {
-    for (var r = 0; r < fiberRoots.length; r++) {
-      var found = findFiber(fiberRoots[r], function(fiber) {
+    var roots = getAllFiberRoots();
+    for (var r = 0; r < roots.length; r++) {
+      var found = findFiber(roots[r], function(fiber) {
         // tag 10 = ContextProvider in React source (stable across React 16–18)
         if (fiber.tag !== 10) return false;
         var val = fiber.memoizedProps && fiber.memoizedProps.value;
@@ -190,8 +333,9 @@ const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
      */
     getState: function(componentName) {
       var states = [];
-      for (var r = 0; r < fiberRoots.length; r++) {
-        var found = findFiber(fiberRoots[r], function(fiber) {
+      var roots = getAllFiberRoots();
+      for (var r = 0; r < roots.length; r++) {
+        var found = findFiber(roots[r], function(fiber) {
           var type = fiber.type;
           if (!type) return false;
           return type.name === componentName || type.displayName === componentName;
@@ -220,22 +364,27 @@ const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
      */
     listContexts: function() {
       var results = [];
-      for (var r = 0; r < fiberRoots.length; r++) {
+      var roots = getAllFiberRoots();
+      for (var r = 0; r < roots.length; r++) {
         (function searchRoot(fiber) {
           if (!fiber) return;
-          if (fiber.tag === 10) {
-            var val = fiber.memoizedProps && fiber.memoizedProps.value;
-            if (val && typeof val === 'object') {
-              results.push({
-                keys: Object.keys(val),
-                // Include a shallow snapshot so the caller can see values.
-                value: val
-              });
+          // Start from .current if this is a FiberRootNode
+          var node = fiber.current || fiber;
+          (function walk(f) {
+            if (!f) return;
+            if (f.tag === 10) {
+              var val = f.memoizedProps && f.memoizedProps.value;
+              if (val && typeof val === 'object') {
+                results.push({
+                  keys: Object.keys(val),
+                  value: val
+                });
+              }
             }
-          }
-          if (fiber.child)   searchRoot(fiber.child);
-          if (fiber.sibling) searchRoot(fiber.sibling);
-        })(fiberRoots[r]);
+            if (f.child)   walk(f.child);
+            if (f.sibling) walk(f.sibling);
+          })(node);
+        })(roots[r]);
       }
       return results;
     }
