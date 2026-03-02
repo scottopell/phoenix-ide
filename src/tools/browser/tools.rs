@@ -1099,8 +1099,10 @@ impl Tool for BrowserKeyPressTool {
          capture listeners receive them. \
          method=\"cdp\" (default): isTrusted=true but Chrome intercepts browser-native \
          shortcuts (Ctrl+P=print, Ctrl+W=close tab, Ctrl+T=new tab) before the page sees them. \
+         Fires separate keydown events for each modifier and the key (e.g. Ctrl+P fires two events). \
          method=\"js\": dispatches via JavaScript KeyboardEvent so the page receives even \
-         browser-intercepted shortcuts; isTrusted=false (rarely checked by app code)."
+         browser-intercepted shortcuts; isTrusted=false (rarely checked by app code). \
+         Fires a single synthetic event with modifier flags set (e.g. ctrlKey=true)."
             .to_string()
     }
 
@@ -1120,7 +1122,7 @@ impl Tool for BrowserKeyPressTool {
                 "method": {
                     "type": "string",
                     "enum": ["cdp", "js"],
-                    "description": "How to dispatch the key event. \"cdp\" (default): CDP hardware simulation, isTrusted=true, but Chrome intercepts Ctrl+P/Ctrl+W/Ctrl+T before the page sees them. \"js\": JavaScript KeyboardEvent, reaches the page even for browser-intercepted shortcuts, isTrusted=false."
+                    "description": "How to dispatch the key event. \"cdp\" (default): CDP hardware simulation, isTrusted=true, fires separate events per modifier key, but Chrome intercepts Ctrl+P/Ctrl+W/Ctrl+T before the page sees them. \"js\": single synthetic KeyboardEvent with modifier flags set, reaches the page even for browser-intercepted shortcuts, isTrusted=false."
                 }
             },
             "required": ["key"]
@@ -1192,7 +1194,7 @@ impl Tool for BrowserKeyPressTool {
                 );
 
                 match guard.page.evaluate(js).await {
-                    Ok(_) => ToolOutput::success(format!("Pressed {chord} (js)")),
+                    Ok(_) => ToolOutput::success(format!("Pressed {chord} [js]")),
                     Err(e) => ToolOutput::error(format!("JS dispatch failed: {e}")),
                 }
             }
@@ -1275,5 +1277,5 @@ async fn dispatch_key_cdp(
         return ToolOutput::error(format!("Failed to dispatch keyup: {e}"));
     }
 
-    ToolOutput::success(format!("Pressed {chord}"))
+    ToolOutput::success(format!("Pressed {chord} [cdp]"))
 }
