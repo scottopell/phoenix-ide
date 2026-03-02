@@ -1,78 +1,54 @@
 /**
- * FileSource — command palette source that searches files in the conversation's cwd
- * and opens the selected file in ProseReader via fileExplorer.openFile.
+ * FileSource — command palette source that searches files in the active
+ * conversation's working directory via the server-side search endpoint.
+ *
+ * Uses /api/conversations/:id/files/search which is gitignore-aware,
+ * recursive, and fuzzy-matches server-side — the same endpoint as the
+ * ./ inline file reference autocomplete in InputArea.
+ *
+ * Returns empty results when query is empty (no point listing every file).
+ * Returns empty results when no convId is available (root route).
  */
+import { api } from '../../../api';
 import type { PaletteSource, PaletteItem } from '../types';
-import { fuzzyMatch } from '../fuzzyMatch';
 
 export function createFileSource(
-  rootPath: string,
+  convId: string,
+  rootDir: string,
   openFile: (path: string, rootDir: string) => void,
 ): PaletteSource {
-  // Cache of loaded file paths for this rootPath
-  let cached: string[] = [];
-  let cacheKey = '';
-
-  async function loadFiles(root: string): Promise<string[]> {
-    if (cacheKey === root && cached.length > 0) return cached;
-    try {
-      const resp = await fetch(`/api/files/list?path=${encodeURIComponent(root)}`);
-      if (!resp.ok) return [];
-      const data = await resp.json();
-      // Flatten: collect all file paths recursively via repeated listing
-      const files: string[] = [];
-      const walk = async (items: { name: string; path: string; is_dir: boolean }[]) => {
-        for (const item of items) {
-          if (!item.is_dir) {
-            files.push(item.path);
-          }
-        }
-      };
-      await walk(data.files || []);
-      cacheKey = root;
-      cached = files;
-      return files;
-    } catch {
-      return [];
-    }
-  }
-
-  // Kick off initial load immediately
-  void loadFiles(rootPath);
-
   return {
     id: 'files',
     category: 'Files',
 
-    search(query: string): PaletteItem[] {
-      if (!query) return [];
-      // Reload in background if rootPath changed
-      if (cacheKey !== rootPath) void loadFiles(rootPath);
-      const items = cached.map(p => toItem(p, rootPath));
-      return fuzzyMatch(items, query, item => item.title).slice(0, 15);
+    async search(query: string, signal?: AbortSignal): Promise<PaletteItem[]> {
+      if (!query.trim()) return [];
+      try {
+        const result = await api.searchConversationFiles(convId, query, 15, signal);
+        return result.items.map(entry => toItem(entry.path, rootDir));
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return [];
+        return [];
+      }
     },
 
     onSelect(item: PaletteItem) {
-      const path = item.metadata as string;
-      openFile(path, rootPath);
+      const relPath = item.metadata as string;
+      const absPath = relPath.startsWith('/') ? relPath : `${rootDir}/${relPath}`;
+      openFile(absPath, rootDir);
     },
   };
 }
 
-function toItem(filePath: string, rootPath: string): PaletteItem {
-  // Show path relative to rootPath for readability
-  const rel = filePath.startsWith(rootPath + '/')
-    ? filePath.slice(rootPath.length + 1)
-    : filePath;
-  const parts = rel.split('/');
+function toItem(relPath: string, rootDir: string): PaletteItem {
+  const parts = relPath.split('/');
   const name = parts[parts.length - 1];
-  const dir = parts.slice(0, -1).join('/');
-
+  const dir = parts.length > 1 ? parts.slice(0, -1).join('/') : rootDir;
   return {
-    id: filePath,
+    id: relPath,
     title: name,
-    subtitle: dir || rootPath,
+    subtitle: dir,
     category: 'Files',
-    metadata: filePath,
+    metadata: relPath,
   };
 }

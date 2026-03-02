@@ -11,6 +11,8 @@ import { createFileSource } from './sources/FileSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 
+const SEARCH_DEBOUNCE_MS = 120;
+
 interface CommandPaletteProps {
   conversations: Conversation[];
 }
@@ -21,8 +23,9 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const overlayRef = useRef<HTMLDivElement>(null);
-  // Track selected index for mouse hover without triggering state machine
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { openFile } = useFileExplorer();
 
   // Desktop detection
@@ -33,26 +36,23 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
-  // Extract current slug from URL
+  // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
   const activeConversation = useMemo(
     () => conversations.find(c => c.slug === currentSlug) ?? null,
     [conversations, currentSlug],
   );
-  const activeCwd = activeConversation?.cwd ?? null;
 
-  // Build sources and actions
+  // Sources — file source only when inside a conversation
   const sources: PaletteSource[] = useMemo(
     () => [
-      createConversationSource(conversations, (slug) => {
-        navigate(`/c/${slug}`);
-      }),
-      ...(activeCwd
-        ? [createFileSource(activeCwd, (path, rootDir) => openFile(path, rootDir))]
+      createConversationSource(conversations, (slug) => navigate(`/c/${slug}`)),
+      ...(activeConversation
+        ? [createFileSource(activeConversation.id, activeConversation.cwd, (path, rootDir) => openFile(path, rootDir))]
         : []),
     ],
-    [conversations, navigate, activeCwd, openFile],
+    [conversations, navigate, activeConversation, openFile],
   );
 
   const actions: PaletteAction[] = useMemo(
@@ -72,16 +72,41 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     [navigate, currentSlug, conversations],
   );
 
-  const context = useMemo(() => ({ sources, actions }), [sources, actions]);
-
-  // Dispatch helper
+  // Dispatch helper — state machine only needs actions now (sources are async)
   const dispatch = useCallback(
     (event: Parameters<typeof transition>[1]) => {
-      setState(prev => transition(prev, event, context));
+      setState(prev => transition(prev, event, actions));
       setHoverIndex(null);
     },
-    [context],
+    [actions],
   );
+
+  // Async search effect — fires on query/mode change, debounced, abortable
+  useEffect(() => {
+    if (state.status !== 'open' || state.mode !== 'search') return;
+
+    // Cancel previous debounce + in-flight request
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    searchAbortRef.current?.abort();
+
+    debounceRef.current = setTimeout(async () => {
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
+
+      const allResults = await Promise.all(
+        sources.map(s => s.search(state.query, controller.signal))
+      );
+
+      if (!controller.signal.aborted) {
+        setState(prev => transition(prev, { type: 'SET_RESULTS', results: allResults.flat() }, actions));
+      }
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.status, state.mode, state.query]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {
@@ -93,16 +118,16 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
         e.stopPropagation();
         setState(prev => {
           if (prev.status === 'open') {
-            return transition(prev, { type: 'CLOSE' }, context);
+            return transition(prev, { type: 'CLOSE' }, actions);
           }
-          return transition(prev, { type: 'OPEN' }, context);
+          return transition(prev, { type: 'OPEN' }, actions);
         });
       }
     };
 
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
-  }, [isDesktop, context]);
+  }, [isDesktop, actions]);
 
   // Close on route change
   useEffect(() => {

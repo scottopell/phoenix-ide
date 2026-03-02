@@ -1,4 +1,4 @@
-import type { PaletteState, PaletteEvent, PaletteItem, PaletteSource, PaletteAction } from './types';
+import type { PaletteState, PaletteEvent, PaletteItem, PaletteAction } from './types';
 import { fuzzyMatch } from './fuzzyMatch';
 
 export const initialState: PaletteState = { status: 'closed' };
@@ -6,23 +6,26 @@ export const initialState: PaletteState = { status: 'closed' };
 /**
  * Pure state transition function for the command palette.
  * All state changes go through here — no side effects.
+ *
+ * Sources are async and handled outside the state machine (in the component
+ * via useEffect). The state machine only needs actions for the synchronous
+ * action-mode fuzzy match.
  */
 export function transition(
   state: PaletteState,
   event: PaletteEvent,
-  context?: { sources: PaletteSource[]; actions: PaletteAction[] },
+  actions?: PaletteAction[],
 ): PaletteState {
   switch (event.type) {
     case 'OPEN': {
       if (state.status === 'open') return state;
-      const results = context ? getSearchResults('', context.sources) : [];
       return {
         status: 'open',
         mode: 'search',
         query: '',
         rawInput: '',
         selectedIndex: 0,
-        results,
+        results: [],
       };
     }
 
@@ -36,20 +39,26 @@ export function transition(
       const query = isAction ? rawInput.slice(1).trimStart() : rawInput;
       const mode = isAction ? 'action' : 'search';
 
-      const results = context
-        ? mode === 'action'
-          ? getActionResults(query, context.actions)
-          : getSearchResults(query, context.sources)
-        : [];
+      // Action mode: compute results synchronously from in-memory list.
+      // Search mode: leave results stale — component useEffect fires async search
+      // and dispatches SET_RESULTS when done.
+      const results = isAction
+        ? getActionResults(query, actions ?? [])
+        : state.results;
 
       return {
-        status: 'open',
+        ...state,
         mode,
         query,
         rawInput,
         selectedIndex: 0,
         results,
       };
+    }
+
+    case 'SET_RESULTS': {
+      if (state.status !== 'open') return state;
+      return { ...state, results: event.results, selectedIndex: 0 };
     }
 
     case 'SELECT_NEXT': {
@@ -71,23 +80,10 @@ export function transition(
     }
 
     case 'CONFIRM': {
-      // Confirmation is handled by the component (side effect)
-      // Transition to closed
       if (state.status !== 'open') return state;
       return { status: 'closed' };
     }
   }
-}
-
-// --- Result computation helpers ---
-
-function getSearchResults(query: string, sources: PaletteSource[]): PaletteItem[] {
-  const allResults: PaletteItem[] = [];
-  for (const source of sources) {
-    const items = source.search(query);
-    allResults.push(...items);
-  }
-  return allResults;
 }
 
 function getActionResults(query: string, actions: PaletteAction[]): PaletteItem[] {

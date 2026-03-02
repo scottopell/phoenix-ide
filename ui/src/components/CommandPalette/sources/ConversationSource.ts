@@ -10,17 +10,14 @@ export function createConversationSource(
     id: 'conversations',
     category: 'Conversations',
 
-    search(query: string): PaletteItem[] {
-      // Sort by updated_at descending (most recent first)
+    search(query: string): Promise<PaletteItem[]> {
       const sorted = [...conversations].sort(
         (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
       );
-
       if (!query) {
-        return sorted.slice(0, 10).map(toItem);
+        return Promise.resolve(sorted.slice(0, 10).map(toItem));
       }
-
-      return fuzzyMatch(sorted, query, c => c.slug).slice(0, 10).map(toItem);
+      return Promise.resolve(fuzzyMatch(sorted, query, c => c.slug).slice(0, 10).map(toItem));
     },
 
     onSelect(item: PaletteItem) {
