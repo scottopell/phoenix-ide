@@ -994,42 +994,42 @@ struct KeyPressInput {
     modifiers: Vec<String>,
 }
 
-/// Map a key name to (key, code, windows_virtual_key_code).
-/// Returns None for unrecognised keys.
+/// Map a key name to (`key`, `code`, `windows_virtual_key_code`).
+/// Returns `None` for unrecognised keys.
 fn key_info(key: &str) -> Option<(String, String, i64)> {
-    // Helper to wrap static strings for named keys.
-    fn named(k: &'static str, c: &'static str, vk: i64) -> Option<(String, String, i64)> {
-        Some((k.to_string(), c.to_string(), vk))
+    // Helper to convert static strings for named keys.
+    fn named(k: &'static str, c: &'static str, vk: i64) -> (String, String, i64) {
+        (k.to_string(), c.to_string(), vk)
     }
 
     match key {
         // Navigation / editing
-        "Escape" => named("Escape", "Escape", 27),
-        "Enter" => named("Enter", "Enter", 13),
-        "Tab" => named("Tab", "Tab", 9),
-        "Backspace" => named("Backspace", "Backspace", 8),
-        "Delete" => named("Delete", "Delete", 46),
-        "Home" => named("Home", "Home", 36),
-        "End" => named("End", "End", 35),
-        "PageUp" => named("PageUp", "PageUp", 33),
-        "PageDown" => named("PageDown", "PageDown", 34),
-        "ArrowUp" => named("ArrowUp", "ArrowUp", 38),
-        "ArrowDown" => named("ArrowDown", "ArrowDown", 40),
-        "ArrowLeft" => named("ArrowLeft", "ArrowLeft", 37),
-        "ArrowRight" => named("ArrowRight", "ArrowRight", 39),
+        "Escape" => Some(named("Escape", "Escape", 27)),
+        "Enter" => Some(named("Enter", "Enter", 13)),
+        "Tab" => Some(named("Tab", "Tab", 9)),
+        "Backspace" => Some(named("Backspace", "Backspace", 8)),
+        "Delete" => Some(named("Delete", "Delete", 46)),
+        "Home" => Some(named("Home", "Home", 36)),
+        "End" => Some(named("End", "End", 35)),
+        "PageUp" => Some(named("PageUp", "PageUp", 33)),
+        "PageDown" => Some(named("PageDown", "PageDown", 34)),
+        "ArrowUp" => Some(named("ArrowUp", "ArrowUp", 38)),
+        "ArrowDown" => Some(named("ArrowDown", "ArrowDown", 40)),
+        "ArrowLeft" => Some(named("ArrowLeft", "ArrowLeft", 37)),
+        "ArrowRight" => Some(named("ArrowRight", "ArrowRight", 39)),
         // Function keys
-        "F1" => named("F1", "F1", 112),
-        "F2" => named("F2", "F2", 113),
-        "F3" => named("F3", "F3", 114),
-        "F4" => named("F4", "F4", 115),
-        "F5" => named("F5", "F5", 116),
-        "F6" => named("F6", "F6", 117),
-        "F7" => named("F7", "F7", 118),
-        "F8" => named("F8", "F8", 119),
-        "F9" => named("F9", "F9", 120),
-        "F10" => named("F10", "F10", 121),
-        "F11" => named("F11", "F11", 122),
-        "F12" => named("F12", "F12", 123),
+        "F1" => Some(named("F1", "F1", 112)),
+        "F2" => Some(named("F2", "F2", 113)),
+        "F3" => Some(named("F3", "F3", 114)),
+        "F4" => Some(named("F4", "F4", 115)),
+        "F5" => Some(named("F5", "F5", 116)),
+        "F6" => Some(named("F6", "F6", 117)),
+        "F7" => Some(named("F7", "F7", 118)),
+        "F8" => Some(named("F8", "F8", 119)),
+        "F9" => Some(named("F9", "F9", 120)),
+        "F10" => Some(named("F10", "F10", 121)),
+        "F11" => Some(named("F11", "F11", 122)),
+        "F12" => Some(named("F12", "F12", 123)),
         // Single printable chars: compute key and code from the character itself.
         c if c.len() == 1 => {
             let ch = c.chars().next().unwrap();
@@ -1138,7 +1138,7 @@ impl Tool for BrowserKeyPressTool {
 
         // Send rawKeyDown + (optionally keypress for printable) + keyUp
         let is_printable = key_str.len() == 1
-            && key_str.chars().next().map(|c| !c.is_control()).unwrap_or(false);
+            && key_str.chars().next().is_some_and(|c| !c.is_control());
 
         let mut keydown = DispatchKeyEventParams::builder()
             .r#type(DispatchKeyEventType::RawKeyDown)
