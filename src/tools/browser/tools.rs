@@ -996,50 +996,56 @@ struct KeyPressInput {
 
 /// Map a key name to (key, code, windows_virtual_key_code).
 /// Returns None for unrecognised keys.
-fn key_info(key: &str) -> Option<(&'static str, &'static str, i64)> {
+fn key_info(key: &str) -> Option<(String, String, i64)> {
+    // Helper to wrap static strings for named keys.
+    fn named(k: &'static str, c: &'static str, vk: i64) -> Option<(String, String, i64)> {
+        Some((k.to_string(), c.to_string(), vk))
+    }
+
     match key {
         // Navigation / editing
-        "Escape" => Some(("Escape", "Escape", 27)),
-        "Enter" => Some(("Enter", "Enter", 13)),
-        "Tab" => Some(("Tab", "Tab", 9)),
-        "Backspace" => Some(("Backspace", "Backspace", 8)),
-        "Delete" => Some(("Delete", "Delete", 46)),
-        "Home" => Some(("Home", "Home", 36)),
-        "End" => Some(("End", "End", 35)),
-        "PageUp" => Some(("PageUp", "PageUp", 33)),
-        "PageDown" => Some(("PageDown", "PageDown", 34)),
-        "ArrowUp" => Some(("ArrowUp", "ArrowUp", 38)),
-        "ArrowDown" => Some(("ArrowDown", "ArrowDown", 40)),
-        "ArrowLeft" => Some(("ArrowLeft", "ArrowLeft", 37)),
-        "ArrowRight" => Some(("ArrowRight", "ArrowRight", 39)),
+        "Escape" => named("Escape", "Escape", 27),
+        "Enter" => named("Enter", "Enter", 13),
+        "Tab" => named("Tab", "Tab", 9),
+        "Backspace" => named("Backspace", "Backspace", 8),
+        "Delete" => named("Delete", "Delete", 46),
+        "Home" => named("Home", "Home", 36),
+        "End" => named("End", "End", 35),
+        "PageUp" => named("PageUp", "PageUp", 33),
+        "PageDown" => named("PageDown", "PageDown", 34),
+        "ArrowUp" => named("ArrowUp", "ArrowUp", 38),
+        "ArrowDown" => named("ArrowDown", "ArrowDown", 40),
+        "ArrowLeft" => named("ArrowLeft", "ArrowLeft", 37),
+        "ArrowRight" => named("ArrowRight", "ArrowRight", 39),
         // Function keys
-        "F1" => Some(("F1", "F1", 112)),
-        "F2" => Some(("F2", "F2", 113)),
-        "F3" => Some(("F3", "F3", 114)),
-        "F4" => Some(("F4", "F4", 115)),
-        "F5" => Some(("F5", "F5", 116)),
-        "F6" => Some(("F6", "F6", 117)),
-        "F7" => Some(("F7", "F7", 118)),
-        "F8" => Some(("F8", "F8", 119)),
-        "F9" => Some(("F9", "F9", 120)),
-        "F10" => Some(("F10", "F10", 121)),
-        "F11" => Some(("F11", "F11", 122)),
-        "F12" => Some(("F12", "F12", 123)),
-        // Single printable chars a-z (lower)
+        "F1" => named("F1", "F1", 112),
+        "F2" => named("F2", "F2", 113),
+        "F3" => named("F3", "F3", 114),
+        "F4" => named("F4", "F4", 115),
+        "F5" => named("F5", "F5", 116),
+        "F6" => named("F6", "F6", 117),
+        "F7" => named("F7", "F7", 118),
+        "F8" => named("F8", "F8", 119),
+        "F9" => named("F9", "F9", 120),
+        "F10" => named("F10", "F10", 121),
+        "F11" => named("F11", "F11", 122),
+        "F12" => named("F12", "F12", 123),
+        // Single printable chars: compute key and code from the character itself.
         c if c.len() == 1 => {
             let ch = c.chars().next().unwrap();
             match ch {
                 'a'..='z' => {
-                    let vk = ch as i64 - 'a' as i64 + 65; // A=65
-                    Some(("a", "KeyA", vk)) // key/code are computed below
+                    let vk = ch as i64 - 'a' as i64 + 65; // VK codes use uppercase: A=65
+                    let upper = ch.to_ascii_uppercase();
+                    Some((c.to_string(), format!("Key{upper}"), vk))
                 }
                 'A'..='Z' => {
                     let vk = ch as i64 - 'A' as i64 + 65;
-                    Some(("A", "KeyA", vk))
+                    Some((c.to_string(), format!("Key{ch}"), vk))
                 }
                 '0'..='9' => {
                     let vk = ch as i64 - '0' as i64 + 48;
-                    Some(("0", "Digit0", vk))
+                    Some((c.to_string(), format!("Digit{ch}"), vk))
                 }
                 _ => None,
             }
@@ -1108,23 +1114,10 @@ impl Tool for BrowserKeyPressTool {
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        // Resolve key name — single char keys need runtime-computed key/code strings
+        // Resolve key name, code, and virtual key code.
         let key_str = input.key.as_str();
         let (key_name, code, vk): (String, String, i64) = match key_info(key_str) {
-            Some((kn, kc, vk)) => {
-                if key_str.len() == 1 {
-                    // Single-char: derive code at runtime (e.g. 'p' → "KeyP")
-                    let upper = key_str.to_ascii_uppercase();
-                    let code = if key_str.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
-                        format!("Key{upper}")
-                    } else {
-                        format!("Digit{upper}")
-                    };
-                    (key_str.to_string(), code, vk)
-                } else {
-                    (kn.to_string(), kc.to_string(), vk)
-                }
-            }
+            Some(info) => info,
             None => {
                 return ToolOutput::error(format!(
                     "Unknown key '{}'. Supported: Escape, Enter, Tab, Backspace, Delete, \
