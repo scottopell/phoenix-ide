@@ -350,14 +350,29 @@ export function ConversationPage() {
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
-      inputRef.current?.appendToDraft(formattedNotes);
+      if (inputRef.current) {
+        // InputArea is mounted (mobile path) — update via React state.
+        inputRef.current.appendToDraft(formattedNotes);
+      } else if (conversationId) {
+        // Desktop early-return renders ProseReader instead of InputArea,
+        // so inputRef.current is null. Write directly to localStorage so
+        // InputArea picks it up when it mounts after the prose reader closes.
+        const key = `phoenix:draft:${conversationId}`;
+        try {
+          const existing = localStorage.getItem(key) ?? '';
+          const next = existing.trim() ? existing + '\n\n' + formattedNotes : formattedNotes;
+          localStorage.setItem(key, next);
+        } catch (e) {
+          console.warn('Failed to save notes to draft:', e);
+        }
+      }
       if (isDesktop) {
         fileExplorer.closeFile();
       } else {
         setMobileProseFile(null);
       }
     },
-    [isDesktop, fileExplorer]
+    [isDesktop, fileExplorer, conversationId]
   );
 
   const handleOpenFileFromPatch = useCallback(

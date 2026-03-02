@@ -7,7 +7,9 @@ import { transition, initialState } from './stateMachine';
 import { CommandPaletteInput } from './CommandPaletteInput';
 import { CommandPaletteResults } from './CommandPaletteResults';
 import { createConversationSource } from './sources/ConversationSource';
+import { createFileSource } from './sources/FileSource';
 import { createBuiltInActions } from './actions/builtInActions';
+import { useFileExplorer } from '../../hooks/useFileExplorer';
 
 interface CommandPaletteProps {
   conversations: Conversation[];
@@ -21,6 +23,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
   // Track selected index for mouse hover without triggering state machine
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const { openFile } = useFileExplorer();
 
   // Desktop detection
   useEffect(() => {
@@ -33,6 +36,11 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   // Extract current slug from URL
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
+  const activeConversation = useMemo(
+    () => conversations.find(c => c.slug === currentSlug) ?? null,
+    [conversations, currentSlug],
+  );
+  const activeCwd = activeConversation?.cwd ?? null;
 
   // Build sources and actions
   const sources: PaletteSource[] = useMemo(
@@ -40,8 +48,11 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
       createConversationSource(conversations, (slug) => {
         navigate(`/c/${slug}`);
       }),
+      ...(activeCwd
+        ? [createFileSource(activeCwd, (path, rootDir) => openFile(path, rootDir))]
+        : []),
     ],
-    [conversations, navigate],
+    [conversations, navigate, activeCwd, openFile],
   );
 
   const actions: PaletteAction[] = useMemo(
