@@ -21,7 +21,7 @@ const MAX_TERM_RESULTS: usize = 64 * 1024; // 64KB per term
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
 
 /// Preferred models for filtering (fast and cheap)
-const PREFERRED_MODELS: &[&str] = &["claude-3.5-haiku", "claude-3.5-sonnet", "claude-4-sonnet"];
+const PREFERRED_MODELS: &[&str] = &["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6"];
 
 const FILTER_SYSTEM_PROMPT: &str = r#"You are a code search relevance evaluator. Your task is to analyze ripgrep results and determine which files are most relevant to the user's query.
 

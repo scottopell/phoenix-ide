@@ -1,6 +1,59 @@
 //! LLM provider abstraction
 //!
 //! Provides a common interface for interacting with various LLM providers.
+//!
+//! # Gateway Contract
+//!
+//! Phoenix supports an optional LLM gateway (`LLM_GATEWAY` env var) that proxies
+//! requests to upstream providers. The primary supported gateway is the exe.dev
+//! built-in gateway at `http://169.254.169.254/gateway/llm`.
+//!
+//! ## URL construction
+//!
+//! Given `LLM_GATEWAY=http://host/gateway/llm`, Phoenix constructs request URLs as:
+//!
+//! | Provider    | URL                                                      |
+//! |-------------|----------------------------------------------------------|
+//! | `Anthropic` | `{gateway}/anthropic/v1/messages`                        |
+//! | `OpenAI`    | `{gateway}/openai/v1/responses`                          |
+//! | `Fireworks` | `{gateway}/fireworks/inference/v1/chat/completions`       |
+//!
+//! The first path segment after the gateway base is an **origin alias** that the
+//! gateway uses to route to the correct upstream provider. Known aliases:
+//! `anthropic`, `openai`, `fireworks`.
+//!
+//! Note: the exe.dev gateway also supports an alternative path convention
+//! `{gateway}/_/gateway/{provider}/...` (used by the Shelley Go agent). Phoenix
+//! uses the shorter form. Both resolve to the same upstream.
+//!
+//! ## Authentication
+//!
+//! When a gateway is configured, Phoenix sends `x-api-key: implicit` (Anthropic)
+//! or `Authorization: Bearer implicit` (OpenAI/Fireworks). The gateway handles
+//! real API key injection.
+//!
+//! ## Discovery
+//!
+//! On startup, Phoenix probes `{gateway}/_proxy/status` for reachability, then
+//! queries `{gateway}/{provider}/v1/models` for each provider to discover
+//! available models. See [`discovery`] module.
+//!
+//! ## Streaming
+//!
+//! All streaming requests use `Transfer-Encoding: chunked` with
+//! `Content-Type: text/event-stream`. The gateway proxies SSE events from the
+//! upstream provider. Phoenix parses these with [`sse::SseParser`] which handles
+//! chunk-boundary splits, bare `\r` line endings, and multi-line `data:` fields.
+//!
+//! ### Known issue: intermittent SSE corruption
+//!
+//! The exe.dev gateway has a known intermittent bug where SSE events are
+//! corrupted during long streams (~500+ chunks). Symptoms: two SSE events
+//! smashed together mid-JSON, or bytes dropped from event boundaries.
+//! Likely cause: chunked transfer-encoding reassembly in the gateway proxy.
+//! See task 594 for tracking. The `SseParser` includes diagnostic dump
+//! capability (`diagnostic_dump()`) to capture raw bytes when parse failures
+//! occur, aiding diagnosis.
 
 mod anthropic;
 mod discovery;

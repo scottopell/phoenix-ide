@@ -217,8 +217,8 @@ impl ModelRegistry {
             .or_else(|| {
                 if services.contains_key("claude-sonnet-4-6") {
                     Some("claude-sonnet-4-6".to_string())
-                } else if services.contains_key("claude-4.5-sonnet") {
-                    Some("claude-4.5-sonnet".to_string())
+                } else if services.contains_key("claude-sonnet-4-5") {
+                    Some("claude-sonnet-4-5".to_string())
                 } else {
                     services.keys().next().cloned()
                 }
@@ -325,10 +325,10 @@ impl ModelRegistry {
     }
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
-    /// Prefers: claude-4.5-haiku > gpt-4o-mini > any available model
+    /// Prefers: claude-haiku-4-5 > gpt-4o-mini > any available model
     pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
         // Priority order for cheap models
-        const CHEAP_MODELS: &[&str] = &["claude-4.5-haiku", "gpt-4o-mini", "gpt-5-mini"];
+        const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-4o-mini", "gpt-5-mini"];
 
         for model_id in CHEAP_MODELS {
             if let Some(service) = self.get(model_id) {
@@ -417,12 +417,12 @@ mod tests {
     fn test_custom_default_model() {
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
-            default_model: Some("claude-4.5-opus".to_string()),
+            default_model: Some("claude-opus-4-5".to_string()),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
 
-        assert_eq!(registry.default_model_id(), "claude-4.5-opus");
+        assert_eq!(registry.default_model_id(), "claude-opus-4-5");
     }
 
     #[test]
