@@ -84,6 +84,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   // Async search effect — fires on query/mode change, debounced, abortable
   useEffect(() => {
     if (state.status !== 'open' || state.mode !== 'search') return;
+    const query = state.query;
 
     // Cancel previous debounce + in-flight request
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -94,7 +95,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
       searchAbortRef.current = controller;
 
       const allResults = await Promise.all(
-        sources.map(s => s.search(state.query, controller.signal))
+        sources.map(s => s.search(query, controller.signal))
       );
 
       if (!controller.signal.aborted) {
@@ -105,8 +106,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.status, state.mode, state.query]);
+  }, [state, sources, actions]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {

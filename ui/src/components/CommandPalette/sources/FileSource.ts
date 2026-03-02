@@ -3,8 +3,8 @@
  * conversation's working directory via the server-side search endpoint.
  *
  * Uses /api/conversations/:id/files/search which is gitignore-aware,
- * recursive, and fuzzy-matches server-side — the same endpoint as the
- * ./ inline file reference autocomplete in InputArea.
+ * recursive, and fuzzy-matches server-side -- the same endpoint as the
+ * ./ inline file reference autocomplete in InputArea.
  *
  * Returns empty results when query is empty (no point listing every file).
  * Returns empty results when no convId is available (root route).
@@ -42,7 +42,7 @@ export function createFileSource(
 
 function toItem(relPath: string, rootDir: string): PaletteItem {
   const parts = relPath.split('/');
-  const name = parts[parts.length - 1];
+  const name = parts[parts.length - 1] ?? relPath;
   const dir = parts.length > 1 ? parts.slice(0, -1).join('/') : rootDir;
   return {
     id: relPath,
