@@ -987,11 +987,25 @@ impl Tool for BrowserTypeTool {
 // browser_key_press
 // ============================================================================
 
+#[derive(Debug, serde::Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum KeyPressMethod {
+    /// CDP Input.dispatchKeyEvent — isTrusted=true, but Chrome intercepts
+    /// browser-native shortcuts (Ctrl+P, Ctrl+W, Ctrl+T) before the page sees them.
+    #[default]
+    Cdp,
+    /// JavaScript `new KeyboardEvent()` — reaches the page even for browser-intercepted
+    /// shortcuts, but `isTrusted=false` (rarely checked by app code).
+    Js,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct KeyPressInput {
     key: String,
     #[serde(default)]
     modifiers: Vec<String>,
+    #[serde(default)]
+    method: KeyPressMethod,
 }
 
 /// Map a key name to (`key`, `code`, `windows_virtual_key_code`).
@@ -1080,11 +1094,13 @@ impl Tool for BrowserKeyPressTool {
     fn description(&self) -> String {
         "Send a key chord (key + optional modifiers) to the page using CDP-level keyboard events. \
          Use for non-printable keys and modifier shortcuts that browser_type cannot send: \
-         Escape, Enter, ArrowUp/Down, Tab, F1-F12, Ctrl+P, Meta+K, etc. \
+         Escape, Enter, ArrowUp/Down, Tab, F1-F12, Ctrl+K, Meta+K, etc. \
          Events target the focused element and bubble normally, so window/document \
-         capture listeners receive them. Note: browser-native shortcuts (Ctrl+P, Ctrl+W, \
-         Ctrl+T) are intercepted by Chrome before reaching the page and cannot be sent \
-         with this tool."
+         capture listeners receive them. \
+         method=\"cdp\" (default): isTrusted=true but Chrome intercepts browser-native \
+         shortcuts (Ctrl+P=print, Ctrl+W=close tab, Ctrl+T=new tab) before the page sees them. \
+         method=\"js\": dispatches via JavaScript KeyboardEvent so the page receives even \
+         browser-intercepted shortcuts; isTrusted=false (rarely checked by app code)."
             .to_string()
     }
 
@@ -1100,6 +1116,11 @@ impl Tool for BrowserKeyPressTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Modifier keys to hold: ctrl, shift, alt, meta. Example: [\"ctrl\"] for Ctrl+P."
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["cdp", "js"],
+                    "description": "How to dispatch the key event. \"cdp\" (default): CDP hardware simulation, isTrusted=true, but Chrome intercepts Ctrl+P/Ctrl+W/Ctrl+T before the page sees them. \"js\": JavaScript KeyboardEvent, reaches the page even for browser-intercepted shortcuts, isTrusted=false."
                 }
             },
             "required": ["key"]
@@ -1107,10 +1128,6 @@ impl Tool for BrowserKeyPressTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        use chromiumoxide::cdp::browser_protocol::input::{
-            DispatchKeyEventParams, DispatchKeyEventType,
-        };
-
         let input: KeyPressInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -1142,72 +1159,112 @@ impl Tool for BrowserKeyPressTool {
         };
         let guard = session.read().await;
 
-        // Send rawKeyDown + (optionally keypress for printable) + keyUp
-        let is_printable =
-            key_str.len() == 1 && key_str.chars().next().is_some_and(|c| !c.is_control());
-
-        let mut keydown = DispatchKeyEventParams::builder()
-            .r#type(DispatchKeyEventType::RawKeyDown)
-            .key(key_name.clone())
-            .code(code.clone())
-            .windows_virtual_key_code(vk)
-            .native_virtual_key_code(vk);
-        if let Some(m) = mod_opt {
-            keydown = keydown.modifiers(m);
-        }
-        let keydown = match keydown.build() {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
-        };
-
-        if let Err(e) = guard.page.execute(keydown).await {
-            return ToolOutput::error(format!("Failed to dispatch keydown: {e}"));
-        }
-
-        // keypress for printable chars (browsers fire this between keydown and keyup)
-        if is_printable {
-            let mut kp = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyDown)
-                .key(key_name.clone())
-                .code(code.clone())
-                .text(key_str.to_string())
-                .windows_virtual_key_code(vk)
-                .native_virtual_key_code(vk);
-            if let Some(m) = mod_opt {
-                kp = kp.modifiers(m);
-            }
-            let kp = match kp.build() {
-                Ok(p) => p,
-                Err(e) => return ToolOutput::error(format!("Failed to build keypress: {e}")),
-            };
-            if let Err(e) = guard.page.execute(kp).await {
-                return ToolOutput::error(format!("Failed to dispatch keypress: {e}"));
-            }
-        }
-
-        let mut keyup = DispatchKeyEventParams::builder()
-            .r#type(DispatchKeyEventType::KeyUp)
-            .key(key_name)
-            .code(code)
-            .windows_virtual_key_code(vk)
-            .native_virtual_key_code(vk);
-        if let Some(m) = mod_opt {
-            keyup = keyup.modifiers(m);
-        }
-        let keyup = match keyup.build() {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
-        };
-
-        if let Err(e) = guard.page.execute(keyup).await {
-            return ToolOutput::error(format!("Failed to dispatch keyup: {e}"));
-        }
-
         let chord = if input.modifiers.is_empty() {
             input.key.clone()
         } else {
             format!("{},{}", input.modifiers.join("+"), input.key)
         };
-        ToolOutput::success(format!("Pressed {chord}"))
+
+        match input.method {
+            KeyPressMethod::Js => {
+                // Dispatch via JavaScript KeyboardEvent — bypasses Chrome's browser-level
+                // shortcut interception (Ctrl+P=print, etc.) at the cost of isTrusted=false.
+                let ctrl = input.modifiers.iter().any(|m| m == "ctrl" || m == "control");
+                let shift = input.modifiers.iter().any(|m| m == "shift");
+                let alt = input.modifiers.iter().any(|m| m == "alt");
+                let meta = input.modifiers.iter().any(|m| m == "meta" || m == "cmd" || m == "command");
+
+                let js = format!(
+                    "(function() {{\
+  var opts = {{key:{key_name:?}, code:{code:?}, ctrlKey:{ctrl}, shiftKey:{shift}, altKey:{alt}, metaKey:{meta}, bubbles:true, cancelable:true, composed:true}};\
+  var down = new KeyboardEvent('keydown', opts);\
+  var up   = new KeyboardEvent('keyup',   opts);\
+  window.dispatchEvent(down);\
+  window.dispatchEvent(up);\
+  return 'ok';\
+}})()"
+                );
+
+                match guard.page.evaluate(js).await {
+                    Ok(_) => ToolOutput::success(format!("Pressed {chord} (js)")),
+                    Err(e) => ToolOutput::error(format!("JS dispatch failed: {e}")),
+                }
+            }
+
+            KeyPressMethod::Cdp => {
+                dispatch_key_cdp(&guard.page, &key_name, &code, key_str, vk, mod_opt, &chord).await
+            }
+        }
     }
+}
+
+/// Send rawKeyDown + optional keypress (for printable chars) + keyUp via CDP.
+async fn dispatch_key_cdp(
+    page: &chromiumoxide::Page,
+    key: &str,
+    code: &str,
+    key_str: &str,
+    vk: i64,
+    mod_opt: Option<i64>,
+    chord: &str,
+) -> ToolOutput {
+    use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+
+    let is_printable = key_str.len() == 1 && key_str.chars().next().is_some_and(|c| !c.is_control());
+
+    let mut keydown = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::RawKeyDown)
+        .key(key.to_string())
+        .code(code.to_string())
+        .windows_virtual_key_code(vk)
+        .native_virtual_key_code(vk);
+    if let Some(m) = mod_opt {
+        keydown = keydown.modifiers(m);
+    }
+    let keydown = match keydown.build() {
+        Ok(p) => p,
+        Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
+    };
+    if let Err(e) = page.execute(keydown).await {
+        return ToolOutput::error(format!("Failed to dispatch keydown: {e}"));
+    }
+
+    if is_printable {
+        let mut kp = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyDown)
+            .key(key.to_string())
+            .code(code.to_string())
+            .text(key_str.to_string())
+            .windows_virtual_key_code(vk)
+            .native_virtual_key_code(vk);
+        if let Some(m) = mod_opt {
+            kp = kp.modifiers(m);
+        }
+        let kp = match kp.build() {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::error(format!("Failed to build keypress: {e}")),
+        };
+        if let Err(e) = page.execute(kp).await {
+            return ToolOutput::error(format!("Failed to dispatch keypress: {e}"));
+        }
+    }
+
+    let mut keyup = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::KeyUp)
+        .key(key.to_string())
+        .code(code.to_string())
+        .windows_virtual_key_code(vk)
+        .native_virtual_key_code(vk);
+    if let Some(m) = mod_opt {
+        keyup = keyup.modifiers(m);
+    }
+    let keyup = match keyup.build() {
+        Ok(p) => p,
+        Err(e) => return ToolOutput::error(format!("Failed to build key event: {e}")),
+    };
+    if let Err(e) = page.execute(keyup).await {
+        return ToolOutput::error(format!("Failed to dispatch keyup: {e}"));
+    }
+
+    ToolOutput::success(format!("Pressed {chord}"))
 }

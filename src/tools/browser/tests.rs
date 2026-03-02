@@ -1751,17 +1751,26 @@ async fn test_key_press_escape_fires_keydown_listener() {
     .await;
 
     let (ctx, _manager) = test_context("test-key-escape");
-    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+    BrowserNavigateTool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let result = BrowserKeyPressTool
         .run(json!({"key": "Escape"}), ctx.clone())
         .await;
 
     assert!(result.success, "key_press failed: {}", result.output);
-    assert!(result.output.contains("Escape"), "Output should mention key: {}", result.output);
+    assert!(
+        result.output.contains("Escape"),
+        "Output should mention key: {}",
+        result.output
+    );
 
     let eval_result = BrowserEvalTool
-        .run(json!({"expression": "document.getElementById('result').textContent"}), ctx.clone())
+        .run(
+            json!({"expression": "document.getElementById('result').textContent"}),
+            ctx.clone(),
+        )
         .await;
     assert!(
         eval_result.output.contains("closed"),
@@ -1795,7 +1804,9 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
     .await;
 
     let (ctx, _manager) = test_context("test-key-ctrl-k");
-    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+    BrowserNavigateTool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let result = BrowserKeyPressTool
         .run(json!({"key": "k", "modifiers": ["ctrl"]}), ctx.clone())
@@ -1804,7 +1815,10 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
     assert!(result.success, "key_press failed: {}", result.output);
 
     let eval_result = BrowserEvalTool
-        .run(json!({"expression": "document.getElementById('result').textContent"}), ctx.clone())
+        .run(
+            json!({"expression": "document.getElementById('result').textContent"}),
+            ctx.clone(),
+        )
         .await;
     assert!(
         eval_result.output.contains("ctrl+k"),
@@ -1838,7 +1852,9 @@ async fn test_key_press_arrow_down() {
     .await;
 
     let (ctx, _manager) = test_context("test-key-arrow-down");
-    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+    BrowserNavigateTool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let result = BrowserKeyPressTool
         .run(json!({"key": "ArrowDown"}), ctx.clone())
@@ -1847,7 +1863,10 @@ async fn test_key_press_arrow_down() {
     assert!(result.success, "key_press failed: {}", result.output);
 
     let eval_result = BrowserEvalTool
-        .run(json!({"expression": "document.getElementById('result').textContent"}), ctx.clone())
+        .run(
+            json!({"expression": "document.getElementById('result').textContent"}),
+            ctx.clone(),
+        )
         .await;
     assert!(
         eval_result.output.contains("down"),
@@ -1864,7 +1883,9 @@ async fn test_key_press_unknown_key_returns_error() {
 
     let server = TestServer::start("<html><body></body></html>").await;
     let (ctx, _manager) = test_context("test-key-unknown");
-    BrowserNavigateTool.run(json!({"url": server.url()}), ctx.clone()).await;
+    BrowserNavigateTool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
 
     let result = BrowserKeyPressTool
         .run(json!({"key": "NotAKey"}), ctx.clone())
