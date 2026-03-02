@@ -623,7 +623,7 @@ where
                         system: vec![SystemContent::cached(&system_prompt)],
                         messages,
                         tools: tool_executor.definitions(),
-                        max_tokens: Some(8192),
+                        max_tokens: Some(16_384),
                     };
 
                     // Use streaming — chunk_tx forwards text tokens to SSE clients.

@@ -154,6 +154,13 @@ impl StreamAccumulator {
     }
 
     fn on_block_stop(&mut self) {
+        self.flush_current_block();
+    }
+
+    /// Commit whatever block is currently being accumulated.
+    /// Called by `on_block_stop` during normal flow, and by `into_response`
+    /// as a safety net for truncated streams.
+    fn flush_current_block(&mut self) {
         let Some(idx) = self.current_index.take() else {
             return;
         };
@@ -165,8 +172,9 @@ impl StreamAccumulator {
                         text: self.current_text.clone(),
                     },
                 ));
+                self.current_text.clear();
             }
-        } else {
+        } else if !self.current_tool_name.is_empty() {
             let input: serde_json::Value = serde_json::from_str(&self.current_tool_json)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
             self.content_blocks.push((
@@ -177,10 +185,18 @@ impl StreamAccumulator {
                     input,
                 },
             ));
+            self.current_tool_json.clear();
+            self.current_tool_name.clear();
+            self.current_tool_id.clear();
         }
     }
 
     fn into_response(mut self) -> Result<LlmResponse, LlmError> {
+        // Flush any in-progress block that never received content_block_stop.
+        // This happens when the stream is truncated (e.g. stop_reason=max_tokens):
+        // Anthropic sends message_delta + message_stop but skips content_block_stop
+        // for the block being generated, so the text/tool_use sits uncommitted.
+        self.flush_current_block();
         self.content_blocks.sort_by_key(|(idx, _)| *idx);
         normalize_response(AnthropicResponse {
             content: self.content_blocks.into_iter().map(|(_, b)| b).collect(),
@@ -364,7 +380,7 @@ fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicReq
 
     AnthropicRequest {
         model: model_api_name.to_string(),
-        max_tokens: request.max_tokens.unwrap_or(8192),
+        max_tokens: request.max_tokens.unwrap_or(16_384),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
