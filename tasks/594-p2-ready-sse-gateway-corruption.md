@@ -26,33 +26,66 @@ data: {"type":"content_block_delta",...,"partial_json":"ies\\n\\n- `
 Pattern: occurs after ~500+ SSE chunks in a single stream. Not every long
 stream is affected — intermittent, maybe 1 in 5 long conversations.
 
-## Root Cause Analysis
+## Root Cause Analysis — CONFIRMED via pcap
 
-A 4-expert subagent panel reviewed client-side code and reached consensus:
-the corruption is in the exe.dev gateway's chunked transfer-encoding
-reassembly, not in Phoenix's SSE parser.
+The corruption occurs inside the exe.dev LLM gateway before the bytes
+reach Phoenix. This is **proven at the TCP level** via packet capture.
 
-Evidence:
+### TCP-level evidence (2026-03-02)
+
+Capture file: `sse-corruption-evidence.pcap` (49MB)
+
+Stream to port 42182, Anthropic SSE for claude-sonnet-4-6:
+
+**Clean event** (seq 2235, early in stream):
+```
+Chunk size: 0x91 (145 bytes)
+data: {..."partial_json":"\":.\"Fou"}       }\n\n
+                                   ^^ proper JSON close + event separator
+```
+
+**Corrupted event** (seq 22224, ~35s into stream, ~139th chunk):
+```
+Chunk size: 0x91 (145 bytes)  ← SAME size as clean events
+data: {..."partial_json":"mo         }\n\neve} }\n
+                                ^^^^^^^^^ spaces where closing "}}
+                                          should be, "eve" fragment
+                                          of next event leaked in
+```
+
+Key observations:
+- Chunked TE frame sizes are correct (0x91 both times)
+- The **content inside the chunk** is already garbled
+- This rules out chunked TE reassembly — corruption happens upstream
+  of the TE framing, in the gateway's response buffer
+- Multiple events in the same stream showed corruption (missing opening
+  quotes on `partial_json` values, garbled closing braces) before the
+  fatal parse error
+- Zero TCP retransmissions or resets in the capture
+- The Shelley Go agent also uses this gateway and may hit the same bug
+
+### Additional evidence
+
 - Phoenix's `SseParser` (src/llm/sse.rs) has property tests proving
   chunk-boundary independence and correct multi-line data joining
-- The corrupted output contains event type strings (`event: content_block_delta`)
-  interleaved with data fields — this can only happen if the gateway drops
-  the `\n\n` event separator between two SSE events
-- No `h2` crate in deps — purely HTTP/1.1 to gateway, ruling out HTTP/2 framing
-- TCP captures (pcap) during successful runs show zero retransmissions/resets
-- The Shelley Go agent also uses this gateway (via `_/gateway/` path prefix)
-  and may experience the same issue
+- No `h2` crate in deps — purely HTTP/1.1 to gateway
+- `SseParser::diagnostic_dump()` confirmed: corruption arrives in
+  a single chunk from the gateway, not introduced by chunk reassembly
+
+### Likely cause
+
+The gateway is re-buffering upstream Anthropic SSE events before
+re-chunking to the client. A race condition or buffer overwrite in
+that layer is corrupting event content while preserving frame sizes.
 
 ## Diagnostic Capability
 
-Phoenix already has diagnostic infrastructure for capturing this:
+Phoenix has diagnostic infrastructure for capturing this:
 
 - `SseParser::diagnostic_dump()` logs raw chunks (capped at 64KB) on parse failure
 - Both `anthropic.rs` and `openai.rs` call `diagnostic_dump()` at ERROR level
   on SSE parse failures
-- To get definitive proof: `tcpdump -i any -w /tmp/sse.pcap -s 0 'host 169.254.169.254'`
-  during a long stream, then inspect whether the TCP payload already contains
-  the corruption or if Phoenix introduced it
+- Capture command: `sudo tcpdump -i any -w /tmp/sse.pcap -s 0 'host 169.254.169.254'`
 
 ## What Phoenix Can Do
 

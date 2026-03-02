@@ -1,4 +1,5 @@
 ---
+created: 2026-03-02
 number: 595
 priority: p1
 status: ready
