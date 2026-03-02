@@ -432,36 +432,36 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setAcItems([]);
     setSkillArgumentHint(null);
 
+    // Clear draft and images eagerly — the message is already queued and
+    // visible in the message list, so there's no reason to keep the text in
+    // the input area while waiting for the network round-trip.  We only
+    // restore the draft if an ExpansionError comes back (user must fix the
+    // broken @reference before re-sending).
+    const previousVoiceBase = voiceBase;
+    if (voiceBase !== null) {
+      setVoiceBase(null);
+      setVoiceInterim('');
+    }
+    clearDraft();
+    setImages([]);
+    setExpansionError(null);
+
     try {
       await onSend(text, images);
-      // Only clear draft and images on success
-      if (voiceBase !== null) {
-        setVoiceBase(null);
-        setVoiceInterim('');
-      }
-      clearDraft();
-      setImages([]);
-      setExpansionError(null);
     } catch (err) {
       if (err instanceof ExpansionError) {
-        // Surface expansion error inline without clearing the draft (REQ-IR-007)
-        // The user must fix or remove the broken @reference before sending.
+        // Surface expansion error inline and restore the draft (REQ-IR-007)
+        // so the user can fix or remove the broken @reference.
         setExpansionError(err.detail.error);
-        // Restore text to draft so the user can edit it
-        if (voiceBase !== null) {
-          // already in voiceBase — leave it
+        if (previousVoiceBase !== null) {
+          setVoiceBase(previousVoiceBase);
         } else {
           setDraft(text);
         }
-      } else {
-        // Non-expansion errors are handled by the queue (already shown in failed-messages)
-        if (voiceBase !== null) {
-          setVoiceBase(null);
-          setVoiceInterim('');
-        }
-        clearDraft();
-        setImages([]);
+        setImages(images);
       }
+      // Non-expansion errors: draft is already cleared; the message queue
+      // shows the failure with a retry button.
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceBase, voiceInterim, draft, images, agentWorking, isOffline, onSend, clearDraft]);
