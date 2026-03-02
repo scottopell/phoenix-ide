@@ -1169,10 +1169,16 @@ impl Tool for BrowserKeyPressTool {
             KeyPressMethod::Js => {
                 // Dispatch via JavaScript KeyboardEvent — bypasses Chrome's browser-level
                 // shortcut interception (Ctrl+P=print, etc.) at the cost of isTrusted=false.
-                let ctrl = input.modifiers.iter().any(|m| m == "ctrl" || m == "control");
+                let ctrl = input
+                    .modifiers
+                    .iter()
+                    .any(|m| m == "ctrl" || m == "control");
                 let shift = input.modifiers.iter().any(|m| m == "shift");
                 let alt = input.modifiers.iter().any(|m| m == "alt");
-                let meta = input.modifiers.iter().any(|m| m == "meta" || m == "cmd" || m == "command");
+                let meta = input
+                    .modifiers
+                    .iter()
+                    .any(|m| m == "meta" || m == "cmd" || m == "command");
 
                 let js = format!(
                     "(function() {{\
@@ -1208,9 +1214,12 @@ async fn dispatch_key_cdp(
     mod_opt: Option<i64>,
     chord: &str,
 ) -> ToolOutput {
-    use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchKeyEventParams, DispatchKeyEventType,
+    };
 
-    let is_printable = key_str.len() == 1 && key_str.chars().next().is_some_and(|c| !c.is_control());
+    let is_printable =
+        key_str.len() == 1 && key_str.chars().next().is_some_and(|c| !c.is_control());
 
     let mut keydown = DispatchKeyEventParams::builder()
         .r#type(DispatchKeyEventType::RawKeyDown)
