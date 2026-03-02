@@ -1,0 +1,263 @@
+# Projects: Git-Backed Workspaces with Isolated Task Execution
+
+## User Story
+
+As a developer using PhoenixIDE, I need a structured way to explore codebases safely
+and execute changes in isolated branches so that I can think through approaches without
+risk and commit to changes with clear human oversight.
+
+## Requirements
+
+### REQ-PROJ-001: Open a Git Repository as a Project
+
+WHEN user creates a new conversation by providing a directory path
+THE SYSTEM SHALL detect whether the directory is inside a git repository
+AND if it is, treat the repository root as the project's canonical path
+AND if it is not, offer to initialize a git repository in that directory
+
+WHEN user declines git initialization
+THE SYSTEM SHALL NOT create a conversation for that directory
+AND SHALL explain that the project model requires git for branch isolation and task history
+
+**Rationale:** Users think in terms of projects (codebases, repositories), not raw
+directories. Git is the structural foundation of the isolation model — without it the
+system cannot create worktrees or maintain task history in a versioned, shareable form.
+
+---
+
+### REQ-PROJ-002: Start Every Conversation in Explore Mode
+
+WHEN a conversation is created for a project
+THE SYSTEM SHALL initialize the conversation in Explore mode
+AND record the HEAD commit of the main branch as the conversation's pinned snapshot
+AND configure all tools in read-only mode
+
+WHILE a conversation is in Explore mode
+THE SYSTEM SHALL prevent file writes to the project via any tool
+AND SHALL allow unrestricted file reading, directory listing, and read-only command execution
+
+WHEN a new conversation is started
+THE SYSTEM SHALL pin it to the current HEAD of main at that moment
+AND NOT automatically repin if main advances during the conversation
+
+**Rationale:** Exploration is the natural, zero-friction starting point. Users can
+freely ask questions, read code, and plan without any risk of accidentally modifying
+anything. Multiple Explore conversations on the same project can coexist safely because
+none of them write anything.
+
+---
+
+### REQ-PROJ-003: Propose a Task to Initiate Work Mode
+
+WHEN agent calls the `create_task` tool with title, priority, and a written plan
+THE SYSTEM SHALL assign the next sequential task ID for the project
+AND write a task file to the `tasks/` directory at the repository root on the main branch
+AND commit the task file to main
+AND transition the conversation to AwaitingTaskApproval state
+AND pause agent execution until the user responds
+
+WHEN `create_task` is called while the conversation is not in Explore mode
+THE SYSTEM SHALL reject the call with an error explaining that tasks must be proposed from Explore mode
+
+**Rationale:** The task creation moment is the natural inflection point between thinking
+and doing. Pausing for human review before creating a worktree ensures the user has
+approved the approach before any branch or file modifications happen outside of main.
+
+---
+
+### REQ-PROJ-004: Review and Iterate on Task Plan Before Starting Work
+
+WHEN conversation enters AwaitingTaskApproval state
+THE SYSTEM SHALL automatically open the task file in the prose reader
+AND present Approve and Discard actions alongside the standard annotation feedback
+
+WHEN user sends annotations as feedback
+THE SYSTEM SHALL route the annotations to the agent as a tool result
+AND the agent SHALL update the task file via `update_task`
+AND the system SHALL re-present the updated task file in the prose reader
+
+WHEN user approves the task
+THE SYSTEM SHALL create a git worktree at the conversation-scoped path (REQ-PROJ-005)
+AND create and checkout a branch named after the task
+AND transition the conversation to Work mode with the worktree as the working directory
+AND resume agent execution
+
+WHEN user discards the task
+THE SYSTEM SHALL delete the task file from the main branch
+AND return the conversation to Explore mode
+AND return a rejection result to the agent
+
+**Rationale:** The prose reader gives users a comfortable interface for reviewing
+structured plans. Iterating on the task document before committing to a worktree keeps
+the feedback loop cheap — no branch or worktree cleanup required if the approach
+changes during planning.
+
+---
+
+### REQ-PROJ-005: Worktree Paths Are Unique by Construction
+
+WHEN a worktree is created for a conversation
+THE SYSTEM SHALL place it at `.phoenix/worktrees/{conversation-id}/` relative to the
+repository root
+AND ensure `.phoenix/worktrees/` is listed in the repository's `.gitignore`
+
+WHEN two conversations create worktrees for the same project simultaneously
+THE SYSTEM SHALL create separate directories for each
+AND the directories SHALL share no file paths
+
+**Rationale:** Deriving the worktree path from the conversation ID makes collisions
+structurally impossible without a lock registry. Each conversation gets a fully isolated
+physical directory. Multiple Work-mode conversations on the same project can coexist
+because their code changes never share a directory.
+
+---
+
+### REQ-PROJ-006: Task Files as Versioned Living Contracts
+
+WHEN the system creates a task file
+THE SYSTEM SHALL write it to `tasks/` with filename `{NNN}-{priority}-{status}-{slug}.md`
+AND include frontmatter with: task ID, priority, status, branch name, conversation ID, and creation date
+AND include a Plan section containing the agent's proposed approach as approved by the user
+AND include a Progress section for the agent to update as work proceeds
+AND commit the file to the main branch
+
+WHEN the agent calls `update_task` with a status or progress change
+THE SYSTEM SHALL update the task file on the main branch
+AND rename the file if the status slug in the filename changes
+AND commit the change to main
+
+WHEN any conversation in Explore mode reads the `tasks/` directory
+THE SYSTEM SHALL show all task files including those for in-progress work conversations
+
+**Rationale:** Task files on main give every conversation — whether Explore or Work —
+project-wide situational awareness. An agent in Explore mode can see what tasks are
+in-progress, planned, or done without any special API. The git history of task files
+is a human-readable audit trail of all work attempted on the project.
+
+---
+
+### REQ-PROJ-007: Work Mode Enables Writes Within the Worktree
+
+WHILE a conversation is in Work mode
+THE SYSTEM SHALL configure tools to operate within the conversation's worktree directory
+AND enable file write tools within the worktree
+AND allow bash commands that read and write files within the worktree
+
+WHEN a Work-mode tool attempts to write outside the worktree directory
+THE SYSTEM SHALL block the write
+AND return a descriptive error
+
+**Rationale:** Work mode's write access is scoped to the worktree, not the whole
+filesystem. This preserves the isolation guarantee: a Work conversation cannot modify
+main directly, and cannot modify another conversation's worktree.
+
+---
+
+### REQ-PROJ-008: Work Sub-Agents Inherit the Worktree
+
+WHEN a Work conversation spawns a sub-agent with Work mode requested
+THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
+AND configure the sub-agent in Work mode with write access to that worktree
+AND allow only one Work sub-agent per parent conversation at a time
+AND place the parent conversation in AwaitingSubAgentResult state for the duration
+
+WHEN a Work conversation spawns a sub-agent with Explore mode
+THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
+AND configure the sub-agent in Explore mode (read-only, no writes)
+AND allow multiple Explore sub-agents in parallel
+
+WHEN an Explore conversation spawns sub-agents
+THE SYSTEM SHALL configure all sub-agents in Explore mode
+AND configure their working directory as the main branch checkout
+
+**Rationale:** Work sub-agents do implementation work inside the same isolated context
+as the parent — they must operate in the worktree, not on stale main. Explore
+sub-agents do read-only analysis of whatever directory they're given; from a Work
+conversation they analyze the current worktree state, which is what matters. The
+one-Work-sub-agent constraint maintains a single writer per worktree at all times.
+
+---
+
+### REQ-PROJ-009: Complete a Task and Propose Merging to Main
+
+WHEN agent calls `update_task` with status set to `ready-for-review`
+THE SYSTEM SHALL generate a summary of changes between the worktree branch and main
+AND present the diff and task file to the user for final review
+AND pause agent execution
+
+WHEN user approves the merge
+THE SYSTEM SHALL merge the worktree branch into main
+AND update the task file status to `done` on main
+AND delete the worktree directory
+AND delete the branch
+AND transition the conversation to Explore mode pinned to the new main HEAD
+
+WHEN user requests further changes before merge
+THE SYSTEM SHALL return the feedback to the agent as a message
+AND resume agent execution in Work mode
+
+**Rationale:** Human review before merging is the final safety gate. The merge approval
+is the moment code moves from isolated experiment to part of the project. Returning to
+Explore mode after a successful merge preserves the conversation for follow-up
+questions and naturally closes the task.
+
+---
+
+### REQ-PROJ-010: Abandon a Task Without Merging
+
+WHEN user discards an in-progress task
+THE SYSTEM SHALL delete the worktree directory
+AND delete the branch
+AND update the task file status to `abandoned` on main
+AND transition the conversation to Explore mode
+
+WHEN a task is abandoned
+THE SYSTEM SHALL preserve the task file on main as a historical record
+AND NOT merge any code changes to main
+
+**Rationale:** Users must be able to stop work with no lasting consequence to the
+codebase. The abandoned task file is a lightweight record of what was attempted —
+useful as context for future work, but carries no code changes forward.
+
+---
+
+### REQ-PROJ-011: Ambient Awareness of Main Branch Advancement
+
+WHEN the main branch of a project receives new commits
+THE SYSTEM SHALL display an ambient indicator on any Explore conversation showing
+how many commits behind the conversation's pinned snapshot is
+AND NOT interrupt the active conversation or force re-pinning
+
+WHEN a Work conversation's branch diverges from an advancing main
+THE SYSTEM SHALL notify the agent that main has advanced
+AND offer a rebase opportunity before the merge step
+
+WHEN user starts a new conversation on a project
+THE SYSTEM SHALL pin the conversation to the current HEAD of main at creation time
+
+**Rationale:** Explore conversations are pinned snapshots — they remain coherent and
+usable even as main advances, but users should have ambient awareness that their view
+may be stale. Work conversations may need to rebase before merging to avoid conflicts.
+Neither case warrants an interruption; ambient indicators respect the current focus.
+
+---
+
+### REQ-PROJ-012: Provide create_task and update_task Tools to Agents
+
+WHEN agent is in Explore mode and calls `create_task`
+THE SYSTEM SHALL accept: title (required string), priority (required: p0-p3),
+and plan (required string describing the proposed approach)
+
+WHEN agent is in Work mode and calls `update_task`
+THE SYSTEM SHALL accept: status (optional enum) and progress (optional string)
+AND apply the update to the task file on main
+
+WHEN `update_task` is called by a sub-agent
+THE SYSTEM SHALL reject the call
+AND explain that task management is the parent conversation's responsibility
+
+**Rationale:** Agents interact with the task system through well-defined tools rather
+than directly writing task files. This ensures task files always conform to the
+Phoenix-managed format, IDs are assigned correctly, and status transitions are
+validated. Sub-agents cannot manage tasks because they are short-lived workers
+operating under a parent's direction.

@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model. Messages flow through well-defined states: idle, awaiting LLM (with retry tracking), executing tools serially, and handling errors. Tools execute one at a time in LLM-requested order to respect intent and prevent conflicts. Cancellation generates synthetic tool results to maintain message chain integrity required by LLM APIs. Error handling distinguishes retryable errors (network, rate limit) from non-retryable (auth), with automatic retry and UI-visible state. Sub-agents complete by calling a dedicated result submission tool. Each conversation has a fixed working directory set at creation. User messages with images are passed through to the LLM provider. Messages sent while agent is busy are rejected (user can cancel if needed).
+Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model. Messages flow through well-defined states: idle, awaiting LLM (with retry tracking), executing tools serially, and handling errors. Tools execute one at a time in LLM-requested order to respect intent and prevent conflicts. Cancellation generates synthetic tool results to maintain message chain integrity required by LLM APIs. Error handling distinguishes retryable errors (network, rate limit) from non-retryable (auth), with automatic retry and UI-visible state. Sub-agents complete by calling a dedicated result submission tool. Each conversation has a fixed working directory set at creation. User messages with images are passed through to the LLM provider. Messages sent while agent is busy are rejected (user can cancel if needed). Conversations have an Explore or Work mode (see `specs/projects/`) stored alongside state; mode determines tool availability and is separate from state machine state.
 
 ## Technical Summary
 
@@ -25,11 +25,11 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-011:** Real-time Event Streaming | ✅ Complete | SSE with broadcast channels |
 | **REQ-BED-012:** Context Window Tracking | ✅ Complete | Usage data stored in messages |
 | **REQ-BED-013:** Image Handling | ✅ Complete | Base64 images passed to LLM |
-| **REQ-BED-014:** Conversation Mode | ❌ Not Started | Restricted/Unrestricted modes with Landlock |
-| **REQ-BED-015:** Mode Upgrade Request | ❌ Not Started | Agent requests upgrade, user approves |
-| **REQ-BED-016:** Mode Downgrade | ❌ Not Started | Immediate user-initiated downgrade |
-| **REQ-BED-017:** Mode Communication | ❌ Not Started | Synthetic messages, error responses |
-| **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Sub-agents always Restricted (when available) |
+| **REQ-BED-014:** Conversation Mode | ⏭️ Deprecated | Replaced by REQ-BED-027. Restricted/Unrestricted model superseded by Explore/Work with git worktrees |
+| **REQ-BED-015:** Mode Upgrade Request | ⏭️ Deprecated | Replaced by REQ-PROJ-003/004 + REQ-BED-028. `request_mode_upgrade` tool replaced by `create_task` flow |
+| **REQ-BED-016:** Mode Downgrade | ⏭️ Deprecated | Replaced by REQ-PROJ-009/010. Mode return now tied to task merge or abandon |
+| **REQ-BED-017:** Mode Communication | ❌ Not Started | Updated: Explore/Work terminology; `create_task` as path to write access |
+| **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Updated: sub-agents inherit parent worktree; Work sub-agents allowed one-at-a-time |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
 | **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Tool-less LLM request, fallback on failure |
 | **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
@@ -38,5 +38,8 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
 | **REQ-BED-025:** Token-by-Token LLM Output | ✅ Complete | Task 582. Fire-and-forget `StreamToken` effects via SSE |
 | **REQ-BED-026:** Sub-Agent Timeout Enforcement | ✅ Complete | Task 578. Mandatory `timeout: Duration`, deadline in executor `select!` |
+| **REQ-BED-027:** Explore and Work Conversation Modes | ❌ Not Started | `ConvMode` as conversation-level field; replaces REQ-BED-014 |
+| **REQ-BED-028:** Task Approval State | ❌ Not Started | `AwaitingTaskApproval` state; replaces REQ-BED-015 |
+| **REQ-BED-029:** Return to Explore Mode on Task Resolution | ❌ Not Started | Mode returns to Explore on merge or abandon; replaces REQ-BED-016 |
 
-**Progress:** 21 of 26 complete
+**Progress:** 21 of 29 complete (3 deprecated, not counted)

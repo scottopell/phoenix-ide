@@ -142,15 +142,20 @@ AND suggest breaking into smaller patches
 
 ### REQ-PATCH-009: Mode-Based Availability
 
-WHEN conversation is in Restricted mode
+WHEN conversation is in Explore mode
 THE SYSTEM SHALL disable the patch tool entirely
-AND return error: "Patch tool is disabled in Restricted mode. Use request_mode_upgrade to request write access."
+AND return error: "Patch tool is unavailable in Explore mode. Use `create_task` to
+propose work that requires file edits."
 
-WHEN conversation is in Unrestricted mode
+WHEN conversation is in Work mode
 THE SYSTEM SHALL enable full patch tool functionality
+AND the patch tool SHALL operate within the conversation's worktree directory
 
-WHEN mode changes from Unrestricted to Restricted
-THE SYSTEM SHALL immediately disable patch tool
-AND NOT affect any in-flight operations (mode change waits for idle)
+WHEN a patch operation targets a path outside the worktree directory
+THE SYSTEM SHALL reject the operation
+AND return a descriptive error identifying the out-of-scope path
 
-**Rationale:** Patch writes files and must be disabled in read-only mode. Phoenix-level enforcement provides clear, actionable error messages guiding agents to request appropriate permissions.
+**Rationale:** The patch tool writes files and must be disabled in Explore mode where
+conversations are read-only. When enabled in Work mode, writes are scoped to the
+conversation's isolated worktree — a conversation cannot use patch to modify the main
+branch directly or another conversation's worktree.

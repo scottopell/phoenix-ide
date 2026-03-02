@@ -117,23 +117,29 @@ THE SYSTEM SHALL check all command components
 
 ---
 
-### REQ-BASH-008: Landlock Enforcement
+### REQ-BASH-008: Landlock Enforcement for Explore Mode
 
-WHEN conversation is in Restricted mode AND Landlock is available (Linux 5.13+)
+WHEN conversation is in Explore mode AND Landlock is available (Linux 5.13+)
 THE SYSTEM SHALL execute bash commands under Landlock restrictions providing:
 - Read-only filesystem access (all writes blocked at kernel level)
-- No outbound network (TCP connect/bind blocked, prevents exfiltration)
+- No outbound network (TCP connect/bind blocked)
 - Signal scoping (kernel 6.12+): processes cannot signal outside sandbox
 - Resource limits via rlimits (memory, CPU time, process count)
 
-WHEN Landlock blocks an operation
+WHEN Landlock blocks an operation in Explore mode
 THE SYSTEM SHALL return the kernel error (EACCES, EPERM)
-AND tool description SHALL include clear explanation of sandbox constraints
+AND the tool description SHALL include a clear explanation of sandbox constraints
 
-WHEN bash command fails due to Landlock restrictions
-THE SYSTEM SHALL NOT retry or attempt to work around restrictions
+WHEN conversation is in Work mode
+THE SYSTEM SHALL NOT apply Landlock restrictions
+AND bash commands SHALL have write access within the conversation's worktree directory
 
-**Rationale:** Landlock provides true read-only mode enforced at the kernel level that cannot be bypassed by clever shell commands, environment manipulation, or prompt injection. Defense-in-depth beyond LLM instruction-following.
+**Rationale:** Landlock is defense-in-depth for Explore mode read-only enforcement on
+Linux. It is NOT the primary isolation mechanism for the overall system — that role
+belongs to git worktrees (see `specs/projects/`), which provide physical directory
+isolation on all platforms. Landlock adds kernel-level enforcement preventing bypass
+of Explore mode constraints via clever shell commands or prompt injection on supported
+Linux kernels.
 
 > **Landlock Feature Matrix:**
 > | Kernel | ABI | Features |
@@ -149,23 +155,27 @@ THE SYSTEM SHALL NOT retry or attempt to work around restrictions
 
 ### REQ-BASH-009: Graceful Degradation Without Landlock
 
-WHEN Landlock is unavailable on the host system
+WHEN Landlock is unavailable (non-Linux OS or Linux kernel < 5.13)
 THE SYSTEM SHALL detect this at startup
-AND disable Restricted mode entirely
-AND log warning about reduced security posture
+AND log a warning that Explore mode read-only enforcement is advisory only
+AND continue to enforce read-only semantics at the application layer
 
-WHEN running on non-Linux operating system
-THE SYSTEM SHALL operate with only Unrestricted mode available
-AND indicate that Landlock requires Linux
+WHEN running on a non-Linux operating system
+THE SYSTEM SHALL enforce Explore mode read-only constraints at the tool level only
+AND indicate to users that kernel-level enforcement is unavailable
+AND note that physical worktree isolation (REQ-PROJ-005) still provides write-write
+isolation between conversations on all platforms
 
 WHEN degraded mode is active
 THE SYSTEM SHALL still apply command safety checks (REQ-BASH-007)
-AND indicate to user that Landlock is unavailable
+AND the absence of Landlock SHALL NOT prevent Work mode from functioning
 
-WHEN user attempts to enable Restricted mode without Landlock
-THE SYSTEM SHALL return error explaining Landlock requirements
-
-**Rationale:** Not all environments support Landlock (requires Linux 5.13+). System must work gracefully without it, clearly communicating reduced protection. macOS, Windows/WSL, and older Linux kernels fall back to Unrestricted-only mode with safety checks as the only guardrail.
+**Rationale:** Worktree isolation works on all platforms — two Work conversations
+cannot touch each other's files regardless of OS because they operate in separate
+physical directories. Landlock's absence only weakens the read-only guarantee for
+Explore mode conversations (an advisory constraint becomes advisory without kernel
+backing). This is a meaningful but bounded reduction in protection, not a failure
+of the overall isolation model.
 
 ---
 

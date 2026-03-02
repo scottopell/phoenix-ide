@@ -19,8 +19,8 @@ Implemented as a stateless Tool receiving all context via `ToolContext` paramete
 | **REQ-BASH-005:** Tool Schema | ✅ Complete | Schema with mode enum (default/slow/background) |
 | **REQ-BASH-006:** Error Reporting | ✅ Complete | Exit codes, truncated output |
 | **REQ-BASH-007:** Command Safety Checks | ✅ Complete | tree-sitter parsing, pattern rejection |
-| **REQ-BASH-008:** Landlock Enforcement | ❌ Not Started | Read-only fs, no network in Restricted mode |
-| **REQ-BASH-009:** Graceful Degradation | ❌ Not Started | Non-Linux and old kernel fallback |
+| **REQ-BASH-008:** Landlock Enforcement for Explore Mode | ❌ Not Started | Defense-in-depth for Explore mode on Linux; worktrees provide primary isolation |
+| **REQ-BASH-009:** Graceful Degradation Without Landlock | ❌ Not Started | Advisory Explore read-only on non-Linux; worktree isolation unaffected |
 | **REQ-BASH-010:** Stateless Tool with Context | 🔄 In Progress | ToolContext refactor |
 
 **Progress:** 7 of 10 complete

@@ -315,3 +315,60 @@ THE SYSTEM SHALL prefix the note with "[Changed line]" automatically
 AND allow the user to edit or remove this prefix
 
 **Rationale:** When multiple patches modify the same file, users need a unified view showing all changes together. This prevents confusion from viewing the same file multiple times with different highlights. Extracting unique files and showing change counts helps users prioritize which files to review. Integration with REQ-PATCH-007 ensures consistency with patch tool output.
+
+---
+
+### REQ-PF-015: System-Triggered Prose Reader for Task Approval
+
+WHEN a conversation enters AwaitingTaskApproval state
+THE SYSTEM SHALL automatically open the prose reader on the task file
+AND SHALL NOT require user navigation to find or open the file
+AND SHALL display an approval toolbar alongside the standard annotation interface
+
+WHEN the prose reader is opened by the system for task approval
+THE SYSTEM SHALL clearly indicate that the file is a pending task plan awaiting review
+AND prevent the user from closing the prose reader without choosing an action
+(Approve, Discard, or Send Feedback)
+
+WHEN the conversation leaves AwaitingTaskApproval state (for any reason)
+THE SYSTEM SHALL automatically close the task approval prose reader
+
+**Rationale:** The task approval flow must be impossible to miss — it is a deliberate
+pause for human oversight, not a passive notification. Automatic opening removes the
+finding-and-opening friction and makes the required action obvious. Preventing casual
+close (without an explicit choice) ensures the user makes a deliberate decision rather
+than accidentally dismissing the review.
+
+---
+
+### REQ-PF-016: Approve, Discard, and Feedback Actions for Task Approval
+
+WHEN prose reader is in task approval mode
+THE SYSTEM SHALL display three primary actions: Approve, Discard, and Send Feedback
+
+WHEN user taps Approve
+THE SYSTEM SHALL resolve the approval with an approved outcome
+AND close the task approval prose reader
+AND transition the conversation out of AwaitingTaskApproval state
+
+WHEN user taps Discard
+THE SYSTEM SHALL display a confirmation: "Discard this task? The task file will be
+deleted and the conversation will return to Explore mode."
+AND on confirmation, resolve the approval with a rejected outcome
+AND close the task approval prose reader
+
+WHEN user annotates lines and taps Send Feedback
+THE SYSTEM SHALL format the annotations as a structured message (per REQ-PF-009 format)
+AND route the formatted feedback to the agent as a tool result
+AND keep the prose reader open for the next iteration
+AND clear annotations after sending
+
+WHEN user sends feedback and the agent updates the task file
+THE SYSTEM SHALL reload the prose reader content to show the revised task file
+AND NOT close or reset the approval toolbar
+
+**Rationale:** Three explicit actions make the user's choices unambiguous. Approve and
+Discard are terminal decisions; Send Feedback is iterative. Reloading on agent revision
+and keeping the toolbar open allows a natural back-and-forth without requiring the user
+to navigate away and back. The discard confirmation prevents accidental loss of task
+proposals that the agent may have worked to produce.

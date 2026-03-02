@@ -220,6 +220,8 @@ THE SYSTEM SHALL track context window consumption
 
 ### REQ-BED-014: Conversation Mode
 
+**DEPRECATED:** Replaced by REQ-BED-027.
+
 WHEN conversation is created
 THE SYSTEM SHALL initialize in Restricted mode (if Landlock is available)
 
@@ -236,13 +238,16 @@ AND disable write-capable tools (patch)
 WHEN conversation is in Unrestricted mode
 THE SYSTEM SHALL allow full tool capabilities
 
-**Rationale:** Users need a safe exploration mode for understanding codebases and triaging issues before committing to changes. Landlock provides kernel-level enforcement that cannot be bypassed by clever commands or prompt injection.
-
-> **What is Landlock?** Landlock is a Linux Security Module (LSM) introduced in kernel 5.13 that enables unprivileged processes to restrict their own capabilities. Unlike traditional sandboxing (containers, VMs), Landlock runs in the same process and enforces allowlist-based restrictions on filesystem access (read-only everywhere, write only to specific paths) and network operations (block TCP connect/bind). It's defense-in-depth: even if an attacker achieves prompt injection and the model complies, the kernel blocks exfiltration and mutation.
+**Deprecation Reason:** The Restricted/Unrestricted framing placed Landlock as the
+primary isolation mechanism. The new model (REQ-BED-027) uses Explore/Work modes
+where git worktrees provide primary physical isolation on all platforms and Landlock
+becomes defense-in-depth for Explore mode read-only enforcement only.
 
 ---
 
 ### REQ-BED-015: Mode Upgrade Request
+
+**DEPRECATED:** Replaced by REQ-PROJ-003, REQ-PROJ-004, and REQ-BED-028.
 
 WHEN LLM needs write capabilities in Restricted mode
 THE SYSTEM SHALL provide a `request_mode_upgrade` tool
@@ -265,11 +270,17 @@ AND resume agent execution
 WHEN user does not respond within reasonable time
 THE SYSTEM SHALL remain paused (no automatic timeout to Unrestricted)
 
-**Rationale:** Agents should be able to request capabilities when needed, with human approval as the gate. This enables "planning mode" → "implementation mode" workflow where agents explore and understand before making changes.
+**Deprecation Reason:** The `request_mode_upgrade` tool and `AwaitingModeApproval`
+state are replaced by the `create_task` tool and `AwaitingTaskApproval` state. The
+new flow is richer: the agent proposes a full task plan rather than just a reason
+string, and the user reviews via the prose reader with line-level annotation support.
+The mode transition is now inseparable from task creation.
 
 ---
 
 ### REQ-BED-016: Mode Downgrade
+
+**DEPRECATED:** Replaced by REQ-PROJ-009 (merge) and REQ-PROJ-010 (abandon).
 
 WHEN user requests mode downgrade (Unrestricted → Restricted)
 THE SYSTEM SHALL transition immediately to Restricted mode
@@ -278,41 +289,57 @@ AND NOT require agent approval
 WHEN mode changes (either direction)
 THE SYSTEM SHALL persist the new mode as part of conversation state
 
-**Rationale:** Users can always tighten permissions. The asymmetry (user approval to upgrade, immediate downgrade) reflects the trust model: escalation requires consent, de-escalation does not.
+**Deprecation Reason:** The downgrade concept (Unrestricted → Restricted) is replaced
+by task completion flows. A conversation returns to Explore mode by either merging its
+task (REQ-PROJ-009) or abandoning it (REQ-PROJ-010). There is no standalone mode
+downgrade; mode is always tied to worktree lifecycle.
 
 ---
 
 ### REQ-BED-017: Mode Communication
 
-WHEN mode changes (upgrade or downgrade)
+WHEN conversation mode changes (Explore → Work or Work → Explore)
 THE SYSTEM SHALL inject a synthetic system message visible to the agent
-WHICH clearly states the new mode and its implications
+WHICH clearly states the new mode and its implications for tool availability
 
-WHEN agent is in Restricted mode
+WHEN agent is in Explore mode
 THE SYSTEM SHALL NOT modify tool descriptions based on mode
 
-WHEN tool is unavailable due to mode restrictions
-THE SYSTEM SHALL return clear, actionable error message
-WHICH suggests using request_mode_upgrade if write access is needed
+WHEN a tool is unavailable due to mode restrictions
+THE SYSTEM SHALL return a clear, actionable error message
+AND for write tools blocked in Explore mode, SHALL suggest using `create_task` to
+propose work that requires write access
 
-**Rationale:** Tool descriptions must remain static throughout conversation to avoid confusing the LLM. Mode awareness comes through synthetic messages (on transitions) and clear error responses (when tools are blocked).
+**Rationale:** Tool descriptions must remain static throughout a conversation to avoid
+confusing the LLM. Mode awareness comes through synthetic messages on transitions and
+clear error responses when tools are blocked. Updated from REQ-BED-014/015 framing to
+reflect Explore/Work mode names and `create_task` as the path to write access.
 
 ---
 
 ### REQ-BED-018: Sub-Agent Mode Enforcement
 
-WHEN sub-agent is spawned AND Landlock is available
-THE SYSTEM SHALL always create sub-agent in Restricted mode
-REGARDLESS of parent conversation's mode
+WHEN sub-agent is spawned by an Explore conversation
+THE SYSTEM SHALL always create the sub-agent in Explore mode
+AND configure its working directory as the parent's main branch checkout
 
-WHEN sub-agent is spawned AND Landlock is unavailable
-THE SYSTEM SHALL create sub-agent in Unrestricted mode (only option)
+WHEN sub-agent is spawned by a Work conversation with Explore mode requested
+THE SYSTEM SHALL create the sub-agent in Explore mode (read-only)
+AND configure its working directory as the parent's worktree path
+
+WHEN sub-agent is spawned by a Work conversation with Work mode requested
+THE SYSTEM SHALL create the sub-agent in Work mode (read-write)
+AND configure its working directory as the parent's worktree path
+AND enforce that only one Work sub-agent exists per parent at a time
 
 WHEN sub-agent is running
-THE SYSTEM SHALL NOT provide request_mode_upgrade tool to sub-agents
-AND sub-agents cannot change their mode
+THE SYSTEM SHALL NOT provide `create_task` or `update_task` tools to sub-agents
+AND sub-agents SHALL NOT be able to change their own mode
 
-**Rationale:** Sub-agents are autonomous and less supervised than the parent conversation. Forcing Restricted mode (when available) limits blast radius. Only the parent conversation, with direct user oversight, can operate in Unrestricted mode.
+**Rationale:** Sub-agents operate under the parent's direction with a constrained
+tool set. Explore sub-agents are safe to run in parallel — they cannot write.
+Work sub-agents inherit the parent's worktree so they operate on the same codebase
+state; the one-at-a-time constraint maintains a single writer per worktree.
 
 ---
 
@@ -435,3 +462,87 @@ WHEN sub-agent timeout fires
 THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
 **Rationale:** Without enforced time limits, a stuck or slow sub-agent can hold the parent conversation indefinitely. Users need assurance that sub-agent work will complete or fail within a bounded time.
+
+---
+
+### REQ-BED-027: Explore and Work Conversation Modes
+
+WHEN a conversation is created for a project
+THE SYSTEM SHALL initialize the conversation in Explore mode
+AND store the mode as a field on the conversation record (not inside state machine state)
+
+WHILE a conversation is in Explore mode
+THE SYSTEM SHALL configure the tool registry with read-only settings
+AND reject any state machine outcomes that would write files to the project
+
+WHILE a conversation is in Work mode
+THE SYSTEM SHALL configure the tool registry with write access scoped to the worktree path
+AND record the worktree path and associated task ID in the mode field
+
+WHEN conversation mode changes
+THE SYSTEM SHALL persist the updated mode before resuming execution
+
+**Rationale:** Mode is conversation-level identity — it persists across all state machine
+transitions and survives server restarts. Keeping it as a separate field (not embedded
+in every ConvState variant) prevents combinatorial explosion of state variants and
+makes crash recovery straightforward: the executor reads mode and state independently
+and configures the tool registry accordingly.
+
+**Dependencies:** REQ-PROJ-002, REQ-PROJ-007
+
+---
+
+### REQ-BED-028: Task Approval State
+
+WHEN the `create_task` tool is called from Explore mode
+THE SYSTEM SHALL transition the conversation to AwaitingTaskApproval state
+AND store the task ID and task file path in the state
+AND pause all agent execution
+
+WHEN the user approves the task while in AwaitingTaskApproval
+THE SYSTEM SHALL resolve the create_task tool call with a success result
+AND transition the conversation to Idle in Work mode
+
+WHEN the user provides annotation feedback while in AwaitingTaskApproval
+THE SYSTEM SHALL resolve the create_task tool call with the annotations as result
+AND transition the conversation to Idle in Explore mode
+AND allow the agent to call create_task again with a revised plan
+
+WHEN the user discards the task while in AwaitingTaskApproval
+THE SYSTEM SHALL resolve the create_task tool call with a rejection result
+AND transition the conversation to Idle in Explore mode
+
+WHEN server restarts with a conversation in AwaitingTaskApproval
+THE SYSTEM SHALL restore the conversation to AwaitingTaskApproval
+AND re-emit the task approval event to reconnecting UI clients
+
+**Rationale:** AwaitingTaskApproval is a first-class state because it has a distinct
+set of valid incoming events (approve, discard, feedback) and a distinct UI
+representation (prose reader with task file open). Making it a flag on an existing
+state would require every handle_outcome arm to check the flag — a
+correct-by-construction violation.
+
+**Dependencies:** REQ-PROJ-003, REQ-PROJ-004
+
+---
+
+### REQ-BED-029: Return to Explore Mode on Task Resolution
+
+WHEN a Work conversation's task is merged to main
+THE SYSTEM SHALL transition the conversation to Explore mode
+AND pin the conversation to the new main HEAD
+AND clear the worktree path and task ID from the mode field
+
+WHEN a Work conversation's task is abandoned
+THE SYSTEM SHALL transition the conversation to Explore mode
+AND pin the conversation to the current main HEAD
+AND clear the worktree path and task ID from the mode field
+
+WHEN the conversation returns to Explore mode after task resolution
+THE SYSTEM SHALL inject a synthetic system message indicating the mode change
+AND reconfigure the tool registry to read-only settings
+
+**Rationale:** Work mode is always tied to a specific task and worktree. When that
+task concludes (successfully or not), the conversation returns to Explore mode — the
+neutral, safe starting state. This mirrors the natural project rhythm: explore,
+propose, execute, review, then explore again.

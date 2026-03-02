@@ -6,7 +6,7 @@ The Prose Feedback feature enables users to browse project files and provide str
 
 ## Technical Summary
 
-This feature consists of two main components: FileBrowser and ProseReader. On mobile, FileBrowser renders as a modal overlay; on desktop, it's superseded by the File Explorer Panel (`specs/file-explorer/`). The FileBrowser fetches directory listings from a backend API endpoint and manages navigation state. It detects file types by extension, sorts items (directories first, then alphabetical), and displays metadata like size and modification time. File selection triggers the ProseReader. On mobile, ProseReader renders as a full-screen overlay; on desktop, it renders in the main content area. The ProseReader uses `react-markdown` with GFM support for documentation files and `react-syntax-highlighter` for code. Long-press detection uses touch event handlers with a 500ms timer that cancels on movement. Notes are stored in component state as an array of objects containing line number, full raw content, and user note. The notes panel uses a bottom-drawer pattern with slide-up animation. Formatted output includes the absolute file path and uses markdown quote blocks for raw line content.
+This feature consists of two main components: FileBrowser and ProseReader. On mobile, FileBrowser renders as a modal overlay; on desktop, it's superseded by the File Explorer Panel (`specs/file-explorer/`). The FileBrowser fetches directory listings from a backend API endpoint and manages navigation state. It detects file types by extension, sorts items (directories first, then alphabetical), and displays metadata like size and modification time. File selection triggers the ProseReader. On mobile, ProseReader renders as a full-screen overlay; on desktop, it renders in the main content area. The ProseReader uses `react-markdown` with GFM support for documentation files and `react-syntax-highlighter` for code. Long-press detection uses touch event handlers with a 500ms timer that cancels on movement. Notes are stored in component state as an array of objects containing line number, full raw content, and user note. The notes panel uses a bottom-drawer pattern with slide-up animation. Formatted output includes the absolute file path and uses markdown quote blocks for raw line content. The ProseReader also supports a system-triggered task approval mode: when the backend emits a `TaskApprovalRequested` SSE event, the UI automatically opens the ProseReader on the specified task file and renders an approval toolbar with Approve, Discard, and Send Feedback actions. Feedback routes back to the agent; approval or discard resolves the `AwaitingTaskApproval` state.
 
 ## Status Summary
 
@@ -26,8 +26,10 @@ This feature consists of two main components: FileBrowser and ProseReader. On mo
 | **REQ-PF-012:** Responsive Layout | ✅ Complete | Mobile overlay; desktop per `specs/file-explorer/` |
 | **REQ-PF-013:** Loading and Error States | ✅ Complete | Loading indicators, error messages |
 | **REQ-PF-014:** Open File from Patch Tool Output | ✅ Complete | PatchFileSummary with diff parsing |
+| **REQ-PF-015:** System-Triggered Prose Reader for Task Approval | ❌ Not Started | Auto-opens on AwaitingTaskApproval state entry |
+| **REQ-PF-016:** Approve, Discard, and Feedback Actions for Task Approval | ❌ Not Started | Three-action toolbar; iterative feedback loop |
 
-**Progress:** 14 of 14 complete
+**Progress:** 14 of 16 complete
 
 ## Prerequisites
 
