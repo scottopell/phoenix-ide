@@ -39,6 +39,7 @@ LAUNCHD_LABEL = "com.phoenix-ide.server"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
 LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
+PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
 
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
@@ -89,6 +90,35 @@ def _discover_gateway_candidates() -> list[str]:
             pass
     candidates.append(DEFAULT_GATEWAY)
     return candidates
+
+
+def write_deployed_sha():
+    """Write the current HEAD SHA to ~/.phoenix-ide/deployed.sha."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    sha = result.stdout.strip()
+    if sha:
+        PROD_SHA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PROD_SHA_PATH.write_text(sha + "\n")
+
+
+def read_deployed_sha() -> str | None:
+    """Read the deployed SHA, return short hash with staleness hint or None."""
+    if not PROD_SHA_PATH.exists():
+        return None
+    deployed = PROD_SHA_PATH.read_text().strip()
+    if not deployed:
+        return None
+    short = deployed[:7]
+    current = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT, capture_output=True, text=True,
+    ).stdout.strip()
+    if current and current != deployed:
+        return f"{short} (HEAD is now {current[:7]})"
+    return f"{short} (current)"
 
 
 def get_llm_gateway() -> str | None:
@@ -1117,6 +1147,7 @@ def native_prod_deploy(version: str | None = None):
             capture_output=True, text=True
         )
         if result.stdout.strip() == "active":
+            write_deployed_sha()
             print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
@@ -1128,21 +1159,22 @@ def native_prod_deploy(version: str | None = None):
     else:
         # Service not running - start socket first, then service
         print("Starting socket and service...")
-        
+
         # Stop any existing (non-socket-activated) service first
         subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME], capture_output=True)
-        
+
         # Start the socket (service will be started on first connection or explicitly)
         subprocess.run(["sudo", "systemctl", "start", f"{PROD_SERVICE_NAME}.socket"], check=True)
         subprocess.run(["sudo", "systemctl", "start", PROD_SERVICE_NAME], check=True)
         time.sleep(1)
-        
+
         # Verify it started
         result = subprocess.run(
             ["systemctl", "is-active", PROD_SERVICE_NAME],
             capture_output=True, text=True
         )
         if result.stdout.strip() == "active":
+            write_deployed_sha()
             print(f"\n✓ Deployed {version} to production")
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
@@ -1229,6 +1261,7 @@ def prod_daemon_deploy():
         print(f"WARNING: Server started but health check failed: {e}", file=sys.stderr)
         version_info = {"version": "unknown"}
 
+    write_deployed_sha()
     print(f"\n✓ Deployed daemon to production")
     print(f"  Version: {version_info.get('version', 'unknown')}")
     print(f"  Port: {PROD_PORT}")
@@ -1260,18 +1293,18 @@ def prod_daemon_status():
         os.kill(pid, 0)  # Signal 0 = check existence
         print(f"Status: Running (PID {pid})")
 
-        # Try to get version from health endpoint
+        # Health check
         try:
             import urllib.request
-            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
-                version_text = resp.read().decode().strip()
-                print(f"  Version: {version_text}")
-                print(f"  Port: {PROD_PORT}")
-                print(f"  URL: http://localhost:{PROD_PORT}")
-                print(f"  Health: OK")
+            urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2).close()
+            print(f"  Health: OK")
         except Exception as e:
             print(f"  Health: Unreachable ({type(e).__name__}: {e})")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  URL: http://localhost:{PROD_PORT}")
 
+        if sha := read_deployed_sha():
+            print(f"  Commit: {sha}")
         print(f"  Logs: {prod_log_path}")
 
     except ProcessLookupError:
@@ -1404,25 +1437,20 @@ def native_prod_status():
     
     if status == "active":
         print(f"Production: running")
-        # Get version from environment
-        result = subprocess.run(
-            ["systemctl", "show", PROD_SERVICE_NAME, "--property=Environment"],
-            capture_output=True, text=True
-        )
-        for part in result.stdout.split():
-            if part.startswith("PHOENIX_VERSION="):
-                print(f"  Version: {part.split('=', 1)[1]}")
         print(f"  Port: {PROD_PORT}")
         print(f"  URL: http://localhost:{PROD_PORT}")
         print(f"  Database: {PROD_DB_PATH}")
 
-        # Check if responding
+        # Health check
         try:
             import urllib.request
-            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
-                print(f"  Health: {resp.read().decode().strip()}")
+            urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2).close()
+            print(f"  Health: OK")
         except Exception:
             print(f"  Health: not responding")
+
+        if sha := read_deployed_sha():
+            print(f"  Commit: {sha}")
     else:
         print(f"Production: {status}")
     
@@ -1580,6 +1608,7 @@ def launchd_prod_deploy(version: str | None = None):
         print(f"WARNING: Server started but health check failed: {e}", file=sys.stderr)
         health_version = None
 
+    write_deployed_sha()
     llm_mode = f"gateway ({gateway})" if gateway else "no gateway detected"
     print(f"\n✓ Deployed {version} to production (launchd)")
     if health_version:
@@ -1621,12 +1650,13 @@ def launchd_prod_status():
     # Health check
     try:
         import urllib.request
-        with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2) as resp:
-            print(f"  Version: {resp.read().decode().strip()}")
-            print(f"  Health: OK")
+        urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2).close()
+        print(f"  Health: OK")
     except Exception:
         print(f"  Health: not responding")
 
+    if sha := read_deployed_sha():
+        print(f"  Commit: {sha}")
     print(f"  Port: {PROD_PORT}")
     print(f"  Database: {PROD_DB_PATH}")
     print(f"  Logs: {LAUNCHD_LOG_PATH}")
