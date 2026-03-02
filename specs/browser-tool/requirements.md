@@ -397,6 +397,51 @@ THE SYSTEM SHALL write requests to a file and return the file path
 
 ---
 
+### REQ-BT-017: React Component Access
+
+The `browser_inject_react_devtools` tool SHALL install a lightweight `window.__phoenix` helper
+into the page BEFORE page JavaScript runs, using CDP's `Page.addScriptToEvaluateOnNewDocument`.
+
+THE SYSTEM SHALL hook into React's `__REACT_DEVTOOLS_GLOBAL_HOOK__` interface so that React
+automatically registers its fiber roots into the helper at startup.
+
+The `window.__phoenix` API SHALL provide:
+- `getContext(keys: string[])` — find a context value by duck-typing (all keys present using `in`)
+- `callContext(keys: string[], method: string, ...args)` — find a context and call a method on it
+- `getState(componentName: string)` — get hook state array for a named component
+- `listContexts()` — enumerate all ContextProvider values for discovery
+
+WHEN `browser_inject_react_devtools` is called
+THE SYSTEM SHALL return a script identifier usable with `browser_remove_react_devtools` for cleanup.
+
+The `browser_remove_react_devtools` tool SHALL remove the injected script from future new documents
+via `Page.removeScriptToEvaluateOnNewDocument`.
+
+The injected script SHALL be idempotent: calling the tool twice before navigation SHALL NOT
+double-register the helper or produce errors.
+
+WHEN injected into a non-React page
+THE SYSTEM SHALL install the hook harmlessly — the hook exists but React never calls it.
+
+WHEN the page already has a `__REACT_DEVTOOLS_GLOBAL_HOOK__` installed (e.g. from a browser
+extension or the app itself)
+THE SYSTEM SHALL wrap the existing hook's `onCommitFiberRoot` callback rather than replacing it.
+
+**Rationale:** Accessing React component state via raw fiber walking requires 6+ sequential
+`browser_eval` calls, is fragile against minification (display names stripped in production),
+and relies on internal React internals that can change. The `__REACT_DEVTOOLS_GLOBAL_HOOK__`
+interface is stable across React 16-18 and explicitly maintained for DevTools integration.
+Injecting before page JS runs is the only way to capture fiber roots — React only calls
+`onCommitFiberRoot` if the hook exists at startup.
+
+The tool is explicit and opt-in (not auto-injected on every navigate) so agents reading a
+conversation trace know the hook is active, and pages with their own DevTools integration are
+not silently broken.
+
+**User Stories:** US-1, US-2
+
+---
+
 ## Requirements Traceability
 
 | Requirement | User Story | MVP |
@@ -417,6 +462,7 @@ THE SYSTEM SHALL write requests to a file and return the file path
 | REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 | ✅ |
 | REQ-BT-015: Access to Full Console Log Content | US-1, US-2 | 🟡 |
 | REQ-BT-016: Keyboard Shortcut Input | US-2 | ✅ |
+| REQ-BT-017: React Component Access | US-1, US-2 | ✅ |
 | REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |

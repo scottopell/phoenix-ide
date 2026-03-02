@@ -36,6 +36,7 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-014:** Accurate Console Log Object Representation | ✅ Complete | CDP preview field; objects show `{k: v}`, arrays show `[v]` |
 | **REQ-BT-015:** Access to Full Console Log Content | ✅ Complete | Buffer stores full content (10KB cap); display truncation at retrieval time only; file escape hatch writes untruncated entries |
 | **REQ-BT-016:** Keyboard Shortcut Input | ✅ Complete | `browser_key_press` tool; CDP-level keydown/keyup for non-printable keys and modifier chords |
+| **REQ-BT-017:** React Component Access | ✅ Complete | `browser_inject_react_devtools` + `browser_remove_react_devtools`; `window.__phoenix` helper via `__REACT_DEVTOOLS_GLOBAL_HOOK__` |
 
 ### Post-MVP Requirements
 
@@ -47,5 +48,5 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
 | **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
-**Core Progress:** 16 of 16 complete
-**Total Progress:** 16 of 21 complete
+**Core Progress:** 17 of 17 complete
+**Total Progress:** 17 of 22 complete

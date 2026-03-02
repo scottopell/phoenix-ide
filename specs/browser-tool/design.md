@@ -327,6 +327,56 @@ document.querySelector('#section').scrollIntoView()
 
 ---
 
+### browser_inject_react_devtools (REQ-BT-017)
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+**Implementation:**
+- Uses CDP `Page.addScriptToEvaluateOnNewDocument` to install the `window.__phoenix` helper
+- The script is injected into every new document created in the current browser session
+- The helper hooks into `__REACT_DEVTOOLS_GLOBAL_HOOK__` before React initialises
+- If an existing hook is present, `onCommitFiberRoot` is wrapped rather than replaced
+- Idempotent: `window.__phoenix.__installed` sentinel prevents double-registration
+
+**Injected `window.__phoenix` API:**
+- `getContext(keys)` — depth-first search for a ContextProvider whose value has all `keys`
+- `callContext(keys, method, ...args)` — find context and call a method on it
+- `getState(componentName)` — unwind `memoizedState` linked list for a named component
+- `listContexts()` — enumerate all ContextProviders (discovery / debugging)
+
+**Output:**
+- Script identifier string (pass to `browser_remove_react_devtools` to clean up)
+
+---
+
+### browser_remove_react_devtools (REQ-BT-017)
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "script_id": { "type": "string", "description": "Script identifier from browser_inject_react_devtools" }
+  },
+  "required": ["script_id"]
+}
+```
+
+**Implementation:**
+- Uses CDP `Page.removeScriptToEvaluateOnNewDocument` with the provided script identifier
+- Removes the injection for future new documents; the current page is unaffected
+
+**Output:**
+- Confirmation message with the removed script identifier
+
+---
+
 ## CDP Domain Usage
 
 | Requirement | CDP Domains |
@@ -337,6 +387,7 @@ document.querySelector('#section').scrollIntoView()
 | REQ-BT-004: Console | Runtime |
 | REQ-BT-005: Viewport | Emulation |
 | REQ-BT-010: Session | Browser |
+| REQ-BT-017: React Component Access | Page (addScriptToEvaluateOnNewDocument) |
 | REQ-BT-020: Service Workers | ServiceWorker, Runtime |
 | REQ-BT-021: Network Source | Network |
 | REQ-BT-022: Offline Mode | Network |
@@ -421,7 +472,8 @@ src/tools/
 ├── browser.rs                    # Module entry, exports tools and session manager
 └── browser/
     ├── session.rs                # BrowserSession + BrowserSessionManager
-    └── tools.rs                  # Tool implementations (navigate, eval, screenshot, etc.)
+    ├── tools.rs                  # Tool implementations (navigate, eval, screenshot, etc.)
+    └── react.rs                  # browser_inject_react_devtools + browser_remove_react_devtools
 ```
 
 Note: No `chrome.rs` or `cdp.rs` needed - chromiumoxide handles process spawning and CDP protocol internally.

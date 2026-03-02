@@ -3,13 +3,16 @@
 //! REQ-BT-010: Implicit Session Model
 //! REQ-BT-011: State Persistence
 //! REQ-BT-012: Stateless Tools with Context Injection
+//! REQ-BT-017: React Component Access
 
+pub mod react;
 pub mod session;
 mod tools;
 
 #[cfg(test)]
 mod tests;
 
+pub use react::{BrowserInjectReactDevtoolsTool, BrowserRemoveReactDevtoolsTool};
 pub use session::{BrowserError, BrowserSessionManager};
 pub use tools::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserKeyPressTool,

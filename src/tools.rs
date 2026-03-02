@@ -14,7 +14,8 @@ mod think;
 pub use bash::BashTool;
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
-    BrowserKeyPressTool, BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
+    BrowserInjectReactDevtoolsTool, BrowserKeyPressTool, BrowserNavigateTool,
+    BrowserRecentConsoleLogsTool, BrowserRemoveReactDevtoolsTool, BrowserResizeTool,
     BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool, BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
@@ -202,6 +203,8 @@ impl ToolRegistry {
             Arc::new(BrowserClickTool),
             Arc::new(BrowserTypeTool),
             Arc::new(BrowserKeyPressTool),
+            Arc::new(BrowserInjectReactDevtoolsTool),
+            Arc::new(BrowserRemoveReactDevtoolsTool),
         ];
 
         if is_sub_agent {
@@ -282,5 +285,13 @@ mod tests {
             "Missing browser_clear_console_logs"
         );
         assert!(names.contains(&"browser_resize"), "Missing browser_resize");
+        assert!(
+            names.contains(&"browser_inject_react_devtools"),
+            "Missing browser_inject_react_devtools"
+        );
+        assert!(
+            names.contains(&"browser_remove_react_devtools"),
+            "Missing browser_remove_react_devtools"
+        );
     }
 }
