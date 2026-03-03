@@ -17,17 +17,9 @@
 //! See the task spec (tasks/596-p1-ready-browser-react-component-access-tool.md)
 //! and spec update (specs/browser-tool/requirements.md REQ-BT-017).
 
-use super::session::BrowserSession;
-use crate::tools::{Tool, ToolContext, ToolOutput};
-use async_trait::async_trait;
-use chromiumoxide::cdp::browser_protocol::page::{
-    AddScriptToEvaluateOnNewDocumentParams, RemoveScriptToEvaluateOnNewDocumentParams,
-    ScriptIdentifier,
-};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+// No imports needed — this module only exports constants (the JS scripts).
+// The hook is injected by BrowserSession::launch_and_init() in session.rs.
+// React detection is called by BrowserNavigateTool in tools.rs.
 
 // ============================================================================
 // The injected JavaScript helper
@@ -94,7 +86,7 @@ use tokio::sync::RwLock;
 ///   Crashed Vite's `@react-refresh` preamble (task 599).
 /// - **Runtime npm dependency**: Would require a build step to bundle JS into the
 ///   Rust binary. The vendored approach keeps us as a single static binary.
-const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
+pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
 (function() {
   // ── Idempotency guard ──────────────────────────────────────────────────────
   // Skip installation if the helper is already present (e.g. tool called twice
@@ -393,149 +385,29 @@ const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
 ";
 
 // ============================================================================
-// browser_inject_react_devtools (REQ-BT-017)
+// React detection — called after browser_navigate to enrich the result
 // ============================================================================
 
-pub struct BrowserInjectReactDevtoolsTool;
-
-#[async_trait]
-impl Tool for BrowserInjectReactDevtoolsTool {
-    fn name(&self) -> &'static str {
-        "browser_inject_react_devtools"
+/// JavaScript snippet that detects React on the current page and returns a
+/// summary string for the navigate tool output. Returns empty string if no
+/// React detected.
+pub const REACT_DETECT_SCRIPT: &str = r#"
+(function() {
+  var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+  if (!hook || !hook.renderers || hook.renderers.size === 0) return '';
+  var contextCount = 0;
+  try {
+    if (window.__phoenix && window.__phoenix.listContexts) {
+      contextCount = window.__phoenix.listContexts().length;
     }
-
-    fn description(&self) -> String {
-        "Install a lightweight window.__phoenix React helper into the page BEFORE \
-page JS runs, using CDP's Page.addScriptToEvaluateOnNewDocument. The helper hooks \
-into React's __REACT_DEVTOOLS_GLOBAL_HOOK__ so React automatically registers its \
-fiber tree on startup, enabling structured access to component state and context \
-without DOM traversal or minification-sensitive property names.\n\
-\n\
-IMPORTANT: Call this tool BEFORE navigating to (or reloading) the target page — \
-the script must be installed before React initialises.\n\
-\n\
-After injection, use browser_eval to call:\n\
-  window.__phoenix.getContext(['openFile', 'closeFile'])  // find context by duck-typing\n\
-  window.__phoenix.callContext(['openFile'], 'openFile', '/src/main.rs')  // call a method\n\
-  window.__phoenix.getState('FileExplorer')               // get hook state array\n\
-  window.__phoenix.listContexts()                         // discover all contexts\n\
-\n\
-Calling this tool twice before navigating is safe — the script is idempotent.\n\
-Injecting on a non-React page is harmless: the hook exists but is never called.\n\
-Returns the script identifier so you can pass it to browser_remove_react_devtools \
-if you need to clean up the injection."
-            .to_string()
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-
-    async fn run(&self, _input: Value, ctx: ToolContext) -> ToolOutput {
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-        };
-
-        let mut guard = session.write().await;
-        guard.last_activity = std::time::Instant::now();
-
-        let params =
-            AddScriptToEvaluateOnNewDocumentParams::new(PHOENIX_REACT_HELPER_SCRIPT.to_string());
-
-        match guard.page.execute(params).await {
-            Ok(result) => {
-                let identifier: String = result.result.identifier.into();
-                tracing::debug!(
-                    script_id = %identifier,
-                    "Injected window.__phoenix React helper via addScriptToEvaluateOnNewDocument"
-                );
-                ToolOutput::success(format!(
-                    "React DevTools helper injected (script id: {identifier}). \
-Navigate to or reload the target page for the helper to take effect. \
-The window.__phoenix API will then be available via browser_eval:\n\
-  window.__phoenix.getContext(['openFile'])\n\
-  window.__phoenix.callContext(['openFile'], 'openFile', '/path')\n\
-  window.__phoenix.getState('ComponentName')\n\
-  window.__phoenix.listContexts()"
-                ))
-            }
-            Err(e) => ToolOutput::error(format!("Failed to inject React helper: {e}")),
-        }
-    }
-}
-
-// ============================================================================
-// browser_remove_react_devtools (REQ-BT-017 cleanup)
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-struct RemoveReactDevtoolsInput {
-    /// The script identifier returned by `browser_inject_react_devtools`
-    script_id: String,
-}
-
-pub struct BrowserRemoveReactDevtoolsTool;
-
-#[async_trait]
-impl Tool for BrowserRemoveReactDevtoolsTool {
-    fn name(&self) -> &'static str {
-        "browser_remove_react_devtools"
-    }
-
-    fn description(&self) -> String {
-        "Remove the window.__phoenix React helper previously installed by \
-browser_inject_react_devtools. Pass the script_id returned by that tool. \
-The injection is removed from future new documents; already-loaded pages are \
-unaffected (the helper stays in the current page's window until navigation)."
-            .to_string()
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "script_id": {
-                    "type": "string",
-                    "description": "The script identifier returned by browser_inject_react_devtools"
-                }
-            },
-            "required": ["script_id"]
-        })
-    }
-
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        let input: RemoveReactDevtoolsInput = match serde_json::from_value(input) {
-            Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
-        };
-
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-        };
-
-        let mut guard = session.write().await;
-        guard.last_activity = std::time::Instant::now();
-
-        let identifier = ScriptIdentifier::from(input.script_id.clone());
-        let params = RemoveScriptToEvaluateOnNewDocumentParams::new(identifier);
-
-        match guard.page.execute(params).await {
-            Ok(_) => {
-                tracing::debug!(
-                    script_id = %input.script_id,
-                    "Removed window.__phoenix React helper"
-                );
-                ToolOutput::success(format!(
-                    "React DevTools helper removed (script id: {}).",
-                    input.script_id
-                ))
-            }
-            Err(e) => ToolOutput::error(format!("Failed to remove React helper: {e}")),
-        }
-    }
-}
+  } catch(e) {}
+  var msg = 'React detected (' + hook.renderers.size + ' renderer(s)';
+  if (contextCount > 0) msg += ', ' + contextCount + ' context(s)';
+  msg += '). window.__phoenix is available for inspection:\n';
+  msg += '  __phoenix.listContexts()              — discover all context providers\n';
+  msg += '  __phoenix.getContext([key1, key2])     — find context by duck-typing its keys\n';
+  msg += '  __phoenix.callContext([key], method)   — find context and call a method on it\n';
+  msg += '  __phoenix.getState("ComponentName")    — get hook state array by component name';
+  return msg;
+})()
+"#;

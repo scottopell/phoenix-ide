@@ -233,6 +233,18 @@ impl BrowserSession {
             .await
             .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
 
+        // Auto-inject the __phoenix React helper into every future document.
+        // Runs before page JS, so React registers its fiber roots into our hook
+        // at startup. Harmless on non-React pages. See react.rs for full docs.
+        let inject_params =
+            chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(
+                super::react::PHOENIX_REACT_HELPER_SCRIPT.to_string(),
+            );
+        if let Err(e) = page.execute(inject_params).await {
+            tracing::warn!("Failed to auto-inject React helper: {e}");
+            // Non-fatal — browser still works, just no __phoenix on React pages
+        }
+
         Ok(Self {
             browser,
             handler_task,

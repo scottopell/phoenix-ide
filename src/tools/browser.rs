@@ -12,7 +12,6 @@ mod tools;
 #[cfg(test)]
 mod tests;
 
-pub use react::{BrowserInjectReactDevtoolsTool, BrowserRemoveReactDevtoolsTool};
 pub use session::{BrowserError, BrowserSessionManager};
 pub use tools::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserKeyPressTool,

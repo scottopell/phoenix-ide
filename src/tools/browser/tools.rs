@@ -102,7 +102,24 @@ impl Tool for BrowserNavigateTool {
         let result = tokio::time::timeout(timeout, guard.page.goto(&input.url)).await;
 
         match result {
-            Ok(Ok(_)) => ToolOutput::success("done"),
+            Ok(Ok(_)) => {
+                // Detect React and enrich the navigate result with __phoenix hints
+                let react_info = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    guard.page.evaluate(super::react::REACT_DETECT_SCRIPT),
+                )
+                .await
+                {
+                    Ok(Ok(val)) => val.into_value::<String>().unwrap_or_default(),
+                    _ => String::new(),
+                };
+
+                if react_info.is_empty() {
+                    ToolOutput::success("done")
+                } else {
+                    ToolOutput::success(format!("done\n\n{react_info}"))
+                }
+            }
             Ok(Err(e)) => ToolOutput::error(format!("Navigation failed: {e}")),
             Err(_) => ToolOutput::error(format!("Timeout after {timeout:?} waiting for page load")),
         }
