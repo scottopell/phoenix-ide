@@ -30,7 +30,18 @@ pub enum RecoveryReason {
     AgentHasTextResponse,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
+    /// Too many consecutive auto-continue restarts (liveness bound)
+    RestartLoopDetected,
 }
+
+/// Sentinel text embedded in the system message injected on auto-continue.
+/// Used to count consecutive restarts and detect restart loops.
+pub const RESTART_SYSTEM_MESSAGE_MARKER: &str = "[server-restart-auto-continue]";
+
+/// Maximum number of consecutive auto-continue restarts before giving up.
+/// If a conversation triggers auto-continue this many times in a row without
+/// the agent completing a turn normally, we stop and go to idle.
+const MAX_CONSECUTIVE_RESTARTS: usize = 2;
 
 impl RecoveryDecision {
     fn idle(reason: RecoveryReason) -> Self {
@@ -92,8 +103,37 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
     if agent_has_text {
         RecoveryDecision::idle(RecoveryReason::AgentHasTextResponse)
     } else {
-        RecoveryDecision::auto_continue()
+        // Check for restart loop: count consecutive restart system messages
+        // at the tail of the conversation. If we've already auto-continued
+        // MAX_CONSECUTIVE_RESTARTS times without the agent completing normally,
+        // stop to prevent infinite restart loops (e.g. agent running a command
+        // that restarts the server).
+        let consecutive_restarts = count_restart_messages_since_last_user_msg(messages);
+        if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS {
+            RecoveryDecision::idle(RecoveryReason::RestartLoopDetected)
+        } else {
+            RecoveryDecision::auto_continue()
+        }
     }
+}
+
+/// Count restart system messages since the last user message.
+/// A user message starts a new turn, so restart markers from before
+/// that point are historical and don't count toward the loop threshold.
+/// This correctly handles: restart → agent completes → user sends new
+/// message → restart again (count resets to 1, not accumulated to 2).
+fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
+    let mut count = 0;
+    for msg in messages.iter().rev() {
+        match &msg.content {
+            MessageContent::User(_) => break, // new turn boundary — stop counting
+            MessageContent::System(sys) if sys.text.contains(RESTART_SYSTEM_MESSAGE_MARKER) => {
+                count += 1;
+            }
+            _ => {} // skip agent/tool messages, keep scanning backwards
+        }
+    }
+    count
 }
 
 #[cfg(test)]
@@ -434,6 +474,88 @@ mod tests {
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::AgentHasTextResponse);
     }
+
+    // =========================================================================
+    // Restart loop detection
+    // =========================================================================
+
+    fn system_restart_msg(seq: i64) -> Message {
+        use crate::db::SystemContent;
+        Message {
+            message_id: format!("sys-{seq}"),
+            conversation_id: "test-conv".to_string(),
+            sequence_id: seq,
+            message_type: MessageType::System,
+            content: MessageContent::System(SystemContent {
+                text: format!(
+                    "{} This conversation was interrupted by a server restart.",
+                    RESTART_SYSTEM_MESSAGE_MARKER
+                ),
+            }),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_first_restart_auto_continues() {
+        // First crash: user → agent(tool_use) → tool_result → system_restart
+        // Recovery sees 1 restart since last user msg → under threshold → auto-continue
+        // Auto-continue runs, LLM responds with more tools, those complete:
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "deploying..."),
+            system_restart_msg(4), // first restart marker
+            agent_tool_use_only(5, &["bash"]),
+            tool_result(6, "tool-5-0", "deploying again..."),
+        ];
+        let decision = should_auto_continue(&messages);
+        // 1 restart since last user msg → auto-continue
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn test_restart_loop_detected() {
+        // Second crash in the same turn: two restart markers since last user msg
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "deploying..."),
+            system_restart_msg(4), // first restart
+            agent_tool_use_only(5, &["bash"]),
+            tool_result(6, "tool-5-0", "deploying again..."),
+            system_restart_msg(7), // second restart — loop!
+            agent_tool_use_only(8, &["bash"]),
+            tool_result(9, "tool-8-0", "deploying yet again..."),
+        ];
+        let decision = should_auto_continue(&messages);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::RestartLoopDetected);
+    }
+
+    #[test]
+    fn test_restart_count_resets_on_new_user_message() {
+        // Restart in first turn, then user sends new message → counter resets
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "output"),
+            system_restart_msg(4), // restart in first turn
+            agent_with_text(5, "Deployed successfully"),
+            user_msg(6, "Do it again"), // new turn — resets counter
+            agent_tool_use_only(7, &["bash"]),
+            tool_result(8, "tool-7-0", "deploying..."),
+            system_restart_msg(9), // only 1 restart since user_msg(6)
+            agent_tool_use_only(10, &["bash"]),
+            tool_result(11, "tool-10-0", "output"),
+        ];
+        let decision = should_auto_continue(&messages);
+        // Only 1 restart since last user msg → auto-continue
+        assert!(decision.needs_auto_continue);
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +833,9 @@ mod proptests {
                 }
                 RecoveryReason::InterruptedMidTurn => {
                     prop_assert!(decision.needs_auto_continue);
+                }
+                RecoveryReason::RestartLoopDetected => {
+                    prop_assert!(!decision.needs_auto_continue);
                 }
             }
         }

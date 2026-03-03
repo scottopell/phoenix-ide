@@ -359,6 +359,7 @@ impl RuntimeManager {
     }
 
     /// Get or create a runtime for a conversation
+    #[allow(clippy::too_many_lines)]
     pub async fn get_or_create(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -448,8 +449,34 @@ impl RuntimeManager {
         )
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone());
 
-        // Log if we're auto-continuing (the executor handles the actual LLM request)
+        // If auto-continuing, inject a system message so the LLM knows a restart
+        // happened. This also serves as the restart loop counter — recovery.rs
+        // counts consecutive restart system messages at the tail of the history.
         if needs_auto_continue {
+            use crate::db::SystemContent;
+            use crate::runtime::recovery::RESTART_SYSTEM_MESSAGE_MARKER;
+
+            let restart_msg = format!(
+                "{RESTART_SYSTEM_MESSAGE_MARKER} This conversation was interrupted \
+                 by a server restart. The last tool execution may have caused the \
+                 restart. Review the tool results above before deciding what to do \
+                 next. Do NOT re-execute the same command that was just running."
+            );
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = self
+                .db
+                .add_message(
+                    &msg_id,
+                    conversation_id,
+                    &crate::db::MessageContent::System(SystemContent { text: restart_msg }),
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(conv_id = %conversation_id, error = %e,
+                    "Failed to inject restart system message");
+            }
             tracing::info!(conv_id = %conversation_id, "Will auto-continue interrupted conversation");
         }
 
