@@ -625,6 +625,10 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
         if path == template:
             continue
 
+        # Skip ancillary files that are not task files (e.g. .qaplan.md)
+        if '.qaplan.' in path.name:
+            continue
+
         name = path.name
         content = path.read_text()
 
@@ -682,6 +686,8 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
     number_map = defaultdict(list)
     for path in task_files:
         if path == template:
+            continue
+        if '.qaplan.' in path.name:
             continue
         task = parse_task_file(path)
         if task:

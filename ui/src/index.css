@@ -779,6 +779,41 @@ body {
   border-bottom-style: solid;
 }
 
+/* Streaming code block (open/incomplete fence).
+ *
+ * Dimensions must match react-syntax-highlighter + oneDark exactly so that
+ * when the closing fence arrives and SyntaxHighlighter replaces this element,
+ * only colors change — no reflow or layout shift.
+ *
+ * oneDark pre style: padding 1em, margin 0.5em 0, border-radius 0.3em,
+ * background hsl(220,13%,18%), font-family "Fira Code"/Menlo/Consolas,
+ * font-size inherits (browser default ~14px in this context), line-height 1.5.
+ */
+.streaming-code-pre {
+  margin: 0.5em 0;
+  padding: 0;
+  background: hsl(220, 13%, 18%);
+  border-radius: 0.3em;
+  overflow-x: auto;
+}
+
+.streaming-code {
+  display: block;
+  font-family: "Fira Code", "Fira Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font-size: 1em;
+  line-height: 1.5;
+  color: hsl(220, 14%, 71%);
+  background: hsl(220, 13%, 18%);
+  padding: 1em;
+  border-radius: 0.3em;
+  white-space: pre;
+  overflow-x: auto;
+  word-spacing: normal;
+  word-break: normal;
+  tab-size: 2;
+  hyphens: none;
+}
+
 /* Images in messages */
 .message-images {
   display: flex;
