@@ -1,7 +1,7 @@
 ---
 created: 2026-02-04
 priority: p3
-status: pending
+status: ready
 ---
 
 # Add ETag Support to Backend API

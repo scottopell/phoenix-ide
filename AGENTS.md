@@ -31,12 +31,12 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 ## Task Tracking
 
-**Format:** `NNN-pX-status-slug.md` (e.g., `042-p1-ready-fix-bug.md`)
+**Format:** `NNNN-pX-status--slug.md` (e.g., `0042-p1-ready--fix-bug.md`)
 
-- `NNN`: Task number | `pX`: Priority (p0 highest) | `status`: ready, in-progress, done, blocked, etc.
+- `NNNN`: 4-digit task number | `pX`: Priority (p0 highest) | `status`: ready, in-progress, done, blocked, etc.
 
 ```bash
-ls tasks/*-ready-*.md              # List ready tasks
+ls tasks/*-ready--*.md             # List ready tasks
 ./dev.py tasks fix                 # Sync filenames to frontmatter
 ./dev.py tasks validate            # Check consistency (runs in ./dev.py check)
 ```

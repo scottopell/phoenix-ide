@@ -1,7 +1,7 @@
 ---
 created: 2026-02-04
 priority: p2
-status: pending
+status: ready
 ---
 
 # Add Conflict Resolution UI

@@ -1,6 +1,9 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.12"
+# dependencies = [
+#   "taskmd @ git+https://github.com/scottopell/taskmd.git",
+# ]
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -16,6 +19,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+import taskmd
 
 ROOT = Path(__file__).parent.resolve()
 
@@ -535,289 +540,82 @@ def cmd_check():
 # =============================================================================
 # Task Validation
 # =============================================================================
-
-VALID_STATUSES = {"ready", "in-progress", "pending", "blocked", "done", "wont-do", "brainstorming"}
-VALID_PRIORITIES = {"p0", "p1", "p2", "p3", "p4"}
-
-# Task filename pattern: NNN-pX-status-slug.md
-# Example: 001-p2-done-refactor-executor.md
-TASK_FILENAME_PATTERN = r"^(\d{3})-(p[0-4])-(" + "|".join(VALID_STATUSES) + r")-(.+)\.md$"
-
-
-def parse_task_file(path: Path) -> dict | None:
-    """Parse a task file and return its metadata, or None if invalid.
-
-    Returns dict with: number, priority, status, slug, fields (from frontmatter)
-    """
-    import re
-
-    content = path.read_text()
-
-    # Check YAML frontmatter exists
-    if not content.startswith("---\n"):
-        return None
-
-    # Extract frontmatter
-    end = content.find("\n---\n", 4)
-    if end == -1:
-        return None
-
-    frontmatter = content[4:end]
-    fields = {}
-    for line in frontmatter.strip().split("\n"):
-        if ":" in line:
-            key, _, value = line.partition(":")
-            fields[key.strip()] = value.strip()
-
-    # Parse filename
-    name = path.name
-    match = re.match(TASK_FILENAME_PATTERN, name)
-    if match:
-        return {
-            "path": path,
-            "number": match.group(1),
-            "file_priority": match.group(2),
-            "file_status": match.group(3),
-            "slug": match.group(4),
-            "fields": fields,
-        }
-
-    # Try old format: NNN-slug.md
-    old_match = re.match(r"^(\d{3})-(.+)\.md$", name)
-    if old_match:
-        return {
-            "path": path,
-            "number": old_match.group(1),
-            "file_priority": None,
-            "file_status": None,
-            "slug": old_match.group(2),
-            "fields": fields,
-        }
-
-    return None
-
-
-def get_expected_filename(number: str, priority: str, status: str, slug: str) -> str:
-    """Generate the expected filename from task metadata."""
-    return f"{number}-{priority}-{status}-{slug}.md"
+#
+# Implementation report (taskmd integration):
+#
+# API surface used:
+#   - taskmd.validate(tasks_dir) -> ValidationResult  (.ok, .errors, .file_count)
+#   - taskmd.fix(tasks_dir) -> FixResult  (.ok, .errors, .patched, .renamed)
+#   - taskmd.VALID_STATUSES, taskmd.VALID_PRIORITIES  (frozensets)
+#
+# API gaps:
+#   - No way to pass a custom filename regex to validate/fix. Phoenix migrated
+#     from 3-digit single-dash to 4-digit double-dash format to match taskmd's
+#     built-in pattern exactly, so no gap remains post-migration.
+#
+# API friction:
+#   - taskmd.validate() prints nothing and returns structured data; dev.py's
+#     cmd_tasks_validate() has a quiet=True codepath used by cmd_check that
+#     suppresses output. The mapping is clean: always call taskmd.validate(),
+#     then conditionally print based on quiet.
+#   - cmd_tasks_fix() previously printed per-file rename lines inline. taskmd's
+#     FixResult only gives aggregate counts (patched, renamed), not per-file
+#     detail. The old behavior printed "  old.md -> new.md" for each rename;
+#     that granularity is lost. The aggregate summary is sufficient.
+#   - taskmd.VALID_STATUSES excludes "pending" (Phoenix used it). Migration
+#     converted all "pending" files to "ready" in both filename and frontmatter.
+#
+# Suggestions for taskmd:
+#   - Add FixResult.renames: list[tuple[str, str]] so callers can display
+#     per-file rename detail without re-implementing scan logic.
+#   - Consider exposing ValidationResult.file_count as the count of files
+#     examined (currently it is, but document it clearly — it counts all task
+#     files seen, not just those with errors).
+#   - A FixResult.summary() -> str convenience method returning the canonical
+#     "patched N file(s), renamed M file(s)" string would reduce boilerplate.
 
 
 def cmd_tasks_validate(quiet: bool = False) -> bool:
-    """Validate all task files conform to the naming and frontmatter conventions.
-
-    Filename format: NNN-pX-status-slug.md
-    Example: 001-p2-done-refactor-executor.md
+    """Validate all task files using taskmd.
 
     Returns True if all tasks pass, False otherwise.
     """
-    import re
-
     tasks_dir = ROOT / "tasks"
-    if not tasks_dir.exists():
-        print("No tasks/ directory found, skipping.")
-        return True
+    result = taskmd.validate(tasks_dir)
 
-    errors = []
-    task_files = sorted(tasks_dir.glob("*.md"))
-    template = tasks_dir / "_TEMPLATE.md"
-
-    for path in task_files:
-        if path == template:
-            continue
-
-        # Skip ancillary files that are not task files (e.g. .qaplan.md)
-        if '.qaplan.' in path.name:
-            continue
-
-        name = path.name
-        content = path.read_text()
-
-        # Check YAML frontmatter exists
-        if not content.startswith("---\n"):
-            errors.append(f"{name}: missing YAML frontmatter (must start with ---)")
-            continue
-
-        # Extract frontmatter
-        end = content.find("\n---\n", 4)
-        if end == -1:
-            errors.append(f"{name}: malformed YAML frontmatter (no closing ---)")
-            continue
-
-        frontmatter = content[4:end]
-        fields = {}
-        for line in frontmatter.strip().split("\n"):
-            if ":" in line:
-                key, _, value = line.partition(":")
-                fields[key.strip()] = value.strip()
-
-        # Check required fields
-        if "status" not in fields:
-            errors.append(f"{name}: missing 'status' field")
-        elif fields["status"] not in VALID_STATUSES:
-            errors.append(
-                f"{name}: invalid status '{fields['status']}' "
-                f"(valid: {', '.join(sorted(VALID_STATUSES))})"
-            )
-
-        if "priority" not in fields:
-            errors.append(f"{name}: missing 'priority' field")
-        elif fields["priority"] not in VALID_PRIORITIES:
-            errors.append(
-                f"{name}: invalid priority '{fields['priority']}' "
-                f"(valid: {', '.join(sorted(VALID_PRIORITIES))})"
-            )
-
-        if "created" not in fields:
-            errors.append(f"{name}: missing 'created' field")
-        elif not re.match(r"^\d{4}-\d{2}-\d{2}$", fields["created"]):
-            errors.append(f"{name}: invalid 'created' date format (expected YYYY-MM-DD)")
-
-        # Check filename matches frontmatter
-        task = parse_task_file(path)
-        if task and fields.get("status") and fields.get("priority"):
-            expected = get_expected_filename(
-                task["number"], fields["priority"], fields["status"], task["slug"]
-            )
-            if name != expected:
-                errors.append(f"{name}: filename doesn't match frontmatter, expected: {expected}")
-
-    # Check for duplicate task numbers
-    from collections import defaultdict
-    number_map = defaultdict(list)
-    for path in task_files:
-        if path == template:
-            continue
-        if '.qaplan.' in path.name:
-            continue
-        task = parse_task_file(path)
-        if task:
-            number_map[task["number"]].append(path.name)
-    for num, files in sorted(number_map.items()):
-        if len(files) > 1:
-            errors.append(f"duplicate task number {num}: {', '.join(files)}")
-
-    if errors:
+    if not result.ok:
         if not quiet:
-            print(f"✗ {len(errors)} task validation error(s):")
-            for err in errors:
+            print(f"✗ {len(result.errors)} task validation error(s):")
+            for err in result.errors:
                 print(f"  - {err}")
             print("\nRun './dev.py tasks fix' to auto-fix (injects missing 'created', renames files).")
         return False
 
     if not quiet:
-        print(f"✓ {len(task_files) - 1} task files validated")  # -1 for template
+        print(f"✓ {result.file_count} task files validated")
     return True
 
 
-def infer_created_date(path: Path) -> str:
-    """Infer a creation date for a task file.
-
-    Priority:
-    1. Earliest git commit date for the file
-    2. File mtime (on-disk creation approximation)
-    3. Today's date
-    """
-    import subprocess
-    from datetime import date, datetime
-
-    # 1. Earliest git commit touching this file
-    try:
-        result = subprocess.run(
-            ["git", "log", "--follow", "--diff-filter=A", "--format=%as", str(path)],
-            capture_output=True,
-            text=True,
-            cwd=path.parent,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().splitlines()[-1]
-    except Exception:
-        pass
-
-    # 2. File mtime
-    try:
-        mtime = path.stat().st_mtime
-        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    # 3. Today
-    return date.today().isoformat()
-
-
 def cmd_tasks_fix() -> bool:
-    """Auto-fix task files: inject missing 'created' fields and rename to match frontmatter.
+    """Auto-fix task files using taskmd: inject missing 'created' and rename to match frontmatter.
 
     Returns True if all files are now correct, False on errors.
     """
-    import re
-
     tasks_dir = ROOT / "tasks"
-    if not tasks_dir.exists():
-        print("No tasks/ directory found.")
-        return True
+    result = taskmd.fix(tasks_dir)
 
-    task_files = sorted(tasks_dir.glob("*.md"))
-    template = tasks_dir / "_TEMPLATE.md"
-    renamed = 0
-    patched = 0
-    errors = []
-
-    for path in task_files:
-        if path == template:
-            continue
-
-        task = parse_task_file(path)
-        if not task:
-            errors.append(f"{path.name}: could not parse file")
-            continue
-
-        fields = task["fields"]
-
-        # Fix missing or malformed 'created' field in frontmatter
-        if "created" not in fields or not re.match(r"^\d{4}-\d{2}-\d{2}$", fields.get("created", "")):
-            created = infer_created_date(path)
-            content = path.read_text()
-            if re.search(r'^created:.*$', content, re.MULTILINE):
-                # Replace existing malformed value (not insert a duplicate)
-                content = re.sub(r'^created:.*$', f'created: {created}', content, count=1, flags=re.MULTILINE)
-            else:
-                # Insert after the opening --- line
-                content = content.replace("---\n", f"---\ncreated: {created}\n", 1)
-            path.write_text(content)
-            print(f"  {path.name}: fixed created: {created}")
-            fields["created"] = created
-            patched += 1
-
-        if not fields.get("status") or not fields.get("priority"):
-            errors.append(f"{path.name}: missing status or priority in frontmatter")
-            continue
-
-        expected = get_expected_filename(
-            task["number"], fields["priority"], fields["status"], task["slug"]
-        )
-
-        if path.name != expected:
-            new_path = tasks_dir / expected
-            if new_path.exists():
-                errors.append(f"{path.name}: cannot rename to {expected}, file exists")
-                continue
-
-            path.rename(new_path)
-            print(f"  {path.name} -> {expected}")
-            renamed += 1
-
-    if errors:
-        print(f"\n✗ {len(errors)} error(s):")
-        for err in errors:
+    if not result.ok:
+        print(f"\n✗ {len(result.errors)} error(s):")
+        for err in result.errors:
             print(f"  - {err}")
         return False
 
-    if patched or renamed:
+    if result.patched or result.renamed:
         parts = []
-        if patched:
-            parts.append(f"patched {patched} file(s)")
-        if renamed:
-            parts.append(f"renamed {renamed} file(s)")
+        if result.patched:
+            parts.append(f"patched {result.patched} file(s)")
+        if result.renamed:
+            parts.append(f"renamed {result.renamed} file(s)")
         print(f"\n✓ {', '.join(parts).capitalize()}")
     else:
         print("✓ All files already correctly named")

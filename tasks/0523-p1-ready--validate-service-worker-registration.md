@@ -1,7 +1,7 @@
 ---
 created: 2026-02-04
 priority: p1
-status: pending
+status: ready
 assignee: human-required
 ---
 
