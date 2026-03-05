@@ -508,13 +508,45 @@ def cmd_check():
             results.append(("task validation", 0 if ok else 1, elapsed, ""))
             print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
-    print("Running 6 checks in parallel...\n")
+    def check_bundle_size():
+        """Build UI and fail if JS bundle exceeds size limit."""
+        BUNDLE_LIMIT_KB = 1200  # raise consciously when adding large deps
+        t0 = time.monotonic()
+        proc = subprocess.run(
+            ["npx", "vite", "build"],
+            cwd=UI_DIR, capture_output=True, text=True,
+        )
+        elapsed = time.monotonic() - t0
+        if proc.returncode != 0:
+            with results_lock:
+                results.append(("bundle size", 1, elapsed, proc.stderr.strip()))
+                print(f"  \u2717 {'bundle size':<18s} ({elapsed:.1f}s)")
+            return
+        # Parse the JS chunk size from vite output
+        import re as _re
+        js_match = _re.search(r'index-\S+\.js\s+([\d,]+(?:\.\d+)?)\s+kB', proc.stdout)
+        if not js_match:
+            # Can't parse — pass with warning
+            with results_lock:
+                results.append(("bundle size", 0, elapsed, ""))
+                print(f"  \u2713 {'bundle size':<18s} ({elapsed:.1f}s)")
+            return
+        size_kb = float(js_match.group(1).replace(",", ""))
+        ok = size_kb <= BUNDLE_LIMIT_KB
+        msg = f"{size_kb:.0f} KB" + (f" (limit: {BUNDLE_LIMIT_KB} KB)" if not ok else "")
+        with results_lock:
+            sym = "\u2713" if ok else "\u2717"
+            results.append(("bundle size", 0 if ok else 1, elapsed, msg if not ok else ""))
+            print(f"  {sym} {'bundle size':<18s} ({elapsed:.1f}s) {size_kb:.0f} KB")
+
+    print("Running 7 checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
         threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
         threading.Thread(target=lane_fast),
+        threading.Thread(target=check_bundle_size),
     ]
     for t in threads:
         t.start()

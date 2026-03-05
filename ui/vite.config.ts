@@ -19,9 +19,8 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
-    // Bundle size guardrail. Current: ~1100KB / ~370KB gzip (2026-03-04).
-    // This warns but doesn't fail the build. To track regressions,
-    // run `npx vite build` and check the output.
-    chunkSizeWarningLimit: 1200, // KB — raise consciously when adding large deps
+    // Suppress Vite's chunk size warning — bundle size is enforced
+    // as a hard failure in ./dev.py check (BUNDLE_LIMIT_KB = 1200).
+    chunkSizeWarningLimit: 9999,
   },
 });
