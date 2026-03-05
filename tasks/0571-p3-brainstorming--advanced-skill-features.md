@@ -1,7 +1,7 @@
 ---
 created: 2025-01-28
 priority: p3
-status: ready
+status: brainstorming
 ---
 
 # Advanced skill features: subagent execution, invocation control, dynamic context

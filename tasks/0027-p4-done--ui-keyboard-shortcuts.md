@@ -1,7 +1,7 @@
 ---
 created: 2026-01-31
 priority: p4
-status: ready
+status: done
 ---
 
 # Keyboard Shortcuts (Desktop)

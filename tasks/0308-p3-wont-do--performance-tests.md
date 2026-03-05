@@ -1,7 +1,7 @@
 ---
 created: 2026-02-04
 priority: p3
-status: ready
+status: wont-do
 ---
 
 # Add Performance Regression Tests

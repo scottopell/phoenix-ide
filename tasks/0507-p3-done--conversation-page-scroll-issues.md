@@ -1,7 +1,7 @@
 ---
 created: 2026-02-07
 priority: p3
-status: ready
+status: done
 ---
 
 # Conversation Page Scroll-to-Top Not Working

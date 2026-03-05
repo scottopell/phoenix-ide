@@ -1,7 +1,7 @@
 ---
 created: 2026-02-09
 priority: p3
-status: ready
+status: brainstorming
 ---
 
 # Browser Tool Enhancements
