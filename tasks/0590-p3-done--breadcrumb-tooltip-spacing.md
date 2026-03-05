@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 590
 priority: p3
-status: ready
+status: done
 slug: breadcrumb-tooltip-spacing
 title: "Breadcrumb tooltip bottom edge should clear the breadcrumb bar content"
 ---

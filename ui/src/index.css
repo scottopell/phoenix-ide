@@ -264,7 +264,7 @@ body {
 
 .breadcrumb-tooltip {
   position: fixed;
-  bottom: calc(var(--breadcrumb-height) + 16px);
+  bottom: calc(var(--breadcrumb-height) + 24px);
   /* left is set dynamically via inline style */
   width: 280px;
   background: var(--bg-primary);
