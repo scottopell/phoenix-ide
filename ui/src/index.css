@@ -4700,6 +4700,9 @@ html * {
 
 .sidebar-toggle {
   flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  font-size: 12px;
 }
 
 /* --- Sidebar Inline New Form (REQ-UI-018) --- */
@@ -5203,8 +5206,8 @@ html * {
 .fe-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
+  gap: 6px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
 }
@@ -5218,6 +5221,12 @@ html * {
 }
 
 .fe-toggle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
   background: none;
   border: none;
   color: var(--text-muted);

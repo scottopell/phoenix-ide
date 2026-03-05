@@ -43,10 +43,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   return (
     <aside className="fe-panel fe-panel--expanded">
       <div className="fe-header">
-        <span className="fe-title">Files</span>
         <button className="fe-toggle" onClick={onToggle} title="Collapse file explorer">
           ◀
         </button>
+        <span className="fe-title">Files</span>
       </div>
       <div className="fe-tree-scroll">
         <FileTree
