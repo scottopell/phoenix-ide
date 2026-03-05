@@ -2,7 +2,7 @@
 created: 2026-03-02
 number: 600
 priority: p3
-status: ready
+status: done
 slug: browser-eval-returns-empty-object-for-arrow-function-expressions
 ---
 

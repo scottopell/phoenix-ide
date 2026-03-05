@@ -10,7 +10,7 @@ use super::session::BrowserSession;
 use crate::tools::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, RemoteObjectType};
 use chromiumoxide::page::ScreenshotParams;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -227,6 +227,17 @@ impl Tool for BrowserEvalTool {
                         await_mode = input.r#await,
                         "browser_eval: value() returned None"
                     );
+                    if obj.r#type == RemoteObjectType::Function {
+                        return ToolOutput::error(format!(
+                            "Expression evaluated to a function object, not a value. \
+                             The expression `{}` defines a function but does not call it. \
+                             To get a value, either write the expression directly \
+                             (e.g. `typeof window.__phoenix`) or wrap it as an IIFE \
+                             (e.g. `(() => typeof window.__phoenix)()`). \
+                             Playwright-style `() => expr` syntax does not work with browser_eval.",
+                            input.expression
+                        ));
+                    }
                     "undefined".to_string()
                 };
 
