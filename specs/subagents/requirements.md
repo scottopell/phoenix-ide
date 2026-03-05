@@ -14,8 +14,13 @@ AND execute all sub-agent conversations in parallel
 
 WHEN spawning sub-agents
 THE SYSTEM SHALL assign a mandatory time limit to each sub-agent
+AND require the LLM to specify a mode (explore or work) for each sub-agent
+AND require the LLM to specify a model tier (fast or capable) for each sub-agent
 
-**Rationale:** Users benefit from parallel task execution for code review, exploration, and divide-and-conquer problem solving. Spawning sub-agents keeps the parent's context clean for synthesis.
+WHEN more than 10 sub-agents are requested in a single spawn call
+THE SYSTEM SHALL reject the call with an error
+
+**Rationale:** Users benefit from parallel task execution for code review, exploration, and divide-and-conquer problem solving. Spawning sub-agents keeps the parent's context clean for synthesis. Required mode and tier fields force the LLM to make conscious decisions about each sub-agent's capabilities and cost.
 
 **Dependencies:** REQ-BED-008
 
@@ -96,3 +101,42 @@ THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 **Rationale:** Without enforced time limits, a stuck or slow sub-agent holds the parent conversation indefinitely. Users need assurance that sub-agent work completes or fails within a bounded time.
 
 **Dependencies:** REQ-BED-026
+
+---
+
+### REQ-SA-007: Model Tier Selection
+
+WHEN spawning a sub-agent with tier "fast"
+THE SYSTEM SHALL select the fastest available model in the parent's model family
+
+WHEN spawning a sub-agent with tier "capable"
+THE SYSTEM SHALL select the most capable available model in the parent's model family
+
+WHEN the requested tier is not available in the parent's model family
+THE SYSTEM SHALL reject the sub-agent spawn with an error
+AND NOT fall back to a different tier silently
+
+**Rationale:** Research and search tasks should use cheap, fast models. Implementation
+and review tasks need more capable models. Intent-based tiers decouple the LLM from
+knowing specific model IDs while ensuring cost-appropriate allocation. Failing on
+unavailable tiers forces the parent to handle the situation explicitly rather than
+silently producing lower-quality results.
+
+---
+
+### REQ-SA-008: Context Injection via Read-First Files
+
+WHEN a sub-agent spawn spec includes a list of file paths in `read_first`
+THE SYSTEM SHALL read each file at spawn time
+AND inject the file contents into the sub-agent's system prompt before the task
+
+WHEN a read_first file does not exist or cannot be read
+THE SYSTEM SHALL reject the sub-agent spawn with an error listing the missing file
+
+THE SYSTEM SHALL accept only exact file paths in read_first (no glob patterns)
+
+**Rationale:** Effective sub-agent prompts need focused context — which spec files to
+consult, which source files are relevant. Injecting files into the system prompt
+ensures the sub-agent sees them before its first LLM call, without spending a tool
+call to read them. Exact paths only keeps context size predictable and prevents
+accidental injection of large directory trees.

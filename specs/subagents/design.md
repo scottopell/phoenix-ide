@@ -119,7 +119,22 @@ struct SubAgentConfig {
     agent_id: String,
     task: String,
     cwd: String,
-    timeout: Duration,  // mandatory, not Option — caller must decide (REQ-SA-006)
+    timeout: Duration,          // mandatory (REQ-SA-006)
+    mode: SubAgentMode,         // mandatory (REQ-SA-001, REQ-BED-018)
+    tier: ModelTier,            // mandatory (REQ-SA-007)
+    read_first: Vec<PathBuf>,   // optional (REQ-SA-008)
+}
+
+/// Conversation mode for the sub-agent (REQ-BED-018)
+enum SubAgentMode {
+    Explore,  // read-only tools, safe in parallel
+    Work,     // write access to parent's worktree, one at a time
+}
+
+/// Model capability tier — resolved to a concrete model ID at spawn time (REQ-SA-007)
+enum ModelTier {
+    Fast,     // cheapest model in the parent's family (e.g., haiku, gpt-4o-mini)
+    Capable,  // most capable in the family (e.g., sonnet, gpt-4o)
 }
 
 enum SubAgentOutcome {
@@ -279,6 +294,74 @@ Sub-agent terminates when any of these occur first:
 
 The deadline is stamped when the SM emits the `SpawnSubAgent` effect. The executor's
 `select!` loop races result arrival against `sleep_until(deadline)`:
+
+### Mode Enforcement at Spawn Time (REQ-BED-018, REQ-SA-001)
+
+The executor validates mode at spawn time based on the parent's current mode:
+
+```rust
+fn validate_sub_agent_mode(
+    parent_mode: &ConvMode,
+    requested: SubAgentMode,
+) -> Result<SubAgentMode, SpawnError> {
+    match (parent_mode, requested) {
+        // Explore parent: only Explore sub-agents allowed.
+        // Requesting Work from Explore is an error — forces the LLM to
+        // understand it's in a read-only context.
+        (ConvMode::Explore { .. }, SubAgentMode::Explore) => Ok(SubAgentMode::Explore),
+        (ConvMode::Explore { .. }, SubAgentMode::Work) => Err(SpawnError::ModeNotAllowed {
+            message: "Cannot spawn Work sub-agent from Explore mode. \
+                      Use create_task to propose work that requires write access.",
+        }),
+
+        // Work parent: both modes allowed.
+        // Work sub-agents share the parent's worktree (one at a time).
+        (ConvMode::Work { .. }, SubAgentMode::Explore) => Ok(SubAgentMode::Explore),
+        (ConvMode::Work { .. }, SubAgentMode::Work) => Ok(SubAgentMode::Work),
+    }
+}
+```
+
+Work sub-agent count enforcement: the executor tracks active Work sub-agents per
+parent. If a Work sub-agent is already running and another Work spawn is requested,
+the spawn fails with an error. Explore sub-agents have no such limit (up to the
+hard cap of 10 per call).
+
+### Model Tier Resolution (REQ-SA-007)
+
+Each model family defines its tier mapping in the model registry:
+
+```rust
+struct ModelFamily {
+    name: String,           // "claude", "gpt"
+    fast: String,           // "claude-haiku-4-5", "gpt-4o-mini"
+    capable: String,        // "claude-sonnet-4-6", "gpt-4o"
+}
+```
+
+At spawn time: look up the parent's model in the registry, find its family, resolve
+the requested tier to a concrete model ID. If the tier's model is not available
+(e.g., API key missing), fail the spawn — don't silently fall back.
+
+### Context Injection via read_first (REQ-SA-008)
+
+At spawn time, before creating the sub-agent conversation:
+
+1. Read each file in `read_first` from disk
+2. Wrap contents: `<file path="/absolute/path">...contents...</file>`
+3. Inject as a system prompt section before the sub-agent's standard system prompt
+4. If any file doesn't exist or can't be read, fail the entire spawn call
+
+The system prompt order for a sub-agent:
+```
+[read_first file contents]
+[standard sub-agent system prompt]
+[user message: task description]
+```
+
+Files are read once at spawn time — the sub-agent sees a snapshot. If the parent
+modifies files while the sub-agent runs, the sub-agent won't see the changes (this
+is intentional — sub-agents work on a consistent snapshot).
 
 ### Terminal State Exclusion from Wildcard Cancel
 
@@ -494,7 +577,7 @@ fn test_subagent_tools_exclude_spawn_agents() {
 ```json
 {
   "name": "spawn_agents",
-  "description": "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.",
+  "description": "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving. You MUST specify mode and tier for each task.",
   "input_schema": {
     "type": "object",
     "required": ["tasks"],
@@ -503,11 +586,26 @@ fn test_subagent_tools_exclude_spawn_agents() {
         "type": "array",
         "items": {
           "type": "object",
-          "required": ["task"],
+          "required": ["task", "mode", "tier"],
           "properties": {
             "task": {
               "type": "string",
               "description": "Task description for the sub-agent"
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["explore", "work"],
+              "description": "explore = read-only (safe in parallel), work = write access to worktree (one at a time). Explore parents can only spawn explore sub-agents."
+            },
+            "tier": {
+              "type": "string",
+              "enum": ["fast", "capable"],
+              "description": "fast = cheapest model in the family (research, search). capable = most capable (implementation, review)."
+            },
+            "read_first": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Exact file paths to inject into the sub-agent's system prompt as context before it starts. No glob patterns."
             },
             "cwd": {
               "type": "string",
@@ -516,7 +614,8 @@ fn test_subagent_tools_exclude_spawn_agents() {
           }
         },
         "minItems": 1,
-        "description": "List of tasks to execute in parallel"
+        "maxItems": 10,
+        "description": "List of tasks to execute in parallel (max 10)"
       }
     }
   }

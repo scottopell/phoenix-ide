@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Sub-agents enable parallel task execution by spawning independent child conversations that run concurrently and report results back to a parent conversation. Each sub-agent runs in isolation with a restricted tool set and cannot spawn its own sub-agents. Results are submitted via dedicated tools (`submit_result`, `submit_error`) that terminate the sub-agent conversation. The parent aggregates all results before continuing. Cancellation propagates from parent to all pending sub-agents. Every sub-agent has a mandatory time limit — if exceeded, the sub-agent is terminated and timeout failure is reported to the parent.
+Sub-agents enable parallel task execution by spawning independent child conversations that run concurrently and report results back to a parent conversation. Each sub-agent runs in isolation and cannot spawn its own sub-agents. The parent specifies mode (explore for read-only, work for write access) and tier (fast for cheap research, capable for implementation) per sub-agent. Mode enforcement follows REQ-BED-018: Explore parents can only spawn Explore sub-agents; Work parents can spawn either, with Work sub-agents limited to one at a time on the shared worktree. Sub-agents can receive focused file context via `read_first` paths injected into their system prompt. Results are submitted via dedicated tools (`submit_result`, `submit_error`). Max 10 sub-agents per spawn call.
 
 ## Technical Summary
 
@@ -18,5 +18,7 @@ Parent state machine accumulates `pending_sub_agents` during `ToolExecuting`, tr
 | **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer, conservation invariant tested |
 | **REQ-SA-005:** Cancellation Propagation | ✅ Complete | `CancellingSubAgents` state |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | Task 578. `DEFAULT_SUBAGENT_TIMEOUT = 5min`, deadline in executor `select!` |
+| **REQ-SA-007:** Model Tier Selection | ❌ Not Started | `fast`/`capable` tiers mapped per model family |
+| **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | Exact paths injected into sub-agent system prompt |
 
-**Progress:** 6 of 6 complete
+**Progress:** 6 of 8 complete

@@ -219,12 +219,41 @@ impl FireworksService {
 }
 ```
 
-## Model Registry (REQ-LLM-003)
+## Model Registry (REQ-LLM-003, REQ-SA-007)
 
 ```rust
 pub struct ModelRegistry {
     services: HashMap<String, Arc<dyn LlmService>>,
+    families: Vec<ModelFamily>,  // tier resolution for sub-agents
     logger: slog::Logger,
+}
+
+/// Model family defines tier mappings for sub-agent model selection.
+/// Each family groups models by the same provider lineage.
+pub struct ModelFamily {
+    pub name: String,       // "claude", "gpt"
+    pub fast: String,       // model ID: "claude-haiku-4-5", "gpt-4o-mini"
+    pub capable: String,    // model ID: "claude-sonnet-4-6", "gpt-4o"
+}
+
+impl ModelRegistry {
+    /// Resolve a model tier to a concrete model ID based on the parent's family.
+    /// Returns Err if the parent's model is not in a known family or the tier's
+    /// model is not available.
+    pub fn resolve_tier(&self, parent_model: &str, tier: ModelTier) -> Result<String, String> {
+        let family = self.families.iter()
+            .find(|f| f.fast == parent_model || f.capable == parent_model)
+            .ok_or_else(|| format!("Model '{parent_model}' not in a known family"))?;
+        let target = match tier {
+            ModelTier::Fast => &family.fast,
+            ModelTier::Capable => &family.capable,
+        };
+        if self.services.contains_key(target) {
+            Ok(target.clone())
+        } else {
+            Err(format!("Tier model '{target}' not available"))
+        }
+    }
 }
 
 impl ModelRegistry {
