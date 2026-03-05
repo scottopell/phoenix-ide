@@ -104,6 +104,9 @@ export function Sidebar({
   if (collapsed) {
     return (
       <aside className="sidebar sidebar-collapsed">
+        <button className="sidebar-icon-btn sidebar-toggle" onClick={onToggle} title="Expand sidebar">
+          ▶
+        </button>
         <button className="sidebar-icon-btn" onClick={() => navigate('/')} title="Phoenix">
           <img src="/phoenix.svg" alt="Phoenix" className="sidebar-logo-icon" />
         </button>
@@ -130,9 +133,6 @@ export function Sidebar({
             );
           })}
         </div>
-        <button className="sidebar-icon-btn sidebar-toggle" onClick={onToggle} title="Expand sidebar">
-          ▶
-        </button>
       </aside>
     );
   }
@@ -140,6 +140,9 @@ export function Sidebar({
   return (
     <aside className="sidebar sidebar-expanded">
       <div className="sidebar-header">
+        <button className="sidebar-toggle-expanded" onClick={onToggle} title="Collapse sidebar">
+          ◀
+        </button>
         <button className="sidebar-brand" onClick={() => navigate('/')}>
           <img src="/phoenix.svg" alt="Phoenix" className="sidebar-logo" />
           <span className="sidebar-brand-text">Phoenix</span>
@@ -174,9 +177,6 @@ export function Sidebar({
           sidebarMode
         />
       </div>
-      <button className="sidebar-toggle-expanded" onClick={onToggle} title="Collapse sidebar">
-        ◀
-      </button>
       <ConfirmDialog
         visible={deleteTarget !== null}
         title="Delete Conversation"

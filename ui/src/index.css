@@ -4607,14 +4607,15 @@ html * {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 36px;
+  width: 28px;
+  height: 28px;
   background: none;
   border: none;
-  border-top: 1px solid var(--border-color);
+  border-radius: 4px;
   color: var(--text-muted);
   cursor: pointer;
   font-size: 12px;
-  width: 100%;
+  padding: 4px;
 }
 
 .sidebar-toggle-expanded:hover {
@@ -4698,7 +4699,7 @@ html * {
 }
 
 .sidebar-toggle {
-  margin-top: auto;
+  flex-shrink: 0;
 }
 
 /* --- Sidebar Inline New Form (REQ-UI-018) --- */
