@@ -2,7 +2,7 @@
 created: 2026-02-28
 number: 591
 priority: p3
-status: ready
+status: done
 slug: file-tree-toggle-button-position
 title: "File tree drawer toggle button jumps between top and bottom on collapse/expand"
 ---

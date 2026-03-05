@@ -32,10 +32,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   if (collapsed) {
     return (
       <aside className="fe-panel fe-panel--collapsed">
-        <RecentFilesStrip files={recentFiles} onFileClick={handleRecentClick} />
         <button className="fe-toggle" onClick={onToggle} title="Expand file explorer">
           ▶
         </button>
+        <RecentFilesStrip files={recentFiles} onFileClick={handleRecentClick} />
       </aside>
     );
   }

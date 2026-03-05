@@ -5229,8 +5229,8 @@ html * {
 }
 
 .fe-panel--collapsed .fe-toggle {
-  margin-top: auto;
-  margin-bottom: 12px;
+  margin-top: 6px;
+  flex-shrink: 0;
 }
 
 /* Tree scroll container */
