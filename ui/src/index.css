@@ -85,6 +85,8 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 0 12px;
+  position: relative;
+  z-index: 1;
 }
 
 /* Minimized State Bar (when keyboard is open) */
@@ -208,6 +210,8 @@ body {
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
   padding: 0 12px;
+  position: relative;
+  z-index: 1;
 }
 
 #breadcrumb-bar::-webkit-scrollbar {

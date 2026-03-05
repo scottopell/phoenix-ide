@@ -1,7 +1,7 @@
 ---
 created: 2025-07-13
 priority: p3
-status: ready
+status: done
 ---
 
 # Breadcrumb bar z-index bleed-through on mobile
