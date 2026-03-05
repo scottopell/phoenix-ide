@@ -43,8 +43,11 @@ main branch advancement and emits ambient SSE notifications.
 | **REQ-PROJ-010:** Abandon a Task Without Merging | ❌ Not Started | - |
 | **REQ-PROJ-011:** Ambient Awareness of Main Branch Advancement | ❌ Not Started | - |
 | **REQ-PROJ-012:** Provide create_task and update_task Tools to Agents | ❌ Not Started | - |
+| **REQ-PROJ-013:** Platform Capability Detection | ❌ Not Started | Probe sandbox at startup, adapt Explore tool set |
+| **REQ-PROJ-014:** Project UI | ❌ Not Started | Project switcher tabs, mode indicators |
+| **REQ-PROJ-015:** Project Worktree Registry | ❌ Not Started | Track worktrees, reconcile on startup |
 
-**Progress:** 0 of 12 complete
+**Progress:** 0 of 15 complete
 
 ## Dependencies
 

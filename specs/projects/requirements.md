@@ -6,6 +6,24 @@ As a developer using PhoenixIDE, I need a structured way to explore codebases sa
 and execute changes in isolated branches so that I can think through approaches without
 risk and commit to changes with clear human oversight.
 
+## Transparency Contract
+
+The user must be able to confidently answer these questions:
+
+**At a glance:**
+1. Which projects do I have active?
+2. For each project: how many conversations are open? Any active tasks?
+3. Is a conversation read-only (Explore) or writing (Work)?
+
+**For any conversation:**
+4. What project does this belong to?
+5. What mode is it in and what tools are available?
+6. If Work mode: what task is it working on? Where is the worktree?
+
+**For project health:**
+7. Are there any orphaned worktrees?
+8. What branches/worktrees are active across all conversations?
+
 ## Requirements
 
 ### REQ-PROJ-001: Open a Git Repository as a Project
@@ -261,3 +279,70 @@ than directly writing task files. This ensures task files always conform to the
 Phoenix-managed format, IDs are assigned correctly, and status transitions are
 validated. Sub-agents cannot manage tasks because they are short-lived workers
 operating under a parent's direction.
+
+---
+
+### REQ-PROJ-013: Platform Capability Detection
+
+WHEN the server starts
+THE SYSTEM SHALL probe for available sandboxing capabilities:
+- Linux: check for Landlock support (kernel >= 5.13, LSM enabled)
+- macOS: check for sandbox-exec availability
+- Other: no sandbox available
+
+THE SYSTEM SHALL re-check capabilities on every startup
+
+WHILE sandbox is not available
+THE SYSTEM SHALL provide Explore mode with ReadFile, Search, and Think tools only
+AND SHALL NOT provide bash or any tool that can execute arbitrary commands
+
+WHILE sandbox is available (Landlock or macOS sandbox)
+THE SYSTEM SHALL provide Explore mode with bash (sandboxed read-only) and all standard tools
+AND ReadFile and Search tools SHALL NOT be provided (bash subsumes them)
+
+**Rationale:** Capabilities are a property of the running environment, not the
+application. On systems with kernel-level sandboxing, bash is safe in Explore mode
+and more capable than ReadFile. On systems without sandboxing, the restricted tool
+set prevents writes structurally. Re-checking on startup ensures the tool set
+matches the current host.
+
+---
+
+### REQ-PROJ-014: Project UI
+
+WHEN displaying the conversation sidebar
+THE SYSTEM SHALL show a project switcher (tabs) at the top of the sidebar
+AND group conversations under their project
+
+WHEN a project has active Work conversations
+THE SYSTEM SHALL indicate the active task count next to the project name
+
+WHEN the user selects a project tab
+THE SYSTEM SHALL show only that project's conversations
+
+WHEN displaying a conversation
+THE SYSTEM SHALL indicate whether it is in Explore or Work mode
+
+**Rationale:** Users manage multiple projects. A project switcher reduces cognitive
+load compared to a flat list mixing conversations from different codebases. Mode
+visibility prevents confusion about what a conversation can do.
+
+---
+
+### REQ-PROJ-015: Project Worktree Registry
+
+WHEN a worktree is created for a task
+THE SYSTEM SHALL register it in the project record with task ID, worktree path,
+branch name, conversation ID, and timestamp
+
+WHEN a worktree is deleted (merge or abandon)
+THE SYSTEM SHALL remove it from the registry
+
+WHEN the server starts
+THE SYSTEM SHALL reconcile the registry against worktrees on disk
+AND clean up orphaned registry entries
+AND report worktrees that exist on disk but have no registry entry
+
+**Rationale:** The registry enables the UI to show all active worktrees and detect
+orphans. Reconciliation on startup handles worktrees deleted externally or
+conversations that ended without cleanup.
