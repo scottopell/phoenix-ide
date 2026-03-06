@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::path::Path;
 
 /// SQL schema for initialization
 pub const SCHEMA: &str = r#"
@@ -78,6 +79,17 @@ pub const MIGRATION_ADD_MODEL: &str = r"
 -- SQLite will return an error which we'll ignore
 ";
 
+/// Migration SQL to create projects table
+pub const MIGRATION_CREATE_PROJECTS: &str = r"
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    canonical_path TEXT UNIQUE NOT NULL,
+    main_ref TEXT NOT NULL DEFAULT 'main',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(canonical_path);
+";
+
 /// Migration SQL to add `local_id` column for idempotent message sends
 /// Migration to rename `messages.id` to `messages.message_id`
 /// `SQLite` 3.25+ supports ALTER TABLE RENAME COLUMN
@@ -87,6 +99,67 @@ pub const MIGRATION_RENAME_MESSAGE_ID: &str = r"
 -- This will fail silently if already renamed or SQLite is too old
 ALTER TABLE messages RENAME COLUMN id TO message_id;
 ";
+
+/// Conversation mode — determines tool availability and write access.
+///
+/// Stored as JSON in the `conv_mode` TEXT column on conversations.
+/// REQ-BED-027: Conversation-level field, NOT embedded in `ConvState`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode")]
+pub enum ConvMode {
+    /// Read-only mode. No file writes, no bash (unless sandboxed).
+    Explore,
+    /// Standalone mode for non-git directories. Full tool suite, no project association.
+    Standalone,
+    // Work mode will be added in M2 (task 0602)
+}
+
+impl Default for ConvMode {
+    fn default() -> Self {
+        Self::Explore
+    }
+}
+
+impl ConvMode {
+    /// Human-readable label for UI display
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Explore => "Explore",
+            Self::Standalone => "Standalone",
+        }
+    }
+}
+
+/// Project record — a git repository tracked by Phoenix.
+///
+/// REQ-PROJ-001: Keyed by resolved git repo root path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub canonical_path: String,
+    pub main_ref: String,
+    pub created_at: DateTime<Utc>,
+    /// Derived: count of non-archived conversations in this project
+    #[serde(default)]
+    pub conversation_count: i64,
+}
+
+/// Detect the git repository root for a given directory path.
+///
+/// Returns `None` if the path is not inside a git repository.
+pub fn detect_git_repo_root(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
 
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +175,12 @@ pub struct Conversation {
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
     pub model: Option<String>,
+    /// Project this conversation belongs to (None for legacy pre-project conversations)
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Conversation mode — determines tool availability. Default: Explore.
+    #[serde(default)]
+    pub conv_mode: ConvMode,
     #[serde(default)]
     pub message_count: i64,
 }

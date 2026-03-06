@@ -465,11 +465,14 @@ THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
 ---
 
-### REQ-BED-027: Explore and Work Conversation Modes
+### REQ-BED-027: Explore, Work, and Standalone Conversation Modes
 
-WHEN a conversation is created for a project
+WHEN a conversation is created for a project (git-backed directory)
 THE SYSTEM SHALL initialize the conversation in Explore mode
 AND store the mode as a field on the conversation record (not inside state machine state)
+
+WHEN a conversation is created for a non-git directory
+THE SYSTEM SHALL initialize the conversation in Standalone mode
 
 WHILE a conversation is in Explore mode
 THE SYSTEM SHALL configure the tool registry with read-only settings
@@ -479,16 +482,23 @@ WHILE a conversation is in Work mode
 THE SYSTEM SHALL configure the tool registry with write access scoped to the worktree path
 AND record the worktree path and associated task ID in the mode field
 
-WHEN conversation mode changes
+WHILE a conversation is in Standalone mode
+THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
+AND SHALL NOT provide `create_task` or `update_task` tools
+AND the mode SHALL NOT change for the lifetime of the conversation
+
+WHEN conversation mode changes (Explore to Work, or Work to Explore)
 THE SYSTEM SHALL persist the updated mode before resuming execution
 
 **Rationale:** Mode is conversation-level identity — it persists across all state machine
 transitions and survives server restarts. Keeping it as a separate field (not embedded
 in every ConvState variant) prevents combinatorial explosion of state variants and
 makes crash recovery straightforward: the executor reads mode and state independently
-and configures the tool registry accordingly.
+and configures the tool registry accordingly. Standalone mode exists for directories
+without git — it provides full tool access but without the safety features (worktrees,
+task tracking, branch isolation) that require a git repository.
 
-**Dependencies:** REQ-PROJ-002, REQ-PROJ-007
+**Dependencies:** REQ-PROJ-002, REQ-PROJ-007, REQ-PROJ-016
 
 ---
 

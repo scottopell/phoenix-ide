@@ -1,6 +1,6 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import type { Conversation } from '../api';
+import type { Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
 import { SidebarNewForm } from './SidebarNewForm';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -33,6 +33,24 @@ export function Sidebar({
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+
+  // Fetch projects on mount
+  useEffect(() => {
+    api.getProjects().then(setProjects).catch(() => {});
+  }, [conversations.length]); // re-fetch when conversation count changes
+
+  // Filter conversations by selected project
+  const filteredConversations = useMemo(() => {
+    if (!activeProjectId) return conversations;
+    return conversations.filter(c => c.project_id === activeProjectId);
+  }, [conversations, activeProjectId]);
+
+  const filteredArchivedConversations = useMemo(() => {
+    if (!activeProjectId) return archivedConversations;
+    return archivedConversations.filter(c => c.project_id === activeProjectId);
+  }, [archivedConversations, activeProjectId]);
 
   // Close inline form when navigating to root (where full form is visible)
   useEffect(() => {
@@ -161,10 +179,30 @@ export function Sidebar({
           showToast={showToast}
         />
       )}
+      {projects.length > 0 && (
+        <div className="project-tabs">
+          <button
+            className={`project-tab ${activeProjectId === null ? 'active' : ''}`}
+            onClick={() => setActiveProjectId(null)}
+          >
+            All
+          </button>
+          {projects.map(p => (
+            <button
+              key={p.id}
+              className={`project-tab ${activeProjectId === p.id ? 'active' : ''}`}
+              onClick={() => setActiveProjectId(p.id)}
+              title={p.canonical_path}
+            >
+              {p.canonical_path.split('/').filter(Boolean).pop() || p.canonical_path}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="sidebar-list">
         <ConversationList
-          conversations={conversations}
-          archivedConversations={archivedConversations}
+          conversations={filteredConversations}
+          archivedConversations={filteredArchivedConversations}
           showArchived={showArchived}
           onToggleArchived={() => setShowArchived(!showArchived)}
           onNewConversation={handleNewClick}

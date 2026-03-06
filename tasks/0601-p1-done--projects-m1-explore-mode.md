@@ -2,7 +2,7 @@
 created: 2026-03-05
 number: 601
 priority: p1
-status: ready
+status: done
 slug: projects-m1-explore-mode
 title: "Projects M1: Project entity + Explore-only mode (safe by default)"
 ---

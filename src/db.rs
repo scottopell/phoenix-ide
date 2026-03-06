@@ -6,7 +6,8 @@ mod schema;
 
 pub use schema::*;
 use schema::{
-    MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
+    MIGRATION_CREATE_PROJECTS, MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID,
+    MIGRATION_TYPED_STATE,
 };
 
 use chrono::{DateTime, Utc};
@@ -88,7 +89,83 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Create projects table (idempotent via IF NOT EXISTS)
+        let _ = sqlx::raw_sql(MIGRATION_CREATE_PROJECTS)
+            .execute(&self.pool)
+            .await;
+
+        // Add project_id and conv_mode columns to conversations
+        // Each ALTER TABLE is independent; ignore errors if columns already exist
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}'",
+        )
+        .execute(&self.pool)
+        .await;
+
         Ok(())
+    }
+
+    // ==================== Project Operations ====================
+
+    /// Find or create a project by its canonical git repo root path.
+    ///
+    /// REQ-PROJ-001: Projects are keyed by resolved repo root.
+    pub async fn find_or_create_project(&self, canonical_path: &str) -> DbResult<Project> {
+        // Try to find existing project
+        let existing = sqlx::query(
+            "SELECT id, canonical_path, main_ref, created_at,
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) as conversation_count
+             FROM projects p WHERE canonical_path = ?1",
+        )
+        .bind(canonical_path)
+        .try_map(parse_project_row)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(project) = existing {
+            return Ok(project);
+        }
+
+        // Create new project
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES (?1, ?2, 'main', ?3)",
+        )
+        .bind(&id)
+        .bind(canonical_path)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Project {
+            id,
+            canonical_path: canonical_path.to_string(),
+            main_ref: "main".to_string(),
+            created_at: now,
+            conversation_count: 0,
+        })
+    }
+
+    /// List all projects with conversation counts
+    pub async fn list_projects(&self) -> DbResult<Vec<Project>> {
+        let rows = sqlx::query(
+            "SELECT p.id, p.canonical_path, p.main_ref, p.created_at,
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) as conversation_count
+             FROM projects p
+             ORDER BY p.created_at DESC",
+        )
+        .try_map(parse_project_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 
     // ==================== Conversation Operations ====================
@@ -103,8 +180,35 @@ impl Database {
         parent_id: Option<&str>,
         model: Option<&str>,
     ) -> DbResult<Conversation> {
+        self.create_conversation_with_project(
+            id,
+            slug,
+            cwd,
+            user_initiated,
+            parent_id,
+            model,
+            None,
+            &ConvMode::Explore,
+        )
+        .await
+    }
+
+    /// Create a new conversation, optionally associated with a project.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_conversation_with_project(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        parent_id: Option<&str>,
+        model: Option<&str>,
+        project_id: Option<&str>,
+        conv_mode: &ConvMode,
+    ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
+        let conv_mode_json = serde_json::to_string(conv_mode).unwrap();
         let now_str = now.to_rfc3339();
 
         // Retry with a random suffix on slug collision (UNIQUE constraint).
@@ -112,8 +216,8 @@ impl Database {
         let mut attempts = 0u8;
         loop {
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8)",
+                "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, ?10)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -123,6 +227,8 @@ impl Database {
             .bind(&idle_state)
             .bind(&now_str)
             .bind(model)
+            .bind(project_id)
+            .bind(&conv_mode_json)
             .execute(&self.pool)
             .await;
 
@@ -153,6 +259,8 @@ impl Database {
             updated_at: now,
             archived: false,
             model: model.map(String::from),
+            project_id: project_id.map(String::from),
+            conv_mode: conv_mode.clone(),
             message_count: 0,
         })
     }
@@ -162,6 +270,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -180,6 +289,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -198,6 +308,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -215,6 +326,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -622,6 +734,15 @@ impl Database {
 fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let state_json: String = row.try_get("state")?;
     let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
+
+    // conv_mode: parse from JSON, default to Explore for old rows without the column
+    let conv_mode: ConvMode = row
+        .try_get::<Option<String>, _>("conv_mode")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
     Ok(Conversation {
         id: row.try_get("id")?,
         slug: row.try_get("slug")?,
@@ -634,7 +755,23 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
         archived: row.try_get("archived")?,
         model: row.try_get("model")?,
+        project_id: row
+            .try_get::<Option<String>, _>("project_id")
+            .unwrap_or(None),
+        conv_mode,
         message_count: row.try_get("message_count")?,
+    })
+}
+
+/// Parse a project row from the database
+#[allow(clippy::needless_pass_by_value)]
+fn parse_project_row(row: SqliteRow) -> Result<Project, sqlx::Error> {
+    Ok(Project {
+        id: row.try_get("id")?,
+        canonical_path: row.try_get("canonical_path")?,
+        main_ref: row.try_get("main_ref")?,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        conversation_count: row.try_get("conversation_count")?,
     })
 }
 

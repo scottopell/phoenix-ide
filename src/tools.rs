@@ -7,7 +7,9 @@ pub mod bash_check;
 pub mod browser;
 mod keyword_search;
 pub mod patch;
+mod read_file;
 mod read_image;
+mod search;
 mod subagent;
 mod think;
 
@@ -19,7 +21,9 @@ pub use browser::{
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
+pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
+pub use search::SearchTool;
 pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use think::ThinkTool;
 
@@ -173,8 +177,47 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Create standard tool registry (parent conversations)
+    /// Create tool registry for Explore mode WITHOUT sandbox.
+    /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no patch.
+    pub fn explore_no_sandbox() -> Self {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ThinkTool),
+            Arc::new(ReadFileTool),
+            Arc::new(SearchTool),
+            Arc::new(KeywordSearchTool),
+            Arc::new(ReadImageTool),
+            Arc::new(SpawnAgentsTool),
+            // Browser tools
+            Arc::new(BrowserNavigateTool),
+            Arc::new(BrowserEvalTool),
+            Arc::new(BrowserTakeScreenshotTool),
+            Arc::new(BrowserRecentConsoleLogsTool),
+            Arc::new(BrowserClearConsoleLogsTool),
+            Arc::new(BrowserResizeTool),
+            Arc::new(BrowserWaitForSelectorTool),
+            Arc::new(BrowserClickTool),
+            Arc::new(BrowserTypeTool),
+            Arc::new(BrowserKeyPressTool),
+        ];
+        Self { tools }
+    }
+
+    /// Create tool registry for Explore mode WITH sandbox.
+    /// REQ-PROJ-013: All tools available, bash sandboxed read-only.
+    pub fn explore_with_sandbox() -> Self {
+        // Same as standard() — bash sandboxing is handled by the bash tool itself
+        Self::new_with_options(false)
+    }
+
+    /// Create standard tool registry (parent conversations — legacy, will be removed)
+    #[cfg(test)] // Only used in tests now; production uses mode-aware constructors
     pub fn standard() -> Self {
+        Self::new_with_options(false)
+    }
+
+    /// Create tool registry for Standalone mode (non-git directories).
+    /// Full tool suite, same as standard/Work mode.
+    pub fn standalone() -> Self {
         Self::new_with_options(false)
     }
 
@@ -228,6 +271,16 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Return an error for a tool that is not available in the current mode.
+    /// REQ-BED-017: Clear, actionable error when tools are unavailable due to mode.
+    #[allow(dead_code)]
+    pub fn blocked_tool_error(tool_name: &str) -> ToolOutput {
+        ToolOutput::error(format!(
+            "The '{tool_name}' tool is not available in Explore mode. \
+             Use create_task to propose work that requires write access."
+        ))
+    }
+
     /// Execute a tool by name with context
     pub async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
         for tool in &self.tools {
@@ -239,12 +292,14 @@ impl ToolRegistry {
     }
 }
 
-// Legacy constructors for compatibility during migration
+// Legacy constructors — kept for any downstream callers during migration.
+// No call sites remain in production code; remove once confirmed dead.
+#[allow(dead_code, deprecated)]
 impl ToolRegistry {
-    /// Legacy constructor - use `standard()` instead
-    #[deprecated(note = "Use ToolRegistry::standard() instead")]
+    /// Legacy constructor - use mode-aware constructors instead
+    #[deprecated(note = "Use ToolRegistry::explore_*() or standard() instead")]
     pub fn new(_working_dir: PathBuf, _llm_registry: Arc<ModelRegistry>) -> Self {
-        Self::standard()
+        Self::new_with_options(false)
     }
 
     /// Legacy constructor - use `for_subagent()` instead

@@ -7,6 +7,7 @@ mod api;
 mod db;
 mod llm;
 mod message_expander;
+mod platform;
 mod runtime;
 mod state_machine;
 mod system_prompt;
@@ -82,8 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY, LLM_GATEWAY, or LLM_API_KEY_HELPER.");
     }
 
+    // Detect platform sandboxing capability (REQ-PROJ-013)
+    let platform = crate::platform::PlatformCapability::detect();
+    tracing::info!(?platform, "Platform capability detected");
+
     // Create application state
-    let state = AppState::new(db, llm_registry).await;
+    let state = AppState::new(db, llm_registry, platform).await;
 
     // Create router
     let cors = CorsLayer::new()

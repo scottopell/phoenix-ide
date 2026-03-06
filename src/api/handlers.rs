@@ -99,6 +99,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/skills",
             get(list_conversation_skills),
         )
+        // Projects (REQ-PROJ-014)
+        .route("/api/projects", get(list_projects))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
         // Environment info
@@ -144,6 +146,10 @@ fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
         obj.insert(
             "display_state".to_string(),
             Value::String(conv.state.display_state().as_str().to_string()),
+        );
+        obj.insert(
+            "conv_mode_label".to_string(),
+            Value::String(conv.conv_mode.label().to_string()),
         );
     }
     v
@@ -245,6 +251,22 @@ async fn list_archived_conversations(
 }
 
 // ============================================================
+// Projects (REQ-PROJ-014)
+// ============================================================
+
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let projects = state
+        .db
+        .list_projects()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(
+        serde_json::to_value(projects).unwrap_or(Value::Array(vec![])),
+    ))
+}
+
+// ============================================================
 // Conversation Creation (REQ-API-002)
 // ============================================================
 
@@ -326,17 +348,41 @@ async fn create_conversation(
         generate_slug()
     };
 
-    // Create conversation
+    // Detect project from git repo root (REQ-PROJ-001)
+    let project_id = if let Some(repo_root) = crate::db::detect_git_repo_root(&path) {
+        match state.db.find_or_create_project(&repo_root).await {
+            Ok(project) => {
+                tracing::info!(project_id = %project.id, path = %repo_root, "Associated conversation with project");
+                Some(project.id)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create project, continuing without");
+                None
+            }
+        }
+    } else {
+        tracing::debug!(cwd = %req.cwd, "Directory is not in a git repo, no project association");
+        None
+    };
+
+    // Create conversation (REQ-PROJ-002: Explore for git repos, Standalone otherwise)
+    let conv_mode = if project_id.is_some() {
+        crate::db::ConvMode::Explore
+    } else {
+        crate::db::ConvMode::Standalone
+    };
     let conversation = state
         .runtime
         .db()
-        .create_conversation(
+        .create_conversation_with_project(
             &id,
             &slug,
             &req.cwd,
             true,                 // user_initiated
             None,                 // no parent
             req.model.as_deref(), // selected model
+            project_id.as_deref(),
+            &conv_mode,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

@@ -12,6 +12,16 @@ export interface Conversation {
   /** Semantic state category from API: idle, working, error, terminal */
   display_state?: 'idle' | 'working' | 'error' | 'terminal';
   archived?: boolean;
+  project_id?: string | null;
+  conv_mode_label?: string;
+}
+
+export interface Project {
+  id: string;
+  canonical_path: string;
+  main_ref: string;
+  created_at: string;
+  conversation_count: number;
 }
 
 export interface PendingSubAgent {
@@ -188,6 +198,12 @@ export class ExpansionError extends Error {
 }
 
 export const api = {
+  async getProjects(): Promise<Project[]> {
+    const resp = await fetch('/api/projects');
+    if (!resp.ok) throw new Error('Failed to list projects');
+    return resp.json();
+  },
+
   async listConversations(): Promise<Conversation[]> {
     const resp = await fetch('/api/conversations');
     if (!resp.ok) throw new Error('Failed to list conversations');

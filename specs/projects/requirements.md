@@ -31,21 +31,25 @@ The user must be able to confidently answer these questions:
 WHEN user creates a new conversation by providing a directory path
 THE SYSTEM SHALL detect whether the directory is inside a git repository
 AND if it is, treat the repository root as the project's canonical path
-AND if it is not, offer to initialize a git repository in that directory
+AND associate the conversation with that project
+AND initialize the conversation in Explore mode
 
-WHEN user declines git initialization
-THE SYSTEM SHALL NOT create a conversation for that directory
-AND SHALL explain that the project model requires git for branch isolation and task history
+WHEN the directory is NOT inside a git repository
+THE SYSTEM SHALL create the conversation in Standalone mode (REQ-PROJ-016)
+AND NOT associate it with any project
 
 **Rationale:** Users think in terms of projects (codebases, repositories), not raw
 directories. Git is the structural foundation of the isolation model — without it the
 system cannot create worktrees or maintain task history in a versioned, shareable form.
+However, Phoenix must remain useful for non-git directories (ad-hoc scripts, /tmp,
+miscellaneous files). Standalone mode provides full tool access without git-backed
+safety features, letting users choose their level of structure.
 
 ---
 
-### REQ-PROJ-002: Start Every Conversation in Explore Mode
+### REQ-PROJ-002: Start Every Project Conversation in Explore Mode
 
-WHEN a conversation is created for a project
+WHEN a conversation is created for a project (directory is inside a git repository)
 THE SYSTEM SHALL initialize the conversation in Explore mode
 AND record the HEAD commit of the main branch as the conversation's pinned snapshot
 AND configure all tools in read-only mode
@@ -346,3 +350,35 @@ AND report worktrees that exist on disk but have no registry entry
 **Rationale:** The registry enables the UI to show all active worktrees and detect
 orphans. Reconciliation on startup handles worktrees deleted externally or
 conversations that ended without cleanup.
+
+---
+
+### REQ-PROJ-016: Standalone Conversation Mode
+
+WHEN a conversation is created for a directory that is not inside a git repository
+THE SYSTEM SHALL initialize the conversation in Standalone mode
+AND provide the full tool suite (bash, patch, and all other tools)
+AND NOT associate it with any project
+
+WHILE a conversation is in Standalone mode
+THE SYSTEM SHALL NOT provide the `create_task` tool
+AND SHALL NOT provide the `update_task` tool
+AND SHALL NOT allow transition to Explore or Work modes
+
+WHEN displaying a Standalone conversation
+THE SYSTEM SHALL NOT show Explore/Work mode indicators
+AND SHALL indicate that it is a standalone conversation (no project association)
+
+WHEN a Standalone conversation is created
+THE SYSTEM SHALL inform the user that the directory is not a git repository
+AND that project features (tasks, worktrees, branch isolation) are not available
+AND that file writes have no git safety net
+
+**Rationale:** Phoenix must be useful beyond git repositories. A user editing a script
+in `/tmp` or exploring a downloaded archive should not be forced to `git init` first.
+Standalone mode provides the full tool suite at the cost of git-backed safety features:
+no worktree isolation, no task tracking, no branch-based undo. This is an explicit
+trade-off the user accepts by working in a non-git directory. Making Standalone a
+distinct mode (rather than overloading Explore or Work) allows the UI to communicate
+the capability difference clearly and prevents accidental mixing of project and
+non-project behaviors.

@@ -13,6 +13,7 @@ pub use types::*;
 
 use crate::db::Database;
 use crate::llm::ModelRegistry;
+use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use std::sync::Arc;
 
@@ -22,17 +23,28 @@ pub struct AppState {
     pub runtime: Arc<RuntimeManager>,
     pub llm_registry: Arc<ModelRegistry>,
     pub db: Database,
+    #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
+    pub platform: PlatformCapability,
 }
 
 impl AppState {
     /// Create new application state and start the sub-agent handler
-    pub async fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
-        let runtime = Arc::new(RuntimeManager::new(db.clone(), llm_registry.clone()));
+    pub async fn new(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        platform: PlatformCapability,
+    ) -> Self {
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform,
+        ));
         runtime.start_sub_agent_handler().await;
         Self {
             runtime,
             llm_registry,
             db,
+            platform,
         }
     }
 }

@@ -106,6 +106,9 @@ export function ConversationList({
                 <div className="conv-item-slug">
                   <span className={`conv-state-dot ${conv.display_state || 'idle'}`} />
                   {conv.slug}
+                  {conv.conv_mode_label && (
+                    <span className="conv-mode-badge">{conv.conv_mode_label}</span>
+                  )}
                 </div>
                 <div className="conv-item-meta">
                   <span className="conv-item-time" title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}>

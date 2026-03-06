@@ -19,6 +19,7 @@ pub mod testing;
 pub use executor::ConversationRuntime;
 pub use traits::*;
 
+use crate::platform::PlatformCapability;
 use crate::state_machine::state::{SubAgentOutcome, SubAgentSpec};
 use crate::tools::{BrowserSessionManager, ToolRegistry};
 
@@ -56,12 +57,13 @@ pub struct SubAgentCancelRequest {
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
     spawn_rx: RwLock<Option<mpsc::Receiver<SubAgentSpawnRequest>>>,
-    /// Channel for sub-agent cancel requests  
+    /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
 }
@@ -109,12 +111,17 @@ pub enum SseEvent {
 }
 
 impl RuntimeManager {
-    pub fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
+    pub fn new(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        platform: PlatformCapability,
+    ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         Self {
             db,
             llm_registry,
+            platform,
             browser_sessions: Arc::new(BrowserSessionManager::default()),
             runtimes: RwLock::new(HashMap::new()),
             spawn_tx,
@@ -122,6 +129,11 @@ impl RuntimeManager {
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
         }
+    }
+
+    /// Get the detected platform capability
+    pub fn platform(&self) -> PlatformCapability {
+        self.platform
     }
 
     /// Get the browser session manager
@@ -253,11 +265,9 @@ impl RuntimeManager {
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
-        #[allow(deprecated)]
-        let tool_executor = ToolRegistryExecutor::new(ToolRegistry::new_for_subagent(
-            conv_context.working_dir.clone(),
-            self.llm_registry.clone(),
-        ));
+        // Sub-agents use the standard sub-agent tool set for now.
+        // Mode inheritance (REQ-BED-018) will be refined in M2.
+        let tool_executor = ToolRegistryExecutor::new(ToolRegistry::for_subagent());
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -416,18 +426,25 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
 
-        // Use appropriate tool registry based on whether this is a sub-agent
-        #[allow(deprecated)]
+        // Use appropriate tool registry based on sub-agent status and conversation mode
         let tool_executor = if is_sub_agent {
-            ToolRegistryExecutor::new(ToolRegistry::new_for_subagent(
-                context.working_dir.clone(),
-                self.llm_registry.clone(),
-            ))
+            ToolRegistryExecutor::new(ToolRegistry::for_subagent())
         } else {
-            ToolRegistryExecutor::new(ToolRegistry::new(
-                context.working_dir.clone(),
-                self.llm_registry.clone(),
-            ))
+            use crate::db::ConvMode;
+            let registry = match conv.conv_mode {
+                ConvMode::Explore => {
+                    if self.platform.has_sandbox() {
+                        ToolRegistry::explore_with_sandbox()
+                    } else {
+                        ToolRegistry::explore_no_sandbox()
+                    }
+                }
+                ConvMode::Standalone => {
+                    // Full tool suite for non-git directories
+                    ToolRegistry::standalone()
+                } // Future: Work mode will use its own registry
+            };
+            ToolRegistryExecutor::new(registry)
         };
 
         // Determine initial state: check if conversation needs auto-continuation
