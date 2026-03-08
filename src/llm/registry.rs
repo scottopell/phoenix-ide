@@ -118,13 +118,21 @@ pub struct LlmConfig {
 
 impl LlmConfig {
     pub fn from_env() -> Self {
+        // OAuth token: prefer env var (set by deploy for system service users who
+        // cannot read ~/.claude/.credentials.json at runtime), then fall back to
+        // reading the file directly (works in dev where the process runs as the user).
+        let anthropic_oauth_token = std::env::var("ANTHROPIC_OAUTH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(load_claude_oauth_token);
+
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             fireworks_api_key: std::env::var("FIREWORKS_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
-            anthropic_oauth_token: load_claude_oauth_token(),
+            anthropic_oauth_token,
         }
     }
 }

@@ -804,6 +804,9 @@ class SystemdConfig:
     # When set, injects Environment=HOME=<path> so the service user can read
     # ~/.claude/.credentials.json for Claude OAuth token auth.
     home_dir: str | None = None
+    # Claude OAuth access token read at deploy time (bypasses file permission issues
+    # since the service user typically cannot read ~/.claude/.credentials.json).
+    anthropic_oauth_token: str | None = None
 
 
 def detect_service_user() -> str:
@@ -885,6 +888,12 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
         # System users have no real home, so we point HOME at the deploying user's home.
         env_lines.append(f"Environment=HOME={config.home_dir}")
 
+    if config.anthropic_oauth_token:
+        # OAuth token read at deploy time — avoids file permission issues at runtime.
+        # The token is embedded directly so the service user doesn't need to read
+        # ~/.claude/.credentials.json (which is owner-only, 600).
+        env_lines.append(f"Environment=ANTHROPIC_OAUTH_TOKEN={config.anthropic_oauth_token}")
+
     env_section = "\n".join(env_lines)
 
     return f"""[Unit]
@@ -957,12 +966,22 @@ def native_prod_deploy(version: str | None = None):
     subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
     subprocess.run(["sudo", "chown", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
 
-    # If ~/.claude/.credentials.json exists, expose the deploying user's HOME to
-    # the service so it can load Claude OAuth tokens at startup.
+    # Read Claude OAuth token at deploy time (as the deploying user who can read it).
+    # The service user (e.g. phoenix-dev) cannot read ~/.claude/.credentials.json
+    # directly (600 permissions), so we bake the token into the systemd unit instead.
     oauth_creds = Path.home() / ".claude" / ".credentials.json"
-    home_dir = str(Path.home()) if oauth_creds.exists() else None
-    if home_dir:
-        print(f"Found Claude OAuth credentials — setting HOME={home_dir} in service unit")
+    anthropic_oauth_token = None
+    if oauth_creds.exists():
+        try:
+            import json as _json
+            creds = _json.loads(oauth_creds.read_text())
+            token_data = creds.get("claudeAiOauth", {})
+            anthropic_oauth_token = token_data.get("accessToken")
+            expires_at = token_data.get("expiresAt", "unknown")
+            if anthropic_oauth_token:
+                print(f"Found Claude OAuth token (expires: {expires_at})")
+        except Exception as e:
+            print(f"Warning: Found ~/.claude/.credentials.json but could not read token: {e}")
 
     # Configure for native deployment
     config = dataclasses.replace(
@@ -970,7 +989,7 @@ def native_prod_deploy(version: str | None = None):
         user=service_user,
         db_path=str(native_db_path),
         llm_gateway=get_llm_gateway(),
-        home_dir=home_dir,
+        anthropic_oauth_token=anthropic_oauth_token,
     )
 
     # Install systemd socket unit (for socket activation)
