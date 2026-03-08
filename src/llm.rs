@@ -70,7 +70,7 @@ mod types;
 pub use discovery::{discover_models, probe_gateway};
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ApiFormat, ModelSpec, Provider};
-pub use registry::{GatewayStatus, LlmConfig, ModelRegistry};
+pub use registry::{AnthropicAuth, GatewayStatus, LlmConfig, ModelRegistry};
 pub use service::LlmServiceImpl;
 pub use types::*;
 

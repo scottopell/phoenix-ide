@@ -801,11 +801,36 @@ class SystemdConfig:
     # For Lima: uses EnvironmentFile for API key; for native: uses LLM_GATEWAY env var
     env_file: str | None = None
     llm_gateway: str | None = None
+    # When set, injects Environment=HOME=<path> so the service user can read
+    # ~/.claude/.credentials.json for Claude OAuth token auth.
+    home_dir: str | None = None
+
+
+def detect_service_user() -> str:
+    """Detect which service user to run phoenix-ide as.
+
+    Checks for supported users in priority order. Fails with a clear message
+    if none exist so the operator knows what to create.
+    """
+    import pwd
+    for candidate in ("phoenix-dev", "exedev"):
+        try:
+            pwd.getpwnam(candidate)
+            return candidate
+        except KeyError:
+            continue
+    print(
+        "ERROR: No supported service user found. "
+        "Create one of: phoenix-dev, exedev\n"
+        "  e.g.: sudo useradd --system --no-create-home phoenix-dev",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 # Configs for each deployment target
 NATIVE_SYSTEMD_CONFIG = SystemdConfig(
-    user="exedev",
+    user="exedev",  # placeholder; overridden at deploy time by detect_service_user()
     db_path=str(PROD_DB_PATH),
     install_dir=str(PROD_INSTALL_DIR),
     port=PROD_PORT,
@@ -854,6 +879,11 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
     elif config.llm_gateway:
         # Native mode: use LLM_GATEWAY directly
         env_lines.append(f"Environment=LLM_GATEWAY={config.llm_gateway}")
+
+    if config.home_dir:
+        # Allow the service user to find ~/.claude/.credentials.json for OAuth auth.
+        # System users have no real home, so we point HOME at the deploying user's home.
+        env_lines.append(f"Environment=HOME={config.home_dir}")
 
     env_section = "\n".join(env_lines)
 
@@ -916,11 +946,32 @@ def native_prod_deploy(version: str | None = None):
     subprocess.run(["sudo", "cp", str(binary), str(dest)], check=True)
     subprocess.run(["sudo", "chmod", "+x", str(dest)], check=True)
     
-    # Ensure database directory exists
-    PROD_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Detect service user first so we can set up the DB directory correctly
+    service_user = detect_service_user()
+
+    # For native systemd deployments the service runs as a dedicated system user,
+    # so the DB must live somewhere that user owns — /var/lib/phoenix-ide/ is the
+    # standard Linux convention.  (~/.phoenix-ide is only used for dev/daemon mode.)
+    native_db_dir = Path("/var/lib/phoenix-ide")
+    native_db_path = native_db_dir / "prod.db"
+    subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
+    subprocess.run(["sudo", "chown", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
+
+    # If ~/.claude/.credentials.json exists, expose the deploying user's HOME to
+    # the service so it can load Claude OAuth tokens at startup.
+    oauth_creds = Path.home() / ".claude" / ".credentials.json"
+    home_dir = str(Path.home()) if oauth_creds.exists() else None
+    if home_dir:
+        print(f"Found Claude OAuth credentials — setting HOME={home_dir} in service unit")
 
     # Configure for native deployment
-    config = dataclasses.replace(NATIVE_SYSTEMD_CONFIG, llm_gateway=get_llm_gateway())
+    config = dataclasses.replace(
+        NATIVE_SYSTEMD_CONFIG,
+        user=service_user,
+        db_path=str(native_db_path),
+        llm_gateway=get_llm_gateway(),
+        home_dir=home_dir,
+    )
 
     # Install systemd socket unit (for socket activation)
     print("Installing systemd socket unit...")
@@ -988,7 +1039,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
-            print(f"  Database: {PROD_DB_PATH}")
+            print(f"  Database: {config.db_path}")
             print(f"  URL: http://localhost:{PROD_PORT}")
         else:
             print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
@@ -1015,7 +1066,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
-            print(f"  Database: {PROD_DB_PATH}")
+            print(f"  Database: {config.db_path}")
             print(f"  URL: http://localhost:{PROD_PORT}")
         else:
             print(f"\n✗ Service failed to start", file=sys.stderr)

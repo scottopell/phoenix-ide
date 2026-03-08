@@ -2,22 +2,24 @@
 
 use super::models::{ApiFormat, ModelSpec};
 use super::types::{LlmRequest, LlmResponse};
-use super::{anthropic, openai, LlmError, LlmService, TokenChunk};
+use super::{anthropic, openai, AnthropicAuth, LlmError, LlmService, TokenChunk};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 /// Unified service implementation that dispatches by API format
 pub struct LlmServiceImpl {
     pub spec: ModelSpec,
-    pub api_key: String,
+    /// Anthropic auth credentials (`ApiKey` or `Bearer` OAuth token).
+    /// For OpenAI/Fireworks format, `auth.as_str()` extracts the plain key string.
+    pub auth: AnthropicAuth,
     pub gateway: Option<String>,
 }
 
 impl LlmServiceImpl {
-    pub fn new(spec: ModelSpec, api_key: String, gateway: Option<String>) -> Self {
+    pub fn new(spec: ModelSpec, auth: AnthropicAuth, gateway: Option<String>) -> Self {
         Self {
             spec,
-            api_key,
+            auth,
             gateway,
         }
     }
@@ -28,11 +30,16 @@ impl LlmService for LlmServiceImpl {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         match self.spec.api_format {
             ApiFormat::Anthropic => {
-                anthropic::complete(&self.spec, &self.api_key, self.gateway.as_deref(), request)
-                    .await
+                anthropic::complete(&self.spec, &self.auth, self.gateway.as_deref(), request).await
             }
             ApiFormat::OpenAIChat => {
-                openai::complete(&self.spec, &self.api_key, self.gateway.as_deref(), request).await
+                openai::complete(
+                    &self.spec,
+                    self.auth.as_str(),
+                    self.gateway.as_deref(),
+                    request,
+                )
+                .await
             }
         }
     }
@@ -46,7 +53,7 @@ impl LlmService for LlmServiceImpl {
             ApiFormat::Anthropic => {
                 anthropic::complete_streaming(
                     &self.spec,
-                    &self.api_key,
+                    &self.auth,
                     self.gateway.as_deref(),
                     request,
                     chunk_tx,
@@ -56,7 +63,7 @@ impl LlmService for LlmServiceImpl {
             ApiFormat::OpenAIChat => {
                 openai::complete_streaming(
                     &self.spec,
-                    &self.api_key,
+                    self.auth.as_str(),
                     self.gateway.as_deref(),
                     request,
                     chunk_tx,

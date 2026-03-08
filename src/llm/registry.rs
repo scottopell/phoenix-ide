@@ -20,6 +20,87 @@ pub enum GatewayStatus {
     Unreachable,
 }
 
+/// How to authenticate Anthropic API requests.
+///
+/// Determines which header carries the credential:
+/// - `ApiKey`: `x-api-key: <key>` (standard API keys and gateway implicit auth)
+/// - `Bearer`: `Authorization: Bearer <token>` (Claude OAuth tokens from `claude login`)
+#[derive(Debug, Clone)]
+pub enum AnthropicAuth {
+    /// Standard API key — sent as `x-api-key` header.
+    /// Also used for gateway mode with the sentinel value `"implicit"`.
+    ApiKey(String),
+    /// OAuth bearer token — sent as `Authorization: Bearer` header.
+    /// Sourced from `~/.claude/.credentials.json` written by `claude login`.
+    Bearer(String),
+}
+
+impl AnthropicAuth {
+    /// Extract the credential string regardless of variant.
+    /// Used by providers that always take a plain string (e.g. `OpenAI`).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::ApiKey(k) | Self::Bearer(k) => k.as_str(),
+        }
+    }
+}
+
+// Private helpers for OAuth credential loading
+#[derive(serde::Deserialize)]
+struct OAuthCredentials {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: OAuthToken,
+}
+
+#[derive(serde::Deserialize)]
+struct OAuthToken {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    #[serde(rename = "expiresAt")]
+    expires_at: String,
+}
+
+/// Attempt to load an OAuth access token from `$HOME/.claude/.credentials.json`.
+///
+/// Returns `None` (silently) if the file doesn't exist, and logs a warning if
+/// the file exists but is unreadable or the token has expired.
+fn load_claude_oauth_token() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let creds_path = std::path::Path::new(&home)
+        .join(".claude")
+        .join(".credentials.json");
+
+    let content = std::fs::read_to_string(&creds_path).ok()?; // silently absent
+
+    let creds: OAuthCredentials = match serde_json::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                path = %creds_path.display(),
+                error = %e,
+                "Failed to parse Claude credentials file; ignoring OAuth auth"
+            );
+            return None;
+        }
+    };
+
+    let token = creds.claude_ai_oauth;
+
+    // If we can parse the expiry, enforce it. On parse failure assume valid (safe default).
+    if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(&token.expires_at) {
+        if expires < chrono::Utc::now() {
+            tracing::warn!(
+                expires_at = %token.expires_at,
+                "Claude OAuth token is expired; ignoring (run `claude login` to refresh)"
+            );
+            return None;
+        }
+    }
+
+    tracing::info!(expires_at = %token.expires_at, "Loaded Claude OAuth token from ~/.claude/.credentials.json");
+    Some(token.access_token)
+}
+
 /// Configuration for LLM providers
 #[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
@@ -30,6 +111,9 @@ pub struct LlmConfig {
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
+    /// OAuth access token loaded from `~/.claude/.credentials.json`, if present and unexpired.
+    /// Takes precedence over `anthropic_api_key` for Anthropic models in direct mode.
+    pub anthropic_oauth_token: Option<String>,
 }
 
 impl LlmConfig {
@@ -40,6 +124,7 @@ impl LlmConfig {
             fireworks_api_key: std::env::var("FIREWORKS_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
+            anthropic_oauth_token: load_claude_oauth_token(),
         }
     }
 }
@@ -238,33 +323,43 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
-        // In exe.dev gateway mode, use "implicit" as the API key
-        // The gateway will handle the actual authentication
-        let api_key = if config.gateway.is_some() {
-            "implicit".to_string()
+        let auth = if config.gateway.is_some() {
+            // Gateway mode: sentinel value; gateway handles real authentication
+            AnthropicAuth::ApiKey("implicit".to_string())
         } else {
-            // Direct mode: require actual API key
+            // Direct mode: require real credentials per provider
             match spec.provider {
-                Provider::Anthropic => config.anthropic_api_key.as_ref()?,
-                Provider::OpenAI => config.openai_api_key.as_ref()?,
-                Provider::Fireworks => config.fireworks_api_key.as_ref()?,
+                Provider::Anthropic => {
+                    // OAuth takes precedence over API key
+                    if let Some(token) = config.anthropic_oauth_token.as_ref() {
+                        AnthropicAuth::Bearer(token.clone())
+                    } else {
+                        let key = config
+                            .anthropic_api_key
+                            .as_deref()
+                            .filter(|k| !k.is_empty())?;
+                        AnthropicAuth::ApiKey(key.to_string())
+                    }
+                }
+                Provider::OpenAI => {
+                    let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
+                    AnthropicAuth::ApiKey(key.to_string())
+                }
+                Provider::Fireworks => {
+                    let key = config
+                        .fireworks_api_key
+                        .as_deref()
+                        .filter(|k| !k.is_empty())?;
+                    AnthropicAuth::ApiKey(key.to_string())
+                }
             }
-            .clone()
         };
 
-        // In direct mode, don't allow empty keys
-        if config.gateway.is_none() && api_key.is_empty() {
-            return None;
-        }
-
-        // Create the unified service
         let service = Arc::new(LlmServiceImpl::new(
             spec.clone(),
-            api_key,
+            auth,
             config.gateway.clone(),
         ));
-
-        // Wrap with logging
         Some(Arc::new(LoggingService::new(service)))
     }
 

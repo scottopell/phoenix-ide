@@ -19,8 +19,8 @@ export function LlmStatusBanner({ models }: LlmStatusBannerProps) {
       <div className="llm-status-banner llm-status-banner--unconfigured">
         <span className="llm-status-banner__icon">!</span>
         <span className="llm-status-banner__text">
-          No LLM configured. Set <code>ANTHROPIC_API_KEY</code> or{' '}
-          <code>LLM_GATEWAY</code> and restart Phoenix.
+          No LLM configured. Run <code>claude login</code>, or set{' '}
+          <code>ANTHROPIC_API_KEY</code> or <code>LLM_GATEWAY</code>, then restart Phoenix.
         </span>
       </div>
     );

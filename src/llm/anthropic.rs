@@ -217,7 +217,7 @@ impl StreamAccumulator {
 /// then returns the fully assembled `LlmResponse`.
 pub async fn complete_streaming(
     spec: &ModelSpec,
-    api_key: &str,
+    auth: &super::AnthropicAuth,
     gateway: Option<&str>,
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
@@ -236,9 +236,14 @@ pub async fn complete_streaming(
     let mut anthropic_request = translate_request(&spec.api_name, request);
     anthropic_request.stream = Some(true);
 
-    let response = client
-        .post(&base_url)
-        .header("x-api-key", api_key)
+    let mut builder = client.post(&base_url);
+    builder = match auth {
+        super::AnthropicAuth::ApiKey(key) => builder.header("x-api-key", key),
+        super::AnthropicAuth::Bearer(token) => {
+            builder.header("Authorization", format!("Bearer {token}"))
+        }
+    };
+    let response = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .header("source", LLM_SOURCE_HEADER)
@@ -297,7 +302,7 @@ pub async fn complete_streaming(
 /// Complete using Anthropic Messages API
 pub async fn complete(
     spec: &ModelSpec,
-    api_key: &str,
+    auth: &super::AnthropicAuth,
     gateway: Option<&str>,
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
@@ -313,9 +318,14 @@ pub async fn complete(
 
     let anthropic_request = translate_request(&spec.api_name, request);
 
-    let response = client
-        .post(&base_url)
-        .header("x-api-key", api_key)
+    let mut builder = client.post(&base_url);
+    builder = match auth {
+        super::AnthropicAuth::ApiKey(key) => builder.header("x-api-key", key),
+        super::AnthropicAuth::Bearer(token) => {
+            builder.header("Authorization", format!("Bearer {token}"))
+        }
+    };
+    let response = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .header("source", LLM_SOURCE_HEADER)
