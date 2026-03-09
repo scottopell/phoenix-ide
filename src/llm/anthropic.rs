@@ -239,9 +239,9 @@ pub async fn complete_streaming(
     let mut builder = client.post(&base_url);
     builder = match auth {
         super::AnthropicAuth::ApiKey(key) => builder.header("x-api-key", key),
-        super::AnthropicAuth::Bearer(token) => {
-            builder.header("Authorization", format!("Bearer {token}"))
-        }
+        super::AnthropicAuth::Bearer(token) => builder
+            .header("Authorization", format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20"),
     };
     let response = builder
         .header("anthropic-version", "2023-06-01")
@@ -321,9 +321,9 @@ pub async fn complete(
     let mut builder = client.post(&base_url);
     builder = match auth {
         super::AnthropicAuth::ApiKey(key) => builder.header("x-api-key", key),
-        super::AnthropicAuth::Bearer(token) => {
-            builder.header("Authorization", format!("Bearer {token}"))
-        }
+        super::AnthropicAuth::Bearer(token) => builder
+            .header("Authorization", format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20"),
     };
     let response = builder
         .header("anthropic-version", "2023-06-01")

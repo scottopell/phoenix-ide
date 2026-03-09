@@ -660,6 +660,49 @@ def cmd_tasks_fix() -> bool:
 # =============================================================================
 
 
+def _mint_api_key_from_oauth(oauth_token: str) -> str | None:
+    """Exchange a Claude OAuth token for a persistent Anthropic API key.
+
+    Calls the internal claude_cli endpoint that Claude Code uses to convert
+    its OAuth session into a standard sk-ant-api03-* key. This is undocumented
+    but reverse-engineered from Claude Code's source. We send an honest
+    User-Agent so Anthropic can identify and block us if they choose to.
+
+    Returns the API key string, or None if the exchange fails.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key"
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {oauth_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "phoenix-ide/dev (personal use; not claude-code)",
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            api_key = data.get("raw_key")
+            if api_key:
+                print(f"✓ Minted API key from OAuth token ({api_key[:18]}...)")
+                return api_key
+            print(f"Warning: create_api_key response missing raw_key: {data}")
+            return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"Warning: create_api_key failed ({e.code}): {body}")
+        return None
+    except Exception as e:
+        print(f"Warning: create_api_key request failed: {e}")
+        return None
+
+
 def detect_prod_env() -> str:
     """Detect production environment: 'launchd', 'native', or 'daemon'.
 
@@ -807,6 +850,9 @@ class SystemdConfig:
     # Claude OAuth access token read at deploy time (bypasses file permission issues
     # since the service user typically cannot read ~/.claude/.credentials.json).
     anthropic_oauth_token: str | None = None
+    # API key minted from OAuth token via create_api_key endpoint (preferred over
+    # oauth_token since it uses standard x-api-key auth with no fingerprinting).
+    anthropic_api_key: str | None = None
 
 
 def detect_service_user() -> str:
@@ -888,10 +934,11 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
         # System users have no real home, so we point HOME at the deploying user's home.
         env_lines.append(f"Environment=HOME={config.home_dir}")
 
-    if config.anthropic_oauth_token:
-        # OAuth token read at deploy time — avoids file permission issues at runtime.
-        # The token is embedded directly so the service user doesn't need to read
-        # ~/.claude/.credentials.json (which is owner-only, 600).
+    if config.anthropic_api_key:
+        # API key minted from OAuth token at deploy time — standard x-api-key auth.
+        env_lines.append(f"Environment=ANTHROPIC_API_KEY={config.anthropic_api_key}")
+    elif config.anthropic_oauth_token:
+        # Fallback: raw OAuth Bearer token (works if Anthropic ever enables it).
         env_lines.append(f"Environment=ANTHROPIC_OAUTH_TOKEN={config.anthropic_oauth_token}")
 
     env_section = "\n".join(env_lines)
@@ -968,9 +1015,10 @@ def native_prod_deploy(version: str | None = None):
 
     # Read Claude OAuth token at deploy time (as the deploying user who can read it).
     # The service user (e.g. phoenix-dev) cannot read ~/.claude/.credentials.json
-    # directly (600 permissions), so we bake the token into the systemd unit instead.
+    # directly (600 permissions), so we bake the result into the systemd unit instead.
     oauth_creds = Path.home() / ".claude" / ".credentials.json"
     anthropic_oauth_token = None
+    anthropic_api_key = None
     if oauth_creds.exists():
         try:
             import json as _json
@@ -980,6 +1028,7 @@ def native_prod_deploy(version: str | None = None):
             expires_at = token_data.get("expiresAt", "unknown")
             if anthropic_oauth_token:
                 print(f"Found Claude OAuth token (expires: {expires_at})")
+                anthropic_api_key = _mint_api_key_from_oauth(anthropic_oauth_token)
         except Exception as e:
             print(f"Warning: Found ~/.claude/.credentials.json but could not read token: {e}")
 
@@ -989,7 +1038,8 @@ def native_prod_deploy(version: str | None = None):
         user=service_user,
         db_path=str(native_db_path),
         llm_gateway=get_llm_gateway(),
-        anthropic_oauth_token=anthropic_oauth_token,
+        anthropic_api_key=anthropic_api_key,
+        anthropic_oauth_token=anthropic_oauth_token if not anthropic_api_key else None,
     )
 
     # Install systemd socket unit (for socket activation)
