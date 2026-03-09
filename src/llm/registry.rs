@@ -86,15 +86,29 @@ fn load_claude_oauth_token() -> Option<String> {
 
     let token = creds.claude_ai_oauth;
 
-    // If we can parse the expiry, enforce it. On parse failure assume valid (safe default).
-    if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(&token.expires_at) {
-        if expires < chrono::Utc::now() {
+    // Check expiry. expiresAt may be RFC3339 or a Unix timestamp in milliseconds.
+    let expired = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
+        .map(|dt| dt < chrono::Utc::now())
+        .or_else(|_| {
+            token
+                .expires_at
+                .parse::<i64>()
+                .map(|ms| chrono::Utc::now().timestamp_millis() > ms)
+        })
+        .unwrap_or_else(|_| {
             tracing::warn!(
                 expires_at = %token.expires_at,
-                "Claude OAuth token is expired; ignoring (run `claude login` to refresh)"
+                "Could not parse Claude OAuth token expiry; assuming valid"
             );
-            return None;
-        }
+            false
+        });
+
+    if expired {
+        tracing::warn!(
+            expires_at = %token.expires_at,
+            "Claude OAuth token is expired; ignoring (run `claude login` to refresh)"
+        );
+        return None;
     }
 
     tracing::info!(expires_at = %token.expires_at, "Loaded Claude OAuth token from ~/.claude/.credentials.json");

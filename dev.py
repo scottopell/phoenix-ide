@@ -696,7 +696,12 @@ def _mint_api_key_from_oauth(oauth_token: str) -> str | None:
             return None
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
-        print(f"Warning: create_api_key failed ({e.code}): {body}")
+        if e.code == 403:
+            # claude.ai Pro/Max login lacks org:create_api_key scope — expected.
+            # The caller will fall back to raw OAuth Bearer token, which works fine.
+            print(f"  (Scope check failed for create_api_key — using Bearer token fallback)")
+        else:
+            print(f"Warning: create_api_key failed ({e.code}): {body}")
         return None
     except Exception as e:
         print(f"Warning: create_api_key request failed: {e}")
@@ -1410,16 +1415,53 @@ def native_prod_status():
     else:
         print(f"Production: {status}")
     
-    # Show systemd overrides
+    # Show systemd overrides and OAuth token expiry info.
+    # The token may be in the main unit file or in a drop-in override.
+    oauth_token: str | None = None
+
+    # Check the main service unit first
+    main_unit = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
+    unit_sources: list[tuple[str, str]] = []
+    if main_unit.exists():
+        try:
+            unit_sources.append((main_unit.name, main_unit.read_text()))
+        except Exception:
+            pass
+
+    # Then check drop-in overrides
     overrides = list_systemd_overrides()
-    if overrides:
-        print(f"  Overrides:")
-        for filename, content in overrides:
-            # Extract the key=value from the content
-            for line in content.split('\n'):
-                if line.startswith('Environment='):
-                    env_val = line.replace('Environment=', '')
-                    print(f"    {filename}: {env_val}")
+    unit_sources.extend(overrides)
+
+    for _filename, content in unit_sources:
+        for line in content.split('\n'):
+            if line.startswith('Environment=ANTHROPIC_OAUTH_TOKEN='):
+                oauth_token = line.split('=', 2)[2]
+
+    if oauth_token:
+            # Show expiry from credentials file rather than parsing the token itself
+            creds_path = Path.home() / ".claude" / ".credentials.json"
+            expiry_str = "unknown"
+            try:
+                creds = json.loads(creds_path.read_text())
+                expires_at = creds["claudeAiOauth"]["expiresAt"]
+                # expiresAt is Unix timestamp in milliseconds
+                import datetime
+                expires_dt = datetime.datetime.fromtimestamp(
+                    int(expires_at) / 1000, tz=datetime.timezone.utc
+                )
+                now = datetime.datetime.now(tz=datetime.timezone.utc)
+                if expires_dt < now:
+                    expiry_str = f"EXPIRED (was {expires_dt.strftime('%Y-%m-%d %H:%M UTC')})"
+                else:
+                    delta = expires_dt - now
+                    hours = int(delta.total_seconds() // 3600)
+                    mins = int((delta.total_seconds() % 3600) // 60)
+                    expiry_str = f"{expires_dt.strftime('%Y-%m-%d %H:%M UTC')} (in {hours}h{mins}m)"
+            except Exception:
+                pass
+            print(f"    ANTHROPIC_OAUTH_TOKEN={oauth_token[:18]}... (expires: {expiry_str})")
+            if "EXPIRED" in expiry_str:
+                print(f"  ⚠ OAuth token expired — run `./dev.py prod deploy` to refresh")
 
 
 def native_prod_stop():
