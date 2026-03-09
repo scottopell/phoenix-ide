@@ -132,7 +132,7 @@ impl LlmService for LoggingService {
             Ok(response) => {
                 tracing::info!(
                     model = %self.model_id,
-                    duration_ms = %duration.as_millis(),
+                    duration_ms = duration.as_millis(),
                     input_tokens = response.usage.input_tokens,
                     output_tokens = response.usage.output_tokens,
                     "LLM request completed"
@@ -141,7 +141,7 @@ impl LlmService for LoggingService {
             Err(e) => {
                 tracing::error!(
                     model = %self.model_id,
-                    duration_ms = %duration.as_millis(),
+                    duration_ms = duration.as_millis(),
                     error = %e.message,
                     retryable = e.kind.is_retryable(),
                     "LLM request failed"
@@ -165,7 +165,7 @@ impl LlmService for LoggingService {
             Ok(response) => {
                 tracing::info!(
                     model = %self.model_id,
-                    duration_ms = %duration.as_millis(),
+                    duration_ms = duration.as_millis(),
                     input_tokens = response.usage.input_tokens,
                     output_tokens = response.usage.output_tokens,
                     "LLM streaming request completed"
@@ -174,7 +174,7 @@ impl LlmService for LoggingService {
             Err(e) => {
                 tracing::error!(
                     model = %self.model_id,
-                    duration_ms = %duration.as_millis(),
+                    duration_ms = duration.as_millis(),
                     error = %e.message,
                     retryable = e.kind.is_retryable(),
                     "LLM streaming request failed"

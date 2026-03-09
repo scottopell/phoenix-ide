@@ -300,6 +300,58 @@ where
         // Update state
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
 
+        // Log notable state transitions at INFO. "Notable" means transitions that cross
+        // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
+        // terminal states). Internal bookkeeping transitions (e.g. AwaitingLlm→LlmRequesting)
+        // are logged at DEBUG to keep steady-state noise low.
+        {
+            fn state_name(s: &ConvState) -> &'static str {
+                match s {
+                    ConvState::Idle => "Idle",
+                    ConvState::AwaitingLlm => "AwaitingLlm",
+                    ConvState::LlmRequesting { .. } => "LlmRequesting",
+                    ConvState::ToolExecuting { .. } => "ToolExecuting",
+                    ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
+                    ConvState::CancellingSubAgents { .. } => "CancellingSubAgents",
+                    ConvState::CancellingTool { .. } => "CancellingTool",
+                    ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
+                    ConvState::Completed { .. } => "Completed",
+                    ConvState::Failed { .. } => "Failed",
+                    ConvState::Error { .. } => "Error",
+                    ConvState::ContextExhausted { .. } => "ContextExhausted",
+                }
+            }
+            let from = state_name(&old_state);
+            let to = state_name(&self.state);
+            if from != to {
+                let notable = matches!(
+                    &self.state,
+                    ConvState::Idle
+                        | ConvState::ToolExecuting { .. }
+                        | ConvState::AwaitingSubAgents { .. }
+                        | ConvState::Completed { .. }
+                        | ConvState::Failed { .. }
+                        | ConvState::Error { .. }
+                        | ConvState::ContextExhausted { .. }
+                );
+                if notable {
+                    tracing::info!(
+                        conv_id = %self.context.conversation_id,
+                        from,
+                        to,
+                        "State transition"
+                    );
+                } else {
+                    tracing::debug!(
+                        conv_id = %self.context.conversation_id,
+                        from,
+                        to,
+                        "State transition"
+                    );
+                }
+            }
+        }
+
         let entering_awaiting = !matches!(
             old_state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
@@ -599,11 +651,20 @@ where
                 });
 
                 let handle = tokio::spawn(async move {
-                    tracing::info!(
-                        is_sub_agent = is_sub_agent,
-                        request_id = %request_id,
-                        "Making LLM request (background)"
-                    );
+                    if is_sub_agent {
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            request_id = %request_id,
+                            sub_agent = true,
+                            "Making LLM request"
+                        );
+                    } else {
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            request_id = %request_id,
+                            "Making LLM request"
+                        );
+                    }
 
                     // Build messages from history
                     let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
@@ -693,13 +754,20 @@ where
                     self.llm_registry.clone(),
                 );
 
+                let conv_id = self.context.conversation_id.clone();
                 let tool_executor = self.tool_executor.clone();
                 let tool_use_id = tool.id.clone();
                 let tool_name = tool.name().to_string();
                 let tool_input = tool.input.to_value();
 
                 tokio::spawn(async move {
-                    tracing::info!(tool = %tool_name, id = %tool_use_id, "Executing tool (background)");
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        tool = %tool_name,
+                        id = %tool_use_id,
+                        "Executing tool"
+                    );
+                    let tool_start = std::time::Instant::now();
 
                     let output = tool_executor
                         .execute(&tool_name, tool_input, tool_ctx)
@@ -710,36 +778,54 @@ where
                     // The state machine only accepts ToolAborted from CancellingTool state,
                     // which is entered when AbortTool effect cancels the token.
                     let tool_outcome = if cancel_token_check.is_cancelled() {
-                        tracing::info!(tool_id = %tool_use_id, "Tool cancelled (token signaled)");
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            tool = %tool_name,
+                            id = %tool_use_id,
+                            "Tool cancelled"
+                        );
                         ToolOutcome::Aborted {
                             tool_use_id,
                             reason: crate::state_machine::AbortReason::CancellationRequested,
                         }
                     } else {
-                        match output {
-                            Some(out) => {
-                                use crate::db::ToolContentImage;
-                                let images = out
-                                    .images
-                                    .into_iter()
-                                    .map(|img| ToolContentImage {
-                                        media_type: img.media_type,
-                                        data: img.data,
-                                    })
-                                    .collect();
-                                ToolOutcome::Completed(ToolResult {
-                                    tool_use_id: tool_use_id.clone(),
-                                    success: out.success,
-                                    output: out.output,
-                                    is_error: !out.success,
-                                    display_data: out.display_data,
-                                    images,
+                        use crate::db::ToolContentImage;
+                        if let Some(out) = output {
+                            tracing::info!(
+                                conv_id = %conv_id,
+                                tool = %tool_name,
+                                id = %tool_use_id,
+                                duration_ms = tool_start.elapsed().as_millis(),
+                                success = out.success,
+                                "Tool completed"
+                            );
+                            let images = out
+                                .images
+                                .into_iter()
+                                .map(|img| ToolContentImage {
+                                    media_type: img.media_type,
+                                    data: img.data,
                                 })
-                            }
-                            None => ToolOutcome::Failed {
+                                .collect();
+                            ToolOutcome::Completed(ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                success: out.success,
+                                output: out.output,
+                                is_error: !out.success,
+                                display_data: out.display_data,
+                                images,
+                            })
+                        } else {
+                            tracing::warn!(
+                                conv_id = %conv_id,
+                                tool = %tool_name,
+                                id = %tool_use_id,
+                                "Tool not found"
+                            );
+                            ToolOutcome::Failed {
                                 tool_use_id,
                                 error: format!("Unknown tool: {tool_name}"),
-                            },
+                            }
                         }
                     };
                     // Send typed outcome through oneshot channel

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
+    trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -43,12 +44,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_span_list(false),
         )
         .init();
-
-    // Log at all levels to verify logging configuration
-    tracing::trace!("Logging initialized - TRACE level");
-    tracing::debug!("Logging initialized - DEBUG level");
-    tracing::info!("Logging initialized - INFO level");
-    tracing::warn!("Logging initialized - WARN level (this is not an error, just a config check)");
 
     // Configuration
     let db_path = std::env::var("PHOENIX_DB_PATH").unwrap_or_else(|_| {
@@ -79,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if llm_registry.has_models() {
         tracing::info!(
-            models = ?llm_registry.available_models(),
+            models = %llm_registry.available_models().join(", "),
             default = %llm_registry.default_model_id(),
             "LLM registry initialized"
         );
@@ -102,7 +97,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .deflate(true)
         .zstd(true);
 
-    let app = create_router(state).layer(cors).layer(compression);
+    // HTTP access log: one line per request with method, path, status, latency.
+    // Health check endpoint (/version) is suppressed from normal INFO logging.
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|request: &axum::http::Request<_>| {
+            // Create a span at INFO level; health checks get a separate disabled span
+            // to suppress them from normal log output.
+            let path = request.uri().path();
+            if path == "/version" {
+                tracing::debug_span!(
+                    "http",
+                    method = %request.method(),
+                    path = %path,
+                )
+            } else {
+                tracing::info_span!(
+                    "http",
+                    method = %request.method(),
+                    path = %path,
+                )
+            }
+        })
+        .on_response(
+            |response: &axum::http::Response<_>,
+             latency: std::time::Duration,
+             span: &tracing::Span| {
+                tracing::info!(
+                    parent: span,
+                    status = response.status().as_u16(),
+                    latency_ms = latency.as_millis(),
+                );
+            },
+        )
+        .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
+        .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
+
+    let app = create_router(state)
+        .layer(trace_layer)
+        .layer(cors)
+        .layer(compression);
 
     // Get listener (either from systemd socket activation or bind fresh)
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
