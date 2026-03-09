@@ -1,7 +1,7 @@
 ---
 created: 2026-02-08
 priority: p0
-status: in-progress
+status: done
 ---
 
 # Graceful Context Exhaustion UI
