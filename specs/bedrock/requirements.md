@@ -271,7 +271,7 @@ WHEN user does not respond within reasonable time
 THE SYSTEM SHALL remain paused (no automatic timeout to Unrestricted)
 
 **Deprecation Reason:** The `request_mode_upgrade` tool and `AwaitingModeApproval`
-state are replaced by the `create_task` tool and `AwaitingTaskApproval` state. The
+state are replaced by the `propose_plan` tool and `AwaitingTaskApproval` state. The
 new flow is richer: the agent proposes a full task plan rather than just a reason
 string, and the user reviews via the prose reader with line-level annotation support.
 The mode transition is now inseparable from task creation.
@@ -307,13 +307,13 @@ THE SYSTEM SHALL NOT modify tool descriptions based on mode
 
 WHEN a tool is unavailable due to mode restrictions
 THE SYSTEM SHALL return a clear, actionable error message
-AND for write tools blocked in Explore mode, SHALL suggest using `create_task` to
+AND for write tools blocked in Explore mode, SHALL suggest using `propose_plan` to
 propose work that requires write access
 
 **Rationale:** Tool descriptions must remain static throughout a conversation to avoid
 confusing the LLM. Mode awareness comes through synthetic messages on transitions and
 clear error responses when tools are blocked. Updated from REQ-BED-014/015 framing to
-reflect Explore/Work mode names and `create_task` as the path to write access.
+reflect Explore/Work mode names and `propose_plan` as the path to write access.
 
 ---
 
@@ -333,7 +333,7 @@ AND configure its working directory as the parent's worktree path
 AND enforce that only one Work sub-agent exists per parent at a time
 
 WHEN sub-agent is running
-THE SYSTEM SHALL NOT provide `create_task` or `update_task` tools to sub-agents
+THE SYSTEM SHALL NOT provide `propose_plan` or `update_task` tools to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
@@ -484,7 +484,7 @@ AND record the worktree path and associated task ID in the mode field
 
 WHILE a conversation is in Standalone mode
 THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
-AND SHALL NOT provide `create_task` or `update_task` tools
+AND SHALL NOT provide `propose_plan` or `update_task` tools
 AND the mode SHALL NOT change for the lifetime of the conversation
 
 WHEN conversation mode changes (Explore to Work, or Work to Explore)
@@ -504,27 +504,39 @@ task tracking, branch isolation) that require a git repository.
 
 ### REQ-BED-028: Task Approval State
 
-WHEN the `create_task` tool is called from Explore mode
+WHEN the `propose_plan` tool completes (task file committed to main)
 THE SYSTEM SHALL transition the conversation to AwaitingTaskApproval state
 AND store the task ID and task file path in the state
 AND pause all agent execution
+AND emit a `task_approval_requested` SSE event with the task file content
 
 WHEN the user approves the task while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the create_task tool call with a success result
+THE SYSTEM SHALL resolve the propose_plan tool call with a success result
+AND create branch `task-{NNN}-{slug}` from main HEAD
+AND checkout that branch
 AND transition the conversation to Idle in Work mode
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the create_task tool call with the annotations as result
+THE SYSTEM SHALL close the prose reader
+AND deliver the annotations to the agent as a user message
 AND transition the conversation to Idle in Explore mode
-AND allow the agent to call create_task again with a revised plan
+  (the agent may revise the plan and call `propose_plan` again with the same task_id,
+   which re-enters AwaitingTaskApproval and reopens the prose reader)
 
 WHEN the user discards the task while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the create_task tool call with a rejection result
+THE SYSTEM SHALL resolve the propose_plan tool call with a rejection result
+AND update the task file status to `abandoned` on main
 AND transition the conversation to Idle in Explore mode
 
-WHEN server restarts with a conversation in AwaitingTaskApproval
-THE SYSTEM SHALL restore the conversation to AwaitingTaskApproval
-AND re-emit the task approval event to reconnecting UI clients
+**Persistence and restart:**
+
+WHEN the server persists AwaitingTaskApproval to the database
+THE SYSTEM SHALL store the task_id and task_file_path as part of the serialized ConvState
+
+WHEN the server restarts and loads a conversation in AwaitingTaskApproval
+THE SYSTEM SHALL read the task file from disk (it is on main, always present)
+AND reconstruct the AwaitingTaskApproval state without a oneshot channel
+AND re-emit the `task_approval_requested` SSE event when the UI reconnects
 
 **Rationale:** AwaitingTaskApproval is a first-class state because it has a distinct
 set of valid incoming events (approve, discard, feedback) and a distinct UI
