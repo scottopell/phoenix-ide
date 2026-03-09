@@ -795,7 +795,7 @@ where
                                 conv_id = %conv_id,
                                 tool = %tool_name,
                                 id = %tool_use_id,
-                                duration_ms = tool_start.elapsed().as_millis(),
+                                duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX),
                                 success = out.success,
                                 "Tool completed"
                             );

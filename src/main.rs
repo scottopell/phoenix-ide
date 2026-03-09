@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
-                .with_current_span(false)
+                .with_current_span(true)
                 .with_span_list(false),
         )
         .init();
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(
                     parent: span,
                     status = response.status().as_u16(),
-                    latency_ms = latency.as_millis(),
+                    latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
                 );
             },
         )
