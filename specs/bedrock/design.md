@@ -438,7 +438,7 @@ requiring every state variant to carry mode.
 |------|---------|------|
 | `patch` | Disabled | Enabled (worktree only) |
 | `bash` | Allowed (read-only enforced) | Allowed (write in worktree) |
-| `create_task` | Allowed | Disabled |
+| `propose_plan` | Allowed | Disabled |
 | `update_task` | Disabled | Allowed (parent only) |
 | `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed |
 
@@ -463,17 +463,17 @@ enum TaskApprovalOutcome {
 Transitions:
 
 ```
-ToolExecuting (create_task call) → AwaitingTaskApproval
+ToolExecuting (propose_plan call) → AwaitingTaskApproval
     Effects: CommitTaskFile, EmitTaskApprovalEvent
 
 AwaitingTaskApproval + Approved → Idle (mode becomes Work)
-    Effects: CreateWorktree, UpdateTaskStatus(in-progress), PersistMode
+    Effects: CreateBranch, CheckoutBranch, UpdateTaskStatus(in-progress), PersistMode
 
 AwaitingTaskApproval + FeedbackProvided → Idle (mode stays Explore)
-    Effects: (tool result returned to agent with annotations)
+    Effects: (annotations delivered as user message; agent may call propose_plan again)
 
 AwaitingTaskApproval + Rejected → Idle (mode stays Explore)
-    Effects: DeleteTaskFile
+    Effects: UpdateTaskStatus(abandoned)
 ```
 
 On server restart with conversation in `AwaitingTaskApproval`: restore state from DB,

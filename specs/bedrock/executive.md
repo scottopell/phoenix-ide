@@ -26,9 +26,9 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-012:** Context Window Tracking | ✅ Complete | Usage data stored in messages |
 | **REQ-BED-013:** Image Handling | ✅ Complete | Base64 images passed to LLM |
 | **REQ-BED-014:** Conversation Mode | ⏭️ Deprecated | Replaced by REQ-BED-027. Restricted/Unrestricted model superseded by Explore/Work with git worktrees |
-| **REQ-BED-015:** Mode Upgrade Request | ⏭️ Deprecated | Replaced by REQ-PROJ-003/004 + REQ-BED-028. `request_mode_upgrade` tool replaced by `create_task` flow |
+| **REQ-BED-015:** Mode Upgrade Request | ⏭️ Deprecated | Replaced by REQ-PROJ-003/004 + REQ-BED-028. `request_mode_upgrade` tool replaced by `propose_plan` flow |
 | **REQ-BED-016:** Mode Downgrade | ⏭️ Deprecated | Replaced by REQ-PROJ-009/010. Mode return now tied to task merge or abandon |
-| **REQ-BED-017:** Mode Communication | ❌ Not Started | Updated: Explore/Work terminology; `create_task` as path to write access |
+| **REQ-BED-017:** Mode Communication | ❌ Not Started | Updated: Explore/Work terminology; `propose_plan` as path to write access |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Updated: sub-agents inherit parent worktree; Work sub-agents allowed one-at-a-time |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
 | **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Tool-less LLM request, fallback on failure |

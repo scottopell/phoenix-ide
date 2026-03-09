@@ -277,7 +277,7 @@ impl ToolRegistry {
     pub fn blocked_tool_error(tool_name: &str) -> ToolOutput {
         ToolOutput::error(format!(
             "The '{tool_name}' tool is not available in Explore mode. \
-             Use create_task to propose work that requires write access."
+             Use propose_plan to propose work that requires write access."
         ))
     }
 

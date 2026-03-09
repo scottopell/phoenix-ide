@@ -63,8 +63,8 @@ present. Worktrees are ephemeral; they are never committed or pushed.
 
 Task files live at `{repo_root}/tasks/` and are committed to main.
 
-Filename convention: `{NNN}-{priority}-{status}-{slug}.md`
-- `NNN`: zero-padded sequential integer, globally unique within the project
+Filename convention: `{NNNN}-{priority}-{status}--{slug}.md`
+- `NNNN`: 4-digit zero-padded sequential integer, globally unique within the project
 - `priority`: p0 (critical) through p3 (low)
 - `status`: awaiting-approval | in-progress | ready-for-review | done | abandoned
 - `slug`: kebab-case title derived by Phoenix at creation time
@@ -83,7 +83,7 @@ Body sections:
 - `## Plan` — the agent's proposed approach as reviewed and approved by the user
 - `## Progress` — checklist the agent updates as work proceeds (optional)
 
-Phoenix writes and commits task files via `create_task` and `update_task` tool
+Phoenix writes and commits task files via `propose_plan` and `update_task` tool
 handlers. Agents never write task files directly via the patch tool.
 
 ## State Machine Integration
@@ -108,10 +108,17 @@ TaskApprovalOutcome {
 ```
 
 The executor opens the prose reader on `task_path` when entering this state (SSE
-event: `TaskApprovalRequested { task_path }`). The UI presents Approve and Discard
-actions. Annotation feedback loops back as `FeedbackProvided`, which the state
-machine routes to the agent as a tool result, keeping the conversation in
-`AwaitingTaskApproval` until a terminal decision is made.
+event: `task_approval_requested` with task file content). The UI presents Approve,
+Reject, and annotation feedback actions.
+
+- **Approved:** Create branch, checkout, transition to Work mode.
+- **FeedbackProvided:** Close prose reader, deliver annotations as user message,
+  return to Explore/Idle. Agent may revise and call `propose_plan` again (reopens
+  prose reader).
+- **Rejected:** Mark task abandoned on main, return to Explore/Idle.
+
+On server restart: reconstruct from DB (task_id + task_file_path), read task file
+from disk, re-emit SSE event on UI reconnect.
 
 ### REQ-PROJ-009 — AwaitingMergeApproval State
 
@@ -133,31 +140,41 @@ event. The UI presents Approve Merge and Request Changes actions.
 
 ## Tool Implementation
 
-### REQ-PROJ-012 — create_task Tool
+### REQ-PROJ-012 — propose_plan Tool
 
-The `create_task` tool is only available in Explore mode. When called:
+The `propose_plan` tool is only available in Explore mode. When called:
+
+**First call (no task_id):**
 
 1. Validate inputs (title, priority, plan)
-2. Assign next sequential task ID (query `tasks/` directory for highest existing NNN)
+2. Assign next sequential task ID (query `tasks/` directory for highest existing NNNN)
 3. Derive filename slug from title (lowercase, spaces to hyphens, truncate at 40 chars)
-4. Write task file to `{repo_root}/tasks/{NNN}-{priority}-awaiting-approval-{slug}.md`
-5. `git add` and `git commit` on main with message: `task {NNN}: propose {title}`
+4. Write task file to `{repo_root}/tasks/{NNNN}-{priority}-awaiting-approval--{slug}.md`
+5. Commit to main via `git commit --only tasks/{file}` (does not touch staging area)
 6. Emit `Effect::TransitionToAwaitingTaskApproval { task_id, task_path }`
+
+**Revision call (with task_id, after feedback):**
+
+1. Update existing task file with revised plan
+2. Commit to main via `git commit --only tasks/{file}`
+3. Re-enter `AwaitingTaskApproval`
 
 The tool does not return until `TaskApprovalOutcome` is resolved. On `Approved`, the
 executor:
-1. `git worktree add {worktree_path} -b {branch_name}`
-2. Updates conversation `conv_mode` to `Work { worktree_path, branch, task_id }`
-3. Updates task file status to `in-progress` and commits to main
-4. Returns success result to agent
+1. `git branch task-{NNNN}-{slug}` from main HEAD
+2. `git checkout task-{NNNN}-{slug}`
+3. Updates conversation `conv_mode` to Work
+4. Updates task file status to `in-progress` and commits to main
+5. Returns success result to agent
 
 On `Rejected`:
-1. `git rm` the task file and commit
+1. Updates task file status to `abandoned` and commits to main
 2. Returns rejection result to agent
 
 On `FeedbackProvided`:
-1. Returns annotations to agent as tool result (agent calls `update_task` with revised plan)
-2. Conversation remains in `AwaitingTaskApproval`
+1. Closes prose reader
+2. Delivers annotations to agent as user message
+3. Returns to Explore/Idle (agent may call `propose_plan` again with task_id)
 
 ### REQ-PROJ-012 — update_task Tool
 
@@ -166,8 +183,9 @@ The `update_task` tool is only available in Work mode for the parent conversatio
 
 1. Read current task file from main (not from worktree)
 2. Apply status and/or progress updates
-3. Rename file if status slug changes
-4. Commit to main: `task {NNN}: update status to {status}`
+3. Present the proposed update to the user for approval
+4. On approval: rename file if status slug changes, commit to main via
+   `git commit --only tasks/{file}`
 5. If status is `ready-for-review`: emit `Effect::TransitionToAwaitingMergeApproval`
 
 ## Executor-Layer Git Operations
@@ -179,7 +197,7 @@ All git operations are side effects dispatched by the executor, not SM transitio
 | `CreateWorktree` | `git worktree add {path} -b {branch}` |
 | `DeleteWorktree` | `git worktree remove {path} --force` + `git branch -D {branch}` |
 | `MergeWorktree` | `git merge --no-ff {branch}` on main |
-| `CommitTaskFile` | `git add tasks/{file} && git commit -m {msg}` |
+| `CommitTaskFile` | `git commit --only tasks/{file} -m {msg}` |
 | `RebaseWorktree` | `git rebase main` in worktree (offered, not forced) |
 
 These effects are typed — the state machine emits the intent; the executor performs
@@ -198,7 +216,7 @@ the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
 | `keyword_search` | Allowed | Allowed |
 | `read_image` | Allowed | Allowed |
 | `browser_*` | Allowed | Allowed |
-| `create_task` | Allowed | Disabled |
+| `propose_plan` | Allowed | Disabled |
 | `update_task` | Disabled | Allowed (parent only, not sub-agents) |
 | `spawn_agents` | Allowed | Allowed |
 | `submit_result` | Sub-agents only | Sub-agents only |
