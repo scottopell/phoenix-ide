@@ -11,61 +11,85 @@ title: "Projects M3: Git worktree isolation for Work mode"
 
 ## Summary
 
-On task approval, create a git worktree. Work mode tools operate in the worktree,
-not the main checkout. Multiple Work conversations get separate worktrees.
+Replace the shared-checkout branch model (M2) with physical worktree isolation.
+Each Work conversation gets its own directory via `git worktree add`, enabling
+parallel Work conversations on the same project.
 
 ## Context
 
 Read first:
-- `specs/projects/requirements.md` — REQ-PROJ-005, REQ-PROJ-007, REQ-PROJ-008, REQ-PROJ-015
-- `specs/subagents/requirements.md` — REQ-SA-007, REQ-SA-008 (tier/mode for sub-agents)
+- `specs/projects/requirements.md` -- REQ-PROJ-005, REQ-PROJ-007, REQ-PROJ-008, REQ-PROJ-015
+- `specs/subagents/requirements.md` -- REQ-SA-007, REQ-SA-008 (tier/mode for sub-agents)
+- Task 0602 (M2) -- establishes branch creation on approve, shared-checkout Work mode
 
 ## Dependencies
 
-- Task 0602 (M2: task approval)
+- Task 0602 (M2: task approval + branch creation)
+
+## What Changes from M2
+
+M2 creates a branch and checks it out in the main checkout. This works but has
+two constraints:
+1. Only one Work conversation per project (shared checkout)
+2. No write boundary enforcement (agent can write anywhere)
+
+M3 replaces the `git checkout` step with `git worktree add`, giving each Work
+conversation a physically separate directory.
 
 ## What to Do
 
 ### Backend
 
-1. **Worktree creation on approval:** When the user approves a task, create a git
-   worktree at `.phoenix/worktrees/{conversation-id}/` with a new branch
-   `phoenix/{task-id}--{slug}` from current main HEAD. Ensure `.phoenix/worktrees/`
-   is in `.gitignore`.
+1. **Worktree creation on approve:** Change the M2 approval flow from
+   `git checkout task-{NNNN}-{slug}` to
+   `git worktree add .phoenix/worktrees/{conversation-id}/ task-{NNNN}-{slug}`.
+   The branch was already created in M2's flow -- worktree add attaches to it.
+   Ensure `.phoenix/worktrees/` is in `.gitignore`.
 
-2. **Worktree registry (REQ-PROJ-015):** Add to project record: a list of active
-   worktrees with task_id, path, branch, conversation_id, timestamp. Update on
-   create/delete. Reconcile on startup.
-
-3. **Work mode tool scoping:** When in Work mode, set the conversation's working
+2. **CWD change:** When entering Work mode, set the conversation's working
    directory to the worktree path. All tools (bash, patch, etc.) operate relative
    to the worktree, not the main checkout.
 
-4. **Sub-agent worktree inheritance (REQ-PROJ-008):** Work sub-agents share the
-   parent's worktree (one at a time). Explore sub-agents from a Work parent get
-   the worktree as their read-only cwd.
+3. **Lift one-Work-conv constraint:** Remove the M2 guard that errors on a second
+   task approval. Multiple Work conversations can now coexist because each has its
+   own directory.
 
-5. **Write boundary enforcement:** Work mode tools that attempt to write outside
-   the worktree path get blocked with a descriptive error.
+4. **Worktree registry (REQ-PROJ-015):** Track active worktrees in the project
+   record: task_id, worktree path, branch name, conversation_id, timestamp.
+   Update on create/delete. On startup, reconcile registry against disk -- clean
+   orphaned entries, report unregistered worktrees.
+
+5. **Write boundary enforcement (REQ-PROJ-007):** Work mode tools that attempt
+   to write outside the worktree path get blocked with a descriptive error.
+
+6. **Sub-agent worktree inheritance (REQ-PROJ-008):** Work sub-agents share the
+   parent's worktree as CWD (one Work sub-agent at a time). Explore sub-agents
+   from a Work parent get the worktree as read-only CWD.
 
 ### Frontend
 
-6. **Worktree indicator:** Work conversations show the worktree path and branch
-   name in the UI (e.g., in the state bar).
+7. **Worktree indicator:** Work conversations show the worktree path and branch
+   name in the conversation header / state bar.
 
 ## Acceptance Criteria
 
 - [ ] Task approval creates a git worktree at `.phoenix/worktrees/{conv-id}/`
-- [ ] A new branch `phoenix/{task-id}--{slug}` is created from main HEAD
-- [ ] Work mode conversation operates in the worktree directory
-- [ ] Multiple Work conversations get separate worktrees
+- [ ] Work mode conversation operates in the worktree directory (CWD changed)
+- [ ] Multiple Work conversations get separate worktrees (parallel work)
 - [ ] Worktree registry tracks all active worktrees
 - [ ] Startup reconciles registry against disk
 - [ ] Work sub-agents operate in parent's worktree
-- [ ] Writes outside worktree are blocked
+- [ ] Writes outside worktree are blocked with descriptive error
+- [ ] `.phoenix/worktrees/` in `.gitignore`
 - [ ] `./dev.py check` passes
 
 ## Value Delivered
 
-Physical isolation. Main branch stays clean. Multiple tasks can proceed in parallel
-without conflicting. Each worktree is disposable.
+Physical isolation. Main checkout stays clean. Multiple tasks proceed in parallel
+without conflicting. Each worktree is disposable. Write boundary enforcement
+prevents accidental cross-contamination.
+
+## Scope boundary (M3 vs M4)
+
+M3 creates and manages worktrees. It does NOT handle merging worktree branches
+back to main or cleaning up after task completion -- that's M4.
