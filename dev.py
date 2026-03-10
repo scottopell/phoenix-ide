@@ -492,8 +492,11 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy then test (share cargo lock)."""
+        """Rust lane: clippy → musl smoke check → test (share cargo lock)."""
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
+        run_step("cargo check musl", [
+            "cargo", "check", "--target", "x86_64-unknown-linux-musl",
+        ])
         run_step("cargo test", ["cargo", "test"])
 
     def lane_fast():
@@ -539,7 +542,7 @@ def cmd_check():
             results.append(("bundle size", 0 if ok else 1, elapsed, msg if not ok else ""))
             print(f"  {sym} {'bundle size':<18s} ({elapsed:.1f}s) {size_kb:.0f} KB")
 
-    print("Running 7 checks in parallel...\n")
+    print("Running 8 checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
