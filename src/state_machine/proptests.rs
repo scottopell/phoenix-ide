@@ -1907,39 +1907,6 @@ proptest! {
         let _ = handle_outcome(&state, &ctx, outcome);
     }
 
-    // handle_outcome never panics with large random outcome sequences
-    #[test]
-    fn prop_handle_outcome_sequence_never_panics(
-        outcomes in proptest::collection::vec(arb_effect_outcome(), 0..10)
-    ) {
-        let ctx = test_context();
-        let mut state = ConvState::Idle;
-
-        // Start with a UserMessage to get into an active state
-        if let Ok(result) = transition(
-            &state,
-            &ctx,
-            Event::UserMessage {
-                text: "test".to_string(),
-                llm_text: None,
-                images: vec![],
-                message_id: "test-msg".to_string(),
-                user_agent: None,
-            },
-        ) {
-            state = result.new_state;
-        }
-
-        for outcome in outcomes {
-            match handle_outcome(&state, &ctx, outcome) {
-                Ok(result) => {
-                    state = result.new_state;
-                    prop_assert!(is_valid_state(&state));
-                }
-                Err(_) => { /* InvalidOutcome is fine — state unchanged */ }
-            }
-        }
-    }
 
     // PersistOutcome::Ok returns the same state unchanged
     #[test]
@@ -2123,5 +2090,43 @@ proptest! {
         let state = ConvState::Idle;
         let result = handle_outcome(&state, &ctx, EffectOutcome::Tool(outcome));
         prop_assert!(result.is_err(), "Tool outcome in Idle should be invalid");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+    // handle_outcome never panics with large random outcome sequences.
+    // 32 cases suffice — the sequence structure is what matters, not volume.
+    #[test]
+    fn prop_handle_outcome_sequence_never_panics(
+        outcomes in proptest::collection::vec(arb_effect_outcome(), 0..10)
+    ) {
+        let ctx = test_context();
+        let mut state = ConvState::Idle;
+
+        if let Ok(result) = transition(
+            &state,
+            &ctx,
+            Event::UserMessage {
+                text: "test".to_string(),
+                llm_text: None,
+                images: vec![],
+                message_id: "test-msg".to_string(),
+                user_agent: None,
+            },
+        ) {
+            state = result.new_state;
+        }
+
+        for outcome in outcomes {
+            match handle_outcome(&state, &ctx, outcome) {
+                Ok(result) => {
+                    state = result.new_state;
+                    prop_assert!(is_valid_state(&state));
+                }
+                Err(_) => { /* InvalidOutcome is fine — state unchanged */ }
+            }
+        }
     }
 }

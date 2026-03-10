@@ -966,7 +966,7 @@ async fn test_wait_for_selector_timeout() {
     let wait_tool = BrowserWaitForSelectorTool;
     let result = wait_tool
         .run(
-            json!({"selector": "#never-exists", "timeout": "1s"}),
+            json!({"selector": "#never-exists", "timeout": "200ms"}),
             ctx.clone(),
         )
         .await;
