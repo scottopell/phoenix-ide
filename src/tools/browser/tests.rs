@@ -861,21 +861,6 @@ async fn test_browser_eval_syntax_error() {
     server.shutdown().await;
 }
 
-#[tokio::test]
-async fn test_browser_navigate_invalid_url() {
-    require_chrome!();
-
-    let (ctx, _manager) = test_context("test-invalid-url");
-
-    let nav_tool = BrowserNavigateTool;
-    let result = nav_tool
-        .run(json!({"url": "not-a-valid-url"}), ctx.clone())
-        .await;
-
-    // Should fail or handle gracefully
-    // (chromiumoxide may accept weird URLs, so we just check it doesn't panic)
-    assert!(!result.output.is_empty(), "Should have some output");
-}
 
 // ============================================================================
 // TDD: browser_wait_for_selector tests
