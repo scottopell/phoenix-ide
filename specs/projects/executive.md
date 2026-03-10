@@ -50,6 +50,13 @@ main branch advancement and emits ambient SSE notifications.
 
 **Progress:** 5 of 16 complete
 
+## Known Gaps
+
+- **Sidebar mode badge lag:** When conv_mode changes (e.g., Explore to Work on
+  approve), the sidebar badge updates on the next 5-second poll, not instantly.
+  Acceptable for M2. Real-time push from conversation atom to sidebar is a future
+  optimization.
+
 ## Dependencies
 
 - `specs/bedrock/` — REQ-BED-027, REQ-BED-028, REQ-BED-029 (mode state, approval states)
