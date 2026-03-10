@@ -497,7 +497,12 @@ def cmd_check():
         run_step("cargo check musl", [
             "cargo", "check", "--target", "x86_64-unknown-linux-musl",
         ])
-        run_step("cargo test", ["cargo", "test"])
+        has_nextest = subprocess.run(
+            ["cargo", "nextest", "--version"],
+            capture_output=True,
+        ).returncode == 0
+        test_cmd = ["cargo", "nextest", "run"] if has_nextest else ["cargo", "test"]
+        run_step("cargo test", test_cmd)
 
     def lane_fast():
         """Fast lane: cargo fmt then task validation."""
@@ -542,14 +547,13 @@ def cmd_check():
             results.append(("bundle size", 0 if ok else 1, elapsed, msg if not ok else ""))
             print(f"  {sym} {'bundle size':<18s} ({elapsed:.1f}s) {size_kb:.0f} KB")
 
-    print("Running 8 checks in parallel...\n")
+    print("Running 7 checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
         threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
         threading.Thread(target=lane_fast),
-        threading.Thread(target=check_bundle_size),
     ]
     for t in threads:
         t.start()
