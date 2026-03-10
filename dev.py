@@ -733,6 +733,18 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
         commit = result.stdout.strip()
         version = f"dev-{commit[:8]}"
         ref = commit
+        # Warn if there are uncommitted changes — they won't be included in the build.
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT, capture_output=True, text=True
+        ).stdout.strip()
+        if dirty:
+            print(f"⚠ Warning: uncommitted changes will NOT be included in the build:")
+            for line in dirty.splitlines()[:10]:
+                print(f"    {line}")
+            if len(dirty.splitlines()) > 10:
+                print(f"    ... and {len(dirty.splitlines()) - 10} more")
+            print()
         print(f"Building from HEAD: {version}")
     
     # Set up or update the build worktree
