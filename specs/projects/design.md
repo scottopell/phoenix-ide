@@ -83,8 +83,10 @@ Body sections:
 - `## Plan` — the agent's proposed approach as reviewed and approved by the user
 - `## Progress` — checklist the agent updates as work proceeds (optional)
 
-Phoenix writes and commits task files via `propose_plan` and `update_task` tool
-handlers. Agents never write task files directly via the patch tool.
+Task files are written to `tasks/` and committed to main at the moment the user
+approves a plan. During the propose/feedback loop, the plan exists only in memory
+(AwaitingTaskApproval state). During Work mode, agents update task files directly
+via the patch tool like any other file.
 
 ## State Machine Integration
 
@@ -95,30 +97,28 @@ REQ-BED-028):
 
 ```
 AwaitingTaskApproval {
-  task_id: String,
-  task_path: PathBuf,
-  reply: oneshot::Sender<TaskApprovalOutcome>,
-}
-
-TaskApprovalOutcome {
-  Approved,
-  Rejected { reason: Option<String> },
-  FeedbackProvided { annotations: String },
+  title: String,
+  priority: Priority,   // p0-p3
+  plan: String,          // the full plan text
 }
 ```
 
-The executor opens the prose reader on `task_path` when entering this state (SSE
-event: `task_approval_requested` with task file content). The UI presents Approve,
-Reject, and annotation feedback actions.
+`propose_plan` is intercepted at the LlmResponse handler (same pattern as
+`submit_result`). It never enters `ToolExecuting`. The assistant message and a
+synthetic tool result are persisted as a `CheckpointData::ToolRound` before the
+state transitions. No oneshot channels — all data is serializable.
 
-- **Approved:** Create branch, checkout, transition to Work mode.
+The prose reader opens with the plan content from the state (not from a file on
+disk). SSE event: `task_approval_requested` with the plan data.
+
+- **Approved:** Write task file to main, create branch, checkout, transition to
+  Work mode. All git operations happen here and only here.
 - **FeedbackProvided:** Close prose reader, deliver annotations as user message,
-  return to Explore/Idle. Agent may revise and call `propose_plan` again (reopens
-  prose reader).
-- **Rejected:** Mark task abandoned on main, return to Explore/Idle.
+  return to Explore/Idle. Agent may revise and call `propose_plan` again.
+- **Rejected:** Return to Explore/Idle. No git operations, nothing to clean up.
 
-On server restart: reconstruct from DB (task_id + task_file_path), read task file
-from disk, re-emit SSE event on UI reconnect.
+On server restart: reconstruct from DB (title, priority, plan are all serialized
+in the ConvState column). Re-emit SSE event on UI reconnect.
 
 ### REQ-PROJ-009 — AwaitingMergeApproval State
 
@@ -142,51 +142,48 @@ event. The UI presents Approve Merge and Request Changes actions.
 
 ### REQ-PROJ-012 — propose_plan Tool
 
-The `propose_plan` tool is only available in Explore mode. When called:
+`propose_plan` is a pure data carrier, intercepted at the LlmResponse handler
+(same pattern as `submit_result`). It never enters `ToolExecuting` or the tool
+executor. Only available in Explore mode, rejected from sub-agents.
 
-**First call (no task_id):**
+**Interception flow (in the LlmResponse transition arm):**
 
-1. Validate inputs (title, priority, plan)
-2. Assign next sequential task ID (query `tasks/` directory for highest existing NNNN)
-3. Derive filename slug from title (lowercase, spaces to hyphens, truncate at 40 chars)
-4. Write task file to `{repo_root}/tasks/{NNNN}-{priority}-awaiting-approval--{slug}.md`
-5. Commit to main via `git commit --only tasks/{file}` (does not touch staging area)
-6. Emit `Effect::TransitionToAwaitingTaskApproval { task_id, task_path }`
+1. Detect `propose_plan` tool_use in the LLM response
+2. Validate: must be the only tool in the response (error otherwise)
+3. Extract title, priority, plan from the tool input
+4. Build synthetic `ToolResult::success` with "Plan submitted for review"
+5. Persist `CheckpointData::ToolRound(assistant_message, [tool_result])`
+6. Transition to `AwaitingTaskApproval { title, priority, plan }`
 
-**Revision call (with task_id, after feedback):**
+**On Approved (executor handles git):**
 
-1. Update existing task file with revised plan
-2. Commit to main via `git commit --only tasks/{file}`
-3. Re-enter `AwaitingTaskApproval`
+1. Assign next sequential task ID (scan `tasks/` for highest existing NNNN)
+2. Derive filename slug from title
+3. Write task file to `{repo_root}/tasks/{NNNN}-{priority}-in-progress--{slug}.md`
+4. `git add tasks/{file} && git commit --only tasks/{file} -m "task {NNNN}: {title}"`
+5. `git branch task-{NNNN}-{slug}` from main HEAD
+6. `git checkout task-{NNNN}-{slug}`
+7. Update `conv_mode` to Work
+8. Resume agent with "Task approved. You are on branch task-{NNNN}-{slug}."
 
-The tool does not return until `TaskApprovalOutcome` is resolved. On `Approved`, the
-executor:
-1. `git branch task-{NNNN}-{slug}` from main HEAD
-2. `git checkout task-{NNNN}-{slug}`
-3. Updates conversation `conv_mode` to Work
-4. Updates task file status to `in-progress` and commits to main
-5. Returns success result to agent
+**On Rejected:**
 
-On `Rejected`:
-1. Updates task file status to `abandoned` and commits to main
-2. Returns rejection result to agent
+1. Transition to Explore/Idle
+2. No git operations needed
 
-On `FeedbackProvided`:
-1. Closes prose reader
-2. Delivers annotations to agent as user message
-3. Returns to Explore/Idle (agent may call `propose_plan` again with task_id)
+**On FeedbackProvided:**
 
-### REQ-PROJ-012 — update_task Tool
+1. Close prose reader
+2. Deliver annotations as user message
+3. Transition to Explore/Idle
+4. Agent may call `propose_plan` again (re-enters AwaitingTaskApproval)
 
-The `update_task` tool is only available in Work mode for the parent conversation
-(not sub-agents). When called:
+### Task File Updates During Work Mode
 
-1. Read current task file from main (not from worktree)
-2. Apply status and/or progress updates
-3. Present the proposed update to the user for approval
-4. On approval: rename file if status slug changes, commit to main via
-   `git commit --only tasks/{file}`
-5. If status is `ready-for-review`: emit `Effect::TransitionToAwaitingMergeApproval`
+During Work mode, the agent updates task files directly using the `patch` tool,
+just like any other file in the worktree. No dedicated tool is needed — task files
+are regular markdown files. Updates to the task file live on the task branch and
+merge to main with the rest of the code changes (M4).
 
 ## Executor-Layer Git Operations
 
@@ -197,7 +194,7 @@ All git operations are side effects dispatched by the executor, not SM transitio
 | `CreateWorktree` | `git worktree add {path} -b {branch}` |
 | `DeleteWorktree` | `git worktree remove {path} --force` + `git branch -D {branch}` |
 | `MergeWorktree` | `git merge --no-ff {branch}` on main |
-| `CommitTaskFile` | `git commit --only tasks/{file} -m {msg}` |
+| `CommitTaskFile` | `git add tasks/{file} && git commit --only tasks/{file} -m {msg}` |
 | `RebaseWorktree` | `git rebase main` in worktree (offered, not forced) |
 
 These effects are typed — the state machine emits the intent; the executor performs
@@ -216,8 +213,7 @@ the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
 | `keyword_search` | Allowed | Allowed |
 | `read_image` | Allowed | Allowed |
 | `browser_*` | Allowed | Allowed |
-| `propose_plan` | Allowed | Disabled |
-| `update_task` | Disabled | Allowed (parent only, not sub-agents) |
+| `propose_plan` | Allowed (intercepted, not executed) | Disabled |
 | `spawn_agents` | Allowed | Allowed |
 | `submit_result` | Sub-agents only | Sub-agents only |
 

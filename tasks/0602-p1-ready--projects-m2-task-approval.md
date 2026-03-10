@@ -12,93 +12,128 @@ title: "Projects M2: propose_plan tool + task approval workflow"
 ## Summary
 
 Add the `propose_plan` tool and the AwaitingTaskApproval state. This is the
-human-in-the-loop gate between Explore (reading) and Work (writing). On approval,
-create a dedicated branch and switch to Work mode in the existing checkout.
+human-in-the-loop gate between Explore (reading) and Work (writing). `propose_plan`
+is a pure data carrier (like submit_result) -- no side effects until the user
+approves. On approval, write the task file, commit to main, create a branch, and
+switch to Work mode.
 
 ## Context
 
 Read first:
 - `specs/projects/requirements.md` -- REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012
 - `specs/bedrock/requirements.md` -- REQ-BED-028
+- `specs/bedrock/design.md` -- "Task Approval State" section, submit_result interception pattern
 
 ## Dependencies
 
 - Task 0601 (M1: project entity + Explore mode) -- DONE
 
+## Design Decisions
+
+1. **propose_plan is a pure data carrier.** Intercepted at the LlmResponse handler
+   (same pattern as submit_result for sub-agents). Never enters ToolExecuting or
+   the tool executor. No file writes, no git operations. The plan exists only in
+   the AwaitingTaskApproval state until approved.
+
+2. **All git operations on approve only.** Writing the task file, committing to
+   main, creating the branch, and checking it out all happen in the approval
+   handler. Reject and feedback are free -- nothing to clean up.
+
+3. **No update_task tool.** During Work mode, agents update task files via the
+   patch tool like any other file. Task file changes live on the branch and merge
+   with code in M4.
+
+4. **submit_result interception pattern.** The LlmResponse handler already
+   intercepts submit_result before entering ToolExecuting. propose_plan follows
+   the same path: detect tool_use, validate it's the only tool, extract data,
+   persist ToolRound, transition to AwaitingTaskApproval.
+
 ## What to Do
 
-### Backend
+### Backend -- State Machine
 
-1. **`propose_plan` tool:** Available in Explore mode only. Accepts title (string),
-   priority (p0-p3), plan (string), and optional task_id (for revisions after
-   feedback). On first call: assigns next sequential task ID, writes task file to
-   `tasks/` in taskmd format, commits to main via `git commit --only <task-file>`.
-   On revision: updates existing task file, commits to main the same way. Returns
-   task_id. Rejected if called outside Explore mode or by a sub-agent.
+1. **New ToolInput variant:** `ToolInput::ProposePlan { title, priority, plan }`.
+   Add parsing in `ToolInput::from_name_and_value`.
 
-2. **AwaitingTaskApproval state:** New ConvState variant holding task_id and
-   task_file_path. Entered when propose_plan commits successfully. Valid incoming
-   events:
+2. **LlmResponse interception:** In the `LlmRequesting + LlmResponse` transition
+   arm, add a check before the existing sub-agent branch:
+   - Detect `propose_plan` tool_use
+   - Validate it's the only tool (error if not)
+   - Extract title, priority, plan from input
+   - Build synthetic `ToolResult::success(tool_id, "Plan submitted for review")`
+   - Persist `CheckpointData::ToolRound(assistant_msg, [tool_result])`
+   - Transition to `AwaitingTaskApproval { title, priority, plan }`
 
-   - **Approve:** Create branch `task-{NNNN}-{slug}` from main HEAD. Checkout
-     branch. Set conv_mode = Work. Resume agent with "Task approved, you are on
-     branch task-{NNNN}-{slug}."
-   - **Feedback:** Close prose reader. Deliver annotations as user message.
-     Return to Explore/Idle. Agent can revise and call propose_plan(task_id=...)
-     again.
-   - **Reject:** Update task file status to `abandoned` on main. Return to
-     Explore/Idle. Agent gets rejection result.
+3. **AwaitingTaskApproval state variant:** Carries title (String), priority
+   (String), plan (String). All serializable, no channels, no file paths.
 
-   DB persistence: task_id and task_file_path serialized in ConvState. On server
-   restart, reconstruct state from DB, read task file from disk, re-emit
-   `task_approval_requested` SSE event on UI reconnect.
+4. **New UserEvent variants:** `TaskApprovalResponse { outcome }` where outcome
+   is `Approved | Rejected | FeedbackProvided { annotations: String }`.
 
-3. **`update_task` tool:** Available in Work mode only. Accepts status (optional
-   enum) and progress (optional string). Presents update to user for approval
-   before committing. On approval: updates task file on main via
-   `git commit --only`, renames file if status changes. Rejected if called outside
-   Work mode or by a sub-agent.
+5. **Transitions from AwaitingTaskApproval:**
+   - Approved: emit effects for git operations (write task file, commit, branch,
+     checkout), transition to Idle with conv_mode = Work
+   - FeedbackProvided: deliver annotations as user message, transition to
+     Idle (Explore)
+   - Rejected: transition to Idle (Explore), no effects
+   - UserCancel: treat as Rejected
 
-4. **Branch creation on approve:** `git branch task-{NNNN}-{slug}` from main HEAD,
-   then `git checkout task-{NNNN}-{slug}`. One Work conversation per project at a
-   time (shared checkout constraint until M3 adds worktrees). Error if a second
-   task is approved while one is active.
+6. **DisplayState:** Add `AwaitingApproval` variant (user must act).
 
-5. **SSE events:** `task_approval_requested` with task file content. On server
-   restart in AwaitingTaskApproval, re-emit on reconnect.
+### Backend -- Git Operations (Approve handler)
+
+7. **On approve, the executor runs these git operations in sequence:**
+   - Assign next task ID (scan `tasks/` for highest NNNN)
+   - Derive slug from title
+   - Write task file to `tasks/{NNNN}-{priority}-in-progress--{slug}.md`
+   - `git add tasks/{file} && git commit --only tasks/{file} -m "task {NNNN}: {title}"`
+   - `git branch task-{NNNN}-{slug}` from main HEAD
+   - `git checkout task-{NNNN}-{slug}`
+   - If any step fails, roll back prior steps (delete branch if created)
+
+8. **One Work conversation per project:** Check DB before executing approve.
+   If another conversation for the same project has conv_mode = Work, reject
+   with actionable error. This is a runtime check, not a state machine concern.
+
+### Backend -- SSE
+
+9. **`task_approval_requested` event:** Emitted on entering AwaitingTaskApproval.
+   Carries title, priority, plan text. On server restart in AwaitingTaskApproval,
+   re-emit on UI reconnect (data is in the serialized ConvState).
 
 ### Frontend
 
-6. **Task approval UI:** When conversation enters AwaitingTaskApproval, open task
-   file in prose reader. Show Approve, Reject, and annotation feedback actions.
-   On feedback: close prose reader, send annotations as message. On next
-   propose_plan: reopen prose reader with updated content.
+10. **`awaiting_task_approval` state variant:** Add to ConversationState union.
+    Handle in all switches (StateBar, breadcrumb, utils). DisplayState mapping.
 
-7. **Work mode indicator:** When conv_mode transitions to Work, show branch name
-   in conversation header. Update mode badge.
+11. **ProseReader task approval mode:** Extend with `taskApproval` prop adding
+    Approve, Reject buttons alongside existing Send Notes. Render plan content
+    from the SSE event payload (not from a file on disk).
+
+12. **Auto-open on state transition:** ConversationPage watches for
+    `awaiting_task_approval` phase and opens ProseReader in approval mode.
+
+13. **Work mode indicator:** Show branch name in StateBar when in Work mode.
+    Add `branch_name` field to Conversation API response.
+
+14. **API endpoints:** `POST /api/conversations/:id/approve-task`,
+    `POST /api/conversations/:id/reject-task`. Feedback uses existing
+    message endpoint.
 
 ## Acceptance Criteria
 
-- [ ] `propose_plan` tool available in Explore mode, blocked in Work/Standalone
-- [ ] Task file written to `tasks/` in taskmd format with correct next number
-- [ ] `git commit --only` used -- user's staging area untouched
-- [ ] Conversation enters AwaitingTaskApproval and pauses
-- [ ] UI shows task file in prose reader with approve/reject/feedback
-- [ ] Approve creates branch and transitions to Work mode
+- [ ] `propose_plan` intercepted at LlmResponse, never enters ToolExecuting
+- [ ] propose_plan with other tools in same response produces error
+- [ ] AwaitingTaskApproval state carries plan data, fully serializable
+- [ ] Approve writes task file, commits to main, creates branch, checks it out
+- [ ] Approve transitions to Work mode with branch name in response
 - [ ] Feedback closes prose reader, delivers annotations, returns to Explore
 - [ ] Agent can call propose_plan again after feedback (revision loop works)
-- [ ] Reject marks task abandoned, stays Explore
-- [ ] Server restart restores AwaitingTaskApproval state correctly
-- [ ] update_task presents changes for user approval before committing to main
-- [ ] Only one Work conversation per project (error on second approve)
+- [ ] Reject returns to Explore with no git operations
+- [ ] Server restart restores AwaitingTaskApproval from serialized state
+- [ ] Only one Work conversation per project (runtime check)
+- [ ] Branch name collision handled (check before create)
 - [ ] `./dev.py check` passes
-
-## Value Delivered
-
-Human-in-the-loop approval workflow. Agent proposes, user reviews with line-level
-feedback, agent can revise. No writes happen without explicit approval. Branch
-isolation proves the full logical flow (Explore -> propose -> approve -> Work)
-even before M3 adds physical worktree isolation.
 
 ## Scope boundary (M2 vs M3)
 

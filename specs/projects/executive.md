@@ -20,8 +20,9 @@ the state machine state. The state machine emits typed effects for git operation
 the executor performs them. Two new states: `AwaitingTaskApproval` (task plan under
 human review) and `AwaitingMergeApproval` (diff under human review before merge).
 Worktree paths are derived from conversation IDs — collision is structurally
-impossible. Two new tools: `propose_plan` (Explore mode only) and `update_task` (Work
-mode, parent conversations only). Tool registry is configured by mode: patch is
+impossible. One new tool: `propose_plan` (Explore mode only, pure data carrier
+intercepted like submit_result). During Work mode, agents update task files via
+the standard patch tool. Tool registry is configured by mode: patch is
 disabled in Explore, enabled in Work. Work sub-agents inherit the parent's worktree
 and can optionally receive write access (one at a time). A filesystem watcher detects
 main branch advancement and emits ambient SSE notifications.
@@ -41,7 +42,7 @@ main branch advancement and emits ambient SSE notifications.
 | **REQ-PROJ-009:** Complete a Task and Propose Merging to Main | ❌ Not Started | - |
 | **REQ-PROJ-010:** Abandon a Task Without Merging | ❌ Not Started | - |
 | **REQ-PROJ-011:** Ambient Awareness of Main Branch Advancement | ❌ Not Started | - |
-| **REQ-PROJ-012:** Provide propose_plan and update_task Tools to Agents | ❌ Not Started | - |
+| **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ❌ Not Started | Pure data carrier, intercepted like submit_result |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 0601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 0601 (M1). Project tabs, mode badges |
 | **REQ-PROJ-015:** Project Worktree Registry | ❌ Not Started | Track worktrees, reconcile on startup |

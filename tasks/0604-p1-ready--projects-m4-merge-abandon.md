@@ -29,9 +29,9 @@ Read first:
 
 ### Backend
 
-1. **AwaitingMergeApproval state:** New ConvState variant. Entered when agent calls
-   `update_task` with status `ready-for-review` and the user approves the status
-   update. Holds task_id, diff_summary, and reply channel.
+1. **AwaitingMergeApproval state:** New ConvState variant. Trigger mechanism TBD
+   (e.g., user-initiated "request review" action, or a dedicated tool). Holds
+   task_id, diff_summary. No `update_task` tool -- agents use patch for task files.
 
 2. **Diff generation:** On entering AwaitingMergeApproval, generate a summary of
    changes between the task branch and main (file list, insertions/deletions).
@@ -78,7 +78,7 @@ Read first:
 
 ## Acceptance Criteria
 
-- [ ] `update_task` with `ready-for-review` (after user approval) enters AwaitingMergeApproval
+- [ ] Merge trigger (mechanism TBD) enters AwaitingMergeApproval
 - [ ] Diff summary generated and shown to user
 - [ ] Approve merges branch to main, cleans up worktree and branch
 - [ ] Task file updated to `done` on main after merge

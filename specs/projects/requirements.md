@@ -72,58 +72,57 @@ none of them write anything.
 ### REQ-PROJ-003: Propose a Task to Initiate Work Mode
 
 WHEN agent calls the `propose_plan` tool with title, priority, and a written plan
-THE SYSTEM SHALL assign the next sequential task ID for the project
-AND write a task file to the `tasks/` directory at the repository root
-AND commit the task file to main using `git commit --only <task-file>`
-  (this commits only the task file regardless of working tree or staging area state)
+THE SYSTEM SHALL intercept it at the LlmResponse handler (like submit_result)
+AND NOT execute any side effects (no file writes, no git operations)
+AND persist the assistant message and a synthetic tool result atomically
 AND transition the conversation to AwaitingTaskApproval state
 AND pause agent execution until the user responds
 
-WHEN `propose_plan` is called with a task_id that already exists (revision after feedback)
-THE SYSTEM SHALL update the existing task file with the revised plan
-AND commit the update to main using `git commit --only <task-file>`
-AND transition the conversation to AwaitingTaskApproval state
+THE AwaitingTaskApproval state SHALL carry the plan content (title, priority, plan text)
+as serializable data, NOT as a file path or git reference
 
 WHEN `propose_plan` is called while the conversation is not in Explore mode
 THE SYSTEM SHALL reject the call with an error explaining that plans must be proposed
 from Explore mode
 
-**Rationale:** The task creation moment is the natural inflection point between thinking
-and doing. Pausing for human review before creating a branch ensures the user has
-approved the approach before any code modifications happen. Using `git commit --only`
-avoids interfering with the user's staging area or uncommitted work.
+**Rationale:** `propose_plan` is a pure data carrier with no side effects. The plan
+exists only in the state machine and prose reader until the user approves. This keeps
+the feedback loop cheap (no git operations, no files to clean up on reject) and defers
+all git work to the approval moment when the user has committed to the approach.
 
 ---
 
 ### REQ-PROJ-004: Review and Iterate on Task Plan Before Starting Work
 
 WHEN conversation enters AwaitingTaskApproval state
-THE SYSTEM SHALL automatically open the task file in the prose reader
+THE SYSTEM SHALL open the prose reader with the plan content from the state
 AND present Approve and Discard actions alongside the standard annotation feedback
 
 WHEN user sends annotation feedback
 THE SYSTEM SHALL close the prose reader
 AND deliver the annotations to the agent as a user message
 AND transition the conversation to Explore mode (Idle)
-AND the agent MAY revise the plan and call `propose_plan` again with the same task_id
+AND the agent MAY revise the plan and call `propose_plan` again
   (which re-enters AwaitingTaskApproval and reopens the prose reader)
 
 WHEN user approves the task
-THE SYSTEM SHALL create a branch named `task-{NNN}-{slug}` from main HEAD
+THE SYSTEM SHALL assign the next sequential task ID for the project
+AND write a task file to `tasks/` in taskmd format
+AND commit the task file to main using `git add <task-file> && git commit --only <task-file>`
+AND create a branch named `task-{NNNN}-{slug}` from main HEAD
 AND checkout that branch in the project checkout
 AND transition the conversation to Work mode
-AND resume agent execution with "Task approved. You are on branch task-{NNN}-{slug}."
+AND resume agent execution with "Task approved. You are on branch task-{NNNN}-{slug}."
 
 WHEN user discards the task
-THE SYSTEM SHALL update the task file status to `abandoned` on main
-AND return the conversation to Explore mode
+THE SYSTEM SHALL return the conversation to Explore mode
 AND return a rejection result to the agent
+AND NOT perform any git operations (no file was written, nothing to clean up)
 
-**Rationale:** The prose reader gives users a comfortable interface for reviewing
-structured plans. Closing the prose reader on feedback and reopening on the next
-`propose_plan` call keeps state transitions clear — the conversation is unambiguously
-in Explore or AwaitingTaskApproval, never a hybrid. Iterating on the plan before
-creating a branch keeps the feedback loop cheap.
+**Rationale:** All git operations are deferred to the approval moment. The feedback
+loop is entirely in-memory: no files written, no commits, no branches until the user
+explicitly approves. Discarding a task is free — there is nothing to undo. The prose
+reader renders from the plan content carried in the state, not from a file on disk.
 
 ---
 
@@ -147,19 +146,21 @@ because their code changes never share a directory.
 
 ### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
-WHEN the system creates a task file
-THE SYSTEM SHALL write it to `tasks/` with filename `{NNNN}-{priority}-{status}--{slug}.md`
+WHEN the user approves a task (REQ-PROJ-004)
+THE SYSTEM SHALL write a task file to `tasks/` with filename
+  `{NNNN}-{priority}-{status}--{slug}.md`
 AND include frontmatter with: task ID, priority, status, branch name, conversation ID,
   and creation date
-AND include a Plan section containing the agent's proposed approach
-AND include a Progress section for the agent to update as work proceeds
+AND include a Plan section containing the agent's proposed approach as approved
+AND include a Progress section (initially empty, updated by the agent via patch tool)
 AND commit the file to the main branch
 
-WHEN the agent calls `update_task` with a status or progress change
-THE SYSTEM SHALL present the proposed update to the user for approval
-AND on approval, update the task file on the main branch
-AND rename the file if the status slug in the filename changes
-AND commit the change to main using `git commit --only <task-file>`
+Task files are only created on approval. During the propose/feedback loop, the plan
+exists only in the AwaitingTaskApproval state — no file on disk, no git commit.
+
+WHEN the agent updates a task file during Work mode (via patch tool)
+THE SYSTEM SHALL allow edits to the task file on the task branch like any other file
+AND the updates SHALL merge to main with the rest of the code changes (M4)
 
 WHEN any conversation in Explore mode reads the `tasks/` directory
 THE SYSTEM SHALL show all task files including those for in-progress work conversations
@@ -167,9 +168,7 @@ THE SYSTEM SHALL show all task files including those for in-progress work conver
 **Rationale:** Task files on main give every conversation — whether Explore or Work —
 project-wide situational awareness. An agent in Explore mode can see what tasks are
 in-progress, planned, or done without any special API. The git history of task files
-is a human-readable audit trail of all work attempted on the project. Requiring user
-approval before committing status/progress updates ensures the user controls what
-appears on main.
+is a human-readable audit trail of all work attempted on the project.
 
 ---
 
@@ -217,7 +216,10 @@ one-Work-sub-agent constraint maintains a single writer per worktree at all time
 
 ### REQ-PROJ-009: Complete a Task and Propose Merging to Main
 
-WHEN agent calls `update_task` with status set to `ready-for-review`
+**NOTE:** The merge trigger mechanism will be defined in M4. `update_task` has been
+removed; the trigger may be a user-initiated action or a dedicated tool.
+
+WHEN the agent signals ready-for-review (mechanism TBD in M4)
 THE SYSTEM SHALL generate a summary of changes between the worktree branch and main
 AND present the diff and task file to the user for final review
 AND pause agent execution
@@ -279,34 +281,31 @@ Neither case warrants an interruption; ambient indicators respect the current fo
 
 ---
 
-### REQ-PROJ-012: Provide propose_plan and update_task Tools to Agents
+### REQ-PROJ-012: Provide propose_plan Tool to Agents
 
 WHEN agent is in Explore mode
 THE SYSTEM SHALL provide the `propose_plan` tool
 WHICH accepts: title (required string), priority (required: p0-p3),
-  plan (required string), and task_id (optional, for revisions after feedback)
-
-WHEN agent is in Work mode
-THE SYSTEM SHALL provide the `update_task` tool
-WHICH accepts: status (optional enum) and progress (optional string)
-AND the system SHALL present the update to the user for approval before committing
+  and plan (required string describing the proposed approach)
 
 WHEN `propose_plan` is called outside Explore mode
 THE SYSTEM SHALL reject the call with "propose_plan is only available in Explore mode"
 
-WHEN `update_task` is called outside Work mode
-THE SYSTEM SHALL reject the call with "update_task is only available in Work mode"
-
-WHEN either tool is called by a sub-agent
+WHEN `propose_plan` is called by a sub-agent
 THE SYSTEM SHALL reject the call
 AND explain that task management is the parent conversation's responsibility
 
+`propose_plan` is a pure data carrier — it has no side effects. It is intercepted
+at the LlmResponse handler (like submit_result for sub-agents) and never enters the
+tool executor. The plan data flows into the AwaitingTaskApproval state.
+
+During Work mode, the agent updates task files directly using the patch tool like
+any other file. No dedicated `update_task` tool is needed.
+
 **Rationale:** `propose_plan` is the agent's way of saying "I have a plan, please
-review it." The name signals human review is required. `update_task` is for progress
-and status updates during active work. Both tools ensure task files conform to the
-Phoenix-managed format, IDs are assigned correctly, and status transitions are
-validated. Sub-agents cannot manage tasks because they are short-lived workers
-operating under a parent's direction.
+review it." The name signals human review is required. Keeping it as a pure data
+carrier with no side effects means the feedback loop is free (no git work to undo)
+and the implementation follows the established submit_result interception pattern.
 
 ---
 
@@ -386,7 +385,6 @@ AND NOT associate it with any project
 
 WHILE a conversation is in Standalone mode
 THE SYSTEM SHALL NOT provide the `propose_plan` tool
-AND SHALL NOT provide the `update_task` tool
 AND SHALL NOT allow transition to Explore or Work modes
 
 WHEN displaying a Standalone conversation

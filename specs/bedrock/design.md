@@ -438,8 +438,7 @@ requiring every state variant to carry mode.
 |------|---------|------|
 | `patch` | Disabled | Enabled (worktree only) |
 | `bash` | Allowed (read-only enforced) | Allowed (write in worktree) |
-| `propose_plan` | Allowed | Disabled |
-| `update_task` | Disabled | Allowed (parent only) |
+| `propose_plan` | Allowed (intercepted, not executed) | Disabled |
 | `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed |
 
 ## Task Approval State (REQ-BED-028, REQ-PROJ-003, REQ-PROJ-004)
@@ -463,17 +462,18 @@ enum TaskApprovalOutcome {
 Transitions:
 
 ```
-ToolExecuting (propose_plan call) → AwaitingTaskApproval
-    Effects: CommitTaskFile, EmitTaskApprovalEvent
+LlmRequesting + LlmResponse(propose_plan) → AwaitingTaskApproval
+    Effects: PersistCheckpoint(ToolRound), BroadcastState
+    Note: intercepted at LlmResponse like submit_result, never enters ToolExecuting
 
 AwaitingTaskApproval + Approved → Idle (mode becomes Work)
-    Effects: CreateBranch, CheckoutBranch, UpdateTaskStatus(in-progress), PersistMode
+    Effects: CommitTaskFile, CreateBranch, CheckoutBranch, PersistMode
 
 AwaitingTaskApproval + FeedbackProvided → Idle (mode stays Explore)
     Effects: (annotations delivered as user message; agent may call propose_plan again)
 
 AwaitingTaskApproval + Rejected → Idle (mode stays Explore)
-    Effects: UpdateTaskStatus(abandoned)
+    Effects: (no git operations — nothing was written to disk)
 ```
 
 On server restart with conversation in `AwaitingTaskApproval`: restore state from DB,
@@ -497,7 +497,7 @@ enum MergeApprovalOutcome {
 Transitions:
 
 ```
-ToolExecuting (update_task with ready-for-review) → AwaitingMergeApproval
+(merge trigger TBD in M4) → AwaitingMergeApproval
     Effects: GenerateDiff, EmitMergeApprovalEvent
 
 AwaitingMergeApproval + Approved → Idle (mode becomes Explore)

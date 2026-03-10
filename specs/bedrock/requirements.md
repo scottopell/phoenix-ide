@@ -333,7 +333,7 @@ AND configure its working directory as the parent's worktree path
 AND enforce that only one Work sub-agent exists per parent at a time
 
 WHEN sub-agent is running
-THE SYSTEM SHALL NOT provide `propose_plan` or `update_task` tools to sub-agents
+THE SYSTEM SHALL NOT provide `propose_plan` tool to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
@@ -484,7 +484,7 @@ AND record the worktree path and associated task ID in the mode field
 
 WHILE a conversation is in Standalone mode
 THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
-AND SHALL NOT provide `propose_plan` or `update_task` tools
+AND SHALL NOT provide `propose_plan` tool
 AND the mode SHALL NOT change for the lifetime of the conversation
 
 WHEN conversation mode changes (Explore to Work, or Work to Explore)
@@ -504,45 +504,45 @@ task tracking, branch isolation) that require a git repository.
 
 ### REQ-BED-028: Task Approval State
 
-WHEN the `propose_plan` tool completes (task file committed to main)
-THE SYSTEM SHALL transition the conversation to AwaitingTaskApproval state
-AND store the task ID and task file path in the state
-AND pause all agent execution
-AND emit a `task_approval_requested` SSE event with the task file content
+WHEN the LLM response contains a `propose_plan` tool call
+THE SYSTEM SHALL intercept it at the LlmResponse handler (same pattern as submit_result)
+AND NOT route it through the tool executor
+AND persist the assistant message and a synthetic tool result as a CheckpointData::ToolRound
+AND transition the conversation to AwaitingTaskApproval state
+AND emit a `task_approval_requested` SSE event with the plan content
+
+THE AwaitingTaskApproval state SHALL carry: title, priority, and plan text
+  (all serializable data — no file paths, no oneshot channels, no git references)
 
 WHEN the user approves the task while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the propose_plan tool call with a success result
-AND create branch `task-{NNN}-{slug}` from main HEAD
-AND checkout that branch
+THE SYSTEM SHALL write a task file to `tasks/` and commit to main
+AND create branch `task-{NNNN}-{slug}` from main HEAD and checkout it
 AND transition the conversation to Idle in Work mode
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
 THE SYSTEM SHALL close the prose reader
 AND deliver the annotations to the agent as a user message
 AND transition the conversation to Idle in Explore mode
-  (the agent may revise the plan and call `propose_plan` again with the same task_id,
-   which re-enters AwaitingTaskApproval and reopens the prose reader)
+  (the agent may revise and call `propose_plan` again, re-entering AwaitingTaskApproval)
 
 WHEN the user discards the task while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the propose_plan tool call with a rejection result
-AND update the task file status to `abandoned` on main
-AND transition the conversation to Idle in Explore mode
+THE SYSTEM SHALL transition the conversation to Idle in Explore mode
+AND NOT perform any git operations (nothing was written to disk)
 
 **Persistence and restart:**
 
 WHEN the server persists AwaitingTaskApproval to the database
-THE SYSTEM SHALL store the task_id and task_file_path as part of the serialized ConvState
+THE SYSTEM SHALL store the title, priority, and plan text as part of the serialized ConvState
 
 WHEN the server restarts and loads a conversation in AwaitingTaskApproval
-THE SYSTEM SHALL read the task file from disk (it is on main, always present)
-AND reconstruct the AwaitingTaskApproval state without a oneshot channel
+THE SYSTEM SHALL reconstruct the state from the serialized data (all data is in the DB)
 AND re-emit the `task_approval_requested` SSE event when the UI reconnects
 
 **Rationale:** AwaitingTaskApproval is a first-class state because it has a distinct
 set of valid incoming events (approve, discard, feedback) and a distinct UI
-representation (prose reader with task file open). Making it a flag on an existing
-state would require every handle_outcome arm to check the flag — a
-correct-by-construction violation.
+representation (prose reader with plan content). `propose_plan` follows the
+submit_result interception pattern — pure data carrier, no side effects, no tool
+execution. All git operations are deferred to the approval moment.
 
 **Dependencies:** REQ-PROJ-003, REQ-PROJ-004
 
