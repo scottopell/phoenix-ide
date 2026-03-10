@@ -660,52 +660,6 @@ def cmd_tasks_fix() -> bool:
 # =============================================================================
 
 
-def _mint_api_key_from_oauth(oauth_token: str) -> str | None:
-    """Exchange a Claude OAuth token for a persistent Anthropic API key.
-
-    Calls the internal claude_cli endpoint that Claude Code uses to convert
-    its OAuth session into a standard sk-ant-api03-* key. This is undocumented
-    but reverse-engineered from Claude Code's source. We send an honest
-    User-Agent so Anthropic can identify and block us if they choose to.
-
-    Returns the API key string, or None if the exchange fails.
-    """
-    import urllib.request
-    import urllib.error
-
-    url = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key"
-    req = urllib.request.Request(
-        url,
-        method="POST",
-        data=b"{}",
-        headers={
-            "Authorization": f"Bearer {oauth_token}",
-            "Content-Type": "application/json",
-            "User-Agent": "phoenix-ide/dev (personal use; not claude-code)",
-            "anthropic-version": "2023-06-01",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            api_key = data.get("raw_key")
-            if api_key:
-                print(f"✓ Minted API key from OAuth token ({api_key[:18]}...)")
-                return api_key
-            print(f"Warning: create_api_key response missing raw_key: {data}")
-            return None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        if e.code == 403:
-            # claude.ai Pro/Max login lacks org:create_api_key scope — expected.
-            # The caller will fall back to raw OAuth Bearer token, which works fine.
-            print(f"  (Scope check failed for create_api_key — using Bearer token fallback)")
-        else:
-            print(f"Warning: create_api_key failed ({e.code}): {body}")
-        return None
-    except Exception as e:
-        print(f"Warning: create_api_key request failed: {e}")
-        return None
 
 
 def detect_prod_env() -> str:
@@ -849,15 +803,9 @@ class SystemdConfig:
     # For Lima: uses EnvironmentFile for API key; for native: uses LLM_GATEWAY env var
     env_file: str | None = None
     llm_gateway: str | None = None
-    # When set, injects Environment=HOME=<path> so the service user can read
-    # ~/.claude/.credentials.json for Claude OAuth token auth.
+    # When set, injects Environment=HOME=<path> so the service user can find
+    # ~/.claude/.credentials.json for per-request OAuth token reads.
     home_dir: str | None = None
-    # Claude OAuth access token read at deploy time (bypasses file permission issues
-    # since the service user typically cannot read ~/.claude/.credentials.json).
-    anthropic_oauth_token: str | None = None
-    # API key minted from OAuth token via create_api_key endpoint (preferred over
-    # oauth_token since it uses standard x-api-key auth with no fingerprinting).
-    anthropic_api_key: str | None = None
 
 
 def detect_service_user() -> str:
@@ -939,12 +887,6 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
         # System users have no real home, so we point HOME at the deploying user's home.
         env_lines.append(f"Environment=HOME={config.home_dir}")
 
-    if config.anthropic_api_key:
-        # API key minted from OAuth token at deploy time — standard x-api-key auth.
-        env_lines.append(f"Environment=ANTHROPIC_API_KEY={config.anthropic_api_key}")
-    elif config.anthropic_oauth_token:
-        # Fallback: raw OAuth Bearer token (works if Anthropic ever enables it).
-        env_lines.append(f"Environment=ANTHROPIC_OAUTH_TOKEN={config.anthropic_oauth_token}")
 
     env_section = "\n".join(env_lines)
 
@@ -1018,33 +960,16 @@ def native_prod_deploy(version: str | None = None):
     subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
     subprocess.run(["sudo", "chown", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
 
-    # Read Claude OAuth token at deploy time (as the deploying user who can read it).
-    # The service user (e.g. phoenix-dev) cannot read ~/.claude/.credentials.json
-    # directly (600 permissions), so we bake the result into the systemd unit instead.
-    oauth_creds = Path.home() / ".claude" / ".credentials.json"
-    anthropic_oauth_token = None
-    anthropic_api_key = None
-    if oauth_creds.exists():
-        try:
-            import json as _json
-            creds = _json.loads(oauth_creds.read_text())
-            token_data = creds.get("claudeAiOauth", {})
-            anthropic_oauth_token = token_data.get("accessToken")
-            expires_at = token_data.get("expiresAt", "unknown")
-            if anthropic_oauth_token:
-                print(f"Found Claude OAuth token (expires: {expires_at})")
-                anthropic_api_key = _mint_api_key_from_oauth(anthropic_oauth_token)
-        except Exception as e:
-            print(f"Warning: Found ~/.claude/.credentials.json but could not read token: {e}")
-
-    # Configure for native deployment
+    # Configure for native deployment.
+    # OAuth token auth: the binary reads ~/.claude/.credentials.json per request.
+    # Requires: chmod g+r ~/.claude/.credentials.json + service user in owner's group.
+    # See skills/phoenix-deployment/SYSTEMD.md for setup instructions.
     config = dataclasses.replace(
         NATIVE_SYSTEMD_CONFIG,
         user=service_user,
         db_path=str(native_db_path),
         llm_gateway=get_llm_gateway(),
-        anthropic_api_key=anthropic_api_key,
-        anthropic_oauth_token=anthropic_oauth_token if not anthropic_api_key else None,
+        home_dir=str(Path.home()),
     )
 
     # Install systemd socket unit (for socket activation)
@@ -1415,53 +1340,28 @@ def native_prod_status():
     else:
         print(f"Production: {status}")
     
-    # Show systemd overrides and OAuth token expiry info.
-    # The token may be in the main unit file or in a drop-in override.
-    oauth_token: str | None = None
-
-    # Check the main service unit first
-    main_unit = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
-    unit_sources: list[tuple[str, str]] = []
-    if main_unit.exists():
+    # Show OAuth token status from credentials file (read directly by the binary).
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    if creds_path.exists():
         try:
-            unit_sources.append((main_unit.name, main_unit.read_text()))
+            import datetime
+            creds = json.loads(creds_path.read_text())
+            expires_at = creds["claudeAiOauth"]["expiresAt"]
+            expires_dt = datetime.datetime.fromtimestamp(
+                int(expires_at) / 1000, tz=datetime.timezone.utc
+            )
+            now = datetime.datetime.now(tz=datetime.timezone.utc)
+            if expires_dt < now:
+                expiry_str = f"EXPIRED (was {expires_dt.strftime('%Y-%m-%d %H:%M UTC')})"
+                print(f"  ⚠ OAuth token expired — run `claude login` to refresh")
+            else:
+                delta = expires_dt - now
+                hours = int(delta.total_seconds() // 3600)
+                mins = int((delta.total_seconds() % 3600) // 60)
+                expiry_str = f"{expires_dt.strftime('%Y-%m-%d %H:%M UTC')} (in {hours}h{mins}m)"
+            print(f"  OAuth token: {expiry_str}")
         except Exception:
             pass
-
-    # Then check drop-in overrides
-    overrides = list_systemd_overrides()
-    unit_sources.extend(overrides)
-
-    for _filename, content in unit_sources:
-        for line in content.split('\n'):
-            if line.startswith('Environment=ANTHROPIC_OAUTH_TOKEN='):
-                oauth_token = line.split('=', 2)[2]
-
-    if oauth_token:
-            # Show expiry from credentials file rather than parsing the token itself
-            creds_path = Path.home() / ".claude" / ".credentials.json"
-            expiry_str = "unknown"
-            try:
-                creds = json.loads(creds_path.read_text())
-                expires_at = creds["claudeAiOauth"]["expiresAt"]
-                # expiresAt is Unix timestamp in milliseconds
-                import datetime
-                expires_dt = datetime.datetime.fromtimestamp(
-                    int(expires_at) / 1000, tz=datetime.timezone.utc
-                )
-                now = datetime.datetime.now(tz=datetime.timezone.utc)
-                if expires_dt < now:
-                    expiry_str = f"EXPIRED (was {expires_dt.strftime('%Y-%m-%d %H:%M UTC')})"
-                else:
-                    delta = expires_dt - now
-                    hours = int(delta.total_seconds() // 3600)
-                    mins = int((delta.total_seconds() % 3600) // 60)
-                    expiry_str = f"{expires_dt.strftime('%Y-%m-%d %H:%M UTC')} (in {hours}h{mins}m)"
-            except Exception:
-                pass
-            print(f"    ANTHROPIC_OAUTH_TOKEN={oauth_token[:18]}... (expires: {expiry_str})")
-            if "EXPIRED" in expiry_str:
-                print(f"  ⚠ OAuth token expired — run `./dev.py prod deploy` to refresh")
 
 
 def native_prod_stop():

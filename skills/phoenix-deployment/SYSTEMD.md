@@ -34,6 +34,20 @@ sudo systemctl restart phoenix-ide        # required for group change to take ef
 Without this, the server cannot validate working directories under `~/<username>/`
 and will return `{"error":"Directory does not exist"}` even for real paths.
 
+## Claude OAuth credentials
+
+`~/.claude/.credentials.json` (written by `claude login`) is 600 by default. The
+service user cannot read it. Fix with one command — the group membership above is a
+prerequisite:
+
+```bash
+chmod g+r ~/.claude/.credentials.json   # make it 640
+```
+
+After this, `./dev.py prod deploy` no longer needs to bake the token into the systemd
+unit at deploy time. The binary reads the file directly on each request, so token
+refreshes take effect immediately without redeploying.
+
 ## Checking status
 
 ```bash

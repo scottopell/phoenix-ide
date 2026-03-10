@@ -20,99 +20,114 @@ pub enum GatewayStatus {
     Unreachable,
 }
 
+/// Provides an OAuth bearer token on demand, read fresh on each call.
+///
+/// Two implementations:
+/// - `EnvTokenProvider`: reads from an environment variable
+/// - `JsonFileTokenProvider`: reads from a JSON file at a dot-separated key path
+pub trait TokenProvider: Send + Sync + std::fmt::Debug {
+    /// Return the current token, or `None` if unavailable (missing file, unset var, etc.).
+    fn token(&self) -> Option<String>;
+}
+
+/// Reads a bearer token from an environment variable on each call.
+#[derive(Debug)]
+pub struct EnvTokenProvider {
+    var_name: String,
+}
+
+impl EnvTokenProvider {
+    pub fn new(var_name: impl Into<String>) -> Self {
+        Self {
+            var_name: var_name.into(),
+        }
+    }
+}
+
+impl TokenProvider for EnvTokenProvider {
+    fn token(&self) -> Option<String> {
+        std::env::var(&self.var_name).ok().filter(|t| !t.is_empty())
+    }
+}
+
+/// Reads a bearer token from a JSON file, traversing a dot-separated key path.
+///
+/// Example: path `["claudeAiOauth", "accessToken"]` extracts
+/// `json["claudeAiOauth"]["accessToken"]` as a string.
+/// Returns `None` silently if the file is absent or the path doesn't resolve.
+#[derive(Debug)]
+pub struct JsonFileTokenProvider {
+    path: std::path::PathBuf,
+    key_path: Vec<String>,
+}
+
+impl JsonFileTokenProvider {
+    pub fn new(path: impl Into<std::path::PathBuf>, key_path: Vec<String>) -> Self {
+        Self {
+            path: path.into(),
+            key_path,
+        }
+    }
+}
+
+impl TokenProvider for JsonFileTokenProvider {
+    fn token(&self) -> Option<String> {
+        let content = std::fs::read_to_string(&self.path).ok()?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| {
+                tracing::warn!(path = %self.path.display(), error = %e, "Failed to parse JSON credentials file");
+            })
+            .ok()?;
+        for key in &self.key_path {
+            value = value.get(key)?.clone();
+        }
+        value.as_str().map(std::string::ToString::to_string)
+    }
+}
+
 /// How to authenticate Anthropic API requests.
 ///
 /// Determines which header carries the credential:
 /// - `ApiKey`: `x-api-key: <key>` (standard API keys and gateway implicit auth)
 /// - `Bearer`: `Authorization: Bearer <token>` (Claude OAuth tokens from `claude login`)
-#[derive(Debug, Clone)]
 pub enum AnthropicAuth {
     /// Standard API key — sent as `x-api-key` header.
     /// Also used for gateway mode with the sentinel value `"implicit"`.
     ApiKey(String),
     /// OAuth bearer token — sent as `Authorization: Bearer` header.
-    /// Sourced from `~/.claude/.credentials.json` written by `claude login`.
-    Bearer(String),
+    /// Token is fetched from the provider on each request (never cached).
+    Bearer(Arc<dyn TokenProvider>),
+}
+
+impl std::fmt::Debug for AnthropicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => write!(f, "ApiKey([redacted])"),
+            Self::Bearer(_) => write!(f, "Bearer([token provider])"),
+        }
+    }
+}
+
+impl Clone for AnthropicAuth {
+    fn clone(&self) -> Self {
+        match self {
+            Self::ApiKey(k) => Self::ApiKey(k.clone()),
+            Self::Bearer(p) => Self::Bearer(Arc::clone(p)),
+        }
+    }
 }
 
 impl AnthropicAuth {
-    /// Extract the credential string regardless of variant.
-    /// Used by providers that always take a plain string (e.g. `OpenAI`).
+    /// Extract the API key string. Only valid for `ApiKey` variant.
+    /// For OpenAI/Fireworks providers that always use a plain key string.
     pub fn as_str(&self) -> &str {
         match self {
-            Self::ApiKey(k) | Self::Bearer(k) => k.as_str(),
+            Self::ApiKey(k) => k.as_str(),
+            Self::Bearer(_) => {
+                panic!("AnthropicAuth::as_str() called on Bearer variant — use TokenProvider::token() instead")
+            }
         }
     }
-}
-
-// Private helpers for OAuth credential loading
-#[derive(serde::Deserialize)]
-struct OAuthCredentials {
-    #[serde(rename = "claudeAiOauth")]
-    claude_ai_oauth: OAuthToken,
-}
-
-#[derive(serde::Deserialize)]
-struct OAuthToken {
-    #[serde(rename = "accessToken")]
-    access_token: String,
-    #[serde(rename = "expiresAt")]
-    expires_at: String,
-}
-
-/// Attempt to load an OAuth access token from `$HOME/.claude/.credentials.json`.
-///
-/// Returns `None` (silently) if the file doesn't exist, and logs a warning if
-/// the file exists but is unreadable or the token has expired.
-fn load_claude_oauth_token() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let creds_path = std::path::Path::new(&home)
-        .join(".claude")
-        .join(".credentials.json");
-
-    let content = std::fs::read_to_string(&creds_path).ok()?; // silently absent
-
-    let creds: OAuthCredentials = match serde_json::from_str(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                path = %creds_path.display(),
-                error = %e,
-                "Failed to parse Claude credentials file; ignoring OAuth auth"
-            );
-            return None;
-        }
-    };
-
-    let token = creds.claude_ai_oauth;
-
-    // Check expiry. expiresAt may be RFC3339 or a Unix timestamp in milliseconds.
-    let expired = chrono::DateTime::parse_from_rfc3339(&token.expires_at)
-        .map(|dt| dt < chrono::Utc::now())
-        .or_else(|_| {
-            token
-                .expires_at
-                .parse::<i64>()
-                .map(|ms| chrono::Utc::now().timestamp_millis() > ms)
-        })
-        .unwrap_or_else(|_| {
-            tracing::warn!(
-                expires_at = %token.expires_at,
-                "Could not parse Claude OAuth token expiry; assuming valid"
-            );
-            false
-        });
-
-    if expired {
-        tracing::warn!(
-            expires_at = %token.expires_at,
-            "Claude OAuth token is expired; ignoring (run `claude login` to refresh)"
-        );
-        return None;
-    }
-
-    tracing::info!(expires_at = %token.expires_at, "Loaded Claude OAuth token from ~/.claude/.credentials.json");
-    Some(token.access_token)
 }
 
 /// Configuration for LLM providers
@@ -125,20 +140,40 @@ pub struct LlmConfig {
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
-    /// OAuth access token loaded from `~/.claude/.credentials.json`, if present and unexpired.
-    /// Takes precedence over `anthropic_api_key` for Anthropic models in direct mode.
-    pub anthropic_oauth_token: Option<String>,
+    /// Token provider for Anthropic OAuth Bearer auth. Takes precedence over
+    /// `anthropic_api_key` for Anthropic models in direct mode. Token is fetched
+    /// fresh on each request — no restart needed after `claude login`.
+    pub anthropic_oauth_token: Option<Arc<dyn TokenProvider>>,
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
-        // OAuth token: prefer env var (set by deploy for system service users who
-        // cannot read ~/.claude/.credentials.json at runtime), then fall back to
-        // reading the file directly (works in dev where the process runs as the user).
-        let anthropic_oauth_token = std::env::var("ANTHROPIC_OAUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(load_claude_oauth_token);
+        // Prefer ANTHROPIC_OAUTH_TOKEN env var (explicit override), then fall back to
+        // reading ~/.claude/.credentials.json directly (works in dev and in prod when
+        // the service user has read access via group membership + chmod g+r).
+        let anthropic_oauth_token: Option<Arc<dyn TokenProvider>> = if std::env::var(
+            "ANTHROPIC_OAUTH_TOKEN",
+        )
+        .ok()
+        .filter(|t| !t.is_empty())
+        .is_some()
+        {
+            Some(Arc::new(EnvTokenProvider::new("ANTHROPIC_OAUTH_TOKEN")))
+        } else {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let creds_path = std::path::Path::new(&home)
+                .join(".claude")
+                .join(".credentials.json");
+            if creds_path.exists() {
+                tracing::info!(path = %creds_path.display(), "Found Claude credentials file; will read OAuth token per request");
+                Some(Arc::new(JsonFileTokenProvider::new(
+                    creds_path,
+                    vec!["claudeAiOauth".to_string(), "accessToken".to_string()],
+                )))
+            } else {
+                None
+            }
+        };
 
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
@@ -353,8 +388,8 @@ impl ModelRegistry {
             match spec.provider {
                 Provider::Anthropic => {
                     // OAuth takes precedence over API key
-                    if let Some(token) = config.anthropic_oauth_token.as_ref() {
-                        AnthropicAuth::Bearer(token.clone())
+                    if let Some(provider) = config.anthropic_oauth_token.as_ref() {
+                        AnthropicAuth::Bearer(Arc::clone(provider))
                     } else {
                         let key = config
                             .anthropic_api_key
