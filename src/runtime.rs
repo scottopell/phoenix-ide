@@ -74,12 +74,55 @@ pub struct ConversationHandle {
     pub broadcast_tx: broadcast::Sender<SseEvent>,
 }
 
+/// Typed update for conversation metadata pushed mid-session.
+/// Each field is `Option` — only populated fields are serialized to the client.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConversationMetadataUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conv_mode_label: Option<String>,
+}
+
+/// A conversation enriched with derived display fields for the API layer.
+///
+/// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
+/// all `Conversation` fields at the top level (via `#[serde(flatten)]`) plus
+/// the extra display fields.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnrichedConversation {
+    #[serde(flatten)]
+    pub inner: crate::db::Conversation,
+    pub display_state: String,
+    pub conv_mode_label: String,
+    pub branch_name: Option<String>,
+    pub worktree_path: Option<String>,
+}
+
+/// Breadcrumb entry for showing LLM thought-process trail in the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SseBreadcrumb {
+    #[serde(rename = "type")]
+    pub crumb_type: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
 /// Events sent to SSE clients
 #[derive(Debug, Clone)]
 pub enum SseEvent {
     Init {
-        conversation: serde_json::Value,
-        messages: Vec<serde_json::Value>,
+        conversation: Box<EnrichedConversation>,
+        messages: Vec<crate::db::Message>,
         agent_working: bool,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
@@ -88,14 +131,14 @@ pub enum SseEvent {
         context_window_size: u64,
         /// Model's maximum context window in tokens (for calculating percentage)
         model_context_window: usize,
-        breadcrumbs: Vec<serde_json::Value>,
+        breadcrumbs: Vec<SseBreadcrumb>,
     },
     Message {
-        message: serde_json::Value,
+        message: crate::db::Message,
     },
     StateChange {
-        /// Full state as JSON object (e.g., `{"type":"awaiting_sub_agents","pending_ids":[...]}`)
-        state: serde_json::Value,
+        /// Full typed conversation state
+        state: ConvState,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
     },
@@ -105,6 +148,11 @@ pub enum SseEvent {
         request_id: String,
     },
     AgentDone,
+    /// Pushed when conversation metadata changes mid-session (e.g., cwd/mode after approval).
+    /// Typed struct instead of `Value` — the executor knows exactly which fields changed.
+    ConversationUpdate {
+        update: ConversationMetadataUpdate,
+    },
     Error {
         message: String,
     },

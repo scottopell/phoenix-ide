@@ -12,6 +12,7 @@ export interface Conversation {
   /** Semantic state category from API: idle, working, error, terminal */
   display_state?: 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval';
   branch_name?: string | null;
+  worktree_path?: string | null;
   archived?: boolean;
   project_id?: string | null;
   conv_mode_label?: string;
@@ -142,7 +143,7 @@ export interface SseStateChangeData {
   display_state?: string;
 }
 
-export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'disconnected';
+export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'conversation_update' | 'disconnected';
 export type SseEventData = SseInitData | SseMessageData | SseStateChangeData | Record<string, never>;
 
 export interface ModelInfo {
@@ -437,6 +438,11 @@ export const api = {
 
     es.addEventListener('agent_done', () => {
       onEvent('agent_done', {});
+    });
+
+    es.addEventListener('conversation_update', (e) => {
+      const data = JSON.parse((e as MessageEvent).data);
+      onEvent('conversation_update', data);
     });
 
     es.addEventListener('error', () => {

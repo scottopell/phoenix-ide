@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, ExpansionError, type Conversation, type ImageData } from '../api';
-import { isAgentWorking, isCancellingState } from '../utils';
+import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
@@ -111,7 +111,7 @@ export function ConversationPage() {
             conversationId: cached.id,
             conversation: cached,
             messages: cachedMessages,
-            phase: { type: 'idle' },
+            phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
             contextWindow: { used: 0, total: 200_000 },
           });
         }
@@ -126,8 +126,9 @@ export function ConversationPage() {
                 conversationId: result.conversation.id,
                 conversation: result.conversation,
                 messages: result.messages,
-                phase:
-                  result.display_state === 'working'
+                phase: result.conversation.state
+                  ? parseConversationState(result.conversation.state)
+                  : result.display_state === 'working'
                     ? { type: 'awaiting_llm' }
                     : { type: 'idle' },
                 contextWindow: {
@@ -539,7 +540,7 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' ? (
+      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
         <InputArea
           ref={inputRef}
           conversationId={conversationId}
@@ -567,7 +568,7 @@ export function ConversationPage() {
         onTriggerContinuation={handleTriggerContinuation}
       />
 
-      {/* Task approval overlay */}
+      {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
       {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
         <TaskApprovalReader
           title={atom.phase.title}

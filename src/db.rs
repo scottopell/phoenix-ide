@@ -379,6 +379,7 @@ impl Database {
     }
 
     /// Check if any non-archived conversation for a project is in Work mode
+    #[allow(dead_code)] // May be used for future project-level queries
     pub async fn has_active_work_conversation(&self, project_id: &str) -> DbResult<bool> {
         let row = sqlx::query(
             "SELECT COUNT(*) FROM conversations
@@ -390,6 +391,39 @@ impl Database {
         .await?;
         let count: i64 = row.get(0);
         Ok(count > 0)
+    }
+
+    /// Update conversation working directory (e.g., after worktree creation).
+    pub async fn update_conversation_cwd(&self, id: &str, cwd: &str) -> DbResult<()> {
+        let now = Utc::now();
+        let result =
+            sqlx::query("UPDATE conversations SET cwd = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(cwd)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Get all non-archived Work conversations (for startup worktree reconciliation).
+    pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
+        sqlx::query(
+            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.archived = 0
+               AND json_extract(c.conv_mode, '$.mode') = 'Work'",
+        )
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
     }
 
     /// Archive a conversation

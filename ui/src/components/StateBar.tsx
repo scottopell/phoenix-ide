@@ -177,7 +177,12 @@ export function StateBar({
                 </span>
               </div>
               {conversation.branch_name && (
-                <span className="conv-branch" title={`Branch: ${conversation.branch_name}`}>
+                <span
+                  className="conv-branch"
+                  title={conversation.worktree_path
+                    ? `Branch: ${conversation.branch_name}\nWorktree: ${conversation.worktree_path}`
+                    : `Branch: ${conversation.branch_name}`}
+                >
                   {conversation.branch_name}
                 </span>
               )}

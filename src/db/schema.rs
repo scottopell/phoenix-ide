@@ -115,6 +115,11 @@ pub enum ConvMode {
     Work {
         /// The git branch name for this work conversation (e.g., `task-0042-fix-bug`)
         branch_name: String,
+        /// Absolute path to the git worktree for this conversation.
+        /// `#[serde(default)]` is a rollout shim for existing Work rows -- startup
+        /// reconciliation reverts rows with empty `worktree_path` to Explore.
+        #[serde(default)]
+        worktree_path: String,
     },
 }
 
@@ -137,7 +142,15 @@ impl ConvMode {
     /// The branch name if in Work mode, None otherwise.
     pub fn branch_name(&self) -> Option<&str> {
         match self {
-            Self::Work { branch_name } => Some(branch_name),
+            Self::Work { branch_name, .. } => Some(branch_name),
+            _ => None,
+        }
+    }
+
+    /// The worktree path if in Work mode, None otherwise.
+    pub fn worktree_path(&self) -> Option<&str> {
+        match self {
+            Self::Work { worktree_path, .. } => Some(worktree_path),
             _ => None,
         }
     }

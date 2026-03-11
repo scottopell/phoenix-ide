@@ -69,6 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
 
+    // Reconcile worktrees: revert Work conversations whose worktree is missing
+    reconcile_worktrees(&db).await;
+
     // Initialize LLM registry with model discovery
     let llm_config = LlmConfig::from_env();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
@@ -162,4 +165,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hot_restart::maybe_perform_hot_restart();
 
     Ok(())
+}
+
+/// Reconcile Work conversations whose worktree has been deleted or whose
+/// `worktree_path` is empty (legacy rows predating M3).
+///
+/// For each affected conversation: revert mode to Explore, reset cwd to the
+/// project root, and run `git worktree prune` to clean stale worktree bookkeeping.
+async fn reconcile_worktrees(db: &Database) {
+    let work_convs = match db.get_work_conversations().await {
+        Ok(convs) => convs,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query Work conversations for reconciliation");
+            return;
+        }
+    };
+
+    let mut pruned_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reverted = 0usize;
+
+    for conv in &work_convs {
+        let wt_path = conv.conv_mode.worktree_path().unwrap_or("");
+
+        // Legacy row (empty worktree_path) or worktree directory missing on disk
+        let needs_revert = wt_path.is_empty() || !std::path::Path::new(wt_path).exists();
+
+        if !needs_revert {
+            continue;
+        }
+
+        let reason = if wt_path.is_empty() {
+            "legacy row (empty worktree_path)"
+        } else {
+            "worktree directory missing"
+        };
+        tracing::warn!(
+            conv_id = %conv.id,
+            worktree_path = wt_path,
+            reason,
+            "Reverting Work conversation to Explore"
+        );
+
+        // Revert to Explore mode
+        if let Err(e) = db
+            .update_conversation_mode(&conv.id, &db::ConvMode::Explore)
+            .await
+        {
+            tracing::error!(conv_id = %conv.id, error = %e, "Failed to revert conv_mode");
+            continue;
+        }
+        reverted += 1;
+
+        // Derive project root from worktree path: {root}/.phoenix/worktrees/{id}
+        // If worktree_path is empty, try to detect from the conversation's current cwd
+        let project_root = if wt_path.is_empty() {
+            // Legacy: use git rev-parse from the conversation's cwd
+            db::detect_git_repo_root(std::path::Path::new(&conv.cwd))
+        } else {
+            // Walk up from worktree path to find .phoenix parent
+            std::path::Path::new(wt_path)
+                .ancestors()
+                .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
+                .and_then(|phoenix_dir| phoenix_dir.parent())
+                .map(|p| p.to_string_lossy().to_string())
+        };
+
+        if let Some(ref root) = project_root {
+            if let Err(e) = db.update_conversation_cwd(&conv.id, root).await {
+                tracing::error!(conv_id = %conv.id, error = %e, "Failed to reset cwd");
+            }
+
+            // Prune stale worktrees in this project root (once per root)
+            if pruned_roots.insert(root.clone()) {
+                let root_path = std::path::PathBuf::from(root);
+                if let Err(e) = std::process::Command::new("git")
+                    .args(["worktree", "prune"])
+                    .current_dir(&root_path)
+                    .output()
+                {
+                    tracing::debug!(root = %root, error = %e, "git worktree prune failed");
+                }
+            }
+        }
+    }
+
+    if reverted > 0 {
+        tracing::info!(
+            total_work = work_convs.len(),
+            reverted,
+            "Worktree reconciliation complete"
+        );
+    }
 }

@@ -232,7 +232,7 @@ export function TaskApprovalReader({
 
     window.addEventListener('keydown', handleKeyDown, true); // capture phase
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [annotatingLine, discardConfirmOpen]);
+  }, [annotatingLine, discardConfirmOpen, handleAddNote]);
 
   const handleLongPress = useCallback(
     (lineNumber: number, lineContent: string) => {

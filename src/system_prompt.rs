@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Names of guidance files to look for, in order of preference
@@ -153,6 +154,16 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
 
     // Reverse so root files come first, cwd files last (more specific override)
     files.reverse();
+
+    // Content-hash dedup: in a worktree, the same tracked AGENTS.md appears at both
+    // the worktree path and the project root. Keep the first occurrence (root).
+    let mut seen_hashes: HashSet<u64> = HashSet::new();
+    files.retain(|f| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        f.content.hash(&mut hasher);
+        seen_hashes.insert(hasher.finish())
+    });
+
     files
 }
 
@@ -195,6 +206,17 @@ pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
             );
         }
         prompt.push_str("</available_skills>");
+    }
+
+    // Add worktree grounding when working_dir is inside a .phoenix/worktrees/ path
+    let wd_str = working_dir.to_string_lossy();
+    if let Some(pos) = wd_str.find("/.phoenix/worktrees/") {
+        let project_root = &wd_str[..pos];
+        let _ = write!(
+            prompt,
+            "\n\nYou are working in a git worktree. Your working directory is the worktree, \
+             not the main checkout at {project_root}. Stay grounded here for file operations."
+        );
     }
 
     // Add sub-agent suffix if applicable

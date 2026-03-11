@@ -139,14 +139,9 @@ pub fn transition(
                 usage: usage_data,
             },
         ) => {
-            // REQ-BED-019: Check context threshold BEFORE tool execution
-            if should_trigger_continuation(&usage_data, context.context_window) {
-                return Ok(handle_context_exhaustion(
-                    context, content, tool_calls, usage_data,
-                ));
-            }
-
-            // REQ-BED-028: Intercept propose_plan before normal tool execution
+            // REQ-BED-028: Intercept propose_plan BEFORE context exhaustion check.
+            // If the LLM proposes a plan at >90% context, we still want to surface it
+            // for approval rather than diverting to the continuation flow.
             let propose_plan_tool = tool_calls
                 .iter()
                 .find(|t| matches!(t.input, ToolInput::ProposePlan(_)));
@@ -185,6 +180,14 @@ pub fn transition(
                     )));
                 }
                 unreachable!("propose_plan_tool matched but input was not ProposePlan");
+            }
+
+            // REQ-BED-019: Check context threshold BEFORE tool execution
+            // (but after propose_plan interception above)
+            if should_trigger_continuation(&usage_data, context.context_window) {
+                return Ok(handle_context_exhaustion(
+                    context, content, tool_calls, usage_data,
+                ));
             }
 
             if tool_calls.is_empty() && context.is_sub_agent {
@@ -918,21 +921,25 @@ pub fn transition(
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_agent_done())),
 
-        // AwaitingTaskApproval + TaskApprovalResponse(FeedbackProvided) -> Idle (Explore)
+        // AwaitingTaskApproval + TaskApprovalResponse(FeedbackProvided) -> LlmRequesting
+        // The agent gets a new turn to revise the plan based on user feedback.
         (
             ConvState::AwaitingTaskApproval { .. },
             Event::TaskApprovalResponse {
                 outcome: TaskApprovalOutcome::FeedbackProvided { annotations },
             },
-        ) => Ok(TransitionResult::new(ConvState::Idle)
-            .with_effect(Effect::PersistMessage {
-                content: crate::db::MessageContent::user(annotations),
-                display_data: None,
-                usage_data: None,
-                message_id: uuid::Uuid::new_v4().to_string(),
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_agent_done())),
+        ) => Ok(
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistMessage {
+                    content: crate::db::MessageContent::user(annotations),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::RequestLlm),
+        ),
 
         // AwaitingTaskApproval + TaskApprovalResponse(Rejected) -> Idle (Explore)
         (

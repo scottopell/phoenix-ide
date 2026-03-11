@@ -2,6 +2,7 @@
 //!
 //! REQ-API-005: Real-time Streaming
 
+use super::handlers::enrich_message_for_api;
 use crate::runtime::SseEvent;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
@@ -45,13 +46,15 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             model_context_window,
             breadcrumbs,
         } => {
-            // Messages are already enriched with display info at creation time
+            // Serialize typed data at the SSE boundary
+            let enriched_msgs: Vec<serde_json::Value> =
+                messages.iter().map(enrich_message_for_api).collect();
             (
                 "init",
                 json!({
                     "type": "init",
                     "conversation": conversation,
-                    "messages": messages,
+                    "messages": enriched_msgs,
                     "agent_working": agent_working,
                     "display_state": display_state,
                     "last_sequence_id": last_sequence_id,
@@ -62,12 +65,12 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             )
         }
         SseEvent::Message { message } => {
-            // Message is already enriched with display info at creation time
+            let message_value = enrich_message_for_api(&message);
             (
                 "message",
                 json!({
                     "type": "message",
-                    "message": message
+                    "message": message_value
                 }),
             )
         }
@@ -78,7 +81,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             "state_change",
             json!({
                 "type": "state_change",
-                "state": state,
+                "state": serde_json::to_value(&state).unwrap_or(serde_json::Value::Null),
                 "display_state": display_state
             }),
         ),
@@ -94,6 +97,13 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             "agent_done",
             json!({
                 "type": "agent_done"
+            }),
+        ),
+        SseEvent::ConversationUpdate { update } => (
+            "conversation_update",
+            json!({
+                "type": "conversation_update",
+                "conversation": update
             }),
         ),
         SseEvent::Error { message } => (

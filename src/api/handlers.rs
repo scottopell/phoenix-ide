@@ -30,7 +30,6 @@ use chrono::Datelike;
 use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -126,7 +125,7 @@ pub fn create_router(state: AppState) -> Router {
 /// For agent messages with bash `tool_use` blocks, the `display` field shows a
 /// simplified command (with cd prefixes stripped when they match cwd).
 /// The `display_data` is pre-computed at message creation time and stored in DB.
-fn enrich_message_for_api(msg: &Message) -> Value {
+pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
     let mut json = serde_json::to_value(msg).unwrap_or(Value::Null);
 
     // Only process agent messages with display_data
@@ -144,26 +143,26 @@ fn enrich_message_for_api(msg: &Message) -> Value {
 /// Merge pre-computed `display_data` into content blocks.
 ///
 /// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
-/// Serialize a conversation to JSON with `display_state` included.
-fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
-    let mut v = serde_json::to_value(conv).unwrap_or(Value::Null);
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert(
-            "display_state".to_string(),
-            Value::String(conv.state.display_state().as_str().to_string()),
-        );
-        obj.insert(
-            "conv_mode_label".to_string(),
-            Value::String(conv.conv_mode.label().to_string()),
-        );
-        // Expose branch_name at top level for Work mode conversations
-        let branch_name = conv
+/// Build an `EnrichedConversation` with derived display fields.
+fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::EnrichedConversation {
+    crate::runtime::EnrichedConversation {
+        display_state: conv.state.display_state().as_str().to_string(),
+        conv_mode_label: conv.conv_mode.label().to_string(),
+        branch_name: conv.conv_mode.branch_name().map(String::from),
+        worktree_path: conv
             .conv_mode
-            .branch_name()
-            .map_or(Value::Null, |s| Value::String(s.to_string()));
-        obj.insert("branch_name".to_string(), branch_name);
+            .worktree_path()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        inner: conv.clone(),
     }
-    v
+}
+
+/// Serialize a conversation to JSON with `display_state` included.
+///
+/// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
+fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
+    serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null)
 }
 
 fn merge_display_data_into_content(json: &mut Value, display_data: &Value) {
@@ -515,19 +514,8 @@ struct StreamQuery {
     after: Option<i64>,
 }
 
-/// Breadcrumb for showing LLM thought process trail
-#[derive(Debug, Clone, Serialize)]
-pub struct Breadcrumb {
-    #[serde(rename = "type")]
-    pub crumb_type: String,
-    pub label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequence_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
-}
+/// Type alias -- breadcrumb type now lives in `runtime.rs` as `SseBreadcrumb`.
+type Breadcrumb = crate::runtime::SseBreadcrumb;
 
 /// Extract breadcrumbs from the last turn in message history
 /// A "turn" starts with the last user message and includes all subsequent agent/tool messages
@@ -770,14 +758,8 @@ async fn stream_conversation(
         .next_back()
         .map_or(0, crate::db::UsageData::context_window_used);
 
-    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
-
     // Extract breadcrumbs from the last turn
     let breadcrumbs = extract_breadcrumbs(&messages);
-    let json_breadcrumbs: Vec<Value> = breadcrumbs
-        .iter()
-        .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
-        .collect();
 
     // Subscribe to updates
     let broadcast_rx = state
@@ -793,18 +775,16 @@ async fn stream_conversation(
         .unwrap_or(state.llm_registry.default_model_id());
     let model_context_window = state.llm_registry.context_window(model_id);
 
-    // Create init event
-    // Note: messages are enriched with display info above via enrich_message_for_api
-    // which handles backwards compatibility for older messages without display field
+    // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
-        conversation: conversation_to_json(&conversation),
-        messages: json_msgs,
+        conversation: Box::new(enrich_conversation(&conversation)),
+        messages,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
         last_sequence_id,
         context_window_size,
         model_context_window,
-        breadcrumbs: json_breadcrumbs,
+        breadcrumbs,
     };
 
     Ok(sse_stream(init_event, broadcast_rx))
@@ -933,19 +913,11 @@ async fn approve_task(
         ));
     }
 
-    // 2. One-Work-per-project constraint
-    if let Some(ref project_id) = conv.project_id {
-        let has_work = state
-            .runtime
-            .db()
-            .has_active_work_conversation(project_id)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        if has_work {
-            return Err(AppError::BadRequest(
-                "Project already has an active Work conversation.".to_string(),
-            ));
-        }
+    // 2. Non-project conversations cannot approve tasks (propose_plan is project-only)
+    if conv.project_id.is_none() {
+        return Err(AppError::BadRequest(
+            "Task approval requires a project-scoped conversation".to_string(),
+        ));
     }
 
     // 3. Dispatch approval event to state machine

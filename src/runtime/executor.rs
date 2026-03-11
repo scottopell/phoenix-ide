@@ -20,7 +20,6 @@ use crate::state_machine::{
 };
 use crate::system_prompt::build_system_prompt;
 use crate::tools::{BrowserSessionManager, ToolContext};
-use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -588,10 +587,9 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
-                let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
                 let _ = self
                     .broadcast_tx
-                    .send(SseEvent::Message { message: msg_json });
+                    .send(SseEvent::Message { message: msg });
                 Ok(None)
             }
 
@@ -602,9 +600,8 @@ where
                     .await?;
 
                 // Broadcast state change with full state data
-                let state_json = serde_json::to_value(&self.state).unwrap_or(Value::Null);
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                    state: state_json,
+                    state: self.state.clone(),
                     display_state: self.state.display_state().as_str().to_string(),
                 });
                 Ok(None)
@@ -860,12 +857,27 @@ where
                         let _ = self.broadcast_tx.send(SseEvent::AgentDone);
                     }
                     "state_change" => {
-                        // data should contain the full state object
-                        if let Some(state) = data.get("state") {
-                            let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                                state: state.clone(),
-                                display_state: self.state.display_state().as_str().to_string(),
-                            });
+                        // data should contain the full state object; deserialize to typed ConvState
+                        if let Some(state_val) = data.get("state") {
+                            match serde_json::from_value::<ConvState>(state_val.clone()) {
+                                Ok(typed_state) => {
+                                    let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                                        state: typed_state,
+                                        display_state: self.state.display_state().as_str().to_string(),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "Failed to deserialize NotifyClient state_change into ConvState; \
+                                         falling back to current executor state"
+                                    );
+                                    let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                                        state: self.state.clone(),
+                                        display_state: self.state.display_state().as_str().to_string(),
+                                    });
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -892,9 +904,8 @@ where
                                 assistant_message.usage.as_ref(),
                             )
                             .await?;
-                        let agent_json = serde_json::to_value(&agent_msg).unwrap_or(Value::Null);
                         let _ = self.broadcast_tx.send(SseEvent::Message {
-                            message: agent_json,
+                            message: agent_msg,
                         });
 
                         // Persist all tool results
@@ -915,10 +926,9 @@ where
                                     None,
                                 )
                                 .await?;
-                            let tool_json = serde_json::to_value(&tool_msg).unwrap_or(Value::Null);
                             let _ = self
                                 .broadcast_tx
-                                .send(SseEvent::Message { message: tool_json });
+                                .send(SseEvent::Message { message: tool_msg });
                         }
                     }
                 }
@@ -942,10 +952,9 @@ where
                         .await?;
 
                     // Tool results don't contain bash tool_use blocks, no enrichment needed
-                    let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
                     let _ = self
                         .broadcast_tx
-                        .send(SseEvent::Message { message: msg_json });
+                        .send(SseEvent::Message { message: msg });
                 }
                 Ok(None)
             }
@@ -1075,11 +1084,9 @@ where
                             Ok(updated_msg) => {
                                 // This is a tool result message, not an agent message
                                 // No bash enrichment needed
-                                let msg_json =
-                                    serde_json::to_value(&updated_msg).unwrap_or(Value::Null);
                                 let _ = self
                                     .broadcast_tx
-                                    .send(SseEvent::Message { message: msg_json });
+                                    .send(SseEvent::Message { message: updated_msg });
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1112,10 +1119,9 @@ where
                         .await?;
 
                     // Broadcast the new message (tool message, no bash enrichment needed)
-                    let msg_json = serde_json::to_value(&message).unwrap_or(Value::Null);
                     let _ = self
                         .broadcast_tx
-                        .send(SseEvent::Message { message: msg_json });
+                        .send(SseEvent::Message { message });
                 }
 
                 Ok(None)
@@ -1132,10 +1138,7 @@ where
             Effect::NotifyContextExhausted { summary } => {
                 // REQ-BED-021: Notify client of context exhaustion
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                    state: serde_json::json!({
-                        "type": "context_exhausted",
-                        "summary": summary
-                    }),
+                    state: ConvState::ContextExhausted { summary },
                     display_state: self.state.display_state().as_str().to_string(),
                 });
                 Ok(None)
@@ -1355,26 +1358,45 @@ where
 
         match result {
             Ok(approval_result) => {
-                // Update conversation mode to Work
+                // Update conversation mode to Work (includes worktree_path)
                 let work_mode = crate::db::ConvMode::Work {
                     branch_name: approval_result.branch_name.clone(),
+                    worktree_path: approval_result.worktree_path.clone(),
                 };
                 storage
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)
                     .await?;
 
+                // Update conversation CWD to the worktree path
+                storage
+                    .update_conversation_cwd(
+                        &self.context.conversation_id,
+                        &approval_result.worktree_path,
+                    )
+                    .await?;
+
+                // Replace working_dir to point at the worktree directory.
+                // Field-level mutation (not full replacement) so we don't lose
+                // is_sub_agent, context_exhaustion_behavior, or future fields.
+                self.context.working_dir =
+                    std::path::PathBuf::from(&approval_result.worktree_path);
+
+                // Upgrade tool registry from Explore to Work mode so the agent
+                // gets bash, patch, etc. for the rest of this conversation.
+                self.tool_executor.upgrade_to_work_mode();
+
                 tracing::info!(
                     task_id = approval_result.task_number,
                     branch = %approval_result.branch_name,
+                    worktree = %approval_result.worktree_path,
                     first_task = approval_result.first_task,
-                    "Task approved — branch created and checked out"
+                    "Task approved — worktree created"
                 );
 
-                // Persist a system message with the branch name so the agent knows
-                // which branch it is on (spec: "Task approved. You are on branch ...")
+                // Persist a system message with the branch + worktree path
                 let branch_msg = format!(
-                    "Task approved. You are on branch {}.",
-                    approval_result.branch_name
+                    "Task approved. You are on branch {} in {}.",
+                    approval_result.branch_name, approval_result.worktree_path
                 );
                 let msg_id = uuid::Uuid::new_v4().to_string();
                 let content = MessageContent::system(&branch_msg);
@@ -1388,20 +1410,21 @@ where
                         None,
                     )
                     .await?;
-                let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
                 let _ = self
                     .broadcast_tx
-                    .send(SseEvent::Message { message: msg_json });
+                    .send(SseEvent::Message { message: msg });
 
-                // Notify client of first_task status via SSE
-                if approval_result.first_task {
-                    let _ = self.broadcast_tx.send(SseEvent::Message {
-                        message: serde_json::json!({
-                            "type": "first_task_created",
-                            "message": "Phoenix uses the tasks/ directory to track work plans. You, other developers, and other tools can read and create task files too."
-                        }),
-                    });
-                }
+                // Push updated conversation metadata to the client so it
+                // reflects the new cwd, branch, worktree_path, and mode label
+                // without requiring a reconnect.
+                let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
+                    update: crate::runtime::ConversationMetadataUpdate {
+                        cwd: Some(approval_result.worktree_path.clone()),
+                        branch_name: Some(approval_result.branch_name.clone()),
+                        worktree_path: Some(approval_result.worktree_path.clone()),
+                        conv_mode_label: Some("Work".to_string()),
+                    },
+                });
 
                 Ok(())
             }
@@ -1434,6 +1457,8 @@ struct TaskApprovalResult {
     task_number: u32,
     branch_name: String,
     first_task: bool,
+    /// Absolute path to the git worktree created for this conversation
+    worktree_path: String,
 }
 
 /// Derive a slug from a task title: lowercase, spaces to hyphens, strip non-alphanumeric
@@ -1500,6 +1525,7 @@ static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Blocking implementation of approve task git operations.
 /// Runs on a blocking thread via `spawn_blocking`.
+#[allow(clippy::too_many_lines)] // Sequential git flow; splitting hurts readability
 fn execute_approve_task_blocking(
     cwd: &std::path::Path,
     conv_id: &str,
@@ -1515,33 +1541,33 @@ fn execute_approve_task_blocking(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+    // 1. Dirty tree check FIRST — before any filesystem changes to avoid partial state
+    let status = run_git(cwd, &["status", "--porcelain"])?;
+    if !status.is_empty() {
+        return Err("Please commit or stash your changes before approving. \
+             The working tree has uncommitted modifications."
+            .to_string());
+    }
+
     let tasks_dir = cwd.join("tasks");
 
     // Track whether tasks/ existed before we create it
     let first_task = !tasks_dir.exists();
 
-    // 1. Assign task ID (scan for highest existing number)
+    // 2. Assign task ID (scan for highest existing number)
     let next_number = scan_highest_task_number(&tasks_dir) + 1;
 
-    // 2. Create tasks/ directory if needed
+    // 3. Create tasks/ directory if needed
     if first_task {
         std::fs::create_dir_all(&tasks_dir)
             .map_err(|e| format!("Failed to create tasks/ directory: {e}"))?;
         tracing::info!("Created tasks/ directory (first task for this project)");
     }
 
-    // 3. Derive slug from title
+    // 4. Derive slug from title
     let slug = derive_slug(title);
     if slug.is_empty() {
         return Err("Cannot derive a valid slug from the task title".to_string());
-    }
-
-    // 4. Dirty tree check (before any git modifications to avoid partial state)
-    let status = run_git(cwd, &["status", "--porcelain"])?;
-    if !status.is_empty() {
-        return Err("Please commit or stash your changes before approving. \
-             The working tree has uncommitted modifications."
-            .to_string());
     }
 
     // 5. Write task file
@@ -1581,17 +1607,46 @@ fn execute_approve_task_blocking(
         .map_err(|e| format!("Failed to write task file: {e}"))?;
     tracing::info!(file = %filepath.display(), "Task file written");
 
-    // 5. Git commit the task file
+    // 5. Ensure .gitignore contains .phoenix/ (worktree dir lives there)
+    let gitignore_path = cwd.join(".gitignore");
+    let gitignore_needs_update = if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path)
+            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
+        !content.lines().any(|line| line.trim() == ".phoenix/")
+    } else {
+        true
+    };
+
+    if gitignore_needs_update {
+        use std::io::Write as _;
+        // Ensure we don't corrupt the last line if .gitignore lacks a trailing newline
+        let needs_leading_newline = gitignore_path.exists()
+            && std::fs::read(&gitignore_path)
+                .ok()
+                .is_some_and(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"));
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore_path)
+            .map_err(|e| format!("Failed to open .gitignore: {e}"))?;
+        if needs_leading_newline {
+            writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        }
+        writeln!(f, ".phoenix/")
+            .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        run_git(cwd, &["add", ".gitignore"])?;
+        tracing::info!("Added .phoenix/ to .gitignore");
+    }
+
+    // 6. Git commit the task file (and .gitignore if modified)
     let relative_path = format!("tasks/{filename}");
     run_git(cwd, &["add", &relative_path])?;
     let commit_msg = format!("task {next_number:04}: {title}");
-    run_git(
-        cwd,
-        &["commit", "--only", &relative_path, "-m", &commit_msg],
-    )?;
+    // Use `git commit` without `--only` so both staged files are included
+    run_git(cwd, &["commit", "-m", &commit_msg])?;
     tracing::info!(commit_msg = %commit_msg, "Task file committed");
 
-    // 6. Branch collision check
+    // 7. Branch collision check
     let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
     if branch_exists {
         // Check if fully merged into current branch
@@ -1608,18 +1663,28 @@ fn execute_approve_task_blocking(
         }
     }
 
-    // 7. Create branch from current HEAD
-    run_git(cwd, &["branch", &branch_name])?;
-    tracing::info!(branch = %branch_name, "Created branch");
+    // 8. Create worktree with new branch (atomic: creates branch + attaches worktree)
+    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
+    std::fs::create_dir_all(&phoenix_dir)
+        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
 
-    // 8. Checkout the branch
-    run_git(cwd, &["checkout", &branch_name])?;
-    tracing::info!(branch = %branch_name, "Checked out branch");
+    let worktree_path = phoenix_dir.join(conv_id);
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    run_git(
+        cwd,
+        &["worktree", "add", &worktree_path_str, "-b", &branch_name],
+    )?;
+    tracing::info!(
+        branch = %branch_name,
+        worktree = %worktree_path_str,
+        "Created git worktree"
+    );
 
     Ok(TaskApprovalResult {
         task_number: next_number,
         branch_name,
         first_task,
+        worktree_path: worktree_path_str,
     })
 }
 

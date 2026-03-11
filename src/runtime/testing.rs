@@ -395,6 +395,15 @@ impl StateStore for InMemoryStorage {
         // In-memory storage doesn't track conv_mode separately
         Ok(())
     }
+
+    async fn update_conversation_cwd(
+        &self,
+        _conv_id: &str,
+        _cwd: &str,
+    ) -> Result<(), String> {
+        // In-memory storage doesn't track cwd separately
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -540,9 +549,11 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(SseEvent::StateChange { state, .. })) = tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
-                if let Some(state_type) = state.get("type").and_then(|v| v.as_str()) {
-                    if state_type == expected_type {
-                        return true;
+                if let Ok(val) = serde_json::to_value(&state) {
+                    if let Some(state_type) = val.get("type").and_then(|v| v.as_str()) {
+                        if state_type == expected_type {
+                            return true;
+                        }
                     }
                 }
             }
@@ -796,7 +807,7 @@ mod tests {
                     break;
                 }
                 Ok(Ok(SseEvent::StateChange { state, .. })) => {
-                    if state.get("type").and_then(|v| v.as_str()) == Some("idle") {
+                    if matches!(state, crate::state_machine::ConvState::Idle) {
                         done = true;
                         break;
                     }
