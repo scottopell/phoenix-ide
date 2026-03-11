@@ -359,6 +359,39 @@ impl Database {
         Ok(())
     }
 
+    /// Update conversation mode (e.g., Explore -> Work on task approval)
+    pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
+        let now = Utc::now();
+        let mode_json = serde_json::to_string(mode).unwrap();
+
+        let result =
+            sqlx::query("UPDATE conversations SET conv_mode = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(&mode_json)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Check if any non-archived conversation for a project is in Work mode
+    pub async fn has_active_work_conversation(&self, project_id: &str) -> DbResult<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) FROM conversations
+             WHERE project_id = ?1 AND archived = 0
+             AND json_extract(conv_mode, '$.mode') = 'Work'",
+        )
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let count: i64 = row.get(0);
+        Ok(count > 0)
+    }
+
     /// Archive a conversation
     pub async fn archive_conversation(&self, id: &str) -> DbResult<()> {
         let now = Utc::now();
@@ -448,11 +481,13 @@ impl Database {
         self.repair_orphaned_tool_use(&now).await?;
 
         // Reset non-terminal conversations to idle.
-        // Terminal states (context_exhausted) should NOT be reset - they represent
-        // completed conversations that cannot accept new messages.
+        // Preserved states (NOT reset):
+        //   - context_exhausted: completed conversations that cannot accept new messages
+        //   - awaiting_task_approval: user approval pending; state data (title/priority/plan)
+        //     is in the JSON column and must survive restart
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())
@@ -922,6 +957,43 @@ mod tests {
         // Verify the summary is intact
         if let ConvState::ContextExhausted { summary } = conv_after.state {
             assert_eq!(summary, "Test summary");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reset_preserves_awaiting_task_approval_state() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let approval_state = ConvState::AwaitingTaskApproval {
+            title: "Fix the widget".to_string(),
+            priority: "p1".to_string(),
+            plan: "Step 1: read code\nStep 2: fix bug".to_string(),
+        };
+        db.update_conversation_state("conv-1", &approval_state)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        let conv_after = db.get_conversation("conv-1").await.unwrap();
+        assert!(
+            matches!(conv_after.state, ConvState::AwaitingTaskApproval { .. }),
+            "AwaitingTaskApproval state should be preserved after reset"
+        );
+
+        if let ConvState::AwaitingTaskApproval {
+            title,
+            priority,
+            plan,
+        } = conv_after.state
+        {
+            assert_eq!(title, "Fix the widget");
+            assert_eq!(priority, "p1");
+            assert_eq!(plan, "Step 1: read code\nStep 2: fix bug");
         }
     }
 

@@ -10,7 +10,8 @@ export interface Conversation {
   message_count: number;
   state?: ConversationState;
   /** Semantic state category from API: idle, working, error, terminal */
-  display_state?: 'idle' | 'working' | 'error' | 'terminal';
+  display_state?: 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval';
+  branch_name?: string | null;
   archived?: boolean;
   project_id?: string | null;
   conv_mode_label?: string;
@@ -52,6 +53,7 @@ export type ConversationState =
   | { type: 'cancelling' }
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
+  | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'error'; message: string }
   | { type: 'terminal' };
@@ -387,6 +389,28 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to search files');
+    return resp.json();
+  },
+
+  async approveTask(convId: string): Promise<{ success: boolean; first_task?: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/approve-task`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to approve task'); }
+    return resp.json();
+  },
+
+  async rejectTask(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/reject-task`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to reject task'); }
+    return resp.json();
+  },
+
+  async sendTaskFeedback(convId: string, annotations: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/task-feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ annotations }),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to send feedback'); }
     return resp.json();
   },
 

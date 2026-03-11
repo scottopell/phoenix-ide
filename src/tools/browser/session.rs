@@ -557,6 +557,7 @@ mod console_arg_tests {
     use chromiumoxide::cdp::js_protocol::runtime::RemoteObject;
     use serde_json::json;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn make_arg(value: Option<serde_json::Value>, description: Option<&str>) -> RemoteObject {
         serde_json::from_value(json!({
             "type": "string",

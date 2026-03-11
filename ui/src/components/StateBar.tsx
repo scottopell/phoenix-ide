@@ -89,6 +89,10 @@ export function StateBar({
             dotClass += ' idle';
             stateText = 'ready';
             break;
+          case 'awaiting_task_approval':
+            dotClass += ' approval';
+            stateText = 'awaiting approval';
+            break;
           case 'error':
             dotClass += ' error';
             stateText = 'error';
@@ -172,6 +176,11 @@ export function StateBar({
                   {formatCwd(conversation.cwd)}
                 </span>
               </div>
+              {conversation.branch_name && (
+                <span className="conv-branch" title={`Branch: ${conversation.branch_name}`}>
+                  {conversation.branch_name}
+                </span>
+              )}
             </>
           ) : (
             <span id="conv-slug">—</span>

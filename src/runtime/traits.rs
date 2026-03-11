@@ -2,7 +2,7 @@
 //!
 //! These traits enable testing the executor with mock implementations.
 
-use crate::db::{Message, MessageContent, UsageData};
+use crate::db::{ConvMode, Message, MessageContent, UsageData};
 use crate::llm::{LlmError, LlmRequest, LlmResponse};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
@@ -58,6 +58,9 @@ pub trait StateStore: Send + Sync {
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
+
+    /// Update the conversation mode (e.g., Explore -> Work on task approval)
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
 }
 
 /// Client for making LLM requests
@@ -155,6 +158,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
+    }
+
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+        (**self).update_conversation_mode(conv_id, mode).await
     }
 }
 
@@ -283,6 +290,13 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
+    }
+
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+        self.db
+            .update_conversation_mode(conv_id, mode)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

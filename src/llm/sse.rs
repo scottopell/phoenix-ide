@@ -347,7 +347,7 @@ mod proptests {
     // Strategies
     // ========================================================================
 
-    /// Generate a valid SSE data payload (simulating JSON content_block_delta).
+    /// Generate a valid SSE data payload (simulating JSON `content_block_delta`).
     /// Includes characters known to cause issues: backticks, em-dashes, quotes,
     /// braces, newlines-within-JSON-strings (escaped as \n in JSON).
     fn arb_sse_data() -> impl Strategy<Value = String> {
@@ -414,12 +414,13 @@ mod proptests {
                 let mut s = seed;
                 let len = bytes.len();
                 if len > 0 {
-                    for _ in 0..((s % 8) + 1) {
-                        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    for _ in 0..=(s % 8) {
+                        s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        #[allow(clippy::cast_possible_truncation)]
                         pts.push((s as usize) % len);
                     }
                 }
-                pts.sort();
+                pts.sort_unstable();
                 pts.dedup();
                 pts
             };
@@ -503,7 +504,8 @@ mod proptests {
             let expected_data = lines.join("\n");
             let mut raw = String::new();
             for line in &lines {
-                raw.push_str(&format!("data: {line}\n"));
+                use std::fmt::Write;
+                let _ = writeln!(raw, "data: {line}");
             }
             raw.push('\n'); // blank line terminates
 

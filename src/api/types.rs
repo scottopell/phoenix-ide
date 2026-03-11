@@ -236,6 +236,21 @@ pub struct ExpansionErrorResponse {
     pub reference: String,
 }
 
+/// Request to provide feedback on a proposed task plan
+#[derive(Debug, Deserialize)]
+pub struct TaskFeedbackRequest {
+    pub annotations: String,
+}
+
+/// Response for task approval actions
+#[derive(Debug, Serialize)]
+pub struct TaskApprovalResponse {
+    pub success: bool,
+    /// True when this was the first task created in the project (tasks/ didn't exist)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_task: Option<bool>,
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

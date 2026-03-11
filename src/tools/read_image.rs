@@ -273,7 +273,7 @@ mod tests {
             let result = tool.run(json!({"path": filename}), ctx).await;
             assert!(result.success, "Failed for {}: {}", ext, result.output);
 
-            assert_eq!(result.images.len(), 1, "Expected image for {}", ext);
+            assert_eq!(result.images.len(), 1, "Expected image for {ext}");
             assert_eq!(result.images[0].media_type, *expected_type);
         }
     }

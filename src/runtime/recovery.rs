@@ -488,8 +488,7 @@ mod tests {
             message_type: MessageType::System,
             content: MessageContent::System(SystemContent {
                 text: format!(
-                    "{} This conversation was interrupted by a server restart.",
-                    RESTART_SYSTEM_MESSAGE_MARKER
+                    "{RESTART_SYSTEM_MESSAGE_MARKER} This conversation was interrupted by a server restart."
                 ),
             }),
             display_data: None,
@@ -659,6 +658,7 @@ mod proptests {
 
     proptest! {
         #[test]
+        #[allow(clippy::cast_possible_wrap)]
         fn prop_always_returns_valid_state(msg_count in 0..20usize) {
             // Generate random sequence of messages
             let messages: Vec<Message> = (0..msg_count)
@@ -703,6 +703,7 @@ mod proptests {
 
     proptest! {
         #[test]
+        #[allow(clippy::cast_possible_wrap)]
         fn prop_auto_continue_requires_last_tool(
             prefix_len in 0..10usize,
             last_type in message_type_strategy()
@@ -785,6 +786,7 @@ mod proptests {
 
     proptest! {
         #[test]
+        #[allow(clippy::cast_possible_wrap)]
         fn prop_reason_matches_behavior(msg_count in 1..10usize) {
             let messages: Vec<Message> = (0..msg_count)
                 .map(|i| {

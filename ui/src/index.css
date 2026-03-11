@@ -440,6 +440,10 @@ body {
   background: var(--text-muted, #6b7280);
 }
 
+.conv-state-dot.awaiting_approval {
+  background: var(--accent-purple, #7c3aed);
+}
+
 @keyframes state-dot-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -5437,6 +5441,186 @@ html * {
 .prose-reader-inline .prose-reader-content {
   flex: 1;
   overflow-y: auto;
+}
+
+/* --- State dot: approval --- */
+
+.dot.approval {
+  background: var(--accent-purple, #7c3aed);
+}
+
+/* --- Branch name display --- */
+
+.conv-branch {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: monospace;
+  padding: 1px 6px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  margin-left: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+  vertical-align: middle;
+}
+
+/* --- Task Approval Reader --- */
+
+.task-approval-reader {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-primary);
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.task-approval-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.task-approval-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.task-approval-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-approval-priority {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-purple);
+  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
+  padding: 2px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.task-approval-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.task-approval-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.task-approval-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.task-approval-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.task-approval-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.task-approval-btn--approve {
+  background: var(--accent-green);
+  color: #fff;
+}
+
+.task-approval-btn--approve:hover {
+  opacity: 0.9;
+}
+
+.task-approval-btn--discard {
+  background: transparent;
+  color: var(--accent-red);
+  border: 1px solid var(--accent-red);
+}
+
+.task-approval-btn--discard:hover {
+  background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+}
+
+.task-approval-btn--feedback {
+  background: var(--accent-blue);
+  color: #fff;
+}
+
+.task-approval-btn--feedback:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+/* --- First Task Welcome modal --- */
+
+.first-task-welcome {
+  max-width: 420px;
+}
+
+.first-task-welcome-text {
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.first-task-welcome-text code {
+  background: var(--bg-tertiary);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 13px;
+}
+
+.first-task-welcome-link {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.first-task-welcome-link a {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+
+.first-task-welcome-link a:hover {
+  text-decoration: underline;
 }
 
 /* Narrower file explorer at tight viewports */

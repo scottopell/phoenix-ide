@@ -442,7 +442,11 @@ impl RuntimeManager {
                 ConvMode::Standalone => {
                     // Full tool suite for non-git directories
                     ToolRegistry::standalone()
-                } // Future: Work mode will use its own registry
+                }
+                ConvMode::Work { .. } => {
+                    // Full tool suite for Work mode (same as standalone for now)
+                    ToolRegistry::standalone()
+                }
             };
             ToolRegistryExecutor::new(registry)
         };

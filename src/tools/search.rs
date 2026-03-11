@@ -296,7 +296,11 @@ mod tests {
     #[tokio::test]
     async fn test_search_max_results() {
         let dir = tempfile::tempdir().unwrap();
-        let content: String = (1..=100).map(|i| format!("match line {i}\n")).collect();
+        let content: String = (1..=100).fold(String::new(), |mut s, i| {
+            use std::fmt::Write;
+            let _ = writeln!(s, "match line {i}");
+            s
+        });
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let tool = SearchTool;

@@ -10,13 +10,14 @@ use super::types::{
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
     ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, ValidateCwdResponse,
+    SystemPromptResponse, TaskApprovalResponse, TaskFeedbackRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ImageData, Message, MessageContent, MessageType};
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
-use crate::state_machine::Event;
+use crate::state_machine::state::TaskApprovalOutcome;
+use crate::state_machine::{ConvState, Event};
 
 use axum::{
     extract::{Path, Query, State},
@@ -68,6 +69,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/trigger-continuation",
             post(trigger_continuation),
         )
+        // Task approval (REQ-BED-028)
+        .route("/api/conversations/:id/approve-task", post(approve_task))
+        .route("/api/conversations/:id/reject-task", post(reject_task))
+        .route("/api/conversations/:id/task-feedback", post(task_feedback))
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -151,6 +156,12 @@ fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
             "conv_mode_label".to_string(),
             Value::String(conv.conv_mode.label().to_string()),
         );
+        // Expose branch_name at top level for Work mode conversations
+        let branch_name = conv
+            .conv_mode
+            .branch_name()
+            .map_or(Value::Null, |s| Value::String(s.to_string()));
+        obj.insert("branch_name".to_string(), branch_name);
     }
     v
 }
@@ -894,6 +905,128 @@ async fn trigger_continuation(
     state
         .runtime
         .send_event(&id, Event::UserTriggerContinuation)
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Task Approval (REQ-BED-028)
+// ============================================================
+
+async fn approve_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskApprovalResponse>, AppError> {
+    // 1. Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    // 2. One-Work-per-project constraint
+    if let Some(ref project_id) = conv.project_id {
+        let has_work = state
+            .runtime
+            .db()
+            .has_active_work_conversation(project_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if has_work {
+            return Err(AppError::BadRequest(
+                "Project already has an active Work conversation.".to_string(),
+            ));
+        }
+    }
+
+    // 3. Dispatch approval event to state machine
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Approved,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(TaskApprovalResponse {
+        success: true,
+        first_task: None, // Set by executor via SSE if applicable
+    }))
+}
+
+async fn reject_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Rejected,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+async fn task_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TaskFeedbackRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::FeedbackProvided {
+                    annotations: req.annotations,
+                },
+            },
+        )
         .await
         .map_err(AppError::BadRequest)?;
 

@@ -9,6 +9,8 @@ import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { ProseReader } from '../components/ProseReader';
+import { TaskApprovalReader } from '../components/TaskApprovalReader';
+import { FirstTaskWelcome } from '../components/FirstTaskWelcome';
 import { useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
@@ -56,6 +58,10 @@ export function ConversationPage() {
 
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
+
+  // Task approval overlay
+  const [showTaskApproval, setShowTaskApproval] = useState(false);
+  const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // Message queue management
   const { queuedMessages, enqueue, markSent, markFailed, retry } =
@@ -185,6 +191,15 @@ export function ConversationPage() {
       .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp }))
       .catch((err) => console.warn('Failed to load system prompt:', err));
   }, [conversationId, dispatch]);
+
+  // Auto-open/close task approval overlay on state transitions
+  useEffect(() => {
+    if (atom.phase.type === 'awaiting_task_approval') {
+      setShowTaskApproval(true);
+    } else {
+      setShowTaskApproval(false);
+    }
+  }, [atom.phase.type]);
 
   // Cache new messages as they arrive via SSE
   const cachedMsgCountRef = useRef(0);
@@ -321,6 +336,36 @@ export function ConversationPage() {
       await api.triggerContinuation(conversationId);
     } catch (err) {
       console.error('Failed to trigger continuation:', err);
+    }
+  };
+
+  const handleApproveTask = async () => {
+    if (!conversationId) return;
+    try {
+      const result = await api.approveTask(conversationId);
+      if (result.first_task) {
+        setShowFirstTaskWelcome(true);
+      }
+    } catch (err) {
+      console.error('Failed to approve task:', err);
+    }
+  };
+
+  const handleRejectTask = async () => {
+    if (!conversationId) return;
+    try {
+      await api.rejectTask(conversationId);
+    } catch (err) {
+      console.error('Failed to reject task:', err);
+    }
+  };
+
+  const handleTaskFeedback = async (annotations: string) => {
+    if (!conversationId) return;
+    try {
+      await api.sendTaskFeedback(conversationId, annotations);
+    } catch (err) {
+      console.error('Failed to send task feedback:', err);
     }
   };
 
@@ -520,6 +565,24 @@ export function ConversationPage() {
         modelContextWindow={atom.contextWindow.total}
         onRetryNow={connectionInfo.retryNow}
         onTriggerContinuation={handleTriggerContinuation}
+      />
+
+      {/* Task approval overlay */}
+      {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
+        <TaskApprovalReader
+          title={atom.phase.title}
+          priority={atom.phase.priority}
+          plan={atom.phase.plan}
+          onApprove={handleApproveTask}
+          onReject={handleRejectTask}
+          onSendFeedback={handleTaskFeedback}
+        />
+      )}
+
+      {/* First task welcome modal */}
+      <FirstTaskWelcome
+        visible={showFirstTaskWelcome}
+        onClose={() => setShowFirstTaskWelcome(false)}
       />
 
       {/* Mobile file browser overlay */}

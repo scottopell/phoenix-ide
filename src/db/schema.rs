@@ -111,7 +111,11 @@ pub enum ConvMode {
     Explore,
     /// Standalone mode for non-git directories. Full tool suite, no project association.
     Standalone,
-    // Work mode will be added in M2 (task 0602)
+    /// Write mode on a task branch. Full tool suite with file write access.
+    Work {
+        /// The git branch name for this work conversation (e.g., `task-0042-fix-bug`)
+        branch_name: String,
+    },
 }
 
 impl Default for ConvMode {
@@ -126,6 +130,15 @@ impl ConvMode {
         match self {
             Self::Explore => "Explore",
             Self::Standalone => "Standalone",
+            Self::Work { .. } => "Work",
+        }
+    }
+
+    /// The branch name if in Work mode, None otherwise.
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            Self::Work { branch_name } => Some(branch_name),
+            _ => None,
         }
     }
 }

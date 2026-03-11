@@ -21,14 +21,14 @@ fn test_context() -> ConvContext {
     ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
 }
 
-/// Build an AssistantMessage with ToolUse content blocks for the given tool IDs.
-/// Used in tests that construct ToolExecuting/CancellingTool states directly,
-/// where CheckpointData::tool_round() enforces tool_use count == tool_result count.
+/// Build an `AssistantMessage` with `ToolUse` content blocks for the given tool IDs.
+/// Used in tests that construct `ToolExecuting`/`CancellingTool` states directly,
+/// where `CheckpointData::tool_round()` enforces `tool_use` count == `tool_result` count.
 fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage {
     let content_blocks: Vec<ContentBlock> = tool_ids
         .iter()
         .map(|id| ContentBlock::ToolUse {
-            id: id.to_string(),
+            id: (*id).to_string(),
             name: "bash".to_string(),
             input: serde_json::json!({}),
         })
@@ -187,6 +187,23 @@ fn arb_context_exhausted_state() -> impl Strategy<Value = ConvState> {
     .prop_map(|summary| ConvState::ContextExhausted { summary })
 }
 
+fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
+    (
+        "[a-zA-Z ]{1,30}",
+        prop_oneof![
+            Just("p0".to_string()),
+            Just("p1".to_string()),
+            Just("p2".to_string())
+        ],
+        "[a-zA-Z0-9 .,\n]{1,100}",
+    )
+        .prop_map(|(title, priority, plan)| ConvState::AwaitingTaskApproval {
+            title,
+            priority,
+            plan,
+        })
+}
+
 fn arb_state() -> impl Strategy<Value = ConvState> {
     prop_oneof![
         arb_idle_state(),
@@ -197,6 +214,7 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_awaiting_llm_state(),
         arb_awaiting_continuation_state(),
         arb_context_exhausted_state(),
+        arb_awaiting_task_approval_state(),
     ]
 }
 
@@ -264,6 +282,19 @@ fn arb_retry_timeout_event() -> impl Strategy<Value = Event> {
     (1u32..5).prop_map(|attempt| Event::RetryTimeout { attempt })
 }
 
+fn arb_task_approval_outcome() -> impl Strategy<Value = TaskApprovalOutcome> {
+    prop_oneof![
+        Just(TaskApprovalOutcome::Approved),
+        Just(TaskApprovalOutcome::Rejected),
+        "[a-zA-Z ]{1,30}"
+            .prop_map(|annotations| TaskApprovalOutcome::FeedbackProvided { annotations }),
+    ]
+}
+
+fn arb_task_approval_event() -> impl Strategy<Value = Event> {
+    arb_task_approval_outcome().prop_map(|outcome| Event::TaskApprovalResponse { outcome })
+}
+
 fn arb_event() -> impl Strategy<Value = Event> {
     prop_oneof![
         arb_user_message_event(),
@@ -272,6 +303,7 @@ fn arb_event() -> impl Strategy<Value = Event> {
         arb_llm_error_event(),
         arb_retry_timeout_event(),
         Just(Event::UserCancel),
+        arb_task_approval_event(),
     ]
 }
 
@@ -409,7 +441,7 @@ proptest! {
         let all_ids: Vec<String> = std::iter::once(current.id.clone())
             .chain(remaining.iter().map(|t| t.id.clone()))
             .collect();
-        let all_id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+        let all_id_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
         let state = ConvState::ToolExecuting {
             current_tool: current.clone(),
             remaining_tools: remaining,
@@ -1033,6 +1065,7 @@ fn test_retry_cycle() {
 
 /// Test multiple tool execution chain
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_multi_tool_chain() {
     let ctx = test_context();
 
@@ -1197,6 +1230,7 @@ fn test_multi_tool_chain() {
 
 /// Test cancellation mid-tool-chain generates synthetic results for all remaining
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_cancel_mid_tool_chain() {
     let ctx = test_context();
 
@@ -2017,7 +2051,7 @@ proptest! {
         let all_ids: Vec<String> = std::iter::once(current.id.clone())
             .chain(remaining.iter().map(|t| t.id.clone()))
             .collect();
-        let all_id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+        let all_id_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
         let state = ConvState::ToolExecuting {
             current_tool: current.clone(),
             remaining_tools: remaining,

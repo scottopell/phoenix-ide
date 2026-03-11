@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn test_detect_skill_prefix_simple() {
         let result = detect_skill_prefix("/writing-style");
-        assert_eq!(result, Some(("writing-style".to_string(), "".to_string())));
+        assert_eq!(result, Some(("writing-style".to_string(), String::new())));
     }
 
     #[test]

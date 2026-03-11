@@ -1140,6 +1140,15 @@ where
                 });
                 Ok(None)
             }
+
+            Effect::ApproveTask {
+                title,
+                priority,
+                plan,
+            } => {
+                self.execute_approve_task(title, priority, plan).await?;
+                Ok(None)
+            }
         }
     }
 
@@ -1314,6 +1323,304 @@ where
         });
         self.llm_task_handle = Some(handle);
     }
+
+    /// REQ-BED-028: Execute git operations for task approval.
+    ///
+    /// Sequence: dirty tree check -> assign task ID -> mkdir tasks/ -> write task file ->
+    /// git commit -> check branch collision -> create branch -> checkout -> update `conv_mode`.
+    ///
+    /// On failure: revert in-memory state to `AwaitingTaskApproval` so the user can retry.
+    /// Collision check on retry handles partial state.
+    async fn execute_approve_task(
+        &mut self,
+        title: String,
+        priority: String,
+        plan: String,
+    ) -> Result<(), String> {
+        let cwd = self.context.working_dir.clone();
+        let conv_id = self.context.conversation_id.clone();
+        let storage = self.storage.clone();
+
+        // Clone for state revert on failure (originals moved into spawn_blocking)
+        let title_backup = title.clone();
+        let priority_backup = priority.clone();
+        let plan_backup = plan.clone();
+
+        // Run blocking git/fs operations on a blocking thread
+        let result = tokio::task::spawn_blocking(move || {
+            execute_approve_task_blocking(&cwd, &conv_id, &title, &priority, &plan)
+        })
+        .await
+        .map_err(|e| format!("Task approval join error: {e}"))?;
+
+        match result {
+            Ok(approval_result) => {
+                // Update conversation mode to Work
+                let work_mode = crate::db::ConvMode::Work {
+                    branch_name: approval_result.branch_name.clone(),
+                };
+                storage
+                    .update_conversation_mode(&self.context.conversation_id, &work_mode)
+                    .await?;
+
+                tracing::info!(
+                    task_id = approval_result.task_number,
+                    branch = %approval_result.branch_name,
+                    first_task = approval_result.first_task,
+                    "Task approved — branch created and checked out"
+                );
+
+                // Persist a system message with the branch name so the agent knows
+                // which branch it is on (spec: "Task approved. You are on branch ...")
+                let branch_msg = format!(
+                    "Task approved. You are on branch {}.",
+                    approval_result.branch_name
+                );
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let content = MessageContent::system(&branch_msg);
+                let msg = self
+                    .storage
+                    .add_message(
+                        &msg_id,
+                        &self.context.conversation_id,
+                        &content,
+                        None,
+                        None,
+                    )
+                    .await?;
+                let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
+                let _ = self
+                    .broadcast_tx
+                    .send(SseEvent::Message { message: msg_json });
+
+                // Notify client of first_task status via SSE
+                if approval_result.first_task {
+                    let _ = self.broadcast_tx.send(SseEvent::Message {
+                        message: serde_json::json!({
+                            "type": "first_task_created",
+                            "message": "Phoenix uses the tasks/ directory to track work plans. You, other developers, and other tools can read and create task files too."
+                        }),
+                    });
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Task approval git operations failed");
+
+                // Revert in-memory state to AwaitingTaskApproval so the user can retry.
+                // The DB still has AwaitingTaskApproval (PersistState hasn't run for the
+                // new Idle state yet), so this keeps memory and DB consistent.
+                self.state = ConvState::AwaitingTaskApproval {
+                    title: title_backup,
+                    priority: priority_backup,
+                    plan: plan_backup,
+                };
+
+                // Broadcast an error so the UI knows, but don't propagate — the
+                // conversation stays in AwaitingTaskApproval for retry.
+                let _ = self.broadcast_tx.send(SseEvent::Error {
+                    message: format!("Task approval failed: {e}"),
+                });
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Result of a successful task approval
+struct TaskApprovalResult {
+    task_number: u32,
+    branch_name: String,
+    first_task: bool,
+}
+
+/// Derive a slug from a task title: lowercase, spaces to hyphens, strip non-alphanumeric
+/// except hyphens, truncate at 40 chars, trim trailing hyphens.
+fn derive_slug(title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let truncated = if slug.len() > 40 {
+        // Truncate at last hyphen within 40 chars to avoid cutting mid-word
+        let s = &slug[..40];
+        s.rfind('-').map_or(s, |i| &s[..i]).to_string()
+    } else {
+        slug
+    };
+    truncated.trim_end_matches('-').to_string()
+}
+
+/// Scan `tasks/` directory for the highest existing task number (NNNN prefix).
+fn scan_highest_task_number(tasks_dir: &std::path::Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(tasks_dir) else {
+        return 0;
+    };
+    let mut max_num: u32 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Extract leading digits (up to 4)
+        if let Some(num_str) = name.split('-').next() {
+            if let Ok(n) = num_str.parse::<u32>() {
+                if n > max_num {
+                    max_num = n;
+                }
+            }
+        }
+    }
+    max_num
+}
+
+/// Run a git command in the given directory, returning stdout on success or an error message.
+fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("git {} failed: {stderr}", args.join(" ")))
+    }
+}
+
+/// Global mutex serializing the scan-tasks + write + commit sequence.
+/// Task approval is rare; a single mutex is sufficient.
+static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Blocking implementation of approve task git operations.
+/// Runs on a blocking thread via `spawn_blocking`.
+fn execute_approve_task_blocking(
+    cwd: &std::path::Path,
+    conv_id: &str,
+    title: &str,
+    priority: &str,
+    plan: &str,
+) -> Result<TaskApprovalResult, String> {
+    use std::io::Write;
+
+    // Serialize the entire scan + write + commit sequence to prevent
+    // concurrent approvals from getting the same task number.
+    let _guard = TASK_APPROVAL_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tasks_dir = cwd.join("tasks");
+
+    // Track whether tasks/ existed before we create it
+    let first_task = !tasks_dir.exists();
+
+    // 1. Assign task ID (scan for highest existing number)
+    let next_number = scan_highest_task_number(&tasks_dir) + 1;
+
+    // 2. Create tasks/ directory if needed
+    if first_task {
+        std::fs::create_dir_all(&tasks_dir)
+            .map_err(|e| format!("Failed to create tasks/ directory: {e}"))?;
+        tracing::info!("Created tasks/ directory (first task for this project)");
+    }
+
+    // 3. Derive slug from title
+    let slug = derive_slug(title);
+    if slug.is_empty() {
+        return Err("Cannot derive a valid slug from the task title".to_string());
+    }
+
+    // 4. Dirty tree check (before any git modifications to avoid partial state)
+    let status = run_git(cwd, &["status", "--porcelain"])?;
+    if !status.is_empty() {
+        return Err("Please commit or stash your changes before approving. \
+             The working tree has uncommitted modifications."
+            .to_string());
+    }
+
+    // 5. Write task file
+    let filename = format!("{next_number:04}-{priority}-in-progress--{slug}.md");
+    let filepath = tasks_dir.join(&filename);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let branch_name = format!("task-{next_number:04}-{slug}");
+
+    // Escape double quotes in title for YAML frontmatter
+    let escaped_title = title.replace('"', r#"\""#);
+
+    let task_content = format!(
+        "---\n\
+         created: {today}\n\
+         number: {next_number}\n\
+         priority: {priority}\n\
+         status: in-progress\n\
+         slug: {slug}\n\
+         title: \"{escaped_title}\"\n\
+         branch: {branch_name}\n\
+         conversation: {conv_id}\n\
+         ---\n\
+         \n\
+         # {title}\n\
+         \n\
+         ## Plan\n\
+         \n\
+         {plan}\n\
+         \n\
+         ## Progress\n\
+         \n"
+    );
+
+    let mut file = std::fs::File::create(&filepath)
+        .map_err(|e| format!("Failed to create task file {}: {e}", filepath.display()))?;
+    file.write_all(task_content.as_bytes())
+        .map_err(|e| format!("Failed to write task file: {e}"))?;
+    tracing::info!(file = %filepath.display(), "Task file written");
+
+    // 5. Git commit the task file
+    let relative_path = format!("tasks/{filename}");
+    run_git(cwd, &["add", &relative_path])?;
+    let commit_msg = format!("task {next_number:04}: {title}");
+    run_git(
+        cwd,
+        &["commit", "--only", &relative_path, "-m", &commit_msg],
+    )?;
+    tracing::info!(commit_msg = %commit_msg, "Task file committed");
+
+    // 6. Branch collision check
+    let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
+    if branch_exists {
+        // Check if fully merged into current branch
+        let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
+        if merge_base.is_ok() {
+            // Fully merged — safe to delete
+            run_git(cwd, &["branch", "-d", &branch_name])?;
+            tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
+        } else {
+            return Err(format!(
+                "Branch '{branch_name}' already exists and is not fully merged. \
+                 Please resolve this manually before approving."
+            ));
+        }
+    }
+
+    // 7. Create branch from current HEAD
+    run_git(cwd, &["branch", &branch_name])?;
+    tracing::info!(branch = %branch_name, "Created branch");
+
+    // 8. Checkout the branch
+    run_git(cwd, &["checkout", &branch_name])?;
+    tracing::info!(branch = %branch_name, "Checked out branch");
+
+    Ok(TaskApprovalResult {
+        task_number: next_number,
+        branch_name,
+        first_task,
+    })
 }
 
 /// Build the continuation prompt (REQ-BED-020)

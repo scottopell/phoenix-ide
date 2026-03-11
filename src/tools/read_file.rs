@@ -195,8 +195,8 @@ mod tests {
             )
             .await;
         assert!(result.success);
-        assert!(result.output.contains("b"));
-        assert!(result.output.contains("c"));
+        assert!(result.output.contains('b'));
+        assert!(result.output.contains('c'));
         assert!(!result.output.contains("\ta\n"));
     }
 
@@ -234,7 +234,11 @@ mod tests {
     async fn test_read_file_truncation_note() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("big.txt");
-        let content: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let content: String = (1..=100).fold(String::new(), |mut s, i| {
+            use std::fmt::Write;
+            let _ = writeln!(s, "line {i}");
+            s
+        });
         std::fs::write(&file_path, &content).unwrap();
 
         let tool = ReadFileTool;

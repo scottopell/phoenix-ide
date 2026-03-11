@@ -7,6 +7,7 @@ pub mod bash_check;
 pub mod browser;
 mod keyword_search;
 pub mod patch;
+mod propose_plan;
 mod read_file;
 mod read_image;
 mod search;
@@ -21,6 +22,7 @@ pub use browser::{
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
+pub use propose_plan::ProposePlanTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
 pub use search::SearchTool;
@@ -186,6 +188,7 @@ impl ToolRegistry {
             Arc::new(SearchTool),
             Arc::new(KeywordSearchTool),
             Arc::new(ReadImageTool),
+            Arc::new(ProposePlanTool),
             Arc::new(SpawnAgentsTool),
             // Browser tools
             Arc::new(BrowserNavigateTool),
@@ -204,9 +207,11 @@ impl ToolRegistry {
 
     /// Create tool registry for Explore mode WITH sandbox.
     /// REQ-PROJ-013: All tools available, bash sandboxed read-only.
+    /// Adds `propose_plan` (Explore-only gateway to Work mode).
     pub fn explore_with_sandbox() -> Self {
-        // Same as standard() — bash sandboxing is handled by the bash tool itself
-        Self::new_with_options(false)
+        let mut registry = Self::new_with_options(false);
+        registry.tools.push(Arc::new(ProposePlanTool));
+        registry
     }
 
     /// Create standard tool registry (parent conversations — legacy, will be removed)
