@@ -1426,6 +1426,7 @@ where
                         worktree_path: Some(approval_result.worktree_path.clone()),
                         conv_mode_label: Some("Work".to_string()),
                         base_branch: Some(approval_result.base_branch.clone()),
+                        commits_behind: None,
                     },
                 });
 

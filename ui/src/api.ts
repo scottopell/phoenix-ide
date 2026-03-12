@@ -14,6 +14,7 @@ export interface Conversation {
   branch_name?: string | null;
   worktree_path?: string | null;
   base_branch?: string | null;
+  commits_behind?: number;
   archived?: boolean;
   project_id?: string | null;
   conv_mode_label?: string;
@@ -132,6 +133,8 @@ export interface SseInitData {
   /** Model's maximum context window in tokens */
   model_context_window?: number;
   breadcrumbs?: SseBreadcrumb[];
+  /** How many commits the base branch is ahead of the task branch (Work mode only) */
+  commits_behind?: number;
 }
 
 export interface SseMessageData {

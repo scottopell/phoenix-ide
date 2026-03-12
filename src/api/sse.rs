@@ -45,6 +45,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             context_window_size,
             model_context_window,
             breadcrumbs,
+            commits_behind,
         } => {
             // Serialize typed data at the SSE boundary
             let enriched_msgs: Vec<serde_json::Value> =
@@ -60,7 +61,8 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                     "last_sequence_id": last_sequence_id,
                     "context_window_size": context_window_size,
                     "model_context_window": model_context_window,
-                    "breadcrumbs": breadcrumbs
+                    "breadcrumbs": breadcrumbs,
+                    "commits_behind": commits_behind
                 }),
             )
         }

@@ -88,6 +88,8 @@ pub struct ConversationMetadataUpdate {
     pub conv_mode_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commits_behind: Option<u32>,
 }
 
 /// A conversation enriched with derived display fields for the API layer.
@@ -135,6 +137,9 @@ pub enum SseEvent {
         /// Model's maximum context window in tokens (for calculating percentage)
         model_context_window: usize,
         breadcrumbs: Vec<SseBreadcrumb>,
+        /// How many commits the base branch is ahead of this conversation's task branch.
+        /// Only populated for Work-mode conversations. 0 means up-to-date or not applicable.
+        commits_behind: u32,
     },
     Message {
         message: crate::db::Message,

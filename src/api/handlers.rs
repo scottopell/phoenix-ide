@@ -157,6 +157,29 @@ pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
     json
 }
 
+/// Count how many commits `base_branch` is ahead of `task_branch` in `repo_root`.
+///
+/// Shells out to `git rev-list --count`. Returns 0 on any error (missing branch,
+/// git not available, parse failure). This is a best-effort indicator.
+///
+/// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
+fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
+    let range = format!("{task_branch}..{base_branch}");
+    match run_git(repo_root, &["rev-list", "--count", &range]) {
+        Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
+        Err(e) => {
+            tracing::debug!(
+                repo = %repo_root.display(),
+                base_branch,
+                task_branch,
+                error = %e,
+                "commits_behind check failed, returning 0"
+            );
+            0
+        }
+    }
+}
+
 /// Merge pre-computed `display_data` into content blocks.
 ///
 /// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
@@ -747,6 +770,7 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -783,12 +807,13 @@ async fn stream_conversation(
     // Extract breadcrumbs from the last turn
     let breadcrumbs = extract_breadcrumbs(&messages);
 
-    // Subscribe to updates
-    let broadcast_rx = state
+    // Get the conversation handle (subscribes + gives us broadcast_tx for polling)
+    let handle = state
         .runtime
-        .subscribe(&id)
+        .get_or_create(&id)
         .await
         .map_err(AppError::Internal)?;
+    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     // Get model's context window for percentage calculation
     let model_id = conversation
@@ -796,6 +821,41 @@ async fn stream_conversation(
         .as_deref()
         .unwrap_or(state.llm_registry.default_model_id());
     let model_context_window = state.llm_registry.context_window(model_id);
+
+    // Compute initial commits_behind for Work conversations.
+    // Extract the git info we need for both the init value and the polling task.
+    let work_git_info = match &conversation.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            base_branch,
+            ..
+        } if !base_branch.is_empty() && !branch_name.is_empty() => {
+            // Resolve repo root from project
+            let repo_root = if let Some(ref project_id) = conversation.project_id {
+                state
+                    .db
+                    .get_project(project_id)
+                    .await
+                    .ok()
+                    .map(|p| PathBuf::from(p.canonical_path))
+            } else {
+                None
+            };
+            repo_root.map(|root| (root, base_branch.clone(), branch_name.clone()))
+        }
+        _ => None,
+    };
+
+    let initial_commits_behind = if let Some((ref repo_root, ref base, ref task)) = work_git_info {
+        let root = repo_root.clone();
+        let base = base.clone();
+        let task = task.clone();
+        tokio::task::spawn_blocking(move || commits_behind(&root, &base, &task))
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
@@ -807,7 +867,46 @@ async fn stream_conversation(
         context_window_size,
         model_context_window,
         breadcrumbs,
+        commits_behind: initial_commits_behind,
     };
+
+    // Spawn periodic commits-behind polling for Work conversations (REQ-PROJ-011)
+    if let Some((repo_root, base_branch, task_branch)) = work_git_info {
+        let broadcast_tx = handle.broadcast_tx.clone();
+        tokio::spawn(async move {
+            let mut last_value = initial_commits_behind;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_mins(1)).await;
+
+                let root = repo_root.clone();
+                let base = base_branch.clone();
+                let task = task_branch.clone();
+                let new_value =
+                    tokio::task::spawn_blocking(move || commits_behind(&root, &base, &task))
+                        .await
+                        .unwrap_or(last_value);
+
+                if new_value != last_value {
+                    last_value = new_value;
+                    let result = broadcast_tx.send(SseEvent::ConversationUpdate {
+                        update: crate::runtime::ConversationMetadataUpdate {
+                            cwd: None,
+                            branch_name: None,
+                            worktree_path: None,
+                            conv_mode_label: None,
+                            base_branch: None,
+                            commits_behind: Some(new_value),
+                        },
+                    });
+                    // No receivers left -- client disconnected, exit polling loop
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("commits-behind polling task exited");
+        });
+    }
 
     Ok(sse_stream(init_event, broadcast_rx))
 }
