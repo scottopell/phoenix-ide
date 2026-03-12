@@ -4,7 +4,8 @@ import { api } from '../api';
 interface WorkActionsProps {
   conversationId: string;
   convModeLabel?: string;
-  displayState?: string;
+  /** Live phase type from atom (not stale conversation.display_state) */
+  phaseType: string;
   branchName?: string;
   baseBranch?: string | null;
 }
@@ -17,7 +18,7 @@ type ModalState =
 export function WorkActions({
   conversationId,
   convModeLabel,
-  displayState,
+  phaseType,
   branchName,
   baseBranch,
 }: WorkActionsProps) {
@@ -27,9 +28,9 @@ export function WorkActions({
   const [confirming, setConfirming] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
 
-  // Only render for idle Work conversations
+  // Only render for idle Work conversations (phaseType is live from atom, not stale)
   if (convModeLabel !== 'Work') return null;
-  if (displayState !== 'idle') return null;
+  if (phaseType !== 'idle') return null;
 
   const isLoading = modalState.type === 'loading' || confirming || abandoning;
 

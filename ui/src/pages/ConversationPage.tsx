@@ -557,7 +557,7 @@ export function ConversationPage() {
           <WorkActions
             conversationId={conversationId}
             convModeLabel={conversation.conv_mode_label}
-            displayState={conversation.display_state}
+            phaseType={convStateForChildren.type}
             branchName={conversation.branch_name ?? undefined}
             baseBranch={conversation.base_branch}
           />
