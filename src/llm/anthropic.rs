@@ -514,16 +514,16 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
         if end_turn {
             // Valid: model completed the tool call loop with nothing further to say.
             // Common with concise models (e.g. haiku) after a simple tool result.
-            // Emit an empty text block so the SM receives a well-formed response
-            // and transitions to idle normally.
+            // Use a single space so the block is non-empty (Anthropic rejects empty
+            // text blocks on re-send) but visually invisible.
             tracing::debug!(
                 stop_reason = ?resp.stop_reason,
                 output_tokens = resp.usage.output_tokens,
                 raw_block_count = raw_block_count,
-                "Anthropic end_turn with empty content — treating as successful completion"
+                "Anthropic end_turn with empty content — injecting placeholder for SM"
             );
             content.push(ContentBlock::Text {
-                text: String::new(),
+                text: " ".to_string(),
             });
         } else {
             tracing::warn!(
