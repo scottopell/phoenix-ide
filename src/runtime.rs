@@ -620,6 +620,29 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Result<(ConvState, bool), String> {
+        // States that survive restart (preserved by reset_all_to_idle) must be
+        // restored from the DB, not derived from message history. The recovery
+        // heuristic only applies to transient states that were reset to Idle.
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        match &conv.state {
+            ConvState::AwaitingTaskApproval { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::Terminal => {
+                tracing::debug!(
+                    conv_id = %conversation_id,
+                    state = ?std::mem::discriminant(&conv.state),
+                    "Restoring persisted state (survives restart)"
+                );
+                return Ok((conv.state, false));
+            }
+            _ => {}
+        }
+
         let messages = self
             .db
             .get_messages(conversation_id)
