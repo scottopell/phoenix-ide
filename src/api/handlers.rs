@@ -1397,13 +1397,15 @@ async fn confirm_complete(
             )));
         }
 
-        // 2d. Commit
-        if let Err(e) = run_git(&repo_root, &["commit", "-m", &commit_message]) {
-            // Reset staged changes on commit failure
-            let _ = run_git(&repo_root, &["reset", "HEAD"]);
-            return Err(AppError::Internal(format!(
-                "Commit failed: {e}"
-            )));
+        // 2d. Commit (skip if merge --squash produced no changes, e.g., only task file)
+        let has_staged = run_git(&repo_root, &["diff", "--cached", "--quiet"]).is_err();
+        if has_staged {
+            if let Err(e) = run_git(&repo_root, &["commit", "-m", &commit_message]) {
+                let _ = run_git(&repo_root, &["reset", "HEAD"]);
+                return Err(AppError::Internal(format!("Commit failed: {e}")));
+            }
+        } else {
+            tracing::info!("Squash merge produced no changes (task-only branch), skipping commit");
         }
 
         // 2e. Record short SHA
@@ -1458,17 +1460,36 @@ async fn confirm_complete(
         "Task completed. Squash merged to {base_branch_for_msg} as {short_sha}."
     );
     let msg_id = uuid::Uuid::new_v4().to_string();
-    state
+    let msg = state
         .db
         .add_message(
             &msg_id,
             &id,
-            &MessageContent::system(system_msg),
+            &MessageContent::system(&system_msg),
             None,
             None,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 6. Broadcast SSE events so the frontend updates in real-time
+    if let Ok(handle) = state.runtime.get_or_create(&id).await {
+        let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
+        let _ = handle.broadcast_tx.send(SseEvent::StateChange {
+            state: ConvState::Terminal,
+            display_state: ConvState::Terminal.display_state().as_str().to_string(),
+        });
+        let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
+            update: crate::runtime::ConversationMetadataUpdate {
+                cwd: None,
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: Some("Explore".to_string()),
+                base_branch: None,
+                commits_behind: None,
+            },
+        });
+    }
 
     Ok(Json(ConfirmCompleteResponse {
         success: true,
@@ -1702,17 +1723,36 @@ async fn abandon_task(
 
     // 5. Inject system message
     let msg_id = uuid::Uuid::new_v4().to_string();
-    state
+    let msg = state
         .db
         .add_message(
             &msg_id,
             &id,
-            &MessageContent::system("Task abandoned. Worktree and branch deleted.".to_string()),
+            &MessageContent::system("Task abandoned. Worktree and branch deleted."),
             None,
             None,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 6. Broadcast SSE events so the frontend updates in real-time
+    if let Ok(handle) = state.runtime.get_or_create(&id).await {
+        let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
+        let _ = handle.broadcast_tx.send(SseEvent::StateChange {
+            state: ConvState::Terminal,
+            display_state: ConvState::Terminal.display_state().as_str().to_string(),
+        });
+        let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
+            update: crate::runtime::ConversationMetadataUpdate {
+                cwd: None,
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: Some("Explore".to_string()),
+                base_branch: None,
+                commits_behind: None,
+            },
+        });
+    }
 
     Ok(Json(SuccessResponse { success: true }))
 }

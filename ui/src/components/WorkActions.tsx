@@ -148,6 +148,8 @@ function CommitModal({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !confirming) {
+        e.preventDefault();
+        e.stopPropagation();
         onCancel();
       }
     },
