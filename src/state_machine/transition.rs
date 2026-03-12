@@ -197,22 +197,35 @@ pub fn transition(
                 // Treat as implicit completion — the text IS the result.
                 use crate::state_machine::state::SubAgentOutcome;
                 let result_text = extract_text_from_content(&content);
-                Ok(TransitionResult::new(ConvState::Completed {
+                let mut tr = TransitionResult::new(ConvState::Completed {
                     result: result_text.clone(),
-                })
-                .with_effect(Effect::persist_agent_message(
-                    content,
-                    Some(usage_data),
-                    &context.working_dir,
-                ))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::NotifyParent {
-                    outcome: SubAgentOutcome::Success {
-                        result: result_text,
-                    },
-                }))
+                });
+                // Only persist the agent message if there's actual content
+                // (empty content = model had nothing to say, don't poison history)
+                if !content.is_empty() {
+                    tr = tr.with_effect(Effect::persist_agent_message(
+                        content,
+                        Some(usage_data),
+                        &context.working_dir,
+                    ));
+                }
+                Ok(tr
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::NotifyParent {
+                        outcome: SubAgentOutcome::Success {
+                            result: result_text,
+                        },
+                    }))
+            } else if tool_calls.is_empty() && content.is_empty() {
+                // Empty content, no tools — model had nothing to say (documented
+                // Anthropic behavior after tool results). Transition to Idle without
+                // persisting an empty agent message that would poison the history.
+                tracing::debug!("LLM returned end_turn with empty content — no message to persist");
+                Ok(TransitionResult::new(ConvState::Idle)
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_agent_done()))
             } else if tool_calls.is_empty() {
-                // No tools, just text response -> Idle
+                // No tools, text response -> Idle
                 Ok(TransitionResult::new(ConvState::Idle)
                     .with_effect(Effect::persist_agent_message(
                         content,
