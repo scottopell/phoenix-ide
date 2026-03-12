@@ -5638,56 +5638,62 @@ html * {
   vertical-align: middle;
 }
 
-/* --- Work Actions (Complete / Abandon) --- */
+/* --- Work Actions (inline bar above input area) --- */
 
-.work-actions {
+.work-actions-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px;
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border-color);
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.work-actions-label {
+  margin-right: auto;
 }
 
 .work-actions-btn {
   font-size: 12px;
-  padding: 4px 12px;
+  padding: 3px 10px;
   border-radius: 4px;
   border: 1px solid var(--border-color);
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 150ms, border-color 150ms, opacity 150ms;
   font-weight: 500;
+  background: transparent;
+  color: var(--text-secondary);
 }
 
 .work-actions-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
 .work-actions-complete {
-  background: var(--accent-green, #22c55e);
-  color: #fff;
-  border-color: var(--accent-green, #22c55e);
+  color: var(--accent-green, #22c55e);
+  border-color: color-mix(in srgb, var(--accent-green, #22c55e) 40%, transparent);
 }
 
 .work-actions-complete:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-green, #22c55e) 85%, #000);
+  background: color-mix(in srgb, var(--accent-green, #22c55e) 10%, transparent);
+  border-color: var(--accent-green, #22c55e);
 }
 
 .work-actions-abandon {
-  background: transparent;
-  color: var(--accent-red, #ef4444);
-  border-color: var(--accent-red, #ef4444);
+  color: var(--text-muted);
+  border-color: transparent;
 }
 
 .work-actions-abandon:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-red, #ef4444) 12%, transparent);
+  color: var(--accent-red, #ef4444);
+  border-color: color-mix(in srgb, var(--accent-red, #ef4444) 30%, transparent);
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 8%, transparent);
 }
 
 .work-actions-error {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--accent-red, #ef4444);
-  margin-left: 8px;
 }
 
 /* --- Commit Message Modal --- */
@@ -5695,7 +5701,7 @@ html * {
 .commit-modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(0, 0, 0, 0.5);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -5712,9 +5718,9 @@ html * {
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  padding: 20px;
+  padding: 20px 24px;
   width: 90%;
-  max-width: 560px;
+  max-width: 520px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   animation: commit-modal-slide-in 150ms ease;
 }
@@ -5725,36 +5731,41 @@ html * {
 }
 
 .commit-modal-title {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
-  margin: 0 0 4px;
-}
-
-.commit-modal-subtitle {
-  font-size: 13px;
-  color: var(--text-secondary);
   margin: 0 0 12px;
 }
 
-.commit-modal-subtitle code {
-  font-family: monospace;
-  font-size: 12px;
+.commit-modal-title code {
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 13px;
   background: var(--bg-tertiary);
-  padding: 1px 4px;
+  padding: 1px 5px;
   border-radius: 3px;
+  font-weight: 500;
+}
+
+.commit-modal-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
 }
 
 .commit-modal-nudge {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  margin-bottom: 12px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
   font-size: 12px;
   color: var(--accent-yellow, #eab308);
-  background: color-mix(in srgb, var(--accent-yellow, #eab308) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent-yellow, #eab308) 30%, transparent);
+  background: color-mix(in srgb, var(--accent-yellow, #eab308) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-yellow, #eab308) 20%, transparent);
   border-radius: 4px;
 }
 
@@ -5771,10 +5782,11 @@ html * {
 
 .commit-modal-textarea {
   width: 100%;
-  min-height: 160px;
+  min-height: 120px;
   padding: 10px;
   font-family: 'SF Mono', Monaco, Consolas, monospace;
   font-size: 13px;
+  line-height: 1.5;
   color: var(--text-primary);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -5805,7 +5817,7 @@ html * {
   border-radius: 4px;
   cursor: pointer;
   font-weight: 500;
-  transition: background 0.15s;
+  transition: background 150ms;
 }
 
 .commit-modal-btn:disabled {

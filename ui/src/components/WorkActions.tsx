@@ -35,7 +35,8 @@ export function WorkActions({
 
   return (
     <>
-      <div className="work-actions">
+      <div className="work-actions-bar">
+        <span className="work-actions-label">Task complete?</span>
         <button
           className="work-actions-btn work-actions-complete"
           disabled={isLoading}
@@ -56,7 +57,7 @@ export function WorkActions({
             }
           }}
         >
-          {modalState.type === 'loading' ? 'Preparing...' : 'Complete'}
+          {modalState.type === 'loading' ? 'Preparing...' : 'Merge to ' + (baseBranch || 'main')}
         </button>
         <button
           className="work-actions-btn work-actions-abandon"
@@ -70,7 +71,6 @@ export function WorkActions({
             setAbandoning(true);
             try {
               await api.abandonTask(conversationId);
-              // Terminal state arrives via SSE
             } catch (err) {
               setError(err instanceof Error ? err.message : 'Failed to abandon task');
             } finally {
@@ -97,7 +97,6 @@ export function WorkActions({
             try {
               await api.confirmComplete(conversationId, editedMessage);
               setModalState({ type: 'closed' });
-              // Terminal state arrives via SSE
             } catch (err) {
               setError(err instanceof Error ? err.message : 'Failed to confirm completion');
             } finally {
@@ -171,13 +170,10 @@ function CommitModal({
       }}
     >
       <div className="commit-modal">
-        <h3 className="commit-modal-title">Confirm Squash Merge</h3>
-        <p className="commit-modal-subtitle">
-          Merging into <code>{baseBranch}</code>
-        </p>
+        <h3 className="commit-modal-title">Squash merge into <code>{baseBranch}</code></h3>
         {taskNotDone && !nudgeDismissed && (
           <div className="commit-modal-nudge">
-            <span>Task file is not marked done. Consider asking the agent to update it before completing.</span>
+            <span>Task file not marked done.</span>
             <button
               className="commit-modal-nudge-dismiss"
               onClick={() => setNudgeDismissed(true)}
@@ -186,12 +182,14 @@ function CommitModal({
             </button>
           </div>
         )}
+        <label className="commit-modal-label">Commit message</label>
         <textarea
           className="commit-modal-textarea"
           value={commitMessage}
           onChange={(e) => onChangeMessage(e.target.value)}
-          rows={8}
+          rows={6}
           disabled={confirming}
+          autoFocus
         />
         <div className="commit-modal-actions">
           <button

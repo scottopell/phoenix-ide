@@ -542,6 +542,16 @@ export function ConversationPage() {
           onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
         />
       ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
+        <>
+        {conversationId && (
+          <WorkActions
+            conversationId={conversationId}
+            convModeLabel={conversation.conv_mode_label}
+            displayState={conversation.display_state}
+            branchName={conversation.branch_name ?? undefined}
+            baseBranch={conversation.base_branch}
+          />
+        )}
         <InputArea
           ref={inputRef}
           conversationId={conversationId}
@@ -555,17 +565,9 @@ export function ConversationPage() {
           onRetry={handleRetry}
           onOpenFileBrowser={handleOpenFileBrowser}
         />
+        </>
       ) : null}
       <BreadcrumbBar breadcrumbs={atom.breadcrumbs} visible={atom.breadcrumbs.length > 0} />
-      {conversationId && (
-        <WorkActions
-          conversationId={conversationId}
-          convModeLabel={conversation.conv_mode_label}
-          displayState={conversation.display_state}
-          branchName={conversation.branch_name ?? undefined}
-          baseBranch={conversation.base_branch}
-        />
-      )}
       <StateBar
         conversation={conversation as Conversation}
         convState={convStateForChildren}
