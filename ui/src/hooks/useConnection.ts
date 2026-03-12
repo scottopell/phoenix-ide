@@ -43,7 +43,10 @@ function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
-  const conversation = raw.conversation;
+  // Merge top-level commits_behind into conversation (backend may send it at SSE init level)
+  const conversation = raw.commits_behind != null
+    ? { ...raw.conversation, commits_behind: raw.commits_behind }
+    : raw.conversation;
   const messages = raw.messages || [];
   const phase = parseConversationState(conversation?.state);
 

@@ -16,6 +16,7 @@ import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
+import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom } from '../conversation';
 
 export function ConversationPage() {
@@ -556,6 +557,15 @@ export function ConversationPage() {
         />
       ) : null}
       <BreadcrumbBar breadcrumbs={atom.breadcrumbs} visible={atom.breadcrumbs.length > 0} />
+      {conversationId && (
+        <WorkActions
+          conversationId={conversationId}
+          convModeLabel={conversation.conv_mode_label}
+          displayState={conversation.display_state}
+          branchName={conversation.branch_name ?? undefined}
+          baseBranch={conversation.base_branch}
+        />
+      )}
       <StateBar
         conversation={conversation as Conversation}
         convState={convStateForChildren}
