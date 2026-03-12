@@ -225,6 +225,16 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                     />
                   );
                 }
+                if (type === 'system') {
+                  const text = (msg.content as { text?: string })?.text;
+                  if (text) {
+                    return (
+                      <div key={msg.sequence_id} className="system-message">
+                        <span className="system-message-text">{text}</span>
+                      </div>
+                    );
+                  }
+                }
                 // Skip tool messages - they're rendered inline with their tool_use
                 return null;
               })}
