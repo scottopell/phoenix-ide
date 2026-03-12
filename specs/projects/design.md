@@ -203,6 +203,19 @@ just like any other file in the worktree. No dedicated tool is needed — task f
 are regular markdown files. Updates to the task file live on the task branch and
 merge to main with the rest of the code changes (M4).
 
+## Main Checkout Mutex
+
+The Complete and Abandon flows require git operations on the main checkout
+(base_branch). Since other Explore conversations may be using the main checkout,
+the executor must acquire a mutex lock before operating on it. Use a per-project
+mutex (keyed by project root path) to serialize Complete/Abandon operations. The
+lock is held only for the duration of the git sequence (checkout + merge +
+commit), not during the LLM commit message generation.
+
+If the main checkout has uncommitted changes when the lock is acquired, the
+operation fails with an actionable error (same pattern as the dirty-worktree
+pre-check).
+
 ## Executor-Layer Git Operations
 
 All git operations are side effects dispatched by the executor, not SM transitions:

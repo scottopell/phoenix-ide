@@ -38,11 +38,12 @@ Read first:
 
 **1a. Add `base_branch` to `ConvMode::Work`** -- `src/db/schema.rs`
 
-Add `base_branch: String` field with `#[serde(default)]` rollout shim. Record
-the checked-out branch at approval time. Update `execute_approve_task_blocking`
-in `src/runtime/executor.rs` to detect current branch via
-`git rev-parse --abbrev-ref HEAD` and pass it through `TaskApprovalResult`.
-Store in `ConvMode::Work` alongside `branch_name` and `worktree_path`.
+Add `base_branch: String` and `task_number: u32` fields with `#[serde(default)]`
+rollout shim. Record the checked-out branch at approval time. Update
+`execute_approve_task_blocking` in `src/runtime/executor.rs` to detect current
+branch via `git rev-parse --abbrev-ref HEAD` and pass it through
+`TaskApprovalResult`. Store in `ConvMode::Work` alongside `branch_name` and
+`worktree_path`.
 
 Spec: REQ-PROJ-017
 
@@ -64,7 +65,8 @@ Flow:
    - `git merge-tree $(git merge-base base_branch HEAD) base_branch HEAD` or
      `git merge --no-commit --no-ff base_branch` dry run -- block if conflicts
 2. Generate commit message: LLM call with `git diff base_branch...HEAD` +
-   semantic commit instructions (REQ-PROJ-009)
+   semantic commit instructions (REQ-PROJ-009). Use the conversation's configured
+   model for the commit message generation.
 3. Return commit message to frontend for confirmation
 
 Spec: REQ-PROJ-009
@@ -76,11 +78,14 @@ New endpoint: `POST /api/conversations/:id/confirm-complete`
 Body: `{ commit_message: "..." }`
 
 Executor sequence (blocking, on spawn_blocking):
-1. `git checkout base_branch` (in main checkout, not worktree)
-2. `git merge --squash task_branch`
-3. `git commit -m "{commit_message}"`
-4. `git worktree remove {path} --force`
-5. `git branch -D {branch}`
+1. Acquire per-project mutex before git operations on main checkout
+2. Check main checkout is clean (`git status --porcelain` on repo root)
+3. `git checkout base_branch` (in main checkout, not worktree)
+4. `git merge --squash task_branch`
+5. `git commit -m "{commit_message}"`
+6. `git worktree remove {path} --force`
+7. `git branch -D {branch}`
+8. Release mutex after git sequence completes
 
 After success:
 - Transition conversation to Terminal state
@@ -108,13 +113,18 @@ Validation: same as complete (Work mode, Idle state, project-scoped).
 Executor sequence (blocking):
 1. `git worktree remove {path} --force`
 2. `git branch -D {branch}`
-3. `git checkout base_branch` (in main checkout)
-4. Update task file status to `wont-do`:
-   - Parse task filename from `ConvMode::Work` data (or scan tasks/ for matching
-     branch name)
+3. Acquire per-project mutex before git operations on main checkout
+4. Check main checkout is clean (`git status --porcelain` on repo root)
+5. `git checkout base_branch` (in main checkout)
+6. Update task file status to `wont-do`:
+   - Identify task file on base_branch by scanning `tasks/` for files whose
+     4-digit prefix matches the task number stored in `ConvMode::Work`.
+     Task IDs are immutable -- even if the agent renamed the file on the task
+     branch, the base_branch copy retains the original name.
    - `git mv tasks/{old_filename} tasks/{new_filename_with_wontdo}` (taskmd
      convention: status in filename)
    - `git commit -m "task {NNNN}: mark wont-do"`
+7. Release mutex after git sequence completes
 
 After success:
 - Transition conversation to Terminal state
@@ -154,8 +164,11 @@ Show "Complete" button on idle Work conversations. Clicking triggers:
 1. `POST /api/conversations/:id/complete-task`
 2. If `task_not_done`, show nudge banner
 3. Show editable commit message dialog (pre-filled from response)
-4. On confirm: `POST /api/conversations/:id/confirm-complete`
-5. On success: conversation transitions to Terminal via SSE
+4. While the commit message confirmation dialog is open, register a
+   `beforeunload` handler to warn the user if they attempt to close or
+   navigate away from the page
+5. On confirm: `POST /api/conversations/:id/confirm-complete`
+6. On success: conversation transitions to Terminal via SSE
 
 **4b. Abandon button** -- same location as Complete
 

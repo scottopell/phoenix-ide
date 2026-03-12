@@ -50,7 +50,7 @@ commits-behind indicator shows base branch advancement in the StateBar.
 | **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ❌ Not Started | Pure data carrier, intercepted like submit_result |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 0601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 0601 (M1). Project tabs, mode badges |
-| **REQ-PROJ-015:** Project Worktree Registry | ❌ Not Started | Track worktrees, reconcile on startup |
+| **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
 | **REQ-PROJ-016:** Standalone Conversation Mode | ✅ Complete | Task 0601 (M1). Non-git dirs get full tools, no project |
 | **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ❌ Not Started | ConvMode::Work stores base_branch from approval time |
 

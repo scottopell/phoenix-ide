@@ -220,12 +220,16 @@ one-Work-sub-agent constraint maintains a single writer per worktree at all time
 WHEN the user initiates the Complete action on an idle Work conversation
 THE SYSTEM SHALL run pre-checks before proceeding:
 - Verify no uncommitted changes exist in the worktree (fail with actionable error if dirty)
+- Verify the main checkout has no uncommitted changes (fail with actionable error if dirty)
 - Verify no merge conflicts exist between the task branch and base_branch (fail with actionable error if conflicts)
 
 WHEN pre-checks pass
 THE SYSTEM SHALL generate a semantic commit message by sending `git diff base_branch...HEAD`
   to the LLM with instructions to produce a concise, concept-focused commit message
 AND present the generated commit message in an editable confirmation dialog
+
+WHILE the commit message confirmation dialog is open
+THE SYSTEM SHALL register a browser navigation guard to warn the user before leaving the page
 
 WHEN the user confirms the commit message (possibly after editing)
 THE SYSTEM SHALL squash merge the task branch into base_branch:
@@ -260,7 +264,8 @@ THE SYSTEM SHALL present a confirmation dialog warning that all work will be
   permanently deleted (worktree and branch)
 
 WHEN the user confirms abandonment
-THE SYSTEM SHALL delete the worktree: `git worktree remove {path} --force`
+THE SYSTEM SHALL verify the main checkout has no uncommitted changes (fail with actionable error if dirty)
+AND delete the worktree: `git worktree remove {path} --force`
 AND delete the task branch: `git branch -D {branch}`
 AND update the task file status to `wont-do` on base_branch:
   `git checkout base_branch && taskmd rename {task_file} --status wont-do && git add tasks/ && git commit -m "task {NNNN}: mark wont-do"`
@@ -382,6 +387,8 @@ visibility prevents confusion about what a conversation can do.
 ---
 
 ### REQ-PROJ-015: Project Worktree Registry
+
+**DESCOPED:** The dedicated worktree registry table is not needed. `ConvMode::Work` on each conversation serves as the de facto registry -- querying all Work conversations for a project yields the active worktree list. Startup reconciliation (M3) handles orphan detection by checking worktree paths on disk. This requirement is retained for historical context but will not be implemented.
 
 WHEN a worktree is created for a task
 THE SYSTEM SHALL register it in the project record with task ID, worktree path,
