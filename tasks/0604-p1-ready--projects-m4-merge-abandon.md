@@ -15,9 +15,6 @@ Two user-initiated actions on idle Work conversations: **Complete** (squash merg
 into base branch, cleanup, Terminal) and **Abandon** (destructive discard, cleanup,
 Terminal). Plus a passive **commits-behind indicator** for awareness.
 
-No new ConvState variant. No agent-initiated review. No diff review gate. No
-return-to-Explore complexity.
-
 ## Context
 
 Read first:
@@ -32,22 +29,84 @@ Read first:
 
 - Task 0603 (M3: worktree isolation) -- DONE
 
+## Design Decisions (resolved)
+
+These were resolved during discovery and stress-testing. Do not re-litigate.
+
+1. **New `ConvState::Terminal` variant.** Existing terminal states (`Completed`,
+   `Failed`) are sub-agent-specific and cause the executor loop to exit. A new
+   `Terminal` variant is needed that: displays as terminal, rejects new messages,
+   and keeps the executor alive long enough to broadcast final SSE events before
+   exiting. Add it to `state.rs`, `DisplayState`, `reset_all_to_idle` (preserve
+   on restart, same as `ContextExhausted`).
+
+2. **Race window between complete-task and confirm-complete is accepted.** There
+   is no cron-like mechanism that triggers events while Idle. The confirm endpoint
+   re-validates Idle state as a safety check but no locking needed.
+
+3. **Global mutex (reuse `TASK_APPROVAL_MUTEX`).** Complete/Abandon/Approve are
+   all rare operations. A single global mutex serializing git-on-main-checkout
+   operations is sufficient. No per-project map needed.
+
+4. **Empty `base_branch` on existing Work rows: revert to Explore.** Same pattern
+   as empty `worktree_path` in M3 reconciliation. Add to startup reconciliation.
+
+5. **`task_number: u32` stored in `ConvMode::Work`.** Format to 4-digit zero-padded
+   (`{:04}`) when scanning task files. The spec's `task_id: String` in REQ-PROJ-017
+   is conceptually the same; use `u32` in code for consistency with existing
+   `scan_highest_task_number`.
+
+6. **Abandon ordering: worktree delete BEFORE mutex.** If worktree deletion
+   succeeds but task-file rename fails (e.g., dirty main checkout), the conversation
+   stays in Work mode with a dangling worktree_path. On next server restart,
+   reconciliation detects the missing worktree and reverts to Explore. This is
+   acceptable -- the user can retry Abandon after fixing the main checkout.
+
+7. **Commit message LLM call: diff truncation.** If `git diff base_branch...HEAD`
+   exceeds 50KB, fall back to `git diff --stat base_branch...HEAD` (summary only).
+   Use a one-shot prompt with the diff + semantic commit instructions. No
+   conversation history needed -- the diff is self-contained context.
+
+8. **Task file identification: scan by 4-digit prefix.** Both Complete (nudge
+   check) and Abandon (rename) locate the task file by scanning `tasks/` for
+   files whose prefix matches `{task_number:04}`. If not found, skip silently
+   (nudge) or skip rename with a warning log (abandon).
+
+9. **Commits-behind SSE: use `ConversationUpdate`.** Add `commits_behind: Option<u32>`
+   to `ConversationMetadataUpdate`. Reuse the existing SSE event type rather than
+   adding a new variant.
+
+10. **Commit message dialog: modal overlay.** Build a simple modal with a textarea
+    for the commit message and Confirm/Cancel buttons. No existing modal component
+    exists in the codebase -- create one. Also guard against React Router navigation
+    (not just `beforeunload`) using a `useBlocker` or `Prompt` equivalent.
+
 ## Implementation
 
-### Batch 1: Backend -- base_branch + Complete flow
+### Batch 1: Backend -- base_branch + ConvState::Terminal + Complete flow
 
-**1a. Add `base_branch` to `ConvMode::Work`** -- `src/db/schema.rs`
+**1a. Add `ConvState::Terminal`** -- `src/state_machine/state.rs`
+
+New variant: `Terminal`. Map to `DisplayState::Terminal` (already exists). Add to
+`reset_all_to_idle` exclusion list alongside `ContextExhausted` and
+`AwaitingTaskApproval`. Add to `StepResult` as terminal. Update all exhaustive
+matches (`proptests.rs`, `transition.rs` -- reject all events from Terminal).
+
+**1b. Add `base_branch` and `task_number` to `ConvMode::Work`** -- `src/db/schema.rs`
 
 Add `base_branch: String` and `task_number: u32` fields with `#[serde(default)]`
-rollout shim. Record the checked-out branch at approval time. Update
+rollout shim. Add `base_branch()` and `task_number()` accessors. Update
 `execute_approve_task_blocking` in `src/runtime/executor.rs` to detect current
 branch via `git rev-parse --abbrev-ref HEAD` and pass it through
 `TaskApprovalResult`. Store in `ConvMode::Work` alongside `branch_name` and
 `worktree_path`.
 
+Update startup reconciliation in `main.rs`: revert Work conversations with empty
+`base_branch` to Explore (same pattern as empty `worktree_path`).
+
 Spec: REQ-PROJ-017
 
-**1b. Complete API endpoint** -- `src/api/handlers.rs`
+**1c. Complete API endpoint** -- `src/api/handlers.rs`
 
 New endpoint: `POST /api/conversations/:id/complete-task`
 
@@ -56,51 +115,54 @@ Validation:
 - Conversation state is Idle (agent not working)
 - Project-scoped conversation
 
-Response: `{ success: true, commit_message: "..." }` on pre-check pass, or
-error with actionable message.
+Pre-checks (blocking, on spawn_blocking):
+1. `git status --porcelain` in worktree -- block if dirty
+2. Conflict detection: `git merge-tree $(git merge-base base_branch HEAD)
+   base_branch HEAD` in repo root -- block if output indicates conflicts
 
-Flow:
-1. Pre-checks (dispatched to executor via new event):
-   - `git status --porcelain` in worktree -- block if dirty
-   - `git merge-tree $(git merge-base base_branch HEAD) base_branch HEAD` or
-     `git merge --no-commit --no-ff base_branch` dry run -- block if conflicts
-2. Generate commit message: LLM call with `git diff base_branch...HEAD` +
-   semantic commit instructions (REQ-PROJ-009). Use the conversation's configured
-   model for the commit message generation.
-3. Return commit message to frontend for confirmation
+Task file nudge: scan worktree `tasks/` for file with matching task_number prefix.
+If found and frontmatter status is not `done`, include `task_not_done: true` in
+response.
+
+Commit message generation:
+1. `git diff base_branch...HEAD` in worktree. If output > 50KB, fall back to
+   `git diff --stat base_branch...HEAD`.
+2. LLM call with diff + semantic commit prompt (see
+   `~/.config/home-dir-configs/claude/commands/semantic-commit.md` for style).
+   Use conversation's configured model. One-shot, no conversation history.
+3. Return `{ success: true, commit_message: "...", task_not_done: false }`.
+
+On pre-check failure: return `{ error: "...", error_type: "dirty_worktree" |
+"merge_conflicts" | "dirty_main_checkout" }` with HTTP 409.
 
 Spec: REQ-PROJ-009
 
-**1c. Complete confirmation endpoint** -- `src/api/handlers.rs`
+**1d. Complete confirmation endpoint** -- `src/api/handlers.rs`
 
 New endpoint: `POST /api/conversations/:id/confirm-complete`
 
 Body: `{ commit_message: "..." }`
 
-Executor sequence (blocking, on spawn_blocking):
-1. Acquire per-project mutex before git operations on main checkout
-2. Check main checkout is clean (`git status --porcelain` on repo root)
-3. `git checkout base_branch` (in main checkout, not worktree)
+Re-validate: conversation is Work mode AND Idle state (race guard).
+
+Executor sequence (blocking, on spawn_blocking, under `TASK_APPROVAL_MUTEX`):
+1. Acquire global mutex
+2. `git status --porcelain` on repo root -- block if dirty
+3. `git checkout base_branch` (in main checkout)
 4. `git merge --squash task_branch`
 5. `git commit -m "{commit_message}"`
-6. `git worktree remove {path} --force`
-7. `git branch -D {branch}`
-8. Release mutex after git sequence completes
+6. Record short SHA: `git rev-parse --short HEAD`
+7. `git worktree remove {worktree_path} --force`
+8. `git branch -D {branch_name}`
+9. Release mutex
 
 After success:
-- Transition conversation to Terminal state
-- Inject system message: "Task completed. Squash merged to {base_branch} as {short_sha}."
+- `self.state = ConvState::Terminal` (direct mutation, then persist)
+- Update conv_mode to Explore (clear Work fields)
+- Inject system message: "Task completed. Squash merged to {base_branch} as {sha}."
 - Broadcast SSE state_change + conversation_update
 
 Spec: REQ-PROJ-009, REQ-BED-029
-
-**1d. Task file done-status nudge** -- `src/api/handlers.rs`
-
-In the complete-task endpoint, before returning the commit message, check if
-the task file in the worktree has `status: done` in its frontmatter. If not,
-include `task_not_done: true` in the response so the frontend can show a nudge.
-
-Spec: REQ-PROJ-009
 
 ### Batch 2: Backend -- Abandon flow
 
@@ -110,24 +172,25 @@ New endpoint: `POST /api/conversations/:id/abandon-task`
 
 Validation: same as complete (Work mode, Idle state, project-scoped).
 
-Executor sequence (blocking):
-1. `git worktree remove {path} --force`
-2. `git branch -D {branch}`
-3. Acquire per-project mutex before git operations on main checkout
-4. Check main checkout is clean (`git status --porcelain` on repo root)
+Frontend sends this only after the user confirms the destructive action dialog.
+
+Executor sequence (blocking, on spawn_blocking):
+1. `git worktree remove {worktree_path} --force`
+2. `git branch -D {branch_name}`
+3. Acquire global mutex (`TASK_APPROVAL_MUTEX`)
+4. `git status --porcelain` on repo root -- block if dirty (release mutex, return error)
 5. `git checkout base_branch` (in main checkout)
-6. Update task file status to `wont-do`:
-   - Identify task file on base_branch by scanning `tasks/` for files whose
-     4-digit prefix matches the task number stored in `ConvMode::Work`.
-     Task IDs are immutable -- even if the agent renamed the file on the task
-     branch, the base_branch copy retains the original name.
-   - `git mv tasks/{old_filename} tasks/{new_filename_with_wontdo}` (taskmd
-     convention: status in filename)
-   - `git commit -m "task {NNNN}: mark wont-do"`
-7. Release mutex after git sequence completes
+6. Scan `tasks/` for file matching `{task_number:04}-*`. If found:
+   - Parse filename: `NNNN-pX-status--slug.md`
+   - Compute new filename with `wont-do` status
+   - `git mv tasks/{old} tasks/{new}`
+   - `git commit -m "task {NNNN:04}: mark wont-do"`
+   - If not found: log warning, skip rename (task file may have been manually deleted)
+7. Release mutex
 
 After success:
-- Transition conversation to Terminal state
+- `self.state = ConvState::Terminal` (direct mutation, then persist)
+- Update conv_mode to Explore
 - Inject system message: "Task abandoned. Worktree and branch deleted."
 - Broadcast SSE state_change + conversation_update
 
@@ -135,57 +198,62 @@ Spec: REQ-PROJ-010, REQ-BED-029
 
 ### Batch 3: Backend -- Commits-behind indicator
 
-**3a. Commits-behind calculation** -- `src/api/handlers.rs` or new module
+**3a. Commits-behind calculation** -- new function in `src/api/handlers.rs` or utility
 
-New function: `commits_behind(repo_root, base_branch, task_branch) -> u32`
+`fn commits_behind(repo_root: &Path, base_branch: &str, task_branch: &str) -> u32`
 
-Implementation: `git rev-list --count task_branch..base_branch`
-
-Called on SSE init and periodically.
+Implementation: `git rev-list --count {task_branch}..{base_branch}` run in repo_root.
+Returns 0 on any error (branch deleted, etc.).
 
 **3b. SSE init integration** -- `src/api/handlers.rs`
 
-Add `commits_behind: u32` to the SSE init payload for Work conversations.
-Compute at SSE connect time. Zero for non-Work conversations.
+For Work conversations, compute `commits_behind` at SSE connect time. Include in
+init event via `ConversationMetadataUpdate` (add `commits_behind: Option<u32>` field).
 
-**3c. Periodic polling** -- `src/runtime/executor.rs` or `src/api/sse.rs`
+**3c. Periodic polling** -- spawned task alongside SSE stream
 
-During SSE streaming for Work conversations, poll every ~60s. If the count
-changes, emit a new SSE event (e.g., `commits_behind` event type with the
-updated count).
+When creating the SSE stream for a Work conversation, spawn a periodic task that:
+1. Sleeps ~60s
+2. Computes `commits_behind`
+3. If value changed from last emission, broadcasts `SseEvent::ConversationUpdate`
+   with `commits_behind` field
+4. Repeats until broadcast channel closes (client disconnects)
 
 Spec: REQ-PROJ-011
 
 ### Batch 4: Frontend -- Complete + Abandon UI
 
-**4a. Complete button** -- `ui/src/components/StateBar.tsx` or new component
+**4a. Complete button** -- `ui/src/components/` (new `WorkActions.tsx` component)
 
-Show "Complete" button on idle Work conversations. Clicking triggers:
-1. `POST /api/conversations/:id/complete-task`
-2. If `task_not_done`, show nudge banner
-3. Show editable commit message dialog (pre-filled from response)
-4. While the commit message confirmation dialog is open, register a
-   `beforeunload` handler to warn the user if they attempt to close or
-   navigate away from the page
-5. On confirm: `POST /api/conversations/:id/confirm-complete`
-6. On success: conversation transitions to Terminal via SSE
+Show "Complete" and "Abandon" buttons on idle Work conversations. Render below
+the StateBar or inline in the StateBar right section.
 
-**4b. Abandon button** -- same location as Complete
+Complete flow:
+1. Click "Complete" -> spinner -> `POST /api/conversations/:id/complete-task`
+2. If error: show inline error message (distinguish dirty_worktree vs merge_conflicts)
+3. If `task_not_done`: show dismissible nudge banner
+4. Show modal dialog with editable commit message textarea + Confirm/Cancel
+5. Register `beforeunload` handler + React Router navigation blocker while modal open
+6. On confirm: `POST /api/conversations/:id/confirm-complete` -> Terminal via SSE
 
-Show "Abandon" button on idle Work conversations. Clicking triggers:
-1. Confirmation dialog: "This permanently deletes all work in this worktree.
-   The task will be marked wont-do. This cannot be undone."
+**4b. Abandon button** -- same component
+
+1. Click "Abandon" -> confirmation dialog (browser `confirm()` or custom modal):
+   "This permanently deletes all work in this worktree. The task will be marked
+   wont-do. This cannot be undone."
 2. On confirm: `POST /api/conversations/:id/abandon-task`
 3. On success: conversation transitions to Terminal via SSE
 
 **4c. Commits-behind badge** -- `ui/src/components/StateBar.tsx`
 
-Show "N behind" badge next to branch name when commits_behind > 0.
-Update from SSE events.
+Show "N behind" badge next to branch name when `commits_behind > 0`.
+Update from `sse_conversation_update` events (already handled in atom reducer).
 
-**4d. Conversation update handling** -- `ui/src/api.ts`
+**4d. SSE + atom integration** -- `ui/src/api.ts`, `ui/src/conversation/atom.ts`
 
-Add `commits_behind` SSE event type. Handle in useConnection + atom reducer.
+- Add `commits_behind?: number` to `Conversation` interface
+- `ConversationMetadataUpdate` already handles partial conversation updates
+- New API methods: `completeTask()`, `confirmComplete()`, `abandonTask()`
 
 Spec: REQ-PROJ-009, REQ-PROJ-010, REQ-PROJ-011
 
@@ -193,22 +261,30 @@ Spec: REQ-PROJ-009, REQ-PROJ-010, REQ-PROJ-011
 
 | File | Change |
 |------|--------|
-| `src/db/schema.rs` | Add `base_branch` to ConvMode::Work |
-| `src/runtime/executor.rs` | Record base_branch at approval, complete/abandon executor logic |
+| `src/state_machine/state.rs` | Add `ConvState::Terminal` variant |
+| `src/state_machine/transition.rs` | Reject events from Terminal state |
+| `src/state_machine/proptests.rs` | Add Terminal to generators |
+| `src/db/schema.rs` | Add `base_branch`, `task_number` to ConvMode::Work |
+| `src/db.rs` | Preserve Terminal in `reset_all_to_idle` |
+| `src/main.rs` | Reconcile empty base_branch Work rows |
+| `src/runtime/executor.rs` | Record base_branch at approval, complete/abandon logic |
+| `src/runtime.rs` | Add `commits_behind` to `ConversationMetadataUpdate` |
 | `src/api/handlers.rs` | Three new endpoints, commits-behind in SSE init |
 | `src/api/types.rs` | Request/response types for new endpoints |
-| `src/api/sse.rs` | commits_behind SSE event |
-| `src/runtime.rs` | SseEvent variant for commits_behind |
-| `ui/src/api.ts` | New API methods, SSE event types |
-| `ui/src/components/StateBar.tsx` | Complete/Abandon buttons, commits-behind badge |
-| `ui/src/conversation/atom.ts` | commits_behind state, SSE handlers |
-| `ui/src/hooks/useConnection.ts` | commits_behind SSE listener |
+| `src/api/sse.rs` | No new variants (reuses ConversationUpdate) |
+| `ui/src/api.ts` | New API methods, `commits_behind` on Conversation |
+| `ui/src/components/WorkActions.tsx` | New: Complete/Abandon buttons + commit msg modal |
+| `ui/src/components/StateBar.tsx` | Commits-behind badge |
+| `ui/src/conversation/atom.ts` | commits_behind in conversation state |
+| `ui/src/hooks/useConnection.ts` | No changes (ConversationUpdate already wired) |
 
 ## Acceptance Criteria
 
-- [ ] `base_branch` stored in ConvMode::Work at approval time (REQ-PROJ-017)
-- [ ] Complete pre-checks block on dirty tree and merge conflicts (REQ-PROJ-009)
-- [ ] LLM generates semantic commit message from diff (REQ-PROJ-009)
+- [ ] `ConvState::Terminal` variant added, preserved on restart (REQ-BED-029)
+- [ ] `base_branch` + `task_number` stored in ConvMode::Work at approval time (REQ-PROJ-017)
+- [ ] Empty base_branch Work rows reverted to Explore on startup
+- [ ] Complete pre-checks block on dirty worktree, dirty main checkout, and merge conflicts (REQ-PROJ-009)
+- [ ] LLM generates semantic commit message from diff, falls back to diff-stat if >50KB (REQ-PROJ-009)
 - [ ] User can edit commit message before confirming (REQ-PROJ-009)
 - [ ] Squash merge into base_branch, worktree+branch deleted (REQ-PROJ-009)
 - [ ] Conversation goes Terminal after Complete (REQ-BED-029)
@@ -217,8 +293,9 @@ Spec: REQ-PROJ-009, REQ-PROJ-010, REQ-PROJ-011
 - [ ] Conversation goes Terminal after Abandon (REQ-BED-029)
 - [ ] Commits-behind badge shows on Work conversations (REQ-PROJ-011)
 - [ ] Commits-behind updates on SSE connect + ~60s poll (REQ-PROJ-011)
-- [ ] Complete/Abandon buttons disabled while agent is working
+- [ ] Complete/Abandon buttons visible only on idle Work conversations
 - [ ] Task-not-done nudge shown (non-blocking) at Complete time
+- [ ] Navigation guard (beforeunload + router blocker) while commit dialog open
 - [ ] `./dev.py check` passes
 
 ## Value Delivered
