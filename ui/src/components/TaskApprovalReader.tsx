@@ -212,6 +212,22 @@ export function TaskApprovalReader({
     return undefined;
   }, [highlightedLine]);
 
+  const handleAddNote = useCallback(() => {
+    if (!annotatingLine || !noteInput.trim()) return;
+
+    const note: ReviewNote = {
+      id: generateUUID(),
+      lineNumber: annotatingLine.lineNumber,
+      lineContent: annotatingLine.lineContent,
+      note: noteInput.trim(),
+      timestamp: Date.now(),
+    };
+
+    setNotes((prev) => [...prev, note]);
+    setAnnotatingLine(null);
+    setNoteInput('');
+  }, [annotatingLine, noteInput]);
+
   // Block Escape from closing — only allow it to dismiss annotation dialog or discard confirm
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -241,22 +257,6 @@ export function TaskApprovalReader({
     },
     []
   );
-
-  const handleAddNote = useCallback(() => {
-    if (!annotatingLine || !noteInput.trim()) return;
-
-    const note: ReviewNote = {
-      id: generateUUID(),
-      lineNumber: annotatingLine.lineNumber,
-      lineContent: annotatingLine.lineContent,
-      note: noteInput.trim(),
-      timestamp: Date.now(),
-    };
-
-    setNotes((prev) => [...prev, note]);
-    setAnnotatingLine(null);
-    setNoteInput('');
-  }, [annotatingLine, noteInput]);
 
   const handleDeleteNote = useCallback((id: string) => {
     setNotes((prev) => prev.filter((n) => n.id !== id));
