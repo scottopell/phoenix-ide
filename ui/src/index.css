@@ -5696,6 +5696,35 @@ html * {
   color: var(--accent-red, #ef4444);
 }
 
+/* --- SSE Error Toast --- */
+
+.sse-error-toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 0 12px;
+  font-size: 12px;
+  color: var(--accent-red, #ef4444);
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-red, #ef4444) 25%, transparent);
+  border-radius: 4px;
+}
+
+.sse-error-text {
+  flex: 1;
+}
+
+.sse-error-dismiss {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  flex-shrink: 0;
+}
+
 /* --- Commit Message Modal --- */
 
 .commit-modal-overlay {

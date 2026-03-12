@@ -250,7 +250,24 @@ export function useConnection({
             }
           });
 
-          es.addEventListener('error', () => {
+          es.addEventListener('error', (e) => {
+            // Backend application errors arrive as SSE event type "error" WITH data.
+            // Native EventSource connection errors fire with NO data.
+            const me = e as MessageEvent;
+            if (me.data) {
+              try {
+                const data = JSON.parse(me.data) as { message?: string };
+                if (data.message) {
+                  dispatchRef.current({
+                    type: 'sse_error',
+                    error: { type: 'BackendError', message: data.message },
+                  });
+                  return; // Don't treat as connection error
+                }
+              } catch {
+                // Parse failure — fall through to connection error handling
+              }
+            }
             dispatchMachineRef.current({ type: 'SSE_ERROR' });
             dispatchRef.current({ type: 'connection_state', state: 'reconnecting' });
           });

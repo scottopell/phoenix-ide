@@ -506,6 +506,16 @@ export function ConversationPage() {
           systemPrompt: atom.systemPrompt,
         })}
       />
+      {atom.uiError && (
+        <div className="sse-error-toast" role="alert">
+          <span className="sse-error-text">
+            {atom.uiError.type === 'BackendError' ? atom.uiError.message : 'Connection error'}
+          </span>
+          <button className="sse-error-dismiss" onClick={() => dispatch({ type: 'clear_error' })}>
+            Dismiss
+          </button>
+        </div>
+      )}
       {convStateForChildren.type === 'context_exhausted' && (
         <div className="context-exhausted-banner">
           <div className="context-exhausted-header">

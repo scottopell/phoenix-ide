@@ -45,6 +45,7 @@ export type SSEAction =
   | { type: 'sse_token'; delta: string; sequence: number }
   | { type: 'sse_conversation_update'; updates: Partial<Conversation> }
   | { type: 'sse_error'; error: UIError }
+  | { type: 'clear_error' }
   | { type: 'connection_state'; state: ConversationAtom['connectionState'] }
   | {
       type: 'set_initial_data';
@@ -314,6 +315,9 @@ export function conversationReducer(
 
     case 'sse_error':
       return { ...atom, uiError: action.error };
+
+    case 'clear_error':
+      return { ...atom, uiError: null };
 
     case 'connection_state':
       return { ...atom, connectionState: action.state };
