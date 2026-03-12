@@ -386,6 +386,10 @@ pub enum ConvState {
         /// The continuation summary
         summary: String,
     },
+
+    /// Task lifecycle completed or abandoned — conversation is permanently read-only.
+    /// Rejects all events. Preserved on server restart (not reset to Idle).
+    Terminal,
 }
 
 /// Outcome of user's decision on a proposed task plan.
@@ -447,12 +451,19 @@ pub enum TerminalOutcome {
     Failed(String, ErrorKind),
     /// Context window exhausted — conversation is read-only
     ContextExhausted { summary: String },
+    /// Task lifecycle ended (complete or abandon) — conversation is permanently read-only
+    TaskResolved,
 }
 
 impl ConvState {
-    /// Check if this is a terminal state (sub-agent only - cannot transition out)
+    /// Check if this is a terminal state — cannot transition out.
+    /// `Completed`/`Failed` are sub-agent specific; `Terminal` is the
+    /// user-facing lifecycle end state (complete/abandon).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
+        matches!(
+            self,
+            ConvState::Completed { .. } | ConvState::Failed { .. } | ConvState::Terminal
+        )
     }
 
     /// Structural terminal-state check for the executor loop.
@@ -472,7 +483,17 @@ impl ConvState {
                     summary: summary.clone(),
                 })
             }
-            _ => StepResult::Continue,
+            ConvState::Terminal => StepResult::Terminal(TerminalOutcome::TaskResolved),
+            ConvState::Idle
+            | ConvState::AwaitingLlm
+            | ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::Error { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingTaskApproval { .. } => StepResult::Continue,
         }
     }
 
@@ -485,8 +506,15 @@ impl ConvState {
             ConvState::AwaitingTaskApproval { .. } => DisplayState::AwaitingApproval,
             ConvState::ContextExhausted { .. }
             | ConvState::Completed { .. }
-            | ConvState::Failed { .. } => DisplayState::Terminal,
-            _ => DisplayState::Working,
+            | ConvState::Failed { .. }
+            | ConvState::Terminal => DisplayState::Terminal,
+            ConvState::AwaitingLlm
+            | ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingContinuation { .. } => DisplayState::Working,
         }
     }
 }

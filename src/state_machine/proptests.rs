@@ -187,6 +187,10 @@ fn arb_context_exhausted_state() -> impl Strategy<Value = ConvState> {
     .prop_map(|summary| ConvState::ContextExhausted { summary })
 }
 
+fn arb_terminal_state() -> impl Strategy<Value = ConvState> {
+    Just(ConvState::Terminal)
+}
+
 fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
     (
         "[a-zA-Z ]{1,30}",
@@ -215,6 +219,7 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_awaiting_continuation_state(),
         arb_context_exhausted_state(),
         arb_awaiting_task_approval_state(),
+        arb_terminal_state(),
     ]
 }
 

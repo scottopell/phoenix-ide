@@ -86,6 +86,8 @@ pub struct ConversationMetadataUpdate {
     pub worktree_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conv_mode_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// A conversation enriched with derived display fields for the API layer.
@@ -101,6 +103,7 @@ pub struct EnrichedConversation {
     pub conv_mode_label: String,
     pub branch_name: Option<String>,
     pub worktree_path: Option<String>,
+    pub base_branch: Option<String>,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.

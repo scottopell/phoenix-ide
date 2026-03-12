@@ -154,6 +154,11 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
             .worktree_path()
             .filter(|s| !s.is_empty())
             .map(String::from),
+        base_branch: conv
+            .conv_mode
+            .base_branch()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
         inner: conv.clone(),
     }
 }

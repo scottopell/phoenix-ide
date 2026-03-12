@@ -13,6 +13,7 @@ export interface Conversation {
   display_state?: 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval';
   branch_name?: string | null;
   worktree_path?: string | null;
+  base_branch?: string | null;
   archived?: boolean;
   project_id?: string | null;
   conv_mode_label?: string;

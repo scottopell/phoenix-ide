@@ -63,6 +63,8 @@ pub enum TransitionError {
     ContextExhausted,
     #[error("Conversation is awaiting task approval")]
     AwaitingTaskApproval,
+    #[error("Conversation has reached terminal state (completed or abandoned)")]
+    ConversationTerminal,
     #[error("Invalid transition: {0}")]
     InvalidTransition(String),
 }
@@ -1087,6 +1089,15 @@ pub fn transition(
         (state @ ConvState::ContextExhausted { .. }, _event) => {
             // Log but don't error - terminal states ignore events
             Ok(TransitionResult::new(state.clone()))
+        }
+
+        // Terminal rejects ALL events (REQ-BED-029)
+        (ConvState::Terminal, Event::UserMessage { .. }) => {
+            Err(TransitionError::ConversationTerminal)
+        }
+        (ConvState::Terminal, _event) => {
+            // Non-user events are silently absorbed (no error, no state change)
+            Ok(TransitionResult::new(ConvState::Terminal))
         }
 
         // UserTriggerContinuation from Idle (REQ-BED-023)

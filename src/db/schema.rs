@@ -120,6 +120,17 @@ pub enum ConvMode {
         /// reconciliation reverts rows with empty `worktree_path` to Explore.
         #[serde(default)]
         worktree_path: String,
+        /// The branch that was checked out when the task was approved (e.g., `main`).
+        /// Used as the merge target for Complete and the restore target for Abandon.
+        /// `#[serde(default)]` is a rollout shim -- startup reconciliation reverts
+        /// rows with empty `base_branch` to Explore.
+        #[serde(default)]
+        base_branch: String,
+        /// The task number assigned at approval time (e.g., 42).
+        /// Used to locate and update the task file in `tasks/`.
+        /// `#[serde(default)]` is a rollout shim for existing Work rows.
+        #[serde(default)]
+        task_number: u32,
     },
 }
 
@@ -143,7 +154,7 @@ impl ConvMode {
     pub fn branch_name(&self) -> Option<&str> {
         match self {
             Self::Work { branch_name, .. } => Some(branch_name),
-            _ => None,
+            Self::Explore | Self::Standalone => None,
         }
     }
 
@@ -151,7 +162,24 @@ impl ConvMode {
     pub fn worktree_path(&self) -> Option<&str> {
         match self {
             Self::Work { worktree_path, .. } => Some(worktree_path),
-            _ => None,
+            Self::Explore | Self::Standalone => None,
+        }
+    }
+
+    /// The base branch if in Work mode, None otherwise.
+    pub fn base_branch(&self) -> Option<&str> {
+        match self {
+            Self::Work { base_branch, .. } => Some(base_branch),
+            Self::Explore | Self::Standalone => None,
+        }
+    }
+
+    /// The task number if in Work mode, None otherwise.
+    #[allow(dead_code)] // Used by M4 Complete/Abandon flows (task 0604)
+    pub fn task_number(&self) -> Option<u32> {
+        match self {
+            Self::Work { task_number, .. } => Some(*task_number),
+            Self::Explore | Self::Standalone => None,
         }
     }
 }

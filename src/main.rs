@@ -186,9 +186,11 @@ async fn reconcile_worktrees(db: &Database) {
 
     for conv in &work_convs {
         let wt_path = conv.conv_mode.worktree_path().unwrap_or("");
+        let base_branch = conv.conv_mode.base_branch().unwrap_or("");
 
-        // Legacy row (empty worktree_path) or worktree directory missing on disk
-        let needs_revert = wt_path.is_empty() || !std::path::Path::new(wt_path).exists();
+        // Legacy row (empty worktree_path or base_branch) or worktree directory missing on disk
+        let needs_revert =
+            wt_path.is_empty() || base_branch.is_empty() || !std::path::Path::new(wt_path).exists();
 
         if !needs_revert {
             continue;
@@ -196,6 +198,8 @@ async fn reconcile_worktrees(db: &Database) {
 
         let reason = if wt_path.is_empty() {
             "legacy row (empty worktree_path)"
+        } else if base_branch.is_empty() {
+            "legacy row (empty base_branch)"
         } else {
             "worktree directory missing"
         };

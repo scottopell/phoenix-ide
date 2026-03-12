@@ -519,9 +519,10 @@ impl Database {
         //   - context_exhausted: completed conversations that cannot accept new messages
         //   - awaiting_task_approval: user approval pending; state data (title/priority/plan)
         //     is in the JSON column and must survive restart
+        //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval', 'terminal')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())

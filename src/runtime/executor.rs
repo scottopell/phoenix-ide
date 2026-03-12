@@ -1358,10 +1358,12 @@ where
 
         match result {
             Ok(approval_result) => {
-                // Update conversation mode to Work (includes worktree_path)
+                // Update conversation mode to Work (includes worktree_path, base_branch, task_number)
                 let work_mode = crate::db::ConvMode::Work {
                     branch_name: approval_result.branch_name.clone(),
                     worktree_path: approval_result.worktree_path.clone(),
+                    base_branch: approval_result.base_branch.clone(),
+                    task_number: approval_result.task_number,
                 };
                 storage
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)
@@ -1423,6 +1425,7 @@ where
                         branch_name: Some(approval_result.branch_name.clone()),
                         worktree_path: Some(approval_result.worktree_path.clone()),
                         conv_mode_label: Some("Work".to_string()),
+                        base_branch: Some(approval_result.base_branch.clone()),
                     },
                 });
 
@@ -1459,6 +1462,8 @@ struct TaskApprovalResult {
     first_task: bool,
     /// Absolute path to the git worktree created for this conversation
     worktree_path: String,
+    /// The branch that was checked out when the task was approved (merge target)
+    base_branch: String,
 }
 
 /// Derive a slug from a task title: lowercase, spaces to hyphens, strip non-alphanumeric
@@ -1540,6 +1545,16 @@ fn execute_approve_task_blocking(
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // 0. Detect the current branch before any mutations (used as merge target for Complete)
+    let base_branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base_branch = base_branch.trim().to_string();
+    if base_branch.is_empty() || base_branch == "HEAD" {
+        return Err(
+            "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
+                .to_string(),
+        );
+    }
 
     // 1. Dirty tree check FIRST — before any filesystem changes to avoid partial state
     let status = run_git(cwd, &["status", "--porcelain"])?;
@@ -1685,6 +1700,7 @@ fn execute_approve_task_blocking(
         branch_name,
         first_task,
         worktree_path: worktree_path_str,
+        base_branch,
     })
 }
 
