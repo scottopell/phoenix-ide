@@ -289,16 +289,16 @@ AND NOT require agent approval
 WHEN mode changes (either direction)
 THE SYSTEM SHALL persist the new mode as part of conversation state
 
-**Deprecation Reason:** The downgrade concept (Unrestricted → Restricted) is replaced
-by task completion flows. A conversation returns to Explore mode by either merging its
-task (REQ-PROJ-009) or abandoning it (REQ-PROJ-010). There is no standalone mode
+**Deprecation Reason:** The downgrade concept (Unrestricted -> Restricted) is replaced
+by task completion flows. A Work conversation transitions to Terminal state on task
+completion (REQ-PROJ-009) or abandonment (REQ-PROJ-010). There is no standalone mode
 downgrade; mode is always tied to worktree lifecycle.
 
 ---
 
 ### REQ-BED-017: Mode Communication
 
-WHEN conversation mode changes (Explore → Work or Work → Explore)
+WHEN conversation mode changes (Explore to Work on task approval)
 THE SYSTEM SHALL inject a synthetic system message visible to the agent
 WHICH clearly states the new mode and its implications for tool availability
 
@@ -487,7 +487,7 @@ THE SYSTEM SHALL configure the tool registry with full write access (equivalent 
 AND SHALL NOT provide `propose_plan` tool
 AND the mode SHALL NOT change for the lifetime of the conversation
 
-WHEN conversation mode changes (Explore to Work, or Work to Explore)
+WHEN conversation mode changes (Explore to Work on task approval)
 THE SYSTEM SHALL persist the updated mode before resuming execution
 
 **Rationale:** Mode is conversation-level identity — it persists across all state machine
@@ -548,23 +548,25 @@ execution. All git operations are deferred to the approval moment.
 
 ---
 
-### REQ-BED-029: Return to Explore Mode on Task Resolution
+### REQ-BED-029: Conversation Terminal State on Task Resolution
 
-WHEN a Work conversation's task is merged to main
-THE SYSTEM SHALL transition the conversation to Explore mode
-AND pin the conversation to the new main HEAD
-AND clear the worktree path and task ID from the mode field
+WHEN a Work conversation's task is completed (squash merged to base_branch)
+THE SYSTEM SHALL transition the conversation to Terminal state
+AND the conversation SHALL NOT accept new user messages
 
 WHEN a Work conversation's task is abandoned
-THE SYSTEM SHALL transition the conversation to Explore mode
-AND pin the conversation to the current main HEAD
-AND clear the worktree path and task ID from the mode field
+THE SYSTEM SHALL transition the conversation to Terminal state
+AND the conversation SHALL NOT accept new user messages
 
-WHEN the conversation returns to Explore mode after task resolution
-THE SYSTEM SHALL inject a synthetic system message indicating the mode change
-AND reconfigure the tool registry to read-only settings
+WHEN a conversation enters Terminal state after task resolution
+THE SYSTEM SHALL inject a synthetic system message indicating the outcome
+  (completed with commit hash, or abandoned)
+AND the conversation SHALL remain visible in the sidebar for reference
+AND the user SHALL be able to start a new Explore conversation on the same project
 
-**Rationale:** Work mode is always tied to a specific task and worktree. When that
-task concludes (successfully or not), the conversation returns to Explore mode — the
-neutral, safe starting state. This mirrors the natural project rhythm: explore,
-propose, execute, review, then explore again.
+**Rationale:** Work conversations are single-purpose: one task, one worktree, one
+lifecycle. When the task concludes (successfully or not), the conversation is done.
+Returning to Explore mode would create confusion about what the conversation's
+context represents (the old worktree is gone, the pinned commit is arbitrary).
+Terminal state is clean and explicit. The user creates a new Explore conversation
+to continue working on the project.

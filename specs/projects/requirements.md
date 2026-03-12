@@ -109,9 +109,10 @@ WHEN user approves the task
 THE SYSTEM SHALL assign the next sequential task ID for the project
 AND write a task file to `tasks/` in taskmd format
 AND commit the task file to main using `git add <task-file> && git commit --only <task-file>`
-AND create a branch named `task-{NNNN}-{slug}` from main HEAD
-AND checkout that branch in the project checkout
-AND transition the conversation to Work mode
+AND record the current checked-out branch as `base_branch` in the conversation mode
+AND create a worktree at `.phoenix/worktrees/{conv-id}` with a new branch `task-{NNNN}-{slug}`
+  using `git worktree add .phoenix/worktrees/{conv-id} -b task-{NNNN}-{slug}`
+AND transition the conversation to Work mode (storing base_branch, worktree_path, branch, task_id)
 AND resume agent execution with "Task approved. You are on branch task-{NNNN}-{slug}."
 
 WHEN user discards the task
@@ -214,70 +215,94 @@ one-Work-sub-agent constraint maintains a single writer per worktree at all time
 
 ---
 
-### REQ-PROJ-009: Complete a Task and Propose Merging to Main
+### REQ-PROJ-009: Complete a Task (Squash Merge)
 
-**NOTE:** The merge trigger mechanism will be defined in M4. `update_task` has been
-removed; the trigger may be a user-initiated action or a dedicated tool.
+WHEN the user initiates the Complete action on an idle Work conversation
+THE SYSTEM SHALL run pre-checks before proceeding:
+- Verify no uncommitted changes exist in the worktree (fail with actionable error if dirty)
+- Verify no merge conflicts exist between the task branch and base_branch (fail with actionable error if conflicts)
 
-WHEN the agent signals ready-for-review (mechanism TBD in M4)
-THE SYSTEM SHALL generate a summary of changes between the worktree branch and main
-AND present the diff and task file to the user for final review
-AND pause agent execution
+WHEN pre-checks pass
+THE SYSTEM SHALL generate a semantic commit message by sending `git diff base_branch...HEAD`
+  to the LLM with instructions to produce a concise, concept-focused commit message
+AND present the generated commit message in an editable confirmation dialog
 
-WHEN user approves the merge
-THE SYSTEM SHALL merge the worktree branch into main
-AND update the task file status to `done` on main
-AND delete the worktree directory
-AND delete the branch
-AND transition the conversation to Explore mode pinned to the new main HEAD
+WHEN the user confirms the commit message (possibly after editing)
+THE SYSTEM SHALL squash merge the task branch into base_branch:
+  `git checkout base_branch && git merge --squash task_branch && git commit -m "{message}"`
+AND delete the worktree: `git worktree remove {path} --force`
+AND delete the task branch: `git branch -D {branch}`
+AND transition the conversation to Terminal state
 
-WHEN user requests further changes before merge
-THE SYSTEM SHALL return the feedback to the agent as a message
-AND resume agent execution in Work mode
+WHEN the task file status is not `done` at Complete time
+THE SYSTEM SHALL display a non-blocking nudge suggesting the user ask the agent to
+  update the task file before completing
+AND SHALL NOT block the Complete action
 
-**Rationale:** Human review before merging is the final safety gate. The merge approval
-is the moment code moves from isolated experiment to part of the project. Returning to
-Explore mode after a successful merge preserves the conversation for follow-up
-questions and naturally closes the task.
+WHEN pre-checks fail
+THE SYSTEM SHALL display a specific, actionable error message
+AND SHALL NOT proceed with the merge
+AND the conversation SHALL remain in Work mode (user can ask the agent to fix the issue)
 
----
-
-### REQ-PROJ-010: Abandon a Task Without Merging
-
-WHEN user discards an in-progress task
-THE SYSTEM SHALL delete the worktree directory
-AND delete the branch
-AND update the task file status to `abandoned` on main
-AND transition the conversation to Explore mode
-
-WHEN a task is abandoned
-THE SYSTEM SHALL preserve the task file on main as a historical record
-AND NOT merge any code changes to main
-
-**Rationale:** Users must be able to stop work with no lasting consequence to the
-codebase. The abandoned task file is a lightweight record of what was attempted —
-useful as context for future work, but carries no code changes forward.
+**Rationale:** Completion is user-initiated, not agent-initiated. The user has been
+reviewing work live during the conversation and does not need a separate diff review
+gate. Squash merge produces a clean single commit on the base branch. The conversation
+goes to Terminal (not back to Explore) because the task is done -- the user creates a
+new Explore conversation if they need to continue working on the project. Pre-checks
+prevent silent data loss (dirty tree) and broken merges (conflicts).
 
 ---
 
-### REQ-PROJ-011: Ambient Awareness of Main Branch Advancement
+### REQ-PROJ-010: Abandon a Task (Destructive Discard)
 
-WHEN the main branch of a project receives new commits
-THE SYSTEM SHALL display an ambient indicator on any Explore conversation showing
-how many commits behind the conversation's pinned snapshot is
-AND NOT interrupt the active conversation or force re-pinning
+WHEN the user initiates the Abandon action on an idle Work conversation
+THE SYSTEM SHALL present a confirmation dialog warning that all work will be
+  permanently deleted (worktree and branch)
 
-WHEN a Work conversation's branch diverges from an advancing main
-THE SYSTEM SHALL notify the agent that main has advanced
-AND offer a rebase opportunity before the merge step
+WHEN the user confirms abandonment
+THE SYSTEM SHALL delete the worktree: `git worktree remove {path} --force`
+AND delete the task branch: `git branch -D {branch}`
+AND update the task file status to `wont-do` on base_branch:
+  `git checkout base_branch && taskmd rename {task_file} --status wont-do && git add tasks/ && git commit -m "task {NNNN}: mark wont-do"`
+AND transition the conversation to Terminal state
 
-WHEN user starts a new conversation on a project
-THE SYSTEM SHALL pin the conversation to the current HEAD of main at creation time
+WHEN the user cancels the confirmation dialog
+THE SYSTEM SHALL take no action
+AND the conversation SHALL remain in Work mode
 
-**Rationale:** Explore conversations are pinned snapshots — they remain coherent and
-usable even as main advances, but users should have ambient awareness that their view
-may be stale. Work conversations may need to rebase before merging to avoid conflicts.
-Neither case warrants an interruption; ambient indicators respect the current focus.
+**Rationale:** Abandon is a destructive, irreversible operation -- the worktree and
+branch are deleted, discarding all code changes. The task file is updated to `wont-do`
+(a valid taskmd status) on the base branch as a historical record of what was attempted.
+The conversation goes to Terminal because the task is over. Confirmation dialog is
+mandatory to prevent accidental data loss.
+
+---
+
+### REQ-PROJ-011: Passive Commits-Behind Indicator
+
+WHEN a client connects to a Work conversation via SSE
+THE SYSTEM SHALL check how many commits base_branch is ahead of the worktree's branch point
+AND emit the count as part of the initial state payload
+
+WHILE a Work conversation has connected clients
+THE SYSTEM SHALL poll for base_branch advancement approximately every 60 seconds
+AND emit updated counts via SSE when the value changes
+
+WHEN the commits-behind count is greater than zero
+THE SYSTEM SHALL display an "N behind" badge in the StateBar next to the branch name
+
+WHEN the commits-behind count is zero
+THE SYSTEM SHALL NOT display any badge
+
+THE SYSTEM SHALL NOT automatically rebase, notify the agent, or take any action
+  based on the commits-behind count
+
+**Rationale:** The commits-behind indicator gives the user ambient awareness that their
+base branch has advanced, which may affect the merge at completion time. It is passive
+and informational only -- no filesystem watcher, no rebase automation. The agent already
+has bash access to run `git rebase` when the user asks. Polling on SSE connect plus a
+periodic interval is simple and sufficient; real-time filesystem watching adds complexity
+without meaningful benefit for a metric that changes infrequently.
 
 ---
 
@@ -404,3 +429,28 @@ trade-off the user accepts by working in a non-git directory. Making Standalone 
 distinct mode (rather than overloading Explore or Work) allows the UI to communicate
 the capability difference clearly and prevents accidental mixing of project and
 non-project behaviors.
+
+---
+
+### REQ-PROJ-017: Base Branch Tracking in Work Mode
+
+WHEN a conversation transitions from Explore to Work mode (task approval)
+THE SYSTEM SHALL record the currently checked-out branch as `base_branch` in the
+  `ConvMode::Work` data
+
+THE `ConvMode::Work` struct SHALL contain:
+- `worktree_path: PathBuf` — path to the conversation's worktree
+- `branch: String` — the task branch name
+- `task_id: String` — the task identifier
+- `base_branch: String` — the branch that was checked out at approval time
+
+WHEN the Complete action runs (REQ-PROJ-009)
+THE SYSTEM SHALL merge into `base_branch` (not hardcoded to main)
+
+WHEN the Abandon action runs (REQ-PROJ-010)
+THE SYSTEM SHALL commit the task file status update on `base_branch`
+
+**Rationale:** Not all projects use `main` as their integration branch. A user may be
+working on a shared feature branch and want task work merged there. Recording the
+base branch at approval time supports this workflow without requiring the user to
+specify a merge target at completion time.

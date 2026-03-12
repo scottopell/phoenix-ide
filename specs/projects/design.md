@@ -38,8 +38,9 @@ ConvMode {
   }
   Work {                       // read-write in an isolated worktree
     worktree_path: PathBuf,    // .phoenix/worktrees/{conv-id}/
-    branch: String,            // phoenix/{task-id}-{slug}
+    branch: String,            // task-{NNNN}-{slug}
     task_id: String,
+    base_branch: String,       // branch checked out at approval time (e.g. "main")
   }
 }
 ```
@@ -66,7 +67,7 @@ Task files live at `{repo_root}/tasks/` and are committed to main.
 Filename convention: `{NNNN}-{priority}-{status}--{slug}.md`
 - `NNNN`: 4-digit zero-padded sequential integer, globally unique within the project
 - `priority`: p0 (critical) through p3 (low)
-- `status`: awaiting-approval | in-progress | ready-for-review | done | abandoned
+- `status`: awaiting-approval | in-progress | ready-for-review | done | wont-do
 - `slug`: kebab-case title derived by Phoenix at creation time
 
 Frontmatter:
@@ -120,23 +121,40 @@ disk). SSE event: `task_approval_requested` with the plan data.
 On server restart: reconstruct from DB (title, priority, plan are all serialized
 in the ConvState column). Re-emit SSE event on UI reconnect.
 
-### REQ-PROJ-009 — AwaitingMergeApproval State
+### REQ-PROJ-009, REQ-PROJ-010 — Task Completion and Abandon
 
-```
-AwaitingMergeApproval {
-  task_id: String,
-  diff_summary: String,
-  reply: oneshot::Sender<MergeApprovalOutcome>,
-}
+There is no `AwaitingMergeApproval` state. Completion and abandonment are user-initiated
+actions on idle Work conversations, handled entirely by the executor as effect sequences.
+The conversation transitions to Terminal (an existing state) after cleanup completes.
 
-MergeApprovalOutcome {
-  Approved,
-  ChangesRequested { feedback: String },
-}
-```
+**Complete flow (REQ-PROJ-009):**
 
-The executor generates the diff when entering this state and includes it in the SSE
-event. The UI presents Approve Merge and Request Changes actions.
+1. User clicks Complete on an idle Work conversation
+2. Executor runs pre-checks:
+   - `git -C {worktree} status --porcelain` — must be empty (no dirty files)
+   - `git -C {worktree} merge-tree $(git merge-base base_branch HEAD) base_branch HEAD` — check for conflicts
+3. If pre-checks fail: return actionable error, conversation stays in Work/Idle
+4. If task file status is not `done`: emit non-blocking nudge to UI
+5. Executor sends `git diff base_branch...HEAD` to LLM for commit message generation
+6. UI shows editable commit message in confirmation dialog
+7. On confirm: executor runs squash merge sequence:
+   - `git checkout base_branch`
+   - `git merge --squash {branch}`
+   - `git commit -m "{user-confirmed message}"`
+   - `git worktree remove {path} --force`
+   - `git branch -D {branch}`
+8. Conversation transitions to Terminal
+
+**Abandon flow (REQ-PROJ-010):**
+
+1. User clicks Abandon on an idle Work conversation
+2. UI shows confirmation dialog (destructive action warning)
+3. On confirm: executor runs cleanup:
+   - `git worktree remove {path} --force`
+   - `git branch -D {branch}`
+   - `git checkout base_branch`
+   - Update task file status to `wont-do`: rename file, `git add tasks/`, `git commit`
+4. Conversation transitions to Terminal
 
 ## Tool Implementation
 
@@ -159,11 +177,11 @@ executor. Only available in Explore mode, rejected from sub-agents.
 
 1. Assign next sequential task ID (scan `tasks/` for highest existing NNNN)
 2. Derive filename slug from title
-3. Write task file to `{repo_root}/tasks/{NNNN}-{priority}-in-progress--{slug}.md`
-4. `git add tasks/{file} && git commit --only tasks/{file} -m "task {NNNN}: {title}"`
-5. `git branch task-{NNNN}-{slug}` from main HEAD
-6. `git checkout task-{NNNN}-{slug}`
-7. Update `conv_mode` to Work
+3. Record current checked-out branch as `base_branch`
+4. Write task file to `{repo_root}/tasks/{NNNN}-{priority}-in-progress--{slug}.md`
+5. `git add tasks/{file} && git commit --only tasks/{file} -m "task {NNNN}: {title}"`
+6. `git worktree add .phoenix/worktrees/{conv-id} -b task-{NNNN}-{slug}`
+7. Update `conv_mode` to `Work { worktree_path, branch, task_id, base_branch }`
 8. Resume agent with "Task approved. You are on branch task-{NNNN}-{slug}."
 
 **On Rejected:**
@@ -193,11 +211,11 @@ All git operations are side effects dispatched by the executor, not SM transitio
 |--------|---------------|
 | `CreateWorktree` | `git worktree add {path} -b {branch}` |
 | `DeleteWorktree` | `git worktree remove {path} --force` + `git branch -D {branch}` |
-| `MergeWorktree` | `git merge --no-ff {branch}` on main |
+| `SquashMergeWorktree` | `git checkout {base_branch} && git merge --squash {branch} && git commit -m {msg}` |
 | `CommitTaskFile` | `git add tasks/{file} && git commit --only tasks/{file} -m {msg}` |
-| `RebaseWorktree` | `git rebase main` in worktree (offered, not forced) |
+| `CommitTaskStatusOnBase` | `git checkout {base_branch} && taskmd rename {file} --status wont-do && git add tasks/ && git commit -m {msg}` |
 
-These effects are typed — the state machine emits the intent; the executor performs
+These effects are typed -- the state machine emits the intent; the executor performs
 the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
 `WorktreeDeleted`, or `GitOperationFailed`.
 
@@ -270,19 +288,25 @@ CREATE TABLE tasks (
 
 On startup, the executor scans conversations with `conv_mode = Work`:
 - If worktree directory exists: restore normally, resume from `Idle` in Work mode
-- If worktree directory is missing: transition to Explore mode, mark task `abandoned`,
-  log warning
+- If worktree directory is missing: transition to Terminal state, mark task `wont-do`
+  on base_branch, log warning
 
-## Main Branch Advancement Detection
+## Commits-Behind Indicator
 
-### REQ-PROJ-011 — Watching for main branch changes
+### REQ-PROJ-011 — Passive polling for base branch advancement
 
-A background watcher monitors `.git/refs/heads/{main_ref}` for changes using
-filesystem events (inotify on Linux, FSEvents on macOS). When main advances:
+No filesystem watcher. The system polls on two triggers:
 
-1. For each Explore conversation on the project: emit `SSE::MainAdvanced { commits_ahead: N }`
-2. For each Work conversation on the project: emit `SSE::MainAdvanced { commits_ahead: N }`
-   and store the advancement notification for the agent to see on next turn
+1. **SSE connect:** When a client connects to a Work conversation, compute
+   `git rev-list HEAD..base_branch --count` and include in the initial state payload.
+2. **Periodic poll:** Every ~60 seconds while clients are connected, re-run the count
+   and emit `SSE::CommitsBehind { count: N }` if the value changed.
+
+The UI shows an "N behind" badge in the StateBar next to the branch name when count > 0.
+No badge when count is 0.
+
+No rebase automation. No agent notification. The agent has bash access to run
+`git rebase` when the user asks.
 
 `.gitignore` management: the system checks for `.phoenix/worktrees/` in `.gitignore`
 at project creation and appends it if missing.

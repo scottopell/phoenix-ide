@@ -40,6 +40,6 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-026:** Sub-Agent Timeout Enforcement | ✅ Complete | Task 578. Mandatory `timeout: Duration`, deadline in executor `select!` |
 | **REQ-BED-027:** Explore and Work Conversation Modes | ❌ Not Started | `ConvMode` as conversation-level field; replaces REQ-BED-014 |
 | **REQ-BED-028:** Task Approval State | ❌ Not Started | `AwaitingTaskApproval` state; replaces REQ-BED-015 |
-| **REQ-BED-029:** Return to Explore Mode on Task Resolution | ❌ Not Started | Mode returns to Explore on merge or abandon; replaces REQ-BED-016 |
+| **REQ-BED-029:** Conversation Terminal State on Task Resolution | ❌ Not Started | Work conversations go to Terminal on complete or abandon; replaces REQ-BED-016 |
 
 **Progress:** 21 of 29 complete (3 deprecated, not counted)
