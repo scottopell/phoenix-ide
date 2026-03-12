@@ -1195,20 +1195,10 @@ where
                 }
 
                 MessageContent::Agent(blocks) => {
-                    // Filter empty text blocks that Anthropic rejects on re-send.
-                    // These can exist in old DB rows from a prior bug where
-                    // normalize_response synthesized ContentBlock::Text { text: "" }.
-                    let filtered: Vec<ContentBlock> = blocks
-                        .iter()
-                        .filter(|b| !matches!(b, ContentBlock::Text { text } if text.trim().is_empty()))
-                        .cloned()
-                        .collect();
-                    if !filtered.is_empty() {
-                        messages.push(LlmMessage {
-                            role: MessageRole::Assistant,
-                            content: filtered,
-                        });
-                    }
+                    messages.push(LlmMessage {
+                        role: MessageRole::Assistant,
+                        content: blocks.clone(),
+                    });
                 }
 
                 MessageContent::Tool(ToolContent {
