@@ -9,7 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
-mod executor;
+pub(crate) mod executor;
 mod recovery;
 pub mod traits;
 

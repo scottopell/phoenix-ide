@@ -5,16 +5,19 @@
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::sse::sse_stream;
 use super::types::{
-    CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
-    ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
-    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, TaskApprovalResponse, TaskFeedbackRequest, ValidateCwdResponse,
+    CancelResponse, ChatRequest, ChatResponse, CompleteTaskResponse, ConfirmCompleteRequest,
+    ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse,
+    ConversationResponse, ConversationWithMessagesResponse, CreateConversationRequest,
+    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
+    FileSearchQuery, FileSearchResponse, GatewayStatusApi, ListDirectoryResponse,
+    ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse, RenameRequest,
+    SkillEntry, SkillsResponse, SuccessResponse, SystemPromptResponse, TaskApprovalResponse,
+    TaskFeedbackRequest, ValidateCwdResponse,
 };
 use super::AppState;
-use crate::db::{ImageData, Message, MessageContent, MessageType};
-use crate::llm::{ContentBlock, GatewayStatus};
+use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
+use crate::llm::{ContentBlock, GatewayStatus, LlmMessage, LlmRequest, MessageRole, SystemContent as LlmSystemContent};
+use crate::runtime::executor::{run_git, TASK_APPROVAL_MUTEX};
 use crate::runtime::SseEvent;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
@@ -72,6 +75,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/approve-task", post(approve_task))
         .route("/api/conversations/:id/reject-task", post(reject_task))
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
+        // Task completion (REQ-PROJ-009)
+        .route(
+            "/api/conversations/:id/complete-task",
+            post(complete_task),
+        )
+        .route(
+            "/api/conversations/:id/confirm-complete",
+            post(confirm_complete),
+        )
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -1011,6 +1023,399 @@ async fn task_feedback(
 }
 
 // ============================================================
+// Task Completion (REQ-PROJ-009)
+// ============================================================
+
+/// Pre-check endpoint: validates worktree state, detects conflicts, generates commit message.
+/// Does NOT merge -- the user reviews the commit message first.
+#[allow(clippy::too_many_lines)] // Sequential validation + LLM call; splitting hurts readability
+async fn complete_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CompleteTaskResponse>, AppError> {
+    // 1. Validate conversation exists, is Work mode, Idle state, project-scoped
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to complete a task".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, base_branch, task_number) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            task_number,
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+            *task_number,
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work mode".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv.project_id.as_deref().ok_or_else(|| {
+        AppError::BadRequest("Conversation is not project-scoped".to_string())
+    })?;
+
+    // Look up project to get canonical_path (repo root)
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+    let worktree_dir = PathBuf::from(&worktree_path);
+
+    // Capture what we need for the blocking section
+    let base_branch_clone = base_branch.clone();
+
+    // 2. Pre-checks (blocking git operations)
+    let prechecks = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+        // 2a. Worktree must be clean
+        let wt_status = run_git(&worktree_dir, &["status", "--porcelain"])
+            .map_err(AppError::Internal)?;
+        if !wt_status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: "Worktree has uncommitted changes. Ask the agent to commit or stash before completing.".to_string(),
+                error_type: "dirty_worktree".to_string(),
+            }));
+        }
+
+        // 2b. Main checkout must be clean
+        let main_status = run_git(&repo_root, &["status", "--porcelain"])
+            .map_err(AppError::Internal)?;
+        if !main_status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: "Main checkout has uncommitted changes. Commit or stash them before completing.".to_string(),
+                error_type: "dirty_main_checkout".to_string(),
+            }));
+        }
+
+        // 2c. Conflict detection via merge-tree
+        let merge_base = run_git(
+            &worktree_dir,
+            &["merge-base", &base_branch_clone, "HEAD"],
+        )
+        .map_err(|e| AppError::Internal(format!("Failed to find merge base: {e}")))?;
+
+        let merge_tree_output = run_git(
+            &worktree_dir,
+            &["merge-tree", &merge_base, &base_branch_clone, "HEAD"],
+        )
+        .unwrap_or_default();
+        // merge-tree outputs conflict markers if there are conflicts
+        if merge_tree_output.contains("<<<<<<") || merge_tree_output.contains("changed in both") {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: format!(
+                    "Merge conflicts detected between your branch and {base_branch_clone}. Rebase first."
+                ),
+                error_type: "merge_conflicts".to_string(),
+            }));
+        }
+
+        // 2d. Get diff for commit message generation
+        let diff = run_git(
+            &worktree_dir,
+            &["diff", &format!("{base_branch_clone}...HEAD")],
+        )
+        .unwrap_or_default();
+
+        let diff_content = if diff.len() > 50_000 {
+            // Fall back to diff --stat if diff is too large
+            run_git(
+                &worktree_dir,
+                &["diff", "--stat", &format!("{base_branch_clone}...HEAD")],
+            )
+            .unwrap_or_else(|_| "(no diff available)".to_string())
+        } else {
+            diff
+        };
+
+        Ok(diff_content)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?;
+
+    let diff_content = prechecks?;
+
+    // 3. Task file nudge check
+    let task_not_done = check_task_file_status(&PathBuf::from(&worktree_path), task_number);
+
+    // 4. Generate commit message via LLM
+    let model_id = conv
+        .model
+        .as_deref()
+        .unwrap_or_else(|| state.llm_registry.default_model_id());
+
+    let llm_service = state
+        .llm_registry
+        .get(model_id)
+        .ok_or_else(|| AppError::Internal(format!("LLM model '{model_id}' not available")))?;
+
+    let system_prompt = "You are writing a git commit message for a squash merge. \
+        Write a semantic commit message in imperative mood. Focus on WHAT changed and WHY, \
+        not which files were modified. The message should have:\n\
+        - A concise subject line (max 72 chars), using a conventional prefix \
+          (feat:, fix:, refactor:, docs:, test:, chore:)\n\
+        - An optional body separated by a blank line with more detail if the change is complex\n\n\
+        Output ONLY the commit message text, nothing else. No markdown formatting, no code blocks.";
+
+    let user_msg = if diff_content.is_empty() {
+        "No diff found between branches. Write a generic commit message: 'chore: merge task branch'".to_string()
+    } else {
+        format!("Write a commit message for this diff:\n\n{diff_content}")
+    };
+
+    let request = LlmRequest {
+        system: vec![LlmSystemContent::new(system_prompt)],
+        messages: vec![LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(user_msg)],
+        }],
+        tools: vec![],
+        max_tokens: Some(500),
+    };
+
+    let commit_message = match llm_service.complete(&request).await {
+        Ok(response) => {
+            let text = response.text();
+            if text.is_empty() {
+                format!("feat: complete task from branch {branch_name}")
+            } else {
+                text
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "LLM commit message generation failed, using fallback");
+            format!("feat: complete task from branch {branch_name}")
+        }
+    };
+
+    Ok(Json(CompleteTaskResponse {
+        success: true,
+        commit_message,
+        task_not_done: if task_not_done { Some(true) } else { None },
+    }))
+}
+
+/// Confirm and execute the squash merge after the user reviews the commit message.
+#[allow(clippy::too_many_lines)] // Sequential git + DB operations; splitting hurts readability
+async fn confirm_complete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ConfirmCompleteRequest>,
+) -> Result<Json<ConfirmCompleteResponse>, AppError> {
+    // 1. Re-validate conversation state (race guard)
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to complete a task".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, base_branch) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            ..
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work mode".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv.project_id.as_deref().ok_or_else(|| {
+        AppError::BadRequest("Conversation is not project-scoped".to_string())
+    })?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+
+    let commit_message = req.commit_message;
+    let base_branch_for_msg = base_branch.clone();
+
+    // 2. Execute merge sequence (blocking, under global mutex)
+    let merge_result = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+        let _guard = TASK_APPROVAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 2a. Repo root must be clean
+        let status = run_git(&repo_root, &["status", "--porcelain"])
+            .map_err(AppError::Internal)?;
+        if !status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: "Main checkout has uncommitted changes. Commit or stash them before completing.".to_string(),
+                error_type: "dirty_main_checkout".to_string(),
+            }));
+        }
+
+        // 2b. Checkout base branch
+        run_git(&repo_root, &["checkout", &base_branch])
+            .map_err(|e| AppError::Internal(format!("Failed to checkout {base_branch}: {e}")))?;
+
+        // 2c. Squash merge
+        if let Err(e) = run_git(&repo_root, &["merge", "--squash", &branch_name]) {
+            // Attempt to recover by aborting the merge
+            let _ = run_git(&repo_root, &["merge", "--abort"]);
+            return Err(AppError::Internal(format!(
+                "Squash merge failed: {e}"
+            )));
+        }
+
+        // 2d. Commit
+        if let Err(e) = run_git(&repo_root, &["commit", "-m", &commit_message]) {
+            // Reset staged changes on commit failure
+            let _ = run_git(&repo_root, &["reset", "HEAD"]);
+            return Err(AppError::Internal(format!(
+                "Commit failed: {e}"
+            )));
+        }
+
+        // 2e. Record short SHA
+        let short_sha = run_git(&repo_root, &["rev-parse", "--short", "HEAD"])
+            .map_err(|e| AppError::Internal(format!("Failed to get commit SHA: {e}")))?;
+
+        // 2f. Remove worktree
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(&repo_root, &["worktree", "remove", &worktree_path, "--force"]) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal)"
+            );
+            // Try filesystem removal as fallback
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root, &["worktree", "prune"]);
+        }
+
+        // 2g. Delete branch
+        if let Err(e) = run_git(&repo_root, &["branch", "-D", &branch_name]) {
+            tracing::warn!(
+                error = %e,
+                branch = %branch_name,
+                "Failed to delete branch (non-fatal)"
+            );
+        }
+
+        Ok(short_sha)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?;
+
+    let short_sha = merge_result?;
+
+    // 3. Update conversation state to Terminal
+    state
+        .db
+        .update_conversation_state(&id, &ConvState::Terminal)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 4. Update conv_mode to Explore
+    state
+        .db
+        .update_conversation_mode(&id, &ConvMode::Explore)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 5. Inject system message
+    let system_msg = format!(
+        "Task completed. Squash merged to {base_branch_for_msg} as {short_sha}."
+    );
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    state
+        .db
+        .add_message(
+            &msg_id,
+            &id,
+            &MessageContent::system(system_msg),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(ConfirmCompleteResponse {
+        success: true,
+        commit_sha: short_sha,
+    }))
+}
+
+/// Check if the task file for a given task number has status `done`.
+/// Returns true if the task file exists and its status is NOT done.
+fn check_task_file_status(worktree_path: &std::path::Path, task_number: u32) -> bool {
+    let tasks_dir = worktree_path.join("tasks");
+    if !tasks_dir.exists() {
+        return false;
+    }
+
+    let prefix = format!("{task_number:04}-");
+    let Ok(entries) = std::fs::read_dir(&tasks_dir) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&prefix) && name_str.ends_with(".md") {
+            // Read the file and check frontmatter for status: done
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                // Simple frontmatter parse: look for `status: done` between `---` delimiters
+                if let Some(fm) = extract_frontmatter(&content) {
+                    return !fm.contains("status: done");
+                }
+            }
+            // File found but couldn't parse -- assume not done
+            return true;
+        }
+    }
+
+    // No matching task file found
+    false
+}
+
+/// Extract frontmatter content (between `---` delimiters) from a markdown file.
+fn extract_frontmatter(content: &str) -> Option<&str> {
+    let content = content.trim_start();
+    if !content.starts_with("---") {
+        return None;
+    }
+    let rest = &content[3..];
+    rest.find("---").map(|end| &rest[..end])
+}
+
+// ============================================================
 // Lifecycle (REQ-API-006)
 // ============================================================
 
@@ -1671,6 +2076,8 @@ enum AppError {
     BadRequest(String),
     NotFound(String),
     Internal(String),
+    /// 409 — conflict (dirty worktree, merge conflicts, etc.)
+    Conflict(ConflictErrorResponse),
     /// 422 — expansion reference validation failure (REQ-IR-007)
     UnprocessableEntity(ExpansionErrorResponse),
 }
@@ -1689,6 +2096,9 @@ impl IntoResponse for AppError {
                 Json(ErrorResponse::new(msg)),
             )
                 .into_response(),
+            AppError::Conflict(detail) => {
+                (StatusCode::CONFLICT, Json(detail)).into_response()
+            }
             AppError::UnprocessableEntity(detail) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, Json(detail)).into_response()
             }

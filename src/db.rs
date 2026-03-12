@@ -153,6 +153,21 @@ impl Database {
         })
     }
 
+    /// Get a project by ID.
+    pub async fn get_project(&self, id: &str) -> DbResult<Project> {
+        let project = sqlx::query(
+            "SELECT id, canonical_path, main_ref, created_at,
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) as conversation_count
+             FROM projects p WHERE id = ?1",
+        )
+        .bind(id)
+        .try_map(parse_project_row)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        project.ok_or_else(|| DbError::ConversationNotFound(format!("project {id}")))
+    }
+
     /// List all projects with conversation counts
     pub async fn list_projects(&self) -> DbResult<Vec<Project>> {
         let rows = sqlx::query(

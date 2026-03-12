@@ -1510,7 +1510,7 @@ fn scan_highest_task_number(tasks_dir: &std::path::Path) -> u32 {
 }
 
 /// Run a git command in the given directory, returning stdout on success or an error message.
-fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -1526,7 +1526,8 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
 
 /// Global mutex serializing the scan-tasks + write + commit sequence.
 /// Task approval is rare; a single mutex is sufficient.
-static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Also used by Complete/Abandon flows (task 0604) for git-on-main-checkout operations.
+pub(crate) static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Blocking implementation of approve task git operations.
 /// Runs on a blocking thread via `spawn_blocking`.
