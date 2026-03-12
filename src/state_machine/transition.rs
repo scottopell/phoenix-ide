@@ -933,6 +933,16 @@ pub fn transition(
         ) => Ok(
             TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::PersistMessage {
+                    content: crate::db::MessageContent::system(
+                        "Plan not approved. The user provided feedback below. \
+                         You must call propose_plan again with a revised plan \
+                         that addresses their feedback."
+                    ),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistMessage {
                     content: crate::db::MessageContent::user(annotations),
                     display_data: None,
                     usage_data: None,
