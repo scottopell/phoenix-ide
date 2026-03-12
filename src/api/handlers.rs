@@ -84,6 +84,11 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/confirm-complete",
             post(confirm_complete),
         )
+        // Task abandon (REQ-PROJ-010)
+        .route(
+            "/api/conversations/:id/abandon-task",
+            post(abandon_task),
+        )
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -1413,6 +1418,204 @@ fn extract_frontmatter(content: &str) -> Option<&str> {
     }
     let rest = &content[3..];
     rest.find("---").map(|end| &rest[..end])
+}
+
+/// Abandon a Work-mode task: delete worktree/branch, mark task file wont-do, go Terminal.
+/// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
+#[allow(clippy::too_many_lines)]
+async fn abandon_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // 1. Validate conversation exists, is Work mode, Idle state, project-scoped
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to abandon a task".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, base_branch, task_number) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            task_number,
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+            *task_number,
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work mode".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv.project_id.as_deref().ok_or_else(|| {
+        AppError::BadRequest("Conversation is not project-scoped".to_string())
+    })?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+
+    // 2. Execute abandon sequence (blocking)
+    let repo_root_clone = repo_root.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // Phase 1: worktree cleanup (BEFORE mutex -- these don't touch the main checkout)
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(&repo_root_clone, &["worktree", "remove", &worktree_path, "--force"]) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal), trying filesystem fallback"
+            );
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
+        }
+
+        if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
+            tracing::warn!(
+                error = %e,
+                branch = %branch_name,
+                "Failed to delete branch (non-fatal)"
+            );
+        }
+
+        // Phase 2: task file update (UNDER mutex)
+        let _guard = TASK_APPROVAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Check main checkout is clean
+        let status = run_git(&repo_root_clone, &["status", "--porcelain"])
+            .map_err(AppError::Internal)?;
+        if !status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: "Main checkout has uncommitted changes. Commit or stash them before abandoning.".to_string(),
+                error_type: "dirty_main_checkout".to_string(),
+            }));
+        }
+
+        // Checkout base branch
+        run_git(&repo_root_clone, &["checkout", &base_branch])
+            .map_err(|e| AppError::Internal(format!("Failed to checkout {base_branch}: {e}")))?;
+
+        // Scan tasks/ for matching task file and rename to wont-do
+        let tasks_dir = repo_root_clone.join("tasks");
+        let prefix = format!("{task_number:04}-");
+
+        let mut found_file = None;
+        if tasks_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy().to_string();
+                    if name_str.starts_with(&prefix) && name_str.ends_with(".md") {
+                        found_file = Some(name_str);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(old_filename) = found_file {
+            // Parse: everything before `--` is `NNNN-pX-status`, everything after is `slug.md`
+            if let Some(double_dash_pos) = old_filename.find("--") {
+                let before_dd = &old_filename[..double_dash_pos];
+                let after_dd = &old_filename[double_dash_pos..]; // includes "--slug.md"
+
+                // before_dd is like "0042-p1-in-progress" -- find the second '-' to locate status
+                // Split: first part is NNNN, second is pX, rest is status
+                let parts: Vec<&str> = before_dd.splitn(3, '-').collect();
+                if parts.len() == 3 {
+                    let new_filename = format!("{}-{}-wont-do{}", parts[0], parts[1], after_dd);
+                    let old_path = format!("tasks/{old_filename}");
+                    let new_path = format!("tasks/{new_filename}");
+
+                    if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
+                        tracing::warn!(
+                            error = %e,
+                            old = %old_path,
+                            new = %new_path,
+                            "Failed to git mv task file (non-fatal)"
+                        );
+                    } else if let Err(e) = run_git(
+                        &repo_root_clone,
+                        &["commit", "-m", &format!("task {task_number:04}: mark wont-do")],
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to commit task file rename (non-fatal)"
+                        );
+                        // Reset staged changes
+                        let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
+                    }
+                } else {
+                    tracing::warn!(
+                        filename = %old_filename,
+                        "Task filename does not match expected NNNN-pX-status--slug.md format"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    filename = %old_filename,
+                    "Task filename missing '--' separator"
+                );
+            }
+        } else {
+            tracing::warn!(
+                task_number = task_number,
+                "No task file found for task number (may have been manually deleted)"
+            );
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+
+    // 3. Update conversation state to Terminal
+    state
+        .db
+        .update_conversation_state(&id, &ConvState::Terminal)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 4. Update conv_mode to Explore
+    state
+        .db
+        .update_conversation_mode(&id, &ConvMode::Explore)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 5. Inject system message
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    state
+        .db
+        .add_message(
+            &msg_id,
+            &id,
+            &MessageContent::system("Task abandoned. Worktree and branch deleted.".to_string()),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 // ============================================================
