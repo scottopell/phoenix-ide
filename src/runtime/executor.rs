@@ -1558,14 +1558,6 @@ fn execute_approve_task_blocking(
         );
     }
 
-    // 1. Dirty tree check FIRST — before any filesystem changes to avoid partial state
-    let status = run_git(cwd, &["status", "--porcelain"])?;
-    if !status.is_empty() {
-        return Err("Please commit or stash your changes before approving. \
-             The working tree has uncommitted modifications."
-            .to_string());
-    }
-
     let tasks_dir = cwd.join("tasks");
 
     // Track whether tasks/ existed before we create it
