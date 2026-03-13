@@ -396,11 +396,7 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
-    async fn update_conversation_cwd(
-        &self,
-        _conv_id: &str,
-        _cwd: &str,
-    ) -> Result<(), String> {
+    async fn update_conversation_cwd(&self, _conv_id: &str, _cwd: &str) -> Result<(), String> {
         // In-memory storage doesn't track cwd separately
         Ok(())
     }
@@ -537,7 +533,9 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub async fn wait_for_done(&mut self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) = tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await
+            {
                 return true;
             }
         }
@@ -548,7 +546,9 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub async fn wait_for_state(&mut self, expected_type: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::StateChange { state, .. })) = tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
+            if let Ok(Ok(SseEvent::StateChange { state, .. })) =
+                tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await
+            {
                 if let Ok(val) = serde_json::to_value(&state) {
                     if let Some(state_type) = val.get("type").and_then(|v| v.as_str()) {
                         if state_type == expected_type {
@@ -911,7 +911,9 @@ mod tests {
         let mut done = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) = tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await {
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
                 done = true;
                 break;
             }
@@ -1006,7 +1008,9 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) = tokio::time::timeout(Duration::from_millis(10), broadcast_rx.recv()).await {
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(10), broadcast_rx.recv()).await
+            {
                 agent_done = true;
                 break;
             }
@@ -1498,7 +1502,9 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) = tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await {
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
                 agent_done = true;
                 break;
             }

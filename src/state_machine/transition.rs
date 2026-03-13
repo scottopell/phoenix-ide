@@ -949,7 +949,7 @@ pub fn transition(
                     content: crate::db::MessageContent::system(
                         "Plan not approved. The user provided feedback below. \
                          You must call propose_plan again with a revised plan \
-                         that addresses their feedback."
+                         that addresses their feedback.",
                     ),
                     display_data: None,
                     usage_data: None,

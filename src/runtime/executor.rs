@@ -587,9 +587,7 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
-                let _ = self
-                    .broadcast_tx
-                    .send(SseEvent::Message { message: msg });
+                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
                 Ok(None)
             }
 
@@ -863,7 +861,11 @@ where
                                 Ok(typed_state) => {
                                     let _ = self.broadcast_tx.send(SseEvent::StateChange {
                                         state: typed_state,
-                                        display_state: self.state.display_state().as_str().to_string(),
+                                        display_state: self
+                                            .state
+                                            .display_state()
+                                            .as_str()
+                                            .to_string(),
                                     });
                                 }
                                 Err(e) => {
@@ -874,7 +876,11 @@ where
                                     );
                                     let _ = self.broadcast_tx.send(SseEvent::StateChange {
                                         state: self.state.clone(),
-                                        display_state: self.state.display_state().as_str().to_string(),
+                                        display_state: self
+                                            .state
+                                            .display_state()
+                                            .as_str()
+                                            .to_string(),
                                     });
                                 }
                             }
@@ -904,9 +910,9 @@ where
                                 assistant_message.usage.as_ref(),
                             )
                             .await?;
-                        let _ = self.broadcast_tx.send(SseEvent::Message {
-                            message: agent_msg,
-                        });
+                        let _ = self
+                            .broadcast_tx
+                            .send(SseEvent::Message { message: agent_msg });
 
                         // Persist all tool results
                         for result in tool_results {
@@ -952,9 +958,7 @@ where
                         .await?;
 
                     // Tool results don't contain bash tool_use blocks, no enrichment needed
-                    let _ = self
-                        .broadcast_tx
-                        .send(SseEvent::Message { message: msg });
+                    let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
                 }
                 Ok(None)
             }
@@ -1084,9 +1088,9 @@ where
                             Ok(updated_msg) => {
                                 // This is a tool result message, not an agent message
                                 // No bash enrichment needed
-                                let _ = self
-                                    .broadcast_tx
-                                    .send(SseEvent::Message { message: updated_msg });
+                                let _ = self.broadcast_tx.send(SseEvent::Message {
+                                    message: updated_msg,
+                                });
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1119,9 +1123,7 @@ where
                         .await?;
 
                     // Broadcast the new message (tool message, no bash enrichment needed)
-                    let _ = self
-                        .broadcast_tx
-                        .send(SseEvent::Message { message });
+                    let _ = self.broadcast_tx.send(SseEvent::Message { message });
                 }
 
                 Ok(None)
@@ -1380,8 +1382,7 @@ where
                 // Replace working_dir to point at the worktree directory.
                 // Field-level mutation (not full replacement) so we don't lose
                 // is_sub_agent, context_exhaustion_behavior, or future fields.
-                self.context.working_dir =
-                    std::path::PathBuf::from(&approval_result.worktree_path);
+                self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -1404,17 +1405,9 @@ where
                 let content = MessageContent::system(&branch_msg);
                 let msg = self
                     .storage
-                    .add_message(
-                        &msg_id,
-                        &self.context.conversation_id,
-                        &content,
-                        None,
-                        None,
-                    )
+                    .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
                     .await?;
-                let _ = self
-                    .broadcast_tx
-                    .send(SseEvent::Message { message: msg });
+                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
 
                 // Push updated conversation metadata to the client so it
                 // reflects the new cwd, branch, worktree_path, and mode label
@@ -1641,8 +1634,7 @@ fn execute_approve_task_blocking(
         if needs_leading_newline {
             writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
-        writeln!(f, ".phoenix/")
-            .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         run_git(cwd, &["add", ".gitignore"])?;
         tracing::info!("Added .phoenix/ to .gitignore");
     }

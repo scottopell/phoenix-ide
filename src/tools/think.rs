@@ -43,7 +43,9 @@ impl Tool for ThinkTool {
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
         // Parse input (mainly for validation)
         match serde_json::from_value::<ThinkInput>(input) {
-            Ok(_) => ToolOutput::success("Thoughts recorded. Now continue with your response to the user."),
+            Ok(_) => ToolOutput::success(
+                "Thoughts recorded. Now continue with your response to the user.",
+            ),
             Err(e) => ToolOutput::error(format!("Invalid input: {e}")),
         }
     }

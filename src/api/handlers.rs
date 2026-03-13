@@ -6,17 +6,19 @@ use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_s
 use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, CompleteTaskResponse, ConfirmCompleteRequest,
-    ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse,
-    ConversationResponse, ConversationWithMessagesResponse, CreateConversationRequest,
-    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
-    FileSearchQuery, FileSearchResponse, GatewayStatusApi, ListDirectoryResponse,
-    ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse, RenameRequest,
-    SkillEntry, SkillsResponse, SuccessResponse, SystemPromptResponse, TaskApprovalResponse,
-    TaskFeedbackRequest, ValidateCwdResponse,
+    ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse, ConversationResponse,
+    ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
+    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
+    GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SystemPromptResponse, TaskApprovalResponse, TaskFeedbackRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
-use crate::llm::{ContentBlock, GatewayStatus, LlmMessage, LlmRequest, MessageRole, SystemContent as LlmSystemContent};
+use crate::llm::{
+    ContentBlock, GatewayStatus, LlmMessage, LlmRequest, MessageRole,
+    SystemContent as LlmSystemContent,
+};
 use crate::runtime::executor::{run_git, TASK_APPROVAL_MUTEX};
 use crate::runtime::SseEvent;
 use crate::state_machine::state::TaskApprovalOutcome;
@@ -76,19 +78,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/reject-task", post(reject_task))
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
         // Task completion (REQ-PROJ-009)
-        .route(
-            "/api/conversations/:id/complete-task",
-            post(complete_task),
-        )
+        .route("/api/conversations/:id/complete-task", post(complete_task))
         .route(
             "/api/conversations/:id/confirm-complete",
             post(confirm_complete),
         )
         // Task abandon (REQ-PROJ-010)
-        .route(
-            "/api/conversations/:id/abandon-task",
-            post(abandon_task),
-        )
+        .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -1178,9 +1174,10 @@ async fn complete_task(
         }
     };
 
-    let project_id = conv.project_id.as_deref().ok_or_else(|| {
-        AppError::BadRequest("Conversation is not project-scoped".to_string())
-    })?;
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
 
     // Look up project to get canonical_path (repo root)
     let project = state
@@ -1286,7 +1283,8 @@ async fn complete_task(
         Output ONLY the commit message text, nothing else. No markdown formatting, no code blocks.";
 
     let user_msg = if diff_content.is_empty() {
-        "No diff found between branches. Write a generic commit message: 'chore: merge task branch'".to_string()
+        "No diff found between branches. Write a generic commit message: 'chore: merge task branch'"
+            .to_string()
     } else {
         format!("Write a commit message for this diff:\n\n{diff_content}")
     };
@@ -1362,9 +1360,10 @@ async fn confirm_complete(
         }
     };
 
-    let project_id = conv.project_id.as_deref().ok_or_else(|| {
-        AppError::BadRequest("Conversation is not project-scoped".to_string())
-    })?;
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
 
     let project = state
         .db
@@ -1383,11 +1382,12 @@ async fn confirm_complete(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // 2a. Repo root must be clean
-        let status = run_git(&repo_root, &["status", "--porcelain"])
-            .map_err(AppError::Internal)?;
+        let status = run_git(&repo_root, &["status", "--porcelain"]).map_err(AppError::Internal)?;
         if !status.is_empty() {
             return Err(AppError::Conflict(ConflictErrorResponse {
-                error: "Main checkout has uncommitted changes. Commit or stash them before completing.".to_string(),
+                error:
+                    "Main checkout has uncommitted changes. Commit or stash them before completing."
+                        .to_string(),
                 error_type: "dirty_main_checkout".to_string(),
             }));
         }
@@ -1400,9 +1400,7 @@ async fn confirm_complete(
         if let Err(e) = run_git(&repo_root, &["merge", "--squash", &branch_name]) {
             // Attempt to recover by aborting the merge
             let _ = run_git(&repo_root, &["merge", "--abort"]);
-            return Err(AppError::Internal(format!(
-                "Squash merge failed: {e}"
-            )));
+            return Err(AppError::Internal(format!("Squash merge failed: {e}")));
         }
 
         // 2d. Commit (skip if merge --squash produced no changes, e.g., only task file)
@@ -1422,7 +1420,10 @@ async fn confirm_complete(
 
         // 2f. Remove worktree
         let worktree_dir = PathBuf::from(&worktree_path);
-        if let Err(e) = run_git(&repo_root, &["worktree", "remove", &worktree_path, "--force"]) {
+        if let Err(e) = run_git(
+            &repo_root,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
             tracing::warn!(
                 error = %e,
                 worktree = %worktree_path,
@@ -1464,9 +1465,8 @@ async fn confirm_complete(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     // 5. Inject system message
-    let system_msg = format!(
-        "Task completed. Squash merged to {base_branch_for_msg} as {short_sha}."
-    );
+    let system_msg =
+        format!("Task completed. Squash merged to {base_branch_for_msg} as {short_sha}.");
     let msg_id = uuid::Uuid::new_v4().to_string();
     let msg = state
         .db
@@ -1588,9 +1588,10 @@ async fn abandon_task(
         }
     };
 
-    let project_id = conv.project_id.as_deref().ok_or_else(|| {
-        AppError::BadRequest("Conversation is not project-scoped".to_string())
-    })?;
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
 
     let project = state
         .db
@@ -1604,7 +1605,10 @@ async fn abandon_task(
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         // Phase 1: worktree cleanup (BEFORE mutex -- these don't touch the main checkout)
         let worktree_dir = PathBuf::from(&worktree_path);
-        if let Err(e) = run_git(&repo_root_clone, &["worktree", "remove", &worktree_path, "--force"]) {
+        if let Err(e) = run_git(
+            &repo_root_clone,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
             tracing::warn!(
                 error = %e,
                 worktree = %worktree_path,
@@ -1628,11 +1632,13 @@ async fn abandon_task(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Check main checkout is clean
-        let status = run_git(&repo_root_clone, &["status", "--porcelain"])
-            .map_err(AppError::Internal)?;
+        let status =
+            run_git(&repo_root_clone, &["status", "--porcelain"]).map_err(AppError::Internal)?;
         if !status.is_empty() {
             return Err(AppError::Conflict(ConflictErrorResponse {
-                error: "Main checkout has uncommitted changes. Commit or stash them before abandoning.".to_string(),
+                error:
+                    "Main checkout has uncommitted changes. Commit or stash them before abandoning."
+                        .to_string(),
                 error_type: "dirty_main_checkout".to_string(),
             }));
         }
@@ -1651,7 +1657,11 @@ async fn abandon_task(
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy().to_string();
-                    if name_str.starts_with(&prefix) && name_str.ends_with(".md") {
+                    if name_str.starts_with(&prefix)
+                        && std::path::Path::new(&name_str)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
                         found_file = Some(name_str);
                         break;
                     }
@@ -1682,7 +1692,11 @@ async fn abandon_task(
                         );
                     } else if let Err(e) = run_git(
                         &repo_root_clone,
-                        &["commit", "-m", &format!("task {task_number:04}: mark wont-do")],
+                        &[
+                            "commit",
+                            "-m",
+                            &format!("task {task_number:04}: mark wont-do"),
+                        ],
                     ) {
                         tracing::warn!(
                             error = %e,
@@ -1929,7 +1943,7 @@ async fn list_directory(
         .filter_map(Result::ok)
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
             DirectoryEntry { name, is_dir }
         })
         .collect();
@@ -2446,9 +2460,7 @@ impl IntoResponse for AppError {
                 Json(ErrorResponse::new(msg)),
             )
                 .into_response(),
-            AppError::Conflict(detail) => {
-                (StatusCode::CONFLICT, Json(detail)).into_response()
-            }
+            AppError::Conflict(detail) => (StatusCode::CONFLICT, Json(detail)).into_response(),
             AppError::UnprocessableEntity(detail) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, Json(detail)).into_response()
             }

@@ -104,10 +104,11 @@ ALTER TABLE messages RENAME COLUMN id TO message_id;
 ///
 /// Stored as JSON in the `conv_mode` TEXT column on conversations.
 /// REQ-BED-027: Conversation-level field, NOT embedded in `ConvState`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "mode")]
 pub enum ConvMode {
     /// Read-only mode. No file writes, no bash (unless sandboxed).
+    #[default]
     Explore,
     /// Standalone mode for non-git directories. Full tool suite, no project association.
     Standalone,
@@ -132,12 +133,6 @@ pub enum ConvMode {
         #[serde(default)]
         task_number: u32,
     },
-}
-
-impl Default for ConvMode {
-    fn default() -> Self {
-        Self::Explore
-    }
 }
 
 impl ConvMode {

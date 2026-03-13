@@ -3,11 +3,11 @@ import { api } from '../api';
 
 interface WorkActionsProps {
   conversationId: string;
-  convModeLabel?: string;
+  convModeLabel: string | undefined;
   /** Live phase type from atom (not stale conversation.display_state) */
   phaseType: string;
-  branchName?: string;
-  baseBranch?: string | null;
+  branchName: string | undefined;
+  baseBranch: string | null | undefined;
 }
 
 type ModalState =
