@@ -2,7 +2,7 @@
 created: 2026-03-05
 number: 604
 priority: p1
-status: in-progress
+status: done
 slug: projects-m4-merge-abandon
 title: "Projects M4: Complete and abandon flows (task lifecycle)"
 ---
