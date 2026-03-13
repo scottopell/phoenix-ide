@@ -24,10 +24,10 @@ use tokio::task::JoinHandle;
 const MAX_CONSOLE_LOGS: usize = 1000;
 
 /// Idle timeout before session cleanup (30 minutes)
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Cleanup check interval (60 seconds)
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Default viewport dimensions
 const DEFAULT_VIEWPORT_WIDTH: u32 = 1024;

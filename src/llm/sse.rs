@@ -76,13 +76,7 @@ impl SseParser {
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
 
-        loop {
-            // SSE spec (WHATWG) recognises three line endings: \n, \r\n, bare \r.
-            // Find the first \r or \n.
-            let Some(eol_pos) = self.buf.iter().position(|&b| b == b'\n' || b == b'\r') else {
-                break;
-            };
-
+        while let Some(eol_pos) = self.buf.iter().position(|&b| b == b'\n' || b == b'\r') {
             // Determine how many bytes the line ending consumes.
             let eol_len = if self.buf[eol_pos] == b'\r' {
                 // \r\n counts as one line ending; bare \r also counts.

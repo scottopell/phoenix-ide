@@ -243,7 +243,7 @@ pub async fn complete_streaming(
 
     let base_url = resolve_anthropic_url(gateway, base_url_override);
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
@@ -328,7 +328,7 @@ pub async fn complete(
     let base_url = resolve_anthropic_url(gateway, base_url_override);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(5))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 

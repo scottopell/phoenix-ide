@@ -41,7 +41,7 @@ pub async fn complete(
     let responses_request = translate_to_responses_request(&spec.api_name, request);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(5))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
@@ -232,7 +232,7 @@ pub async fn complete_streaming(
     responses_request.stream = Some(true);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 

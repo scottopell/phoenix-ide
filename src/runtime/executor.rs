@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Default timeout for sub-agents: 5 minutes (REQ-SA-006, FM-6 prevention).
 /// Long enough for real work, short enough to catch stuck agents.
-const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
