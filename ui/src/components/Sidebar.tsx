@@ -1,11 +1,11 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { api, getDisplayState } from '../api';
 import type { Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
 import { SidebarNewForm } from './SidebarNewForm';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
-import { api } from '../api';
 
 interface SidebarProps {
   collapsed: boolean;
@@ -137,7 +137,7 @@ export function Sidebar({
         </button>
         <div className="sidebar-collapsed-dots">
           {conversations.slice(0, 15).map(conv => {
-            const displayState = conv.display_state || 'idle';
+            const displayState = getDisplayState(conv.state?.type);
             const isActive = conv.slug === activeSlug;
             return (
               <button

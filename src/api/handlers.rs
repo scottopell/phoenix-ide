@@ -186,7 +186,6 @@ fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &
 /// Build an `EnrichedConversation` with derived display fields.
 fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::EnrichedConversation {
     crate::runtime::EnrichedConversation {
-        display_state: conv.state.display_state().as_str().to_string(),
         conv_mode_label: conv.conv_mode.label().to_string(),
         branch_name: conv.conv_mode.branch_name().map(String::from),
         worktree_path: conv
@@ -206,8 +205,17 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
 /// Serialize a conversation to JSON with `display_state` included.
 ///
 /// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
+/// `display_state` is injected here (not on `EnrichedConversation`) so REST
+/// clients still receive it while the typed struct stays clean.
 fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
-    serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null)
+    let mut val = serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = val {
+        map.insert(
+            "display_state".to_string(),
+            Value::String(conv.state.display_state().as_str().to_string()),
+        );
+    }
+    val
 }
 
 fn merge_display_data_into_content(json: &mut Value, display_data: &Value) {

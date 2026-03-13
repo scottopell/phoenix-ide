@@ -9,8 +9,6 @@ export interface Conversation {
   updated_at: string;
   message_count: number;
   state?: ConversationState;
-  /** Semantic state category from API: idle, working, error, terminal */
-  display_state?: 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval';
   branch_name?: string | null;
   worktree_path?: string | null;
   base_branch?: string | null;
@@ -60,6 +58,19 @@ export type ConversationState =
   | { type: 'context_exhausted'; summary: string }
   | { type: 'error'; message: string }
   | { type: 'terminal' };
+
+/** Derive the coarse display category from a conversation's state type.
+ *  Use this instead of reading `display_state` off the conversation object. */
+export function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
+  switch (stateType) {
+    case 'idle': return 'idle';
+    case 'terminal': return 'terminal';
+    case 'error': return 'error';
+    case 'context_exhausted': return 'terminal';
+    case 'awaiting_task_approval': return 'awaiting_approval';
+    default: return stateType ? 'working' : 'idle';
+  }
+}
 
 export interface ToolCall {
   id: string;

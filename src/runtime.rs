@@ -101,7 +101,6 @@ pub struct ConversationMetadataUpdate {
 pub struct EnrichedConversation {
     #[serde(flatten)]
     pub inner: crate::db::Conversation,
-    pub display_state: String,
     pub conv_mode_label: String,
     pub branch_name: Option<String>,
     pub worktree_path: Option<String>,

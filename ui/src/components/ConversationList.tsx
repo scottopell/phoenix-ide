@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { getDisplayState } from '../api';
 import type { Conversation } from '../api';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 
@@ -104,7 +105,7 @@ export function ConversationList({
             >
               <div className="conv-item-main" onClick={() => handleClick(conv)}>
                 <div className="conv-item-slug">
-                  <span className={`conv-state-dot ${conv.display_state || 'idle'}`} />
+                  <span className={`conv-state-dot ${getDisplayState(conv.state?.type)}`} />
                   {conv.slug}
                   {conv.conv_mode_label && (
                     <span className="conv-mode-badge">{conv.conv_mode_label}</span>
