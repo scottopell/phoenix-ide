@@ -110,6 +110,8 @@ impl TestServer {
                                     html
                                 );
                                 let _ = socket.write_all(response.as_bytes()).await;
+                                // Force-close so Chrome releases the keep-alive connection
+                                let _ = socket.shutdown().await;
                             });
                         }
                     }
@@ -130,8 +132,16 @@ impl TestServer {
 
     async fn shutdown(self) {
         let _ = self.shutdown.send(());
-        let _ = self.handle.await;
+        // Timeout guards against Chrome keeping connections open past server teardown
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.handle).await;
     }
+}
+
+/// Shut down browser sessions before the test server so Chrome releases its
+/// connections first, preventing server.shutdown() from hanging.
+async fn shutdown_test(manager: Arc<BrowserSessionManager>, server: TestServer) {
+    manager.shutdown_all().await;
+    server.shutdown().await;
 }
 
 // ============================================================================
@@ -163,7 +173,7 @@ async fn test_browser_navigate_local() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -227,7 +237,7 @@ async fn test_browser_eval_local() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 // ============================================================================
@@ -273,7 +283,7 @@ async fn test_eval_inner_text_not_undefined() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -314,7 +324,7 @@ async fn test_eval_inner_html_slice_not_undefined() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -356,7 +366,7 @@ async fn test_eval_json_stringify_dom_not_undefined() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -470,7 +480,7 @@ async fn test_eval_complex_page_inner_text() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -507,7 +517,7 @@ async fn test_eval_await_false_returns_value() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -551,7 +561,7 @@ async fn test_eval_promise_chain_awaited() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -642,7 +652,7 @@ async fn test_browser_console_logs_local() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -688,7 +698,7 @@ async fn test_browser_screenshot_local() {
         }
     }
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -733,7 +743,7 @@ async fn test_browser_resize_local() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -782,7 +792,7 @@ async fn test_browser_session_persistence() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 // ============================================================================
@@ -887,7 +897,7 @@ async fn test_browser_eval_syntax_error() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 // ============================================================================
@@ -927,7 +937,7 @@ async fn test_wait_for_selector_immediate() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -968,7 +978,7 @@ async fn test_wait_for_selector_delayed() {
 
     assert!(result.success, "Wait failed: {}", result.output);
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1008,7 +1018,7 @@ async fn test_wait_for_selector_timeout() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1051,7 +1061,7 @@ async fn test_wait_for_selector_hidden_then_visible() {
 
     assert!(result.success, "Wait for visible failed: {}", result.output);
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1080,7 +1090,7 @@ async fn test_wait_for_selector_invalid_selector() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 // ============================================================================
@@ -1134,7 +1144,7 @@ async fn test_click_button() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1180,7 +1190,7 @@ async fn test_click_link() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1209,7 +1219,7 @@ async fn test_click_element_not_found() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1265,7 +1275,7 @@ async fn test_click_checkbox() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1326,7 +1336,7 @@ async fn test_click_with_wait() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 // ============================================================================
@@ -1382,7 +1392,7 @@ async fn test_type_in_input() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1434,7 +1444,7 @@ async fn test_type_in_textarea() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1497,7 +1507,7 @@ async fn test_type_triggers_react_events() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1549,7 +1559,7 @@ async fn test_type_with_clear() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1598,7 +1608,7 @@ async fn test_type_append() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1630,7 +1640,7 @@ async fn test_type_element_not_found() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1682,7 +1692,7 @@ async fn test_type_special_characters() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1734,7 +1744,7 @@ async fn test_type_password_field() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 // ============================================================================
@@ -1791,7 +1801,7 @@ async fn test_key_press_escape_fires_keydown_listener() {
         eval_result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1839,7 +1849,7 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         eval_result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1887,7 +1897,7 @@ async fn test_key_press_arrow_down() {
         eval_result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }
 
 #[tokio::test]
@@ -1911,5 +1921,5 @@ async fn test_key_press_unknown_key_returns_error() {
         result.output
     );
 
-    server.shutdown().await;
+    shutdown_test(_manager, server).await;
 }

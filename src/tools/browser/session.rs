@@ -567,6 +567,17 @@ impl BrowserSessionManager {
     }
 }
 
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
+        // Abort background tasks so their I/O registrations are released immediately.
+        // Dropping a JoinHandle does NOT abort the task — explicit abort is required.
+        self.handler_task.abort();
+        if let Some(task) = &self.console_task {
+            task.abort();
+        }
+    }
+}
+
 impl Default for BrowserSessionManager {
     fn default() -> Self {
         Self {
