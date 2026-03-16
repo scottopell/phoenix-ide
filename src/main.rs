@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "LLM registry initialized"
         );
     } else {
-        tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY or LLM_GATEWAY.");
+        tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY, LLM_GATEWAY, or LLM_API_KEY_HELPER.");
     }
 
     // Create application state

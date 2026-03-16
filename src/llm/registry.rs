@@ -3,11 +3,13 @@
 #![allow(dead_code)] // new_empty() used in tests
 
 use super::{
-    all_models, discover_models, probe_gateway, LlmService, LlmServiceImpl, LoggingService,
-    Provider,
+    all_models, discover_models, probe_gateway, DiscoveryConfig, LlmService, LlmServiceImpl,
+    LoggingService, Provider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 
 /// Gateway reachability status determined at startup
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,21 +87,162 @@ impl TokenProvider for JsonFileTokenProvider {
     }
 }
 
-/// How to authenticate Anthropic API requests.
+/// A dynamically-resolved credential string.
+/// Unlike `TokenProvider` (OAuth-specific), this is provider-agnostic —
+/// it just produces a string that the caller decides how to send.
+#[async_trait::async_trait]
+pub trait CredentialSource: Send + Sync + std::fmt::Debug {
+    /// Fetch the current credential, possibly re-executing or re-reading.
+    async fn get(&self) -> Option<String>;
+    /// Invalidate any cached value (e.g. after a 401).
+    /// Returns `true` if there was a cached value to invalidate (i.e. a retry is worthwhile).
+    async fn invalidate(&self) -> bool;
+}
+
+/// A static credential string that never changes.
+pub struct StaticCredential(String);
+
+impl StaticCredential {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl std::fmt::Debug for StaticCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticCredential")
+            .field("value", &"[redacted]")
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for StaticCredential {
+    async fn get(&self) -> Option<String> {
+        Some(self.0.clone())
+    }
+    async fn invalidate(&self) -> bool {
+        false // Static credentials can't be invalidated — retry won't help
+    }
+}
+
+/// Runs a shell command to obtain an API key/token on demand, caching the
+/// result for `ttl` duration.
+pub struct CommandCredential {
+    command: String,
+    ttl: Duration,
+    cache: TokioMutex<Option<(String, Instant)>>,
+}
+
+impl CommandCredential {
+    pub fn new(command: impl Into<String>, ttl: Duration) -> Self {
+        Self {
+            command: command.into(),
+            ttl,
+            cache: TokioMutex::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandCredential")
+            .field("command", &"[redacted]")
+            .field("ttl", &self.ttl)
+            .field("cache", &"<locked>")
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for CommandCredential {
+    async fn get(&self) -> Option<String> {
+        let guard = self.cache.lock().await;
+
+        // Return cached token if still valid
+        if let Some((ref tok, ref at)) = *guard {
+            if at.elapsed() < self.ttl {
+                return Some(tok.clone());
+            }
+        }
+
+        // Cache miss or expired — release lock during execution
+        drop(guard);
+
+        let output = tokio::process::Command::new("sh")
+            .args(["-c", &self.command])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await;
+
+        match output {
+            Err(e) => {
+                tracing::warn!(
+                    command = %self.command,
+                    error = %e,
+                    "LLM_API_KEY_HELPER command failed to spawn"
+                );
+                None
+            }
+            Ok(out) if !out.status.success() => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!(
+                    command = %self.command,
+                    exit_code = ?out.status.code(),
+                    stderr = %stderr.trim(),
+                    "LLM_API_KEY_HELPER command exited with non-zero status"
+                );
+                None
+            }
+            Ok(out) => {
+                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if token.is_empty() {
+                    tracing::warn!(
+                        command = %self.command,
+                        "LLM_API_KEY_HELPER command produced empty output"
+                    );
+                    return None;
+                }
+                tracing::debug!(
+                    command = %self.command,
+                    ttl_ms = self.ttl.as_millis(),
+                    "LLM_API_KEY_HELPER token refreshed"
+                );
+                let mut guard = self.cache.lock().await;
+                *guard = Some((token.clone(), Instant::now()));
+                Some(token)
+            }
+        }
+    }
+
+    async fn invalidate(&self) -> bool {
+        let mut guard = self.cache.lock().await;
+        if guard.is_some() {
+            *guard = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// How to authenticate LLM API requests.
 ///
 /// Determines which header carries the credential:
 /// - `ApiKey`: `x-api-key: <key>` (standard API keys and gateway implicit auth)
 /// - `Bearer`: `Authorization: Bearer <token>` (Claude OAuth tokens from `claude login`)
-pub enum AnthropicAuth {
-    /// Standard API key — sent as `x-api-key` header.
-    /// Also used for gateway mode with the sentinel value `"implicit"`.
-    ApiKey(String),
+pub enum LlmAuth {
+    /// Standard API key — sent as `x-api-key` header. Source may be static or
+    /// dynamic (command-backed). Also used for gateway mode with the sentinel
+    /// value `"implicit"`.
+    ApiKey(Arc<dyn CredentialSource>),
     /// OAuth bearer token — sent as `Authorization: Bearer` header.
     /// Token is fetched from the provider on each request (never cached).
     Bearer(Arc<dyn TokenProvider>),
 }
 
-impl std::fmt::Debug for AnthropicAuth {
+impl std::fmt::Debug for LlmAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ApiKey(_) => write!(f, "ApiKey([redacted])"),
@@ -108,34 +251,62 @@ impl std::fmt::Debug for AnthropicAuth {
     }
 }
 
-impl Clone for AnthropicAuth {
+impl Clone for LlmAuth {
     fn clone(&self) -> Self {
         match self {
-            Self::ApiKey(k) => Self::ApiKey(k.clone()),
+            Self::ApiKey(s) => Self::ApiKey(Arc::clone(s)),
             Self::Bearer(p) => Self::Bearer(Arc::clone(p)),
         }
     }
 }
 
-impl AnthropicAuth {
-    /// Extract the API key string. Only valid for `ApiKey` variant.
-    /// For OpenAI/Fireworks providers that always use a plain key string.
-    pub fn as_str(&self) -> &str {
+/// Credential resolved for use in HTTP headers.
+pub enum ResolvedAuth {
+    /// Standard API key -> `x-api-key` header
+    ApiKey(String),
+    /// OAuth bearer -> `Authorization: Bearer` header + `anthropic-beta`
+    Bearer(String),
+    /// Plain bearer -> `Authorization: Bearer` header (no anthropic-beta).
+    /// Used for service-to-service auth (e.g. Datadog AI Gateway with ddtool JWT).
+    PlainBearer(String),
+}
+
+impl LlmAuth {
+    /// Resolve the credential for use in request headers.
+    pub async fn resolve(&self) -> Result<ResolvedAuth, super::LlmError> {
         match self {
-            Self::ApiKey(k) => k.as_str(),
-            Self::Bearer(_) => {
-                panic!("AnthropicAuth::as_str() called on Bearer variant — use TokenProvider::token() instead")
+            Self::ApiKey(source) => {
+                let key = source.get().await.ok_or_else(|| {
+                    super::LlmError::auth(
+                        "API key unavailable — check ANTHROPIC_API_KEY or LLM_API_KEY_HELPER",
+                    )
+                })?;
+                Ok(ResolvedAuth::ApiKey(key))
             }
+            Self::Bearer(provider) => {
+                let token = provider.token().ok_or_else(|| {
+                    super::LlmError::auth(
+                        "OAuth token unavailable — check ~/.claude/.credentials.json or run `claude login`",
+                    )
+                })?;
+                Ok(ResolvedAuth::Bearer(token))
+            }
+        }
+    }
+
+    /// Invalidate any cached credential (e.g. after a 401).
+    pub async fn invalidate(&self) -> bool {
+        match self {
+            Self::ApiKey(source) => source.invalidate().await,
+            Self::Bearer(_) => false, // TokenProvider has no invalidation concept
         }
     }
 }
 
 /// Configuration for LLM providers
-#[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
     pub openai_api_key: Option<String>,
-    pub fireworks_api_key: Option<String>,
     /// exe.dev gateway URL (e.g., `http://127.0.0.1:8462`)
     pub gateway: Option<String>,
     /// Default model ID
@@ -144,6 +315,74 @@ pub struct LlmConfig {
     /// `anthropic_api_key` for Anthropic models in direct mode. Token is fetched
     /// fresh on each request — no restart needed after `claude login`.
     pub anthropic_oauth_token: Option<Arc<dyn TokenProvider>>,
+    /// Shell command to run for obtaining an API key/token dynamically.
+    pub api_key_helper: Option<Arc<dyn CredentialSource>>,
+    /// Direct URL override for the Anthropic endpoint (overrides gateway routing).
+    pub anthropic_base_url: Option<String>,
+    /// Direct URL override for the `OpenAI` endpoint (overrides gateway routing).
+    pub openai_base_url: Option<String>,
+    /// Extra headers to inject on every LLM request (newline-separated "key: value").
+    /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
+    /// based on which provider is being called.
+    pub custom_headers: Vec<(String, String)>,
+    /// When true, send `api_key_helper` output as `Authorization: Bearer` instead of `x-api-key`.
+    /// Set via `LLM_AUTH_HEADER=bearer`. Used for service gateways that expect JWT bearer auth.
+    pub use_bearer_auth: bool,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("anthropic_api_key", &self.anthropic_api_key.as_ref().map(|_| "[redacted]"))
+            .field("openai_api_key", &self.openai_api_key.as_ref().map(|_| "[redacted]"))
+            .field("gateway", &self.gateway)
+            .field("default_model", &self.default_model)
+            .field("anthropic_oauth_token", &self.anthropic_oauth_token.is_some())
+            .field("api_key_helper", &self.api_key_helper)
+            .field("anthropic_base_url", &self.anthropic_base_url)
+            .field("openai_base_url", &self.openai_base_url)
+            .field("custom_headers", &self.custom_headers)
+            .field("use_bearer_auth", &self.use_bearer_auth)
+            .finish()
+    }
+}
+
+impl Clone for LlmConfig {
+    fn clone(&self) -> Self {
+        Self {
+            anthropic_api_key: self.anthropic_api_key.clone(),
+            openai_api_key: self.openai_api_key.clone(),
+            gateway: self.gateway.clone(),
+            default_model: self.default_model.clone(),
+            anthropic_oauth_token: self.anthropic_oauth_token.as_ref().map(Arc::clone),
+            api_key_helper: self.api_key_helper.as_ref().map(Arc::clone),
+            anthropic_base_url: self.anthropic_base_url.clone(),
+            openai_base_url: self.openai_base_url.clone(),
+            custom_headers: self.custom_headers.clone(),
+            use_bearer_auth: self.use_bearer_auth,
+        }
+    }
+}
+
+// Default is derived via the `#[derive(Default)]` approach won't work for
+// `Arc<dyn Trait>`, but `Option<Arc<dyn Trait>>` defaults to `None` just fine.
+// Clippy pedantic suggests deriving, but trait objects prevent it. Suppress.
+#[allow(clippy::derivable_impls)]
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            anthropic_api_key: None,
+            openai_api_key: None,
+            gateway: None,
+            default_model: None,
+            anthropic_oauth_token: None,
+            api_key_helper: None,
+            anthropic_base_url: None,
+            openai_base_url: None,
+            custom_headers: Vec::new(),
+            use_bearer_auth: false,
+        }
+    }
 }
 
 impl LlmConfig {
@@ -175,15 +414,64 @@ impl LlmConfig {
             }
         };
 
+        let api_key_helper: Option<Arc<dyn CredentialSource>> = std::env::var("LLM_API_KEY_HELPER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|command| {
+                let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
+                Arc::new(CommandCredential::new(command, Duration::from_millis(ttl_ms)))
+                    as Arc<dyn CredentialSource>
+            });
+
+        let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let openai_base_url = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        // Parse newline-separated "key: value" pairs
+        let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
+            .ok()
+            .map(|raw| {
+                raw.lines()
+                    .filter_map(|line| {
+                        let line = line.trim();
+                        let (k, v) = line.split_once(':')?;
+                        Some((k.trim().to_string(), v.trim().to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
-            fireworks_api_key: std::env::var("FIREWORKS_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
             anthropic_oauth_token,
+            api_key_helper,
+            anthropic_base_url,
+            openai_base_url,
+            custom_headers,
+            use_bearer_auth: std::env::var("LLM_AUTH_HEADER")
+                .ok()
+                .is_some_and(|v| v.eq_ignore_ascii_case("bearer")),
         }
     }
+}
+
+/// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
+/// Replaces the last path segment with `"models"`, stripping any query string first.
+fn derive_models_url(base_url: &str) -> Option<String> {
+    // Strip query string if present (e.g. "https://host/v1/messages?foo=bar")
+    let path = base_url.split('?').next().unwrap_or(base_url);
+    let last_slash = path.rfind('/')?;
+    Some(format!("{}models", &path[..=last_slash]))
 }
 
 /// Registry of available LLM models
@@ -231,14 +519,7 @@ impl ModelRegistry {
             })
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
-        // In non-discovery (direct key) mode, gateway is not configured
-        let gateway_status = if config.gateway.is_some() {
-            // new() is called without an async probe; treat as not configured
-            // (new_with_discovery should be used when a gateway is present)
-            GatewayStatus::NotConfigured
-        } else {
-            GatewayStatus::NotConfigured
-        };
+        let gateway_status = GatewayStatus::NotConfigured;
 
         Self {
             services,
@@ -248,109 +529,90 @@ impl ModelRegistry {
         }
     }
 
-    /// Create registry with dynamic model discovery from gateway
+    /// Create a registry with a specific gateway status, using hardcoded models only.
+    fn new_with_status(config: &LlmConfig, status: GatewayStatus) -> Self {
+        let mut reg = Self::new(config);
+        reg.gateway_status = status;
+        reg
+    }
+
+    /// Create registry with model discovery from gateway or `api_key_helper`.
     ///
-    /// When gateway is configured, queries provider endpoints for available models.
+    /// Discovery validates which hardcoded models are available on the gateway.
+    /// Unknown/dynamic models from the gateway are silently ignored.
     /// Falls back to hardcoded models if discovery fails.
-    /// Always probes gateway reachability and records the result in `gateway_status`.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
-        // If no gateway, use direct-key mode (no probe needed)
-        if config.gateway.is_none() {
+        // Build discovery config from available settings
+        let Some((discovery, is_gateway_mode)) =
+            Self::build_discovery_config(config).await
+        else {
             return Self::new(config);
-        }
-
-        let gateway_url = config.gateway.as_ref().unwrap();
-        tracing::info!("Discovering models from gateway: {}", gateway_url);
-
-        // Probe gateway reachability before attempting discovery
-        let gateway_reachable = probe_gateway(gateway_url).await;
-        let gateway_status = if gateway_reachable {
-            GatewayStatus::Healthy
-        } else {
-            GatewayStatus::Unreachable
         };
 
-        if !gateway_reachable {
-            tracing::warn!(
-                gateway = %gateway_url,
-                "Gateway unreachable during startup probe; falling back to hardcoded models"
-            );
-            // Fall back to hardcoded models, but carry the Unreachable status so the
-            // UI can show a warning banner.  Only use direct API keys if present.
-            let mut fallback = Self::new(config);
-            fallback.gateway_status = GatewayStatus::Unreachable;
-            return fallback;
+        // Gateway mode: probe reachability first
+        if let (true, Some(ref gw)) = (is_gateway_mode, &config.gateway) {
+            tracing::info!("Discovering models from gateway: {}", gw);
+
+            let reachable = probe_gateway(
+                gw,
+                discovery.auth_token.as_deref(),
+                &discovery.custom_headers,
+            )
+            .await;
+
+            if !reachable {
+                tracing::warn!(
+                    gateway = %gw,
+                    "Gateway unreachable during startup probe; falling back to hardcoded models"
+                );
+                return Self::new_with_status(config, GatewayStatus::Unreachable);
+            }
+        } else {
+            tracing::info!("Discovering models via api_key_helper auth");
         }
 
-        // Try to discover models from gateway
-        let discovered = discover_models(gateway_url).await;
+        // Try to discover models
+        let discovered = discover_models(&discovery).await;
 
         if discovered.is_empty() {
             tracing::warn!(
                 "Gateway model discovery returned no models, falling back to hardcoded list"
             );
-            let mut fallback = Self::new(config);
-            // Gateway was reachable (probe passed) but discovery returned nothing —
-            // treat as Unreachable so the UI can warn the user.
-            fallback.gateway_status = GatewayStatus::Unreachable;
-            return fallback;
+            return Self::new_with_status(config, GatewayStatus::Unreachable);
         }
 
         tracing::info!("Discovered {} models from gateway", discovered.len());
 
-        // Build services from both hardcoded and discovered models
+        // Register hardcoded models that were confirmed by discovery.
+        // The AI gateway returns provider-prefixed IDs (e.g. "anthropic/claude-sonnet-4-6"),
+        // so also check for "{provider}/{id}" and "{provider}/{api_name}".
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
-        let mut registered_ids = std::collections::HashSet::new();
 
-        // First, register hardcoded models that were discovered (preserves metadata).
-        // Register both id and api_name in registered_ids so the second pass doesn't
-        // double-register under the api_name string with a wrong (default) context window.
         for spec in all_models() {
-            if discovered.contains_key(&spec.id) || discovered.contains_key(&spec.api_name) {
+            let prefixed_id = format!("{}/{}", spec.provider.header_value(), spec.id);
+            let prefixed_api = format!("{}/{}", spec.provider.header_value(), spec.api_name);
+            if discovered.contains(&spec.id)
+                || discovered.contains(&spec.api_name)
+                || discovered.contains(&prefixed_id)
+                || discovered.contains(&prefixed_api)
+            {
                 if let Some(service) = Self::try_create_model(&spec, config) {
                     services.insert(spec.id.clone(), service);
                     specs.insert(spec.id.clone(), spec.clone());
-                    registered_ids.insert(spec.id.clone());
-                    registered_ids.insert(spec.api_name.clone());
                 }
             }
         }
 
-        // Guard: if no hardcoded model matched anything in the discovery list, the
-        // gateway is returning an unrecognized format (e.g. provider-prefixed IDs,
-        // Vertex AI models, etc.).  Fall back to the full hardcoded list rather than
-        // poisoning the registry with hundreds of unusable dynamic entries.
-        if registered_ids.is_empty() {
+        if services.is_empty() {
             tracing::warn!(
                 discovered = discovered.len(),
                 "No known models found in gateway discovery; falling back to hardcoded list"
             );
-            let mut fallback = Self::new(config);
-            // Gateway was reachable but returned an unrecognized model format.
-            // Treat as Unreachable so the UI can warn the user.
-            fallback.gateway_status = GatewayStatus::Unreachable;
-            return fallback;
+            return Self::new_with_status(config, GatewayStatus::Unreachable);
         }
 
-        // Then, create services for any discovered models not in hardcoded list
-        for (model_id, discovered_model) in &discovered {
-            if !registered_ids.contains(model_id) {
-                let spec = discovered_model.to_model_spec();
-                if let Some(service) = Self::try_create_model(&spec, config) {
-                    tracing::info!("Dynamically registered model: {}", model_id);
-                    services.insert(spec.id.clone(), service);
-                    specs.insert(spec.id.clone(), spec);
-                }
-            }
-        }
-
-        tracing::info!(
-            "Registered {} models ({} hardcoded, {} dynamic)",
-            services.len(),
-            registered_ids.len(),
-            services.len() - registered_ids.len()
-        );
+        tracing::info!("Registered {} models (hardcoded only)", services.len());
 
         // Determine default model
         let default_model = config
@@ -371,7 +633,51 @@ impl ModelRegistry {
             services,
             specs,
             default_model,
-            gateway_status,
+            gateway_status: GatewayStatus::Healthy,
+        }
+    }
+
+    /// Build a `DiscoveryConfig` from the available LLM config settings.
+    ///
+    /// Returns `Some((config, is_gateway_mode))` when discovery is possible,
+    /// or `None` when no gateway or `api_key_helper` is configured.
+    async fn build_discovery_config(
+        config: &LlmConfig,
+    ) -> Option<(DiscoveryConfig, bool)> {
+        if let Some(ref gw) = config.gateway {
+            // Legacy gateway mode — construct URLs from gateway base
+            let base = gw.trim_end_matches('/');
+            Some((
+                DiscoveryConfig {
+                    anthropic_models_url: Some(format!("{base}/anthropic/v1/models")),
+                    openai_models_url: Some(format!("{base}/openai/v1/models")),
+                    auth_token: None, // Gateway handles auth
+                    custom_headers: vec![],
+                },
+                true,
+            ))
+        } else if let Some(ref helper) = config.api_key_helper {
+            // Direct auth mode — derive models URLs from base URL overrides
+            let auth_token = helper.get().await;
+            let headers = config.custom_headers.clone();
+
+            Some((
+                DiscoveryConfig {
+                    anthropic_models_url: config
+                        .anthropic_base_url
+                        .as_deref()
+                        .and_then(derive_models_url),
+                    openai_models_url: config
+                        .openai_base_url
+                        .as_deref()
+                        .and_then(derive_models_url),
+                    auth_token,
+                    custom_headers: headers,
+                },
+                false,
+            ))
+        } else {
+            None
         }
     }
 
@@ -380,34 +686,30 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
-        let auth = if config.gateway.is_some() {
+        let auth = if let Some(ref helper) = config.api_key_helper {
+            // api_key_helper takes highest priority — dynamic API key for all providers
+            LlmAuth::ApiKey(Arc::clone(helper))
+        } else if config.gateway.is_some() {
             // Gateway mode: sentinel value; gateway handles real authentication
-            AnthropicAuth::ApiKey("implicit".to_string())
+            LlmAuth::ApiKey(Arc::new(StaticCredential::new("implicit")))
         } else {
             // Direct mode: require real credentials per provider
             match spec.provider {
                 Provider::Anthropic => {
                     // OAuth takes precedence over API key
                     if let Some(provider) = config.anthropic_oauth_token.as_ref() {
-                        AnthropicAuth::Bearer(Arc::clone(provider))
+                        LlmAuth::Bearer(Arc::clone(provider))
                     } else {
                         let key = config
                             .anthropic_api_key
                             .as_deref()
                             .filter(|k| !k.is_empty())?;
-                        AnthropicAuth::ApiKey(key.to_string())
+                        LlmAuth::ApiKey(Arc::new(StaticCredential::new(key)))
                     }
                 }
                 Provider::OpenAI => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
-                    AnthropicAuth::ApiKey(key.to_string())
-                }
-                Provider::Fireworks => {
-                    let key = config
-                        .fireworks_api_key
-                        .as_deref()
-                        .filter(|k| !k.is_empty())?;
-                    AnthropicAuth::ApiKey(key.to_string())
+                    LlmAuth::ApiKey(Arc::new(StaticCredential::new(key)))
                 }
             }
         };
@@ -416,6 +718,10 @@ impl ModelRegistry {
             spec.clone(),
             auth,
             config.gateway.clone(),
+            config.anthropic_base_url.clone(),
+            config.openai_base_url.clone(),
+            config.custom_headers.clone(),
+            config.use_bearer_auth,
         ));
         Some(Arc::new(LoggingService::new(service)))
     }
@@ -577,6 +883,54 @@ mod tests {
         assert_eq!(registry.default_model_id(), "claude-opus-4-5");
     }
 
+    #[tokio::test]
+    async fn test_command_credential_caches() {
+        let cred = CommandCredential::new("echo cached-token", Duration::from_secs(3600));
+        let t1 = cred.get().await;
+        let t2 = cred.get().await;
+        assert_eq!(t1, Some("cached-token".to_string()));
+        assert_eq!(t2, Some("cached-token".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_command_credential_invalidate() {
+        let cred = CommandCredential::new("echo fresh", Duration::from_secs(3600));
+        assert!(cred.get().await.is_some());
+        cred.invalidate().await;
+        assert!(cred.get().await.is_some()); // re-runs command
+    }
+
+    #[tokio::test]
+    async fn test_command_credential_failed_command() {
+        let cred = CommandCredential::new("exit 1", Duration::from_secs(3600));
+        assert!(cred.get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_command_credential_empty_output() {
+        let cred = CommandCredential::new("true", Duration::from_secs(3600));
+        assert!(cred.get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_static_credential() {
+        let cred = StaticCredential::new("test-key");
+        assert_eq!(cred.get().await, Some("test-key".to_string()));
+    }
+
+    #[test]
+    fn test_api_key_helper_enables_all_models() {
+        // When api_key_helper is set, all models become available
+        let config = LlmConfig {
+            api_key_helper: Some(Arc::new(StaticCredential::new("test-token"))),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(!registry.available_models().is_empty());
+        assert!(registry.get("claude-sonnet-4-6").is_some());
+        assert!(registry.get("gpt-4o").is_some());
+    }
+
     #[test]
     fn test_model_info_metadata() {
         let config = LlmConfig {
@@ -604,5 +958,43 @@ mod tests {
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));
         assert_eq!(opus.context_window, 200_000);
+    }
+
+    #[test]
+    fn test_derive_models_url_from_messages() {
+        assert_eq!(
+            derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/messages"),
+            Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_models_url_from_responses() {
+        assert_eq!(
+            derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/responses"),
+            Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_models_url_from_anthropic_api() {
+        assert_eq!(
+            derive_models_url("https://api.anthropic.com/v1/messages"),
+            Some("https://api.anthropic.com/v1/models".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_models_url_no_slash() {
+        // A URL with no slash at all returns None
+        assert_eq!(derive_models_url("noslash"), None);
+    }
+
+    #[test]
+    fn test_derive_models_url_strips_query_string() {
+        assert_eq!(
+            derive_models_url("https://host/v1/messages?foo=bar"),
+            Some("https://host/v1/models".to_string())
+        );
     }
 }

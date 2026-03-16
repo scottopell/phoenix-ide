@@ -8,7 +8,6 @@
 pub enum Provider {
     Anthropic,
     OpenAI,
-    Fireworks,
 }
 
 impl Provider {
@@ -17,7 +16,14 @@ impl Provider {
         match self {
             Provider::Anthropic => "Anthropic",
             Provider::OpenAI => "OpenAI",
-            Provider::Fireworks => "Fireworks",
+        }
+    }
+
+    /// Lowercase provider name for gateway `provider` header (e.g. "anthropic", "openai").
+    pub fn header_value(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAI => "openai",
         }
     }
 
@@ -27,7 +33,6 @@ impl Provider {
         match self {
             Provider::Anthropic => "ANTHROPIC_API_KEY",
             Provider::OpenAI => "OPENAI_API_KEY",
-            Provider::Fireworks => "FIREWORKS_API_KEY",
         }
     }
 }
@@ -37,8 +42,8 @@ impl Provider {
 pub enum ApiFormat {
     /// Anthropic Messages API
     Anthropic,
-    /// `OpenAI` Chat Completions (used by `OpenAI` + Fireworks)
-    OpenAIChat,
+    /// `OpenAI` Responses API
+    OpenAIResponses,
 }
 
 /// Model specification with metadata
@@ -107,7 +112,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-4o".into(),
             api_name: "gpt-4o".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-4o (balanced, multimodal)".into(),
             context_window: 128_000,
             recommended: true,
@@ -116,7 +121,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-4o-mini".into(),
             api_name: "gpt-4o-mini".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-4o Mini (fast, efficient)".into(),
             context_window: 128_000,
             recommended: false,
@@ -125,17 +130,17 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "o4-mini".into(),
             api_name: "o4-mini".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "O4-Mini (reasoning model)".into(),
             context_window: 200_000,
             recommended: true,
         },
-        // GPT-5 models (chat endpoint)
+        // GPT-5 models
         ModelSpec {
             id: "gpt-5".into(),
             api_name: "gpt-5".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5 (reasoning model)".into(),
             context_window: 128_000,
             recommended: true,
@@ -144,7 +149,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5-mini".into(),
             api_name: "gpt-5-mini".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5 Mini (fast reasoning)".into(),
             context_window: 128_000,
             recommended: false,
@@ -153,7 +158,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.1".into(),
             api_name: "gpt-5.1".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.1 (latest GPT-5)".into(),
             context_window: 128_000,
             recommended: false,
@@ -163,7 +168,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5-codex".into(),
             api_name: "gpt-5-codex".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5 Codex (code generation)".into(),
             context_window: 200_000,
             recommended: false,
@@ -172,7 +177,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.1-codex".into(),
             api_name: "gpt-5.1-codex".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.1 Codex (advanced code)".into(),
             context_window: 200_000,
             recommended: false,
@@ -181,38 +186,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.2-codex".into(),
             api_name: "gpt-5.2-codex".into(),
             provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIChat,
+            api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.2 Codex (latest code model)".into(),
             context_window: 200_000,
             recommended: true,
-        },
-        // Fireworks models
-        ModelSpec {
-            id: "glm-4p7-fireworks".into(),
-            api_name: "accounts/fireworks/models/glm-4p7".into(),
-            provider: Provider::Fireworks,
-            api_format: ApiFormat::OpenAIChat,
-            description: "GLM-4P7 on Fireworks".into(),
-            context_window: 128_000,
-            recommended: false,
-        },
-        ModelSpec {
-            id: "qwen3-coder-fireworks".into(),
-            api_name: "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct".into(),
-            provider: Provider::Fireworks,
-            api_format: ApiFormat::OpenAIChat,
-            description: "Qwen3 Coder 480B on Fireworks".into(),
-            context_window: 128_000,
-            recommended: false,
-        },
-        ModelSpec {
-            id: "deepseek-v3-fireworks".into(),
-            api_name: "accounts/fireworks/models/deepseek-v3p1".into(),
-            provider: Provider::Fireworks,
-            api_format: ApiFormat::OpenAIChat,
-            description: "DeepSeek V3 on Fireworks".into(),
-            context_window: 128_000,
-            recommended: false,
         },
     ]
 }

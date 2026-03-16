@@ -16,11 +16,10 @@
 //! |-------------|----------------------------------------------------------|
 //! | `Anthropic` | `{gateway}/anthropic/v1/messages`                        |
 //! | `OpenAI`    | `{gateway}/openai/v1/responses`                          |
-//! | `Fireworks` | `{gateway}/fireworks/inference/v1/chat/completions`       |
 //!
 //! The first path segment after the gateway base is an **origin alias** that the
 //! gateway uses to route to the correct upstream provider. Known aliases:
-//! `anthropic`, `openai`, `fireworks`.
+//! `anthropic`, `openai`.
 //!
 //! Note: the exe.dev gateway also supports an alternative path convention
 //! `{gateway}/_/gateway/{provider}/...` (used by the Shelley Go agent). Phoenix
@@ -29,7 +28,7 @@
 //! ## Authentication
 //!
 //! When a gateway is configured, Phoenix sends `x-api-key: implicit` (Anthropic)
-//! or `Authorization: Bearer implicit` (OpenAI/Fireworks). The gateway handles
+//! or `Authorization: Bearer implicit` (OpenAI). The gateway handles
 //! real API key injection.
 //!
 //! ## Discovery
@@ -67,10 +66,11 @@ mod service;
 pub(crate) mod sse;
 mod types;
 
-pub use discovery::{discover_models, probe_gateway};
+pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
-pub use models::{all_models, ApiFormat, ModelSpec, Provider};
-pub use registry::{AnthropicAuth, GatewayStatus, LlmConfig, ModelRegistry};
+pub use models::{all_models, ModelSpec, Provider};
+#[allow(unused_imports)] // CredentialSource + ResolvedAuth: public API for downstream consumers
+pub use registry::{LlmAuth, CredentialSource, GatewayStatus, LlmConfig, ModelRegistry, ResolvedAuth};
 pub use service::LlmServiceImpl;
 pub use types::*;
 
