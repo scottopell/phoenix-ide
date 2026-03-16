@@ -1,38 +1,11 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
 use super::models::ModelSpec;
-use super::types::{
-    ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER,
-};
+use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER};
 use super::LlmError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-
-/// Complete using `OpenAI` Responses API
-pub async fn complete(
-    spec: &ModelSpec,
-    api_key: &str,
-    gateway: Option<&str>,
-    base_url_override: Option<&str>,
-    custom_headers: &[(String, String)],
-    request: &LlmRequest,
-) -> Result<LlmResponse, LlmError> {
-    complete_responses_api(spec, api_key, gateway, base_url_override, custom_headers, request).await
-}
-
-/// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
-pub async fn complete_streaming(
-    spec: &ModelSpec,
-    api_key: &str,
-    gateway: Option<&str>,
-    base_url_override: Option<&str>,
-    custom_headers: &[(String, String)],
-    request: &LlmRequest,
-    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
-) -> Result<LlmResponse, LlmError> {
-    complete_streaming_responses_api(spec, api_key, gateway, base_url_override, custom_headers, request, chunk_tx).await
-}
 
 // ---------------------------------------------------------------------------
 // Endpoint resolution
@@ -55,8 +28,8 @@ fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> S
 // Responses API
 // ---------------------------------------------------------------------------
 
-/// Complete using the v1/responses API.
-async fn complete_responses_api(
+/// Complete using the `OpenAI` Responses API.
+pub async fn complete(
     spec: &ModelSpec,
     api_key: &str,
     gateway: Option<&str>,
@@ -80,19 +53,15 @@ async fn complete_responses_api(
     for (k, v) in custom_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let response = builder
-        .json(&responses_request)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                LlmError::network(format!("Request timeout: {e}"))
-            } else if e.is_connect() {
-                LlmError::network(format!("Connection failed: {e}"))
-            } else {
-                LlmError::network(format!("Request failed: {e}"))
-            }
-        })?;
+    let response = builder.json(&responses_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
 
     let status = response.status();
     let body = response
@@ -246,7 +215,8 @@ impl ResponsesStreamAccumulator {
     }
 }
 
-async fn complete_streaming_responses_api(
+/// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
+pub async fn complete_streaming(
     spec: &ModelSpec,
     api_key: &str,
     gateway: Option<&str>,
@@ -274,19 +244,15 @@ async fn complete_streaming_responses_api(
     for (k, v) in custom_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let response = builder
-        .json(&responses_request)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                LlmError::network(format!("Request timeout: {e}"))
-            } else if e.is_connect() {
-                LlmError::network(format!("Connection failed: {e}"))
-            } else {
-                LlmError::network(format!("Request failed: {e}"))
-            }
-        })?;
+    let response = builder.json(&responses_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
 
     let status = response.status();
     if !status.is_success() {

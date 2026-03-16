@@ -127,11 +127,9 @@ pub fn transition(
                 content,
                 tool_calls,
                 end_turn: _,
-                usage,
+                usage: usage_data,
             },
         ) => {
-            let usage_data = usage_to_data(&usage);
-
             // REQ-BED-019: Check context threshold BEFORE tool execution
             if should_trigger_continuation(&usage_data, context.context_window) {
                 return Ok(handle_context_exhaustion(
@@ -1148,15 +1146,6 @@ impl ToolResult {
     #[allow(dead_code)] // Used in tests; normal tool rounds use PersistCheckpoint
     fn display_data(&self) -> Option<Value> {
         self.display_data.clone()
-    }
-}
-
-fn usage_to_data(usage: &crate::llm::Usage) -> UsageData {
-    UsageData {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_creation_tokens: usage.cache_creation_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
     }
 }
 

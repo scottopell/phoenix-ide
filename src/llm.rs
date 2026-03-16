@@ -28,7 +28,7 @@
 //! ## Authentication
 //!
 //! When a gateway is configured, Phoenix sends `x-api-key: implicit` (Anthropic)
-//! or `Authorization: Bearer implicit` (OpenAI). The gateway handles
+//! or `Authorization: Bearer implicit` (`OpenAI`). The gateway handles
 //! real API key injection.
 //!
 //! ## Discovery
@@ -69,8 +69,11 @@ mod types;
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ModelSpec, Provider};
-#[allow(unused_imports)] // CredentialSource + ResolvedAuth: public API for downstream consumers
-pub use registry::{LlmAuth, CredentialSource, GatewayStatus, LlmConfig, ModelRegistry, ResolvedAuth};
+#[allow(unused_imports)]
+// CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
+pub use registry::{
+    AuthStyle, CredentialSource, GatewayStatus, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
+};
 pub use service::LlmServiceImpl;
 pub use types::*;
 

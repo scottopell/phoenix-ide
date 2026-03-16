@@ -517,23 +517,8 @@ impl fmt::Display for MessageType {
     }
 }
 
-/// Usage statistics
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(clippy::struct_field_names)] // tokens suffix is meaningful
-pub struct UsageData {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    #[serde(default)]
-    pub cache_read_tokens: u64,
-}
-
-impl UsageData {
-    pub fn context_window_used(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
-    }
-}
+/// Type alias for backward compatibility — `Usage` is the canonical type.
+pub type UsageData = crate::llm::Usage;
 
 #[cfg(test)]
 mod error_kind_tests {

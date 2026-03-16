@@ -40,9 +40,7 @@ pub async fn probe_gateway(
 ) -> bool {
     let url = format!("{}/_proxy/status", gateway_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let mut request = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3));
+    let mut request = client.get(&url).timeout(std::time::Duration::from_secs(3));
 
     if let Some(token) = auth_token {
         request = request.header("Authorization", format!("Bearer {token}"));
@@ -71,14 +69,30 @@ pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
     let mut models = HashSet::new();
 
     if let Some(ref url) = config.anthropic_models_url {
-        match discover_provider(url, "anthropic", config.auth_token.as_deref(), &config.custom_headers, &[("anthropic-version", "2023-06-01")]).await {
+        match discover_provider(
+            url,
+            "anthropic",
+            config.auth_token.as_deref(),
+            &config.custom_headers,
+            &[("anthropic-version", "2023-06-01")],
+        )
+        .await
+        {
             Ok(m) => models.extend(m),
             Err(e) => tracing::warn!(provider = "anthropic", error = %e, "Discovery failed"),
         }
     }
 
     if let Some(ref url) = config.openai_models_url {
-        match discover_provider(url, "openai", config.auth_token.as_deref(), &config.custom_headers, &[]).await {
+        match discover_provider(
+            url,
+            "openai",
+            config.auth_token.as_deref(),
+            &config.custom_headers,
+            &[],
+        )
+        .await
+        {
             Ok(m) => models.extend(m),
             Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
         }
@@ -114,12 +128,20 @@ async fn discover_provider(
     let response = request.send().await?;
 
     if !response.status().is_success() {
-        return Err(format!("{provider_name} models endpoint returned {}", response.status()).into());
+        return Err(format!(
+            "{provider_name} models endpoint returned {}",
+            response.status()
+        )
+        .into());
     }
 
     let models_response: ModelsResponse = response.json().await?;
     let ids: HashSet<String> = models_response.data.into_iter().map(|m| m.id).collect();
 
-    tracing::info!("Discovered {} {} models from gateway", ids.len(), provider_name);
+    tracing::info!(
+        "Discovered {} {} models from gateway",
+        ids.len(),
+        provider_name
+    );
     Ok(ids)
 }

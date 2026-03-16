@@ -251,13 +251,13 @@ pub async fn complete_streaming(
     anthropic_request.stream = Some(true);
 
     let mut builder = client.post(&base_url);
-    builder = match auth {
-        super::ResolvedAuth::ApiKey(key) => builder.header("x-api-key", key),
-        super::ResolvedAuth::Bearer(token) => builder
-            .header("Authorization", format!("Bearer {token}"))
+    builder = match auth.style {
+        super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
+        super::AuthStyle::Bearer => builder
+            .header("Authorization", format!("Bearer {}", auth.credential))
             .header("anthropic-beta", "oauth-2025-04-20"),
-        super::ResolvedAuth::PlainBearer(token) => {
-            builder.header("Authorization", format!("Bearer {token}"))
+        super::AuthStyle::PlainBearer => {
+            builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
     builder = builder
@@ -267,19 +267,15 @@ pub async fn complete_streaming(
     for (k, v) in custom_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let response = builder
-        .json(&anthropic_request)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                LlmError::network(format!("Request timeout: {e}"))
-            } else if e.is_connect() {
-                LlmError::network(format!("Connection failed: {e}"))
-            } else {
-                LlmError::network(format!("Request failed: {e}"))
-            }
-        })?;
+    let response = builder.json(&anthropic_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -339,13 +335,13 @@ pub async fn complete(
     let anthropic_request = translate_request(&spec.api_name, request);
 
     let mut builder = client.post(&base_url);
-    builder = match auth {
-        super::ResolvedAuth::ApiKey(key) => builder.header("x-api-key", key),
-        super::ResolvedAuth::Bearer(token) => builder
-            .header("Authorization", format!("Bearer {token}"))
+    builder = match auth.style {
+        super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
+        super::AuthStyle::Bearer => builder
+            .header("Authorization", format!("Bearer {}", auth.credential))
             .header("anthropic-beta", "oauth-2025-04-20"),
-        super::ResolvedAuth::PlainBearer(token) => {
-            builder.header("Authorization", format!("Bearer {token}"))
+        super::AuthStyle::PlainBearer => {
+            builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
     builder = builder
@@ -355,19 +351,15 @@ pub async fn complete(
     for (k, v) in custom_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let response = builder
-        .json(&anthropic_request)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                LlmError::network(format!("Request timeout: {e}"))
-            } else if e.is_connect() {
-                LlmError::network(format!("Connection failed: {e}"))
-            } else {
-                LlmError::network(format!("Request failed: {e}"))
-            }
-        })?;
+    let response = builder.json(&anthropic_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
 
     let status = response.status();
     let body = response

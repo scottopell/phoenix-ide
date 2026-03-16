@@ -22,23 +22,13 @@ pub enum GatewayStatus {
     Unreachable,
 }
 
-/// Provides an OAuth bearer token on demand, read fresh on each call.
-///
-/// Two implementations:
-/// - `EnvTokenProvider`: reads from an environment variable
-/// - `JsonFileTokenProvider`: reads from a JSON file at a dot-separated key path
-pub trait TokenProvider: Send + Sync + std::fmt::Debug {
-    /// Return the current token, or `None` if unavailable (missing file, unset var, etc.).
-    fn token(&self) -> Option<String>;
-}
-
-/// Reads a bearer token from an environment variable on each call.
+/// Reads a credential from an environment variable on each call.
 #[derive(Debug)]
-pub struct EnvTokenProvider {
+pub struct EnvCredential {
     var_name: String,
 }
 
-impl EnvTokenProvider {
+impl EnvCredential {
     pub fn new(var_name: impl Into<String>) -> Self {
         Self {
             var_name: var_name.into(),
@@ -46,24 +36,18 @@ impl EnvTokenProvider {
     }
 }
 
-impl TokenProvider for EnvTokenProvider {
-    fn token(&self) -> Option<String> {
-        std::env::var(&self.var_name).ok().filter(|t| !t.is_empty())
-    }
-}
-
-/// Reads a bearer token from a JSON file, traversing a dot-separated key path.
+/// Reads a credential from a JSON file, traversing a dot-separated key path.
 ///
 /// Example: path `["claudeAiOauth", "accessToken"]` extracts
 /// `json["claudeAiOauth"]["accessToken"]` as a string.
 /// Returns `None` silently if the file is absent or the path doesn't resolve.
 #[derive(Debug)]
-pub struct JsonFileTokenProvider {
+pub struct JsonFileCredential {
     path: std::path::PathBuf,
     key_path: Vec<String>,
 }
 
-impl JsonFileTokenProvider {
+impl JsonFileCredential {
     pub fn new(path: impl Into<std::path::PathBuf>, key_path: Vec<String>) -> Self {
         Self {
             path: path.into(),
@@ -72,24 +56,8 @@ impl JsonFileTokenProvider {
     }
 }
 
-impl TokenProvider for JsonFileTokenProvider {
-    fn token(&self) -> Option<String> {
-        let content = std::fs::read_to_string(&self.path).ok()?;
-        let mut value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| {
-                tracing::warn!(path = %self.path.display(), error = %e, "Failed to parse JSON credentials file");
-            })
-            .ok()?;
-        for key in &self.key_path {
-            value = value.get(key)?.clone();
-        }
-        value.as_str().map(std::string::ToString::to_string)
-    }
-}
-
-/// A dynamically-resolved credential string.
-/// Unlike `TokenProvider` (OAuth-specific), this is provider-agnostic —
-/// it just produces a string that the caller decides how to send.
+/// A credential source that produces a string on demand.
+/// Implementations range from static strings to cached command execution.
 #[async_trait::async_trait]
 pub trait CredentialSource: Send + Sync + std::fmt::Debug {
     /// Fetch the current credential, possibly re-executing or re-reading.
@@ -123,6 +91,35 @@ impl CredentialSource for StaticCredential {
     }
     async fn invalidate(&self) -> bool {
         false // Static credentials can't be invalidated — retry won't help
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for EnvCredential {
+    async fn get(&self) -> Option<String> {
+        std::env::var(&self.var_name).ok().filter(|t| !t.is_empty())
+    }
+    async fn invalidate(&self) -> bool {
+        false // Re-reads env var each time — nothing to invalidate
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for JsonFileCredential {
+    async fn get(&self) -> Option<String> {
+        let content = std::fs::read_to_string(&self.path).ok()?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| {
+                tracing::warn!(path = %self.path.display(), error = %e, "Failed to parse JSON credentials file");
+            })
+            .ok()?;
+        for key in &self.key_path {
+            value = value.get(key)?.clone();
+        }
+        value.as_str().map(std::string::ToString::to_string)
+    }
+    async fn invalidate(&self) -> bool {
+        false // Re-reads file each time — nothing to invalidate
     }
 }
 
@@ -227,80 +224,70 @@ impl CredentialSource for CommandCredential {
     }
 }
 
-/// How to authenticate LLM API requests.
-///
-/// Determines which header carries the credential:
-/// - `ApiKey`: `x-api-key: <key>` (standard API keys and gateway implicit auth)
-/// - `Bearer`: `Authorization: Bearer <token>` (Claude OAuth tokens from `claude login`)
-pub enum LlmAuth {
-    /// Standard API key — sent as `x-api-key` header. Source may be static or
-    /// dynamic (command-backed). Also used for gateway mode with the sentinel
-    /// value `"implicit"`.
-    ApiKey(Arc<dyn CredentialSource>),
-    /// OAuth bearer token — sent as `Authorization: Bearer` header.
-    /// Token is fetched from the provider on each request (never cached).
-    Bearer(Arc<dyn TokenProvider>),
+/// How an LLM credential should be sent in HTTP headers.
+#[derive(Debug, Clone, Copy)]
+pub enum AuthStyle {
+    /// `x-api-key: <credential>` (standard API keys and gateway implicit auth)
+    ApiKey,
+    /// `Authorization: Bearer <credential>` + `anthropic-beta` header (Claude OAuth)
+    Bearer,
+    /// `Authorization: Bearer <credential>` without `anthropic-beta`.
+    /// Used for service-to-service auth (e.g. Datadog AI Gateway with ddtool JWT).
+    PlainBearer,
+}
+
+/// LLM authentication: a credential source paired with a header style.
+pub struct LlmAuth {
+    source: Arc<dyn CredentialSource>,
+    style: AuthStyle,
+}
+
+impl LlmAuth {
+    pub fn new(source: Arc<dyn CredentialSource>, style: AuthStyle) -> Self {
+        Self { source, style }
+    }
+
+    /// Resolve the credential for use in request headers.
+    pub async fn resolve(&self) -> Result<ResolvedAuth, super::LlmError> {
+        let credential = self.source.get().await.ok_or_else(|| {
+            super::LlmError::auth(
+                "Credential unavailable — check API key, LLM_API_KEY_HELPER, or `claude login`",
+            )
+        })?;
+        Ok(ResolvedAuth {
+            credential,
+            style: self.style,
+        })
+    }
+
+    /// Invalidate any cached credential (e.g. after a 401).
+    pub async fn invalidate(&self) -> bool {
+        self.source.invalidate().await
+    }
 }
 
 impl std::fmt::Debug for LlmAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ApiKey(_) => write!(f, "ApiKey([redacted])"),
-            Self::Bearer(_) => write!(f, "Bearer([token provider])"),
-        }
+        f.debug_struct("LlmAuth")
+            .field("style", &self.style)
+            .field("source", &"[redacted]")
+            .finish()
     }
 }
 
 impl Clone for LlmAuth {
     fn clone(&self) -> Self {
-        match self {
-            Self::ApiKey(s) => Self::ApiKey(Arc::clone(s)),
-            Self::Bearer(p) => Self::Bearer(Arc::clone(p)),
+        Self {
+            source: Arc::clone(&self.source),
+            style: self.style,
         }
     }
 }
 
 /// Credential resolved for use in HTTP headers.
-pub enum ResolvedAuth {
-    /// Standard API key -> `x-api-key` header
-    ApiKey(String),
-    /// OAuth bearer -> `Authorization: Bearer` header + `anthropic-beta`
-    Bearer(String),
-    /// Plain bearer -> `Authorization: Bearer` header (no anthropic-beta).
-    /// Used for service-to-service auth (e.g. Datadog AI Gateway with ddtool JWT).
-    PlainBearer(String),
-}
-
-impl LlmAuth {
-    /// Resolve the credential for use in request headers.
-    pub async fn resolve(&self) -> Result<ResolvedAuth, super::LlmError> {
-        match self {
-            Self::ApiKey(source) => {
-                let key = source.get().await.ok_or_else(|| {
-                    super::LlmError::auth(
-                        "API key unavailable — check ANTHROPIC_API_KEY or LLM_API_KEY_HELPER",
-                    )
-                })?;
-                Ok(ResolvedAuth::ApiKey(key))
-            }
-            Self::Bearer(provider) => {
-                let token = provider.token().ok_or_else(|| {
-                    super::LlmError::auth(
-                        "OAuth token unavailable — check ~/.claude/.credentials.json or run `claude login`",
-                    )
-                })?;
-                Ok(ResolvedAuth::Bearer(token))
-            }
-        }
-    }
-
-    /// Invalidate any cached credential (e.g. after a 401).
-    pub async fn invalidate(&self) -> bool {
-        match self {
-            Self::ApiKey(source) => source.invalidate().await,
-            Self::Bearer(_) => false, // TokenProvider has no invalidation concept
-        }
-    }
+pub struct ResolvedAuth {
+    pub credential: String,
+    pub style: AuthStyle,
 }
 
 /// Configuration for LLM providers
@@ -311,10 +298,10 @@ pub struct LlmConfig {
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
-    /// Token provider for Anthropic OAuth Bearer auth. Takes precedence over
+    /// Credential source for Anthropic OAuth Bearer auth. Takes precedence over
     /// `anthropic_api_key` for Anthropic models in direct mode. Token is fetched
     /// fresh on each request — no restart needed after `claude login`.
-    pub anthropic_oauth_token: Option<Arc<dyn TokenProvider>>,
+    pub anthropic_oauth_token: Option<Arc<dyn CredentialSource>>,
     /// Shell command to run for obtaining an API key/token dynamically.
     pub api_key_helper: Option<Arc<dyn CredentialSource>>,
     /// Direct URL override for the Anthropic endpoint (overrides gateway routing).
@@ -333,11 +320,20 @@ pub struct LlmConfig {
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmConfig")
-            .field("anthropic_api_key", &self.anthropic_api_key.as_ref().map(|_| "[redacted]"))
-            .field("openai_api_key", &self.openai_api_key.as_ref().map(|_| "[redacted]"))
+            .field(
+                "anthropic_api_key",
+                &self.anthropic_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "openai_api_key",
+                &self.openai_api_key.as_ref().map(|_| "[redacted]"),
+            )
             .field("gateway", &self.gateway)
             .field("default_model", &self.default_model)
-            .field("anthropic_oauth_token", &self.anthropic_oauth_token.is_some())
+            .field(
+                "anthropic_oauth_token",
+                &self.anthropic_oauth_token.is_some(),
+            )
             .field("api_key_helper", &self.api_key_helper)
             .field("anthropic_base_url", &self.anthropic_base_url)
             .field("openai_base_url", &self.openai_base_url)
@@ -390,14 +386,14 @@ impl LlmConfig {
         // Prefer ANTHROPIC_OAUTH_TOKEN env var (explicit override), then fall back to
         // reading ~/.claude/.credentials.json directly (works in dev and in prod when
         // the service user has read access via group membership + chmod g+r).
-        let anthropic_oauth_token: Option<Arc<dyn TokenProvider>> = if std::env::var(
+        let anthropic_oauth_token: Option<Arc<dyn CredentialSource>> = if std::env::var(
             "ANTHROPIC_OAUTH_TOKEN",
         )
         .ok()
         .filter(|t| !t.is_empty())
         .is_some()
         {
-            Some(Arc::new(EnvTokenProvider::new("ANTHROPIC_OAUTH_TOKEN")))
+            Some(Arc::new(EnvCredential::new("ANTHROPIC_OAUTH_TOKEN")))
         } else {
             let home = std::env::var("HOME").unwrap_or_default();
             let creds_path = std::path::Path::new(&home)
@@ -405,7 +401,7 @@ impl LlmConfig {
                 .join(".credentials.json");
             if creds_path.exists() {
                 tracing::info!(path = %creds_path.display(), "Found Claude credentials file; will read OAuth token per request");
-                Some(Arc::new(JsonFileTokenProvider::new(
+                Some(Arc::new(JsonFileCredential::new(
                     creds_path,
                     vec!["claudeAiOauth".to_string(), "accessToken".to_string()],
                 )))
@@ -422,8 +418,10 @@ impl LlmConfig {
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
-                Arc::new(CommandCredential::new(command, Duration::from_millis(ttl_ms)))
-                    as Arc<dyn CredentialSource>
+                Arc::new(CommandCredential::new(
+                    command,
+                    Duration::from_millis(ttl_ms),
+                )) as Arc<dyn CredentialSource>
             });
 
         let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
@@ -506,26 +504,13 @@ impl ModelRegistry {
             }
         }
 
-        // Determine default model
-        let default_model = config
-            .default_model
-            .clone()
-            .or_else(|| {
-                if services.contains_key("claude-sonnet-4-6") {
-                    Some("claude-sonnet-4-6".to_string())
-                } else {
-                    services.keys().next().cloned()
-                }
-            })
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-
-        let gateway_status = GatewayStatus::NotConfigured;
+        let default_model = Self::pick_default_model(&services, config);
 
         Self {
             services,
             specs,
             default_model,
-            gateway_status,
+            gateway_status: GatewayStatus::NotConfigured,
         }
     }
 
@@ -536,6 +521,26 @@ impl ModelRegistry {
         reg
     }
 
+    /// Pick the default model from available services.
+    /// Prefers claude-sonnet-4-6 > claude-sonnet-4-5 > any available > hardcoded fallback.
+    fn pick_default_model(
+        services: &HashMap<String, Arc<dyn LlmService>>,
+        config: &LlmConfig,
+    ) -> String {
+        config
+            .default_model
+            .clone()
+            .or_else(|| {
+                const PREFERRED: &[&str] = &["claude-sonnet-4-6", "claude-sonnet-4-5"];
+                PREFERRED
+                    .iter()
+                    .find(|id| services.contains_key(**id))
+                    .map(|id| (*id).to_string())
+                    .or_else(|| services.keys().next().cloned())
+            })
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+    }
+
     /// Create registry with model discovery from gateway or `api_key_helper`.
     ///
     /// Discovery validates which hardcoded models are available on the gateway.
@@ -543,9 +548,7 @@ impl ModelRegistry {
     /// Falls back to hardcoded models if discovery fails.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
         // Build discovery config from available settings
-        let Some((discovery, is_gateway_mode)) =
-            Self::build_discovery_config(config).await
-        else {
+        let Some((discovery, is_gateway_mode)) = Self::build_discovery_config(config).await else {
             return Self::new(config);
         };
 
@@ -614,20 +617,7 @@ impl ModelRegistry {
 
         tracing::info!("Registered {} models (hardcoded only)", services.len());
 
-        // Determine default model
-        let default_model = config
-            .default_model
-            .clone()
-            .or_else(|| {
-                if services.contains_key("claude-sonnet-4-6") {
-                    Some("claude-sonnet-4-6".to_string())
-                } else if services.contains_key("claude-sonnet-4-5") {
-                    Some("claude-sonnet-4-5".to_string())
-                } else {
-                    services.keys().next().cloned()
-                }
-            })
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        let default_model = Self::pick_default_model(&services, config);
 
         Self {
             services,
@@ -641,9 +631,7 @@ impl ModelRegistry {
     ///
     /// Returns `Some((config, is_gateway_mode))` when discovery is possible,
     /// or `None` when no gateway or `api_key_helper` is configured.
-    async fn build_discovery_config(
-        config: &LlmConfig,
-    ) -> Option<(DiscoveryConfig, bool)> {
+    async fn build_discovery_config(config: &LlmConfig) -> Option<(DiscoveryConfig, bool)> {
         if let Some(ref gw) = config.gateway {
             // Legacy gateway mode — construct URLs from gateway base
             let base = gw.trim_end_matches('/');
@@ -688,28 +676,31 @@ impl ModelRegistry {
     ) -> Option<Arc<dyn LlmService>> {
         let auth = if let Some(ref helper) = config.api_key_helper {
             // api_key_helper takes highest priority — dynamic API key for all providers
-            LlmAuth::ApiKey(Arc::clone(helper))
+            LlmAuth::new(Arc::clone(helper), AuthStyle::ApiKey)
         } else if config.gateway.is_some() {
             // Gateway mode: sentinel value; gateway handles real authentication
-            LlmAuth::ApiKey(Arc::new(StaticCredential::new("implicit")))
+            LlmAuth::new(
+                Arc::new(StaticCredential::new("implicit")),
+                AuthStyle::ApiKey,
+            )
         } else {
             // Direct mode: require real credentials per provider
             match spec.provider {
                 Provider::Anthropic => {
                     // OAuth takes precedence over API key
-                    if let Some(provider) = config.anthropic_oauth_token.as_ref() {
-                        LlmAuth::Bearer(Arc::clone(provider))
+                    if let Some(source) = config.anthropic_oauth_token.as_ref() {
+                        LlmAuth::new(Arc::clone(source), AuthStyle::Bearer)
                     } else {
                         let key = config
                             .anthropic_api_key
                             .as_deref()
                             .filter(|k| !k.is_empty())?;
-                        LlmAuth::ApiKey(Arc::new(StaticCredential::new(key)))
+                        LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                     }
                 }
                 Provider::OpenAI => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
-                    LlmAuth::ApiKey(Arc::new(StaticCredential::new(key)))
+                    LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
             }
         };

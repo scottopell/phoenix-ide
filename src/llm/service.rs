@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 /// Unified service implementation that dispatches by API format
 pub struct LlmServiceImpl {
     pub spec: ModelSpec,
-    /// LLM auth credentials (`ApiKey` or `Bearer` OAuth token).
+    /// LLM auth: credential source + header style.
     pub auth: LlmAuth,
     pub gateway: Option<String>,
     pub anthropic_base_url: Option<String>,
@@ -92,10 +92,19 @@ impl LlmServiceImpl {
     /// Build the custom headers for a request, auto-injecting `provider` based on the model spec.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
-        if !headers.is_empty() || self.anthropic_base_url.is_some() || self.openai_base_url.is_some() {
+        if !headers.is_empty()
+            || self.anthropic_base_url.is_some()
+            || self.openai_base_url.is_some()
+        {
             // Auto-inject provider header if not already present
-            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("provider")) {
-                headers.push(("provider".to_string(), self.spec.provider.header_value().to_string()));
+            if !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("provider"))
+            {
+                headers.push((
+                    "provider".to_string(),
+                    self.spec.provider.header_value().to_string(),
+                ));
             }
         }
         headers
@@ -169,23 +178,15 @@ impl LlmServiceImpl {
 
     /// Resolve auth, promoting `ApiKey` to `PlainBearer` when `use_bearer_auth` is set.
     async fn resolve_auth(&self) -> Result<super::ResolvedAuth, super::LlmError> {
-        let resolved = self.auth.resolve().await?;
-        if self.use_bearer_auth {
-            match resolved {
-                super::ResolvedAuth::ApiKey(k) => Ok(super::ResolvedAuth::PlainBearer(k)),
-                other => Ok(other),
-            }
-        } else {
-            Ok(resolved)
+        let mut resolved = self.auth.resolve().await?;
+        if self.use_bearer_auth && matches!(resolved.style, super::AuthStyle::ApiKey) {
+            resolved.style = super::AuthStyle::PlainBearer;
         }
+        Ok(resolved)
     }
 
-    /// Resolve a plain API key string for `OpenAI` calls.
+    /// Resolve a plain credential string for `OpenAI` calls.
     async fn resolve_openai_key(&self) -> Result<String, super::LlmError> {
-        match self.auth.resolve().await? {
-            super::ResolvedAuth::ApiKey(k)
-            | super::ResolvedAuth::Bearer(k)
-            | super::ResolvedAuth::PlainBearer(k) => Ok(k),
-        }
+        Ok(self.auth.resolve().await?.credential)
     }
 }

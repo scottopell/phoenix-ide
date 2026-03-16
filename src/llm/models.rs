@@ -26,15 +26,6 @@ impl Provider {
             Provider::OpenAI => "openai",
         }
     }
-
-    /// Get the environment variable name for this provider's API key
-    #[allow(dead_code)] // Will be used for error messages
-    pub fn api_key_env_var(self) -> &'static str {
-        match self {
-            Provider::Anthropic => "ANTHROPIC_API_KEY",
-            Provider::OpenAI => "OPENAI_API_KEY",
-        }
-    }
 }
 
 /// API format / wire protocol
@@ -192,13 +183,4 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
         },
     ]
-}
-
-/// Get the default model specification
-#[allow(dead_code)]
-pub fn default_model() -> ModelSpec {
-    all_models()
-        .into_iter()
-        .find(|m| m.id == "claude-sonnet-4-6")
-        .expect("claude-sonnet-4-6 must be in all_models()")
 }
