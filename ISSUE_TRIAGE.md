@@ -38,6 +38,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Landing page includes a brief description or onboarding hint for new users
   4. Current: Only "New conversation" heading and a bare text input with placeholder text
 - **Validation notes**: Confirmed via Playwright snapshot. Landing page shows only "New conversation" heading and a text input with placeholder "What would you like to work on?" -- no tagline, explanation, or onboarding.
+- **Status**: fixed -- Added "AI-powered coding assistant" tagline below heading
 
 ### FTUX-03: Input retains stale text from previous sessions
 
@@ -76,6 +77,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Tabs show human-readable project names or have tooltips explaining what they are
   4. Current: Tabs show raw directory basenames like "phoenix-qa-j5" and "tmp.7dnAbLdFNa" with no explanation
 - **Validation notes**: Confirmed via Playwright snapshot -- tabs show raw directory basenames like "phoenix-qa-j5", "tmp.7dnAbLdFNa", "tmp.dgax4DAkwx" with no explanation. The "changes unpredictably" part could not be reproduced since settings panel interactions don't affect `activeProjectId` state. The raw directory names part is the real issue.
+- **Status**: fixed -- Tabs already show last path component and have full-path tooltips; no better name source available
 
 ### FTUX-06: StateBar abbreviations are cryptic
 
@@ -92,6 +94,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Each element has a tooltip or label explaining its meaning; chevron has a hover state
   4. Current: No tooltips, "DIR" and "MODEL" abbreviations are cryptic, chevron ">" has no visual affordance
 - **Validation notes**: Confirmed via Playwright snapshot. The StateBar button reads "dir [check] ~/ . model ... >" with no tooltip attribute. The chevron ">" toggles the settings panel but has no hover state or label indicating it is interactive.
+- **Status**: fixed -- Added title tooltips to DIR, MODEL, and settings chevron
 
 ### FTUX-07: Explore/Work/Standalone mode badges unexplained
 
@@ -108,6 +111,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Badges have tooltips explaining what each mode means
   4. Current: Badges are plain `<span>` elements with no tooltip, title, or aria-label
 - **Validation notes**: Confirmed via Playwright snapshot. Every conversation shows an EXPLORE, WORK, or STANDALONE badge. The badge is a plain `<span>` with class `conv-mode-badge` -- no title attribute, no tooltip, no aria-label. No legend or explanation anywhere in the UI.
+- **Status**: fixed -- Added title tooltips explaining each mode; STANDALONE abbreviated to SOLO
 
 ### FTUX-08: Conversation names are auto-generated slugs
 
@@ -136,6 +140,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Hidden/sensitive directories (.ssh, .aws, .gnupg) are filtered out or collapsed by default
   4. Current: All 60+ hidden directories and files are displayed, including sensitive paths like .ssh and .aws
 - **Validation notes**: Confirmed via Playwright snapshot. Navigating to a Standalone conversation with CWD ~/ shows the file explorer with 60+ hidden directories (.ssh, .aws, .docker, .gnupg, .kube, etc.) and dozens of hidden files (.bash_history, .zsh_history, .claude.json, .google.env). Sensitive paths fully exposed.
+- **Status**: fixed -- Dotfiles filtered out at both root and child directory levels in FileTree
 
 ### FTUX-10: Raw paths and model IDs in conversation header
 
@@ -152,6 +157,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Model shown as friendly name (e.g., "Claude Sonnet 4.6"), path uses tilde for home dir (e.g., "~/")
   4. Current: Shows raw model ID "claude-sonnet-4-6" and full absolute path "/Users/scott.opell"
 - **Validation notes**: Confirmed via Playwright snapshot. The conversation header banner shows "claude-sonnet-4-6" and "/Users/scott.opell" as raw strings. No tilde substitution for home directory, no friendly model display name.
+- **Status**: fixed -- formatCwd now replaces /Users/<name> and /home/<name> with ~; model tooltip shows "Model: <id>"
 
 ### FTUX-11: Breadcrumb execution trail is unexplained
 
@@ -168,6 +174,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Trail segments have tooltips explaining their meaning; "LLM" replaced with user-friendly term; clickable segments have button affordance
   4. Current: No tooltips, "LLM" is unexplained jargon, clickable segments show cursor=pointer but no visual button styling
 - **Validation notes**: Confirmed via Playwright snapshot. Navigation bar shows "User -> bash -> LLM (retry 3)" with cursor=pointer on segments but no visual button affordance (no border, no background change). "LLM" is unexplained jargon.
+- **Status**: fixed -- Added title tooltips to all breadcrumb types; "LLM" renamed to "AI" in display
 
 ### FTUX-12: "Background" button next to Send is unexplained
 
@@ -184,6 +191,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: "Background" button has a visible label or icon that conveys its purpose without hovering
   4. Current: Button label "Background" is ambiguous; tooltip exists on hover but is not discoverable at a glance
 - **Validation notes**: Confirmed via Playwright snapshot. The "Background" button is visible next to "Send" on the new conversation form. It has a `title="Create and stay on this page"` in the code (line 238 of NewConversationPage.tsx), so there IS a tooltip -- but it only appears on hover. The button label alone is ambiguous.
+- **Status**: fixed -- Renamed button from "Background" to "Send & Stay"
 
 ### FTUX-13: Token counter meaning unclear
 
@@ -200,6 +208,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Token counter has a tooltip explaining what tokens are and why the percentage matters (e.g., context window usage)
   4. Current: Tooltip repeats the same "4k / 128k tokens (3.5%)" text with no additional explanation
 - **Validation notes**: Confirmed via Playwright snapshot on conversation page. Banner shows "4k / 128k tokens (3.5%)" with a title attribute "4k / 128k tokens (3.5%)" -- tooltip just repeats the same text, no explanation of what tokens are or why the user should care.
+- **Status**: fixed -- Tooltip now explains context window usage and summarization threshold
 
 ### FTUX-14: System prompt visible by default
 
@@ -216,6 +225,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: System prompt is hidden by default or only shown in a debug/advanced mode
   4. Current: "System Prompt" header with preview text is always visible at the top of every conversation
 - **Validation notes**: Confirmed via Playwright snapshot. Conversation page shows "System Prompt" with "show" toggle and preview text "You are a helpful AI assistant with access to tools for executing code, editing files...". Always visible at the top of every conversation.
+- **Status**: fixed -- System prompt collapsed by default with no preview text; just a "System prompt" toggle
 
 ### SIDE-01: Project tab clicks auto-submit pre-filled text
 
@@ -279,6 +289,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Visible indicator that more tabs exist (fade edge, arrows, or "..." overflow menu)
   4. Current: Tabs are silently clipped at the sidebar edge with no visual hint that more exist
 - **Validation notes**: Confirmed via screenshot. Tab bar shows "All", "phoenix-qa-j5", "phoenix-qa-j2", and a truncated "phoeni..." -- the remaining 7 tabs (phoenix-qa-test, python-data-scripts, tmp.*, go-microservice, phoenix-ide) are cut off with no scroll indicator, arrows, or overflow affordance. Accessibility tree shows all 10 tabs exist in DOM but are visually clipped.
+- **Status**: fixed -- Added CSS mask-image fade gradient at right edge of tab bar
 
 ### SIDE-06: "STANDALONE" badge truncates in sidebar
 
@@ -295,6 +306,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: "STANDALONE" badge text is fully visible (or abbreviated intentionally, e.g., "SOLO")
   4. Current: Badge truncates to "STANDALON..." while EXPLORE and WORK badges display fully
 - **Validation notes**: Confirmed via screenshot. The "STANDALONE" badge on "echo-hello-world-bash-command" is visibly truncated to "STANDALON..." while EXPLORE and WORK badges display fully.
+- **Status**: fixed -- "STANDALONE" abbreviated to "SOLO" in badge display
 
 ### SIDE-07: No search or filter for conversations
 
@@ -322,6 +334,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
   3. Expected: Dots have tooltips explaining their meaning (e.g., "Active", "Idle", "Error")
   4. Current: Dots are plain `<span>` elements with no tooltip, title, or aria-label
 - **Validation notes**: Confirmed via Playwright snapshot and screenshot. Conversations show colored dots (green for active/idle, red for error) with class `conv-state-dot`. The dot element is a plain `<span>` with no title, tooltip, or aria-label. No legend exists anywhere in the UI.
+- **Status**: fixed -- Added title tooltips to state dots (Ready, Working, Error, Completed, Awaiting approval)
 
 ### SIDE-09: Work conversations don't show task info in sidebar
 

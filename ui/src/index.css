@@ -3750,7 +3750,13 @@ html * {
   font-size: 22px;
   font-weight: 400;
   color: var(--text-secondary);
-  margin: 0 0 20px 0;
+  margin: 0 0 4px 0;
+}
+
+.new-conv-tagline {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 0 0 16px 0;
 }
 
 .new-conv-error {
@@ -4548,6 +4554,8 @@ html * {
   overflow-x: auto;
   flex-shrink: 0;
   scrollbar-width: none;
+  mask-image: linear-gradient(to right, black 85%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, black 85%, transparent 100%);
 }
 
 .project-tabs::-webkit-scrollbar {

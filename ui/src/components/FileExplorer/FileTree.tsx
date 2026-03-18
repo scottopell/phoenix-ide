@@ -193,7 +193,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
   const renderItem = (item: FileItem, depth: number = 0) => {
     const isExpanded = expandedPaths.has(item.path);
     const isLoadingChildren = loadingPaths.has(item.path);
-    const children = childItems.get(item.path) || [];
+    const children = (childItems.get(item.path) || []).filter(child => !child.name.startsWith('.'));
     const isDisabled = !item.is_directory && !item.is_text_file;
     const isActive = activeFile === item.path;
 
@@ -272,9 +272,12 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
     );
   }
 
+  // Filter out dotfiles/directories at root level by default
+  const visibleItems = items.filter(item => !item.name.startsWith('.'));
+
   return (
     <div className="ft-root">
-      {items.map(item => renderItem(item, 0))}
+      {visibleItems.map(item => renderItem(item, 0))}
     </div>
   );
 }

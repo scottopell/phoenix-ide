@@ -189,18 +189,13 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                 className="system-prompt-header"
                 onClick={() => setSystemPromptExpanded((v) => !v)}
               >
-                <span className="system-prompt-label">System Prompt</span>
+                <span className="system-prompt-label">System prompt</span>
                 <span className="system-prompt-toggle">
                   {systemPromptExpanded ? '▼ hide' : '▶ show'}
                 </span>
               </div>
-              {systemPromptExpanded ? (
+              {systemPromptExpanded && (
                 <pre className="system-prompt-content">{systemPrompt}</pre>
-              ) : (
-                <div className="system-prompt-preview">
-                  {systemPrompt.slice(0, PREVIEW_LENGTH).trimEnd()}
-                  {systemPrompt.length > PREVIEW_LENGTH ? '…' : ''}
-                </div>
               )}
             </div>
           )}

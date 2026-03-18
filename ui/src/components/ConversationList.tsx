@@ -118,10 +118,27 @@ export function ConversationList({
             >
               <div className="conv-item-main" onClick={() => handleClick(conv)}>
                 <div className="conv-item-slug">
-                  <span className={`conv-state-dot ${getDisplayState(conv.state?.type)}`} />
+                  <span className={`conv-state-dot ${getDisplayState(conv.state?.type)}`} title={
+                    (() => {
+                      const s = getDisplayState(conv.state?.type);
+                      switch (s) {
+                        case 'idle': return 'Ready';
+                        case 'working': return 'Working';
+                        case 'error': return 'Error';
+                        case 'terminal': return 'Completed';
+                        case 'awaiting_approval': return 'Awaiting approval';
+                        default: return s;
+                      }
+                    })()
+                  } />
                   {conv.slug}
                   {conv.conv_mode_label && (
-                    <span className="conv-mode-badge">{conv.conv_mode_label}</span>
+                    <span className="conv-mode-badge" title={
+                      conv.conv_mode_label.toLowerCase() === 'explore' ? 'Read-only mode (git project)' :
+                      conv.conv_mode_label.toLowerCase() === 'work' ? 'Write mode (task branch)' :
+                      conv.conv_mode_label.toLowerCase() === 'standalone' ? 'Full access (non-git directory)' :
+                      conv.conv_mode_label
+                    }>{conv.conv_mode_label.toLowerCase() === 'standalone' ? 'SOLO' : conv.conv_mode_label}</span>
                   )}
                 </div>
                 <div className="conv-item-meta">

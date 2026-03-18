@@ -140,12 +140,19 @@ export function StateBar({
     return n.toString();
   };
 
-  const tooltipText = `${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%)`;
+  const tooltipText = `Context window usage: ${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%). When full, the conversation will need to be summarized.`;
 
-  // Format cwd for display - show last 2 path components
+  // Format cwd for display - replace home dir with ~, show last 2 path components
   const formatCwd = (cwd: string): string => {
-    const parts = cwd.split('/').filter(Boolean);
-    if (parts.length <= 2) return cwd;
+    // Replace /Users/<name> or /home/<name> with ~
+    const homeMatch = cwd.match(/^(\/(?:Users|home)\/[^/]+)/);
+    let display = cwd;
+    if (homeMatch) {
+      display = '~' + cwd.slice(homeMatch[1].length);
+      if (display === '~') display = '~/';
+    }
+    const parts = display.split('/').filter(Boolean);
+    if (parts.length <= 2) return display;
     return '.../' + parts.slice(-2).join('/');
   };
 
