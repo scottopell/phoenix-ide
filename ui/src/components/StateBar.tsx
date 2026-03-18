@@ -147,7 +147,7 @@ export function StateBar({
     // Replace /Users/<name> or /home/<name> with ~
     const homeMatch = cwd.match(/^(\/(?:Users|home)\/[^/]+)/);
     let display = cwd;
-    if (homeMatch) {
+    if (homeMatch?.[1]) {
       display = '~' + cwd.slice(homeMatch[1].length);
       if (display === '~') display = '~/';
     }

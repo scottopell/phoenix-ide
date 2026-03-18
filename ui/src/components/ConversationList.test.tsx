@@ -4,7 +4,7 @@
 // SIDE-04: Context menu persists across navigation (no click-outside handler)
 
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { ConversationList } from './ConversationList';
 import type { Conversation } from '../api';

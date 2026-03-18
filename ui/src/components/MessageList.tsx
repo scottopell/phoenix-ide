@@ -21,8 +21,6 @@ interface MessageListProps {
   streamingBuffer?: StreamingBuffer | null;
 }
 
-const PREVIEW_LENGTH = 150;
-
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
 const SCROLL_THRESHOLD = 100;
 

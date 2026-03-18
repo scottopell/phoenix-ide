@@ -5,7 +5,7 @@
 // menu, modal, or popover is open. Pressing Escape while a context menu is
 // open should close the menu WITHOUT triggering navigation.
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ReactNode } from 'react';

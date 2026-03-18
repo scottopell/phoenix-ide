@@ -1298,13 +1298,22 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
 
         let conv = db
-            .create_conversation("conv-ftux08", "my-test-conversation", "/tmp", true, None, None)
+            .create_conversation(
+                "conv-ftux08",
+                "my-test-conversation",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
         // Serialize to JSON (same path as conversation_to_json in handlers.rs)
         let json_val = serde_json::to_value(&conv).unwrap();
-        let obj = json_val.as_object().expect("Conversation should serialize to JSON object");
+        let obj = json_val
+            .as_object()
+            .expect("Conversation should serialize to JSON object");
 
         // The JSON should have a "title" field with a human-readable name.
         // Currently it only has "slug" (kebab-case), so this test FAILS.
