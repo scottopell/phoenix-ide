@@ -1269,4 +1269,41 @@ mod tests {
             Some(second_slug)
         );
     }
+
+    // FTUX-08: Conversation names are auto-generated slugs
+    //
+    // The Conversation struct only has a `slug` field (kebab-case) and no
+    // `title` field. The UI displays slugs like "add-hello-file-task" as
+    // conversation names. The serialized JSON sent to the API should include
+    // a human-readable `title` field (e.g., "Add Hello File Task") in
+    // addition to the machine-friendly `slug`.
+    #[tokio::test]
+    async fn test_ftux08_conversation_json_includes_title_field() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let conv = db
+            .create_conversation("conv-ftux08", "my-test-conversation", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        // Serialize to JSON (same path as conversation_to_json in handlers.rs)
+        let json_val = serde_json::to_value(&conv).unwrap();
+        let obj = json_val.as_object().expect("Conversation should serialize to JSON object");
+
+        // The JSON should have a "title" field with a human-readable name.
+        // Currently it only has "slug" (kebab-case), so this test FAILS.
+        assert!(
+            obj.contains_key("title"),
+            "Conversation JSON must include a 'title' field for human-readable display. \
+             Found keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+
+        let title = obj["title"].as_str().expect("title should be a string");
+        // The title should be human-readable, not kebab-case
+        assert!(
+            !title.contains('-'),
+            "title should be human-readable, not kebab-case. Got: {title}"
+        );
+    }
 }
