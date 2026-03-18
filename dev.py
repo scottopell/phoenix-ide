@@ -1092,6 +1092,63 @@ def native_prod_deploy(version: str | None = None):
             sys.exit(1)
 
 
+def _load_env_file(env: dict[str, str]) -> str | None:
+    """Load .phoenix-ide.env from project root into env dict. Returns path if loaded.
+
+    Simple KEY=VALUE format, one per line. Lines starting with # are comments.
+    Literal \\n in values is unescaped to real newlines (for LLM_CUSTOM_HEADERS).
+    """
+    env_file = ROOT / ".phoenix-ide.env"
+    if not env_file.exists():
+        return None
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            if key and value:
+                env[key.strip()] = value.strip().replace("\\n", "\n")
+    return str(env_file)
+
+
+def _configure_llm_env(env: dict[str, str]) -> str:
+    """Configure LLM environment variables. Returns a human-readable mode string.
+
+    Priority:
+    1. .phoenix-ide.env overrides (LLM_API_KEY_HELPER, ANTHROPIC_API_KEY, etc.)
+    2. Auto-detected exe.dev gateway (LLM_GATEWAY)
+    3. ANTHROPIC_API_KEY from shell environment
+    """
+    # If env file provided LLM config, respect it — skip auto-detection
+    if env.get("LLM_API_KEY_HELPER"):
+        helper = env["LLM_API_KEY_HELPER"]
+        return f"api_key_helper ({helper})"
+    if env.get("LLM_GATEWAY"):
+        return f"gateway ({env['LLM_GATEWAY']})"
+    if env.get("ANTHROPIC_API_KEY"):
+        return "direct API key (ANTHROPIC_API_KEY)"
+
+    # Auto-detect exe.dev gateway
+    gateway = get_llm_gateway()
+    if gateway:
+        env["LLM_GATEWAY"] = gateway
+        return f"gateway ({gateway}) [auto-detected]"
+
+    # Last resort: check shell env for API key
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+        return "direct API key (ANTHROPIC_API_KEY)"
+
+    print("ERROR: No LLM configuration found.", file=sys.stderr)
+    print("  Options:", file=sys.stderr)
+    print("    1. Create .phoenix-ide.env with LLM_API_KEY_HELPER or ANTHROPIC_API_KEY", file=sys.stderr)
+    print("    2. Set ANTHROPIC_API_KEY in your environment", file=sys.stderr)
+    print("    3. Run on a host with an exe.dev gateway", file=sys.stderr)
+    sys.exit(1)
+
+
 def prod_daemon_deploy():
     """Deploy as background daemon in ~/.phoenix-ide/ (no systemd).
 
@@ -1114,15 +1171,16 @@ def prod_daemon_deploy():
 
     env["PHOENIX_DB_PATH"] = str(prod_db_path)
 
-    gateway = get_llm_gateway()
-    if gateway:
-        env["LLM_GATEWAY"] = gateway
+    # Load .phoenix-ide.env (overrides auto-detection)
+    env_file = _load_env_file(env)
+    if env_file:
+        print(f"  Loaded env from {env_file}")
     else:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            print("ERROR: No LLM gateway reachable and ANTHROPIC_API_KEY not set.", file=sys.stderr)
-            sys.exit(1)
-        env["ANTHROPIC_API_KEY"] = api_key
+        print(f"  No .phoenix-ide.env found (using auto-detection)")
+
+    # Configure LLM auth
+    llm_mode = _configure_llm_env(env)
+    print(f"  LLM mode: {llm_mode}")
 
     # Stop existing daemon if running
     if prod_pid_path.exists():
@@ -1173,7 +1231,6 @@ def prod_daemon_deploy():
     print(f"  Database: {prod_db_path}")
     print(f"  Logs: {prod_log_path}")
     print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
-    llm_mode = f"gateway ({gateway})" if gateway else "Direct API (ANTHROPIC_API_KEY)"
     print(f"  LLM Mode: {llm_mode}")
     print()
     print("Use './dev.py prod status' to check status")

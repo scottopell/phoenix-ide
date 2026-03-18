@@ -14,6 +14,9 @@ ui/node_modules
 ui/dist
 static/dist/
 
+# Local config (machine-specific LLM credentials)
+.phoenix-ide.env
+
 # Tools
 .claude/
 .playwright-mcp/
