@@ -107,6 +107,11 @@ impl Database {
         .execute(&self.pool)
         .await;
 
+        // Add title column for human-readable conversation names
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN title TEXT")
+            .execute(&self.pool)
+            .await;
+
         Ok(())
     }
 
@@ -230,12 +235,14 @@ impl Database {
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
         loop {
+            let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, ?10)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11)",
             )
             .bind(id)
             .bind(&actual_slug)
+            .bind(&title_str)
             .bind(cwd)
             .bind(parent_id)
             .bind(user_initiated)
@@ -262,9 +269,11 @@ impl Database {
             }
         }
 
+        let title = schema::title_from_slug(&actual_slug);
         Ok(Conversation {
             id: id.to_string(),
             slug: Some(actual_slug),
+            title: Some(title),
             cwd: cwd.to_string(),
             parent_conversation_id: parent_id.map(String::from),
             user_initiated,
@@ -283,7 +292,7 @@ impl Database {
     /// Get conversation by ID
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -302,7 +311,7 @@ impl Database {
     /// Get conversation by slug
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -321,7 +330,7 @@ impl Database {
     /// List active (non-archived) user-initiated conversations
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -339,7 +348,7 @@ impl Database {
     /// List archived conversations
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -427,7 +436,7 @@ impl Database {
     /// Get all non-archived Work conversations (for startup worktree reconciliation).
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -828,9 +837,16 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
+    let slug: Option<String> = row.try_get("slug")?;
+    let title: Option<String> = row
+        .try_get::<Option<String>, _>("title")
+        .unwrap_or(None)
+        .or_else(|| slug.as_deref().map(schema::title_from_slug));
+
     Ok(Conversation {
         id: row.try_get("id")?,
-        slug: row.try_get("slug")?,
+        slug,
+        title,
         cwd: row.try_get("cwd")?,
         parent_conversation_id: row.try_get("parent_conversation_id")?,
         user_initiated: row.try_get("user_initiated")?,

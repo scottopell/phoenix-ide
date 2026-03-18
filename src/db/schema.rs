@@ -215,6 +215,10 @@ pub fn detect_git_repo_root(path: &Path) -> Option<String> {
 pub struct Conversation {
     pub id: String,
     pub slug: Option<String>,
+    /// Human-readable title for UI display (e.g., "Fix Login Page CSS").
+    /// Derived from the slug by title-casing when not set explicitly.
+    #[serde(default)]
+    pub title: Option<String>,
     pub cwd: String,
     pub parent_conversation_id: Option<String>,
     pub user_initiated: bool,
@@ -232,6 +236,25 @@ pub struct Conversation {
     pub conv_mode: ConvMode,
     #[serde(default)]
     pub message_count: i64,
+}
+
+/// Derive a human-readable title from a kebab-case slug.
+/// E.g., "my-test-conversation" -> "My Test Conversation"
+pub fn title_from_slug(slug: &str) -> String {
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(c) => {
+                    let upper: String = c.to_uppercase().collect();
+                    format!("{upper}{}", chars.as_str())
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Conversation {

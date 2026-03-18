@@ -24,7 +24,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
-  const [dirStatus, setDirStatus] = useState<DirStatus>('checking');
+  const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
+    localStorage.getItem(LAST_CWD_KEY) ? 'exists' : 'checking'
+  );
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
   const [draft, setDraft] = useState('');

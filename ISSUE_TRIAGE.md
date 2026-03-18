@@ -18,7 +18,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
 - **Summary**: Settings panel briefly shows "invalid path" with red X before async validation completes. User sees error state flash for 1-2 seconds on every page load.
 - **Validated**: yes
 - **Unit Testable**: yes
-- **Failing Test**: written
+- **Failing Test**: passing
 - **QA Plan**: pending
 - **Validation notes**: Reproduced via Playwright. On load, StateBar shows "dir ... /Users/scott.opell" with "checking..." status for 2-3 seconds before settling to "dir [check] ~/". The initial state in NewConversationPage is `dirStatus: 'checking'` (line 27), which shows an ellipsis, not a red X. The flash is "checking..." not "invalid", but the user-facing confusion is real.
 - **Test file**: `ui/src/pages/NewConversationPage.test.tsx`
@@ -96,7 +96,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
 - **Summary**: Sidebar shows kebab-case slugs like "add-hello-file-task" instead of human-readable titles.
 - **Validated**: yes
 - **Unit Testable**: yes
-- **Failing Test**: written
+- **Failing Test**: passing
 - **QA Plan**: pending
 - **Validation notes**: Not a test artifact. The title_generator.rs generates a human-readable title, but `derive_slug()` in executor.rs converts it to kebab-case (e.g., "Add Hello File Task" becomes "add-hello-file-task"). ConversationList.tsx line 109 displays `conv.slug` -- there is no separate `title` field exposed to the UI. The slug IS the only display name.
 - **Test file**: `src/db.rs` (test `test_ftux08_conversation_json_includes_title_field`)
@@ -185,7 +185,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
 - **Summary**: In the "All" view, conversations show no project indicator. With 50+ conversations across 9 projects, you can't tell which project a conversation belongs to without clicking into it.
 - **Validated**: yes
 - **Unit Testable**: yes
-- **Failing Test**: written
+- **Failing Test**: passing
 - **QA Plan**: pending
 - **Validation notes**: Confirmed via Playwright snapshot. The "All" tab shows all 50+ conversations with only mode badges (EXPLORE/WORK/STANDALONE) -- no project name or path indicator. ConversationList.tsx renders `conv.slug` and `conv.conv_mode_label` but no project information.
 - **Test file**: `ui/src/components/ConversationList.test.tsx` (test `SIDE-02`)
@@ -197,7 +197,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
 - **Summary**: Opening three-dot menu on a sidebar item and pressing Escape both closes the menu AND navigates to home route. Same class as the commit modal Escape bug (global keyboard nav handler).
 - **Validated**: yes
 - **Unit Testable**: yes
-- **Failing Test**: written
+- **Failing Test**: passing
 - **QA Plan**: pending
 - **Validation notes**: Reproduced via Playwright. Opened three-dot menu on a conversation while at /c/echo-hello-world-bash-command, pressed Escape -- navigated to / immediately. The context menu uses `e.stopPropagation()` only on click events (ConversationList.tsx line 59). The global Escape handler in useKeyboardNav.ts (line 20-31) listens on `window` keydown and navigates to / when on a /c/ path. The context menu does not intercept keyboard Escape events. Additionally, the context menu did NOT close on Escape -- it persisted (see SIDE-04).
 - **Test file**: `ui/src/hooks/useKeyboardNav.test.tsx` (test `SIDE-03`)
@@ -209,7 +209,7 @@ Tracked issues from QA agents. Each issue must be validated, then either have a 
 - **Summary**: The Rename/Archive/Delete dropdown stays open when clicking project tabs, the "All" tab, or navigating to other views. Does not dismiss on click-away.
 - **Validated**: yes
 - **Unit Testable**: yes
-- **Failing Test**: written
+- **Failing Test**: passing
 - **QA Plan**: pending
 - **Validation notes**: Reproduced via Playwright. Opened context menu on conversation, then clicked away to another conversation -- menu stayed open. Context menu state (`expandedId`) in ConversationList.tsx is managed via `useState` and only toggles on explicit three-dot button clicks. No click-outside handler, no effect to close on navigation, no Escape key handler.
 - **Test file**: `ui/src/components/ConversationList.test.tsx` (test `SIDE-04`)

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getDisplayState } from '../api';
 import type { Conversation } from '../api';
@@ -38,6 +38,19 @@ export function ConversationList({
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Close context menu on click-outside
+  useEffect(() => {
+    if (!expandedId) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setExpandedId(null);
+      }
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    return () => document.removeEventListener('mousedown', handleMouseDown);
+  }, [expandedId]);
 
   const displayList = showArchived ? archivedConversations : conversations;
 
@@ -118,10 +131,14 @@ export function ConversationList({
                   <span className="conv-item-messages">{conv.message_count} {conv.message_count === 1 ? 'msg' : 'msgs'}</span>
                 </div>
                 <div className="conv-item-meta secondary">
+                  {conv.project_id && conv.cwd && (
+                    <span className="conv-project-label">{conv.cwd.split('/').filter(Boolean).pop()}</span>
+                  )}
                   <span className="conv-item-model">{conv.model}</span>
                   <span className="conv-item-cwd">{conv.cwd}</span>
                 </div>
               </div>
+              <div ref={expandedId === conv.id ? menuRef : undefined} className="conv-item-menu-container">
               <button
                 className="conv-item-menu-btn"
                 onClick={(e) => toggleActions(e, conv.id)}
@@ -176,6 +193,7 @@ export function ConversationList({
                   </button>
                 </div>
               )}
+              </div>
             </li>
           ))
         )}
