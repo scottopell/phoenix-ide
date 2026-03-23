@@ -547,13 +547,33 @@ def cmd_check():
             results.append(("bundle size", 0 if ok else 1, elapsed, msg if not ok else ""))
             print(f"  {sym} {'bundle size':<18s} ({elapsed:.1f}s) {size_kb:.0f} KB")
 
-    print("Running 7 checks in parallel...\n")
+    def check_ast_grep():
+        """Run structural lint rules via ast-grep (one result entry per rule file)."""
+        import shutil
+        if not shutil.which("ast-grep"):
+            with results_lock:
+                results.append(("ast-grep", 0, 0.0, ""))
+                print(f"  - {'ast-grep':<18s} (skipped — not installed)")
+            return
+        rules_dir = ROOT / "ast-grep-rules"
+        if not rules_dir.exists():
+            return
+        rule_files = sorted(rules_dir.glob("*.yml"))
+        if not rule_files:
+            return
+        for rule_file in rule_files:
+            run_step(f"ast-grep:{rule_file.stem[:14]}", [
+                "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
+            ])
+
+    print("Running 8 checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
         threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
         threading.Thread(target=lane_fast),
+        threading.Thread(target=check_ast_grep),
     ]
     for t in threads:
         t.start()

@@ -1,0 +1,31 @@
+id: ref-current-optional-data-call
+language: Tsx
+severity: warning
+message: |
+  $REF.current?.$METHOD(...) silently no-ops when the ref is null — if this call
+  delivers data or has a meaningful side effect, that data is lost with no error.
+  This pattern caused a real bug: prose notes were dropped when InputArea was
+  unmounted on desktop (ConversationPage renders ProseReader instead).
+
+  Safe pattern for idempotent DOM ops (focus, blur, scroll) — use ?. freely there.
+  For data-delivering calls, use an explicit null check with a fallback:
+
+    if (ref.current) {
+      ref.current.deliverData(payload);
+    } else {
+      // explicit fallback — e.g. write to localStorage, queue for later, throw
+    }
+note: "Anti-pattern: silent data loss via optional chain on ref method call"
+rule:
+  pattern: $REF.current?.$METHOD($$$)
+  not:
+    any:
+      - pattern: $REF.current?.focus($$$)
+      - pattern: $REF.current?.blur($$$)
+      - pattern: $REF.current?.select($$$)
+      - pattern: $REF.current?.abort($$$)
+      - pattern: $REF.current?.click($$$)
+      - pattern: $REF.current?.scrollIntoView($$$)
+      - pattern: $REF.current?.scrollTo($$$)
+      - pattern: $REF.current?.getBoundingClientRect($$$)
+      - pattern: $REF.current?.contains($$$)
