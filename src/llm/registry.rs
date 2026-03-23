@@ -588,9 +588,7 @@ impl ModelRegistry {
                 );
                 return Self::new_with_status(config, GatewayStatus::Healthy);
             }
-            tracing::warn!(
-                "Model discovery returned no models, falling back to hardcoded list"
-            );
+            tracing::warn!("Model discovery returned no models, falling back to hardcoded list");
             return Self::new_with_status(config, GatewayStatus::Unreachable);
         }
 
