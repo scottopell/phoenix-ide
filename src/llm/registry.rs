@@ -577,9 +577,19 @@ impl ModelRegistry {
         // Try to discover models
         let discovered = discover_models(&discovery).await;
 
+        // If discovery returned no models but we're in gateway mode and the probe succeeded,
+        // the gateway is reachable but doesn't expose a model-listing endpoint (e.g. exe.dev
+        // gateway only proxies inference). Fall back to hardcoded models with Healthy status.
         if discovered.is_empty() {
+            if is_gateway_mode {
+                tracing::warn!(
+                    "Gateway model discovery returned no models (gateway may not support listing); \
+                     using hardcoded model list with Healthy status"
+                );
+                return Self::new_with_status(config, GatewayStatus::Healthy);
+            }
             tracing::warn!(
-                "Gateway model discovery returned no models, falling back to hardcoded list"
+                "Model discovery returned no models, falling back to hardcoded list"
             );
             return Self::new_with_status(config, GatewayStatus::Unreachable);
         }
