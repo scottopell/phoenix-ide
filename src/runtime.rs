@@ -507,7 +507,7 @@ impl RuntimeManager {
                 }
             };
             // Inject MCP tools into every registry (available in all modes)
-            registry.register_mcp_tools(&self.mcp_manager);
+            registry.register_mcp_tools(&self.mcp_manager).await;
             ToolRegistryExecutor::new(registry)
         };
 

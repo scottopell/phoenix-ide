@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 /// Timeout for a single JSON-RPC request-response round trip.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -369,43 +369,88 @@ impl McpServer {
 
 /// Owns all MCP server connections.
 pub struct McpClientManager {
-    servers: HashMap<String, McpServer>,
+    servers: Arc<RwLock<HashMap<String, McpServer>>>,
 }
 
 impl McpClientManager {
-    /// Scan config files, spawn servers, and initialize each.
-    pub async fn discover_and_connect() -> Self {
-        let configs = Self::read_all_configs();
-        let mut servers = HashMap::new();
-
-        for (name, entry) in &configs {
-            match Self::connect_one(name, entry).await {
-                Ok(server) => {
-                    servers.insert(name.clone(), server);
-                }
-                Err(e) => {
-                    tracing::warn!(server = %name, "Skipping MCP server: {e}");
-                }
-            }
+    /// Create an empty manager. Servers are connected asynchronously via
+    /// `start_background_discovery`.
+    pub fn new() -> Self {
+        Self {
+            servers: Arc::new(RwLock::new(HashMap::new())),
         }
-
-        let total_tools: usize = servers.values().map(|s| s.tools.len()).sum();
-        let server_names: Vec<&str> = servers.keys().map(String::as_str).collect();
-        tracing::info!(
-            tools = total_tools,
-            servers = servers.len(),
-            names = ?server_names,
-            "Discovered {total_tools} MCP tools from {} servers",
-            servers.len()
-        );
-
-        Self { servers }
     }
 
-    /// Return (`server_name`, `tool_def`) pairs for all connected servers.
-    pub fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
+    /// Spawn a background task that reads config files and connects to each
+    /// MCP server in parallel. Servers become available in `tool_definitions`
+    /// and `call_tool` as they finish connecting.
+    pub fn start_background_discovery(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let configs = Self::read_all_configs();
+            if configs.is_empty() {
+                tracing::debug!("No MCP server configs found");
+                return;
+            }
+
+            tracing::info!(
+                count = configs.len(),
+                "Starting background MCP server discovery"
+            );
+
+            // Connect to all servers in parallel.
+            let handles: Vec<_> = configs
+                .into_iter()
+                .map(|(name, entry)| {
+                    let mgr = Arc::clone(&manager);
+                    tokio::spawn(async move {
+                        match Self::connect_one(&name, &entry).await {
+                            Ok(server) => {
+                                let tool_count = server.tools.len();
+                                mgr.servers.write().await.insert(name.clone(), server);
+                                tracing::info!(
+                                    server = %name,
+                                    tools = tool_count,
+                                    "MCP server connected"
+                                );
+                                Some((name, tool_count))
+                            }
+                            Err(e) => {
+                                tracing::warn!(server = %name, "Skipping MCP server: {e}");
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            // Collect results for the summary log.
+            let mut total_tools = 0usize;
+            let mut connected_servers = 0usize;
+            let mut server_names = Vec::new();
+            for handle in handles {
+                if let Ok(Some((name, tool_count))) = handle.await {
+                    total_tools += tool_count;
+                    connected_servers += 1;
+                    server_names.push(name);
+                }
+            }
+
+            tracing::info!(
+                tools = total_tools,
+                servers = connected_servers,
+                names = ?server_names,
+                "Discovered {total_tools} MCP tools from {connected_servers} servers",
+            );
+        });
+    }
+
+    /// Return (`server_name`, `tool_def`) pairs for all currently connected servers.
+    /// May return an empty list if background discovery hasn't finished yet.
+    pub async fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
+        let servers = self.servers.read().await;
         let mut out = Vec::new();
-        for (server_name, server) in &self.servers {
+        for (server_name, server) in servers.iter() {
             for tool in &server.tools {
                 out.push((server_name.clone(), tool.clone()));
             }
@@ -420,10 +465,10 @@ impl McpClientManager {
         tool_name: &str,
         arguments: Value,
     ) -> Result<String, String> {
-        let server = self
-            .servers
+        let servers = self.servers.read().await;
+        let server = servers
             .get(server_name)
-            .ok_or_else(|| format!("MCP server '{server_name}' is not running"))?;
+            .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
         server.call_tool(tool_name, arguments).await
     }
 
@@ -591,9 +636,10 @@ impl Tool for McpTool {
 }
 
 /// Create one `McpTool` per discovered tool across all servers.
-pub fn create_mcp_tools(manager: &Arc<McpClientManager>) -> Vec<Box<dyn Tool>> {
+pub async fn create_mcp_tools(manager: &Arc<McpClientManager>) -> Vec<Box<dyn Tool>> {
     manager
         .tool_definitions()
+        .await
         .into_iter()
         .map(|(server_name, def)| {
             let full_name = format!("{server_name}__{}", def.name);
@@ -615,9 +661,7 @@ mod tests {
 
     #[test]
     fn test_tool_naming() {
-        let manager = Arc::new(McpClientManager {
-            servers: HashMap::new(),
-        });
+        let manager = Arc::new(McpClientManager::new());
 
         let tool = McpTool {
             server_name: "slack".to_string(),
@@ -632,12 +676,10 @@ mod tests {
         assert_eq!(tool.description(), "Send a Slack message");
     }
 
-    #[test]
-    fn test_create_mcp_tools_empty() {
-        let manager = Arc::new(McpClientManager {
-            servers: HashMap::new(),
-        });
-        let tools = create_mcp_tools(&manager);
+    #[tokio::test]
+    async fn test_create_mcp_tools_empty() {
+        let manager = Arc::new(McpClientManager::new());
+        let tools = create_mcp_tools(&manager).await;
         assert!(tools.is_empty());
     }
 

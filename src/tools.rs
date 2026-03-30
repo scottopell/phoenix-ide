@@ -267,8 +267,10 @@ impl ToolRegistry {
 
     /// Register MCP tools from a client manager. Called after constructing the
     /// mode-specific registry to inject dynamically-discovered tools.
-    pub fn register_mcp_tools(&mut self, manager: &std::sync::Arc<mcp::McpClientManager>) {
-        for tool in mcp::create_mcp_tools(manager) {
+    /// Returns whatever tools are available at the moment of the call; if
+    /// background discovery hasn't finished, some servers may be missing.
+    pub async fn register_mcp_tools(&mut self, manager: &std::sync::Arc<mcp::McpClientManager>) {
+        for tool in mcp::create_mcp_tools(manager).await {
             self.tools.push(Arc::from(tool));
         }
     }

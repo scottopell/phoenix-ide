@@ -90,8 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let platform = crate::platform::PlatformCapability::detect();
     tracing::info!(?platform, "Platform capability detected");
 
-    // Discover and connect to MCP servers (stdio transport)
-    let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::discover_and_connect().await);
+    // Create MCP manager and start background server discovery (non-blocking).
+    // Servers connect in parallel; tools become available as each finishes.
+    let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+    mcp_manager.start_background_discovery();
 
     // Create application state
     let state = AppState::new(db, llm_registry, platform, mcp_manager).await;
