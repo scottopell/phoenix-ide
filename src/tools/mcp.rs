@@ -924,24 +924,28 @@ impl Tool for McpTool {
     }
 }
 
-/// Create one `McpTool` per discovered tool across all servers.
-pub async fn create_mcp_tools(manager: &Arc<McpClientManager>) -> Vec<Box<dyn Tool>> {
-    manager
-        .tool_definitions()
-        .await
+/// Look up a single MCP tool by its full `{server}__{tool}` name.
+/// Used by `ToolRegistryExecutor` for live resolution of MCP tools
+/// that aren't in the static registry.
+pub async fn create_mcp_tool_by_name(
+    manager: &Arc<McpClientManager>,
+    full_name: &str,
+) -> Option<Box<dyn Tool>> {
+    let (server_name, tool_name) = full_name.split_once("__")?;
+    let defs = manager.tool_definitions().await;
+    let (srv, def) = defs
         .into_iter()
-        .map(|(server_name, def)| {
-            let full_name = format!("{server_name}__{}", def.name);
-            Box::new(McpTool {
-                server_name,
-                tool_name: def.name,
-                full_name,
-                description: def.description,
-                input_schema: def.input_schema,
-                manager: Arc::clone(manager),
-            }) as Box<dyn Tool>
-        })
-        .collect()
+        .find(|(s, d)| s == server_name && d.name == tool_name)?;
+
+    let name = format!("{srv}__{}", def.name);
+    Some(Box::new(McpTool {
+        server_name: srv,
+        tool_name: def.name,
+        full_name: name,
+        description: def.description,
+        input_schema: def.input_schema,
+        manager: Arc::clone(manager),
+    }))
 }
 
 #[cfg(test)]
@@ -966,10 +970,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_mcp_tools_empty() {
+    async fn test_create_mcp_tool_by_name_empty() {
         let manager = Arc::new(McpClientManager::new());
-        let tools = create_mcp_tools(&manager).await;
-        assert!(tools.is_empty());
+        let tool = create_mcp_tool_by_name(&manager, "slack__send_message").await;
+        assert!(tool.is_none());
     }
 
     #[test]

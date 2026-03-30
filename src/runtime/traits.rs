@@ -98,7 +98,7 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput>;
 
     /// Get tool definitions for LLM
-    fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
+    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
 
     /// Replace the tool set (e.g., Explore -> Work mode transition).
     /// Default is a no-op for test doubles that don't need dynamic swapping.
@@ -203,8 +203,8 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         (**self).execute(name, input, ctx).await
     }
 
-    fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
-        (**self).definitions()
+    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+        (**self).definitions().await
     }
 
     fn upgrade_to_work_mode(&self) {
@@ -373,13 +373,25 @@ impl LlmClient for RegistryLlmClient {
 /// at runtime (e.g., Explore -> Work mode transition after task approval).
 pub struct ToolRegistryExecutor {
     registry: std::sync::RwLock<ToolRegistry>,
+    /// When set, MCP tools are resolved live from the manager on every
+    /// `definitions()` and `execute()` call instead of being snapshotted
+    /// into the registry. This means enable/disable and reload take effect
+    /// immediately across all conversations.
+    mcp_manager: Option<Arc<crate::tools::mcp::McpClientManager>>,
 }
 
 impl ToolRegistryExecutor {
     pub fn new(registry: ToolRegistry) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
+            mcp_manager: None,
         }
+    }
+
+    /// Attach an MCP manager for live tool resolution.
+    pub fn with_mcp(mut self, manager: Arc<crate::tools::mcp::McpClientManager>) -> Self {
+        self.mcp_manager = Some(manager);
+        self
     }
 
     /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
@@ -404,18 +416,48 @@ impl ToolExecutor for ToolRegistryExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry.find_tool(name)
         };
-        match tool {
-            Some(t) => Some(t.run(input, ctx).await),
-            None => None,
+        if let Some(t) = tool {
+            return Some(t.run(input, ctx).await);
         }
+
+        // Fall back to live MCP tool resolution.
+        if let Some(ref manager) = self.mcp_manager {
+            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, name).await
+            {
+                return Some(mcp_tool.run(input, ctx).await);
+            }
+        }
+
+        None
     }
 
-    fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
-        let registry = self
-            .registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.definitions()
+    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+        let mut defs = {
+            let registry = self
+                .registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.definitions()
+        };
+
+        // Merge live MCP tool definitions (respects current disabled state).
+        if let Some(ref manager) = self.mcp_manager {
+            let builtin_names: std::collections::HashSet<String> =
+                defs.iter().map(|d| d.name.clone()).collect();
+
+            for (server_name, tool_def) in manager.tool_definitions().await {
+                let full_name = format!("{server_name}__{}", tool_def.name);
+                if !builtin_names.contains(&full_name) {
+                    defs.push(crate::llm::ToolDefinition {
+                        name: full_name,
+                        description: tool_def.description,
+                        input_schema: tool_def.input_schema,
+                    });
+                }
+            }
+        }
+
+        defs
     }
 
     fn upgrade_to_work_mode(&self) {

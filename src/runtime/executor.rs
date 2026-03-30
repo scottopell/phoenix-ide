@@ -682,7 +682,7 @@ where
                     let request = LlmRequest {
                         system: vec![SystemContent::cached(&system_prompt)],
                         messages,
-                        tools: tool_executor.definitions(),
+                        tools: tool_executor.definitions().await,
                         max_tokens: Some(16_384),
                     };
 

@@ -491,7 +491,7 @@ impl RuntimeManager {
             ToolRegistryExecutor::new(ToolRegistry::for_subagent())
         } else {
             use crate::db::ConvMode;
-            let mut registry = match conv.conv_mode {
+            let registry = match conv.conv_mode {
                 ConvMode::Explore => {
                     if self.platform.has_sandbox() {
                         ToolRegistry::explore_with_sandbox()
@@ -508,9 +508,9 @@ impl RuntimeManager {
                     ToolRegistry::standalone()
                 }
             };
-            // Inject MCP tools into every registry (available in all modes)
-            registry.register_mcp_tools(&self.mcp_manager).await;
-            ToolRegistryExecutor::new(registry)
+            // MCP tools resolved live from the manager on every definitions()
+            // call -- enable/disable and reload take effect immediately.
+            ToolRegistryExecutor::new(registry).with_mcp(self.mcp_manager.clone())
         };
 
         // Determine initial state: check if conversation needs auto-continuation

@@ -126,7 +126,7 @@ impl ToolExecutor for MockToolExecutor {
         self.outputs.get(name).cloned()
     }
 
-    fn definitions(&self) -> Vec<ToolDefinition> {
+    async fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
     }
 }
@@ -227,8 +227,8 @@ impl ToolExecutor for DelayedMockToolExecutor {
         }
     }
 
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        self.inner.definitions()
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions().await
     }
 }
 
