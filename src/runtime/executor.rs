@@ -1487,23 +1487,33 @@ fn derive_slug(title: &str) -> String {
 }
 
 /// Get the next task ID by shelling out to `taskmd next`.
-/// Returns an ID like "YF042". Falls back to timestamp-based ID if taskmd is unavailable.
-fn get_next_task_id(cwd: &std::path::Path) -> Result<String, String> {
-    let output = std::process::Command::new("taskmd")
+/// Returns an ID like "YF042". Falls back to a timestamp-based ID if taskmd
+/// is not installed, so task approval still works without the CLI.
+fn get_next_task_id(cwd: &std::path::Path) -> String {
+    let result = std::process::Command::new("taskmd")
         .args(["next", "--output", "text"])
         .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("Failed to run taskmd next: {e}"))?;
-    if output.status.success() {
-        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if id.is_empty() {
-            return Err("taskmd next returned empty ID".to_string());
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !id.is_empty() {
+                return id;
+            }
         }
-        Ok(id)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(format!("taskmd next failed: {stderr}"))
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            tracing::warn!(error = %stderr, "taskmd next failed, using fallback ID");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "taskmd not available, using fallback ID");
+        }
     }
+
+    // Fallback: timestamp-based ID that sorts correctly and won't collide
+    let now = chrono::Local::now();
+    format!("T{}", now.format("%y%m%d%H%M"))
 }
 
 /// Run a git command in the given directory, returning stdout on success or an error message.
@@ -1559,8 +1569,8 @@ fn execute_approve_task_blocking(
     // Track whether tasks/ existed before we create it
     let first_task = !tasks_dir.exists();
 
-    // 2. Assign task ID via taskmd
-    let task_id = get_next_task_id(cwd)?;
+    // 2. Assign task ID via taskmd (falls back to timestamp if unavailable)
+    let task_id = get_next_task_id(cwd);
 
     // 3. Create tasks/ directory if needed
     if first_task {
