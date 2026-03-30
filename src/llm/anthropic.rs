@@ -247,7 +247,7 @@ pub async fn complete_streaming(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let mut anthropic_request = translate_request(&spec.api_name, request);
+    let mut anthropic_request = translate_request(spec, request);
     anthropic_request.stream = Some(true);
 
     let mut builder = client.post(&base_url);
@@ -332,7 +332,7 @@ pub async fn complete(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let anthropic_request = translate_request(&spec.api_name, request);
+    let anthropic_request = translate_request(spec, request);
 
     let mut builder = client.post(&base_url);
     builder = match auth.style {
@@ -378,7 +378,7 @@ pub async fn complete(
     normalize_response(anthropic_response)
 }
 
-fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicRequest {
+fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> AnthropicRequest {
     let system: Vec<AnthropicSystemBlock> = request
         .system
         .iter()
@@ -397,18 +397,38 @@ fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicReq
 
     let messages: Vec<AnthropicMessage> = request.messages.iter().map(translate_message).collect();
 
-    let tools: Vec<AnthropicTool> = request
+    let has_deferred = spec.supports_tool_search
+        && request.tools.iter().any(|t| t.defer_loading);
+
+    let mut tools: Vec<AnthropicToolEntry> = request
         .tools
         .iter()
-        .map(|t| AnthropicTool {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            input_schema: t.input_schema.clone(),
+        .map(|t| {
+            AnthropicToolEntry::Function(AnthropicFunctionTool {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+                defer_loading: if has_deferred { t.defer_loading } else { false },
+            })
         })
         .collect();
 
+    // Inject tool search tool when deferred tools exist
+    if has_deferred {
+        let mut variant_map = std::collections::HashMap::new();
+        variant_map.insert(
+            TOOL_SEARCH_VARIANT.to_string(),
+            serde_json::json!({}),
+        );
+        tools.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
+            r#type: "tool_search".to_string(),
+            name: "tool_search".to_string(),
+            variant: variant_map,
+        }));
+    }
+
     AnthropicRequest {
-        model: model_api_name.to_string(),
+        model: spec.api_name.clone(),
         max_tokens: request.max_tokens.unwrap_or(16_384),
         system,
         messages,
@@ -559,7 +579,7 @@ struct AnthropicRequest {
     system: Vec<AnthropicSystemBlock>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<AnthropicTool>>,
+    tools: Option<Vec<AnthropicToolEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
 }
@@ -613,11 +633,30 @@ pub(crate) struct AnthropicImageSource {
     pub(crate) data: String,
 }
 
+const TOOL_SEARCH_VARIANT: &str = "tool_search_tool_regex_20251119";
+
 #[derive(Debug, Serialize)]
-struct AnthropicTool {
+#[serde(untagged)]
+enum AnthropicToolEntry {
+    Function(AnthropicFunctionTool),
+    ToolSearch(AnthropicToolSearchTool),
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicFunctionTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    defer_loading: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicToolSearchTool {
+    r#type: String,
+    name: String,
+    #[serde(flatten)]
+    variant: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,6 +678,105 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::models::{ApiFormat, ModelSpec, Provider};
+    use crate::llm::types::{LlmRequest, ToolDefinition};
+
+    fn test_spec(supports_tool_search: bool) -> ModelSpec {
+        ModelSpec {
+            id: "test-model".into(),
+            api_name: "test-model-api".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "test".into(),
+            context_window: 200_000,
+            recommended: false,
+            supports_tool_search,
+        }
+    }
+
+    fn test_request_with_tools() -> LlmRequest {
+        LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![
+                ToolDefinition {
+                    name: "bash".into(),
+                    description: "Run a bash command".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    defer_loading: false,
+                },
+                ToolDefinition {
+                    name: "mcp_tool".into(),
+                    description: "An MCP tool".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    defer_loading: true,
+                },
+            ],
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn test_tool_search_enabled_serialization() {
+        let spec = test_spec(true);
+        let request = test_request_with_tools();
+        let anthropic_req = translate_request(&spec, &request);
+
+        assert_eq!(anthropic_req.model, "test-model-api");
+
+        let json = serde_json::to_value(&anthropic_req).unwrap();
+        let tools = json["tools"].as_array().unwrap();
+
+        // 2 function tools + 1 tool_search entry
+        assert_eq!(tools.len(), 3);
+
+        // First tool: defer_loading=false -> field omitted
+        assert_eq!(tools[0]["name"], "bash");
+        assert!(
+            tools[0].get("defer_loading").is_none(),
+            "defer_loading should be omitted when false"
+        );
+
+        // Second tool: defer_loading=true -> field present
+        assert_eq!(tools[1]["name"], "mcp_tool");
+        assert_eq!(tools[1]["defer_loading"], true);
+
+        // Third entry: tool_search
+        assert_eq!(tools[2]["type"], "tool_search");
+        assert_eq!(tools[2]["name"], "tool_search");
+        assert!(
+            tools[2].get(TOOL_SEARCH_VARIANT).is_some(),
+            "tool_search entry must contain the variant key"
+        );
+    }
+
+    #[test]
+    fn test_tool_search_disabled_serialization() {
+        let spec = test_spec(false);
+        let request = test_request_with_tools();
+        let anthropic_req = translate_request(&spec, &request);
+
+        let json = serde_json::to_value(&anthropic_req).unwrap();
+        let tools = json["tools"].as_array().unwrap();
+
+        // No tool_search entry injected
+        assert_eq!(tools.len(), 2);
+
+        // Neither tool has defer_loading in JSON
+        for tool in tools {
+            assert!(
+                tool.get("defer_loading").is_none(),
+                "defer_loading should be omitted when tool search is disabled: {}",
+                tool
+            );
+        }
+
+        // No tool_search type present
+        assert!(
+            !tools.iter().any(|t| t.get("type").and_then(|v| v.as_str()) == Some("tool_search")),
+            "tool_search entry should not be present when supports_tool_search is false"
+        );
+    }
 
     #[test]
     fn test_resolve_anthropic_url_override_takes_priority() {
