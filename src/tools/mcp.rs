@@ -623,14 +623,41 @@ impl Tool for McpTool {
         self.input_schema.clone()
     }
 
-    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
-        match self
-            .manager
-            .call_tool(&self.server_name, &self.tool_name, input)
-            .await
-        {
-            Ok(text) => ToolOutput::success(text),
-            Err(e) => ToolOutput::error(e),
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        // Spawn call_tool as a detached task so that cancellation never drops
+        // the future mid-write while it holds the stdin/stdout mutex locks.
+        // If we cancelled by dropping the select'd future directly, a partial
+        // JSON-RPC write could corrupt the server's stdin stream.
+        let manager = Arc::clone(&self.manager);
+        let server_name = self.server_name.clone();
+        let tool_name = self.tool_name.clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = manager.call_tool(&server_name, &tool_name, input).await;
+            // If the receiver was dropped (cancellation), this send fails silently.
+            let _ = tx.send(result);
+        });
+
+        tokio::select! {
+            biased;
+
+            () = ctx.cancel.cancelled() => {
+                tracing::debug!(
+                    tool = %self.full_name,
+                    "MCP tool call cancelled -- spawned task will complete in background"
+                );
+                ToolOutput::error("[mcp tool call cancelled]")
+            }
+
+            result = rx => {
+                match result {
+                    Ok(Ok(text)) => ToolOutput::success(text),
+                    Ok(Err(e)) => ToolOutput::error(e),
+                    // Spawned task panicked or was aborted
+                    Err(_) => ToolOutput::error("MCP tool call task terminated unexpectedly"),
+                }
+            }
         }
     }
 }
