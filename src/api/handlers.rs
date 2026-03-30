@@ -122,6 +122,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/models", get(list_models))
         // Environment info
         .route("/api/env", get(get_env))
+        // MCP management
+        .route("/api/mcp/reload", post(reload_mcp))
         // Version
         .route("/version", get(get_version))
         .with_state(state)
@@ -2349,6 +2351,19 @@ async fn get_env() -> Json<serde_json::Value> {
 
 async fn get_version() -> &'static str {
     concat!("phoenix-ide ", env!("CARGO_PKG_VERSION"))
+}
+
+/// Reload MCP server configurations: disconnect removed servers,
+/// connect newly added ones, leave existing ones untouched.
+async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
+    let result = state.mcp_manager.reload().await;
+    tracing::info!(
+        added = ?result.added,
+        removed = ?result.removed,
+        unchanged = result.unchanged.len(),
+        "MCP config reloaded"
+    );
+    Json(result)
 }
 
 // ============================================================

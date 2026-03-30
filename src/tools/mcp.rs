@@ -46,6 +46,8 @@ pub struct McpServer {
     spawn_command: String,
     spawn_args: Vec<String>,
     spawn_env: HashMap<String, String>,
+    /// Handle to the stderr drain task -- aborted on shutdown/respawn.
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl McpServer {
@@ -78,7 +80,7 @@ impl McpServer {
             .ok_or_else(|| format!("MCP server '{name}': stdout not captured"))?;
 
         // Drain stderr to debug logs so the child doesn't block on a full pipe.
-        if let Some(stderr) = child.stderr.take() {
+        let stderr_task = child.stderr.take().map(|stderr| {
             let server_name = name.to_string();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -96,8 +98,8 @@ impl McpServer {
                         }
                     }
                 }
-            });
-        }
+            })
+        });
 
         Ok(Self {
             name: name.to_string(),
@@ -109,6 +111,7 @@ impl McpServer {
             spawn_command: command.to_string(),
             spawn_args: args.to_vec(),
             spawn_env: env.clone(),
+            stderr_task,
         })
     }
 
@@ -387,6 +390,10 @@ impl McpServer {
 
     /// Attempt to respawn and reinitialize after a crash.
     async fn respawn(&mut self) -> Result<(), String> {
+        // Abort the old stderr drain task.
+        if let Some(handle) = self.stderr_task.take() {
+            handle.abort();
+        }
         // Kill old process if still somehow alive.
         let _ = self.child.kill().await;
 
@@ -664,6 +671,91 @@ impl McpClientManager {
 
         seen.into_iter().collect()
     }
+
+    /// Re-scan config files and reconcile servers: connect new ones,
+    /// disconnect removed ones, leave unchanged ones alone.
+    ///
+    /// Returns a summary of what changed.
+    pub async fn reload(&self) -> McpReloadResult {
+        let configs = Self::read_all_configs();
+        let config_names: std::collections::HashSet<String> =
+            configs.iter().map(|(n, _)| n.clone()).collect();
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut unchanged = Vec::new();
+
+        // Remove servers no longer in config.
+        {
+            let mut servers = self.servers.write().await;
+            let existing_names: Vec<String> = servers.keys().cloned().collect();
+            for name in existing_names {
+                if !config_names.contains(&name) {
+                    if let Some(mut server) = servers.remove(&name) {
+                        if let Some(handle) = server.stderr_task.take() {
+                            handle.abort();
+                        }
+                        let _ = server.child.kill().await;
+                        tracing::info!(server = %name, "MCP server removed during reload");
+                    }
+                    removed.push(name);
+                }
+            }
+        }
+
+        // Connect new servers (skip those already connected).
+        for (name, entry) in configs {
+            let already_exists = self.servers.read().await.contains_key(&name);
+            if already_exists {
+                unchanged.push(name);
+                continue;
+            }
+
+            match Self::connect_one(&name, &entry).await {
+                Ok(server) => {
+                    let tool_count = server.tools.len();
+                    self.servers.write().await.insert(name.clone(), server);
+                    tracing::info!(
+                        server = %name,
+                        tools = tool_count,
+                        "MCP server connected during reload"
+                    );
+                    added.push(name);
+                }
+                Err(e) => {
+                    tracing::warn!(server = %name, "Failed to connect during reload: {e}");
+                }
+            }
+        }
+
+        McpReloadResult {
+            added,
+            removed,
+            unchanged,
+        }
+    }
+
+    /// Shut down all MCP server processes and abort stderr drain tasks.
+    #[allow(dead_code)] // Available for graceful shutdown integration
+    pub async fn shutdown(&self) {
+        let mut servers = self.servers.write().await;
+        for (name, server) in servers.iter_mut() {
+            if let Some(handle) = server.stderr_task.take() {
+                handle.abort();
+            }
+            let _ = server.child.kill().await;
+            tracing::debug!(server = %name, "MCP server stopped");
+        }
+        servers.clear();
+    }
+}
+
+/// Result of an MCP config reload.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpReloadResult {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub unchanged: Vec<String>,
 }
 
 /// Parsed MCP server configuration from a config file.
