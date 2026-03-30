@@ -191,6 +191,16 @@ impl McpServer {
             }
         }
 
+        // MCP spec supports cursor-based pagination for tools/list.
+        // We don't implement it yet -- log if the server indicates more pages.
+        if resp.get("nextCursor").is_some() {
+            tracing::warn!(
+                server = %self.name,
+                tools_so_far = defs.len(),
+                "tools/list returned nextCursor but pagination is not implemented -- some tools may be missing"
+            );
+        }
+
         self.tools.clone_from(&defs);
         Ok(defs)
     }
@@ -456,6 +466,11 @@ impl McpServer {
 // ---------------------------------------------------------------------------
 
 /// Owns all MCP server connections.
+///
+/// Lock ordering: always acquire `servers` before `disabled_servers`.
+/// Both are tokio `RwLock` and must not be held across heavy `.await`
+/// points (respawn, connect, etc.) -- extract data, drop the lock, then
+/// do async I/O.
 pub struct McpClientManager {
     servers: Arc<RwLock<HashMap<String, McpServer>>>,
     /// Server names whose tools should be excluded from conversations.
@@ -595,13 +610,19 @@ impl McpClientManager {
     ///
     /// Uses a read lock for the happy path so calls to different servers run
     /// concurrently (each `McpServer` serializes its own stdin/stdout internally).
-    /// Only upgrades to a write lock when crash detection + respawn is needed.
+    /// On crash, the crashed server is removed under a brief write lock, then
+    /// respawned with no lock held to avoid blocking all MCP operations.
     pub async fn call_tool(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
     ) -> Result<String, String> {
+        // Check disabled state before attempting the call.
+        if self.disabled_servers.read().await.contains(server_name) {
+            return Err(format!("MCP server '{server_name}' is disabled"));
+        }
+
         // Happy path: read lock -- McpServer.call_tool takes &self.
         let first_result = {
             let servers = self.servers.read().await;
@@ -612,37 +633,60 @@ impl McpClientManager {
         };
 
         match first_result {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                // Upgrade to write lock for crash detection and respawn.
-                let mut servers = self.servers.write().await;
-                let server = servers
-                    .get_mut(server_name)
-                    .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+            Ok(result) => return Ok(result),
+            Err(ref e) => {
+                // Brief write lock: check liveness and extract the crashed
+                // server for out-of-lock respawn.
+                let crashed_server = {
+                    let mut servers = self.servers.write().await;
+                    let server = servers
+                        .get_mut(server_name)
+                        .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
 
-                // Re-check liveness under the write lock. If the process is
-                // alive, either the error was a tool-level failure or another
-                // task already respawned the server while we waited for the lock.
-                if server.is_alive() {
-                    return Err(e);
+                    // If alive, the error is a tool-level failure (not a crash).
+                    // Also covers the case where another task already respawned.
+                    if server.is_alive() {
+                        return Err(e.clone());
+                    }
+
+                    tracing::warn!(
+                        server = %server_name,
+                        error = %e,
+                        "MCP server crashed, removing for respawn"
+                    );
+
+                    // Remove the server so the write lock can be dropped.
+                    servers.remove(server_name)
+                };
+                // Write lock is dropped here.
+
+                // Respawn outside the lock so other servers aren't blocked.
+                if let Some(mut server) = crashed_server {
+                    match server.respawn().await {
+                        Ok(()) => {
+                            // Reinsert under a brief write lock, then retry
+                            // via the read-lock path.
+                            self.servers
+                                .write()
+                                .await
+                                .insert(server_name.to_string(), server);
+                        }
+                        Err(respawn_err) => {
+                            return Err(format!(
+                                "MCP server '{server_name}' crashed and respawn failed: {respawn_err}"
+                            ));
+                        }
+                    }
                 }
-
-                tracing::warn!(
-                    server = %server_name,
-                    error = %e,
-                    "MCP server crashed, attempting respawn"
-                );
-
-                if let Err(respawn_err) = server.respawn().await {
-                    return Err(format!(
-                        "MCP server '{server_name}' crashed and respawn failed: {respawn_err}"
-                    ));
-                }
-
-                // Retry once after successful respawn.
-                server.call_tool(tool_name, arguments).await
             }
         }
+
+        // Retry once via the normal read-lock path after respawn.
+        let servers = self.servers.read().await;
+        let server = servers
+            .get(server_name)
+            .ok_or_else(|| format!("MCP server '{server_name}' respawn succeeded but server not found"))?;
+        server.call_tool(tool_name, arguments).await
     }
 
     /// Spawn and initialize a single MCP server.
