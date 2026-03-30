@@ -12,6 +12,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const [expandedServers, setExpandedServers] = useState<Set<string>>(new Set());
   const [reloading, setReloading] = useState(false);
+  const [togglingServers, setTogglingServers] = useState<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchStatus = useCallback(async () => {
@@ -63,6 +64,27 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
     }
   }, [reloading, fetchStatus, showToast]);
 
+  const handleToggleEnabled = useCallback(async (serverName: string, currentlyEnabled: boolean) => {
+    setTogglingServers(prev => new Set(prev).add(serverName));
+    try {
+      if (currentlyEnabled) {
+        await api.disableMcpServer(serverName);
+      } else {
+        await api.enableMcpServer(serverName);
+      }
+      await fetchStatus();
+      showToast(`${serverName}: ${currentlyEnabled ? 'disabled' : 'enabled'}`, 2000);
+    } catch {
+      showToast(`Failed to ${currentlyEnabled ? 'disable' : 'enable'} ${serverName}`, 3000);
+    } finally {
+      setTogglingServers(prev => {
+        const next = new Set(prev);
+        next.delete(serverName);
+        return next;
+      });
+    }
+  }, [fetchStatus, showToast]);
+
   const toggleServer = useCallback((name: string) => {
     setExpandedServers(prev => {
       const next = new Set(prev);
@@ -75,7 +97,9 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
     });
   }, []);
 
-  const totalTools = servers.reduce((sum, s) => sum + s.tool_count, 0);
+  const enabledServers = servers.filter(s => s.enabled);
+  const totalTools = enabledServers.reduce((sum, s) => sum + s.tool_count, 0);
+  const disabledCount = servers.length - enabledServers.length;
 
   if (servers.length === 0 && !expanded) {
     return null;
@@ -88,7 +112,13 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
         <span className="mcp-panel-summary">
           {servers.length === 0
             ? 'No MCP servers'
-            : `MCP \u00b7 ${servers.length} server${servers.length !== 1 ? 's' : ''} \u00b7 ${totalTools} tool${totalTools !== 1 ? 's' : ''}`}
+            : <>
+                MCP &middot; {servers.length} server{servers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''}
+                {disabledCount > 0 && (
+                  <span className="mcp-disabled-count"> ({disabledCount} off)</span>
+                )}
+              </>
+          }
         </span>
         {servers.length > 0 && (
           <span
@@ -109,7 +139,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
             <div className="mcp-empty">No MCP servers connected</div>
           ) : (
             servers.map(server => (
-              <div key={server.name} className="mcp-server-item">
+              <div key={server.name} className={`mcp-server-item ${!server.enabled ? 'mcp-server-disabled' : ''}`}>
                 <button
                   className="mcp-server-header"
                   onClick={() => toggleServer(server.name)}
@@ -117,15 +147,37 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
                   <span className={`mcp-server-chevron ${expandedServers.has(server.name) ? 'expanded' : ''}`}>
                     &#9654;
                   </span>
-                  <span className="mcp-server-name">{server.name}</span>
+                  <span className={`mcp-server-name ${!server.enabled ? 'mcp-name-disabled' : ''}`}>
+                    {server.name}
+                  </span>
                   <span className="mcp-server-count">
                     {server.tool_count} tool{server.tool_count !== 1 ? 's' : ''}
+                  </span>
+                  <span
+                    className={`mcp-server-toggle ${server.enabled ? 'on' : 'off'} ${togglingServers.has(server.name) ? 'toggling' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    title={server.enabled ? 'Disable server' : 'Enable server'}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!togglingServers.has(server.name)) {
+                        handleToggleEnabled(server.name, server.enabled);
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if ((e.key === 'Enter' || e.key === ' ') && !togglingServers.has(server.name)) {
+                        e.stopPropagation();
+                        handleToggleEnabled(server.name, server.enabled);
+                      }
+                    }}
+                  >
+                    {server.enabled ? '\u25CF' : '\u25CB'}
                   </span>
                 </button>
                 {expandedServers.has(server.name) && (
                   <div className="mcp-tool-list">
                     {server.tools.map(tool => (
-                      <span key={tool} className="mcp-tool-name">{tool}</span>
+                      <span key={tool} className={`mcp-tool-name ${!server.enabled ? 'mcp-tool-disabled' : ''}`}>{tool}</span>
                     ))}
                   </div>
                 )}

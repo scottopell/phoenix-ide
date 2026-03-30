@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(canonical_path);
 ";
 
+/// Migration SQL to create `mcp_disabled_servers` table.
+pub const MIGRATION_CREATE_MCP_DISABLED_SERVERS: &str = r"
+CREATE TABLE IF NOT EXISTS mcp_disabled_servers (
+    server_name TEXT PRIMARY KEY
+);
+";
+
 /// Migration SQL to add `local_id` column for idempotent message sends
 /// Migration to rename `messages.id` to `messages.message_id`
 /// `SQLite` 3.25+ supports ALTER TABLE RENAME COLUMN

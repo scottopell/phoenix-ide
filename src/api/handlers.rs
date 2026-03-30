@@ -125,6 +125,8 @@ pub fn create_router(state: AppState) -> Router {
         // MCP management
         .route("/api/mcp/status", get(mcp_status))
         .route("/api/mcp/reload", post(reload_mcp))
+        .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
+        .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
         // Version
         .route("/version", get(get_version))
         .with_state(state)
@@ -2370,6 +2372,35 @@ async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
         "MCP config reloaded"
     );
     Json(result)
+}
+
+/// Disable an MCP server: its tools are excluded from conversations.
+/// The server stays connected for instant re-enable.
+async fn disable_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = state.db.disable_mcp_server(&name).await {
+        tracing::warn!(server = %name, error = %e, "Failed to persist MCP server disable");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    }
+    state.mcp_manager.disable_server(&name).await;
+    tracing::info!(server = %name, "MCP server disabled");
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// Re-enable a previously disabled MCP server.
+async fn enable_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = state.db.enable_mcp_server(&name).await {
+        tracing::warn!(server = %name, error = %e, "Failed to persist MCP server enable");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    }
+    state.mcp_manager.enable_server(&name).await;
+    tracing::info!(server = %name, "MCP server enabled");
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 // ============================================================

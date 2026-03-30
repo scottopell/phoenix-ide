@@ -219,6 +219,7 @@ export interface McpServerStatus {
   name: string;
   tool_count: number;
   tools: string[];
+  enabled: boolean;
 }
 
 export interface McpReloadResult {
@@ -474,6 +475,16 @@ export const api = {
     const resp = await fetch('/api/mcp/reload', { method: 'POST' });
     if (!resp.ok) throw new Error('Failed to reload MCP servers');
     return resp.json();
+  },
+
+  async disableMcpServer(name: string): Promise<void> {
+    const resp = await fetch(`/api/mcp/servers/${encodeURIComponent(name)}/disable`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to disable MCP server');
+  },
+
+  async enableMcpServer(name: string): Promise<void> {
+    const resp = await fetch(`/api/mcp/servers/${encodeURIComponent(name)}/enable`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to enable MCP server');
   },
 
   streamConversation(

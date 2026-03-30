@@ -35,6 +35,7 @@ pub struct McpServerStatus {
     pub name: String,
     pub tool_count: usize,
     pub tools: Vec<String>,
+    pub enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +458,9 @@ impl McpServer {
 /// Owns all MCP server connections.
 pub struct McpClientManager {
     servers: Arc<RwLock<HashMap<String, McpServer>>>,
+    /// Server names whose tools should be excluded from conversations.
+    /// The servers remain connected for instant re-enable.
+    disabled_servers: RwLock<std::collections::HashSet<String>>,
 }
 
 impl McpClientManager {
@@ -465,7 +469,29 @@ impl McpClientManager {
     pub fn new() -> Self {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
+            disabled_servers: RwLock::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Replace the disabled server set (called at startup with persisted state).
+    pub async fn set_disabled_servers(&self, disabled: std::collections::HashSet<String>) {
+        *self.disabled_servers.write().await = disabled;
+    }
+
+    /// Check whether a server is currently disabled.
+    #[allow(dead_code)] // Public API for future use by health checks / diagnostics
+    pub async fn is_disabled(&self, name: &str) -> bool {
+        self.disabled_servers.read().await.contains(name)
+    }
+
+    /// Add a server to the disabled set.
+    pub async fn disable_server(&self, name: &str) {
+        self.disabled_servers.write().await.insert(name.to_string());
+    }
+
+    /// Remove a server from the disabled set.
+    pub async fn enable_server(&self, name: &str) {
+        self.disabled_servers.write().await.remove(name);
     }
 
     /// Spawn a background task that reads config files and connects to each
@@ -535,22 +561,29 @@ impl McpClientManager {
     /// Return status of all connected MCP servers.
     pub async fn status(&self) -> Vec<McpServerStatus> {
         let servers = self.servers.read().await;
+        let disabled = self.disabled_servers.read().await;
         servers
             .iter()
             .map(|(name, server)| McpServerStatus {
                 name: name.clone(),
                 tool_count: server.tools.len(),
                 tools: server.tools.iter().map(|t| t.name.clone()).collect(),
+                enabled: !disabled.contains(name),
             })
             .collect()
     }
 
     /// Return (`server_name`, `tool_def`) pairs for all currently connected servers.
-    /// May return an empty list if background discovery hasn't finished yet.
+    /// Disabled servers are excluded. May return an empty list if background
+    /// discovery hasn't finished yet.
     pub async fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
         let servers = self.servers.read().await;
+        let disabled = self.disabled_servers.read().await;
         let mut out = Vec::new();
         for (server_name, server) in servers.iter() {
+            if disabled.contains(server_name) {
+                continue;
+            }
             for tool in &server.tools {
                 out.push((server_name.clone(), tool.clone()));
             }

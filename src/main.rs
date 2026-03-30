@@ -31,6 +31,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod hot_restart;
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::registry()
@@ -93,6 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create MCP manager and start background server discovery (non-blocking).
     // Servers connect in parallel; tools become available as each finishes.
     let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+
+    // Load persisted disabled-server set before discovery starts.
+    let disabled = db.get_disabled_mcp_servers().await.unwrap_or_default();
+    if !disabled.is_empty() {
+        tracing::info!(count = disabled.len(), servers = ?disabled, "Loaded disabled MCP servers from DB");
+    }
+    mcp_manager.set_disabled_servers(disabled).await;
+
     mcp_manager.start_background_discovery();
 
     // Create application state

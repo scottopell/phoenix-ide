@@ -43,6 +43,11 @@
   text-overflow: ellipsis;
 }
 
+.mcp-disabled-count {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
 .mcp-panel-reload {
   display: flex;
   align-items: center;
@@ -84,6 +89,10 @@
   padding: 2px 0;
 }
 
+.mcp-server-item.mcp-server-disabled {
+  opacity: 0.6;
+}
+
 .mcp-server-header {
   display: flex;
   align-items: center;
@@ -116,11 +125,51 @@
 .mcp-server-name {
   font-weight: 500;
   color: var(--text-primary);
+  transition: color 200ms ease;
+}
+
+.mcp-server-name.mcp-name-disabled {
+  text-decoration: line-through;
+  color: var(--text-muted);
 }
 
 .mcp-server-count {
   color: var(--text-muted);
   margin-left: auto;
+}
+
+.mcp-server-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  flex-shrink: 0;
+  transition: color 200ms ease, opacity 200ms ease;
+}
+
+.mcp-server-toggle.on {
+  color: var(--color-success, #4caf50);
+}
+
+.mcp-server-toggle.off {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.mcp-server-toggle:hover {
+  opacity: 1;
+}
+
+.mcp-server-toggle.toggling {
+  pointer-events: none;
+  opacity: 0.4;
 }
 
 .mcp-tool-list {
@@ -134,6 +183,11 @@
   color: var(--text-muted);
   font-size: 11px;
   font-family: var(--font-mono, monospace);
+}
+
+.mcp-tool-name.mcp-tool-disabled {
+  opacity: 0.5;
+  text-decoration: line-through;
 }
 
 .mcp-empty {

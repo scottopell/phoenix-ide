@@ -6,8 +6,8 @@ mod schema;
 
 pub use schema::*;
 use schema::{
-    MIGRATION_CREATE_PROJECTS, MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID,
-    MIGRATION_TYPED_STATE,
+    MIGRATION_CREATE_MCP_DISABLED_SERVERS, MIGRATION_CREATE_PROJECTS,
+    MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
 };
 
 use chrono::{DateTime, Utc};
@@ -112,6 +112,40 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Create mcp_disabled_servers table (idempotent via IF NOT EXISTS)
+        let _ = sqlx::raw_sql(MIGRATION_CREATE_MCP_DISABLED_SERVERS)
+            .execute(&self.pool)
+            .await;
+
+        Ok(())
+    }
+
+    // ==================== MCP Disabled Servers ====================
+
+    /// Return the set of MCP server names that have been disabled.
+    pub async fn get_disabled_mcp_servers(&self) -> DbResult<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT server_name FROM mcp_disabled_servers")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
+    /// Mark an MCP server as disabled (idempotent).
+    pub async fn disable_mcp_server(&self, name: &str) -> DbResult<()> {
+        sqlx::query("INSERT OR IGNORE INTO mcp_disabled_servers (server_name) VALUES (?1)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Re-enable an MCP server by removing it from the disabled set.
+    pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
