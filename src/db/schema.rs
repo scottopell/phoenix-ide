@@ -127,11 +127,11 @@ pub enum ConvMode {
         /// rows with empty `base_branch` to Explore.
         #[serde(default)]
         base_branch: String,
-        /// The task number assigned at approval time (e.g., 42).
+        /// The task ID assigned at approval time (e.g., "YF042").
         /// Used to locate and update the task file in `tasks/`.
         /// `#[serde(default)]` is a rollout shim for existing Work rows.
         #[serde(default)]
-        task_number: u32,
+        task_id: String,
     },
 }
 
@@ -169,11 +169,11 @@ impl ConvMode {
         }
     }
 
-    /// The task number if in Work mode, None otherwise.
+    /// The task ID if in Work mode, None otherwise.
     #[allow(dead_code)] // Used by M4 Complete/Abandon flows (task 0604)
-    pub fn task_number(&self) -> Option<u32> {
+    pub fn task_id(&self) -> Option<&str> {
         match self {
-            Self::Work { task_number, .. } => Some(*task_number),
+            Self::Work { task_id, .. } => Some(task_id),
             Self::Explore | Self::Standalone => None,
         }
     }

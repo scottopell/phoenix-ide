@@ -1155,17 +1155,17 @@ async fn complete_task(
         ));
     }
 
-    let (branch_name, worktree_path, base_branch, task_number) = match &conv.conv_mode {
+    let (branch_name, worktree_path, base_branch, task_id) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
             base_branch,
-            task_number,
+            task_id,
         } => (
             branch_name.clone(),
             worktree_path.clone(),
             base_branch.clone(),
-            *task_number,
+            task_id.clone(),
         ),
         _ => {
             return Err(AppError::BadRequest(
@@ -1261,7 +1261,7 @@ async fn complete_task(
     let diff_content = prechecks?;
 
     // 3. Task file nudge check
-    let task_not_done = check_task_file_status(&PathBuf::from(&worktree_path), task_number);
+    let task_not_done = check_task_file_status(&PathBuf::from(&worktree_path), &task_id);
 
     // 4. Generate commit message via LLM
     let model_id = conv
@@ -1507,13 +1507,13 @@ async fn confirm_complete(
 
 /// Check if the task file for a given task number has status `done`.
 /// Returns true if the task file exists and its status is NOT done.
-fn check_task_file_status(worktree_path: &std::path::Path, task_number: u32) -> bool {
+fn check_task_file_status(worktree_path: &std::path::Path, task_id: &str) -> bool {
     let tasks_dir = worktree_path.join("tasks");
     if !tasks_dir.exists() {
         return false;
     }
 
-    let prefix = format!("{task_number:04}-");
+    let prefix = format!("{task_id}-");
     let Ok(entries) = std::fs::read_dir(&tasks_dir) else {
         return false;
     };
@@ -1569,17 +1569,17 @@ async fn abandon_task(
         ));
     }
 
-    let (branch_name, worktree_path, base_branch, task_number) = match &conv.conv_mode {
+    let (branch_name, worktree_path, base_branch, task_id) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
             base_branch,
-            task_number,
+            task_id,
         } => (
             branch_name.clone(),
             worktree_path.clone(),
             base_branch.clone(),
-            *task_number,
+            task_id.clone(),
         ),
         _ => {
             return Err(AppError::BadRequest(
@@ -1649,7 +1649,7 @@ async fn abandon_task(
 
         // Scan tasks/ for matching task file and rename to wont-do
         let tasks_dir = repo_root_clone.join("tasks");
-        let prefix = format!("{task_number:04}-");
+        let prefix = format!("{task_id}-");
 
         let mut found_file = None;
         if tasks_dir.exists() {
@@ -1670,7 +1670,7 @@ async fn abandon_task(
         }
 
         if let Some(old_filename) = found_file {
-            // Parse: everything before `--` is `NNNN-pX-status`, everything after is `slug.md`
+            // Parse: everything before `--` is `AANNN-pX-status`, everything after is `slug.md`
             if let Some(double_dash_pos) = old_filename.find("--") {
                 let before_dd = &old_filename[..double_dash_pos];
                 let after_dd = &old_filename[double_dash_pos..]; // includes "--slug.md"
@@ -1692,11 +1692,7 @@ async fn abandon_task(
                         );
                     } else if let Err(e) = run_git(
                         &repo_root_clone,
-                        &[
-                            "commit",
-                            "-m",
-                            &format!("task {task_number:04}: mark wont-do"),
-                        ],
+                        &["commit", "-m", &format!("task {task_id}: mark wont-do")],
                     ) {
                         tracing::warn!(
                             error = %e,
@@ -1708,7 +1704,7 @@ async fn abandon_task(
                 } else {
                     tracing::warn!(
                         filename = %old_filename,
-                        "Task filename does not match expected NNNN-pX-status--slug.md format"
+                        "Task filename does not match expected AANNN-pX-status--slug.md format"
                     );
                 }
             } else {
@@ -1719,7 +1715,7 @@ async fn abandon_task(
             }
         } else {
             tracing::warn!(
-                task_number = task_number,
+                task_id = task_id,
                 "No task file found for task number (may have been manually deleted)"
             );
         }

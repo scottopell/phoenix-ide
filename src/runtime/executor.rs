@@ -1369,7 +1369,7 @@ where
                     branch_name: approval_result.branch_name.clone(),
                     worktree_path: approval_result.worktree_path.clone(),
                     base_branch: approval_result.base_branch.clone(),
-                    task_number: approval_result.task_number,
+                    task_id: approval_result.task_id.clone(),
                 };
                 storage
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)
@@ -1393,7 +1393,7 @@ where
                 self.tool_executor.upgrade_to_work_mode();
 
                 tracing::info!(
-                    task_id = approval_result.task_number,
+                    task_id = %approval_result.task_id,
                     branch = %approval_result.branch_name,
                     worktree = %approval_result.worktree_path,
                     first_task = approval_result.first_task,
@@ -1455,7 +1455,7 @@ where
 
 /// Result of a successful task approval
 struct TaskApprovalResult {
-    task_number: u32,
+    task_id: String,
     branch_name: String,
     first_task: bool,
     /// Absolute path to the git worktree created for this conversation
@@ -1486,25 +1486,24 @@ fn derive_slug(title: &str) -> String {
     truncated.trim_end_matches('-').to_string()
 }
 
-/// Scan `tasks/` directory for the highest existing task number (NNNN prefix).
-fn scan_highest_task_number(tasks_dir: &std::path::Path) -> u32 {
-    let Ok(entries) = std::fs::read_dir(tasks_dir) else {
-        return 0;
-    };
-    let mut max_num: u32 = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Extract leading digits (up to 4)
-        if let Some(num_str) = name.split('-').next() {
-            if let Ok(n) = num_str.parse::<u32>() {
-                if n > max_num {
-                    max_num = n;
-                }
-            }
+/// Get the next task ID by shelling out to `taskmd next`.
+/// Returns an ID like "YF042". Falls back to timestamp-based ID if taskmd is unavailable.
+fn get_next_task_id(cwd: &std::path::Path) -> Result<String, String> {
+    let output = std::process::Command::new("taskmd")
+        .args(["next", "--output", "text"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to run taskmd next: {e}"))?;
+    if output.status.success() {
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if id.is_empty() {
+            return Err("taskmd next returned empty ID".to_string());
         }
+        Ok(id)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("taskmd next failed: {stderr}"))
     }
-    max_num
 }
 
 /// Run a git command in the given directory, returning stdout on success or an error message.
@@ -1560,8 +1559,8 @@ fn execute_approve_task_blocking(
     // Track whether tasks/ existed before we create it
     let first_task = !tasks_dir.exists();
 
-    // 2. Assign task ID (scan for highest existing number)
-    let next_number = scan_highest_task_number(&tasks_dir) + 1;
+    // 2. Assign task ID via taskmd
+    let task_id = get_next_task_id(cwd)?;
 
     // 3. Create tasks/ directory if needed
     if first_task {
@@ -1576,25 +1575,18 @@ fn execute_approve_task_blocking(
         return Err("Cannot derive a valid slug from the task title".to_string());
     }
 
-    // 5. Write task file
-    let filename = format!("{next_number:04}-{priority}-in-progress--{slug}.md");
+    // 5. Write task file (taskmd format: AANNN-pX-status--slug.md)
+    let filename = format!("{task_id}-{priority}-in-progress--{slug}.md");
     let filepath = tasks_dir.join(&filename);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let branch_name = format!("task-{next_number:04}-{slug}");
-
-    // Escape double quotes in title for YAML frontmatter
-    let escaped_title = title.replace('"', r#"\""#);
+    let branch_name = format!("task-{task_id}-{slug}");
 
     let task_content = format!(
         "---\n\
          created: {today}\n\
-         number: {next_number}\n\
          priority: {priority}\n\
          status: in-progress\n\
-         slug: {slug}\n\
-         title: \"{escaped_title}\"\n\
-         branch: {branch_name}\n\
-         conversation: {conv_id}\n\
+         artifact: pending\n\
          ---\n\
          \n\
          # {title}\n\
@@ -1646,7 +1638,7 @@ fn execute_approve_task_blocking(
     // 6. Git commit the task file (and .gitignore if modified)
     let relative_path = format!("tasks/{filename}");
     run_git(cwd, &["add", &relative_path])?;
-    let commit_msg = format!("task {next_number:04}: {title}");
+    let commit_msg = format!("task {task_id}: {title}");
     // Use `git commit` without `--only` so both staged files are included
     run_git(cwd, &["commit", "-m", &commit_msg])?;
     tracing::info!(commit_msg = %commit_msg, "Task file committed");
@@ -1686,7 +1678,7 @@ fn execute_approve_task_blocking(
     );
 
     Ok(TaskApprovalResult {
-        task_number: next_number,
+        task_id,
         branch_name,
         first_task,
         worktree_path: worktree_path_str,
