@@ -113,7 +113,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
           {servers.length === 0
             ? 'No MCP servers'
             : <>
-                MCP &middot; {servers.length} server{servers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''}
+                MCP &middot; {servers.length} server{servers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
                 {disabledCount > 0 && (
                   <span className="mcp-disabled-count"> ({disabledCount} off)</span>
                 )}

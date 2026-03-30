@@ -472,6 +472,17 @@ impl ToolExecutor for ToolRegistryExecutor {
             }
         }
 
+        if defs.len() > 50 {
+            let deferred = defs.iter().filter(|d| d.defer_loading).count();
+            if deferred == 0 {
+                tracing::warn!(
+                    total = defs.len(),
+                    "Tool count exceeds 50 with no deferred tools -- accuracy may degrade. \
+                     Consider disabling unused MCP servers or using a model that supports tool search."
+                );
+            }
+        }
+
         defs
     }
 
