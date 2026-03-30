@@ -273,6 +273,7 @@ impl ToolRegistry {
                 name: t.name().to_string(),
                 description: t.description(),
                 input_schema: t.input_schema(),
+                defer_loading: false,
             })
             .collect()
     }

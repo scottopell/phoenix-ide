@@ -99,6 +99,7 @@ impl MockToolExecutor {
             name: name.clone(),
             description: format!("Mock {name}"),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            defer_loading: false,
         });
         self.outputs.insert(name, output);
         self

@@ -54,6 +54,8 @@ pub struct ModelSpec {
     pub context_window: usize,
     /// Recommended for most users (shown by default in UI)
     pub recommended: bool,
+    /// Whether this model supports Anthropic's tool search feature
+    pub supports_tool_search: bool,
 }
 
 /// Get all available model specifications
@@ -70,6 +72,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Opus 4.6 (most capable, slower)".into(),
             context_window: 200_000,
             recommended: true,
+            supports_tool_search: true,
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
@@ -79,6 +82,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Sonnet 4.6 (balanced performance)".into(),
             context_window: 200_000,
             recommended: true,
+            supports_tool_search: true,
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
@@ -88,6 +92,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
             recommended: true,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "claude-opus-4-5".into(),
@@ -97,6 +102,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Opus 4.5 (legacy)".into(),
             context_window: 200_000,
             recommended: false,
+            supports_tool_search: true,
         },
         // OpenAI models
         ModelSpec {
@@ -107,6 +113,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-4o (balanced, multimodal)".into(),
             context_window: 128_000,
             recommended: true,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "gpt-4o-mini".into(),
@@ -116,6 +123,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-4o Mini (fast, efficient)".into(),
             context_window: 128_000,
             recommended: false,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "o4-mini".into(),
@@ -125,6 +133,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "O4-Mini (reasoning model)".into(),
             context_window: 200_000,
             recommended: true,
+            supports_tool_search: false,
         },
         // GPT-5 models
         ModelSpec {
@@ -135,6 +144,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5 (reasoning model)".into(),
             context_window: 128_000,
             recommended: true,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "gpt-5-mini".into(),
@@ -144,6 +154,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5 Mini (fast reasoning)".into(),
             context_window: 128_000,
             recommended: false,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "gpt-5.1".into(),
@@ -153,6 +164,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5.1 (latest GPT-5)".into(),
             context_window: 128_000,
             recommended: false,
+            supports_tool_search: false,
         },
         // GPT-5 Codex models (responses API)
         ModelSpec {
@@ -163,6 +175,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5 Codex (code generation)".into(),
             context_window: 200_000,
             recommended: false,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "gpt-5.1-codex".into(),
@@ -172,6 +185,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5.1 Codex (advanced code)".into(),
             context_window: 200_000,
             recommended: false,
+            supports_tool_search: false,
         },
         ModelSpec {
             id: "gpt-5.2-codex".into(),
@@ -181,6 +195,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5.2 Codex (latest code model)".into(),
             context_window: 200_000,
             recommended: true,
+            supports_tool_search: false,
         },
     ]
 }

@@ -467,6 +467,7 @@ impl ToolExecutor for ToolRegistryExecutor {
                     name: full_name,
                     description: tool_def.description,
                     input_schema: tool_def.input_schema,
+                    defer_loading: true,
                 });
             }
         }

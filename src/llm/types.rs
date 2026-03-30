@@ -108,6 +108,9 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Whether this tool should use Anthropic's deferred loading (zero context
+    /// tokens until discovered via tool search).
+    pub defer_loading: bool,
 }
 
 /// LLM response
