@@ -326,8 +326,14 @@ def start_phoenix(port: int, release: bool = True):
         sys.exit(1)
 
     env = os.environ.copy()
-    if gateway := get_llm_gateway():
-        env["LLM_GATEWAY"] = gateway
+    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
+    env_file = _load_env_file(env)
+    if env_file:
+        print(f"  Loaded env from {env_file}")
+    # Auto-detect gateway only if .phoenix-ide.env didn't provide LLM config
+    if not env.get("LLM_API_KEY_HELPER") and not env.get("LLM_GATEWAY"):
+        if gateway := get_llm_gateway():
+            env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
     # Default to debug logging in dev, can be overridden via RUST_LOG env var
