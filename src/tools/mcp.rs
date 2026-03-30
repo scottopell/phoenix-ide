@@ -29,6 +29,14 @@ pub struct McpToolDef {
     pub input_schema: Value,
 }
 
+/// Status of one connected MCP server (for API responses).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub tool_count: usize,
+    pub tools: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // McpServer
 // ---------------------------------------------------------------------------
@@ -522,6 +530,19 @@ impl McpClientManager {
                 "Discovered {total_tools} MCP tools from {connected_servers} servers",
             );
         });
+    }
+
+    /// Return status of all connected MCP servers.
+    pub async fn status(&self) -> Vec<McpServerStatus> {
+        let servers = self.servers.read().await;
+        servers
+            .iter()
+            .map(|(name, server)| McpServerStatus {
+                name: name.clone(),
+                tool_count: server.tools.len(),
+                tools: server.tools.iter().map(|t| t.name.clone()).collect(),
+            })
+            .collect()
     }
 
     /// Return (`server_name`, `tool_def`) pairs for all currently connected servers.

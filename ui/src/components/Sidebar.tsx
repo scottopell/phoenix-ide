@@ -6,6 +6,7 @@ import { ConversationList } from './ConversationList';
 import { SidebarNewForm } from './SidebarNewForm';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
+import { McpStatusPanel } from './McpStatusPanel';
 
 interface SidebarProps {
   collapsed: boolean;
@@ -215,6 +216,7 @@ export function Sidebar({
           sidebarMode
         />
       </div>
+      <McpStatusPanel showToast={showToast} />
       <ConfirmDialog
         visible={deleteTarget !== null}
         title="Delete Conversation"

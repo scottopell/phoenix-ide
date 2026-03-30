@@ -215,6 +215,18 @@ export class ExpansionError extends Error {
   }
 }
 
+export interface McpServerStatus {
+  name: string;
+  tool_count: number;
+  tools: string[];
+}
+
+export interface McpReloadResult {
+  added: string[];
+  removed: string[];
+  unchanged: string[];
+}
+
 export const api = {
   async getProjects(): Promise<Project[]> {
     const resp = await fetch('/api/projects');
@@ -449,6 +461,18 @@ export const api = {
       body: JSON.stringify({ annotations }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to send feedback'); }
+    return resp.json();
+  },
+
+  async getMcpStatus(): Promise<McpServerStatus[]> {
+    const resp = await fetch('/api/mcp/status');
+    if (!resp.ok) throw new Error('Failed to get MCP status');
+    return resp.json();
+  },
+
+  async reloadMcp(): Promise<McpReloadResult> {
+    const resp = await fetch('/api/mcp/reload', { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to reload MCP servers');
     return resp.json();
   },
 
