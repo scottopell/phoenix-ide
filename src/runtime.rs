@@ -484,7 +484,9 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
 
-        // Use appropriate tool registry based on sub-agent status and conversation mode
+        // Use appropriate tool registry based on sub-agent status and conversation mode.
+        // Sub-agents get a restricted tool set (no MCP, no spawn_agents) -- they only
+        // have SubmitResult/SubmitError for completion signaling.
         let tool_executor = if is_sub_agent {
             ToolRegistryExecutor::new(ToolRegistry::for_subagent())
         } else {

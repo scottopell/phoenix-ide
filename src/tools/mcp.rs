@@ -64,7 +64,8 @@ impl McpServer {
             .envs(env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
@@ -194,6 +195,12 @@ impl McpServer {
 
         let resp = self.send_request("tools/call", params).await?;
 
+        // MCP tools/call can signal failure via isError at the result level.
+        let is_error = resp
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         // Extract text from content blocks.
         let content = resp
             .get("content")
@@ -208,15 +215,30 @@ impl McpServer {
         let text: Vec<&str> = content
             .iter()
             .filter_map(|block| {
-                if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    block.get("text").and_then(|v| v.as_str())
-                } else {
-                    None
+                let block_type = block.get("type").and_then(|v| v.as_str());
+                match block_type {
+                    Some("text") => block.get("text").and_then(|v| v.as_str()),
+                    Some(other) => {
+                        tracing::debug!(
+                            server = %self.name,
+                            tool = %tool_name,
+                            block_type = other,
+                            "Dropping non-text MCP content block"
+                        );
+                        None
+                    }
+                    None => None,
                 }
             })
             .collect();
 
-        Ok(text.join("\n"))
+        let output = text.join("\n");
+
+        if is_error {
+            Err(output)
+        } else {
+            Ok(output)
+        }
     }
 
     /// Send a JSON-RPC request and read the response with a timeout.
@@ -517,24 +539,34 @@ impl McpClientManager {
 
     /// Route a tool call to the correct server.
     ///
-    /// Takes a write lock because a crashed server triggers an in-place respawn.
+    /// Uses a read lock for the happy path so calls to different servers run
+    /// concurrently (each `McpServer` serializes its own stdin/stdout internally).
+    /// Only upgrades to a write lock when crash detection + respawn is needed.
     pub async fn call_tool(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
     ) -> Result<String, String> {
-        let mut servers = self.servers.write().await;
-        let server = servers
-            .get_mut(server_name)
-            .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+        // Happy path: read lock -- McpServer.call_tool takes &self.
+        let first_result = {
+            let servers = self.servers.read().await;
+            let server = servers
+                .get(server_name)
+                .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+            server.call_tool(tool_name, arguments.clone()).await
+        };
 
-        // First attempt.
-        match server.call_tool(tool_name, arguments.clone()).await {
+        match first_result {
             Ok(result) => Ok(result),
             Err(e) => {
-                // Only attempt respawn if the process is dead. If the process is
-                // alive, the error is a tool-level failure -- propagate it as-is.
+                // Upgrade to write lock for crash detection and respawn.
+                let mut servers = self.servers.write().await;
+                let server = servers
+                    .get_mut(server_name)
+                    .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+
+                // If the process is alive, the error is a tool-level failure.
                 if server.is_alive() {
                     return Err(e);
                 }
@@ -589,7 +621,7 @@ impl McpClientManager {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         path = %path.display(),
                         "Failed to read MCP config: {e}"
                     );
@@ -600,7 +632,7 @@ impl McpClientManager {
             let parsed: Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         path = %path.display(),
                         "Failed to parse MCP config: {e}"
                     );
