@@ -683,9 +683,9 @@ impl McpClientManager {
 
         // Retry once via the normal read-lock path after respawn.
         let servers = self.servers.read().await;
-        let server = servers
-            .get(server_name)
-            .ok_or_else(|| format!("MCP server '{server_name}' respawn succeeded but server not found"))?;
+        let server = servers.get(server_name).ok_or_else(|| {
+            format!("MCP server '{server_name}' respawn succeeded but server not found")
+        })?;
         server.call_tool(tool_name, arguments).await
     }
 

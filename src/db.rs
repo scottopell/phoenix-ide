@@ -124,10 +124,9 @@ impl Database {
 
     /// Return the set of MCP server names that have been disabled.
     pub async fn get_disabled_mcp_servers(&self) -> DbResult<std::collections::HashSet<String>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT server_name FROM mcp_disabled_servers")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT server_name FROM mcp_disabled_servers")
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 

@@ -393,7 +393,10 @@ impl ToolRegistryExecutor {
     /// Create an executor with built-in tools + live MCP tool resolution.
     /// MCP tools are resolved from the manager on every `definitions()` and
     /// `execute()` call, so enable/disable and reload take effect immediately.
-    pub fn with_mcp(registry: ToolRegistry, manager: Arc<crate::tools::mcp::McpClientManager>) -> Self {
+    pub fn with_mcp(
+        registry: ToolRegistry,
+        manager: Arc<crate::tools::mcp::McpClientManager>,
+    ) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: Some(manager),

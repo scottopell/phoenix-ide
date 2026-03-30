@@ -137,7 +137,10 @@ impl StreamAccumulator {
             }
             other => {
                 // tool_search_tool_result, web_search_tool_result, etc.
-                tracing::debug!(block_type = other, "Streaming: skipping server-handled block");
+                tracing::debug!(
+                    block_type = other,
+                    "Streaming: skipping server-handled block"
+                );
             }
         }
     }
@@ -415,8 +418,7 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     let messages: Vec<AnthropicMessage> = request.messages.iter().map(translate_message).collect();
 
-    let has_deferred = spec.supports_tool_search
-        && request.tools.iter().any(|t| t.defer_loading);
+    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
     let mut tools: Vec<AnthropicToolEntry> = request
         .tools
@@ -434,10 +436,7 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
     // Inject tool search tool when deferred tools exist
     if has_deferred {
         let mut variant_map = std::collections::HashMap::new();
-        variant_map.insert(
-            TOOL_SEARCH_VARIANT.to_string(),
-            serde_json::json!({}),
-        );
+        variant_map.insert(TOOL_SEARCH_VARIANT.to_string(), serde_json::json!({}));
         tools.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
             r#type: "tool_search".to_string(),
             name: "tool_search".to_string(),
@@ -814,7 +813,9 @@ mod tests {
 
         // No tool_search type present
         assert!(
-            !tools.iter().any(|t| t.get("type").and_then(|v| v.as_str()) == Some("tool_search")),
+            !tools
+                .iter()
+                .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("tool_search")),
             "tool_search entry should not be present when supports_tool_search is false"
         );
     }
@@ -888,12 +889,14 @@ mod tests {
     #[test]
     fn test_normalize_response_unknown_blocks() {
         // Deserialize a block type we don't recognize -- should become Unknown
-        let json = r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {}}"#;
+        let json =
+            r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {}}"#;
         let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
         assert!(matches!(block, AnthropicContentBlock::Unknown));
 
         // Also verify web_search_tool_result falls through
-        let json2 = r#"{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_456", "content": {}}"#;
+        let json2 =
+            r#"{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_456", "content": {}}"#;
         let block2: AnthropicContentBlock = serde_json::from_str(json2).unwrap();
         assert!(matches!(block2, AnthropicContentBlock::Unknown));
     }
@@ -901,13 +904,11 @@ mod tests {
     #[test]
     fn test_normalize_response_only_server_blocks_with_end_turn() {
         let resp = AnthropicResponse {
-            content: vec![
-                AnthropicContentBlock::ServerToolUse {
-                    id: "srvtoolu_abc".to_string(),
-                    name: "tool_search".to_string(),
-                    input: serde_json::json!({}),
-                },
-            ],
+            content: vec![AnthropicContentBlock::ServerToolUse {
+                id: "srvtoolu_abc".to_string(),
+                name: "tool_search".to_string(),
+                input: serde_json::json!({}),
+            }],
             stop_reason: Some("end_turn".to_string()),
             usage: AnthropicUsage {
                 input_tokens: 100,

@@ -2382,7 +2382,11 @@ async fn disable_mcp_server(
 ) -> impl IntoResponse {
     if let Err(e) = state.db.disable_mcp_server(&name).await {
         tracing::warn!(server = %name, error = %e, "Failed to persist MCP server disable");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     state.mcp_manager.disable_server(&name).await;
     tracing::info!(server = %name, "MCP server disabled");
@@ -2396,7 +2400,11 @@ async fn enable_mcp_server(
 ) -> impl IntoResponse {
     if let Err(e) = state.db.enable_mcp_server(&name).await {
         tracing::warn!(server = %name, error = %e, "Failed to persist MCP server enable");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     state.mcp_manager.enable_server(&name).await;
     tracing::info!(server = %name, "MCP server enabled");
