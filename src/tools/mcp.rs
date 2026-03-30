@@ -36,13 +36,16 @@ pub struct McpToolDef {
 /// Manages one stdio MCP server subprocess with JSON-RPC 2.0 communication.
 pub struct McpServer {
     name: String,
-    #[allow(dead_code)] // Holds ownership of child process; dropping it would kill the server
     child: Child,
     /// Locked together with `stdout` for request-response serialization.
     stdin: Mutex<BufWriter<ChildStdin>>,
     stdout: Mutex<BufReader<ChildStdout>>,
     next_id: AtomicU64,
     tools: Vec<McpToolDef>,
+    // Spawn config retained for respawning after crashes.
+    spawn_command: String,
+    spawn_args: Vec<String>,
+    spawn_env: HashMap<String, String>,
 }
 
 impl McpServer {
@@ -103,6 +106,9 @@ impl McpServer {
             stdout: Mutex::new(BufReader::new(child_stdout)),
             next_id: AtomicU64::new(1),
             tools: Vec::new(),
+            spawn_command: command.to_string(),
+            spawn_args: args.to_vec(),
+            spawn_env: env.clone(),
         })
     }
 
@@ -356,10 +362,36 @@ impl McpServer {
     }
 
     /// Check whether the child process is still running.
-    #[allow(dead_code)] // Useful diagnostic; will be wired into /status endpoint
     pub fn is_alive(&mut self) -> bool {
         // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Attempt to respawn and reinitialize after a crash.
+    async fn respawn(&mut self) -> Result<(), String> {
+        // Kill old process if still somehow alive.
+        let _ = self.child.kill().await;
+
+        // Re-spawn with the same config.
+        let mut new_server = McpServer::spawn(
+            &self.name,
+            &self.spawn_command,
+            &self.spawn_args,
+            &self.spawn_env,
+        )
+        .await?;
+
+        new_server.initialize().await?;
+        new_server.list_tools().await?;
+
+        tracing::info!(
+            server = %self.name,
+            tools = new_server.tools.len(),
+            "MCP server respawned"
+        );
+
+        *self = new_server;
+        Ok(())
     }
 }
 
@@ -459,17 +491,45 @@ impl McpClientManager {
     }
 
     /// Route a tool call to the correct server.
+    ///
+    /// Takes a write lock because a crashed server triggers an in-place respawn.
     pub async fn call_tool(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
     ) -> Result<String, String> {
-        let servers = self.servers.read().await;
+        let mut servers = self.servers.write().await;
         let server = servers
-            .get(server_name)
+            .get_mut(server_name)
             .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
-        server.call_tool(tool_name, arguments).await
+
+        // First attempt.
+        match server.call_tool(tool_name, arguments.clone()).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Only attempt respawn if the process is dead. If the process is
+                // alive, the error is a tool-level failure -- propagate it as-is.
+                if server.is_alive() {
+                    return Err(e);
+                }
+
+                tracing::warn!(
+                    server = %server_name,
+                    error = %e,
+                    "MCP server crashed, attempting respawn"
+                );
+
+                if let Err(respawn_err) = server.respawn().await {
+                    return Err(format!(
+                        "MCP server '{server_name}' crashed and respawn failed: {respawn_err}"
+                    ));
+                }
+
+                // Retry once after successful respawn.
+                server.call_tool(tool_name, arguments).await
+            }
+        }
     }
 
     /// Spawn and initialize a single MCP server.
