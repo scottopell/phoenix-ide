@@ -105,22 +105,40 @@ impl StreamAccumulator {
             .pointer("/content_block/type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("text");
-        self.current_index = Some(idx);
-        self.current_is_text = block_type == "text";
-        if self.current_is_text {
-            self.current_text.clear();
-        } else {
-            self.current_tool_id = v
-                .pointer("/content_block/id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.current_tool_name = v
-                .pointer("/content_block/name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.current_tool_json.clear();
+
+        match block_type {
+            "text" => {
+                self.current_index = Some(idx);
+                self.current_is_text = true;
+                self.current_text.clear();
+            }
+            "tool_use" => {
+                self.current_index = Some(idx);
+                self.current_is_text = false;
+                self.current_tool_id = v
+                    .pointer("/content_block/id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_name = v
+                    .pointer("/content_block/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_json.clear();
+            }
+            "server_tool_use" => {
+                // Server-side execution -- log but don't accumulate.
+                let name = v
+                    .pointer("/content_block/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                tracing::debug!(name, "Streaming: server_tool_use block (skipping)");
+            }
+            other => {
+                // tool_search_tool_result, web_search_tool_result, etc.
+                tracing::debug!(block_type = other, "Streaming: skipping server-handled block");
+            }
         }
     }
 
@@ -504,6 +522,7 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
 pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
     let raw_block_count = resp.content.len();
+    let mut server_handled_count: usize = 0;
 
     for block in resp.content {
         match block {
@@ -525,6 +544,14 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
                     "Unexpected tool_result block in Anthropic response",
                 ));
             }
+            AnthropicContentBlock::ServerToolUse { name, .. } => {
+                tracing::debug!(name = %name, "Server tool use in response (handled by API)");
+                server_handled_count += 1;
+            }
+            AnthropicContentBlock::Unknown => {
+                tracing::debug!("Skipping unknown content block type in response");
+                server_handled_count += 1;
+            }
         }
     }
 
@@ -541,11 +568,12 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
             stop_reason = ?resp.stop_reason,
             output_tokens = resp.usage.output_tokens,
             raw_block_count = raw_block_count,
+            server_handled_count = server_handled_count,
             "Anthropic returned empty content without end_turn"
         );
         return Err(LlmError::invalid_response(format!(
-            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
-            resp.stop_reason, resp.usage.output_tokens, raw_block_count
+            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={}, server_handled={})",
+            resp.stop_reason, resp.usage.output_tokens, raw_block_count, server_handled_count
         )));
     }
 
@@ -554,6 +582,7 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
             stop_reason = ?resp.stop_reason,
             output_tokens = resp.usage.output_tokens,
             raw_block_count = raw_block_count,
+            server_handled_count = server_handled_count,
             "Anthropic end_turn with empty content — model has nothing to say"
         );
     }
@@ -624,6 +653,18 @@ pub(crate) enum AnthropicContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// Server-side tool invocation (tool search, web search, code execution).
+    /// Handled by Anthropic -- client skips these.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Catch-all for block types we don't recognize (`tool_search_tool_result`,
+    /// `web_search_tool_result`, etc.). Prevents deserialization failures when
+    /// Anthropic adds new block types.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -803,6 +844,85 @@ mod tests {
     fn test_resolve_anthropic_url_trailing_slash_stripped() {
         let url = resolve_anthropic_url(Some("http://gateway.local/"), None);
         assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
+    }
+
+    #[test]
+    fn test_normalize_response_with_server_tool_use() {
+        let resp = AnthropicResponse {
+            content: vec![
+                AnthropicContentBlock::Text {
+                    text: "Here is my analysis.".to_string(),
+                },
+                AnthropicContentBlock::ServerToolUse {
+                    id: "srvtoolu_abc123".to_string(),
+                    name: "tool_search".to_string(),
+                    input: serde_json::json!({"query": "bash"}),
+                },
+                AnthropicContentBlock::ToolUse {
+                    id: "toolu_xyz789".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = normalize_response(resp).unwrap();
+
+        // ServerToolUse is skipped -- only Text and ToolUse come through
+        assert_eq!(result.content.len(), 2);
+        assert!(
+            matches!(&result.content[0], ContentBlock::Text { text } if text == "Here is my analysis.")
+        );
+        assert!(
+            matches!(&result.content[1], ContentBlock::ToolUse { id, name, .. } if id == "toolu_xyz789" && name == "bash")
+        );
+    }
+
+    #[test]
+    fn test_normalize_response_unknown_blocks() {
+        // Deserialize a block type we don't recognize -- should become Unknown
+        let json = r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        assert!(matches!(block, AnthropicContentBlock::Unknown));
+
+        // Also verify web_search_tool_result falls through
+        let json2 = r#"{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_456", "content": {}}"#;
+        let block2: AnthropicContentBlock = serde_json::from_str(json2).unwrap();
+        assert!(matches!(block2, AnthropicContentBlock::Unknown));
+    }
+
+    #[test]
+    fn test_normalize_response_only_server_blocks_with_end_turn() {
+        let resp = AnthropicResponse {
+            content: vec![
+                AnthropicContentBlock::ServerToolUse {
+                    id: "srvtoolu_abc".to_string(),
+                    name: "tool_search".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = normalize_response(resp).unwrap();
+
+        // All blocks were server-handled, content should be empty, and this is OK
+        // because stop_reason is end_turn
+        assert!(result.content.is_empty());
+        assert!(result.end_turn);
     }
 }
 
