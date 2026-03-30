@@ -389,9 +389,7 @@ impl LlmConfig {
         let anthropic_oauth_token: Option<Arc<dyn CredentialSource>> = if std::env::var(
             "ANTHROPIC_OAUTH_TOKEN",
         )
-        .ok()
-        .filter(|t| !t.is_empty())
-        .is_some()
+        .is_ok_and(|t| !t.is_empty())
         {
             Some(Arc::new(EnvCredential::new("ANTHROPIC_OAUTH_TOKEN")))
         } else {

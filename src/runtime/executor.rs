@@ -318,6 +318,8 @@ where
                     ConvState::Failed { .. } => "Failed",
                     ConvState::Error { .. } => "Error",
                     ConvState::ContextExhausted { .. } => "ContextExhausted",
+                    ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
+                    ConvState::Terminal => "Terminal",
                 }
             }
             let from = state_name(&old_state);
@@ -332,6 +334,8 @@ where
                         | ConvState::Failed { .. }
                         | ConvState::Error { .. }
                         | ConvState::ContextExhausted { .. }
+                        | ConvState::AwaitingTaskApproval { .. }
+                        | ConvState::Terminal
                 );
                 if notable {
                     tracing::info!(
