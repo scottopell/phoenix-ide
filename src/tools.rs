@@ -6,6 +6,7 @@ mod bash;
 pub mod bash_check;
 pub mod browser;
 mod keyword_search;
+pub mod mcp;
 pub mod patch;
 mod propose_plan;
 mod read_file;
@@ -262,6 +263,14 @@ impl ToolRegistry {
         }
 
         Self { tools }
+    }
+
+    /// Register MCP tools from a client manager. Called after constructing the
+    /// mode-specific registry to inject dynamically-discovered tools.
+    pub fn register_mcp_tools(&mut self, manager: &std::sync::Arc<mcp::McpClientManager>) {
+        for tool in mcp::create_mcp_tools(manager) {
+            self.tools.push(Arc::from(tool));
+        }
     }
 
     /// Get all tool definitions for LLM

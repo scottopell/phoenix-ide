@@ -15,6 +15,7 @@ use crate::db::Database;
 use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
+use crate::tools::mcp::McpClientManager;
 use std::sync::Arc;
 
 /// Application state shared across handlers
@@ -25,6 +26,8 @@ pub struct AppState {
     pub db: Database,
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
+    #[allow(dead_code)] // Holds Arc to keep MCP server processes alive for the app lifetime
+    pub mcp_manager: Arc<McpClientManager>,
 }
 
 impl AppState {
@@ -33,11 +36,13 @@ impl AppState {
         db: Database,
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
+        mcp_manager: Arc<McpClientManager>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
             platform,
+            mcp_manager.clone(),
         ));
         runtime.start_sub_agent_handler().await;
         Self {
@@ -45,6 +50,7 @@ impl AppState {
             llm_registry,
             db,
             platform,
+            mcp_manager,
         }
     }
 }

@@ -59,6 +59,7 @@ pub struct RuntimeManager {
     llm_registry: Arc<ModelRegistry>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
+    mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
@@ -170,6 +171,7 @@ impl RuntimeManager {
         db: Database,
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
+        mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
@@ -178,6 +180,7 @@ impl RuntimeManager {
             llm_registry,
             platform,
             browser_sessions: Arc::new(BrowserSessionManager::default()),
+            mcp_manager,
             runtimes: RwLock::new(HashMap::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
@@ -486,7 +489,7 @@ impl RuntimeManager {
             ToolRegistryExecutor::new(ToolRegistry::for_subagent())
         } else {
             use crate::db::ConvMode;
-            let registry = match conv.conv_mode {
+            let mut registry = match conv.conv_mode {
                 ConvMode::Explore => {
                     if self.platform.has_sandbox() {
                         ToolRegistry::explore_with_sandbox()
@@ -503,6 +506,8 @@ impl RuntimeManager {
                     ToolRegistry::standalone()
                 }
             };
+            // Inject MCP tools into every registry (available in all modes)
+            registry.register_mcp_tools(&self.mcp_manager);
             ToolRegistryExecutor::new(registry)
         };
 

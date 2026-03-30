@@ -90,8 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let platform = crate::platform::PlatformCapability::detect();
     tracing::info!(?platform, "Platform capability detected");
 
+    // Discover and connect to MCP servers (stdio transport)
+    let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::discover_and_connect().await);
+
     // Create application state
-    let state = AppState::new(db, llm_registry, platform).await;
+    let state = AppState::new(db, llm_registry, platform, mcp_manager).await;
 
     // Create router
     let cors = CorsLayer::new()
