@@ -92,6 +92,12 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_projects(self) -> list[dict]:
+        """Get all projects."""
+        resp = self.http.get(f"{self.base_url}/api/projects")
+        resp.raise_for_status()
+        return resp.json().get('projects', [])
+
     def create_conversation(self, cwd: str, text: str, images: list[dict], model: str | None = None) -> dict:
         """Create new conversation with initial message."""
         import uuid
@@ -341,12 +347,13 @@ def format_response(data: dict) -> str:
 @click.option('-m', '--model', default=None,
               help='Model ID for new conversations (e.g. claude-4.5-sonnet)')
 @click.option('--list-models', is_flag=True, help='List available models and exit')
+@click.option('--list-projects', is_flag=True, help='List projects and exit')
 @click.option('--api-url', default=None,
               help='API endpoint URL (default: auto-detect from dev.py or PHOENIX_API_URL)')
 @click.option('--timeout', default=600, help='Timeout in seconds')
 @click.option('--poll-interval', default=1.0, help='Polling interval in seconds (with --poll)')
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
-def main(message, conversation, directory, images, model, list_models, api_url, timeout, poll_interval, poll):
+def main(message, conversation, directory, images, model, list_models, list_projects, api_url, timeout, poll_interval, poll):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -356,6 +363,9 @@ def main(message, conversation, directory, images, model, list_models, api_url, 
 
         # List available models
         phoenix-client.py --list-models
+
+        # List projects
+        phoenix-client.py --list-projects
 
         # New conversation with specific model
         phoenix-client.py -m claude-4.5-sonnet "Analyze this project"
@@ -383,6 +393,16 @@ def main(message, conversation, directory, images, model, list_models, api_url, 
             click.echo(f"  {m['id']:30s} {m.get('provider', ''):10s} {m.get('description', '')}{marker}")
         return
 
+    if list_projects:
+        projects = client.get_projects()
+        if not projects:
+            click.echo("No projects found.")
+        else:
+            for p in projects:
+                convs = p.get('conversation_count', 0)
+                click.echo(f"  {p.get('name', p['id']):30s} {convs} conversation(s)  {p.get('repo_root', '')}")
+        return
+
     if not message:
         raise click.UsageError("Missing argument 'MESSAGE' (required unless using --list-models).")
 
@@ -391,14 +411,18 @@ def main(message, conversation, directory, images, model, list_models, api_url, 
 
     if conversation:
         conv = client.get_conversation(conversation)
-        click.echo(f"Continuing conversation: {conv.get('slug', conv['id'])}", err=True)
+        mode_label = conv.get('conv_mode_label', '')
+        mode_suffix = f" ({mode_label})" if mode_label else ""
+        click.echo(f"Continuing conversation: {conv.get('slug', conv['id'])}{mode_suffix}", err=True)
         click.echo("Sending message...", err=True)
         client.send_message(conv['id'], message, image_data)
     else:
         cwd = directory or os.getcwd()
         click.echo("Sending message...", err=True)
         conv = client.create_conversation(cwd, message, image_data, model=model)
-        click.echo(f"Created conversation: {conv.get('slug', conv['id'])}", err=True)
+        mode_label = conv.get('conv_mode_label', '')
+        mode_suffix = f" ({mode_label})" if mode_label else ""
+        click.echo(f"Created conversation: {conv.get('slug', conv['id'])}{mode_suffix}", err=True)
 
     if poll:
         click.echo("Waiting for response (polling)...", err=True)

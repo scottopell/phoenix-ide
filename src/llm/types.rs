@@ -81,7 +81,7 @@ impl ContentBlock {
         ContentBlock::Text { text: s.into() }
     }
 
-    #[allow(dead_code)] // Constructor for API completeness
+    #[cfg(test)]
     pub fn tool_use(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -91,20 +91,6 @@ impl ContentBlock {
             id: id.into(),
             name: name.into(),
             input,
-        }
-    }
-
-    #[allow(dead_code)] // Constructor for API completeness
-    pub fn tool_result(
-        tool_use_id: impl Into<String>,
-        content: impl Into<String>,
-        is_error: bool,
-    ) -> Self {
-        ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.into(),
-            content: content.into(),
-            images: vec![],
-            is_error,
         }
     }
 }
@@ -157,34 +143,22 @@ impl LlmResponse {
             .collect::<Vec<_>>()
             .join("")
     }
-
-    /// Check if response contains any tool use requests
-    #[allow(dead_code)] // Utility method for API completeness
-    pub fn has_tool_use(&self) -> bool {
-        self.content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-    }
 }
 
 /// Usage statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)] // tokens suffix is meaningful
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
     pub cache_creation_tokens: u64,
+    #[serde(default)]
     pub cache_read_tokens: u64,
 }
 
 impl Usage {
-    #[allow(dead_code)] // For future context tracking
     pub fn context_window_used(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
-    }
-
-    #[allow(dead_code)] // Utility method
-    pub fn is_zero(&self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0
     }
 }

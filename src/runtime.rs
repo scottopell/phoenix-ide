@@ -9,7 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
-mod executor;
+pub(crate) mod executor;
 mod recovery;
 pub mod traits;
 
@@ -19,6 +19,7 @@ pub mod testing;
 pub use executor::ConversationRuntime;
 pub use traits::*;
 
+use crate::platform::PlatformCapability;
 use crate::state_machine::state::{SubAgentOutcome, SubAgentSpec};
 use crate::tools::{BrowserSessionManager, ToolRegistry};
 
@@ -56,12 +57,13 @@ pub struct SubAgentCancelRequest {
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
     spawn_rx: RwLock<Option<mpsc::Receiver<SubAgentSpawnRequest>>>,
-    /// Channel for sub-agent cancel requests  
+    /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
 }
@@ -72,12 +74,59 @@ pub struct ConversationHandle {
     pub broadcast_tx: broadcast::Sender<SseEvent>,
 }
 
+/// Typed update for conversation metadata pushed mid-session.
+/// Each field is `Option` — only populated fields are serialized to the client.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConversationMetadataUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conv_mode_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commits_behind: Option<u32>,
+}
+
+/// A conversation enriched with derived display fields for the API layer.
+///
+/// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
+/// all `Conversation` fields at the top level (via `#[serde(flatten)]`) plus
+/// the extra display fields.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnrichedConversation {
+    #[serde(flatten)]
+    pub inner: crate::db::Conversation,
+    pub conv_mode_label: String,
+    pub branch_name: Option<String>,
+    pub worktree_path: Option<String>,
+    pub base_branch: Option<String>,
+}
+
+/// Breadcrumb entry for showing LLM thought-process trail in the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SseBreadcrumb {
+    #[serde(rename = "type")]
+    pub crumb_type: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
 /// Events sent to SSE clients
 #[derive(Debug, Clone)]
 pub enum SseEvent {
     Init {
-        conversation: serde_json::Value,
-        messages: Vec<serde_json::Value>,
+        conversation: Box<EnrichedConversation>,
+        messages: Vec<crate::db::Message>,
         agent_working: bool,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
@@ -86,14 +135,17 @@ pub enum SseEvent {
         context_window_size: u64,
         /// Model's maximum context window in tokens (for calculating percentage)
         model_context_window: usize,
-        breadcrumbs: Vec<serde_json::Value>,
+        breadcrumbs: Vec<SseBreadcrumb>,
+        /// How many commits the base branch is ahead of this conversation's task branch.
+        /// Only populated for Work-mode conversations. 0 means up-to-date or not applicable.
+        commits_behind: u32,
     },
     Message {
-        message: serde_json::Value,
+        message: crate::db::Message,
     },
     StateChange {
-        /// Full state as JSON object (e.g., `{"type":"awaiting_sub_agents","pending_ids":[...]}`)
-        state: serde_json::Value,
+        /// Full typed conversation state
+        state: ConvState,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
     },
@@ -103,18 +155,28 @@ pub enum SseEvent {
         request_id: String,
     },
     AgentDone,
+    /// Pushed when conversation metadata changes mid-session (e.g., cwd/mode after approval).
+    /// Typed struct instead of `Value` — the executor knows exactly which fields changed.
+    ConversationUpdate {
+        update: ConversationMetadataUpdate,
+    },
     Error {
         message: String,
     },
 }
 
 impl RuntimeManager {
-    pub fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
+    pub fn new(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        platform: PlatformCapability,
+    ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         Self {
             db,
             llm_registry,
+            platform,
             browser_sessions: Arc::new(BrowserSessionManager::default()),
             runtimes: RwLock::new(HashMap::new()),
             spawn_tx,
@@ -122,6 +184,11 @@ impl RuntimeManager {
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
         }
+    }
+
+    /// Get the detected platform capability
+    pub fn platform(&self) -> PlatformCapability {
+        self.platform
     }
 
     /// Get the browser session manager
@@ -253,11 +320,9 @@ impl RuntimeManager {
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
-        #[allow(deprecated)]
-        let tool_executor = ToolRegistryExecutor::new(ToolRegistry::new_for_subagent(
-            conv_context.working_dir.clone(),
-            self.llm_registry.clone(),
-        ));
+        // Sub-agents use the standard sub-agent tool set for now.
+        // Mode inheritance (REQ-BED-018) will be refined in M2.
+        let tool_executor = ToolRegistryExecutor::new(ToolRegistry::for_subagent());
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -416,18 +481,29 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
 
-        // Use appropriate tool registry based on whether this is a sub-agent
-        #[allow(deprecated)]
+        // Use appropriate tool registry based on sub-agent status and conversation mode
         let tool_executor = if is_sub_agent {
-            ToolRegistryExecutor::new(ToolRegistry::new_for_subagent(
-                context.working_dir.clone(),
-                self.llm_registry.clone(),
-            ))
+            ToolRegistryExecutor::new(ToolRegistry::for_subagent())
         } else {
-            ToolRegistryExecutor::new(ToolRegistry::new(
-                context.working_dir.clone(),
-                self.llm_registry.clone(),
-            ))
+            use crate::db::ConvMode;
+            let registry = match conv.conv_mode {
+                ConvMode::Explore => {
+                    if self.platform.has_sandbox() {
+                        ToolRegistry::explore_with_sandbox()
+                    } else {
+                        ToolRegistry::explore_no_sandbox()
+                    }
+                }
+                ConvMode::Standalone => {
+                    // Full tool suite for non-git directories
+                    ToolRegistry::standalone()
+                }
+                ConvMode::Work { .. } => {
+                    // Full tool suite for Work mode (same as standalone for now)
+                    ToolRegistry::standalone()
+                }
+            };
+            ToolRegistryExecutor::new(registry)
         };
 
         // Determine initial state: check if conversation needs auto-continuation
@@ -543,6 +619,29 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Result<(ConvState, bool), String> {
+        // States that survive restart (preserved by reset_all_to_idle) must be
+        // restored from the DB, not derived from message history. The recovery
+        // heuristic only applies to transient states that were reset to Idle.
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        match &conv.state {
+            ConvState::AwaitingTaskApproval { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::Terminal => {
+                tracing::debug!(
+                    conv_id = %conversation_id,
+                    state = ?std::mem::discriminant(&conv.state),
+                    "Restoring persisted state (survives restart)"
+                );
+                return Ok((conv.state, false));
+            }
+            _ => {}
+        }
+
         let messages = self
             .db
             .get_messages(conversation_id)

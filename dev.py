@@ -492,9 +492,17 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy then test (share cargo lock)."""
+        """Rust lane: clippy → musl smoke check → test (share cargo lock)."""
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
-        run_step("cargo test", ["cargo", "test"])
+        run_step("cargo check musl", [
+            "cargo", "check", "--target", "x86_64-unknown-linux-musl",
+        ])
+        has_nextest = subprocess.run(
+            ["cargo", "nextest", "--version"],
+            capture_output=True,
+        ).returncode == 0
+        test_cmd = ["cargo", "nextest", "run"] if has_nextest else ["cargo", "test"]
+        run_step("cargo test", test_cmd)
 
     def lane_fast():
         """Fast lane: cargo fmt then task validation."""
@@ -539,14 +547,33 @@ def cmd_check():
             results.append(("bundle size", 0 if ok else 1, elapsed, msg if not ok else ""))
             print(f"  {sym} {'bundle size':<18s} ({elapsed:.1f}s) {size_kb:.0f} KB")
 
-    print("Running 7 checks in parallel...\n")
+    def check_ast_grep():
+        """Run structural lint rules via ast-grep (one result entry per rule file)."""
+        import shutil
+        if not shutil.which("ast-grep"):
+            with results_lock:
+                results.append(("ast-grep", 0, 0.0, ""))
+                print(f"  - {'ast-grep':<18s} (skipped — not installed)")
+            return
+        rules_dir = ROOT / "ast-grep-rules"
+        if not rules_dir.exists():
+            return
+        rule_files = sorted(rules_dir.glob("*.yml"))
+        if not rule_files:
+            return
+        for rule_file in rule_files:
+            run_step(f"ast-grep:{rule_file.stem[:14]}", [
+                "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
+            ])
+
+    print("Running 8 checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
         threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
         threading.Thread(target=lane_fast),
-        threading.Thread(target=check_bundle_size),
+        threading.Thread(target=check_ast_grep),
     ]
     for t in threads:
         t.start()
@@ -660,6 +687,8 @@ def cmd_tasks_fix() -> bool:
 # =============================================================================
 
 
+
+
 def detect_prod_env() -> str:
     """Detect production environment: 'launchd', 'native', or 'daemon'.
 
@@ -731,6 +760,18 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
         commit = result.stdout.strip()
         version = f"dev-{commit[:8]}"
         ref = commit
+        # Warn if there are uncommitted changes — they won't be included in the build.
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT, capture_output=True, text=True
+        ).stdout.strip()
+        if dirty:
+            print(f"⚠ Warning: uncommitted changes will NOT be included in the build:")
+            for line in dirty.splitlines()[:10]:
+                print(f"    {line}")
+            if len(dirty.splitlines()) > 10:
+                print(f"    ... and {len(dirty.splitlines()) - 10} more")
+            print()
         print(f"Building from HEAD: {version}")
     
     # Set up or update the build worktree
@@ -801,11 +842,36 @@ class SystemdConfig:
     # For Lima: uses EnvironmentFile for API key; for native: uses LLM_GATEWAY env var
     env_file: str | None = None
     llm_gateway: str | None = None
+    # When set, injects Environment=HOME=<path> so the service user can find
+    # ~/.claude/.credentials.json for per-request OAuth token reads.
+    home_dir: str | None = None
+
+
+def detect_service_user() -> str:
+    """Detect which service user to run phoenix-ide as.
+
+    Checks for supported users in priority order. Fails with a clear message
+    if none exist so the operator knows what to create.
+    """
+    import pwd
+    for candidate in ("phoenix-dev", "exedev"):
+        try:
+            pwd.getpwnam(candidate)
+            return candidate
+        except KeyError:
+            continue
+    print(
+        "ERROR: No supported service user found. "
+        "Create one of: phoenix-dev, exedev\n"
+        "  e.g.: sudo useradd --system --no-create-home phoenix-dev",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 # Configs for each deployment target
 NATIVE_SYSTEMD_CONFIG = SystemdConfig(
-    user="exedev",
+    user="exedev",  # placeholder; overridden at deploy time by detect_service_user()
     db_path=str(PROD_DB_PATH),
     install_dir=str(PROD_INSTALL_DIR),
     port=PROD_PORT,
@@ -854,6 +920,12 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
     elif config.llm_gateway:
         # Native mode: use LLM_GATEWAY directly
         env_lines.append(f"Environment=LLM_GATEWAY={config.llm_gateway}")
+
+    if config.home_dir:
+        # Allow the service user to find ~/.claude/.credentials.json for OAuth auth.
+        # System users have no real home, so we point HOME at the deploying user's home.
+        env_lines.append(f"Environment=HOME={config.home_dir}")
+
 
     env_section = "\n".join(env_lines)
 
@@ -916,11 +988,28 @@ def native_prod_deploy(version: str | None = None):
     subprocess.run(["sudo", "cp", str(binary), str(dest)], check=True)
     subprocess.run(["sudo", "chmod", "+x", str(dest)], check=True)
     
-    # Ensure database directory exists
-    PROD_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Detect service user first so we can set up the DB directory correctly
+    service_user = detect_service_user()
 
-    # Configure for native deployment
-    config = dataclasses.replace(NATIVE_SYSTEMD_CONFIG, llm_gateway=get_llm_gateway())
+    # For native systemd deployments the service runs as a dedicated system user,
+    # so the DB must live somewhere that user owns — /var/lib/phoenix-ide/ is the
+    # standard Linux convention.  (~/.phoenix-ide is only used for dev/daemon mode.)
+    native_db_dir = Path("/var/lib/phoenix-ide")
+    native_db_path = native_db_dir / "prod.db"
+    subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
+    subprocess.run(["sudo", "chown", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
+
+    # Configure for native deployment.
+    # OAuth token auth: the binary reads ~/.claude/.credentials.json per request.
+    # Requires: chmod g+r ~/.claude/.credentials.json + service user in owner's group.
+    # See skills/phoenix-deployment/SYSTEMD.md for setup instructions.
+    config = dataclasses.replace(
+        NATIVE_SYSTEMD_CONFIG,
+        user=service_user,
+        db_path=str(native_db_path),
+        llm_gateway=get_llm_gateway(),
+        home_dir=str(Path.home()),
+    )
 
     # Install systemd socket unit (for socket activation)
     print("Installing systemd socket unit...")
@@ -988,7 +1077,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
-            print(f"  Database: {PROD_DB_PATH}")
+            print(f"  Database: {config.db_path}")
             print(f"  URL: http://localhost:{PROD_PORT}")
         else:
             print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
@@ -1015,12 +1104,69 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Service: {PROD_SERVICE_NAME}")
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
-            print(f"  Database: {PROD_DB_PATH}")
+            print(f"  Database: {config.db_path}")
             print(f"  URL: http://localhost:{PROD_PORT}")
         else:
             print(f"\n✗ Service failed to start", file=sys.stderr)
             subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
             sys.exit(1)
+
+
+def _load_env_file(env: dict[str, str]) -> str | None:
+    """Load .phoenix-ide.env from project root into env dict. Returns path if loaded.
+
+    Simple KEY=VALUE format, one per line. Lines starting with # are comments.
+    Literal \\n in values is unescaped to real newlines (for LLM_CUSTOM_HEADERS).
+    """
+    env_file = ROOT / ".phoenix-ide.env"
+    if not env_file.exists():
+        return None
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            if key and value:
+                env[key.strip()] = value.strip().replace("\\n", "\n")
+    return str(env_file)
+
+
+def _configure_llm_env(env: dict[str, str]) -> str:
+    """Configure LLM environment variables. Returns a human-readable mode string.
+
+    Priority:
+    1. .phoenix-ide.env overrides (LLM_API_KEY_HELPER, ANTHROPIC_API_KEY, etc.)
+    2. Auto-detected exe.dev gateway (LLM_GATEWAY)
+    3. ANTHROPIC_API_KEY from shell environment
+    """
+    # If env file provided LLM config, respect it — skip auto-detection
+    if env.get("LLM_API_KEY_HELPER"):
+        helper = env["LLM_API_KEY_HELPER"]
+        return f"api_key_helper ({helper})"
+    if env.get("LLM_GATEWAY"):
+        return f"gateway ({env['LLM_GATEWAY']})"
+    if env.get("ANTHROPIC_API_KEY"):
+        return "direct API key (ANTHROPIC_API_KEY)"
+
+    # Auto-detect exe.dev gateway
+    gateway = get_llm_gateway()
+    if gateway:
+        env["LLM_GATEWAY"] = gateway
+        return f"gateway ({gateway}) [auto-detected]"
+
+    # Last resort: check shell env for API key
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+        return "direct API key (ANTHROPIC_API_KEY)"
+
+    print("ERROR: No LLM configuration found.", file=sys.stderr)
+    print("  Options:", file=sys.stderr)
+    print("    1. Create .phoenix-ide.env with LLM_API_KEY_HELPER or ANTHROPIC_API_KEY", file=sys.stderr)
+    print("    2. Set ANTHROPIC_API_KEY in your environment", file=sys.stderr)
+    print("    3. Run on a host with an exe.dev gateway", file=sys.stderr)
+    sys.exit(1)
 
 
 def prod_daemon_deploy():
@@ -1045,15 +1191,16 @@ def prod_daemon_deploy():
 
     env["PHOENIX_DB_PATH"] = str(prod_db_path)
 
-    gateway = get_llm_gateway()
-    if gateway:
-        env["LLM_GATEWAY"] = gateway
+    # Load .phoenix-ide.env (overrides auto-detection)
+    env_file = _load_env_file(env)
+    if env_file:
+        print(f"  Loaded env from {env_file}")
     else:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            print("ERROR: No LLM gateway reachable and ANTHROPIC_API_KEY not set.", file=sys.stderr)
-            sys.exit(1)
-        env["ANTHROPIC_API_KEY"] = api_key
+        print(f"  No .phoenix-ide.env found (using auto-detection)")
+
+    # Configure LLM auth
+    llm_mode = _configure_llm_env(env)
+    print(f"  LLM mode: {llm_mode}")
 
     # Stop existing daemon if running
     if prod_pid_path.exists():
@@ -1104,7 +1251,6 @@ def prod_daemon_deploy():
     print(f"  Database: {prod_db_path}")
     print(f"  Logs: {prod_log_path}")
     print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
-    llm_mode = f"gateway ({gateway})" if gateway else "Direct API (ANTHROPIC_API_KEY)"
     print(f"  LLM Mode: {llm_mode}")
     print()
     print("Use './dev.py prod status' to check status")
@@ -1290,16 +1436,28 @@ def native_prod_status():
     else:
         print(f"Production: {status}")
     
-    # Show systemd overrides
-    overrides = list_systemd_overrides()
-    if overrides:
-        print(f"  Overrides:")
-        for filename, content in overrides:
-            # Extract the key=value from the content
-            for line in content.split('\n'):
-                if line.startswith('Environment='):
-                    env_val = line.replace('Environment=', '')
-                    print(f"    {filename}: {env_val}")
+    # Show OAuth token status from credentials file (read directly by the binary).
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    if creds_path.exists():
+        try:
+            import datetime
+            creds = json.loads(creds_path.read_text())
+            expires_at = creds["claudeAiOauth"]["expiresAt"]
+            expires_dt = datetime.datetime.fromtimestamp(
+                int(expires_at) / 1000, tz=datetime.timezone.utc
+            )
+            now = datetime.datetime.now(tz=datetime.timezone.utc)
+            if expires_dt < now:
+                expiry_str = f"EXPIRED (was {expires_dt.strftime('%Y-%m-%d %H:%M UTC')})"
+                print(f"  ⚠ OAuth token expired — run `claude login` to refresh")
+            else:
+                delta = expires_dt - now
+                hours = int(delta.total_seconds() // 3600)
+                mins = int((delta.total_seconds() % 3600) // 60)
+                expiry_str = f"{expires_dt.strftime('%Y-%m-%d %H:%M UTC')} (in {hours}h{mins}m)"
+            print(f"  OAuth token: {expiry_str}")
+        except Exception:
+            pass
 
 
 def native_prod_stop():

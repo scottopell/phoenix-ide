@@ -21,8 +21,6 @@ interface MessageListProps {
   streamingBuffer?: StreamingBuffer | null;
 }
 
-const PREVIEW_LENGTH = 150;
-
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
 const SCROLL_THRESHOLD = 100;
 
@@ -189,18 +187,13 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                 className="system-prompt-header"
                 onClick={() => setSystemPromptExpanded((v) => !v)}
               >
-                <span className="system-prompt-label">System Prompt</span>
+                <span className="system-prompt-label">System prompt</span>
                 <span className="system-prompt-toggle">
                   {systemPromptExpanded ? '▼ hide' : '▶ show'}
                 </span>
               </div>
-              {systemPromptExpanded ? (
+              {systemPromptExpanded && (
                 <pre className="system-prompt-content">{systemPrompt}</pre>
-              ) : (
-                <div className="system-prompt-preview">
-                  {systemPrompt.slice(0, PREVIEW_LENGTH).trimEnd()}
-                  {systemPrompt.length > PREVIEW_LENGTH ? '…' : ''}
-                </div>
               )}
             </div>
           )}
@@ -224,6 +217,16 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                       onOpenFile={onOpenFile}
                     />
                   );
+                }
+                if (type === 'system') {
+                  const text = (msg.content as { text?: string })?.text;
+                  if (text) {
+                    return (
+                      <div key={msg.sequence_id} className="system-message">
+                        <span className="system-message-text">{text}</span>
+                      </div>
+                    );
+                  }
                 }
                 // Skip tool messages - they're rendered inline with their tool_use
                 return null;

@@ -1,10 +1,8 @@
 ---
 created: 2026-03-01
-number: 592
 priority: p2
 status: ready
-slug: streaming-markdown-rendering-qaplan
-title: "QA Plan: Streaming markdown rendering"
+artifact: pending
 ---
 
 # QA Plan: Task 592 — Streaming Markdown Rendering

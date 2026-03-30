@@ -2,7 +2,7 @@
 //!
 //! These traits enable testing the executor with mock implementations.
 
-use crate::db::{Message, MessageContent, UsageData};
+use crate::db::{ConvMode, Message, MessageContent, UsageData};
 use crate::llm::{LlmError, LlmRequest, LlmResponse};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
@@ -58,6 +58,12 @@ pub trait StateStore: Send + Sync {
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
+
+    /// Update the conversation mode (e.g., Explore -> Work on task approval)
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
+
+    /// Update the conversation working directory (e.g., after worktree creation)
+    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String>;
 }
 
 /// Client for making LLM requests
@@ -93,6 +99,12 @@ pub trait ToolExecutor: Send + Sync {
 
     /// Get tool definitions for LLM
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
+
+    /// Replace the tool set (e.g., Explore -> Work mode transition).
+    /// Default is a no-op for test doubles that don't need dynamic swapping.
+    fn upgrade_to_work_mode(&self) {
+        // No-op by default
+    }
 }
 
 /// Combined storage trait for convenience
@@ -156,6 +168,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
     }
+
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+        (**self).update_conversation_mode(conv_id, mode).await
+    }
+
+    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
+        (**self).update_conversation_cwd(conv_id, cwd).await
+    }
 }
 
 #[async_trait]
@@ -185,6 +205,10 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
         (**self).definitions()
+    }
+
+    fn upgrade_to_work_mode(&self) {
+        (**self).upgrade_to_work_mode();
     }
 }
 
@@ -284,6 +308,20 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
     }
+
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+        self.db
+            .update_conversation_mode(conv_id, mode)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
+        self.db
+            .update_conversation_cwd(conv_id, cwd)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Adapter to use `ModelRegistry` as `LlmClient`
@@ -330,23 +368,58 @@ impl LlmClient for RegistryLlmClient {
 }
 
 /// Adapter to use `ToolRegistry` as `ToolExecutor`
+///
+/// Uses `RwLock` for interior mutability so the registry can be swapped
+/// at runtime (e.g., Explore -> Work mode transition after task approval).
 pub struct ToolRegistryExecutor {
-    registry: ToolRegistry,
+    registry: std::sync::RwLock<ToolRegistry>,
 }
 
 impl ToolRegistryExecutor {
     pub fn new(registry: ToolRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry: std::sync::RwLock::new(registry),
+        }
+    }
+
+    /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
+    pub fn swap_registry(&self, new_registry: ToolRegistry) {
+        let mut guard = self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = new_registry;
     }
 }
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
-        self.registry.execute(name, input, ctx).await
+        // Look up the tool while holding the read lock, then drop the guard
+        // before the async .run() call (RwLockReadGuard is !Send).
+        let tool = {
+            let registry = self
+                .registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.find_tool(name)
+        };
+        match tool {
+            Some(t) => Some(t.run(input, ctx).await),
+            None => None,
+        }
     }
 
     fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
-        self.registry.definitions()
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.definitions()
+    }
+
+    fn upgrade_to_work_mode(&self) {
+        self.swap_registry(ToolRegistry::standalone());
+        tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
 }

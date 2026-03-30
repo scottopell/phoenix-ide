@@ -144,7 +144,7 @@ AND suggest breaking into smaller patches
 
 WHEN conversation is in Explore mode
 THE SYSTEM SHALL disable the patch tool entirely
-AND return error: "Patch tool is unavailable in Explore mode. Use `create_task` to
+AND return error: "Patch tool is unavailable in Explore mode. Use `propose_plan` to
 propose work that requires file edits."
 
 WHEN conversation is in Work mode

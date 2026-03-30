@@ -50,7 +50,10 @@ export function DirectoryPicker({ value, onChange, onStatusChange, placeholder =
   const [isLoading, setIsLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [showDropdown, setShowDropdown] = useState(false);
-  const [pathStatus, setPathStatus] = useState<DirStatus>('checking');
+  const [pathStatus, setPathStatus] = useState<DirStatus>(() =>
+    value.trim().startsWith('/') ? 'exists' : 'checking'
+  );
+  const isFirstValidation = useRef(true);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -123,8 +126,12 @@ export function DirectoryPicker({ value, onChange, onStatusChange, placeholder =
       return;
     }
 
-    setPathStatus('checking');
-    onStatusChangeRef.current?.('checking');
+    if (isFirstValidation.current) {
+      isFirstValidation.current = false;
+    } else {
+      setPathStatus('checking');
+      onStatusChangeRef.current?.('checking');
+    }
 
     const timeoutId = setTimeout(async () => {
       try {

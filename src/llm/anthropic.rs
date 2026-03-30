@@ -211,49 +211,71 @@ impl StreamAccumulator {
     }
 }
 
+/// Resolve the Anthropic endpoint URL with priority:
+/// 1. `base_url_override` (`ANTHROPIC_BASE_URL`) — used as-is, no path appended
+/// 2. `gateway` (`LLM_GATEWAY`) — appends `/anthropic/v1/messages`
+/// 3. Default: `https://api.anthropic.com/v1/messages`
+fn resolve_anthropic_url(gateway: Option<&str>, base_url_override: Option<&str>) -> String {
+    if let Some(url) = base_url_override {
+        url.to_string()
+    } else {
+        match gateway {
+            Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
+            None => "https://api.anthropic.com/v1/messages".to_string(),
+        }
+    }
+}
+
 /// Complete using Anthropic Messages API with streaming.
 ///
 /// Emits `TokenChunk::Text` events via `chunk_tx` as text tokens arrive,
 /// then returns the fully assembled `LlmResponse`.
 pub async fn complete_streaming(
     spec: &ModelSpec,
-    api_key: &str,
+    auth: &super::ResolvedAuth,
     gateway: Option<&str>,
+    base_url_override: Option<&str>,
+    custom_headers: &[(String, String)],
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
-    let base_url = match gateway {
-        Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
-        None => "https://api.anthropic.com/v1/messages".to_string(),
-    };
+    let base_url = resolve_anthropic_url(gateway, base_url_override);
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let mut anthropic_request = translate_request(&spec.api_name, request);
     anthropic_request.stream = Some(true);
 
-    let response = client
-        .post(&base_url)
-        .header("x-api-key", api_key)
+    let mut builder = client.post(&base_url);
+    builder = match auth.style {
+        super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
+        super::AuthStyle::Bearer => builder
+            .header("Authorization", format!("Bearer {}", auth.credential))
+            .header("anthropic-beta", "oauth-2025-04-20"),
+        super::AuthStyle::PlainBearer => {
+            builder.header("Authorization", format!("Bearer {}", auth.credential))
+        }
+    };
+    builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .header("source", LLM_SOURCE_HEADER)
-        .json(&anthropic_request)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                LlmError::network(format!("Request timeout: {e}"))
-            } else if e.is_connect() {
-                LlmError::network(format!("Connection failed: {e}"))
-            } else {
-                LlmError::network(format!("Request failed: {e}"))
-            }
-        })?;
+        .header("source", LLM_SOURCE_HEADER);
+    for (k, v) in custom_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let response = builder.json(&anthropic_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -297,40 +319,47 @@ pub async fn complete_streaming(
 /// Complete using Anthropic Messages API
 pub async fn complete(
     spec: &ModelSpec,
-    api_key: &str,
+    auth: &super::ResolvedAuth,
     gateway: Option<&str>,
+    base_url_override: Option<&str>,
+    custom_headers: &[(String, String)],
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
-    let base_url = match gateway {
-        Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
-        None => "https://api.anthropic.com/v1/messages".to_string(),
-    };
+    let base_url = resolve_anthropic_url(gateway, base_url_override);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(5))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let anthropic_request = translate_request(&spec.api_name, request);
 
-    let response = client
-        .post(&base_url)
-        .header("x-api-key", api_key)
+    let mut builder = client.post(&base_url);
+    builder = match auth.style {
+        super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
+        super::AuthStyle::Bearer => builder
+            .header("Authorization", format!("Bearer {}", auth.credential))
+            .header("anthropic-beta", "oauth-2025-04-20"),
+        super::AuthStyle::PlainBearer => {
+            builder.header("Authorization", format!("Bearer {}", auth.credential))
+        }
+    };
+    builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .header("source", LLM_SOURCE_HEADER)
-        .json(&anthropic_request)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                LlmError::network(format!("Request timeout: {e}"))
-            } else if e.is_connect() {
-                LlmError::network(format!("Connection failed: {e}"))
-            } else {
-                LlmError::network(format!("Request failed: {e}"))
-            }
-        })?;
+        .header("source", LLM_SOURCE_HEADER);
+    for (k, v) in custom_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let response = builder.json(&anthropic_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
 
     let status = response.status();
     let body = response
@@ -481,33 +510,32 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
 
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
+    // Empty content with end_turn is valid and documented Anthropic behavior:
+    // the model completed a tool call loop with nothing further to say.
+    // Let it through as content: [] — the state machine handles this by
+    // transitioning to Idle without persisting an empty agent message.
+    //
+    // Empty content WITHOUT end_turn is genuinely unexpected.
+    if content.is_empty() && !end_turn {
+        tracing::warn!(
+            stop_reason = ?resp.stop_reason,
+            output_tokens = resp.usage.output_tokens,
+            raw_block_count = raw_block_count,
+            "Anthropic returned empty content without end_turn"
+        );
+        return Err(LlmError::invalid_response(format!(
+            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
+            resp.stop_reason, resp.usage.output_tokens, raw_block_count
+        )));
+    }
+
     if content.is_empty() {
-        if end_turn {
-            // Valid: model completed the tool call loop with nothing further to say.
-            // Common with concise models (e.g. haiku) after a simple tool result.
-            // Emit an empty text block so the SM receives a well-formed response
-            // and transitions to idle normally.
-            tracing::debug!(
-                stop_reason = ?resp.stop_reason,
-                output_tokens = resp.usage.output_tokens,
-                raw_block_count = raw_block_count,
-                "Anthropic end_turn with empty content — treating as successful completion"
-            );
-            content.push(ContentBlock::Text {
-                text: String::new(),
-            });
-        } else {
-            tracing::warn!(
-                stop_reason = ?resp.stop_reason,
-                output_tokens = resp.usage.output_tokens,
-                raw_block_count = raw_block_count,
-                "Anthropic returned empty content after normalization"
-            );
-            return Err(LlmError::invalid_response(format!(
-                "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
-                resp.stop_reason, resp.usage.output_tokens, raw_block_count
-            )));
-        }
+        tracing::debug!(
+            stop_reason = ?resp.stop_reason,
+            output_tokens = resp.usage.output_tokens,
+            raw_block_count = raw_block_count,
+            "Anthropic end_turn with empty content — model has nothing to say"
+        );
     }
 
     Ok(LlmResponse {
@@ -606,6 +634,38 @@ pub(crate) struct AnthropicUsage {
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_input_tokens: Option<u64>,
     pub(crate) cache_read_input_tokens: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_anthropic_url_override_takes_priority() {
+        let url = resolve_anthropic_url(
+            Some("http://gateway.local"),
+            Some("https://ai-gateway.us1.ddbuild.io/v1/messages"),
+        );
+        assert_eq!(url, "https://ai-gateway.us1.ddbuild.io/v1/messages");
+    }
+
+    #[test]
+    fn test_resolve_anthropic_url_gateway_fallback() {
+        let url = resolve_anthropic_url(Some("http://gateway.local"), None);
+        assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
+    }
+
+    #[test]
+    fn test_resolve_anthropic_url_default() {
+        let url = resolve_anthropic_url(None, None);
+        assert_eq!(url, "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn test_resolve_anthropic_url_trailing_slash_stripped() {
+        let url = resolve_anthropic_url(Some("http://gateway.local/"), None);
+        assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
+    }
 }
 
 #[cfg(test)]

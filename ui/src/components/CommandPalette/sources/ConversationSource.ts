@@ -1,3 +1,4 @@
+import { getDisplayState } from '../../../api';
 import type { Conversation } from '../../../api';
 import type { PaletteSource, PaletteItem } from '../types';
 import { fuzzyMatch } from '../fuzzyMatch';
@@ -40,5 +41,5 @@ function toItem(conv: Conversation): PaletteItem {
 // Re-export helper for rendering state in the component
 export function getConversationState(item: PaletteItem): string {
   const conv = item.metadata as Conversation | undefined;
-  return conv?.display_state || 'idle';
+  return getDisplayState(conv?.state?.type);
 }

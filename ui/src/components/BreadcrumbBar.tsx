@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Breadcrumb } from '../types';
 
+const BREADCRUMB_TITLES: Record<string, string> = {
+  user: 'Your message',
+  llm: 'AI is thinking',
+  tool: 'Running a tool',
+  subagents: 'Running sub-agents in parallel',
+};
+
 interface BreadcrumbBarProps {
   breadcrumbs: Breadcrumb[];
   visible: boolean;
@@ -120,14 +127,15 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
                 onClick={() => handleClick(b)}
                 onMouseEnter={(e) => handleMouseEnter(i, e)}
                 onMouseLeave={handleMouseLeave}
+                title={BREADCRUMB_TITLES[b.type] || b.label}
               >
-                {b.label}
+                {b.label.replace(/^LLM/, 'AI')}
                 {showTooltip && (
                   <span
                     className="breadcrumb-tooltip"
                     style={{ left: tooltipPos!.tooltipLeft, transform: 'none' }}
                   >
-                    <strong>{b.label}</strong>
+                    <strong>{b.label.replace(/^LLM/, 'AI')}</strong>
                     <span className="breadcrumb-tooltip-preview">{tooltipText}</span>
                     <span
                       className="breadcrumb-tooltip-arrow"

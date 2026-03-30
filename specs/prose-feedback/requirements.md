@@ -321,14 +321,16 @@ AND allow the user to edit or remove this prefix
 ### REQ-PF-015: System-Triggered Prose Reader for Task Approval
 
 WHEN a conversation enters AwaitingTaskApproval state
-THE SYSTEM SHALL automatically open the prose reader on the task file
+THE SYSTEM SHALL automatically open the prose reader with the plan content
+  from the serialized state (title, priority, plan text — NOT from a file on disk)
 AND SHALL NOT require user navigation to find or open the file
 AND SHALL display an approval toolbar alongside the standard annotation interface
 
 WHEN the prose reader is opened by the system for task approval
-THE SYSTEM SHALL clearly indicate that the file is a pending task plan awaiting review
+THE SYSTEM SHALL clearly indicate that this is a pending task plan awaiting review
 AND prevent the user from closing the prose reader without choosing an action
-(Approve, Discard, or Send Feedback)
+  (Approve, Discard, or Send Feedback)
+AND suppress back/Escape-to-close — the user MUST choose an explicit action
 
 WHEN the conversation leaves AwaitingTaskApproval state (for any reason)
 THE SYSTEM SHALL automatically close the task approval prose reader
@@ -338,6 +340,8 @@ pause for human oversight, not a passive notification. Automatic opening removes
 finding-and-opening friction and makes the required action obvious. Preventing casual
 close (without an explicit choice) ensures the user makes a deliberate decision rather
 than accidentally dismissing the review.
+
+**Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028
 
 ---
 
@@ -349,26 +353,32 @@ THE SYSTEM SHALL display three primary actions: Approve, Discard, and Send Feedb
 WHEN user taps Approve
 THE SYSTEM SHALL resolve the approval with an approved outcome
 AND close the task approval prose reader
-AND transition the conversation out of AwaitingTaskApproval state
+AND the system SHALL perform all git operations (write task file, commit, branch,
+  checkout) as defined in REQ-PROJ-004
 
 WHEN user taps Discard
-THE SYSTEM SHALL display a confirmation: "Discard this task? The task file will be
-deleted and the conversation will return to Explore mode."
+THE SYSTEM SHALL display a confirmation: "Discard this plan? The conversation will
+return to Explore mode."
 AND on confirmation, resolve the approval with a rejected outcome
 AND close the task approval prose reader
+AND NOT perform any git operations (no file was written, nothing to clean up)
 
 WHEN user annotates lines and taps Send Feedback
 THE SYSTEM SHALL format the annotations as a structured message (per REQ-PF-009 format)
-AND route the formatted feedback to the agent as a tool result
-AND keep the prose reader open for the next iteration
+AND deliver the formatted feedback to the agent as a user message (NOT a tool result —
+  the propose_plan tool result was already persisted when entering AwaitingTaskApproval)
+AND close the prose reader
+AND transition the conversation to Explore/Idle
 AND clear annotations after sending
 
-WHEN user sends feedback and the agent updates the task file
-THE SYSTEM SHALL reload the prose reader content to show the revised task file
-AND NOT close or reset the approval toolbar
+The agent may revise the plan and call `propose_plan` again, which re-enters
+AwaitingTaskApproval and opens a fresh prose reader with the updated plan content.
+No content reload or keep-open behavior is needed — each feedback cycle is a clean
+mount/unmount of the prose reader.
 
 **Rationale:** Three explicit actions make the user's choices unambiguous. Approve and
-Discard are terminal decisions; Send Feedback is iterative. Reloading on agent revision
-and keeping the toolbar open allows a natural back-and-forth without requiring the user
-to navigate away and back. The discard confirmation prevents accidental loss of task
-proposals that the agent may have worked to produce.
+Discard are terminal decisions; Send Feedback is iterative but each round is a clean
+cycle (close, agent revises, reopen). The discard confirmation prevents accidental loss
+of task proposals that the agent may have worked to produce.
+
+**Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028

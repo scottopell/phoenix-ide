@@ -89,6 +89,10 @@ export function StateBar({
             dotClass += ' idle';
             stateText = 'ready';
             break;
+          case 'awaiting_task_approval':
+            dotClass += ' approval';
+            stateText = 'awaiting approval';
+            break;
           case 'error':
             dotClass += ' error';
             stateText = 'error';
@@ -136,12 +140,19 @@ export function StateBar({
     return n.toString();
   };
 
-  const tooltipText = `${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%)`;
+  const tooltipText = `Context window usage: ${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%). When full, the conversation will need to be summarized.`;
 
-  // Format cwd for display - show last 2 path components
+  // Format cwd for display - replace home dir with ~, show last 2 path components
   const formatCwd = (cwd: string): string => {
-    const parts = cwd.split('/').filter(Boolean);
-    if (parts.length <= 2) return cwd;
+    // Replace /Users/<name> or /home/<name> with ~
+    const homeMatch = cwd.match(/^(\/(?:Users|home)\/[^/]+)/);
+    let display = cwd;
+    if (homeMatch?.[1]) {
+      display = '~' + cwd.slice(homeMatch[1].length);
+      if (display === '~') display = '~/';
+    }
+    const parts = display.split('/').filter(Boolean);
+    if (parts.length <= 2) return display;
     return '.../' + parts.slice(-2).join('/');
   };
 
@@ -172,6 +183,26 @@ export function StateBar({
                   {formatCwd(conversation.cwd)}
                 </span>
               </div>
+              {conversation.branch_name && (
+                <>
+                  <span
+                    className="conv-branch"
+                    title={conversation.worktree_path
+                      ? `Branch: ${conversation.branch_name}\nWorktree: ${conversation.worktree_path}`
+                      : `Branch: ${conversation.branch_name}`}
+                  >
+                    {conversation.branch_name}
+                  </span>
+                  {conversation.commits_behind != null && conversation.commits_behind > 0 && (
+                    <span
+                      className="conv-behind-badge"
+                      title={`${conversation.commits_behind} commit(s) behind ${conversation.base_branch || 'base branch'}`}
+                    >
+                      {conversation.commits_behind} behind
+                    </span>
+                  )}
+                </>
+              )}
             </>
           ) : (
             <span id="conv-slug">—</span>

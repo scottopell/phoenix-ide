@@ -20,7 +20,6 @@ use crate::state_machine::{
 };
 use crate::system_prompt::build_system_prompt;
 use crate::tools::{BrowserSessionManager, ToolContext};
-use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -28,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Default timeout for sub-agents: 5 minutes (REQ-SA-006, FM-6 prevention).
 /// Long enough for real work, short enough to catch stuck agents.
-const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
@@ -300,6 +299,62 @@ where
         // Update state
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
 
+        // Log notable state transitions at INFO. "Notable" means transitions that cross
+        // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
+        // terminal states). Internal bookkeeping transitions (e.g. AwaitingLlm→LlmRequesting)
+        // are logged at DEBUG to keep steady-state noise low.
+        {
+            fn state_name(s: &ConvState) -> &'static str {
+                match s {
+                    ConvState::Idle => "Idle",
+                    ConvState::AwaitingLlm => "AwaitingLlm",
+                    ConvState::LlmRequesting { .. } => "LlmRequesting",
+                    ConvState::ToolExecuting { .. } => "ToolExecuting",
+                    ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
+                    ConvState::CancellingSubAgents { .. } => "CancellingSubAgents",
+                    ConvState::CancellingTool { .. } => "CancellingTool",
+                    ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
+                    ConvState::Completed { .. } => "Completed",
+                    ConvState::Failed { .. } => "Failed",
+                    ConvState::Error { .. } => "Error",
+                    ConvState::ContextExhausted { .. } => "ContextExhausted",
+                    ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
+                    ConvState::Terminal => "Terminal",
+                }
+            }
+            let from = state_name(&old_state);
+            let to = state_name(&self.state);
+            if from != to {
+                let notable = matches!(
+                    &self.state,
+                    ConvState::Idle
+                        | ConvState::ToolExecuting { .. }
+                        | ConvState::AwaitingSubAgents { .. }
+                        | ConvState::Completed { .. }
+                        | ConvState::Failed { .. }
+                        | ConvState::Error { .. }
+                        | ConvState::ContextExhausted { .. }
+                        | ConvState::AwaitingTaskApproval { .. }
+                        | ConvState::Terminal
+                );
+                if notable {
+                    tracing::info!(
+                        conv_id = %self.context.conversation_id,
+                        from,
+                        to,
+                        "State transition"
+                    );
+                } else {
+                    tracing::debug!(
+                        conv_id = %self.context.conversation_id,
+                        from,
+                        to,
+                        "State transition"
+                    );
+                }
+            }
+        }
+
         let entering_awaiting = !matches!(
             old_state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
@@ -536,10 +591,7 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
-                let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
-                let _ = self
-                    .broadcast_tx
-                    .send(SseEvent::Message { message: msg_json });
+                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
                 Ok(None)
             }
 
@@ -550,9 +602,8 @@ where
                     .await?;
 
                 // Broadcast state change with full state data
-                let state_json = serde_json::to_value(&self.state).unwrap_or(Value::Null);
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                    state: state_json,
+                    state: self.state.clone(),
                     display_state: self.state.display_state().as_str().to_string(),
                 });
                 Ok(None)
@@ -599,11 +650,20 @@ where
                 });
 
                 let handle = tokio::spawn(async move {
-                    tracing::info!(
-                        is_sub_agent = is_sub_agent,
-                        request_id = %request_id,
-                        "Making LLM request (background)"
-                    );
+                    if is_sub_agent {
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            request_id = %request_id,
+                            sub_agent = true,
+                            "Making LLM request"
+                        );
+                    } else {
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            request_id = %request_id,
+                            "Making LLM request"
+                        );
+                    }
 
                     // Build messages from history
                     let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
@@ -693,13 +753,20 @@ where
                     self.llm_registry.clone(),
                 );
 
+                let conv_id = self.context.conversation_id.clone();
                 let tool_executor = self.tool_executor.clone();
                 let tool_use_id = tool.id.clone();
                 let tool_name = tool.name().to_string();
                 let tool_input = tool.input.to_value();
 
                 tokio::spawn(async move {
-                    tracing::info!(tool = %tool_name, id = %tool_use_id, "Executing tool (background)");
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        tool = %tool_name,
+                        id = %tool_use_id,
+                        "Executing tool"
+                    );
+                    let tool_start = std::time::Instant::now();
 
                     let output = tool_executor
                         .execute(&tool_name, tool_input, tool_ctx)
@@ -710,36 +777,54 @@ where
                     // The state machine only accepts ToolAborted from CancellingTool state,
                     // which is entered when AbortTool effect cancels the token.
                     let tool_outcome = if cancel_token_check.is_cancelled() {
-                        tracing::info!(tool_id = %tool_use_id, "Tool cancelled (token signaled)");
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            tool = %tool_name,
+                            id = %tool_use_id,
+                            "Tool cancelled"
+                        );
                         ToolOutcome::Aborted {
                             tool_use_id,
                             reason: crate::state_machine::AbortReason::CancellationRequested,
                         }
                     } else {
-                        match output {
-                            Some(out) => {
-                                use crate::db::ToolContentImage;
-                                let images = out
-                                    .images
-                                    .into_iter()
-                                    .map(|img| ToolContentImage {
-                                        media_type: img.media_type,
-                                        data: img.data,
-                                    })
-                                    .collect();
-                                ToolOutcome::Completed(ToolResult {
-                                    tool_use_id: tool_use_id.clone(),
-                                    success: out.success,
-                                    output: out.output,
-                                    is_error: !out.success,
-                                    display_data: out.display_data,
-                                    images,
+                        use crate::db::ToolContentImage;
+                        if let Some(out) = output {
+                            tracing::info!(
+                                conv_id = %conv_id,
+                                tool = %tool_name,
+                                id = %tool_use_id,
+                                duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                success = out.success,
+                                "Tool completed"
+                            );
+                            let images = out
+                                .images
+                                .into_iter()
+                                .map(|img| ToolContentImage {
+                                    media_type: img.media_type,
+                                    data: img.data,
                                 })
-                            }
-                            None => ToolOutcome::Failed {
+                                .collect();
+                            ToolOutcome::Completed(ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                success: out.success,
+                                output: out.output,
+                                is_error: !out.success,
+                                display_data: out.display_data,
+                                images,
+                            })
+                        } else {
+                            tracing::warn!(
+                                conv_id = %conv_id,
+                                tool = %tool_name,
+                                id = %tool_use_id,
+                                "Tool not found"
+                            );
+                            ToolOutcome::Failed {
                                 tool_use_id,
                                 error: format!("Unknown tool: {tool_name}"),
-                            },
+                            }
                         }
                     };
                     // Send typed outcome through oneshot channel
@@ -774,12 +859,35 @@ where
                         let _ = self.broadcast_tx.send(SseEvent::AgentDone);
                     }
                     "state_change" => {
-                        // data should contain the full state object
-                        if let Some(state) = data.get("state") {
-                            let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                                state: state.clone(),
-                                display_state: self.state.display_state().as_str().to_string(),
-                            });
+                        // data should contain the full state object; deserialize to typed ConvState
+                        if let Some(state_val) = data.get("state") {
+                            match serde_json::from_value::<ConvState>(state_val.clone()) {
+                                Ok(typed_state) => {
+                                    let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                                        state: typed_state,
+                                        display_state: self
+                                            .state
+                                            .display_state()
+                                            .as_str()
+                                            .to_string(),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "Failed to deserialize NotifyClient state_change into ConvState; \
+                                         falling back to current executor state"
+                                    );
+                                    let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                                        state: self.state.clone(),
+                                        display_state: self
+                                            .state
+                                            .display_state()
+                                            .as_str()
+                                            .to_string(),
+                                    });
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -806,10 +914,9 @@ where
                                 assistant_message.usage.as_ref(),
                             )
                             .await?;
-                        let agent_json = serde_json::to_value(&agent_msg).unwrap_or(Value::Null);
-                        let _ = self.broadcast_tx.send(SseEvent::Message {
-                            message: agent_json,
-                        });
+                        let _ = self
+                            .broadcast_tx
+                            .send(SseEvent::Message { message: agent_msg });
 
                         // Persist all tool results
                         for result in tool_results {
@@ -829,10 +936,9 @@ where
                                     None,
                                 )
                                 .await?;
-                            let tool_json = serde_json::to_value(&tool_msg).unwrap_or(Value::Null);
                             let _ = self
                                 .broadcast_tx
-                                .send(SseEvent::Message { message: tool_json });
+                                .send(SseEvent::Message { message: tool_msg });
                         }
                     }
                 }
@@ -856,10 +962,7 @@ where
                         .await?;
 
                     // Tool results don't contain bash tool_use blocks, no enrichment needed
-                    let msg_json = serde_json::to_value(&msg).unwrap_or(Value::Null);
-                    let _ = self
-                        .broadcast_tx
-                        .send(SseEvent::Message { message: msg_json });
+                    let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
                 }
                 Ok(None)
             }
@@ -989,11 +1092,9 @@ where
                             Ok(updated_msg) => {
                                 // This is a tool result message, not an agent message
                                 // No bash enrichment needed
-                                let msg_json =
-                                    serde_json::to_value(&updated_msg).unwrap_or(Value::Null);
-                                let _ = self
-                                    .broadcast_tx
-                                    .send(SseEvent::Message { message: msg_json });
+                                let _ = self.broadcast_tx.send(SseEvent::Message {
+                                    message: updated_msg,
+                                });
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1026,10 +1127,7 @@ where
                         .await?;
 
                     // Broadcast the new message (tool message, no bash enrichment needed)
-                    let msg_json = serde_json::to_value(&message).unwrap_or(Value::Null);
-                    let _ = self
-                        .broadcast_tx
-                        .send(SseEvent::Message { message: msg_json });
+                    let _ = self.broadcast_tx.send(SseEvent::Message { message });
                 }
 
                 Ok(None)
@@ -1046,12 +1144,18 @@ where
             Effect::NotifyContextExhausted { summary } => {
                 // REQ-BED-021: Notify client of context exhaustion
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                    state: serde_json::json!({
-                        "type": "context_exhausted",
-                        "summary": summary
-                    }),
+                    state: ConvState::ContextExhausted { summary },
                     display_state: self.state.display_state().as_str().to_string(),
                 });
+                Ok(None)
+            }
+
+            Effect::ApproveTask {
+                title,
+                priority,
+                plan,
+            } => {
+                self.execute_approve_task(title, priority, plan).await?;
                 Ok(None)
             }
         }
@@ -1228,6 +1332,368 @@ where
         });
         self.llm_task_handle = Some(handle);
     }
+
+    /// REQ-BED-028: Execute git operations for task approval.
+    ///
+    /// Sequence: dirty tree check -> assign task ID -> mkdir tasks/ -> write task file ->
+    /// git commit -> check branch collision -> create branch -> checkout -> update `conv_mode`.
+    ///
+    /// On failure: revert in-memory state to `AwaitingTaskApproval` so the user can retry.
+    /// Collision check on retry handles partial state.
+    async fn execute_approve_task(
+        &mut self,
+        title: String,
+        priority: String,
+        plan: String,
+    ) -> Result<(), String> {
+        let cwd = self.context.working_dir.clone();
+        let conv_id = self.context.conversation_id.clone();
+        let storage = self.storage.clone();
+
+        // Clone for state revert on failure (originals moved into spawn_blocking)
+        let title_backup = title.clone();
+        let priority_backup = priority.clone();
+        let plan_backup = plan.clone();
+
+        // Run blocking git/fs operations on a blocking thread
+        let result = tokio::task::spawn_blocking(move || {
+            execute_approve_task_blocking(&cwd, &conv_id, &title, &priority, &plan)
+        })
+        .await
+        .map_err(|e| format!("Task approval join error: {e}"))?;
+
+        match result {
+            Ok(approval_result) => {
+                // Update conversation mode to Work (includes worktree_path, base_branch, task_number)
+                let work_mode = crate::db::ConvMode::Work {
+                    branch_name: approval_result.branch_name.clone(),
+                    worktree_path: approval_result.worktree_path.clone(),
+                    base_branch: approval_result.base_branch.clone(),
+                    task_id: approval_result.task_id.clone(),
+                };
+                storage
+                    .update_conversation_mode(&self.context.conversation_id, &work_mode)
+                    .await?;
+
+                // Update conversation CWD to the worktree path
+                storage
+                    .update_conversation_cwd(
+                        &self.context.conversation_id,
+                        &approval_result.worktree_path,
+                    )
+                    .await?;
+
+                // Replace working_dir to point at the worktree directory.
+                // Field-level mutation (not full replacement) so we don't lose
+                // is_sub_agent, context_exhaustion_behavior, or future fields.
+                self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
+
+                // Upgrade tool registry from Explore to Work mode so the agent
+                // gets bash, patch, etc. for the rest of this conversation.
+                self.tool_executor.upgrade_to_work_mode();
+
+                tracing::info!(
+                    task_id = %approval_result.task_id,
+                    branch = %approval_result.branch_name,
+                    worktree = %approval_result.worktree_path,
+                    first_task = approval_result.first_task,
+                    "Task approved — worktree created"
+                );
+
+                // Persist a system message with the branch + worktree path
+                let branch_msg = format!(
+                    "Task approved. You are on branch {} in {}.",
+                    approval_result.branch_name, approval_result.worktree_path
+                );
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let content = MessageContent::system(&branch_msg);
+                let msg = self
+                    .storage
+                    .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+                    .await?;
+                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+
+                // Push updated conversation metadata to the client so it
+                // reflects the new cwd, branch, worktree_path, and mode label
+                // without requiring a reconnect.
+                let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
+                    update: crate::runtime::ConversationMetadataUpdate {
+                        cwd: Some(approval_result.worktree_path.clone()),
+                        branch_name: Some(approval_result.branch_name.clone()),
+                        worktree_path: Some(approval_result.worktree_path.clone()),
+                        conv_mode_label: Some("Work".to_string()),
+                        base_branch: Some(approval_result.base_branch.clone()),
+                        commits_behind: None,
+                    },
+                });
+
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Task approval git operations failed");
+
+                // Revert in-memory state to AwaitingTaskApproval so the user can retry.
+                // The DB still has AwaitingTaskApproval (PersistState hasn't run for the
+                // new Idle state yet), so this keeps memory and DB consistent.
+                self.state = ConvState::AwaitingTaskApproval {
+                    title: title_backup,
+                    priority: priority_backup,
+                    plan: plan_backup,
+                };
+
+                // Broadcast an error so the UI knows, but don't propagate — the
+                // conversation stays in AwaitingTaskApproval for retry.
+                let _ = self.broadcast_tx.send(SseEvent::Error {
+                    message: format!("Task approval failed: {e}"),
+                });
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Result of a successful task approval
+struct TaskApprovalResult {
+    task_id: String,
+    branch_name: String,
+    first_task: bool,
+    /// Absolute path to the git worktree created for this conversation
+    worktree_path: String,
+    /// The branch that was checked out when the task was approved (merge target)
+    base_branch: String,
+}
+
+/// Derive a slug from a task title: lowercase, spaces to hyphens, strip non-alphanumeric
+/// except hyphens, truncate at 40 chars, trim trailing hyphens.
+fn derive_slug(title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let truncated = if slug.len() > 40 {
+        // Truncate at last hyphen within 40 chars to avoid cutting mid-word
+        let s = &slug[..40];
+        s.rfind('-').map_or(s, |i| &s[..i]).to_string()
+    } else {
+        slug
+    };
+    truncated.trim_end_matches('-').to_string()
+}
+
+/// Get the next task ID by shelling out to `taskmd next`.
+/// Returns an ID like "YF042". Falls back to a timestamp-based ID if taskmd
+/// is not installed, so task approval still works without the CLI.
+fn get_next_task_id(cwd: &std::path::Path) -> String {
+    let result = std::process::Command::new("taskmd")
+        .args(["next", "--output", "text"])
+        .current_dir(cwd)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !id.is_empty() {
+                return id;
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            tracing::warn!(error = %stderr, "taskmd next failed, using fallback ID");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "taskmd not available, using fallback ID");
+        }
+    }
+
+    // Fallback: timestamp-based ID that sorts correctly and won't collide
+    let now = chrono::Local::now();
+    format!("T{}", now.format("%y%m%d%H%M"))
+}
+
+/// Run a git command in the given directory, returning stdout on success or an error message.
+pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("git {} failed: {stderr}", args.join(" ")))
+    }
+}
+
+/// Global mutex serializing the scan-tasks + write + commit sequence.
+/// Task approval is rare; a single mutex is sufficient.
+/// Also used by Complete/Abandon flows (task 0604) for git-on-main-checkout operations.
+pub(crate) static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Blocking implementation of approve task git operations.
+/// Runs on a blocking thread via `spawn_blocking`.
+#[allow(clippy::too_many_lines)] // Sequential git flow; splitting hurts readability
+fn execute_approve_task_blocking(
+    cwd: &std::path::Path,
+    conv_id: &str,
+    title: &str,
+    priority: &str,
+    plan: &str,
+) -> Result<TaskApprovalResult, String> {
+    use std::io::Write;
+
+    // Serialize the entire scan + write + commit sequence to prevent
+    // concurrent approvals from getting the same task number.
+    let _guard = TASK_APPROVAL_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // 0. Detect the current branch before any mutations (used as merge target for Complete)
+    let base_branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base_branch = base_branch.trim().to_string();
+    if base_branch.is_empty() || base_branch == "HEAD" {
+        return Err(
+            "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
+                .to_string(),
+        );
+    }
+
+    let tasks_dir = cwd.join("tasks");
+
+    // Track whether tasks/ existed before we create it
+    let first_task = !tasks_dir.exists();
+
+    // 2. Assign task ID via taskmd (falls back to timestamp if unavailable)
+    let task_id = get_next_task_id(cwd);
+
+    // 3. Create tasks/ directory if needed
+    if first_task {
+        std::fs::create_dir_all(&tasks_dir)
+            .map_err(|e| format!("Failed to create tasks/ directory: {e}"))?;
+        tracing::info!("Created tasks/ directory (first task for this project)");
+    }
+
+    // 4. Derive slug from title
+    let slug = derive_slug(title);
+    if slug.is_empty() {
+        return Err("Cannot derive a valid slug from the task title".to_string());
+    }
+
+    // 5. Write task file (taskmd format: AANNN-pX-status--slug.md)
+    let filename = format!("{task_id}-{priority}-in-progress--{slug}.md");
+    let filepath = tasks_dir.join(&filename);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let branch_name = format!("task-{task_id}-{slug}");
+
+    let task_content = format!(
+        "---\n\
+         created: {today}\n\
+         priority: {priority}\n\
+         status: in-progress\n\
+         artifact: pending\n\
+         ---\n\
+         \n\
+         # {title}\n\
+         \n\
+         ## Plan\n\
+         \n\
+         {plan}\n\
+         \n\
+         ## Progress\n\
+         \n"
+    );
+
+    let mut file = std::fs::File::create(&filepath)
+        .map_err(|e| format!("Failed to create task file {}: {e}", filepath.display()))?;
+    file.write_all(task_content.as_bytes())
+        .map_err(|e| format!("Failed to write task file: {e}"))?;
+    tracing::info!(file = %filepath.display(), "Task file written");
+
+    // 5. Ensure .gitignore contains .phoenix/ (worktree dir lives there)
+    let gitignore_path = cwd.join(".gitignore");
+    let gitignore_needs_update = if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path)
+            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
+        !content.lines().any(|line| line.trim() == ".phoenix/")
+    } else {
+        true
+    };
+
+    if gitignore_needs_update {
+        use std::io::Write as _;
+        // Ensure we don't corrupt the last line if .gitignore lacks a trailing newline
+        let needs_leading_newline = gitignore_path.exists()
+            && std::fs::read(&gitignore_path)
+                .ok()
+                .is_some_and(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"));
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore_path)
+            .map_err(|e| format!("Failed to open .gitignore: {e}"))?;
+        if needs_leading_newline {
+            writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        }
+        writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        run_git(cwd, &["add", ".gitignore"])?;
+        tracing::info!("Added .phoenix/ to .gitignore");
+    }
+
+    // 6. Git commit the task file (and .gitignore if modified)
+    let relative_path = format!("tasks/{filename}");
+    run_git(cwd, &["add", &relative_path])?;
+    let commit_msg = format!("task {task_id}: {title}");
+    // Use `git commit` without `--only` so both staged files are included
+    run_git(cwd, &["commit", "-m", &commit_msg])?;
+    tracing::info!(commit_msg = %commit_msg, "Task file committed");
+
+    // 7. Branch collision check
+    let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
+    if branch_exists {
+        // Check if fully merged into current branch
+        let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
+        if merge_base.is_ok() {
+            // Fully merged — safe to delete
+            run_git(cwd, &["branch", "-d", &branch_name])?;
+            tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
+        } else {
+            return Err(format!(
+                "Branch '{branch_name}' already exists and is not fully merged. \
+                 Please resolve this manually before approving."
+            ));
+        }
+    }
+
+    // 8. Create worktree with new branch (atomic: creates branch + attaches worktree)
+    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
+    std::fs::create_dir_all(&phoenix_dir)
+        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
+
+    let worktree_path = phoenix_dir.join(conv_id);
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    run_git(
+        cwd,
+        &["worktree", "add", &worktree_path_str, "-b", &branch_name],
+    )?;
+    tracing::info!(
+        branch = %branch_name,
+        worktree = %worktree_path_str,
+        "Created git worktree"
+    );
+
+    Ok(TaskApprovalResult {
+        task_id,
+        branch_name,
+        first_task,
+        worktree_path: worktree_path_str,
+        base_branch,
+    })
 }
 
 /// Build the continuation prompt (REQ-BED-020)

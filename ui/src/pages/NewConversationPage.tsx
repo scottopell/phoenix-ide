@@ -24,7 +24,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
-  const [dirStatus, setDirStatus] = useState<DirStatus>('checking');
+  const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
+    localStorage.getItem(LAST_CWD_KEY) ? 'exists' : 'checking'
+  );
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
   const [draft, setDraft] = useState('');
@@ -200,6 +202,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       <main className="new-conv-main">
         <div className="new-conv-content">
           <h1 className="new-conv-title">New conversation</h1>
+          <p className="new-conv-tagline">AI-powered coding assistant</p>
 
           <LlmStatusBanner models={models} />
           {error && <div className="new-conv-error">{error}</div>}
@@ -235,7 +238,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               </div>
               <div className="new-conv-input-right">
                 {desktopMode && (
-                  <button className="new-conv-send-bg" onClick={() => handleSend(true)} disabled={!canSend} title="Create and stay on this page">Background</button>
+                  <button className="new-conv-send-bg" onClick={() => handleSend(true)} disabled={!canSend} title="Create conversation and stay on this page">Send & Stay</button>
                 )}
                 <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
               </div>
@@ -244,17 +247,17 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
           {/* Desktop: collapsible settings row */}
           <button className="settings-row desktop-only" onClick={() => setShowSettings(!showSettings)}>
-            <span className="settings-item">
+            <span className="settings-item" title="Working directory for this conversation">
               <span className="settings-label">dir</span>
               <span className={`settings-status ${dirStatusClass}`}>{dirStatusIcon}</span>
               <span className="settings-value">{cwdDisplay}</span>
             </span>
             <span className="settings-dot">·</span>
-            <span className="settings-item">
+            <span className="settings-item" title="AI model used for this conversation">
               <span className="settings-label">model</span>
               <span className="settings-value">{modelDisplay}</span>
             </span>
-            <span className={`settings-caret ${showSettings ? 'open' : ''}`}>›</span>
+            <span className={`settings-caret ${showSettings ? 'open' : ''}`} title="Settings">›</span>
           </button>
 
           <div className={`settings-panel desktop-only ${showSettings ? 'open' : ''}`}>

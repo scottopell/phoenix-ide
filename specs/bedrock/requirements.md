@@ -271,7 +271,7 @@ WHEN user does not respond within reasonable time
 THE SYSTEM SHALL remain paused (no automatic timeout to Unrestricted)
 
 **Deprecation Reason:** The `request_mode_upgrade` tool and `AwaitingModeApproval`
-state are replaced by the `create_task` tool and `AwaitingTaskApproval` state. The
+state are replaced by the `propose_plan` tool and `AwaitingTaskApproval` state. The
 new flow is richer: the agent proposes a full task plan rather than just a reason
 string, and the user reviews via the prose reader with line-level annotation support.
 The mode transition is now inseparable from task creation.
@@ -289,16 +289,16 @@ AND NOT require agent approval
 WHEN mode changes (either direction)
 THE SYSTEM SHALL persist the new mode as part of conversation state
 
-**Deprecation Reason:** The downgrade concept (Unrestricted → Restricted) is replaced
-by task completion flows. A conversation returns to Explore mode by either merging its
-task (REQ-PROJ-009) or abandoning it (REQ-PROJ-010). There is no standalone mode
+**Deprecation Reason:** The downgrade concept (Unrestricted -> Restricted) is replaced
+by task completion flows. A Work conversation transitions to Terminal state on task
+completion (REQ-PROJ-009) or abandonment (REQ-PROJ-010). There is no standalone mode
 downgrade; mode is always tied to worktree lifecycle.
 
 ---
 
 ### REQ-BED-017: Mode Communication
 
-WHEN conversation mode changes (Explore → Work or Work → Explore)
+WHEN conversation mode changes (Explore to Work on task approval)
 THE SYSTEM SHALL inject a synthetic system message visible to the agent
 WHICH clearly states the new mode and its implications for tool availability
 
@@ -307,13 +307,13 @@ THE SYSTEM SHALL NOT modify tool descriptions based on mode
 
 WHEN a tool is unavailable due to mode restrictions
 THE SYSTEM SHALL return a clear, actionable error message
-AND for write tools blocked in Explore mode, SHALL suggest using `create_task` to
+AND for write tools blocked in Explore mode, SHALL suggest using `propose_plan` to
 propose work that requires write access
 
 **Rationale:** Tool descriptions must remain static throughout a conversation to avoid
 confusing the LLM. Mode awareness comes through synthetic messages on transitions and
 clear error responses when tools are blocked. Updated from REQ-BED-014/015 framing to
-reflect Explore/Work mode names and `create_task` as the path to write access.
+reflect Explore/Work mode names and `propose_plan` as the path to write access.
 
 ---
 
@@ -333,7 +333,7 @@ AND configure its working directory as the parent's worktree path
 AND enforce that only one Work sub-agent exists per parent at a time
 
 WHEN sub-agent is running
-THE SYSTEM SHALL NOT provide `create_task` or `update_task` tools to sub-agents
+THE SYSTEM SHALL NOT provide `propose_plan` tool to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
@@ -465,11 +465,14 @@ THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
 ---
 
-### REQ-BED-027: Explore and Work Conversation Modes
+### REQ-BED-027: Explore, Work, and Standalone Conversation Modes
 
-WHEN a conversation is created for a project
+WHEN a conversation is created for a project (git-backed directory)
 THE SYSTEM SHALL initialize the conversation in Explore mode
 AND store the mode as a field on the conversation record (not inside state machine state)
+
+WHEN a conversation is created for a non-git directory
+THE SYSTEM SHALL initialize the conversation in Standalone mode
 
 WHILE a conversation is in Explore mode
 THE SYSTEM SHALL configure the tool registry with read-only settings
@@ -479,70 +482,91 @@ WHILE a conversation is in Work mode
 THE SYSTEM SHALL configure the tool registry with write access scoped to the worktree path
 AND record the worktree path and associated task ID in the mode field
 
-WHEN conversation mode changes
+WHILE a conversation is in Standalone mode
+THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
+AND SHALL NOT provide `propose_plan` tool
+AND the mode SHALL NOT change for the lifetime of the conversation
+
+WHEN conversation mode changes (Explore to Work on task approval)
 THE SYSTEM SHALL persist the updated mode before resuming execution
 
 **Rationale:** Mode is conversation-level identity — it persists across all state machine
 transitions and survives server restarts. Keeping it as a separate field (not embedded
 in every ConvState variant) prevents combinatorial explosion of state variants and
 makes crash recovery straightforward: the executor reads mode and state independently
-and configures the tool registry accordingly.
+and configures the tool registry accordingly. Standalone mode exists for directories
+without git — it provides full tool access but without the safety features (worktrees,
+task tracking, branch isolation) that require a git repository.
 
-**Dependencies:** REQ-PROJ-002, REQ-PROJ-007
+**Dependencies:** REQ-PROJ-002, REQ-PROJ-007, REQ-PROJ-016
 
 ---
 
 ### REQ-BED-028: Task Approval State
 
-WHEN the `create_task` tool is called from Explore mode
-THE SYSTEM SHALL transition the conversation to AwaitingTaskApproval state
-AND store the task ID and task file path in the state
-AND pause all agent execution
+WHEN the LLM response contains a `propose_plan` tool call
+THE SYSTEM SHALL intercept it at the LlmResponse handler (same pattern as submit_result)
+AND NOT route it through the tool executor
+AND persist the assistant message and a synthetic tool result as a CheckpointData::ToolRound
+AND transition the conversation to AwaitingTaskApproval state
+AND emit a `task_approval_requested` SSE event with the plan content
+
+THE AwaitingTaskApproval state SHALL carry: title, priority, and plan text
+  (all serializable data — no file paths, no oneshot channels, no git references)
 
 WHEN the user approves the task while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the create_task tool call with a success result
+THE SYSTEM SHALL write a task file to `tasks/` and commit to main
+AND create branch `task-{NNNN}-{slug}` from main HEAD and checkout it
 AND transition the conversation to Idle in Work mode
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the create_task tool call with the annotations as result
+THE SYSTEM SHALL close the prose reader
+AND deliver the annotations to the agent as a user message
 AND transition the conversation to Idle in Explore mode
-AND allow the agent to call create_task again with a revised plan
+  (the agent may revise and call `propose_plan` again, re-entering AwaitingTaskApproval)
 
 WHEN the user discards the task while in AwaitingTaskApproval
-THE SYSTEM SHALL resolve the create_task tool call with a rejection result
-AND transition the conversation to Idle in Explore mode
+THE SYSTEM SHALL transition the conversation to Idle in Explore mode
+AND NOT perform any git operations (nothing was written to disk)
 
-WHEN server restarts with a conversation in AwaitingTaskApproval
-THE SYSTEM SHALL restore the conversation to AwaitingTaskApproval
-AND re-emit the task approval event to reconnecting UI clients
+**Persistence and restart:**
+
+WHEN the server persists AwaitingTaskApproval to the database
+THE SYSTEM SHALL store the title, priority, and plan text as part of the serialized ConvState
+
+WHEN the server restarts and loads a conversation in AwaitingTaskApproval
+THE SYSTEM SHALL reconstruct the state from the serialized data (all data is in the DB)
+AND re-emit the `task_approval_requested` SSE event when the UI reconnects
 
 **Rationale:** AwaitingTaskApproval is a first-class state because it has a distinct
 set of valid incoming events (approve, discard, feedback) and a distinct UI
-representation (prose reader with task file open). Making it a flag on an existing
-state would require every handle_outcome arm to check the flag — a
-correct-by-construction violation.
+representation (prose reader with plan content). `propose_plan` follows the
+submit_result interception pattern — pure data carrier, no side effects, no tool
+execution. All git operations are deferred to the approval moment.
 
 **Dependencies:** REQ-PROJ-003, REQ-PROJ-004
 
 ---
 
-### REQ-BED-029: Return to Explore Mode on Task Resolution
+### REQ-BED-029: Conversation Terminal State on Task Resolution
 
-WHEN a Work conversation's task is merged to main
-THE SYSTEM SHALL transition the conversation to Explore mode
-AND pin the conversation to the new main HEAD
-AND clear the worktree path and task ID from the mode field
+WHEN a Work conversation's task is completed (squash merged to base_branch)
+THE SYSTEM SHALL transition the conversation to Terminal state
+AND the conversation SHALL NOT accept new user messages
 
 WHEN a Work conversation's task is abandoned
-THE SYSTEM SHALL transition the conversation to Explore mode
-AND pin the conversation to the current main HEAD
-AND clear the worktree path and task ID from the mode field
+THE SYSTEM SHALL transition the conversation to Terminal state
+AND the conversation SHALL NOT accept new user messages
 
-WHEN the conversation returns to Explore mode after task resolution
-THE SYSTEM SHALL inject a synthetic system message indicating the mode change
-AND reconfigure the tool registry to read-only settings
+WHEN a conversation enters Terminal state after task resolution
+THE SYSTEM SHALL inject a synthetic system message indicating the outcome
+  (completed with commit hash, or abandoned)
+AND the conversation SHALL remain visible in the sidebar for reference
+AND the user SHALL be able to start a new Explore conversation on the same project
 
-**Rationale:** Work mode is always tied to a specific task and worktree. When that
-task concludes (successfully or not), the conversation returns to Explore mode — the
-neutral, safe starting state. This mirrors the natural project rhythm: explore,
-propose, execute, review, then explore again.
+**Rationale:** Work conversations are single-purpose: one task, one worktree, one
+lifecycle. When the task concludes (successfully or not), the conversation is done.
+Returning to Explore mode would create confusion about what the conversation's
+context represents (the old worktree is gone, the pinned commit is arbitrary).
+Terminal state is clean and explicit. The user creates a new Explore conversation
+to continue working on the project.

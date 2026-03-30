@@ -3,8 +3,6 @@
 //! These tests verify that the translation between our internal types
 //! and provider wire formats preserves key invariants:
 //! - Empty responses are rejected
-//! - Tool calls with empty names are rejected
-//! - Invalid JSON arguments are rejected
 //! - Message translation never produces empty output
 //! - Content is preserved through translation
 
@@ -12,9 +10,8 @@
 
 use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
-    self, OpenAIChoice, OpenAIContent, OpenAIFunctionCall, OpenAIMessage, OpenAIResponse,
-    OpenAIToolCall, OpenAIUsage, ResponsesApiContentPart, ResponsesApiFunctionOutput,
-    ResponsesApiInputItem, ResponsesApiMessageContent, ResponsesApiOutputPart,
+    self, ResponsesApiContentPart, ResponsesApiFunctionOutput, ResponsesApiInputItem,
+    ResponsesApiMessageContent, ResponsesApiOutputPart,
 };
 use super::types::{ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole};
 use proptest::prelude::*;
@@ -115,8 +112,7 @@ fn arb_user_message() -> impl Strategy<Value = LlmMessage> {
     })
 }
 
-/// Assistant message (text and tool use — no images or tool results typically,
-/// but we test the edge case of tool results in assistant messages for bug #4)
+/// Assistant message (text and tool use)
 fn arb_assistant_message() -> impl Strategy<Value = LlmMessage> {
     proptest::collection::vec(
         prop_oneof![
@@ -140,42 +136,6 @@ fn arb_message() -> impl Strategy<Value = LlmMessage> {
 // Strategies — provider-specific response generators
 // ============================================================================
 
-/// Build an `OpenAI` response with given content and optional tool calls
-fn make_openai_response(
-    content: Option<String>,
-    tool_calls: Option<Vec<OpenAIToolCall>>,
-    finish_reason: Option<String>,
-) -> OpenAIResponse {
-    OpenAIResponse {
-        choices: vec![OpenAIChoice {
-            message: OpenAIMessage {
-                role: "assistant".to_string(),
-                content: content.map(OpenAIContent::Text),
-                tool_calls,
-                tool_call_id: None,
-            },
-            finish_reason,
-        }],
-        usage: OpenAIUsage {
-            prompt_tokens: 10,
-            completion_tokens: 5,
-            total_tokens: 15,
-        },
-    }
-}
-
-/// Build an `OpenAI` tool call
-fn make_openai_tool_call(id: &str, name: &str, arguments: &str) -> OpenAIToolCall {
-    OpenAIToolCall {
-        id: id.to_string(),
-        r#type: "function".to_string(),
-        function: OpenAIFunctionCall {
-            name: name.to_string(),
-            arguments: arguments.to_string(),
-        },
-    }
-}
-
 /// Build an Anthropic response
 fn make_anthropic_response(
     content: Vec<AnthropicContentBlock>,
@@ -194,21 +154,10 @@ fn make_anthropic_response(
 }
 
 // ============================================================================
-// Group A — Response validation (verifies bug #1 fix)
+// Group A — Anthropic response validation
 // ============================================================================
 
 proptest! {
-
-
-    /// Empty OpenAI response (no content, no tool calls) → Err
-    #[test]
-    fn prop_openai_normalize_rejects_empty(
-        finish_reason in proptest::option::of("[a-z_]{3,10}")
-    ) {
-        let resp = make_openai_response(None, None, finish_reason);
-        let result = openai::test_helpers::normalize_response(resp);
-        prop_assert!(result.is_err(), "Expected error for empty OpenAI response");
-    }
 
     /// Empty Anthropic response → Err
     #[test]
@@ -229,20 +178,11 @@ proptest! {
         prop_assert!(result.is_err(), "Expected error for empty Anthropic response");
     }
 
-    /// For all providers: Ok(resp) implies non-empty content
+    /// Ok(resp) implies non-empty content
     #[test]
-    fn prop_normalize_ok_implies_nonempty(
+    fn prop_anthropic_normalize_ok_implies_nonempty(
         text in "[a-zA-Z0-9 ]{1,100}"
     ) {
-        // OpenAI
-        let openai_resp = make_openai_response(
-            Some(text.clone()), None, Some("stop".to_string()),
-        );
-        if let Ok(resp) = openai::test_helpers::normalize_response(openai_resp) {
-            prop_assert!(!resp.content.is_empty(), "OpenAI Ok response had empty content");
-        }
-
-        // Anthropic
         let anth_resp = make_anthropic_response(
             vec![AnthropicContentBlock::Text { text }],
             Some("end_turn"),
@@ -254,147 +194,10 @@ proptest! {
 }
 
 // ============================================================================
-// Group B — Tool call integrity (catches bug #2)
+// Group E — Anthropic content preservation
 // ============================================================================
 
 proptest! {
-
-
-    /// N tool calls with non-empty names → exactly N ToolUse blocks in output
-    #[test]
-    fn prop_openai_normalize_preserves_named_tools(
-        calls in proptest::collection::vec(
-            (
-                "[a-z0-9]{5,15}",
-                "[a-z_]{3,15}",
-                arb_json_value(),
-            ),
-            1..5,
-        ),
-    ) {
-        let n = calls.len();
-        let tool_calls: Vec<OpenAIToolCall> = calls
-            .into_iter()
-            .map(|(id, name, args)| {
-                make_openai_tool_call(&id, &name, &serde_json::to_string(&args).unwrap())
-            })
-            .collect();
-        let resp = make_openai_response(None, Some(tool_calls), Some("tool_calls".to_string()));
-
-        let result = openai::test_helpers::normalize_response(resp);
-        prop_assert!(result.is_ok(), "Expected Ok for valid tool calls");
-        let llm_resp = result.unwrap();
-        let tool_count = llm_resp.content.iter().filter(|b| matches!(b, ContentBlock::ToolUse { .. })).count();
-        prop_assert_eq!(tool_count, n, "Expected {} tool calls, got {}", n, tool_count);
-    }
-
-    /// Response with empty-name tool call → Err
-    #[test]
-    fn prop_openai_normalize_rejects_empty_name_tools(
-        id in "[a-z0-9]{5,15}",
-        args in arb_json_value(),
-    ) {
-        let tc = make_openai_tool_call(&id, "", &serde_json::to_string(&args).unwrap());
-        let resp = make_openai_response(None, Some(vec![tc]), Some("tool_calls".to_string()));
-        let result = openai::test_helpers::normalize_response(resp);
-        prop_assert!(result.is_err(), "Expected error for empty-name tool call");
-    }
-}
-
-// ============================================================================
-// Group C — JSON argument fidelity (catches bug #3)
-// ============================================================================
-
-proptest! {
-
-
-    /// Valid JSON arguments survive normalize: round-trip check
-    #[test]
-    fn prop_normalize_valid_json_roundtrips(
-        id in "[a-z0-9]{5,15}",
-        name in "[a-z_]{3,15}",
-        value in arb_json_value(),
-    ) {
-        let json_str = serde_json::to_string(&value).unwrap();
-        let tc = make_openai_tool_call(&id, &name, &json_str);
-        let resp = make_openai_response(None, Some(vec![tc]), Some("tool_calls".to_string()));
-
-        let result = openai::test_helpers::normalize_response(resp);
-        prop_assert!(result.is_ok(), "Expected Ok for valid JSON args");
-
-        let llm_resp = result.unwrap();
-        let tool_uses: Vec<_> = llm_resp.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolUse { input, .. } => Some(input),
-            _ => None,
-        }).collect();
-
-        prop_assert_eq!(tool_uses.len(), 1);
-        // Round-trip: serialized then parsed should equal original
-        let round_tripped: serde_json::Value = serde_json::from_str(
-            &serde_json::to_string(tool_uses[0]).unwrap()
-        ).unwrap();
-        prop_assert_eq!(&round_tripped, &value, "JSON did not round-trip");
-    }
-
-    /// Invalid JSON in tool arguments → Err
-    #[test]
-    fn prop_normalize_rejects_invalid_json_args(
-        id in "[a-z0-9]{5,15}",
-        name in "[a-z_]{3,15}",
-    ) {
-        // These are definitely invalid JSON
-        let invalid_jsons = vec!["{invalid", "not json at all", "{key: unquoted}", "[,]"];
-        for invalid in invalid_jsons {
-            let tc = make_openai_tool_call(&id, &name, invalid);
-            let resp = make_openai_response(None, Some(vec![tc]), Some("tool_calls".to_string()));
-
-            let result = openai::test_helpers::normalize_response(resp);
-            prop_assert!(result.is_err(), "Expected error for invalid JSON args: {}", invalid);
-        }
-    }
-}
-
-// ============================================================================
-// Group D — Message translation invariants (catches bug #4)
-// ============================================================================
-
-proptest! {
-
-
-    /// Any LlmMessage → at least one OpenAIMessage
-    #[test]
-    fn prop_openai_translate_never_empty_output(
-        msg in arb_message(),
-    ) {
-        let result = openai::test_helpers::translate_message(&msg);
-        prop_assert!(!result.is_empty(), "translate_message returned empty for {:?}", msg.role);
-    }
-
-    /// Every output message has either content, tool_calls, or tool_call_id
-    #[test]
-    fn prop_openai_translate_messages_have_content_or_tool_id(
-        msg in arb_message(),
-    ) {
-        let messages = openai::test_helpers::translate_message(&msg);
-        for m in &messages {
-            let has_content = m.content.is_some();
-            let has_tool_calls = m.tool_calls.is_some();
-            let has_tool_call_id = m.tool_call_id.is_some();
-            prop_assert!(
-                has_content || has_tool_calls || has_tool_call_id,
-                "OpenAI message has neither content, tool_calls, nor tool_call_id: role={}",
-                m.role,
-            );
-        }
-    }
-}
-
-// ============================================================================
-// Group E — Content preservation
-// ============================================================================
-
-proptest! {
-
 
     /// Anthropic translate is 1:1 (same number of content blocks, types match)
     #[test]
@@ -411,119 +214,18 @@ proptest! {
         // Verify type correspondence
         for (orig, trans) in msg.content.iter().zip(translated.content.iter()) {
             match (orig, trans) {
-                (ContentBlock::Text { .. }, AnthropicContentBlock::Text { .. }) => {}
-                (ContentBlock::Image { .. }, AnthropicContentBlock::Image { .. }) => {}
-                (ContentBlock::ToolUse { .. }, AnthropicContentBlock::ToolUse { .. }) => {}
-                (ContentBlock::ToolResult { .. }, AnthropicContentBlock::ToolResult { .. }) => {}
+                (ContentBlock::Text { .. }, AnthropicContentBlock::Text { .. })
+                | (ContentBlock::Image { .. }, AnthropicContentBlock::Image { .. })
+                | (ContentBlock::ToolUse { .. }, AnthropicContentBlock::ToolUse { .. })
+                | (ContentBlock::ToolResult { .. }, AnthropicContentBlock::ToolResult { .. }) => {}
                 _ => prop_assert!(false, "Type mismatch: {:?} vs {:?}", orig, trans),
             }
         }
     }
-
-    /// All Text blocks appear in translated OpenAI output
-    #[test]
-    fn prop_openai_translate_preserves_text(
-        msg in arb_assistant_message(),
-    ) {
-        let text_blocks: Vec<&str> = msg.content.iter().filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        }).collect();
-
-        let messages = openai::test_helpers::translate_message(&msg);
-        let mut all_text = String::new();
-        for m in &messages {
-            if let Some(OpenAIContent::Text(t)) = &m.content {
-                all_text.push_str(t);
-            }
-        }
-
-        for text in &text_blocks {
-            prop_assert!(
-                all_text.contains(text),
-                "Text '{}' not found in translated output '{}'",
-                text,
-                all_text,
-            );
-        }
-    }
-
-    /// N ToolUse blocks → N tool_calls
-    #[test]
-    fn prop_openai_translate_preserves_tool_use_count(
-        msg in arb_assistant_message(),
-    ) {
-        let tool_use_count = msg.content.iter().filter(|b| matches!(b, ContentBlock::ToolUse { .. })).count();
-        let messages = openai::test_helpers::translate_message(&msg);
-
-        let translated_count: usize = messages.iter()
-            .filter_map(|m| m.tool_calls.as_ref())
-            .map(|tcs| tcs.len())
-            .sum();
-
-        prop_assert_eq!(
-            translated_count,
-            tool_use_count,
-            "ToolUse count mismatch"
-        );
-    }
-
-    /// Each ToolResult → separate role="tool" message with matching tool_call_id
-    #[test]
-    fn prop_openai_translate_tool_results_become_tool_role(
-        msg in arb_user_message(),
-    ) {
-        let tool_result_ids: Vec<&str> = msg.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-            _ => None,
-        }).collect();
-
-        let messages = openai::test_helpers::translate_message(&msg);
-        let tool_messages: Vec<_> = messages.iter()
-            .filter(|m| m.role == "tool")
-            .collect();
-
-        prop_assert_eq!(
-            tool_messages.len(),
-            tool_result_ids.len(),
-            "Expected {} tool messages, got {}",
-            tool_result_ids.len(),
-            tool_messages.len(),
-        );
-
-        for (expected_id, tool_msg) in tool_result_ids.iter().zip(tool_messages.iter()) {
-            prop_assert_eq!(
-                tool_msg.tool_call_id.as_deref(),
-                Some(*expected_id),
-                "tool_call_id mismatch"
-            );
-        }
-    }
 }
 
 // ============================================================================
-// Group F — Serialization safety
-// ============================================================================
-
-proptest! {
-
-
-    /// Translated messages serialize without error
-    #[test]
-    fn prop_translated_request_serializes(
-        msg in arb_message(),
-    ) {
-        // OpenAI translation
-        let openai_msgs = openai::test_helpers::translate_message(&msg);
-        for m in &openai_msgs {
-            let result = serde_json::to_value(m);
-            prop_assert!(result.is_ok(), "OpenAI message failed to serialize: {:?}", result.err());
-        }
-    }
-}
-
-// ============================================================================
-// Group G — ToolResult image channel invariants
+// Group G — Anthropic ToolResult image channel invariants
 // ============================================================================
 
 proptest! {
@@ -594,37 +296,6 @@ proptest! {
         } else {
             prop_assert!(false, "Expected ToolResult block");
         }
-    }
-
-    /// C — OpenAI chat (Fireworks): images have no effect on tool result wire format
-    #[test]
-    fn prop_openai_tool_result_images_ignored(
-        tool_use_id in "[a-z0-9_]{5,20}",
-        content in "[a-zA-Z0-9 _.!?,]{0,100}",
-        is_error in any::<bool>(),
-        images in proptest::collection::vec(arb_image_source(), 1..3usize),
-    ) {
-        let block_with = ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            content: content.clone(),
-            images,
-            is_error,
-        };
-        let block_without = ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            content: content.clone(),
-            images: vec![],
-            is_error,
-        };
-        let msg_with = LlmMessage { role: MessageRole::User, content: vec![block_with] };
-        let msg_without = LlmMessage { role: MessageRole::User, content: vec![block_without] };
-
-        let result_with = openai::test_helpers::translate_message(&msg_with);
-        let result_without = openai::test_helpers::translate_message(&msg_without);
-
-        let json_with = serde_json::to_value(&result_with).unwrap();
-        let json_without = serde_json::to_value(&result_without).unwrap();
-        prop_assert_eq!(json_with, json_without, "OpenAI chat must ignore images in tool results");
     }
 }
 

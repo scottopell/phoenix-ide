@@ -2,7 +2,9 @@
 
 use crate::db::{ErrorKind, ImageData, ToolResult};
 use crate::llm::{ContentBlock, Usage};
-use crate::state_machine::state::{PendingSubAgent, SubAgentOutcome, ToolCall};
+use crate::state_machine::state::{
+    PendingSubAgent, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
+};
 
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
@@ -77,4 +79,10 @@ pub enum Event {
     },
     /// User manually triggered continuation (REQ-BED-023)
     UserTriggerContinuation,
+
+    // Task approval events (REQ-BED-028)
+    /// User responded to a proposed task plan
+    TaskApprovalResponse {
+        outcome: TaskApprovalOutcome,
+    },
 }

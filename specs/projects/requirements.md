@@ -31,21 +31,25 @@ The user must be able to confidently answer these questions:
 WHEN user creates a new conversation by providing a directory path
 THE SYSTEM SHALL detect whether the directory is inside a git repository
 AND if it is, treat the repository root as the project's canonical path
-AND if it is not, offer to initialize a git repository in that directory
+AND associate the conversation with that project
+AND initialize the conversation in Explore mode
 
-WHEN user declines git initialization
-THE SYSTEM SHALL NOT create a conversation for that directory
-AND SHALL explain that the project model requires git for branch isolation and task history
+WHEN the directory is NOT inside a git repository
+THE SYSTEM SHALL create the conversation in Standalone mode (REQ-PROJ-016)
+AND NOT associate it with any project
 
 **Rationale:** Users think in terms of projects (codebases, repositories), not raw
 directories. Git is the structural foundation of the isolation model — without it the
 system cannot create worktrees or maintain task history in a versioned, shareable form.
+However, Phoenix must remain useful for non-git directories (ad-hoc scripts, /tmp,
+miscellaneous files). Standalone mode provides full tool access without git-backed
+safety features, letting users choose their level of structure.
 
 ---
 
-### REQ-PROJ-002: Start Every Conversation in Explore Mode
+### REQ-PROJ-002: Start Every Project Conversation in Explore Mode
 
-WHEN a conversation is created for a project
+WHEN a conversation is created for a project (directory is inside a git repository)
 THE SYSTEM SHALL initialize the conversation in Explore mode
 AND record the HEAD commit of the main branch as the conversation's pinned snapshot
 AND configure all tools in read-only mode
@@ -67,48 +71,59 @@ none of them write anything.
 
 ### REQ-PROJ-003: Propose a Task to Initiate Work Mode
 
-WHEN agent calls the `create_task` tool with title, priority, and a written plan
-THE SYSTEM SHALL assign the next sequential task ID for the project
-AND write a task file to the `tasks/` directory at the repository root on the main branch
-AND commit the task file to main
+WHEN agent calls the `propose_plan` tool with title, priority, and a written plan
+THE SYSTEM SHALL intercept it at the LlmResponse handler (like submit_result)
+AND NOT execute any side effects (no file writes, no git operations)
+AND persist the assistant message and a synthetic tool result atomically
 AND transition the conversation to AwaitingTaskApproval state
 AND pause agent execution until the user responds
 
-WHEN `create_task` is called while the conversation is not in Explore mode
-THE SYSTEM SHALL reject the call with an error explaining that tasks must be proposed from Explore mode
+THE AwaitingTaskApproval state SHALL carry the plan content (title, priority, plan text)
+as serializable data, NOT as a file path or git reference
 
-**Rationale:** The task creation moment is the natural inflection point between thinking
-and doing. Pausing for human review before creating a worktree ensures the user has
-approved the approach before any branch or file modifications happen outside of main.
+WHEN `propose_plan` is called while the conversation is not in Explore mode
+THE SYSTEM SHALL reject the call with an error explaining that plans must be proposed
+from Explore mode
+
+**Rationale:** `propose_plan` is a pure data carrier with no side effects. The plan
+exists only in the state machine and prose reader until the user approves. This keeps
+the feedback loop cheap (no git operations, no files to clean up on reject) and defers
+all git work to the approval moment when the user has committed to the approach.
 
 ---
 
 ### REQ-PROJ-004: Review and Iterate on Task Plan Before Starting Work
 
 WHEN conversation enters AwaitingTaskApproval state
-THE SYSTEM SHALL automatically open the task file in the prose reader
+THE SYSTEM SHALL open the prose reader with the plan content from the state
 AND present Approve and Discard actions alongside the standard annotation feedback
 
-WHEN user sends annotations as feedback
-THE SYSTEM SHALL route the annotations to the agent as a tool result
-AND the agent SHALL update the task file via `update_task`
-AND the system SHALL re-present the updated task file in the prose reader
+WHEN user sends annotation feedback
+THE SYSTEM SHALL close the prose reader
+AND deliver the annotations to the agent as a user message
+AND transition the conversation to Explore mode (Idle)
+AND the agent MAY revise the plan and call `propose_plan` again
+  (which re-enters AwaitingTaskApproval and reopens the prose reader)
 
 WHEN user approves the task
-THE SYSTEM SHALL create a git worktree at the conversation-scoped path (REQ-PROJ-005)
-AND create and checkout a branch named after the task
-AND transition the conversation to Work mode with the worktree as the working directory
-AND resume agent execution
+THE SYSTEM SHALL assign the next sequential task ID for the project
+AND write a task file to `tasks/` in taskmd format
+AND commit the task file to main using `git add <task-file> && git commit --only <task-file>`
+AND record the current checked-out branch as `base_branch` in the conversation mode
+AND create a worktree at `.phoenix/worktrees/{conv-id}` with a new branch `task-{NNNN}-{slug}`
+  using `git worktree add .phoenix/worktrees/{conv-id} -b task-{NNNN}-{slug}`
+AND transition the conversation to Work mode (storing base_branch, worktree_path, branch, task_id)
+AND resume agent execution with "Task approved. You are on branch task-{NNNN}-{slug}."
 
 WHEN user discards the task
-THE SYSTEM SHALL delete the task file from the main branch
-AND return the conversation to Explore mode
+THE SYSTEM SHALL return the conversation to Explore mode
 AND return a rejection result to the agent
+AND NOT perform any git operations (no file was written, nothing to clean up)
 
-**Rationale:** The prose reader gives users a comfortable interface for reviewing
-structured plans. Iterating on the task document before committing to a worktree keeps
-the feedback loop cheap — no branch or worktree cleanup required if the approach
-changes during planning.
+**Rationale:** All git operations are deferred to the approval moment. The feedback
+loop is entirely in-memory: no files written, no commits, no branches until the user
+explicitly approves. Discarding a task is free — there is nothing to undo. The prose
+reader renders from the plan content carried in the state, not from a file on disk.
 
 ---
 
@@ -132,17 +147,21 @@ because their code changes never share a directory.
 
 ### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
-WHEN the system creates a task file
-THE SYSTEM SHALL write it to `tasks/` with filename `{NNN}-{priority}-{status}-{slug}.md`
-AND include frontmatter with: task ID, priority, status, branch name, conversation ID, and creation date
-AND include a Plan section containing the agent's proposed approach as approved by the user
-AND include a Progress section for the agent to update as work proceeds
+WHEN the user approves a task (REQ-PROJ-004)
+THE SYSTEM SHALL write a task file to `tasks/` with filename
+  `{NNNN}-{priority}-{status}--{slug}.md`
+AND include frontmatter with: task ID, priority, status, branch name, conversation ID,
+  and creation date
+AND include a Plan section containing the agent's proposed approach as approved
+AND include a Progress section (initially empty, updated by the agent via patch tool)
 AND commit the file to the main branch
 
-WHEN the agent calls `update_task` with a status or progress change
-THE SYSTEM SHALL update the task file on the main branch
-AND rename the file if the status slug in the filename changes
-AND commit the change to main
+Task files are only created on approval. During the propose/feedback loop, the plan
+exists only in the AwaitingTaskApproval state — no file on disk, no git commit.
+
+WHEN the agent updates a task file during Work mode (via patch tool)
+THE SYSTEM SHALL allow edits to the task file on the task branch like any other file
+AND the updates SHALL merge to main with the rest of the code changes (M4)
 
 WHEN any conversation in Explore mode reads the `tasks/` directory
 THE SYSTEM SHALL show all task files including those for in-progress work conversations
@@ -196,89 +215,127 @@ one-Work-sub-agent constraint maintains a single writer per worktree at all time
 
 ---
 
-### REQ-PROJ-009: Complete a Task and Propose Merging to Main
+### REQ-PROJ-009: Complete a Task (Squash Merge)
 
-WHEN agent calls `update_task` with status set to `ready-for-review`
-THE SYSTEM SHALL generate a summary of changes between the worktree branch and main
-AND present the diff and task file to the user for final review
-AND pause agent execution
+WHEN the user initiates the Complete action on an idle Work conversation
+THE SYSTEM SHALL run pre-checks before proceeding:
+- Verify no uncommitted changes exist in the worktree (fail with actionable error if dirty)
+- Verify the main checkout has no uncommitted changes (fail with actionable error if dirty)
+- Verify no merge conflicts exist between the task branch and base_branch (fail with actionable error if conflicts)
 
-WHEN user approves the merge
-THE SYSTEM SHALL merge the worktree branch into main
-AND update the task file status to `done` on main
-AND delete the worktree directory
-AND delete the branch
-AND transition the conversation to Explore mode pinned to the new main HEAD
+WHEN pre-checks pass
+THE SYSTEM SHALL generate a semantic commit message by sending `git diff base_branch...HEAD`
+  to the LLM with instructions to produce a concise, concept-focused commit message
+AND present the generated commit message in an editable confirmation dialog
 
-WHEN user requests further changes before merge
-THE SYSTEM SHALL return the feedback to the agent as a message
-AND resume agent execution in Work mode
+WHILE the commit message confirmation dialog is open
+THE SYSTEM SHALL register a browser navigation guard to warn the user before leaving the page
 
-**Rationale:** Human review before merging is the final safety gate. The merge approval
-is the moment code moves from isolated experiment to part of the project. Returning to
-Explore mode after a successful merge preserves the conversation for follow-up
-questions and naturally closes the task.
+WHEN the user confirms the commit message (possibly after editing)
+THE SYSTEM SHALL squash merge the task branch into base_branch:
+  `git checkout base_branch && git merge --squash task_branch && git commit -m "{message}"`
+AND delete the worktree: `git worktree remove {path} --force`
+AND delete the task branch: `git branch -D {branch}`
+AND transition the conversation to Terminal state
 
----
+WHEN the task file status is not `done` at Complete time
+THE SYSTEM SHALL display a non-blocking nudge suggesting the user ask the agent to
+  update the task file before completing
+AND SHALL NOT block the Complete action
 
-### REQ-PROJ-010: Abandon a Task Without Merging
+WHEN pre-checks fail
+THE SYSTEM SHALL display a specific, actionable error message
+AND SHALL NOT proceed with the merge
+AND the conversation SHALL remain in Work mode (user can ask the agent to fix the issue)
 
-WHEN user discards an in-progress task
-THE SYSTEM SHALL delete the worktree directory
-AND delete the branch
-AND update the task file status to `abandoned` on main
-AND transition the conversation to Explore mode
-
-WHEN a task is abandoned
-THE SYSTEM SHALL preserve the task file on main as a historical record
-AND NOT merge any code changes to main
-
-**Rationale:** Users must be able to stop work with no lasting consequence to the
-codebase. The abandoned task file is a lightweight record of what was attempted —
-useful as context for future work, but carries no code changes forward.
-
----
-
-### REQ-PROJ-011: Ambient Awareness of Main Branch Advancement
-
-WHEN the main branch of a project receives new commits
-THE SYSTEM SHALL display an ambient indicator on any Explore conversation showing
-how many commits behind the conversation's pinned snapshot is
-AND NOT interrupt the active conversation or force re-pinning
-
-WHEN a Work conversation's branch diverges from an advancing main
-THE SYSTEM SHALL notify the agent that main has advanced
-AND offer a rebase opportunity before the merge step
-
-WHEN user starts a new conversation on a project
-THE SYSTEM SHALL pin the conversation to the current HEAD of main at creation time
-
-**Rationale:** Explore conversations are pinned snapshots — they remain coherent and
-usable even as main advances, but users should have ambient awareness that their view
-may be stale. Work conversations may need to rebase before merging to avoid conflicts.
-Neither case warrants an interruption; ambient indicators respect the current focus.
+**Rationale:** Completion is user-initiated, not agent-initiated. The user has been
+reviewing work live during the conversation and does not need a separate diff review
+gate. Squash merge produces a clean single commit on the base branch. The conversation
+goes to Terminal (not back to Explore) because the task is done -- the user creates a
+new Explore conversation if they need to continue working on the project. Pre-checks
+prevent silent data loss (dirty tree) and broken merges (conflicts).
 
 ---
 
-### REQ-PROJ-012: Provide create_task and update_task Tools to Agents
+### REQ-PROJ-010: Abandon a Task (Destructive Discard)
 
-WHEN agent is in Explore mode and calls `create_task`
-THE SYSTEM SHALL accept: title (required string), priority (required: p0-p3),
-and plan (required string describing the proposed approach)
+WHEN the user initiates the Abandon action on an idle Work conversation
+THE SYSTEM SHALL present a confirmation dialog warning that all work will be
+  permanently deleted (worktree and branch)
 
-WHEN agent is in Work mode and calls `update_task`
-THE SYSTEM SHALL accept: status (optional enum) and progress (optional string)
-AND apply the update to the task file on main
+WHEN the user confirms abandonment
+THE SYSTEM SHALL verify the main checkout has no uncommitted changes (fail with actionable error if dirty)
+AND delete the worktree: `git worktree remove {path} --force`
+AND delete the task branch: `git branch -D {branch}`
+AND update the task file status to `wont-do` on base_branch:
+  `git checkout base_branch && taskmd rename {task_file} --status wont-do && git add tasks/ && git commit -m "task {NNNN}: mark wont-do"`
+AND transition the conversation to Terminal state
 
-WHEN `update_task` is called by a sub-agent
+WHEN the user cancels the confirmation dialog
+THE SYSTEM SHALL take no action
+AND the conversation SHALL remain in Work mode
+
+**Rationale:** Abandon is a destructive, irreversible operation -- the worktree and
+branch are deleted, discarding all code changes. The task file is updated to `wont-do`
+(a valid taskmd status) on the base branch as a historical record of what was attempted.
+The conversation goes to Terminal because the task is over. Confirmation dialog is
+mandatory to prevent accidental data loss.
+
+---
+
+### REQ-PROJ-011: Passive Commits-Behind Indicator
+
+WHEN a client connects to a Work conversation via SSE
+THE SYSTEM SHALL check how many commits base_branch is ahead of the worktree's branch point
+AND emit the count as part of the initial state payload
+
+WHILE a Work conversation has connected clients
+THE SYSTEM SHALL poll for base_branch advancement approximately every 60 seconds
+AND emit updated counts via SSE when the value changes
+
+WHEN the commits-behind count is greater than zero
+THE SYSTEM SHALL display an "N behind" badge in the StateBar next to the branch name
+
+WHEN the commits-behind count is zero
+THE SYSTEM SHALL NOT display any badge
+
+THE SYSTEM SHALL NOT automatically rebase, notify the agent, or take any action
+  based on the commits-behind count
+
+**Rationale:** The commits-behind indicator gives the user ambient awareness that their
+base branch has advanced, which may affect the merge at completion time. It is passive
+and informational only -- no filesystem watcher, no rebase automation. The agent already
+has bash access to run `git rebase` when the user asks. Polling on SSE connect plus a
+periodic interval is simple and sufficient; real-time filesystem watching adds complexity
+without meaningful benefit for a metric that changes infrequently.
+
+---
+
+### REQ-PROJ-012: Provide propose_plan Tool to Agents
+
+WHEN agent is in Explore mode
+THE SYSTEM SHALL provide the `propose_plan` tool
+WHICH accepts: title (required string), priority (required: p0-p3),
+  and plan (required string describing the proposed approach)
+
+WHEN `propose_plan` is called outside Explore mode
+THE SYSTEM SHALL reject the call with "propose_plan is only available in Explore mode"
+
+WHEN `propose_plan` is called by a sub-agent
 THE SYSTEM SHALL reject the call
 AND explain that task management is the parent conversation's responsibility
 
-**Rationale:** Agents interact with the task system through well-defined tools rather
-than directly writing task files. This ensures task files always conform to the
-Phoenix-managed format, IDs are assigned correctly, and status transitions are
-validated. Sub-agents cannot manage tasks because they are short-lived workers
-operating under a parent's direction.
+`propose_plan` is a pure data carrier — it has no side effects. It is intercepted
+at the LlmResponse handler (like submit_result for sub-agents) and never enters the
+tool executor. The plan data flows into the AwaitingTaskApproval state.
+
+During Work mode, the agent updates task files directly using the patch tool like
+any other file. No dedicated `update_task` tool is needed.
+
+**Rationale:** `propose_plan` is the agent's way of saying "I have a plan, please
+review it." The name signals human review is required. Keeping it as a pure data
+carrier with no side effects means the feedback loop is free (no git work to undo)
+and the implementation follows the established submit_result interception pattern.
 
 ---
 
@@ -331,6 +388,8 @@ visibility prevents confusion about what a conversation can do.
 
 ### REQ-PROJ-015: Project Worktree Registry
 
+**DESCOPED:** The dedicated worktree registry table is not needed. `ConvMode::Work` on each conversation serves as the de facto registry -- querying all Work conversations for a project yields the active worktree list. Startup reconciliation (M3) handles orphan detection by checking worktree paths on disk. This requirement is retained for historical context but will not be implemented.
+
 WHEN a worktree is created for a task
 THE SYSTEM SHALL register it in the project record with task ID, worktree path,
 branch name, conversation ID, and timestamp
@@ -346,3 +405,59 @@ AND report worktrees that exist on disk but have no registry entry
 **Rationale:** The registry enables the UI to show all active worktrees and detect
 orphans. Reconciliation on startup handles worktrees deleted externally or
 conversations that ended without cleanup.
+
+---
+
+### REQ-PROJ-016: Standalone Conversation Mode
+
+WHEN a conversation is created for a directory that is not inside a git repository
+THE SYSTEM SHALL initialize the conversation in Standalone mode
+AND provide the full tool suite (bash, patch, and all other tools)
+AND NOT associate it with any project
+
+WHILE a conversation is in Standalone mode
+THE SYSTEM SHALL NOT provide the `propose_plan` tool
+AND SHALL NOT allow transition to Explore or Work modes
+
+WHEN displaying a Standalone conversation
+THE SYSTEM SHALL NOT show Explore/Work mode indicators
+AND SHALL indicate that it is a standalone conversation (no project association)
+
+WHEN a Standalone conversation is created
+THE SYSTEM SHALL inform the user that the directory is not a git repository
+AND that project features (tasks, worktrees, branch isolation) are not available
+AND that file writes have no git safety net
+
+**Rationale:** Phoenix must be useful beyond git repositories. A user editing a script
+in `/tmp` or exploring a downloaded archive should not be forced to `git init` first.
+Standalone mode provides the full tool suite at the cost of git-backed safety features:
+no worktree isolation, no task tracking, no branch-based undo. This is an explicit
+trade-off the user accepts by working in a non-git directory. Making Standalone a
+distinct mode (rather than overloading Explore or Work) allows the UI to communicate
+the capability difference clearly and prevents accidental mixing of project and
+non-project behaviors.
+
+---
+
+### REQ-PROJ-017: Base Branch Tracking in Work Mode
+
+WHEN a conversation transitions from Explore to Work mode (task approval)
+THE SYSTEM SHALL record the currently checked-out branch as `base_branch` in the
+  `ConvMode::Work` data
+
+THE `ConvMode::Work` struct SHALL contain:
+- `worktree_path: PathBuf` — path to the conversation's worktree
+- `branch: String` — the task branch name
+- `task_id: String` — the task identifier
+- `base_branch: String` — the branch that was checked out at approval time
+
+WHEN the Complete action runs (REQ-PROJ-009)
+THE SYSTEM SHALL merge into `base_branch` (not hardcoded to main)
+
+WHEN the Abandon action runs (REQ-PROJ-010)
+THE SYSTEM SHALL commit the task file status update on `base_branch`
+
+**Rationale:** Not all projects use `main` as their integration branch. A user may be
+working on a shared feature branch and want task work merged there. Recording the
+base branch at approval time supports this workflow without requiring the user to
+specify a merge target at completion time.

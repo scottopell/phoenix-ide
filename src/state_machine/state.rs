@@ -75,6 +75,14 @@ pub struct SubmitErrorInput {
     pub error: String,
 }
 
+/// Input for the `propose_plan` tool (task approval workflow)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposePlanInput {
+    pub title: String,
+    pub priority: String,
+    pub plan: String,
+}
+
 /// Strongly typed tool input enum
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
@@ -87,6 +95,7 @@ pub enum ToolInput {
     SpawnAgents(SpawnAgentsInput),
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
+    ProposePlan(ProposePlanInput),
     /// Fallback for unknown tools or parsing failures
     Unknown {
         name: String,
@@ -106,6 +115,7 @@ impl ToolInput {
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
+            ToolInput::ProposePlan(_) => "propose_plan",
             ToolInput::Unknown { name, .. } => name,
         }
     }
@@ -126,6 +136,7 @@ impl ToolInput {
             ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::ProposePlan(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } => input.clone(),
         }
     }
@@ -188,6 +199,13 @@ impl ToolInput {
                     input: value,
                 },
                 ToolInput::SubmitError,
+            ),
+            "propose_plan" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::ProposePlan,
             ),
             _ => ToolInput::Unknown {
                 name: name.to_string(),
@@ -356,11 +374,31 @@ pub enum ConvState {
         attempt: u32,
     },
 
+    /// Awaiting user approval of a proposed task plan (REQ-BED-028)
+    AwaitingTaskApproval {
+        title: String,
+        priority: String,
+        plan: String,
+    },
+
     /// Context window exhausted - conversation is read-only
     ContextExhausted {
         /// The continuation summary
         summary: String,
     },
+
+    /// Task lifecycle completed or abandoned — conversation is permanently read-only.
+    /// Rejects all events. Preserved on server restart (not reset to Idle).
+    Terminal,
+}
+
+/// Outcome of user's decision on a proposed task plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskApprovalOutcome {
+    Approved,
+    Rejected,
+    FeedbackProvided { annotations: String },
 }
 
 /// Semantic state category for UI display.
@@ -378,6 +416,8 @@ pub enum DisplayState {
     Error,
     /// Conversation cannot continue — context exhausted, completed, or failed (gray dot, static)
     Terminal,
+    /// Awaiting user action on a proposed task plan (REQ-BED-028)
+    AwaitingApproval,
 }
 
 impl DisplayState {
@@ -387,6 +427,7 @@ impl DisplayState {
             DisplayState::Working => "working",
             DisplayState::Error => "error",
             DisplayState::Terminal => "terminal",
+            DisplayState::AwaitingApproval => "awaiting_approval",
         }
     }
 }
@@ -410,12 +451,19 @@ pub enum TerminalOutcome {
     Failed(String, ErrorKind),
     /// Context window exhausted — conversation is read-only
     ContextExhausted { summary: String },
+    /// Task lifecycle ended (complete or abandon) — conversation is permanently read-only
+    TaskResolved,
 }
 
 impl ConvState {
-    /// Check if this is a terminal state (sub-agent only - cannot transition out)
+    /// Check if this is a terminal state — cannot transition out.
+    /// `Completed`/`Failed` are sub-agent specific; `Terminal` is the
+    /// user-facing lifecycle end state (complete/abandon).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
+        matches!(
+            self,
+            ConvState::Completed { .. } | ConvState::Failed { .. } | ConvState::Terminal
+        )
     }
 
     /// Structural terminal-state check for the executor loop.
@@ -435,7 +483,17 @@ impl ConvState {
                     summary: summary.clone(),
                 })
             }
-            _ => StepResult::Continue,
+            ConvState::Terminal => StepResult::Terminal(TerminalOutcome::TaskResolved),
+            ConvState::Idle
+            | ConvState::AwaitingLlm
+            | ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::Error { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingTaskApproval { .. } => StepResult::Continue,
         }
     }
 
@@ -445,10 +503,18 @@ impl ConvState {
         match self {
             ConvState::Idle => DisplayState::Idle,
             ConvState::Error { .. } => DisplayState::Error,
+            ConvState::AwaitingTaskApproval { .. } => DisplayState::AwaitingApproval,
             ConvState::ContextExhausted { .. }
             | ConvState::Completed { .. }
-            | ConvState::Failed { .. } => DisplayState::Terminal,
-            _ => DisplayState::Working,
+            | ConvState::Failed { .. }
+            | ConvState::Terminal => DisplayState::Terminal,
+            ConvState::AwaitingLlm
+            | ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingContinuation { .. } => DisplayState::Working,
         }
     }
 }

@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::path::Path;
 
 /// SQL schema for initialization
 pub const SCHEMA: &str = r#"
@@ -78,6 +79,17 @@ pub const MIGRATION_ADD_MODEL: &str = r"
 -- SQLite will return an error which we'll ignore
 ";
 
+/// Migration SQL to create projects table
+pub const MIGRATION_CREATE_PROJECTS: &str = r"
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    canonical_path TEXT UNIQUE NOT NULL,
+    main_ref TEXT NOT NULL DEFAULT 'main',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(canonical_path);
+";
+
 /// Migration SQL to add `local_id` column for idempotent message sends
 /// Migration to rename `messages.id` to `messages.message_id`
 /// `SQLite` 3.25+ supports ALTER TABLE RENAME COLUMN
@@ -88,11 +100,125 @@ pub const MIGRATION_RENAME_MESSAGE_ID: &str = r"
 ALTER TABLE messages RENAME COLUMN id TO message_id;
 ";
 
+/// Conversation mode — determines tool availability and write access.
+///
+/// Stored as JSON in the `conv_mode` TEXT column on conversations.
+/// REQ-BED-027: Conversation-level field, NOT embedded in `ConvState`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode")]
+pub enum ConvMode {
+    /// Read-only mode. No file writes, no bash (unless sandboxed).
+    #[default]
+    Explore,
+    /// Standalone mode for non-git directories. Full tool suite, no project association.
+    Standalone,
+    /// Write mode on a task branch. Full tool suite with file write access.
+    Work {
+        /// The git branch name for this work conversation (e.g., `task-0042-fix-bug`)
+        branch_name: String,
+        /// Absolute path to the git worktree for this conversation.
+        /// `#[serde(default)]` is a rollout shim for existing Work rows -- startup
+        /// reconciliation reverts rows with empty `worktree_path` to Explore.
+        #[serde(default)]
+        worktree_path: String,
+        /// The branch that was checked out when the task was approved (e.g., `main`).
+        /// Used as the merge target for Complete and the restore target for Abandon.
+        /// `#[serde(default)]` is a rollout shim -- startup reconciliation reverts
+        /// rows with empty `base_branch` to Explore.
+        #[serde(default)]
+        base_branch: String,
+        /// The task ID assigned at approval time (e.g., "YF042").
+        /// Used to locate and update the task file in `tasks/`.
+        /// `#[serde(default)]` is a rollout shim for existing Work rows.
+        #[serde(default)]
+        task_id: String,
+    },
+}
+
+impl ConvMode {
+    /// Human-readable label for UI display
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Explore => "Explore",
+            Self::Standalone => "Standalone",
+            Self::Work { .. } => "Work",
+        }
+    }
+
+    /// The branch name if in Work mode, None otherwise.
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            Self::Work { branch_name, .. } => Some(branch_name),
+            Self::Explore | Self::Standalone => None,
+        }
+    }
+
+    /// The worktree path if in Work mode, None otherwise.
+    pub fn worktree_path(&self) -> Option<&str> {
+        match self {
+            Self::Work { worktree_path, .. } => Some(worktree_path),
+            Self::Explore | Self::Standalone => None,
+        }
+    }
+
+    /// The base branch if in Work mode, None otherwise.
+    pub fn base_branch(&self) -> Option<&str> {
+        match self {
+            Self::Work { base_branch, .. } => Some(base_branch),
+            Self::Explore | Self::Standalone => None,
+        }
+    }
+
+    /// The task ID if in Work mode, None otherwise.
+    #[allow(dead_code)] // Used by M4 Complete/Abandon flows (task 0604)
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Work { task_id, .. } => Some(task_id),
+            Self::Explore | Self::Standalone => None,
+        }
+    }
+}
+
+/// Project record — a git repository tracked by Phoenix.
+///
+/// REQ-PROJ-001: Keyed by resolved git repo root path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub canonical_path: String,
+    pub main_ref: String,
+    pub created_at: DateTime<Utc>,
+    /// Derived: count of non-archived conversations in this project
+    #[serde(default)]
+    pub conversation_count: i64,
+}
+
+/// Detect the git repository root for a given directory path.
+///
+/// Returns `None` if the path is not inside a git repository.
+pub fn detect_git_repo_root(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
     pub slug: Option<String>,
+    /// Human-readable title for UI display (e.g., "Fix Login Page CSS").
+    /// Derived from the slug by title-casing when not set explicitly.
+    #[serde(default)]
+    pub title: Option<String>,
     pub cwd: String,
     pub parent_conversation_id: Option<String>,
     pub user_initiated: bool,
@@ -102,8 +228,33 @@ pub struct Conversation {
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
     pub model: Option<String>,
+    /// Project this conversation belongs to (None for legacy pre-project conversations)
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Conversation mode — determines tool availability. Default: Explore.
+    #[serde(default)]
+    pub conv_mode: ConvMode,
     #[serde(default)]
     pub message_count: i64,
+}
+
+/// Derive a human-readable title from a kebab-case slug.
+/// E.g., "my-test-conversation" -> "My Test Conversation"
+pub fn title_from_slug(slug: &str) -> String {
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(c) => {
+                    let upper: String = c.to_uppercase().collect();
+                    format!("{upper}{}", chars.as_str())
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Conversation {
@@ -517,23 +668,8 @@ impl fmt::Display for MessageType {
     }
 }
 
-/// Usage statistics
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(clippy::struct_field_names)] // tokens suffix is meaningful
-pub struct UsageData {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    #[serde(default)]
-    pub cache_read_tokens: u64,
-}
-
-impl UsageData {
-    pub fn context_window_used(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
-    }
-}
+/// Type alias for backward compatibility — `Usage` is the canonical type.
+pub type UsageData = crate::llm::Usage;
 
 #[cfg(test)]
 mod error_kind_tests {

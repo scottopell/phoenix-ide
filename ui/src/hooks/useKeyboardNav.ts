@@ -24,6 +24,10 @@ export function useGlobalKeyboardShortcuts() {
           e.preventDefault();
           return;
         }
+        // If a context menu, modal, or popover is open, let its own handler deal with it
+        if (document.querySelector('.conv-item-actions, [role="menu"], [role="dialog"], [role="popover"]')) {
+          return;
+        }
         // If on conversation page, go back to list
         if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/') || location.pathname === '/new') {
           e.preventDefault();

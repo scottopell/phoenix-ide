@@ -1,104 +1,55 @@
 //! Dynamic model discovery from LLM gateway
 //!
 //! Queries gateway endpoints to discover available models at runtime,
-//! merging with hardcoded metadata for context windows and descriptions.
+//! validating which hardcoded models are available.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::HashSet;
 
-/// Discovered model information from gateway
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveredModel {
-    pub id: String,
-    pub provider: String,
-    pub display_name: Option<String>,
-    pub context_length: Option<usize>,
-    pub supports_chat: Option<bool>,
-    pub supports_tools: Option<bool>,
+/// Configuration for model discovery
+pub struct DiscoveryConfig {
+    /// URL for Anthropic models endpoint
+    pub anthropic_models_url: Option<String>,
+    /// URL for `OpenAI` models endpoint
+    pub openai_models_url: Option<String>,
+    /// Auth token to send as Authorization: Bearer (if any)
+    pub auth_token: Option<String>,
+    /// Custom headers to inject on discovery requests
+    pub custom_headers: Vec<(String, String)>,
 }
 
-impl DiscoveredModel {
-    /// Convert discovered model to `ModelSpec`
-    pub fn to_model_spec(&self) -> super::ModelSpec {
-        use super::{ApiFormat, ModelSpec, Provider};
-
-        // Infer provider from string
-        let provider = match self.provider.as_str() {
-            "Anthropic" => Provider::Anthropic,
-            "OpenAI" => Provider::OpenAI,
-            "Fireworks" => Provider::Fireworks,
-            _ => {
-                tracing::warn!("Unknown provider '{}', defaulting to OpenAI", self.provider);
-                Provider::OpenAI
-            }
-        };
-
-        // Infer API format from provider
-        let api_format = match provider {
-            Provider::Anthropic => ApiFormat::Anthropic,
-            Provider::OpenAI | Provider::Fireworks => ApiFormat::OpenAIChat,
-        };
-
-        // Use display_name or id for description
-        let description = self.display_name.clone().unwrap_or_else(|| self.id.clone());
-
-        // Default context window if not provided
-        let context_window = self.context_length.unwrap_or(128_000);
-
-        ModelSpec {
-            id: self.id.clone(),
-            api_name: self.id.clone(), // Gateway models use same name
-            provider,
-            api_format,
-            description,
-            context_window,
-            recommended: false, // Discovered models not recommended by default
-        }
-    }
-}
-
-/// Anthropic /v1/models response
+/// `/v1/models` response — works for both Anthropic and `OpenAI`.
 #[derive(Debug, Deserialize)]
-struct AnthropicModelsResponse {
-    data: Vec<AnthropicModelData>,
+struct ModelsResponse {
+    data: Vec<ModelData>,
 }
 
 #[derive(Debug, Deserialize)]
-struct AnthropicModelData {
+struct ModelData {
     id: String,
-    display_name: Option<String>,
-}
-
-/// `OpenAI` /v1/models response (also used by Fireworks)
-#[derive(Debug, Deserialize)]
-struct OpenAIModelsResponse {
-    data: Vec<OpenAIModelData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIModelData {
-    id: String,
-    #[serde(default)]
-    context_length: Option<usize>,
-    #[serde(default)]
-    supports_chat: Option<bool>,
-    #[serde(default)]
-    supports_tools: Option<bool>,
 }
 
 /// Probe gateway reachability with a lightweight HEAD/GET request.
 ///
 /// Returns `true` if the gateway responds with any HTTP status (even an error),
 /// meaning the host is up and listening. Returns `false` on network/timeout errors.
-pub async fn probe_gateway(gateway_url: &str) -> bool {
+pub async fn probe_gateway(
+    gateway_url: &str,
+    auth_token: Option<&str>,
+    custom_headers: &[(String, String)],
+) -> bool {
     let url = format!("{}/_proxy/status", gateway_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    match client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-    {
+    let mut request = client.get(&url).timeout(std::time::Duration::from_secs(3));
+
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    for (key, value) in custom_headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+
+    match request.send().await {
         Ok(_) => {
             tracing::debug!(url = %url, "Gateway probe succeeded");
             true
@@ -110,143 +61,87 @@ pub async fn probe_gateway(gateway_url: &str) -> bool {
     }
 }
 
-/// Discover models from the LLM gateway
-pub async fn discover_models(gateway_url: &str) -> HashMap<String, DiscoveredModel> {
-    let mut models = HashMap::new();
+/// Discover available model IDs from the LLM gateway.
+///
+/// Returns a set of model IDs that the gateway reports as available.
+/// Used to validate which hardcoded models are actually reachable.
+pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
+    let mut models = HashSet::new();
 
-    // Try each provider endpoint
-    if let Ok(anthropic_models) = discover_anthropic(gateway_url).await {
-        models.extend(anthropic_models);
+    if let Some(ref url) = config.anthropic_models_url {
+        match discover_provider(
+            url,
+            "anthropic",
+            config.auth_token.as_deref(),
+            &config.custom_headers,
+            &[("anthropic-version", "2023-06-01")],
+        )
+        .await
+        {
+            Ok(m) => models.extend(m),
+            Err(e) => tracing::warn!(provider = "anthropic", error = %e, "Discovery failed"),
+        }
     }
 
-    if let Ok(openai_models) = discover_openai(gateway_url).await {
-        models.extend(openai_models);
-    }
-
-    if let Ok(fireworks_models) = discover_fireworks(gateway_url).await {
-        models.extend(fireworks_models);
+    if let Some(ref url) = config.openai_models_url {
+        match discover_provider(
+            url,
+            "openai",
+            config.auth_token.as_deref(),
+            &config.custom_headers,
+            &[],
+        )
+        .await
+        {
+            Ok(m) => models.extend(m),
+            Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
+        }
     }
 
     models
 }
 
-/// Discover Anthropic models
-async fn discover_anthropic(
-    gateway_url: &str,
-) -> Result<HashMap<String, DiscoveredModel>, Box<dyn std::error::Error>> {
-    let url = format!("{}/anthropic/v1/models", gateway_url.trim_end_matches('/'));
-
+/// Discover model IDs from a single provider endpoint.
+async fn discover_provider(
+    url: &str,
+    provider_name: &str,
+    auth_token: Option<&str>,
+    custom_headers: &[(String, String)],
+    extra_headers: &[(&str, &str)],
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header("anthropic-version", "2023-06-01")
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await?;
+    let mut request = client
+        .get(url)
+        .header("provider", provider_name)
+        .timeout(std::time::Duration::from_secs(5));
+
+    for &(key, value) in extra_headers {
+        request = request.header(key, value);
+    }
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    for (key, value) in custom_headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+
+    let response = request.send().await?;
 
     if !response.status().is_success() {
-        return Err(format!("Anthropic models endpoint returned {}", response.status()).into());
+        return Err(format!(
+            "{provider_name} models endpoint returned {}",
+            response.status()
+        )
+        .into());
     }
 
-    let models_response: AnthropicModelsResponse = response.json().await?;
+    let models_response: ModelsResponse = response.json().await?;
+    let ids: HashSet<String> = models_response.data.into_iter().map(|m| m.id).collect();
 
-    let mut models = HashMap::new();
-    for model in models_response.data {
-        models.insert(
-            model.id.clone(),
-            DiscoveredModel {
-                id: model.id,
-                provider: "Anthropic".to_string(),
-                display_name: model.display_name,
-                context_length: None, // Anthropic doesn't provide this
-                supports_chat: Some(true),
-                supports_tools: Some(true),
-            },
-        );
-    }
-
-    tracing::info!("Discovered {} Anthropic models from gateway", models.len());
-    Ok(models)
-}
-
-/// Discover `OpenAI` models
-async fn discover_openai(
-    gateway_url: &str,
-) -> Result<HashMap<String, DiscoveredModel>, Box<dyn std::error::Error>> {
-    let url = format!("{}/openai/v1/models", gateway_url.trim_end_matches('/'));
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(format!("OpenAI models endpoint returned {}", response.status()).into());
-    }
-
-    let models_response: OpenAIModelsResponse = response.json().await?;
-
-    let mut models = HashMap::new();
-    for model in models_response.data {
-        models.insert(
-            model.id.clone(),
-            DiscoveredModel {
-                id: model.id,
-                provider: "OpenAI".to_string(),
-                display_name: None,
-                context_length: model.context_length,
-                supports_chat: model.supports_chat,
-                supports_tools: model.supports_tools,
-            },
-        );
-    }
-
-    tracing::info!("Discovered {} OpenAI models from gateway", models.len());
-    Ok(models)
-}
-
-/// Discover Fireworks models
-async fn discover_fireworks(
-    gateway_url: &str,
-) -> Result<HashMap<String, DiscoveredModel>, Box<dyn std::error::Error>> {
-    let url = format!(
-        "{}/fireworks/inference/v1/models",
-        gateway_url.trim_end_matches('/')
+    tracing::info!(
+        "Discovered {} {} models from gateway",
+        ids.len(),
+        provider_name
     );
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(format!("Fireworks models endpoint returned {}", response.status()).into());
-    }
-
-    let models_response: OpenAIModelsResponse = response.json().await?;
-
-    let mut models = HashMap::new();
-    for model in models_response.data {
-        // Filter to chat models with tool support for Phoenix
-        if model.supports_chat.unwrap_or(false) {
-            models.insert(
-                model.id.clone(),
-                DiscoveredModel {
-                    id: model.id,
-                    provider: "Fireworks".to_string(),
-                    display_name: None,
-                    context_length: model.context_length,
-                    supports_chat: model.supports_chat,
-                    supports_tools: model.supports_tools,
-                },
-            );
-        }
-    }
-
-    tracing::info!("Discovered {} Fireworks models from gateway", models.len());
-    Ok(models)
+    Ok(ids)
 }
