@@ -381,17 +381,23 @@ pub struct ToolRegistryExecutor {
 }
 
 impl ToolRegistryExecutor {
-    pub fn new(registry: ToolRegistry) -> Self {
+    /// Create an executor with built-in tools only (no MCP).
+    /// Used for sub-agents which have a restricted tool set.
+    pub fn builtin_only(registry: ToolRegistry) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: None,
         }
     }
 
-    /// Attach an MCP manager for live tool resolution.
-    pub fn with_mcp(mut self, manager: Arc<crate::tools::mcp::McpClientManager>) -> Self {
-        self.mcp_manager = Some(manager);
-        self
+    /// Create an executor with built-in tools + live MCP tool resolution.
+    /// MCP tools are resolved from the manager on every `definitions()` and
+    /// `execute()` call, so enable/disable and reload take effect immediately.
+    pub fn with_mcp(registry: ToolRegistry, manager: Arc<crate::tools::mcp::McpClientManager>) -> Self {
+        Self {
+            registry: std::sync::RwLock::new(registry),
+            mcp_manager: Some(manager),
+        }
     }
 
     /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
@@ -441,19 +447,27 @@ impl ToolExecutor for ToolRegistryExecutor {
         };
 
         // Merge live MCP tool definitions (respects current disabled state).
+        // Built-in names are checked to prevent shadowing; MCP full names
+        // are also tracked to detect cross-server collisions.
         if let Some(ref manager) = self.mcp_manager {
-            let builtin_names: std::collections::HashSet<String> =
+            let mut seen_names: std::collections::HashSet<String> =
                 defs.iter().map(|d| d.name.clone()).collect();
 
             for (server_name, tool_def) in manager.tool_definitions().await {
                 let full_name = format!("{server_name}__{}", tool_def.name);
-                if !builtin_names.contains(&full_name) {
-                    defs.push(crate::llm::ToolDefinition {
-                        name: full_name,
-                        description: tool_def.description,
-                        input_schema: tool_def.input_schema,
-                    });
+                if seen_names.contains(&full_name) {
+                    tracing::debug!(
+                        tool = %full_name,
+                        "MCP tool name conflicts with existing tool, skipping"
+                    );
+                    continue;
                 }
+                seen_names.insert(full_name.clone());
+                defs.push(crate::llm::ToolDefinition {
+                    name: full_name,
+                    description: tool_def.description,
+                    input_schema: tool_def.input_schema,
+                });
             }
         }
 

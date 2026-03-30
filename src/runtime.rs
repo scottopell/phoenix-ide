@@ -325,7 +325,7 @@ impl RuntimeManager {
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
         // Sub-agents use the standard sub-agent tool set for now.
         // Mode inheritance (REQ-BED-018) will be refined in M2.
-        let tool_executor = ToolRegistryExecutor::new(ToolRegistry::for_subagent());
+        let tool_executor = ToolRegistryExecutor::builtin_only(ToolRegistry::for_subagent());
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -488,7 +488,7 @@ impl RuntimeManager {
         // Sub-agents get a restricted tool set (no MCP, no spawn_agents) -- they only
         // have SubmitResult/SubmitError for completion signaling.
         let tool_executor = if is_sub_agent {
-            ToolRegistryExecutor::new(ToolRegistry::for_subagent())
+            ToolRegistryExecutor::builtin_only(ToolRegistry::for_subagent())
         } else {
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {
@@ -510,7 +510,7 @@ impl RuntimeManager {
             };
             // MCP tools resolved live from the manager on every definitions()
             // call -- enable/disable and reload take effect immediately.
-            ToolRegistryExecutor::new(registry).with_mcp(self.mcp_manager.clone())
+            ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
         };
 
         // Determine initial state: check if conversation needs auto-continuation

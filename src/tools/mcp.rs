@@ -763,9 +763,9 @@ impl McpClientManager {
     /// Re-scan config files and reconcile servers: connect new ones,
     /// disconnect removed ones, leave unchanged ones alone.
     ///
-    /// NOTE: Active conversations snapshot their tool registries at start
-    /// time. Newly added servers will only be visible to conversations
-    /// started after this reload completes.
+    /// Changes take effect immediately: MCP tools are resolved live from
+    /// the manager on each LLM request, so all conversations (new and
+    /// existing) see the updated server set.
     ///
     /// Returns a summary of what changed.
     pub async fn reload(&self) -> McpReloadResult {
