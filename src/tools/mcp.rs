@@ -219,7 +219,13 @@ impl McpServer {
     /// Send a JSON-RPC request and read the response with a timeout.
     ///
     /// Both stdin and stdout locks are held for the duration to serialize
-    /// concurrent calls on the same server.
+    /// concurrent calls on the same server. This is intentional: a proper
+    /// multiplexing dispatcher (lock stdin briefly to write, then match
+    /// responses by ID from a reader task) would be complex and provide
+    /// little real benefit -- the MCP server is a single process that
+    /// serializes work internally anyway, so parallel requests would just
+    /// queue on the server side.
+    #[allow(clippy::too_many_lines)] // Protocol handling is inherently sequential; splitting would obscure the flow.
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -240,7 +246,19 @@ impl McpServer {
             })?
         );
 
-        // Lock both to serialize the request-response pair.
+        // Detect contention: if the lock is already held, another call is
+        // in-flight and this one will queue behind it.
+        if self.stdin.try_lock().is_err() {
+            tracing::debug!(
+                server = %self.name,
+                method = %method,
+                id = id,
+                "MCP request queued behind in-flight call"
+            );
+        }
+
+        // Lock both to serialize the request-response pair. See doc comment
+        // above for why we don't multiplex.
         let mut stdin = self.stdin.lock().await;
         let mut stdout = self.stdout.lock().await;
 

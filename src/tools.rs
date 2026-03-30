@@ -269,8 +269,20 @@ impl ToolRegistry {
     /// mode-specific registry to inject dynamically-discovered tools.
     /// Returns whatever tools are available at the moment of the call; if
     /// background discovery hasn't finished, some servers may be missing.
+    ///
+    /// MCP tools whose names conflict with already-registered (built-in) tools
+    /// are skipped with a warning to prevent silent shadowing.
     pub async fn register_mcp_tools(&mut self, manager: &std::sync::Arc<mcp::McpClientManager>) {
+        let existing_names: std::collections::HashSet<String> =
+            self.tools.iter().map(|t| t.name().to_string()).collect();
         for tool in mcp::create_mcp_tools(manager).await {
+            if existing_names.contains(tool.name()) {
+                tracing::warn!(
+                    tool = tool.name(),
+                    "MCP tool name conflicts with built-in tool, skipping"
+                );
+                continue;
+            }
             self.tools.push(Arc::from(tool));
         }
     }
