@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api';
 import type { McpServerStatus } from '../api';
 import './McpStatusPanel.css';
@@ -12,18 +12,36 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const [expandedServers, setExpandedServers] = useState<Set<string>>(new Set());
   const [reloading, setReloading] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchStatus = useCallback(async () => {
     try {
       const status = await api.getMcpStatus();
       setServers(status);
+      return status.length;
     } catch {
-      // Silently fail -- panel just shows nothing
+      return 0;
     }
   }, []);
 
+  // Fetch on mount, then poll every 3s until servers appear (background
+  // discovery may still be running). Stop once we have results.
   useEffect(() => {
-    fetchStatus();
+    let cancelled = false;
+    fetchStatus().then(count => {
+      if (cancelled || count > 0) return;
+      pollRef.current = setInterval(async () => {
+        const n = await fetchStatus();
+        if (n > 0 && pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      }, 3000);
+    });
+    return () => {
+      cancelled = true;
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [fetchStatus]);
 
   const handleReload = useCallback(async (e: React.MouseEvent) => {
@@ -65,7 +83,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
 
   return (
     <div className="mcp-panel">
-      <div className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
+      <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
         <span className={`mcp-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
         <span className="mcp-panel-summary">
           {servers.length === 0
@@ -73,15 +91,18 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
             : `MCP \u00b7 ${servers.length} server${servers.length !== 1 ? 's' : ''} \u00b7 ${totalTools} tool${totalTools !== 1 ? 's' : ''}`}
         </span>
         {servers.length > 0 && (
-          <button
+          <span
             className={`mcp-panel-reload ${reloading ? 'reloading' : ''}`}
+            role="button"
+            tabIndex={0}
             onClick={handleReload}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleReload(e as unknown as React.MouseEvent); }}
             title="Reload MCP servers"
           >
             &#8635;
-          </button>
+          </span>
         )}
-      </div>
+      </button>
       {expanded && (
         <div className="mcp-panel-body">
           {servers.length === 0 ? (
@@ -89,7 +110,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
           ) : (
             servers.map(server => (
               <div key={server.name} className="mcp-server-item">
-                <div
+                <button
                   className="mcp-server-header"
                   onClick={() => toggleServer(server.name)}
                 >
@@ -100,7 +121,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
                   <span className="mcp-server-count">
                     {server.tool_count} tool{server.tool_count !== 1 ? 's' : ''}
                   </span>
-                </div>
+                </button>
                 {expandedServers.has(server.name) && (
                   <div className="mcp-tool-list">
                     {server.tools.map(tool => (

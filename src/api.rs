@@ -26,7 +26,6 @@ pub struct AppState {
     pub db: Database,
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
-    #[allow(dead_code)] // Holds Arc to keep MCP server processes alive for the app lifetime
     pub mcp_manager: Arc<McpClientManager>,
 }
 

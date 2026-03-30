@@ -132,7 +132,7 @@ impl McpServer {
             "capabilities": {},
             "clientInfo": {
                 "name": "phoenix-ide",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             }
         });
 
@@ -587,7 +587,9 @@ impl McpClientManager {
                     .get_mut(server_name)
                     .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
 
-                // If the process is alive, the error is a tool-level failure.
+                // Re-check liveness under the write lock. If the process is
+                // alive, either the error was a tool-level failure or another
+                // task already respawned the server while we waited for the lock.
                 if server.is_alive() {
                     return Err(e);
                 }
@@ -727,6 +729,10 @@ impl McpClientManager {
 
     /// Re-scan config files and reconcile servers: connect new ones,
     /// disconnect removed ones, leave unchanged ones alone.
+    ///
+    /// NOTE: Active conversations snapshot their tool registries at start
+    /// time. Newly added servers will only be visible to conversations
+    /// started after this reload completes.
     ///
     /// Returns a summary of what changed.
     pub async fn reload(&self) -> McpReloadResult {
