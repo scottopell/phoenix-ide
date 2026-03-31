@@ -156,59 +156,81 @@ impl McpServer {
     }
 
     /// Discover tools from the server via `tools/list`.
+    /// Follows cursor-based pagination if the server returns `nextCursor`.
     pub async fn list_tools(&mut self) -> Result<Vec<McpToolDef>, String> {
-        let resp = self
-            .send_request("tools/list", serde_json::json!({}))
-            .await?;
+        const MAX_PAGES: usize = 20;
 
-        let tools_arr = resp
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                format!(
-                    "MCP server '{}': tools/list response missing 'tools' array",
-                    self.name
-                )
-            })?;
+        let mut all_defs = Vec::new();
+        let mut cursor: Option<String> = None;
 
-        let mut defs = Vec::with_capacity(tools_arr.len());
-        for tool in tools_arr {
-            let name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input_schema = tool
-                .get("inputSchema")
-                .cloned()
-                .unwrap_or(serde_json::json!({"type": "object"}));
+        for page in 0..MAX_PAGES {
+            let params = match &cursor {
+                Some(c) => serde_json::json!({ "cursor": c }),
+                None => serde_json::json!({}),
+            };
 
-            if !name.is_empty() {
-                defs.push(McpToolDef {
-                    name,
-                    description,
-                    input_schema,
-                });
+            let resp = self.send_request("tools/list", params).await?;
+
+            let tools_arr = resp
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    format!(
+                        "MCP server '{}': tools/list response missing 'tools' array",
+                        self.name
+                    )
+                })?;
+
+            for tool in tools_arr {
+                let name = tool
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = tool
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input_schema = tool
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({"type": "object"}));
+
+                if !name.is_empty() {
+                    all_defs.push(McpToolDef {
+                        name,
+                        description,
+                        input_schema,
+                    });
+                }
+            }
+
+            match resp.get("nextCursor").and_then(|v| v.as_str()) {
+                Some(next) => {
+                    tracing::debug!(
+                        server = %self.name,
+                        page = page + 1,
+                        tools_so_far = all_defs.len(),
+                        "tools/list pagination: following nextCursor"
+                    );
+                    cursor = Some(next.to_string());
+                }
+                None => break,
             }
         }
 
-        // MCP spec supports cursor-based pagination for tools/list.
-        // We don't implement it yet -- log if the server indicates more pages.
-        if resp.get("nextCursor").is_some() {
+        if cursor.is_some() {
             tracing::warn!(
                 server = %self.name,
-                tools_so_far = defs.len(),
-                "tools/list returned nextCursor but pagination is not implemented -- some tools may be missing"
+                pages = MAX_PAGES,
+                tools = all_defs.len(),
+                "tools/list pagination hit safety cap -- some tools may be missing"
             );
         }
 
-        self.tools.clone_from(&defs);
-        Ok(defs)
+        self.tools.clone_from(&all_defs);
+        Ok(all_defs)
     }
 
     /// Call a tool on this server via `tools/call`.
