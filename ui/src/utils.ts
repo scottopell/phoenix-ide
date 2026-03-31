@@ -47,6 +47,7 @@ export function formatShortDateTime(isoStr: string): string {
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
     case 'idle': case 'error': case 'terminal': case 'context_exhausted':
+    case 'awaiting_task_approval':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -61,6 +62,7 @@ export function isCancellingState(state: ConversationState): boolean {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
     case 'idle': case 'error': case 'terminal': case 'context_exhausted':
+    case 'awaiting_task_approval':
     case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
       return false;
@@ -95,6 +97,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'cancelling...';
     case 'idle': case 'terminal':
       return 'ready';
+    case 'awaiting_task_approval':
+      return 'awaiting approval';
     case 'error':
       return 'error';
     case 'context_exhausted':
@@ -134,6 +138,13 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     case 'cancelling_sub_agents':
       return { type: 'cancelling_sub_agents', pending: (obj['pending'] as PendingSubAgent[]) ?? [] };
+    case 'awaiting_task_approval':
+      return {
+        type: 'awaiting_task_approval',
+        title: (obj['title'] as string) ?? '',
+        priority: (obj['priority'] as string) ?? '',
+        plan: (obj['plan'] as string) ?? '',
+      };
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
     case 'error':

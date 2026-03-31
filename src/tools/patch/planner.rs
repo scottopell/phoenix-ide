@@ -176,7 +176,7 @@ impl PatchPlanner {
         let mut result = original.to_string();
 
         // Sort by offset descending so we can apply without adjusting offsets
-        edits.sort_by(|a, b| b.offset.cmp(&a.offset));
+        edits.sort_by_key(|b| std::cmp::Reverse(b.offset));
 
         for edit in &edits {
             if edit.offset + edit.length > result.len() {

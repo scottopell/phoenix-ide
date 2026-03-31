@@ -7,6 +7,7 @@ mod api;
 mod db;
 mod llm;
 mod message_expander;
+mod platform;
 mod runtime;
 mod state_machine;
 mod system_prompt;
@@ -30,6 +31,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod hot_restart;
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::registry()
@@ -68,6 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
 
+    // Reconcile worktrees: revert Work conversations whose worktree is missing
+    reconcile_worktrees(&db).await;
+
     // Initialize LLM registry with model discovery
     let llm_config = LlmConfig::from_env();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
@@ -82,8 +87,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY, LLM_GATEWAY, or LLM_API_KEY_HELPER.");
     }
 
+    // Detect platform sandboxing capability (REQ-PROJ-013)
+    let platform = crate::platform::PlatformCapability::detect();
+    tracing::info!(?platform, "Platform capability detected");
+
+    // Create MCP manager and start background server discovery (non-blocking).
+    // Servers connect in parallel; tools become available as each finishes.
+    let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+
+    // Load persisted disabled-server set before discovery starts.
+    let disabled = db.get_disabled_mcp_servers().await.unwrap_or_default();
+    if !disabled.is_empty() {
+        tracing::info!(count = disabled.len(), servers = ?disabled, "Loaded disabled MCP servers from DB");
+    }
+    mcp_manager.set_disabled_servers(disabled).await;
+
+    mcp_manager.start_background_discovery();
+
     // Create application state
-    let state = AppState::new(db, llm_registry).await;
+    let state = AppState::new(db, llm_registry, platform, mcp_manager).await;
 
     // Create router
     let cors = CorsLayer::new()
@@ -157,4 +179,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hot_restart::maybe_perform_hot_restart();
 
     Ok(())
+}
+
+/// Reconcile Work conversations whose worktree has been deleted or whose
+/// `worktree_path` is empty (legacy rows predating M3).
+///
+/// For each affected conversation: revert mode to Explore, reset cwd to the
+/// project root, and run `git worktree prune` to clean stale worktree bookkeeping.
+async fn reconcile_worktrees(db: &Database) {
+    let work_convs = match db.get_work_conversations().await {
+        Ok(convs) => convs,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query Work conversations for reconciliation");
+            return;
+        }
+    };
+
+    let mut pruned_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reverted = 0usize;
+
+    for conv in &work_convs {
+        let wt_path = conv.conv_mode.worktree_path().unwrap_or("");
+        let base_branch = conv.conv_mode.base_branch().unwrap_or("");
+
+        // Legacy row (empty worktree_path or base_branch) or worktree directory missing on disk
+        let needs_revert =
+            wt_path.is_empty() || base_branch.is_empty() || !std::path::Path::new(wt_path).exists();
+
+        if !needs_revert {
+            continue;
+        }
+
+        let reason = if wt_path.is_empty() {
+            "legacy row (empty worktree_path)"
+        } else if base_branch.is_empty() {
+            "legacy row (empty base_branch)"
+        } else {
+            "worktree directory missing"
+        };
+        tracing::warn!(
+            conv_id = %conv.id,
+            worktree_path = wt_path,
+            reason,
+            "Reverting Work conversation to Explore"
+        );
+
+        // Revert to Explore mode
+        if let Err(e) = db
+            .update_conversation_mode(&conv.id, &db::ConvMode::Explore)
+            .await
+        {
+            tracing::error!(conv_id = %conv.id, error = %e, "Failed to revert conv_mode");
+            continue;
+        }
+        reverted += 1;
+
+        // Derive project root from worktree path: {root}/.phoenix/worktrees/{id}
+        // If worktree_path is empty, try to detect from the conversation's current cwd
+        let project_root = if wt_path.is_empty() {
+            // Legacy: use git rev-parse from the conversation's cwd
+            db::detect_git_repo_root(std::path::Path::new(&conv.cwd))
+        } else {
+            // Walk up from worktree path to find .phoenix parent
+            std::path::Path::new(wt_path)
+                .ancestors()
+                .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
+                .and_then(|phoenix_dir| phoenix_dir.parent())
+                .map(|p| p.to_string_lossy().to_string())
+        };
+
+        if let Some(ref root) = project_root {
+            if let Err(e) = db.update_conversation_cwd(&conv.id, root).await {
+                tracing::error!(conv_id = %conv.id, error = %e, "Failed to reset cwd");
+            }
+
+            // Prune stale worktrees in this project root (once per root)
+            if pruned_roots.insert(root.clone()) {
+                let root_path = std::path::PathBuf::from(root);
+                if let Err(e) = std::process::Command::new("git")
+                    .args(["worktree", "prune"])
+                    .current_dir(&root_path)
+                    .output()
+                {
+                    tracing::debug!(root = %root, error = %e, "git worktree prune failed");
+                }
+            }
+        }
+    }
+
+    if reverted > 0 {
+        tracing::info!(
+            total_work = work_convs.len(),
+            reverted,
+            "Worktree reconciliation complete"
+        );
+    }
 }

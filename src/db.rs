@@ -6,6 +6,7 @@ mod schema;
 
 pub use schema::*;
 use schema::{
+    MIGRATION_CREATE_MCP_DISABLED_SERVERS, MIGRATION_CREATE_PROJECTS,
     MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
 };
 
@@ -88,7 +89,136 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Create projects table (idempotent via IF NOT EXISTS)
+        let _ = sqlx::raw_sql(MIGRATION_CREATE_PROJECTS)
+            .execute(&self.pool)
+            .await;
+
+        // Add project_id and conv_mode columns to conversations
+        // Each ALTER TABLE is independent; ignore errors if columns already exist
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}'",
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Add title column for human-readable conversation names
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN title TEXT")
+            .execute(&self.pool)
+            .await;
+
+        // Create mcp_disabled_servers table (idempotent via IF NOT EXISTS)
+        let _ = sqlx::raw_sql(MIGRATION_CREATE_MCP_DISABLED_SERVERS)
+            .execute(&self.pool)
+            .await;
+
         Ok(())
+    }
+
+    // ==================== MCP Disabled Servers ====================
+
+    /// Return the set of MCP server names that have been disabled.
+    pub async fn get_disabled_mcp_servers(&self) -> DbResult<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT server_name FROM mcp_disabled_servers")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
+    /// Mark an MCP server as disabled (idempotent).
+    pub async fn disable_mcp_server(&self, name: &str) -> DbResult<()> {
+        sqlx::query("INSERT OR IGNORE INTO mcp_disabled_servers (server_name) VALUES (?1)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Re-enable an MCP server by removing it from the disabled set.
+    pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Project Operations ====================
+
+    /// Find or create a project by its canonical git repo root path.
+    ///
+    /// REQ-PROJ-001: Projects are keyed by resolved repo root.
+    pub async fn find_or_create_project(&self, canonical_path: &str) -> DbResult<Project> {
+        // Try to find existing project
+        let existing = sqlx::query(
+            "SELECT id, canonical_path, main_ref, created_at,
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) as conversation_count
+             FROM projects p WHERE canonical_path = ?1",
+        )
+        .bind(canonical_path)
+        .try_map(parse_project_row)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(project) = existing {
+            return Ok(project);
+        }
+
+        // Create new project
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES (?1, ?2, 'main', ?3)",
+        )
+        .bind(&id)
+        .bind(canonical_path)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Project {
+            id,
+            canonical_path: canonical_path.to_string(),
+            main_ref: "main".to_string(),
+            created_at: now,
+            conversation_count: 0,
+        })
+    }
+
+    /// Get a project by ID.
+    pub async fn get_project(&self, id: &str) -> DbResult<Project> {
+        let project = sqlx::query(
+            "SELECT id, canonical_path, main_ref, created_at,
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) as conversation_count
+             FROM projects p WHERE id = ?1",
+        )
+        .bind(id)
+        .try_map(parse_project_row)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        project.ok_or_else(|| DbError::ConversationNotFound(format!("project {id}")))
+    }
+
+    /// List all projects with conversation counts
+    pub async fn list_projects(&self) -> DbResult<Vec<Project>> {
+        let rows = sqlx::query(
+            "SELECT p.id, p.canonical_path, p.main_ref, p.created_at,
+                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) as conversation_count
+             FROM projects p
+             ORDER BY p.created_at DESC",
+        )
+        .try_map(parse_project_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 
     // ==================== Conversation Operations ====================
@@ -103,26 +233,57 @@ impl Database {
         parent_id: Option<&str>,
         model: Option<&str>,
     ) -> DbResult<Conversation> {
+        self.create_conversation_with_project(
+            id,
+            slug,
+            cwd,
+            user_initiated,
+            parent_id,
+            model,
+            None,
+            &ConvMode::Explore,
+        )
+        .await
+    }
+
+    /// Create a new conversation, optionally associated with a project.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_conversation_with_project(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        parent_id: Option<&str>,
+        model: Option<&str>,
+        project_id: Option<&str>,
+        conv_mode: &ConvMode,
+    ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
+        let conv_mode_json = serde_json::to_string(conv_mode).unwrap();
         let now_str = now.to_rfc3339();
 
         // Retry with a random suffix on slug collision (UNIQUE constraint).
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
         loop {
+            let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11)",
             )
             .bind(id)
             .bind(&actual_slug)
+            .bind(&title_str)
             .bind(cwd)
             .bind(parent_id)
             .bind(user_initiated)
             .bind(&idle_state)
             .bind(&now_str)
             .bind(model)
+            .bind(project_id)
+            .bind(&conv_mode_json)
             .execute(&self.pool)
             .await;
 
@@ -141,9 +302,11 @@ impl Database {
             }
         }
 
+        let title = schema::title_from_slug(&actual_slug);
         Ok(Conversation {
             id: id.to_string(),
             slug: Some(actual_slug),
+            title: Some(title),
             cwd: cwd.to_string(),
             parent_conversation_id: parent_id.map(String::from),
             user_initiated,
@@ -153,6 +316,8 @@ impl Database {
             updated_at: now,
             archived: false,
             model: model.map(String::from),
+            project_id: project_id.map(String::from),
+            conv_mode: conv_mode.clone(),
             message_count: 0,
         })
     }
@@ -160,8 +325,9 @@ impl Database {
     /// Get conversation by ID
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -178,8 +344,9 @@ impl Database {
     /// Get conversation by slug
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -196,8 +363,9 @@ impl Database {
     /// List active (non-archived) user-initiated conversations
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -213,8 +381,9 @@ impl Database {
     /// List archived conversations
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -245,6 +414,73 @@ impl Database {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Update conversation mode (e.g., Explore -> Work on task approval)
+    pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
+        let now = Utc::now();
+        let mode_json = serde_json::to_string(mode).unwrap();
+
+        let result =
+            sqlx::query("UPDATE conversations SET conv_mode = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(&mode_json)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Check if any non-archived conversation for a project is in Work mode
+    #[allow(dead_code)] // May be used for future project-level queries
+    pub async fn has_active_work_conversation(&self, project_id: &str) -> DbResult<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) FROM conversations
+             WHERE project_id = ?1 AND archived = 0
+             AND json_extract(conv_mode, '$.mode') = 'Work'",
+        )
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let count: i64 = row.get(0);
+        Ok(count > 0)
+    }
+
+    /// Update conversation working directory (e.g., after worktree creation).
+    pub async fn update_conversation_cwd(&self, id: &str, cwd: &str) -> DbResult<()> {
+        let now = Utc::now();
+        let result =
+            sqlx::query("UPDATE conversations SET cwd = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(cwd)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Get all non-archived Work conversations (for startup worktree reconciliation).
+    pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
+        sqlx::query(
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.archived = 0
+               AND json_extract(c.conv_mode, '$.mode') = 'Work'",
+        )
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
     }
 
     /// Archive a conversation
@@ -336,11 +572,14 @@ impl Database {
         self.repair_orphaned_tool_use(&now).await?;
 
         // Reset non-terminal conversations to idle.
-        // Terminal states (context_exhausted) should NOT be reset - they represent
-        // completed conversations that cannot accept new messages.
+        // Preserved states (NOT reset):
+        //   - context_exhausted: completed conversations that cannot accept new messages
+        //   - awaiting_task_approval: user approval pending; state data (title/priority/plan)
+        //     is in the JSON column and must survive restart
+        //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval', 'terminal')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())
@@ -622,9 +861,25 @@ impl Database {
 fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let state_json: String = row.try_get("state")?;
     let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
+
+    // conv_mode: parse from JSON, default to Explore for old rows without the column
+    let conv_mode: ConvMode = row
+        .try_get::<Option<String>, _>("conv_mode")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let slug: Option<String> = row.try_get("slug")?;
+    let title: Option<String> = row
+        .try_get::<Option<String>, _>("title")
+        .unwrap_or(None)
+        .or_else(|| slug.as_deref().map(schema::title_from_slug));
+
     Ok(Conversation {
         id: row.try_get("id")?,
-        slug: row.try_get("slug")?,
+        slug,
+        title,
         cwd: row.try_get("cwd")?,
         parent_conversation_id: row.try_get("parent_conversation_id")?,
         user_initiated: row.try_get("user_initiated")?,
@@ -634,7 +889,23 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
         archived: row.try_get("archived")?,
         model: row.try_get("model")?,
+        project_id: row
+            .try_get::<Option<String>, _>("project_id")
+            .unwrap_or(None),
+        conv_mode,
         message_count: row.try_get("message_count")?,
+    })
+}
+
+/// Parse a project row from the database
+#[allow(clippy::needless_pass_by_value)]
+fn parse_project_row(row: SqliteRow) -> Result<Project, sqlx::Error> {
+    Ok(Project {
+        id: row.try_get("id")?,
+        canonical_path: row.try_get("canonical_path")?,
+        main_ref: row.try_get("main_ref")?,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        conversation_count: row.try_get("conversation_count")?,
     })
 }
 
@@ -785,6 +1056,43 @@ mod tests {
         // Verify the summary is intact
         if let ConvState::ContextExhausted { summary } = conv_after.state {
             assert_eq!(summary, "Test summary");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reset_preserves_awaiting_task_approval_state() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let approval_state = ConvState::AwaitingTaskApproval {
+            title: "Fix the widget".to_string(),
+            priority: "p1".to_string(),
+            plan: "Step 1: read code\nStep 2: fix bug".to_string(),
+        };
+        db.update_conversation_state("conv-1", &approval_state)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        let conv_after = db.get_conversation("conv-1").await.unwrap();
+        assert!(
+            matches!(conv_after.state, ConvState::AwaitingTaskApproval { .. }),
+            "AwaitingTaskApproval state should be preserved after reset"
+        );
+
+        if let ConvState::AwaitingTaskApproval {
+            title,
+            priority,
+            plan,
+        } = conv_after.state
+        {
+            assert_eq!(title, "Fix the widget");
+            assert_eq!(priority, "p1");
+            assert_eq!(plan, "Step 1: read code\nStep 2: fix bug");
         }
     }
 
@@ -1008,6 +1316,52 @@ mod tests {
         assert_eq!(
             db.get_conversation("id-2").await.unwrap().slug,
             Some(second_slug)
+        );
+    }
+
+    // FTUX-08: Conversation names are auto-generated slugs
+    //
+    // The Conversation struct only has a `slug` field (kebab-case) and no
+    // `title` field. The UI displays slugs like "add-hello-file-task" as
+    // conversation names. The serialized JSON sent to the API should include
+    // a human-readable `title` field (e.g., "Add Hello File Task") in
+    // addition to the machine-friendly `slug`.
+    #[tokio::test]
+    async fn test_ftux08_conversation_json_includes_title_field() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let conv = db
+            .create_conversation(
+                "conv-ftux08",
+                "my-test-conversation",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Serialize to JSON (same path as conversation_to_json in handlers.rs)
+        let json_val = serde_json::to_value(&conv).unwrap();
+        let obj = json_val
+            .as_object()
+            .expect("Conversation should serialize to JSON object");
+
+        // The JSON should have a "title" field with a human-readable name.
+        // Currently it only has "slug" (kebab-case), so this test FAILS.
+        assert!(
+            obj.contains_key("title"),
+            "Conversation JSON must include a 'title' field for human-readable display. \
+             Found keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+
+        let title = obj["title"].as_str().expect("title should be a string");
+        // The title should be human-readable, not kebab-case
+        assert!(
+            !title.contains('-'),
+            "title should be human-readable, not kebab-case. Got: {title}"
         );
     }
 }

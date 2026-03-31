@@ -1,0 +1,197 @@
+/* MCP Status Panel - collapsible sidebar footer */
+.mcp-panel {
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mcp-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  transition: background 150ms ease;
+}
+
+.mcp-panel-header:hover {
+  background: var(--bg-hover);
+}
+
+.mcp-panel-chevron {
+  font-size: 10px;
+  transition: transform 200ms ease;
+  flex-shrink: 0;
+}
+
+.mcp-panel-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.mcp-panel-summary {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mcp-disabled-count {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+.mcp-panel-reload {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+  transition: background 150ms ease, color 150ms ease;
+}
+
+.mcp-panel-reload:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.mcp-panel-reload.reloading {
+  animation: mcp-spin 800ms linear infinite;
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+@keyframes mcp-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.mcp-panel-body {
+  padding: 0 12px 8px;
+}
+
+.mcp-server-item {
+  padding: 2px 0;
+}
+
+.mcp-server-item.mcp-server-disabled {
+  opacity: 0.6;
+}
+
+.mcp-server-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 2px 0;
+  user-select: none;
+}
+
+.mcp-server-header:hover {
+  color: var(--text-primary);
+}
+
+.mcp-server-chevron {
+  font-size: 8px;
+  transition: transform 200ms ease;
+  flex-shrink: 0;
+}
+
+.mcp-server-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.mcp-server-name {
+  font-weight: 500;
+  color: var(--text-primary);
+  transition: color 200ms ease;
+}
+
+.mcp-server-name.mcp-name-disabled {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+.mcp-server-count {
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.mcp-server-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  flex-shrink: 0;
+  transition: color 200ms ease, opacity 200ms ease;
+}
+
+.mcp-server-toggle.on {
+  color: var(--color-success, #4caf50);
+}
+
+.mcp-server-toggle.off {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.mcp-server-toggle:hover {
+  opacity: 1;
+}
+
+.mcp-server-toggle.toggling {
+  pointer-events: none;
+  opacity: 0.4;
+}
+
+.mcp-tool-list {
+  padding-left: 16px;
+  margin: 2px 0 4px;
+}
+
+.mcp-tool-name {
+  display: block;
+  padding: 1px 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+}
+
+.mcp-tool-name.mcp-tool-disabled {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+
+.mcp-empty {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-style: italic;
+}

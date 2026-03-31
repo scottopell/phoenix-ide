@@ -5,18 +5,24 @@
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::sse::sse_stream;
 use super::types::{
-    CancelResponse, ChatRequest, ChatResponse, ConversationListResponse, ConversationResponse,
+    CancelResponse, ChatRequest, ChatResponse, CompleteTaskResponse, ConfirmCompleteRequest,
+    ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
     ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, ValidateCwdResponse,
+    SystemPromptResponse, TaskApprovalResponse, TaskFeedbackRequest, ValidateCwdResponse,
 };
 use super::AppState;
-use crate::db::{ImageData, Message, MessageContent, MessageType};
-use crate::llm::{ContentBlock, GatewayStatus};
+use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
+use crate::llm::{
+    ContentBlock, GatewayStatus, LlmMessage, LlmRequest, MessageRole,
+    SystemContent as LlmSystemContent,
+};
+use crate::runtime::executor::{run_git, TASK_APPROVAL_MUTEX};
 use crate::runtime::SseEvent;
-use crate::state_machine::Event;
+use crate::state_machine::state::TaskApprovalOutcome;
+use crate::state_machine::{ConvState, Event};
 
 use axum::{
     extract::{Path, Query, State},
@@ -29,7 +35,6 @@ use chrono::Datelike;
 use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -68,6 +73,18 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/trigger-continuation",
             post(trigger_continuation),
         )
+        // Task approval (REQ-BED-028)
+        .route("/api/conversations/:id/approve-task", post(approve_task))
+        .route("/api/conversations/:id/reject-task", post(reject_task))
+        .route("/api/conversations/:id/task-feedback", post(task_feedback))
+        // Task completion (REQ-PROJ-009)
+        .route("/api/conversations/:id/complete-task", post(complete_task))
+        .route(
+            "/api/conversations/:id/confirm-complete",
+            post(confirm_complete),
+        )
+        // Task abandon (REQ-PROJ-010)
+        .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -99,10 +116,17 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/skills",
             get(list_conversation_skills),
         )
+        // Projects (REQ-PROJ-014)
+        .route("/api/projects", get(list_projects))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
         // Environment info
         .route("/api/env", get(get_env))
+        // MCP management
+        .route("/api/mcp/status", get(mcp_status))
+        .route("/api/mcp/reload", post(reload_mcp))
+        .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
+        .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
         // Version
         .route("/version", get(get_version))
         .with_state(state)
@@ -119,7 +143,7 @@ pub fn create_router(state: AppState) -> Router {
 /// For agent messages with bash `tool_use` blocks, the `display` field shows a
 /// simplified command (with cd prefixes stripped when they match cwd).
 /// The `display_data` is pre-computed at message creation time and stored in DB.
-fn enrich_message_for_api(msg: &Message) -> Value {
+pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
     let mut json = serde_json::to_value(msg).unwrap_or(Value::Null);
 
     // Only process agent messages with display_data
@@ -134,19 +158,65 @@ fn enrich_message_for_api(msg: &Message) -> Value {
     json
 }
 
+/// Count how many commits `base_branch` is ahead of `task_branch` in `repo_root`.
+///
+/// Shells out to `git rev-list --count`. Returns 0 on any error (missing branch,
+/// git not available, parse failure). This is a best-effort indicator.
+///
+/// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
+fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
+    let range = format!("{task_branch}..{base_branch}");
+    match run_git(repo_root, &["rev-list", "--count", &range]) {
+        Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
+        Err(e) => {
+            tracing::debug!(
+                repo = %repo_root.display(),
+                base_branch,
+                task_branch,
+                error = %e,
+                "commits_behind check failed, returning 0"
+            );
+            0
+        }
+    }
+}
+
 /// Merge pre-computed `display_data` into content blocks.
 ///
 /// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
+/// Build an `EnrichedConversation` with derived display fields.
+fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::EnrichedConversation {
+    crate::runtime::EnrichedConversation {
+        conv_mode_label: conv.conv_mode.label().to_string(),
+        branch_name: conv.conv_mode.branch_name().map(String::from),
+        worktree_path: conv
+            .conv_mode
+            .worktree_path()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        base_branch: conv
+            .conv_mode
+            .base_branch()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        inner: conv.clone(),
+    }
+}
+
 /// Serialize a conversation to JSON with `display_state` included.
+///
+/// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
+/// `display_state` is injected here (not on `EnrichedConversation`) so REST
+/// clients still receive it while the typed struct stays clean.
 fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
-    let mut v = serde_json::to_value(conv).unwrap_or(Value::Null);
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert(
+    let mut val = serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = val {
+        map.insert(
             "display_state".to_string(),
             Value::String(conv.state.display_state().as_str().to_string()),
         );
     }
-    v
+    val
 }
 
 fn merge_display_data_into_content(json: &mut Value, display_data: &Value) {
@@ -245,6 +315,22 @@ async fn list_archived_conversations(
 }
 
 // ============================================================
+// Projects (REQ-PROJ-014)
+// ============================================================
+
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let projects = state
+        .db
+        .list_projects()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(
+        serde_json::to_value(projects).unwrap_or(Value::Array(vec![])),
+    ))
+}
+
+// ============================================================
 // Conversation Creation (REQ-API-002)
 // ============================================================
 
@@ -326,17 +412,41 @@ async fn create_conversation(
         generate_slug()
     };
 
-    // Create conversation
+    // Detect project from git repo root (REQ-PROJ-001)
+    let project_id = if let Some(repo_root) = crate::db::detect_git_repo_root(&path) {
+        match state.db.find_or_create_project(&repo_root).await {
+            Ok(project) => {
+                tracing::info!(project_id = %project.id, path = %repo_root, "Associated conversation with project");
+                Some(project.id)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create project, continuing without");
+                None
+            }
+        }
+    } else {
+        tracing::debug!(cwd = %req.cwd, "Directory is not in a git repo, no project association");
+        None
+    };
+
+    // Create conversation (REQ-PROJ-002: Explore for git repos, Standalone otherwise)
+    let conv_mode = if project_id.is_some() {
+        crate::db::ConvMode::Explore
+    } else {
+        crate::db::ConvMode::Standalone
+    };
     let conversation = state
         .runtime
         .db()
-        .create_conversation(
+        .create_conversation_with_project(
             &id,
             &slug,
             &req.cwd,
             true,                 // user_initiated
             None,                 // no parent
             req.model.as_deref(), // selected model
+            project_id.as_deref(),
+            &conv_mode,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -458,19 +568,8 @@ struct StreamQuery {
     after: Option<i64>,
 }
 
-/// Breadcrumb for showing LLM thought process trail
-#[derive(Debug, Clone, Serialize)]
-pub struct Breadcrumb {
-    #[serde(rename = "type")]
-    pub crumb_type: String,
-    pub label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequence_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
-}
+/// Type alias -- breadcrumb type now lives in `runtime.rs` as `SseBreadcrumb`.
+type Breadcrumb = crate::runtime::SseBreadcrumb;
 
 /// Extract breadcrumbs from the last turn in message history
 /// A "turn" starts with the last user message and includes all subsequent agent/tool messages
@@ -680,6 +779,7 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -713,21 +813,16 @@ async fn stream_conversation(
         .next_back()
         .map_or(0, crate::db::UsageData::context_window_used);
 
-    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
-
     // Extract breadcrumbs from the last turn
     let breadcrumbs = extract_breadcrumbs(&messages);
-    let json_breadcrumbs: Vec<Value> = breadcrumbs
-        .iter()
-        .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
-        .collect();
 
-    // Subscribe to updates
-    let broadcast_rx = state
+    // Get the conversation handle (subscribes + gives us broadcast_tx for polling)
+    let handle = state
         .runtime
-        .subscribe(&id)
+        .get_or_create(&id)
         .await
         .map_err(AppError::Internal)?;
+    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     // Get model's context window for percentage calculation
     let model_id = conversation
@@ -736,19 +831,91 @@ async fn stream_conversation(
         .unwrap_or(state.llm_registry.default_model_id());
     let model_context_window = state.llm_registry.context_window(model_id);
 
-    // Create init event
-    // Note: messages are enriched with display info above via enrich_message_for_api
-    // which handles backwards compatibility for older messages without display field
+    // Compute initial commits_behind for Work conversations.
+    // Extract the git info we need for both the init value and the polling task.
+    let work_git_info = match &conversation.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            base_branch,
+            ..
+        } if !base_branch.is_empty() && !branch_name.is_empty() => {
+            // Resolve repo root from project
+            let repo_root = if let Some(ref project_id) = conversation.project_id {
+                state
+                    .db
+                    .get_project(project_id)
+                    .await
+                    .ok()
+                    .map(|p| PathBuf::from(p.canonical_path))
+            } else {
+                None
+            };
+            repo_root.map(|root| (root, base_branch.clone(), branch_name.clone()))
+        }
+        _ => None,
+    };
+
+    let initial_commits_behind = if let Some((ref repo_root, ref base, ref task)) = work_git_info {
+        let root = repo_root.clone();
+        let base = base.clone();
+        let task = task.clone();
+        tokio::task::spawn_blocking(move || commits_behind(&root, &base, &task))
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
-        conversation: conversation_to_json(&conversation),
-        messages: json_msgs,
+        conversation: Box::new(enrich_conversation(&conversation)),
+        messages,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
         last_sequence_id,
         context_window_size,
         model_context_window,
-        breadcrumbs: json_breadcrumbs,
+        breadcrumbs,
+        commits_behind: initial_commits_behind,
     };
+
+    // Spawn periodic commits-behind polling for Work conversations (REQ-PROJ-011)
+    if let Some((repo_root, base_branch, task_branch)) = work_git_info {
+        let broadcast_tx = handle.broadcast_tx.clone();
+        tokio::spawn(async move {
+            let mut last_value = initial_commits_behind;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_mins(1)).await;
+
+                let root = repo_root.clone();
+                let base = base_branch.clone();
+                let task = task_branch.clone();
+                let new_value =
+                    tokio::task::spawn_blocking(move || commits_behind(&root, &base, &task))
+                        .await
+                        .unwrap_or(last_value);
+
+                if new_value != last_value {
+                    last_value = new_value;
+                    let result = broadcast_tx.send(SseEvent::ConversationUpdate {
+                        update: crate::runtime::ConversationMetadataUpdate {
+                            cwd: None,
+                            branch_name: None,
+                            worktree_path: None,
+                            conv_mode_label: None,
+                            base_branch: None,
+                            commits_behind: Some(new_value),
+                        },
+                    });
+                    // No receivers left -- client disconnected, exit polling loop
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("commits-behind polling task exited");
+        });
+    }
 
     Ok(sse_stream(init_event, broadcast_rx))
 }
@@ -850,6 +1017,765 @@ async fn trigger_continuation(
         .send_event(&id, Event::UserTriggerContinuation)
         .await
         .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Task Approval (REQ-BED-028)
+// ============================================================
+
+async fn approve_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskApprovalResponse>, AppError> {
+    // 1. Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    // 2. Non-project conversations cannot approve tasks (propose_plan is project-only)
+    if conv.project_id.is_none() {
+        return Err(AppError::BadRequest(
+            "Task approval requires a project-scoped conversation".to_string(),
+        ));
+    }
+
+    // 3. Dispatch approval event to state machine
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Approved,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(TaskApprovalResponse {
+        success: true,
+        first_task: None, // Set by executor via SSE if applicable
+    }))
+}
+
+async fn reject_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Rejected,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+async fn task_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TaskFeedbackRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::FeedbackProvided {
+                    annotations: req.annotations,
+                },
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Task Completion (REQ-PROJ-009)
+// ============================================================
+
+/// Pre-check endpoint: validates worktree state, detects conflicts, generates commit message.
+/// Does NOT merge -- the user reviews the commit message first.
+#[allow(clippy::too_many_lines)] // Sequential validation + LLM call; splitting hurts readability
+async fn complete_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CompleteTaskResponse>, AppError> {
+    // 1. Validate conversation exists, is Work mode, Idle state, project-scoped
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to complete a task".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, base_branch, task_id) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            task_id,
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+            task_id.clone(),
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work mode".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+
+    // Look up project to get canonical_path (repo root)
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+    let worktree_dir = PathBuf::from(&worktree_path);
+
+    // Capture what we need for the blocking section
+    let base_branch_clone = base_branch.clone();
+
+    // 2. Pre-checks (blocking git operations)
+    let prechecks = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+        // 2a. Worktree must be clean
+        let wt_status = run_git(&worktree_dir, &["status", "--porcelain"])
+            .map_err(AppError::Internal)?;
+        if !wt_status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: "Worktree has uncommitted changes. Ask the agent to commit or stash before completing.".to_string(),
+                error_type: "dirty_worktree".to_string(),
+            }));
+        }
+
+        // 2b. Main checkout must be clean
+        let main_status = run_git(&repo_root, &["status", "--porcelain"])
+            .map_err(AppError::Internal)?;
+        if !main_status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: "Main checkout has uncommitted changes. Commit or stash them before completing.".to_string(),
+                error_type: "dirty_main_checkout".to_string(),
+            }));
+        }
+
+        // 2c. Conflict detection via merge-tree
+        let merge_base = run_git(
+            &worktree_dir,
+            &["merge-base", &base_branch_clone, "HEAD"],
+        )
+        .map_err(|e| AppError::Internal(format!("Failed to find merge base: {e}")))?;
+
+        let merge_tree_output = run_git(
+            &worktree_dir,
+            &["merge-tree", &merge_base, &base_branch_clone, "HEAD"],
+        )
+        .unwrap_or_default();
+        // merge-tree outputs conflict markers if there are conflicts
+        if merge_tree_output.contains("<<<<<<") || merge_tree_output.contains("changed in both") {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error: format!(
+                    "Merge conflicts detected between your branch and {base_branch_clone}. Rebase first."
+                ),
+                error_type: "merge_conflicts".to_string(),
+            }));
+        }
+
+        // 2d. Get diff for commit message generation
+        let diff = run_git(
+            &worktree_dir,
+            &["diff", &format!("{base_branch_clone}...HEAD")],
+        )
+        .unwrap_or_default();
+
+        let diff_content = if diff.len() > 50_000 {
+            // Fall back to diff --stat if diff is too large
+            run_git(
+                &worktree_dir,
+                &["diff", "--stat", &format!("{base_branch_clone}...HEAD")],
+            )
+            .unwrap_or_else(|_| "(no diff available)".to_string())
+        } else {
+            diff
+        };
+
+        Ok(diff_content)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?;
+
+    let diff_content = prechecks?;
+
+    // 3. Task file nudge check
+    let task_not_done = check_task_file_status(&PathBuf::from(&worktree_path), &task_id);
+
+    // 4. Generate commit message via LLM
+    let model_id = conv
+        .model
+        .as_deref()
+        .unwrap_or_else(|| state.llm_registry.default_model_id());
+
+    let llm_service = state
+        .llm_registry
+        .get(model_id)
+        .ok_or_else(|| AppError::Internal(format!("LLM model '{model_id}' not available")))?;
+
+    let system_prompt = "You are writing a git commit message for a squash merge. \
+        Write a semantic commit message in imperative mood. Focus on WHAT changed and WHY, \
+        not which files were modified. The message should have:\n\
+        - A concise subject line (max 72 chars), using a conventional prefix \
+          (feat:, fix:, refactor:, docs:, test:, chore:)\n\
+        - An optional body separated by a blank line with more detail if the change is complex\n\n\
+        Output ONLY the commit message text, nothing else. No markdown formatting, no code blocks.";
+
+    let user_msg = if diff_content.is_empty() {
+        "No diff found between branches. Write a generic commit message: 'chore: merge task branch'"
+            .to_string()
+    } else {
+        format!("Write a commit message for this diff:\n\n{diff_content}")
+    };
+
+    let request = LlmRequest {
+        system: vec![LlmSystemContent::new(system_prompt)],
+        messages: vec![LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(user_msg)],
+        }],
+        tools: vec![],
+        max_tokens: Some(500),
+    };
+
+    let commit_message = match llm_service.complete(&request).await {
+        Ok(response) => {
+            let text = response.text();
+            if text.is_empty() {
+                format!("feat: complete task from branch {branch_name}")
+            } else {
+                text
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "LLM commit message generation failed, using fallback");
+            format!("feat: complete task from branch {branch_name}")
+        }
+    };
+
+    Ok(Json(CompleteTaskResponse {
+        success: true,
+        commit_message,
+        task_not_done: if task_not_done { Some(true) } else { None },
+    }))
+}
+
+/// Confirm and execute the squash merge after the user reviews the commit message.
+#[allow(clippy::too_many_lines)] // Sequential git + DB operations; splitting hurts readability
+async fn confirm_complete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ConfirmCompleteRequest>,
+) -> Result<Json<ConfirmCompleteResponse>, AppError> {
+    // 1. Re-validate conversation state (race guard)
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to complete a task".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, base_branch) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            ..
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work mode".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+
+    let commit_message = req.commit_message;
+    let base_branch_for_msg = base_branch.clone();
+
+    // 2. Execute merge sequence (blocking, under global mutex)
+    let merge_result = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+        let _guard = TASK_APPROVAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 2a. Repo root must be clean
+        let status = run_git(&repo_root, &["status", "--porcelain"]).map_err(AppError::Internal)?;
+        if !status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error:
+                    "Main checkout has uncommitted changes. Commit or stash them before completing."
+                        .to_string(),
+                error_type: "dirty_main_checkout".to_string(),
+            }));
+        }
+
+        // 2b. Checkout base branch
+        run_git(&repo_root, &["checkout", &base_branch])
+            .map_err(|e| AppError::Internal(format!("Failed to checkout {base_branch}: {e}")))?;
+
+        // 2c. Squash merge
+        if let Err(e) = run_git(&repo_root, &["merge", "--squash", &branch_name]) {
+            // Attempt to recover by aborting the merge
+            let _ = run_git(&repo_root, &["merge", "--abort"]);
+            return Err(AppError::Internal(format!("Squash merge failed: {e}")));
+        }
+
+        // 2d. Commit (skip if merge --squash produced no changes, e.g., only task file)
+        let has_staged = run_git(&repo_root, &["diff", "--cached", "--quiet"]).is_err();
+        if has_staged {
+            if let Err(e) = run_git(&repo_root, &["commit", "-m", &commit_message]) {
+                let _ = run_git(&repo_root, &["reset", "HEAD"]);
+                return Err(AppError::Internal(format!("Commit failed: {e}")));
+            }
+        } else {
+            tracing::info!("Squash merge produced no changes (task-only branch), skipping commit");
+        }
+
+        // 2e. Record short SHA
+        let short_sha = run_git(&repo_root, &["rev-parse", "--short", "HEAD"])
+            .map_err(|e| AppError::Internal(format!("Failed to get commit SHA: {e}")))?;
+
+        // 2f. Remove worktree
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(
+            &repo_root,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal)"
+            );
+            // Try filesystem removal as fallback
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root, &["worktree", "prune"]);
+        }
+
+        // 2g. Delete branch
+        if let Err(e) = run_git(&repo_root, &["branch", "-D", &branch_name]) {
+            tracing::warn!(
+                error = %e,
+                branch = %branch_name,
+                "Failed to delete branch (non-fatal)"
+            );
+        }
+
+        Ok(short_sha)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?;
+
+    let short_sha = merge_result?;
+
+    // 3. Update conversation state to Terminal
+    state
+        .db
+        .update_conversation_state(&id, &ConvState::Terminal)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 4. Update conv_mode to Explore
+    state
+        .db
+        .update_conversation_mode(&id, &ConvMode::Explore)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 5. Inject system message
+    let system_msg =
+        format!("Task completed. Squash merged to {base_branch_for_msg} as {short_sha}.");
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let msg = state
+        .db
+        .add_message(
+            &msg_id,
+            &id,
+            &MessageContent::system(&system_msg),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 6. Broadcast SSE events so the frontend updates in real-time
+    if let Ok(handle) = state.runtime.get_or_create(&id).await {
+        let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
+        let _ = handle.broadcast_tx.send(SseEvent::StateChange {
+            state: ConvState::Terminal,
+            display_state: ConvState::Terminal.display_state().as_str().to_string(),
+        });
+        let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
+            update: crate::runtime::ConversationMetadataUpdate {
+                cwd: None,
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: Some("Explore".to_string()),
+                base_branch: None,
+                commits_behind: None,
+            },
+        });
+    }
+
+    Ok(Json(ConfirmCompleteResponse {
+        success: true,
+        commit_sha: short_sha,
+    }))
+}
+
+/// Check if the task file for a given task number has status `done`.
+/// Returns true if the task file exists and its status is NOT done.
+fn check_task_file_status(worktree_path: &std::path::Path, task_id: &str) -> bool {
+    let tasks_dir = worktree_path.join("tasks");
+    if !tasks_dir.exists() {
+        return false;
+    }
+
+    let prefix = format!("{task_id}-");
+    let Ok(entries) = std::fs::read_dir(&tasks_dir) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&prefix) && name_str.ends_with(".md") {
+            // Read the file and check frontmatter for status: done
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                // Simple frontmatter parse: look for `status: done` between `---` delimiters
+                if let Some(fm) = extract_frontmatter(&content) {
+                    return !fm.contains("status: done");
+                }
+            }
+            // File found but couldn't parse -- assume not done
+            return true;
+        }
+    }
+
+    // No matching task file found
+    false
+}
+
+/// Extract frontmatter content (between `---` delimiters) from a markdown file.
+fn extract_frontmatter(content: &str) -> Option<&str> {
+    let content = content.trim_start();
+    if !content.starts_with("---") {
+        return None;
+    }
+    let rest = &content[3..];
+    rest.find("---").map(|end| &rest[..end])
+}
+
+/// Abandon a Work-mode task: delete worktree/branch, mark task file wont-do, go Terminal.
+/// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
+#[allow(clippy::too_many_lines)]
+async fn abandon_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // 1. Validate conversation exists, is Work mode, Idle state, project-scoped
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to abandon a task".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, base_branch, task_id) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            task_id,
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+            task_id.clone(),
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work mode".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+
+    // 2. Execute abandon sequence (blocking)
+    let repo_root_clone = repo_root.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // Phase 1: worktree cleanup (BEFORE mutex -- these don't touch the main checkout)
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(
+            &repo_root_clone,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal), trying filesystem fallback"
+            );
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
+        }
+
+        if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
+            tracing::warn!(
+                error = %e,
+                branch = %branch_name,
+                "Failed to delete branch (non-fatal)"
+            );
+        }
+
+        // Phase 2: task file update (UNDER mutex)
+        let _guard = TASK_APPROVAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Check main checkout is clean
+        let status =
+            run_git(&repo_root_clone, &["status", "--porcelain"]).map_err(AppError::Internal)?;
+        if !status.is_empty() {
+            return Err(AppError::Conflict(ConflictErrorResponse {
+                error:
+                    "Main checkout has uncommitted changes. Commit or stash them before abandoning."
+                        .to_string(),
+                error_type: "dirty_main_checkout".to_string(),
+            }));
+        }
+
+        // Checkout base branch
+        run_git(&repo_root_clone, &["checkout", &base_branch])
+            .map_err(|e| AppError::Internal(format!("Failed to checkout {base_branch}: {e}")))?;
+
+        // Scan tasks/ for matching task file and rename to wont-do
+        let tasks_dir = repo_root_clone.join("tasks");
+        let prefix = format!("{task_id}-");
+
+        let mut found_file = None;
+        if tasks_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy().to_string();
+                    if name_str.starts_with(&prefix)
+                        && std::path::Path::new(&name_str)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
+                        found_file = Some(name_str);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(old_filename) = found_file {
+            // Parse: everything before `--` is `AANNN-pX-status`, everything after is `slug.md`
+            if let Some(double_dash_pos) = old_filename.find("--") {
+                let before_dd = &old_filename[..double_dash_pos];
+                let after_dd = &old_filename[double_dash_pos..]; // includes "--slug.md"
+
+                // before_dd is like "0042-p1-in-progress" -- find the second '-' to locate status
+                // Split: first part is NNNN, second is pX, rest is status
+                let parts: Vec<&str> = before_dd.splitn(3, '-').collect();
+                if parts.len() == 3 {
+                    let new_filename = format!("{}-{}-wont-do{}", parts[0], parts[1], after_dd);
+                    let old_path = format!("tasks/{old_filename}");
+                    let new_path = format!("tasks/{new_filename}");
+
+                    if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
+                        tracing::warn!(
+                            error = %e,
+                            old = %old_path,
+                            new = %new_path,
+                            "Failed to git mv task file (non-fatal)"
+                        );
+                    } else if let Err(e) = run_git(
+                        &repo_root_clone,
+                        &["commit", "-m", &format!("task {task_id}: mark wont-do")],
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to commit task file rename (non-fatal)"
+                        );
+                        // Reset staged changes
+                        let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
+                    }
+                } else {
+                    tracing::warn!(
+                        filename = %old_filename,
+                        "Task filename does not match expected AANNN-pX-status--slug.md format"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    filename = %old_filename,
+                    "Task filename missing '--' separator"
+                );
+            }
+        } else {
+            tracing::warn!(
+                task_id = task_id,
+                "No task file found for task number (may have been manually deleted)"
+            );
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+
+    // 3. Update conversation state to Terminal
+    state
+        .db
+        .update_conversation_state(&id, &ConvState::Terminal)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 4. Update conv_mode to Explore
+    state
+        .db
+        .update_conversation_mode(&id, &ConvMode::Explore)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 5. Inject system message
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let msg = state
+        .db
+        .add_message(
+            &msg_id,
+            &id,
+            &MessageContent::system("Task abandoned. Worktree and branch deleted."),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 6. Broadcast SSE events so the frontend updates in real-time
+    if let Ok(handle) = state.runtime.get_or_create(&id).await {
+        let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
+        let _ = handle.broadcast_tx.send(SseEvent::StateChange {
+            state: ConvState::Terminal,
+            display_state: ConvState::Terminal.display_state().as_str().to_string(),
+        });
+        let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
+            update: crate::runtime::ConversationMetadataUpdate {
+                cwd: None,
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: Some("Explore".to_string()),
+                base_branch: None,
+                commits_behind: None,
+            },
+        });
+    }
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -1018,7 +1944,7 @@ async fn list_directory(
         .filter_map(Result::ok)
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
             DirectoryEntry { name, is_dir }
         })
         .collect();
@@ -1430,6 +2356,61 @@ async fn get_version() -> &'static str {
     concat!("phoenix-ide ", env!("CARGO_PKG_VERSION"))
 }
 
+/// Return status of all connected MCP servers.
+async fn mcp_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.mcp_manager.status().await)
+}
+
+/// Reload MCP server configurations: disconnect removed servers,
+/// connect newly added ones, leave existing ones untouched.
+async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
+    let result = state.mcp_manager.reload().await;
+    tracing::info!(
+        added = ?result.added,
+        removed = ?result.removed,
+        unchanged = result.unchanged.len(),
+        "MCP config reloaded"
+    );
+    Json(result)
+}
+
+/// Disable an MCP server: its tools are excluded from conversations.
+/// The server stays connected for instant re-enable.
+async fn disable_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = state.db.disable_mcp_server(&name).await {
+        tracing::warn!(server = %name, error = %e, "Failed to persist MCP server disable");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    state.mcp_manager.disable_server(&name).await;
+    tracing::info!(server = %name, "MCP server disabled");
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// Re-enable a previously disabled MCP server.
+async fn enable_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = state.db.enable_mcp_server(&name).await {
+        tracing::warn!(server = %name, error = %e, "Failed to persist MCP server enable");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    state.mcp_manager.enable_server(&name).await;
+    tracing::info!(server = %name, "MCP server enabled");
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
 // ============================================================
 // Slug Generation (REQ-API-002)
 // ============================================================
@@ -1515,6 +2496,8 @@ enum AppError {
     BadRequest(String),
     NotFound(String),
     Internal(String),
+    /// 409 — conflict (dirty worktree, merge conflicts, etc.)
+    Conflict(ConflictErrorResponse),
     /// 422 — expansion reference validation failure (REQ-IR-007)
     UnprocessableEntity(ExpansionErrorResponse),
 }
@@ -1533,6 +2516,7 @@ impl IntoResponse for AppError {
                 Json(ErrorResponse::new(msg)),
             )
                 .into_response(),
+            AppError::Conflict(detail) => (StatusCode::CONFLICT, Json(detail)).into_response(),
             AppError::UnprocessableEntity(detail) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, Json(detail)).into_response()
             }

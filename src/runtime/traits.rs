@@ -2,7 +2,7 @@
 //!
 //! These traits enable testing the executor with mock implementations.
 
-use crate::db::{Message, MessageContent, UsageData};
+use crate::db::{ConvMode, Message, MessageContent, UsageData};
 use crate::llm::{LlmError, LlmRequest, LlmResponse};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
@@ -58,6 +58,12 @@ pub trait StateStore: Send + Sync {
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
+
+    /// Update the conversation mode (e.g., Explore -> Work on task approval)
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
+
+    /// Update the conversation working directory (e.g., after worktree creation)
+    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String>;
 }
 
 /// Client for making LLM requests
@@ -92,7 +98,13 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput>;
 
     /// Get tool definitions for LLM
-    fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
+    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
+
+    /// Replace the tool set (e.g., Explore -> Work mode transition).
+    /// Default is a no-op for test doubles that don't need dynamic swapping.
+    fn upgrade_to_work_mode(&self) {
+        // No-op by default
+    }
 }
 
 /// Combined storage trait for convenience
@@ -156,6 +168,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
     }
+
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+        (**self).update_conversation_mode(conv_id, mode).await
+    }
+
+    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
+        (**self).update_conversation_cwd(conv_id, cwd).await
+    }
 }
 
 #[async_trait]
@@ -183,8 +203,12 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         (**self).execute(name, input, ctx).await
     }
 
-    fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
-        (**self).definitions()
+    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+        (**self).definitions().await
+    }
+
+    fn upgrade_to_work_mode(&self) {
+        (**self).upgrade_to_work_mode();
     }
 }
 
@@ -284,6 +308,20 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
     }
+
+    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+        self.db
+            .update_conversation_mode(conv_id, mode)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
+        self.db
+            .update_conversation_cwd(conv_id, cwd)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Adapter to use `ModelRegistry` as `LlmClient`
@@ -330,23 +368,129 @@ impl LlmClient for RegistryLlmClient {
 }
 
 /// Adapter to use `ToolRegistry` as `ToolExecutor`
+///
+/// Uses `RwLock` for interior mutability so the registry can be swapped
+/// at runtime (e.g., Explore -> Work mode transition after task approval).
 pub struct ToolRegistryExecutor {
-    registry: ToolRegistry,
+    registry: std::sync::RwLock<ToolRegistry>,
+    /// When set, MCP tools are resolved live from the manager on every
+    /// `definitions()` and `execute()` call instead of being snapshotted
+    /// into the registry. This means enable/disable and reload take effect
+    /// immediately across all conversations.
+    mcp_manager: Option<Arc<crate::tools::mcp::McpClientManager>>,
 }
 
 impl ToolRegistryExecutor {
-    pub fn new(registry: ToolRegistry) -> Self {
-        Self { registry }
+    /// Create an executor with built-in tools only (no MCP).
+    /// Used for sub-agents which have a restricted tool set.
+    pub fn builtin_only(registry: ToolRegistry) -> Self {
+        Self {
+            registry: std::sync::RwLock::new(registry),
+            mcp_manager: None,
+        }
+    }
+
+    /// Create an executor with built-in tools + live MCP tool resolution.
+    /// MCP tools are resolved from the manager on every `definitions()` and
+    /// `execute()` call, so enable/disable and reload take effect immediately.
+    pub fn with_mcp(
+        registry: ToolRegistry,
+        manager: Arc<crate::tools::mcp::McpClientManager>,
+    ) -> Self {
+        Self {
+            registry: std::sync::RwLock::new(registry),
+            mcp_manager: Some(manager),
+        }
+    }
+
+    /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
+    pub fn swap_registry(&self, new_registry: ToolRegistry) {
+        let mut guard = self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = new_registry;
     }
 }
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
-        self.registry.execute(name, input, ctx).await
+        // Look up the tool while holding the read lock, then drop the guard
+        // before the async .run() call (RwLockReadGuard is !Send).
+        let tool = {
+            let registry = self
+                .registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.find_tool(name)
+        };
+        if let Some(t) = tool {
+            return Some(t.run(input, ctx).await);
+        }
+
+        // Fall back to live MCP tool resolution.
+        if let Some(ref manager) = self.mcp_manager {
+            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, name).await
+            {
+                return Some(mcp_tool.run(input, ctx).await);
+            }
+        }
+
+        None
     }
 
-    fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
-        self.registry.definitions()
+    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+        let mut defs = {
+            let registry = self
+                .registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.definitions()
+        };
+
+        // Merge live MCP tool definitions (respects current disabled state).
+        // Built-in names are checked to prevent shadowing; MCP full names
+        // are also tracked to detect cross-server collisions.
+        if let Some(ref manager) = self.mcp_manager {
+            let mut seen_names: std::collections::HashSet<String> =
+                defs.iter().map(|d| d.name.clone()).collect();
+
+            for (server_name, tool_def) in manager.tool_definitions().await {
+                let full_name = format!("{server_name}__{}", tool_def.name);
+                if seen_names.contains(&full_name) {
+                    tracing::debug!(
+                        tool = %full_name,
+                        "MCP tool name conflicts with existing tool, skipping"
+                    );
+                    continue;
+                }
+                seen_names.insert(full_name.clone());
+                defs.push(crate::llm::ToolDefinition {
+                    name: full_name,
+                    description: tool_def.description,
+                    input_schema: tool_def.input_schema,
+                    defer_loading: true,
+                });
+            }
+        }
+
+        if defs.len() > 50 {
+            let deferred = defs.iter().filter(|d| d.defer_loading).count();
+            if deferred == 0 {
+                tracing::warn!(
+                    total = defs.len(),
+                    "Tool count exceeds 50 with no deferred tools -- accuracy may degrade. \
+                     Consider disabling unused MCP servers or using a model that supports tool search."
+                );
+            }
+        }
+
+        defs
+    }
+
+    fn upgrade_to_work_mode(&self) {
+        self.swap_registry(ToolRegistry::standalone());
+        tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
 }

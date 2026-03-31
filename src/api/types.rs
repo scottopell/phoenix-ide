@@ -236,6 +236,51 @@ pub struct ExpansionErrorResponse {
     pub reference: String,
 }
 
+/// Request to provide feedback on a proposed task plan
+#[derive(Debug, Deserialize)]
+pub struct TaskFeedbackRequest {
+    pub annotations: String,
+}
+
+/// Response for task approval actions
+#[derive(Debug, Serialize)]
+pub struct TaskApprovalResponse {
+    pub success: bool,
+    /// True when this was the first task created in the project (tasks/ didn't exist)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_task: Option<bool>,
+}
+
+/// Response for the complete-task pre-check endpoint (REQ-PROJ-009)
+#[derive(Debug, Serialize)]
+pub struct CompleteTaskResponse {
+    pub success: bool,
+    pub commit_message: String,
+    /// True when the task file exists but its status is not `done`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_not_done: Option<bool>,
+}
+
+/// Request body for confirm-complete endpoint (REQ-PROJ-009)
+#[derive(Debug, Deserialize)]
+pub struct ConfirmCompleteRequest {
+    pub commit_message: String,
+}
+
+/// Response for confirm-complete endpoint (REQ-PROJ-009)
+#[derive(Debug, Serialize)]
+pub struct ConfirmCompleteResponse {
+    pub success: bool,
+    pub commit_sha: String,
+}
+
+/// 409 Conflict error with typed `error_type` for frontend dispatch
+#[derive(Debug, Serialize)]
+pub struct ConflictErrorResponse {
+    pub error: String,
+    pub error_type: String,
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

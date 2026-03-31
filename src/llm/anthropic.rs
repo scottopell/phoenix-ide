@@ -25,7 +25,11 @@ struct StreamAccumulator {
     current_tool_id: String,
     current_tool_name: String,
     current_tool_json: String,
-    /// Set true when `message_stop` is received — signals outer loop to stop
+    /// True when the current tool block is a `server_tool_use` (not a regular `tool_use`).
+    current_is_server_tool: bool,
+    /// Raw JSON for server-handled blocks that arrive complete in `content_block_start`.
+    current_server_block: Option<serde_json::Value>,
+    /// Set true when `message_stop` is received -- signals outer loop to stop
     pub done: bool,
 }
 
@@ -44,6 +48,8 @@ impl StreamAccumulator {
             current_tool_id: String::new(),
             current_tool_name: String::new(),
             current_tool_json: String::new(),
+            current_is_server_tool: false,
+            current_server_block: None,
             done: false,
         }
     }
@@ -105,22 +111,76 @@ impl StreamAccumulator {
             .pointer("/content_block/type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("text");
-        self.current_index = Some(idx);
-        self.current_is_text = block_type == "text";
-        if self.current_is_text {
-            self.current_text.clear();
-        } else {
-            self.current_tool_id = v
-                .pointer("/content_block/id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.current_tool_name = v
-                .pointer("/content_block/name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.current_tool_json.clear();
+
+        match block_type {
+            "text" => {
+                self.current_index = Some(idx);
+                self.current_is_text = true;
+                self.current_text.clear();
+            }
+            "tool_use" => {
+                self.current_index = Some(idx);
+                self.current_is_text = false;
+                self.current_is_server_tool = false;
+                self.current_tool_id = v
+                    .pointer("/content_block/id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_name = v
+                    .pointer("/content_block/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_json.clear();
+            }
+            "server_tool_use" => {
+                // Server-side execution -- accumulate like tool_use for history.
+                self.current_index = Some(idx);
+                self.current_is_text = false;
+                self.current_is_server_tool = true;
+                self.current_tool_id = v
+                    .pointer("/content_block/id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_name = v
+                    .pointer("/content_block/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_json.clear();
+                let name = &self.current_tool_name;
+                tracing::debug!(name, "Streaming: server_tool_use block");
+            }
+            "tool_search_tool_result"
+            | "web_search_tool_result"
+            | "web_fetch_tool_result"
+            | "code_execution_tool_result"
+            | "bash_code_execution_tool_result"
+            | "text_editor_code_execution_tool_result"
+            | "mcp_tool_result" => {
+                // Server result blocks arrive complete -- capture the whole block.
+                if let Some(block) = v.get("content_block") {
+                    self.current_index = Some(idx);
+                    self.current_server_block = Some(block.clone());
+                    tracing::debug!(block_type, "Streaming: server result block captured");
+                }
+            }
+            "mcp_tool_use" => {
+                // MCP tool use blocks -- capture the whole block.
+                if let Some(block) = v.get("content_block") {
+                    self.current_index = Some(idx);
+                    self.current_server_block = Some(block.clone());
+                    tracing::debug!("Streaming: mcp_tool_use block captured");
+                }
+            }
+            other => {
+                tracing::warn!(
+                    block_type = other,
+                    "Streaming: unknown block type -- may need code update"
+                );
+            }
         }
     }
 
@@ -164,6 +224,17 @@ impl StreamAccumulator {
         let Some(idx) = self.current_index.take() else {
             return;
         };
+        // Server result/mcp blocks captured whole from content_block_start.
+        if let Some(block) = self.current_server_block.take() {
+            if let Ok(parsed) = serde_json::from_value::<AnthropicContentBlock>(block) {
+                self.content_blocks.push((idx, parsed));
+            } else {
+                tracing::warn!(
+                    "Failed to deserialize server block from streaming content_block_start"
+                );
+            }
+            return;
+        }
         if self.current_is_text {
             if !self.current_text.is_empty() {
                 self.content_blocks.push((
@@ -177,17 +248,24 @@ impl StreamAccumulator {
         } else if !self.current_tool_name.is_empty() {
             let input: serde_json::Value = serde_json::from_str(&self.current_tool_json)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-            self.content_blocks.push((
-                idx,
+            let block = if self.current_is_server_tool {
+                AnthropicContentBlock::ServerToolUse {
+                    id: self.current_tool_id.clone(),
+                    name: self.current_tool_name.clone(),
+                    input,
+                }
+            } else {
                 AnthropicContentBlock::ToolUse {
                     id: self.current_tool_id.clone(),
                     name: self.current_tool_name.clone(),
                     input,
-                },
-            ));
+                }
+            };
+            self.content_blocks.push((idx, block));
             self.current_tool_json.clear();
             self.current_tool_name.clear();
             self.current_tool_id.clear();
+            self.current_is_server_tool = false;
         }
     }
 
@@ -243,12 +321,14 @@ pub async fn complete_streaming(
 
     let base_url = resolve_anthropic_url(gateway, base_url_override);
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let mut anthropic_request = translate_request(&spec.api_name, request);
+    let mut anthropic_request = translate_request(spec, request);
     anthropic_request.stream = Some(true);
+
+    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
     let mut builder = client.post(&base_url);
     builder = match auth.style {
@@ -260,6 +340,10 @@ pub async fn complete_streaming(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
+    // Tool search requires the advanced-tool-use beta header.
+    if has_deferred {
+        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    }
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -328,11 +412,13 @@ pub async fn complete(
     let base_url = resolve_anthropic_url(gateway, base_url_override);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(5))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let anthropic_request = translate_request(&spec.api_name, request);
+    let anthropic_request = translate_request(spec, request);
+
+    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
     let mut builder = client.post(&base_url);
     builder = match auth.style {
@@ -344,6 +430,9 @@ pub async fn complete(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
+    if has_deferred {
+        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    }
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -378,7 +467,7 @@ pub async fn complete(
     normalize_response(anthropic_response)
 }
 
-fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicRequest {
+fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> AnthropicRequest {
     let system: Vec<AnthropicSystemBlock> = request
         .system
         .iter()
@@ -397,18 +486,31 @@ fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicReq
 
     let messages: Vec<AnthropicMessage> = request.messages.iter().map(translate_message).collect();
 
-    let tools: Vec<AnthropicTool> = request
+    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+
+    let mut tools: Vec<AnthropicToolEntry> = request
         .tools
         .iter()
-        .map(|t| AnthropicTool {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            input_schema: t.input_schema.clone(),
+        .map(|t| {
+            AnthropicToolEntry::Function(AnthropicFunctionTool {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+                defer_loading: if has_deferred { t.defer_loading } else { false },
+            })
         })
         .collect();
 
+    // Inject tool search tool when deferred tools exist
+    if has_deferred {
+        tools.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
+            r#type: TOOL_SEARCH_VARIANT.to_string(),
+            name: TOOL_SEARCH_NAME.to_string(),
+        }));
+    }
+
     AnthropicRequest {
-        model: model_api_name.to_string(),
+        model: spec.api_name.clone(),
         max_tokens: request.max_tokens.unwrap_or(16_384),
         system,
         messages,
@@ -417,6 +519,7 @@ fn translate_request(model_api_name: &str, request: &LlmRequest) -> AnthropicReq
     }
 }
 
+#[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
 pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
     let role = match msg.role {
         MessageRole::User => "user",
@@ -472,6 +575,76 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                     is_error: *is_error,
                 }
             }
+            // Server-handled blocks: round-trip back to their Anthropic wire types.
+            ContentBlock::ServerToolUse { id, name, input } => {
+                AnthropicContentBlock::ServerToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }
+            }
+            ContentBlock::ToolSearchToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::ToolSearchToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::WebSearchToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::WebFetchToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::WebFetchToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::CodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::CodeExecutionToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::BashCodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::BashCodeExecutionToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::TextEditorCodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::TextEditorCodeExecutionToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::McpToolUse {
+                id,
+                name,
+                server_name,
+                input,
+            } => AnthropicContentBlock::McpToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                server_name: server_name.clone(),
+                input: input.clone(),
+            },
+            ContentBlock::McpToolResult {
+                tool_use_id,
+                is_error,
+                content,
+            } => AnthropicContentBlock::McpToolResult {
+                tool_use_id: tool_use_id.clone(),
+                is_error: *is_error,
+                content: content.clone(),
+            },
         })
         .collect();
 
@@ -481,9 +654,9 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
     }
 }
 
+#[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
 pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
-    let raw_block_count = resp.content.len();
 
     for block in resp.content {
         match block {
@@ -505,38 +678,144 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
                     "Unexpected tool_result block in Anthropic response",
                 ));
             }
+            // Server-handled blocks: preserved in history for multi-turn correctness.
+            AnthropicContentBlock::ServerToolUse { id, name, input } => {
+                tracing::debug!(name = %name, "Server tool use in response");
+                content.push(ContentBlock::ServerToolUse { id, name, input });
+            }
+            AnthropicContentBlock::ToolSearchToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Tool search result in response");
+                content.push(ContentBlock::ToolSearchToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::WebSearchToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Web search tool result in response");
+                content.push(ContentBlock::WebSearchToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::WebFetchToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Web fetch tool result in response");
+                content.push(ContentBlock::WebFetchToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::CodeExecutionToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Code execution tool result in response");
+                content.push(ContentBlock::CodeExecutionToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::BashCodeExecutionToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Bash code execution tool result in response");
+                content.push(ContentBlock::BashCodeExecutionToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::TextEditorCodeExecutionToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Text editor code execution tool result in response");
+                content.push(ContentBlock::TextEditorCodeExecutionToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::McpToolUse {
+                id,
+                name,
+                server_name,
+                input,
+            } => {
+                tracing::debug!(name = %name, server = %server_name, "MCP tool use in response");
+                content.push(ContentBlock::McpToolUse {
+                    id,
+                    name,
+                    server_name,
+                    input,
+                });
+            }
+            AnthropicContentBlock::McpToolResult {
+                tool_use_id,
+                is_error,
+                content: c,
+            } => {
+                tracing::debug!("MCP tool result in response");
+                content.push(ContentBlock::McpToolResult {
+                    tool_use_id,
+                    is_error,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::Unknown => {
+                // Anthropic added a new block type we don't know about.
+                // Log loudly -- this needs a code update.
+                tracing::error!(
+                    "Unknown Anthropic content block type encountered. \
+                     This likely means a new server tool type was added to the API. \
+                     Update AnthropicContentBlock enum to handle it."
+                );
+            }
         }
     }
 
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
+    // Check if content has any client-actionable blocks. Server blocks
+    // (ServerToolUse, ToolSearchToolResult, etc.) are preserved in content
+    // for history fidelity but don't satisfy the "non-empty" guard -- a
+    // response with only server blocks and stop_reason="tool_use" would
+    // leave the state machine with nothing to execute.
+    let has_client_content = content.iter().any(|b| {
+        matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. })
+    });
+
+    // Empty content with end_turn is valid and documented Anthropic behavior:
+    // the model completed a tool call loop with nothing further to say.
+    // Let it through as content: [] -- the state machine handles this by
+    // transitioning to Idle without persisting an empty agent message.
+    //
+    // Empty content WITHOUT end_turn is genuinely unexpected.
+    if !has_client_content && !end_turn {
+        tracing::warn!(
+            stop_reason = ?resp.stop_reason,
+            output_tokens = resp.usage.output_tokens,
+            "Anthropic returned empty content without end_turn"
+        );
+        return Err(LlmError::invalid_response(format!(
+            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={})",
+            resp.stop_reason, resp.usage.output_tokens
+        )));
+    }
+
     if content.is_empty() {
-        if end_turn {
-            // Valid: model completed the tool call loop with nothing further to say.
-            // Common with concise models (e.g. haiku) after a simple tool result.
-            // Emit an empty text block so the SM receives a well-formed response
-            // and transitions to idle normally.
-            tracing::debug!(
-                stop_reason = ?resp.stop_reason,
-                output_tokens = resp.usage.output_tokens,
-                raw_block_count = raw_block_count,
-                "Anthropic end_turn with empty content — treating as successful completion"
-            );
-            content.push(ContentBlock::Text {
-                text: String::new(),
-            });
-        } else {
-            tracing::warn!(
-                stop_reason = ?resp.stop_reason,
-                output_tokens = resp.usage.output_tokens,
-                raw_block_count = raw_block_count,
-                "Anthropic returned empty content after normalization"
-            );
-            return Err(LlmError::invalid_response(format!(
-                "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={})",
-                resp.stop_reason, resp.usage.output_tokens, raw_block_count
-            )));
-        }
+        tracing::debug!(
+            stop_reason = ?resp.stop_reason,
+            output_tokens = resp.usage.output_tokens,
+            "Anthropic end_turn with empty content -- model has nothing to say"
+        );
     }
 
     Ok(LlmResponse {
@@ -560,7 +839,7 @@ struct AnthropicRequest {
     system: Vec<AnthropicSystemBlock>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<AnthropicTool>>,
+    tools: Option<Vec<AnthropicToolEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
 }
@@ -605,6 +884,53 @@ pub(crate) enum AnthropicContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// Server-side tool invocation (tool search, web search, code execution).
+    /// Handled by Anthropic -- Phoenix preserves these for multi-turn history.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: super::types::ToolSearchResultContent,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    BashCodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    TextEditorCodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: serde_json::Value,
+    },
+    McpToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        is_error: bool,
+        content: serde_json::Value,
+    },
+    /// Catch-all for truly unknown block types. Triggers a loud error in
+    /// `normalize_response` -- this means the API added something we need to handle.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -614,11 +940,29 @@ pub(crate) struct AnthropicImageSource {
     pub(crate) data: String,
 }
 
+const TOOL_SEARCH_VARIANT: &str = "tool_search_tool_regex_20251119";
+const TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+
 #[derive(Debug, Serialize)]
-struct AnthropicTool {
+#[serde(untagged)]
+enum AnthropicToolEntry {
+    Function(AnthropicFunctionTool),
+    ToolSearch(AnthropicToolSearchTool),
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicFunctionTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    defer_loading: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicToolSearchTool {
+    r#type: String,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -640,6 +984,109 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::models::{ApiFormat, ModelSpec, Provider};
+    use crate::llm::types::{LlmRequest, ToolDefinition};
+
+    fn test_spec(supports_tool_search: bool) -> ModelSpec {
+        ModelSpec {
+            id: "test-model".into(),
+            api_name: "test-model-api".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "test".into(),
+            context_window: 200_000,
+            recommended: false,
+            supports_tool_search,
+        }
+    }
+
+    fn test_request_with_tools() -> LlmRequest {
+        LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![
+                ToolDefinition {
+                    name: "bash".into(),
+                    description: "Run a bash command".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    defer_loading: false,
+                },
+                ToolDefinition {
+                    name: "mcp_tool".into(),
+                    description: "An MCP tool".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    defer_loading: true,
+                },
+            ],
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn test_tool_search_enabled_serialization() {
+        let spec = test_spec(true);
+        let request = test_request_with_tools();
+        let anthropic_req = translate_request(&spec, &request);
+
+        assert_eq!(anthropic_req.model, "test-model-api");
+
+        let json = serde_json::to_value(&anthropic_req).unwrap();
+        let tools = json["tools"].as_array().unwrap();
+
+        // 2 function tools + 1 tool_search entry
+        assert_eq!(tools.len(), 3);
+
+        // First tool: defer_loading=false -> field omitted
+        assert_eq!(tools[0]["name"], "bash");
+        assert!(
+            tools[0].get("defer_loading").is_none(),
+            "defer_loading should be omitted when false"
+        );
+
+        // Second tool: defer_loading=true -> field present
+        assert_eq!(tools[1]["name"], "mcp_tool");
+        assert_eq!(tools[1]["defer_loading"], true);
+
+        // Third entry: tool_search with versioned type and short name
+        assert_eq!(tools[2]["type"], TOOL_SEARCH_VARIANT);
+        assert_eq!(tools[2]["name"], TOOL_SEARCH_NAME);
+        // No extra fields beyond type and name
+        assert_eq!(
+            tools[2].as_object().unwrap().len(),
+            2,
+            "tool_search entry should only have type and name"
+        );
+    }
+
+    #[test]
+    fn test_tool_search_disabled_serialization() {
+        let spec = test_spec(false);
+        let request = test_request_with_tools();
+        let anthropic_req = translate_request(&spec, &request);
+
+        let json = serde_json::to_value(&anthropic_req).unwrap();
+        let tools = json["tools"].as_array().unwrap();
+
+        // No tool_search entry injected
+        assert_eq!(tools.len(), 2);
+
+        // Neither tool has defer_loading in JSON
+        for tool in tools {
+            assert!(
+                tool.get("defer_loading").is_none(),
+                "defer_loading should be omitted when tool search is disabled: {}",
+                tool
+            );
+        }
+
+        // No tool_search type present
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.get("type").and_then(|v| v.as_str()) == Some(TOOL_SEARCH_VARIANT)),
+            "tool_search entry should not be present when supports_tool_search is false"
+        );
+    }
 
     #[test]
     fn test_resolve_anthropic_url_override_takes_priority() {
@@ -666,6 +1113,126 @@ mod tests {
     fn test_resolve_anthropic_url_trailing_slash_stripped() {
         let url = resolve_anthropic_url(Some("http://gateway.local/"), None);
         assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
+    }
+
+    #[test]
+    fn test_normalize_response_with_server_tool_use() {
+        let resp = AnthropicResponse {
+            content: vec![
+                AnthropicContentBlock::Text {
+                    text: "Here is my analysis.".to_string(),
+                },
+                AnthropicContentBlock::ServerToolUse {
+                    id: "srvtoolu_abc123".to_string(),
+                    name: "tool_search".to_string(),
+                    input: serde_json::json!({"query": "bash"}),
+                },
+                AnthropicContentBlock::ToolUse {
+                    id: "toolu_xyz789".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = normalize_response(resp).unwrap();
+
+        // ServerToolUse is now PRESERVED -- Text, ServerToolUse, and ToolUse all come through
+        assert_eq!(result.content.len(), 3);
+        assert!(
+            matches!(&result.content[0], ContentBlock::Text { text } if text == "Here is my analysis.")
+        );
+        assert!(
+            matches!(&result.content[1], ContentBlock::ServerToolUse { id, name, .. } if id == "srvtoolu_abc123" && name == "tool_search")
+        );
+        assert!(
+            matches!(&result.content[2], ContentBlock::ToolUse { id, name, .. } if id == "toolu_xyz789" && name == "bash")
+        );
+    }
+
+    #[test]
+    fn test_normalize_response_known_server_blocks() {
+        // tool_search_tool_result now deserializes to a real variant
+        let json = r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {"type": "tool_search_tool_search_result", "tool_references": [{"type": "tool_reference", "tool_name": "bash"}]}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(block, AnthropicContentBlock::ToolSearchToolResult { tool_use_id, .. } if tool_use_id == "srvtoolu_123")
+        );
+
+        // web_search_tool_result also deserializes properly
+        let json2 =
+            r#"{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_456", "content": {}}"#;
+        let block2: AnthropicContentBlock = serde_json::from_str(json2).unwrap();
+        assert!(
+            matches!(block2, AnthropicContentBlock::WebSearchToolResult { tool_use_id, .. } if tool_use_id == "srvtoolu_456")
+        );
+
+        // Truly unknown types still fall through to Unknown
+        let json3 = r#"{"type": "some_future_block_type", "data": "whatever"}"#;
+        let block3: AnthropicContentBlock = serde_json::from_str(json3).unwrap();
+        assert!(matches!(block3, AnthropicContentBlock::Unknown));
+    }
+
+    #[test]
+    fn test_normalize_response_only_server_blocks_with_end_turn() {
+        let resp = AnthropicResponse {
+            content: vec![AnthropicContentBlock::ServerToolUse {
+                id: "srvtoolu_abc".to_string(),
+                name: "tool_search".to_string(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = normalize_response(resp).unwrap();
+
+        // Server blocks are now preserved in content
+        assert_eq!(result.content.len(), 1);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::ServerToolUse { name, .. } if name == "tool_search"
+        ));
+        assert!(result.end_turn);
+    }
+
+    #[test]
+    fn test_normalize_response_only_server_blocks_with_tool_use_stop_reason() {
+        // Edge case: response has only ServerToolUse blocks (no regular ToolUse)
+        // with stop_reason="tool_use". This should be rejected -- there's nothing
+        // for the client to execute, so the state machine would be stuck.
+        let resp = AnthropicResponse {
+            content: vec![AnthropicContentBlock::ServerToolUse {
+                id: "srvtoolu_abc".to_string(),
+                name: "tool_search".to_string(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = normalize_response(resp);
+        assert!(
+            result.is_err(),
+            "Response with only server blocks and stop_reason=tool_use should be rejected"
+        );
     }
 }
 

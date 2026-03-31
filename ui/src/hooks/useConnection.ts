@@ -43,7 +43,10 @@ function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
-  const conversation = raw.conversation;
+  // Merge top-level commits_behind into conversation (backend may send it at SSE init level)
+  const conversation = raw.commits_behind != null
+    ? { ...raw.conversation, commits_behind: raw.commits_behind }
+    : raw.conversation;
   const messages = raw.messages || [];
   const phase = parseConversationState(conversation?.state);
 
@@ -212,6 +215,20 @@ export function useConnection({
             dispatchRef.current({ type: 'sse_agent_done' });
           });
 
+          es.addEventListener('conversation_update', (e) => {
+            try {
+              const data = JSON.parse((e as MessageEvent).data) as { conversation?: Record<string, unknown> };
+              if (data.conversation) {
+                dispatchRef.current({
+                  type: 'sse_conversation_update',
+                  updates: data.conversation as Partial<import('../api').Conversation>,
+                });
+              }
+            } catch {
+              // Non-fatal — conversation metadata update can be retried on reconnect
+            }
+          });
+
           // Per-connection monotonic counter for sse_token dedup.
           // Reset on each new connection so the reducer's lastSequence check works correctly.
           let tokenSequence = 0;
@@ -233,7 +250,24 @@ export function useConnection({
             }
           });
 
-          es.addEventListener('error', () => {
+          es.addEventListener('error', (e) => {
+            // Backend application errors arrive as SSE event type "error" WITH data.
+            // Native EventSource connection errors fire with NO data.
+            const me = e as MessageEvent;
+            if (me.data) {
+              try {
+                const data = JSON.parse(me.data) as { message?: string };
+                if (data.message) {
+                  dispatchRef.current({
+                    type: 'sse_error',
+                    error: { type: 'BackendError', message: data.message },
+                  });
+                  return; // Don't treat as connection error
+                }
+              } catch {
+                // Parse failure — fall through to connection error handling
+              }
+            }
             dispatchMachineRef.current({ type: 'SSE_ERROR' });
             dispatchRef.current({ type: 'connection_state', state: 'reconnecting' });
           });

@@ -9,9 +9,21 @@ export interface Conversation {
   updated_at: string;
   message_count: number;
   state?: ConversationState;
-  /** Semantic state category from API: idle, working, error, terminal */
-  display_state?: 'idle' | 'working' | 'error' | 'terminal';
+  branch_name?: string | null;
+  worktree_path?: string | null;
+  base_branch?: string | null;
+  commits_behind?: number;
   archived?: boolean;
+  project_id?: string | null;
+  conv_mode_label?: string;
+}
+
+export interface Project {
+  id: string;
+  canonical_path: string;
+  main_ref: string;
+  created_at: string;
+  conversation_count: number;
 }
 
 export interface PendingSubAgent {
@@ -42,9 +54,23 @@ export type ConversationState =
   | { type: 'cancelling' }
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
+  | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'error'; message: string }
   | { type: 'terminal' };
+
+/** Derive the coarse display category from a conversation's state type.
+ *  Use this instead of reading `display_state` off the conversation object. */
+export function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
+  switch (stateType) {
+    case 'idle': return 'idle';
+    case 'terminal': return 'terminal';
+    case 'error': return 'error';
+    case 'context_exhausted': return 'terminal';
+    case 'awaiting_task_approval': return 'awaiting_approval';
+    default: return stateType ? 'working' : 'idle';
+  }
+}
 
 export interface ToolCall {
   id: string;
@@ -55,7 +81,7 @@ export interface Message {
   message_id: string;
   sequence_id: number;
   conversation_id: string;
-  message_type: 'user' | 'agent' | 'tool';
+  message_type: 'user' | 'agent' | 'tool' | 'system';
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown>; // For tool results with images (e.g., screenshots)
@@ -118,6 +144,8 @@ export interface SseInitData {
   /** Model's maximum context window in tokens */
   model_context_window?: number;
   breadcrumbs?: SseBreadcrumb[];
+  /** How many commits the base branch is ahead of the task branch (Work mode only) */
+  commits_behind?: number;
 }
 
 export interface SseMessageData {
@@ -130,7 +158,7 @@ export interface SseStateChangeData {
   display_state?: string;
 }
 
-export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'disconnected';
+export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'conversation_update' | 'disconnected';
 export type SseEventData = SseInitData | SseMessageData | SseStateChangeData | Record<string, never>;
 
 export interface ModelInfo {
@@ -187,7 +215,26 @@ export class ExpansionError extends Error {
   }
 }
 
+export interface McpServerStatus {
+  name: string;
+  tool_count: number;
+  tools: string[];
+  enabled: boolean;
+}
+
+export interface McpReloadResult {
+  added: string[];
+  removed: string[];
+  unchanged: string[];
+}
+
 export const api = {
+  async getProjects(): Promise<Project[]> {
+    const resp = await fetch('/api/projects');
+    if (!resp.ok) throw new Error('Failed to list projects');
+    return resp.json();
+  },
+
   async listConversations(): Promise<Conversation[]> {
     const resp = await fetch('/api/conversations');
     if (!resp.ok) throw new Error('Failed to list conversations');
@@ -374,6 +421,72 @@ export const api = {
     return resp.json();
   },
 
+  async completeTask(convId: string): Promise<{ success: boolean; commit_message: string; task_not_done?: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/complete-task`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to start completion'); }
+    return resp.json();
+  },
+
+  async confirmComplete(convId: string, commitMessage: string): Promise<{ success: boolean; commit_sha: string }> {
+    const resp = await fetch(`/api/conversations/${convId}/confirm-complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commit_message: commitMessage }),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to confirm completion'); }
+    return resp.json();
+  },
+
+  async abandonTask(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/abandon-task`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to abandon task'); }
+    return resp.json();
+  },
+
+  async approveTask(convId: string): Promise<{ success: boolean; first_task?: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/approve-task`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to approve task'); }
+    return resp.json();
+  },
+
+  async rejectTask(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/reject-task`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to reject task'); }
+    return resp.json();
+  },
+
+  async sendTaskFeedback(convId: string, annotations: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/task-feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ annotations }),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to send feedback'); }
+    return resp.json();
+  },
+
+  async getMcpStatus(): Promise<McpServerStatus[]> {
+    const resp = await fetch('/api/mcp/status');
+    if (!resp.ok) throw new Error('Failed to get MCP status');
+    return resp.json();
+  },
+
+  async reloadMcp(): Promise<McpReloadResult> {
+    const resp = await fetch('/api/mcp/reload', { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to reload MCP servers');
+    return resp.json();
+  },
+
+  async disableMcpServer(name: string): Promise<void> {
+    const resp = await fetch(`/api/mcp/servers/${encodeURIComponent(name)}/disable`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to disable MCP server');
+  },
+
+  async enableMcpServer(name: string): Promise<void> {
+    const resp = await fetch(`/api/mcp/servers/${encodeURIComponent(name)}/enable`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to enable MCP server');
+  },
+
   streamConversation(
     convId: string,
     onEvent: (eventType: SseEventType, data: SseEventData) => void
@@ -397,6 +510,11 @@ export const api = {
 
     es.addEventListener('agent_done', () => {
       onEvent('agent_done', {});
+    });
+
+    es.addEventListener('conversation_update', (e) => {
+      const data = JSON.parse((e as MessageEvent).data);
+      onEvent('conversation_update', data);
     });
 
     es.addEventListener('error', () => {

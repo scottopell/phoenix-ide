@@ -389,9 +389,7 @@ impl LlmConfig {
         let anthropic_oauth_token: Option<Arc<dyn CredentialSource>> = if std::env::var(
             "ANTHROPIC_OAUTH_TOKEN",
         )
-        .ok()
-        .filter(|t| !t.is_empty())
-        .is_some()
+        .is_ok_and(|t| !t.is_empty())
         {
             Some(Arc::new(EnvCredential::new("ANTHROPIC_OAUTH_TOKEN")))
         } else {
@@ -884,7 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_credential_caches() {
-        let cred = CommandCredential::new("echo cached-token", Duration::from_secs(3600));
+        let cred = CommandCredential::new("echo cached-token", Duration::from_hours(1));
         let t1 = cred.get().await;
         let t2 = cred.get().await;
         assert_eq!(t1, Some("cached-token".to_string()));
@@ -893,7 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_credential_invalidate() {
-        let cred = CommandCredential::new("echo fresh", Duration::from_secs(3600));
+        let cred = CommandCredential::new("echo fresh", Duration::from_hours(1));
         assert!(cred.get().await.is_some());
         cred.invalidate().await;
         assert!(cred.get().await.is_some()); // re-runs command
@@ -901,13 +899,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_credential_failed_command() {
-        let cred = CommandCredential::new("exit 1", Duration::from_secs(3600));
+        let cred = CommandCredential::new("exit 1", Duration::from_hours(1));
         assert!(cred.get().await.is_none());
     }
 
     #[tokio::test]
     async fn test_command_credential_empty_output() {
-        let cred = CommandCredential::new("true", Duration::from_secs(3600));
+        let cred = CommandCredential::new("true", Duration::from_hours(1));
         assert!(cred.get().await.is_none());
     }
 

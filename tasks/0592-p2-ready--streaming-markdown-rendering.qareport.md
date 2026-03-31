@@ -1,10 +1,8 @@
 ---
 created: 2026-03-04
-number: 592
 priority: p2
 status: done
-slug: streaming-markdown-rendering-qareport
-title: "QA Report: Streaming markdown rendering"
+artifact: completed
 ---
 
 # QA Report: Task 592 — Streaming Markdown Rendering

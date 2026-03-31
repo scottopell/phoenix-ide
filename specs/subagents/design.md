@@ -311,7 +311,7 @@ fn validate_sub_agent_mode(
         (ConvMode::Explore { .. }, SubAgentMode::Explore) => Ok(SubAgentMode::Explore),
         (ConvMode::Explore { .. }, SubAgentMode::Work) => Err(SpawnError::ModeNotAllowed {
             message: "Cannot spawn Work sub-agent from Explore mode. \
-                      Use create_task to propose work that requires write access.",
+                      Use propose_plan to propose work that requires write access.",
         }),
 
         // Work parent: both modes allowed.

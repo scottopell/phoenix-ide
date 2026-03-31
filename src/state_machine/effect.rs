@@ -130,6 +130,15 @@ pub enum Effect {
 
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
+
+    /// Execute git operations for task approval (REQ-BED-028).
+    /// The executor handles: assign task ID, write task file, commit to main,
+    /// create branch, checkout branch. Placeholder — executor implementation in later batch.
+    ApproveTask {
+        title: String,
+        priority: String,
+        plan: String,
+    },
 }
 
 impl Effect {

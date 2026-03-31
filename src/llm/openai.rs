@@ -41,7 +41,7 @@ pub async fn complete(
     let responses_request = translate_to_responses_request(&spec.api_name, request);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(5))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
@@ -232,7 +232,7 @@ pub async fn complete_streaming(
     responses_request.stream = Some(true);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_mins(10))
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
@@ -330,6 +330,20 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
                 ContentBlock::Image { source } => image_blocks.push(source),
                 ContentBlock::ToolUse { .. } => tool_calls.push(block),
                 ContentBlock::ToolResult { .. } => tool_results.push(block),
+                // Anthropic-specific server blocks -- no OpenAI equivalent; skip.
+                ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => {
+                    tracing::debug!(
+                        "Skipping Anthropic server block in OpenAI message translation"
+                    );
+                }
             }
         }
 

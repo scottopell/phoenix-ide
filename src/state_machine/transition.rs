@@ -14,7 +14,8 @@
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolOutcome};
 use super::state::{
-    AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, SubAgentResult, ToolCall,
+    AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, SubAgentResult,
+    TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
@@ -60,6 +61,10 @@ pub enum TransitionError {
     CancellationInProgress,
     #[error("Context window exhausted, please start a new conversation")]
     ContextExhausted,
+    #[error("Conversation is awaiting task approval")]
+    AwaitingTaskApproval,
+    #[error("Conversation has reached terminal state (completed or abandoned)")]
+    ConversationTerminal,
     #[error("Invalid transition: {0}")]
     InvalidTransition(String),
 }
@@ -108,6 +113,12 @@ pub fn transition(
             Event::UserMessage { .. },
         ) => Err(TransitionError::AgentBusy),
 
+        // AwaitingTaskApproval + UserMessage/UserTriggerContinuation -> Reject (REQ-BED-028)
+        (
+            ConvState::AwaitingTaskApproval { .. },
+            Event::UserMessage { .. } | Event::UserTriggerContinuation,
+        ) => Err(TransitionError::AwaitingTaskApproval),
+
         (
             ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. },
             Event::UserMessage { .. },
@@ -130,7 +141,51 @@ pub fn transition(
                 usage: usage_data,
             },
         ) => {
+            // REQ-BED-028: Intercept propose_plan BEFORE context exhaustion check.
+            // If the LLM proposes a plan at >90% context, we still want to surface it
+            // for approval rather than diverting to the continuation flow.
+            let propose_plan_tool = tool_calls
+                .iter()
+                .find(|t| matches!(t.input, ToolInput::ProposePlan(_)));
+            if let Some(tool) = propose_plan_tool {
+                if tool_calls.len() > 1 {
+                    return Err(TransitionError::InvalidTransition(
+                        "propose_plan must be the only tool in response".to_string(),
+                    ));
+                }
+                if let ToolInput::ProposePlan(ref input) = tool.input {
+                    let tool_result = ToolResult::success(
+                        tool.id.clone(),
+                        "Plan submitted for review".to_string(),
+                    );
+                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let assistant_message =
+                        AssistantMessage::new(content, Some(usage_data), display_data);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])
+                            .expect("propose_plan produces exactly one tool_use and one result");
+
+                    return Ok(TransitionResult::new(ConvState::AwaitingTaskApproval {
+                        title: input.title.clone(),
+                        priority: input.priority.clone(),
+                        plan: input.plan.clone(),
+                    })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change(
+                        "awaiting_task_approval",
+                        json!({
+                            "title": input.title,
+                            "priority": input.priority,
+                            "plan": input.plan
+                        }),
+                    )));
+                }
+                unreachable!("propose_plan_tool matched but input was not ProposePlan");
+            }
+
             // REQ-BED-019: Check context threshold BEFORE tool execution
+            // (but after propose_plan interception above)
             if should_trigger_continuation(&usage_data, context.context_window) {
                 return Ok(handle_context_exhaustion(
                     context, content, tool_calls, usage_data,
@@ -142,22 +197,35 @@ pub fn transition(
                 // Treat as implicit completion — the text IS the result.
                 use crate::state_machine::state::SubAgentOutcome;
                 let result_text = extract_text_from_content(&content);
-                Ok(TransitionResult::new(ConvState::Completed {
+                let mut tr = TransitionResult::new(ConvState::Completed {
                     result: result_text.clone(),
-                })
-                .with_effect(Effect::persist_agent_message(
-                    content,
-                    Some(usage_data),
-                    &context.working_dir,
-                ))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::NotifyParent {
-                    outcome: SubAgentOutcome::Success {
-                        result: result_text,
-                    },
-                }))
+                });
+                // Only persist the agent message if there's actual content
+                // (empty content = model had nothing to say, don't poison history)
+                if !content.is_empty() {
+                    tr = tr.with_effect(Effect::persist_agent_message(
+                        content,
+                        Some(usage_data),
+                        &context.working_dir,
+                    ));
+                }
+                Ok(tr
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::NotifyParent {
+                        outcome: SubAgentOutcome::Success {
+                            result: result_text,
+                        },
+                    }))
+            } else if tool_calls.is_empty() && content.is_empty() {
+                // Empty content, no tools — model had nothing to say (documented
+                // Anthropic behavior after tool results). Transition to Idle without
+                // persisting an empty agent message that would poison the history.
+                tracing::debug!("LLM returned end_turn with empty content — no message to persist");
+                Ok(TransitionResult::new(ConvState::Idle)
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_agent_done()))
             } else if tool_calls.is_empty() {
-                // No tools, just text response -> Idle
+                // No tools, text response -> Idle
                 Ok(TransitionResult::new(ConvState::Idle)
                     .with_effect(Effect::persist_agent_message(
                         content,
@@ -844,6 +912,90 @@ pub fn transition(
         }
 
         // ============================================================
+        // Task Approval (REQ-BED-028)
+        // ============================================================
+
+        // AwaitingTaskApproval + TaskApprovalResponse(Approved) -> Idle (Work mode)
+        (
+            ConvState::AwaitingTaskApproval {
+                title,
+                priority,
+                plan,
+            },
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Approved,
+            },
+        ) => Ok(TransitionResult::new(ConvState::Idle)
+            .with_effect(Effect::ApproveTask {
+                title: title.clone(),
+                priority: priority.clone(),
+                plan: plan.clone(),
+            })
+            // System message with branch name is emitted by the executor after
+            // git operations succeed (includes "You are on branch ...").
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_agent_done())),
+
+        // AwaitingTaskApproval + TaskApprovalResponse(FeedbackProvided) -> LlmRequesting
+        // The agent gets a new turn to revise the plan based on user feedback.
+        (
+            ConvState::AwaitingTaskApproval { .. },
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::FeedbackProvided { annotations },
+            },
+        ) => Ok(
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistMessage {
+                    content: crate::db::MessageContent::system(
+                        "Plan not approved. The user provided feedback below. \
+                         You must call propose_plan again with a revised plan \
+                         that addresses their feedback.",
+                    ),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistMessage {
+                    content: crate::db::MessageContent::user(annotations),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::RequestLlm),
+        ),
+
+        // AwaitingTaskApproval + TaskApprovalResponse(Rejected) -> Idle (Explore)
+        (
+            ConvState::AwaitingTaskApproval { .. },
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Rejected,
+            },
+        ) => Ok(TransitionResult::new(ConvState::Idle)
+            .with_effect(Effect::PersistMessage {
+                content: crate::db::MessageContent::system("Task rejected."),
+                display_data: None,
+                usage_data: None,
+                message_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_agent_done())),
+
+        // AwaitingTaskApproval + UserCancel -> treat as Rejected
+        (ConvState::AwaitingTaskApproval { .. }, Event::UserCancel) => {
+            Ok(TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistMessage {
+                    content: crate::db::MessageContent::system("Task rejected."),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()))
+        }
+
+        // ============================================================
         // Context Continuation (REQ-BED-019 through REQ-BED-024)
         // ============================================================
 
@@ -960,6 +1112,15 @@ pub fn transition(
         (state @ ConvState::ContextExhausted { .. }, _event) => {
             // Log but don't error - terminal states ignore events
             Ok(TransitionResult::new(state.clone()))
+        }
+
+        // Terminal rejects ALL events (REQ-BED-029)
+        (ConvState::Terminal, Event::UserMessage { .. }) => {
+            Err(TransitionError::ConversationTerminal)
+        }
+        (ConvState::Terminal, _event) => {
+            // Non-user events are silently absorbed (no error, no state change)
+            Ok(TransitionResult::new(ConvState::Terminal))
         }
 
         // UserTriggerContinuation from Idle (REQ-BED-023)

@@ -43,7 +43,9 @@ export type SSEAction =
   | { type: 'sse_state_change'; phase: ConversationState; sequenceId?: number }
   | { type: 'sse_agent_done'; sequenceId?: number }
   | { type: 'sse_token'; delta: string; sequence: number }
+  | { type: 'sse_conversation_update'; updates: Partial<Conversation> }
   | { type: 'sse_error'; error: UIError }
+  | { type: 'clear_error' }
   | { type: 'connection_state'; state: ConversationAtom['connectionState'] }
   | {
       type: 'set_initial_data';
@@ -314,6 +316,9 @@ export function conversationReducer(
     case 'sse_error':
       return { ...atom, uiError: action.error };
 
+    case 'clear_error':
+      return { ...atom, uiError: null };
+
     case 'connection_state':
       return { ...atom, connectionState: action.state };
 
@@ -327,6 +332,14 @@ export function conversationReducer(
         messages: action.messages,
         phase: action.phase,
         contextWindow: action.contextWindow,
+      };
+
+    case 'sse_conversation_update':
+      // Merge updated fields into the existing conversation object
+      if (!atom.conversation) return atom;
+      return {
+        ...atom,
+        conversation: { ...atom.conversation, ...action.updates },
       };
 
     case 'set_system_prompt':

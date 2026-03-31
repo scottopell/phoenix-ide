@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, ExpansionError, type Conversation, type ImageData } from '../api';
-import { isAgentWorking, isCancellingState } from '../utils';
+import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
@@ -9,11 +9,14 @@ import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { ProseReader } from '../components/ProseReader';
+import { TaskApprovalReader } from '../components/TaskApprovalReader';
+import { FirstTaskWelcome } from '../components/FirstTaskWelcome';
 import { useMessageQueue, useConnection } from '../hooks';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
+import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom } from '../conversation';
 
 export function ConversationPage() {
@@ -56,6 +59,10 @@ export function ConversationPage() {
 
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
+
+  // Task approval overlay
+  const [showTaskApproval, setShowTaskApproval] = useState(false);
+  const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // Message queue management
   const { queuedMessages, enqueue, markSent, markFailed, retry } =
@@ -105,7 +112,7 @@ export function ConversationPage() {
             conversationId: cached.id,
             conversation: cached,
             messages: cachedMessages,
-            phase: { type: 'idle' },
+            phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
             contextWindow: { used: 0, total: 200_000 },
           });
         }
@@ -120,8 +127,9 @@ export function ConversationPage() {
                 conversationId: result.conversation.id,
                 conversation: result.conversation,
                 messages: result.messages,
-                phase:
-                  result.display_state === 'working'
+                phase: result.conversation.state
+                  ? parseConversationState(result.conversation.state)
+                  : result.display_state === 'working'
                     ? { type: 'awaiting_llm' }
                     : { type: 'idle' },
                 contextWindow: {
@@ -185,6 +193,15 @@ export function ConversationPage() {
       .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp }))
       .catch((err) => console.warn('Failed to load system prompt:', err));
   }, [conversationId, dispatch]);
+
+  // Auto-open/close task approval overlay on state transitions
+  useEffect(() => {
+    if (atom.phase.type === 'awaiting_task_approval') {
+      setShowTaskApproval(true);
+    } else {
+      setShowTaskApproval(false);
+    }
+  }, [atom.phase.type]);
 
   // Cache new messages as they arrive via SSE
   const cachedMsgCountRef = useRef(0);
@@ -324,6 +341,36 @@ export function ConversationPage() {
     }
   };
 
+  const handleApproveTask = async () => {
+    if (!conversationId) return;
+    try {
+      const result = await api.approveTask(conversationId);
+      if (result.first_task) {
+        setShowFirstTaskWelcome(true);
+      }
+    } catch (err) {
+      console.error('Failed to approve task:', err);
+    }
+  };
+
+  const handleRejectTask = async () => {
+    if (!conversationId) return;
+    try {
+      await api.rejectTask(conversationId);
+    } catch (err) {
+      console.error('Failed to reject task:', err);
+    }
+  };
+
+  const handleTaskFeedback = async (annotations: string) => {
+    if (!conversationId) return;
+    try {
+      await api.sendTaskFeedback(conversationId, annotations);
+    } catch (err) {
+      console.error('Failed to send task feedback:', err);
+    }
+  };
+
   const handleOpenFileBrowser = useCallback(() => {
     setShowFileBrowser(true);
   }, []);
@@ -459,6 +506,16 @@ export function ConversationPage() {
           systemPrompt: atom.systemPrompt,
         })}
       />
+      {atom.uiError && (
+        <div className="sse-error-toast" role="alert">
+          <span className="sse-error-text">
+            {atom.uiError.type === 'BackendError' ? atom.uiError.message : 'Connection error'}
+          </span>
+          <button className="sse-error-dismiss" onClick={() => dispatch({ type: 'clear_error' })}>
+            Dismiss
+          </button>
+        </div>
+      )}
       {convStateForChildren.type === 'context_exhausted' && (
         <div className="context-exhausted-banner">
           <div className="context-exhausted-header">
@@ -494,7 +551,17 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' ? (
+      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
+        <>
+        {conversationId && (
+          <WorkActions
+            conversationId={conversationId}
+            convModeLabel={conversation.conv_mode_label}
+            phaseType={convStateForChildren.type}
+            branchName={conversation.branch_name ?? undefined}
+            baseBranch={conversation.base_branch}
+          />
+        )}
         <InputArea
           ref={inputRef}
           conversationId={conversationId}
@@ -508,6 +575,7 @@ export function ConversationPage() {
           onRetry={handleRetry}
           onOpenFileBrowser={handleOpenFileBrowser}
         />
+        </>
       ) : null}
       <BreadcrumbBar breadcrumbs={atom.breadcrumbs} visible={atom.breadcrumbs.length > 0} />
       <StateBar
@@ -520,6 +588,24 @@ export function ConversationPage() {
         modelContextWindow={atom.contextWindow.total}
         onRetryNow={connectionInfo.retryNow}
         onTriggerContinuation={handleTriggerContinuation}
+      />
+
+      {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
+      {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
+        <TaskApprovalReader
+          title={atom.phase.title}
+          priority={atom.phase.priority}
+          plan={atom.phase.plan}
+          onApprove={handleApproveTask}
+          onReject={handleRejectTask}
+          onSendFeedback={handleTaskFeedback}
+        />
+      )}
+
+      {/* First task welcome modal */}
+      <FirstTaskWelcome
+        visible={showFirstTaskWelcome}
+        onClose={() => setShowFirstTaskWelcome(false)}
       />
 
       {/* Mobile file browser overlay */}

@@ -99,6 +99,7 @@ impl MockToolExecutor {
             name: name.clone(),
             description: format!("Mock {name}"),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            defer_loading: false,
         });
         self.outputs.insert(name, output);
         self
@@ -126,7 +127,7 @@ impl ToolExecutor for MockToolExecutor {
         self.outputs.get(name).cloned()
     }
 
-    fn definitions(&self) -> Vec<ToolDefinition> {
+    async fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
     }
 }
@@ -227,8 +228,8 @@ impl ToolExecutor for DelayedMockToolExecutor {
         }
     }
 
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        self.inner.definitions()
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions().await
     }
 }
 
@@ -386,6 +387,20 @@ impl StateStore for InMemoryStorage {
             .cloned()
             .unwrap_or_default())
     }
+
+    async fn update_conversation_mode(
+        &self,
+        _conv_id: &str,
+        _mode: &crate::db::ConvMode,
+    ) -> Result<(), String> {
+        // In-memory storage doesn't track conv_mode separately
+        Ok(())
+    }
+
+    async fn update_conversation_cwd(&self, _conv_id: &str, _cwd: &str) -> Result<(), String> {
+        // In-memory storage doesn't track cwd separately
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -409,6 +424,7 @@ pub struct TestRuntime<L: LlmClient + 'static, T: ToolExecutor + 'static> {
 
 impl TestRuntime<MockLlmClient, MockToolExecutor> {
     /// Create a simple test runtime with instant mocks
+    #[allow(clippy::new_ret_no_self)]
     pub fn new() -> TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         TestRuntimeBuilder::new()
     }
@@ -518,10 +534,10 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub async fn wait_for_done(&mut self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::AgentDone)) => return true,
-                Ok(Ok(_)) => continue,
-                _ => continue,
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await
+            {
+                return true;
             }
         }
         false
@@ -531,16 +547,16 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub async fn wait_for_state(&mut self, expected_type: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::StateChange { state, .. })) => {
-                    if let Some(state_type) = state.get("type").and_then(|v| v.as_str()) {
+            if let Ok(Ok(SseEvent::StateChange { state, .. })) =
+                tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await
+            {
+                if let Ok(val) = serde_json::to_value(&state) {
+                    if let Some(state_type) = val.get("type").and_then(|v| v.as_str()) {
                         if state_type == expected_type {
                             return true;
                         }
                     }
                 }
-                Ok(Ok(_)) => continue,
-                _ => continue,
             }
         }
         false
@@ -792,12 +808,12 @@ mod tests {
                     break;
                 }
                 Ok(Ok(SseEvent::StateChange { state, .. })) => {
-                    if state.get("type").and_then(|v| v.as_str()) == Some("idle") {
+                    if matches!(state, crate::state_machine::ConvState::Idle) {
                         done = true;
                         break;
                     }
                 }
-                _ => continue,
+                _ => {}
             }
         }
 
@@ -896,12 +912,11 @@ mod tests {
         let mut done = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::AgentDone)) => {
-                    done = true;
-                    break;
-                }
-                _ => continue,
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                done = true;
+                break;
             }
         }
 
@@ -994,12 +1009,11 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(10), broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::AgentDone)) => {
-                    agent_done = true;
-                    break;
-                }
-                _ => continue,
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(10), broadcast_rx.recv()).await
+            {
+                agent_done = true;
+                break;
             }
         }
 
@@ -1489,12 +1503,11 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::AgentDone)) => {
-                    agent_done = true;
-                    break;
-                }
-                _ => continue,
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                agent_done = true;
+                break;
             }
         }
 
