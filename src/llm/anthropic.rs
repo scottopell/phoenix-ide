@@ -788,9 +788,9 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
     // for history fidelity but don't satisfy the "non-empty" guard -- a
     // response with only server blocks and stop_reason="tool_use" would
     // leave the state machine with nothing to execute.
-    let has_client_content = content.iter().any(|b| {
-        matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. })
-    });
+    let has_client_content = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. }));
 
     // Empty content with end_turn is valid and documented Anthropic behavior:
     // the model completed a tool call loop with nothing further to say.

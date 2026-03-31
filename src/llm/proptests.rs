@@ -496,20 +496,22 @@ fn arb_tool_search_tool_result() -> impl Strategy<Value = ContentBlock> {
         "srvtoolu_[a-z0-9]{5,15}",
         proptest::collection::vec("[a-z_]{3,20}", 0..5),
     )
-        .prop_map(|(tool_use_id, tool_names)| ContentBlock::ToolSearchToolResult {
-            tool_use_id,
-            content: ToolSearchResultContent {
-                r#type: "tool_search_tool_search_result".into(),
-                tool_references: tool_names
-                    .into_iter()
-                    .map(|n| ToolReference {
-                        r#type: "tool_reference".into(),
-                        tool_name: n,
-                    })
-                    .collect(),
-                error_code: None,
+        .prop_map(
+            |(tool_use_id, tool_names)| ContentBlock::ToolSearchToolResult {
+                tool_use_id,
+                content: ToolSearchResultContent {
+                    r#type: "tool_search_tool_search_result".into(),
+                    tool_references: tool_names
+                        .into_iter()
+                        .map(|n| ToolReference {
+                            r#type: "tool_reference".into(),
+                            tool_name: n,
+                        })
+                        .collect(),
+                    error_code: None,
+                },
             },
-        })
+        )
 }
 
 fn arb_opaque_server_result() -> impl Strategy<Value = ContentBlock> {
