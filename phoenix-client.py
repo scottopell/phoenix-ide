@@ -75,7 +75,7 @@ class PhoenixClient:
         """Get conversation by ID or slug."""
         # Try as slug first
         try:
-            resp = self.http.get(f"{self.base_url}/api/conversation-by-slug/{id_or_slug}")
+            resp = self.http.get(f"{self.base_url}/api/conversations/by-slug/{id_or_slug}")
             if resp.status_code == 200:
                 return resp.json()['conversation']
         except Exception:
