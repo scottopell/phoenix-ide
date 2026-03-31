@@ -503,9 +503,12 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     // Inject tool search tool when deferred tools exist
     if has_deferred {
+        let mut variant_config = std::collections::HashMap::new();
+        variant_config.insert(TOOL_SEARCH_VARIANT.to_string(), serde_json::json!({}));
         tools.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
             r#type: TOOL_SEARCH_VARIANT.to_string(),
-            name: TOOL_SEARCH_VARIANT.to_string(),
+            name: TOOL_SEARCH_NAME.to_string(),
+            variant: variant_config,
         }));
     }
 
@@ -951,6 +954,7 @@ pub(crate) struct AnthropicImageSource {
 }
 
 const TOOL_SEARCH_VARIANT: &str = "tool_search_tool_regex_20251119";
+const TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -972,6 +976,10 @@ struct AnthropicFunctionTool {
 struct AnthropicToolSearchTool {
     r#type: String,
     name: String,
+    /// The variant-specific config object. Key is the versioned variant name
+    /// (e.g., `tool_search_tool_regex_20251119`), value is an empty object.
+    #[serde(flatten)]
+    variant: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1056,9 +1064,13 @@ mod tests {
         assert_eq!(tools[1]["name"], "mcp_tool");
         assert_eq!(tools[1]["defer_loading"], true);
 
-        // Third entry: tool_search with full versioned type
+        // Third entry: tool_search with versioned type and short name
         assert_eq!(tools[2]["type"], TOOL_SEARCH_VARIANT);
-        assert_eq!(tools[2]["name"], TOOL_SEARCH_VARIANT);
+        assert_eq!(tools[2]["name"], TOOL_SEARCH_NAME);
+        assert!(
+            tools[2].get(TOOL_SEARCH_VARIANT).is_some(),
+            "tool_search entry must contain the variant config object"
+        );
     }
 
     #[test]
