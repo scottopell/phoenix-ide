@@ -503,12 +503,9 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     // Inject tool search tool when deferred tools exist
     if has_deferred {
-        let mut variant_map = std::collections::HashMap::new();
-        variant_map.insert(TOOL_SEARCH_VARIANT.to_string(), serde_json::json!({}));
         tools.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
-            r#type: "tool_search".to_string(),
-            name: "tool_search".to_string(),
-            variant: variant_map,
+            r#type: TOOL_SEARCH_VARIANT.to_string(),
+            name: TOOL_SEARCH_VARIANT.to_string(),
         }));
     }
 
@@ -975,8 +972,6 @@ struct AnthropicFunctionTool {
 struct AnthropicToolSearchTool {
     r#type: String,
     name: String,
-    #[serde(flatten)]
-    variant: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1061,13 +1056,9 @@ mod tests {
         assert_eq!(tools[1]["name"], "mcp_tool");
         assert_eq!(tools[1]["defer_loading"], true);
 
-        // Third entry: tool_search
-        assert_eq!(tools[2]["type"], "tool_search");
-        assert_eq!(tools[2]["name"], "tool_search");
-        assert!(
-            tools[2].get(TOOL_SEARCH_VARIANT).is_some(),
-            "tool_search entry must contain the variant key"
-        );
+        // Third entry: tool_search with full versioned type
+        assert_eq!(tools[2]["type"], TOOL_SEARCH_VARIANT);
+        assert_eq!(tools[2]["name"], TOOL_SEARCH_VARIANT);
     }
 
     #[test]
@@ -1095,7 +1086,7 @@ mod tests {
         assert!(
             !tools
                 .iter()
-                .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("tool_search")),
+                .any(|t| t.get("type").and_then(|v| v.as_str()) == Some(TOOL_SEARCH_VARIANT)),
             "tool_search entry should not be present when supports_tool_search is false"
         );
     }
