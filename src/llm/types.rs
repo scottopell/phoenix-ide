@@ -81,7 +81,6 @@ pub enum ContentBlock {
     // tool search discovers deferred tools on turn N; turn N+1 needs the
     // server_tool_use + tool_search_tool_result blocks in history or the
     // API returns 400).
-
     /// Server-side tool invocation (tool search, web search, code execution).
     ServerToolUse {
         id: String,

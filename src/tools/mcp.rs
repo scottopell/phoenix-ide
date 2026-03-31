@@ -377,7 +377,10 @@ impl McpServer {
 
                 // Handle server-initiated notifications (no "id" field).
                 if parsed.get("id").is_none() {
-                    let notif_method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let notif_method = parsed
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     if notif_method == "notifications/tools/list_changed" {
                         tracing::info!(
                             server = %self.name,

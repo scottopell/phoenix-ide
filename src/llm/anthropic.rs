@@ -153,9 +153,13 @@ impl StreamAccumulator {
                 let name = &self.current_tool_name;
                 tracing::debug!(name, "Streaming: server_tool_use block");
             }
-            "tool_search_tool_result" | "web_search_tool_result" | "web_fetch_tool_result"
-            | "code_execution_tool_result" | "bash_code_execution_tool_result"
-            | "text_editor_code_execution_tool_result" | "mcp_tool_result" => {
+            "tool_search_tool_result"
+            | "web_search_tool_result"
+            | "web_fetch_tool_result"
+            | "code_execution_tool_result"
+            | "bash_code_execution_tool_result"
+            | "text_editor_code_execution_tool_result"
+            | "mcp_tool_result" => {
                 // Server result blocks arrive complete -- capture the whole block.
                 if let Some(block) = v.get("content_block") {
                     self.current_index = Some(idx);
@@ -324,8 +328,7 @@ pub async fn complete_streaming(
     let mut anthropic_request = translate_request(spec, request);
     anthropic_request.stream = Some(true);
 
-    let has_deferred =
-        spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
     let mut builder = client.post(&base_url);
     builder = match auth.style {
@@ -415,8 +418,7 @@ pub async fn complete(
 
     let anthropic_request = translate_request(spec, request);
 
-    let has_deferred =
-        spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
     let mut builder = client.post(&base_url);
     builder = match auth.style {
@@ -1185,8 +1187,7 @@ mod tests {
         );
 
         // Truly unknown types still fall through to Unknown
-        let json3 =
-            r#"{"type": "some_future_block_type", "data": "whatever"}"#;
+        let json3 = r#"{"type": "some_future_block_type", "data": "whatever"}"#;
         let block3: AnthropicContentBlock = serde_json::from_str(json3).unwrap();
         assert!(matches!(block3, AnthropicContentBlock::Unknown));
     }
