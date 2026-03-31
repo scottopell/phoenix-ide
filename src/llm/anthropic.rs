@@ -271,6 +271,9 @@ pub async fn complete_streaming(
     let mut anthropic_request = translate_request(spec, request);
     anthropic_request.stream = Some(true);
 
+    let has_deferred =
+        spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+
     let mut builder = client.post(&base_url);
     builder = match auth.style {
         super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
@@ -281,6 +284,10 @@ pub async fn complete_streaming(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
+    // Tool search requires the advanced-tool-use beta header.
+    if has_deferred {
+        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    }
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -355,6 +362,9 @@ pub async fn complete(
 
     let anthropic_request = translate_request(spec, request);
 
+    let has_deferred =
+        spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+
     let mut builder = client.post(&base_url);
     builder = match auth.style {
         super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
@@ -365,6 +375,9 @@ pub async fn complete(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
+    if has_deferred {
+        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    }
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -544,6 +557,14 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
                 ));
             }
             AnthropicContentBlock::ServerToolUse { name, .. } => {
+                // Server-side tool execution (tool search, web search, etc.).
+                // These blocks are resolved by the API before we see them.
+                //
+                // OPEN QUESTION: Do these need to be preserved in conversation
+                // history for multi-turn? If the API requires them to re-expand
+                // deferred tool definitions on subsequent turns, stripping them
+                // would break multi-turn tool search. Needs empirical testing.
+                // See YF616 Step 2.
                 tracing::debug!(name = %name, "Server tool use in response (handled by API)");
                 server_handled_count += 1;
             }
