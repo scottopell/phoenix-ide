@@ -782,7 +782,10 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
             .take_while(|&(i, _)| i < max_len - 1)
             .last()
             .map_or(0, |(i, c)| i + c.len_utf8());
-        format!("{}…", &trimmed[..end])
+        // Safety: `end` is computed from `char_indices()` on `trimmed`
+        #[allow(clippy::string_slice)]
+        let prefix = &trimmed[..end];
+        format!("{prefix}…")
     }
 }
 
@@ -1556,7 +1559,9 @@ fn extract_frontmatter(content: &str) -> Option<&str> {
     if !content.starts_with("---") {
         return None;
     }
-    let rest = &content[3..];
+    let rest = content.strip_prefix("---")?;
+    // Safety: `end` is from `find()` on `rest`
+    #[allow(clippy::string_slice)]
     rest.find("---").map(|end| &rest[..end])
 }
 
@@ -1684,7 +1689,10 @@ async fn abandon_task(
         if let Some(old_filename) = found_file {
             // Parse: everything before `--` is `AANNN-pX-status`, everything after is `slug.md`
             if let Some(double_dash_pos) = old_filename.find("--") {
+                // Safety: `double_dash_pos` is from `find()` on `old_filename`
+                #[allow(clippy::string_slice)]
                 let before_dd = &old_filename[..double_dash_pos];
+                #[allow(clippy::string_slice)]
                 let after_dd = &old_filename[double_dash_pos..]; // includes "--slug.md"
 
                 // before_dd is like "0042-p1-in-progress" -- find the second '-' to locate status

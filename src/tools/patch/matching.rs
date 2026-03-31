@@ -77,6 +77,9 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<EditSpec> {
     let without_first = lines[1..].join("\n");
     if let Some(mut spec) = find_exact_unique(content, &without_first) {
         if spec.offset > 0 {
+            // Safety: `spec.offset` is from `find_exact_unique()` which returns byte
+            // offsets found via `str::find()` on `content`
+            #[allow(clippy::string_slice)]
             let before = &content[..spec.offset];
             let first_line_with_newline = format!("{}\n", lines[0]);
             if before.ends_with(&first_line_with_newline) {
@@ -100,6 +103,9 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<EditSpec> {
 /// Get leading whitespace from a string
 pub fn leading_whitespace(s: &str) -> &str {
     let trimmed = s.trim_start();
+    // Safety: `s.len() - trimmed.len()` is the byte length of leading whitespace,
+    // which is a valid boundary since `trim_start()` splits at a char boundary
+    #[allow(clippy::string_slice)]
     &s[..s.len() - trimmed.len()]
 }
 

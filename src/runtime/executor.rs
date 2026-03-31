@@ -1478,8 +1478,14 @@ fn derive_slug(title: &str) -> String {
         .join("-");
     let truncated = if slug.len() > 40 {
         // Truncate at last hyphen within 40 chars to avoid cutting mid-word
+        // Safety: `slug` is built from ASCII alphanumeric chars and hyphens only,
+        // so byte offset 40 is always a valid char boundary. `rfind` returns a
+        // valid byte offset within the same slice.
+        #[allow(clippy::string_slice)]
         let s = &slug[..40];
-        s.rfind('-').map_or(s, |i| &s[..i]).to_string()
+        #[allow(clippy::string_slice)]
+        let truncated_inner = s.rfind('-').map_or(s, |i| &s[..i]);
+        truncated_inner.to_string()
     } else {
         slug
     };

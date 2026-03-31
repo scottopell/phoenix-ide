@@ -292,8 +292,10 @@ impl Database {
                 Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
                     attempts += 1;
                     if attempts >= 10 {
-                        // Last resort: full UUID fragment
-                        actual_slug = format!("{slug}-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+                        // Last resort: full UUID fragment (UUIDs are ASCII, first 8 bytes always valid)
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        actual_slug =
+                            format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
                     } else {
                         actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
                     }

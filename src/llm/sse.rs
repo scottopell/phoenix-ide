@@ -155,7 +155,7 @@ impl SseParser {
             let truncated = if display.len() > 500 {
                 format!(
                     "{}...[truncated, {} bytes total]",
-                    &display[..500],
+                    display.get(..500).unwrap_or(&display),
                     chunk.len()
                 )
             } else {

@@ -27,7 +27,7 @@ pub async fn generate_title(
 ) -> Option<String> {
     // Truncate very long messages for the prompt
     let truncated = if message_text.len() > 500 {
-        format!("{}...", &message_text[..500])
+        format!("{}...", message_text.get(..500).unwrap_or(message_text))
     } else {
         message_text.to_string()
     };
@@ -96,7 +96,11 @@ fn sanitize_title(title: &str) -> String {
     // Truncate if too long
     if kebab.len() > MAX_TITLE_LENGTH {
         // Try to cut at a word boundary
+        // Safety: `kebab` is ASCII (alphanumeric + hyphens only from the sanitization above),
+        // so `MAX_TITLE_LENGTH` is always a valid char boundary. `rfind` returns valid offset.
+        #[allow(clippy::string_slice)]
         let truncated = &kebab[..MAX_TITLE_LENGTH];
+        #[allow(clippy::string_slice)]
         if let Some(last_dash) = truncated.rfind('-') {
             truncated[..last_dash].to_string()
         } else {

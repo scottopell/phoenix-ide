@@ -256,7 +256,7 @@ impl RuntimeManager {
         );
 
         // 1. Create conversation in DB
-        let slug = format!("sub-{}", &spec.agent_id[..8]);
+        let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
             .db
             .create_conversation(

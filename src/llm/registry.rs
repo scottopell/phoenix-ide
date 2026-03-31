@@ -467,6 +467,8 @@ fn derive_models_url(base_url: &str) -> Option<String> {
     // Strip query string if present (e.g. "https://host/v1/messages?foo=bar")
     let path = base_url.split('?').next().unwrap_or(base_url);
     let last_slash = path.rfind('/')?;
+    // Safety: `last_slash` is from `rfind('/')` on `path`
+    #[allow(clippy::string_slice)]
     Some(format!("{}models", &path[..=last_slash]))
 }
 

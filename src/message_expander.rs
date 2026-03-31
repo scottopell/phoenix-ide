@@ -94,6 +94,10 @@ fn extract_at_references(text: &str) -> Vec<String> {
         // Collect the token after `@`
         let start = i + 1;
         let mut end = start;
+        // Safety: `start` is `i + 1` where `i` is from `char_indices()` on `text`
+        // and `@` is a single-byte ASCII char, so `start` is a valid boundary.
+        // `end` is computed from `char_indices()` on the same `text` slice.
+        #[allow(clippy::string_slice)]
         for (j, c) in text[start..].char_indices() {
             if c.is_whitespace() {
                 break;
@@ -101,6 +105,8 @@ fn extract_at_references(text: &str) -> Vec<String> {
             end = start + j + c.len_utf8();
         }
 
+        // Safety: `start` and `end` are from `char_indices()` on `text`
+        #[allow(clippy::string_slice)]
         let token = &text[start..end];
         if !token.is_empty() {
             refs.push(token.to_string());
@@ -130,12 +136,16 @@ fn detect_skill_prefix(text: &str) -> Option<(String, String)> {
     let name_end = without_slash
         .find(|c: char| c.is_whitespace())
         .unwrap_or(without_slash.len());
+    // Safety: `name_end` is from `find()` on `without_slash` (or its `.len()`)
+    #[allow(clippy::string_slice)]
     let skill_name = &without_slash[..name_end];
 
     if skill_name.is_empty() {
         return None;
     }
 
+    // Safety: `name_end` is from `find()` on `without_slash` (or its `.len()`)
+    #[allow(clippy::string_slice)]
     let arguments = without_slash[name_end..].trim().to_string();
     Some((skill_name.to_string(), arguments))
 }

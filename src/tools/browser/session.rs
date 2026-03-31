@@ -164,7 +164,10 @@ pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
         .take_while(|&end| end <= max_bytes)
         .last()
         .unwrap_or(0);
-    format!("{}…", &s[..boundary])
+    // Safety: `boundary` is computed from `char_indices()` on `s`
+    #[allow(clippy::string_slice)]
+    let prefix = &s[..boundary];
+    format!("{prefix}…")
 }
 
 impl BrowserSession {

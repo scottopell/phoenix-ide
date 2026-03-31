@@ -58,6 +58,8 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
         // Handle frontmatter at end of file with no trailing newline after ---
         body.find("\n---").filter(|&i| i + 4 == body.len())
     })?;
+    // Safety: `end` is from `find()` on `body`
+    #[allow(clippy::string_slice)]
     let frontmatter = &body[..end];
 
     let mut name: Option<String> = None;
@@ -211,6 +213,8 @@ pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
     // Add worktree grounding when working_dir is inside a .phoenix/worktrees/ path
     let wd_str = working_dir.to_string_lossy();
     if let Some(pos) = wd_str.find("/.phoenix/worktrees/") {
+        // Safety: `pos` is from `find()` on `wd_str`
+        #[allow(clippy::string_slice)]
         let project_root = &wd_str[..pos];
         let _ = write!(
             prompt,

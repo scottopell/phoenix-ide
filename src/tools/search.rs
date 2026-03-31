@@ -71,7 +71,9 @@ fn matches_glob(filename: &str, pattern: &str) -> bool {
     if let Some(ext) = pattern.strip_prefix("*.") {
         filename.ends_with(&format!(".{ext}"))
     } else if pattern.starts_with('*') && pattern.ends_with('*') {
-        let inner = &pattern[1..pattern.len() - 1];
+        let inner = pattern
+            .get(1..pattern.len() - 1)
+            .unwrap_or("");
         filename.contains(inner)
     } else {
         filename == pattern

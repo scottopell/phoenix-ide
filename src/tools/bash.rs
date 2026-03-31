@@ -214,8 +214,8 @@ impl BashTool {
             return output.to_string();
         }
 
-        let start = &output[..SNIP_SIZE];
-        let end = &output[output.len() - SNIP_SIZE..];
+        let start = output.get(..SNIP_SIZE).unwrap_or(output);
+        let end = output.get(output.len() - SNIP_SIZE..).unwrap_or(output);
 
         format!(
             "[output truncated in middle: got {} bytes, max is {} bytes]\n{}\n\n[snip]\n\n{}",

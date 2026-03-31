@@ -263,7 +263,10 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
                 // If LLM fails, return raw results (truncated)
                 tracing::warn!(error = %e, "LLM filtering failed, returning raw results");
                 let truncated = if results.len() > 8000 {
-                    format!("{}\n\n[results truncated]", &results[..8000])
+                    format!(
+                        "{}\n\n[results truncated]",
+                        results.get(..8000).unwrap_or(&results)
+                    )
                 } else {
                     results
                 };
