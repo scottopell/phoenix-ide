@@ -13,7 +13,10 @@ use super::openai::{
     self, ResponsesApiContentPart, ResponsesApiFunctionOutput, ResponsesApiInputItem,
     ResponsesApiMessageContent, ResponsesApiOutputPart,
 };
-use super::types::{ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole};
+use super::types::{
+    ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole, ToolReference,
+    ToolSearchResultContent,
+};
 use proptest::prelude::*;
 
 // ============================================================================
@@ -467,6 +470,151 @@ proptest! {
             }
         } else {
             prop_assert!(false, "Expected FunctionCallOutput item");
+        }
+    }
+}
+
+// ============================================================================
+// Server block strategies
+// ============================================================================
+
+fn arb_server_tool_use() -> impl Strategy<Value = ContentBlock> {
+    (
+        "srvtoolu_[a-z0-9]{5,15}",
+        prop_oneof![
+            Just("tool_search_tool_regex".to_string()),
+            Just("web_search".to_string()),
+            Just("code_execution".to_string()),
+        ],
+        arb_json_value(),
+    )
+        .prop_map(|(id, name, input)| ContentBlock::ServerToolUse { id, name, input })
+}
+
+fn arb_tool_search_tool_result() -> impl Strategy<Value = ContentBlock> {
+    (
+        "srvtoolu_[a-z0-9]{5,15}",
+        proptest::collection::vec("[a-z_]{3,20}", 0..5),
+    )
+        .prop_map(|(tool_use_id, tool_names)| ContentBlock::ToolSearchToolResult {
+            tool_use_id,
+            content: ToolSearchResultContent {
+                r#type: "tool_search_tool_search_result".into(),
+                tool_references: tool_names
+                    .into_iter()
+                    .map(|n| ToolReference {
+                        r#type: "tool_reference".into(),
+                        tool_name: n,
+                    })
+                    .collect(),
+                error_code: None,
+            },
+        })
+}
+
+fn arb_opaque_server_result() -> impl Strategy<Value = ContentBlock> {
+    ("srvtoolu_[a-z0-9]{5,15}", arb_json_value()).prop_flat_map(|(id, content)| {
+        prop_oneof![
+            Just(ContentBlock::WebSearchToolResult {
+                tool_use_id: id.clone(),
+                content: content.clone(),
+            }),
+            Just(ContentBlock::WebFetchToolResult {
+                tool_use_id: id.clone(),
+                content: content.clone(),
+            }),
+            Just(ContentBlock::CodeExecutionToolResult {
+                tool_use_id: id.clone(),
+                content: content.clone(),
+            }),
+            Just(ContentBlock::BashCodeExecutionToolResult {
+                tool_use_id: id.clone(),
+                content: content.clone(),
+            }),
+        ]
+    })
+}
+
+fn arb_mcp_tool_use() -> impl Strategy<Value = ContentBlock> {
+    (
+        "mcptoolu_[a-z0-9]{5,15}",
+        "[a-z_]{3,20}",
+        "[a-z_]{3,15}",
+        arb_json_value(),
+    )
+        .prop_map(|(id, name, server_name, input)| ContentBlock::McpToolUse {
+            id,
+            name,
+            server_name,
+            input,
+        })
+}
+
+/// Any ContentBlock variant
+fn arb_content_block() -> impl Strategy<Value = ContentBlock> {
+    prop_oneof![
+        3 => arb_text_block(),
+        1 => arb_image_block(),
+        2 => arb_tool_use_block(),
+        2 => arb_tool_result_block(),
+        2 => arb_server_tool_use(),
+        1 => arb_tool_search_tool_result(),
+        2 => arb_opaque_server_result(),
+        1 => arb_mcp_tool_use(),
+    ]
+}
+
+// ============================================================================
+// ContentBlock property tests
+// ============================================================================
+
+proptest! {
+    /// Every ContentBlock round-trips through JSON: deserialize(serialize(x)) == x
+    #[test]
+    fn prop_content_block_serde_round_trip(block in arb_content_block()) {
+        let json = serde_json::to_value(&block).unwrap();
+        let round_tripped: ContentBlock = serde_json::from_value(json).unwrap();
+        prop_assert_eq!(block, round_tripped);
+    }
+
+    /// Every serialized ContentBlock has a non-empty snake_case "type" tag
+    #[test]
+    fn prop_content_block_type_tag_valid(block in arb_content_block()) {
+        let json = serde_json::to_value(&block).unwrap();
+        let type_str = json.get("type").and_then(|v| v.as_str());
+        prop_assert!(type_str.is_some(), "missing type field");
+        let t = type_str.unwrap();
+        prop_assert!(!t.is_empty(), "empty type string");
+        prop_assert!(
+            t.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+            "type tag not snake_case: {t}"
+        );
+    }
+
+    /// tool_uses() only returns ToolUse -- never server or MCP blocks
+    #[test]
+    fn prop_tool_uses_only_returns_tool_use(
+        blocks in proptest::collection::vec(arb_content_block(), 0..20)
+    ) {
+        let response = super::types::LlmResponse {
+            content: blocks,
+            end_turn: false,
+            usage: super::types::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        };
+        for (id, _name, _input) in response.tool_uses() {
+            prop_assert!(
+                !id.starts_with("srvtoolu_"),
+                "tool_uses() returned a server tool: {id}"
+            );
+            prop_assert!(
+                !id.starts_with("mcptoolu_"),
+                "tool_uses() returned an MCP tool: {id}"
+            );
         }
     }
 }
