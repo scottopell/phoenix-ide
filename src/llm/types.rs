@@ -74,6 +74,81 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+
+    // ---- Server-handled blocks (Anthropic) ----
+    // These blocks are executed by the API, not by Phoenix. They MUST be
+    // preserved in conversation history for multi-turn correctness (e.g.
+    // tool search discovers deferred tools on turn N; turn N+1 needs the
+    // server_tool_use + tool_search_tool_result blocks in history or the
+    // API returns 400).
+
+    /// Server-side tool invocation (tool search, web search, code execution).
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool search result -- contains references to discovered deferred tools.
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchResultContent,
+    },
+    /// Web search result -- opaque round-trip.
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    /// Web fetch result -- opaque round-trip.
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    /// Code execution result (legacy) -- opaque round-trip.
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    /// Bash code execution result -- opaque round-trip.
+    BashCodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    /// Text editor code execution result -- opaque round-trip.
+    TextEditorCodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    /// MCP tool invocation (Anthropic MCP connector, beta) -- opaque round-trip.
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: serde_json::Value,
+    },
+    /// MCP tool result (Anthropic MCP connector, beta) -- opaque round-trip.
+    McpToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        is_error: bool,
+        content: serde_json::Value,
+    },
+}
+
+/// Content of a `tool_search_tool_result` block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolSearchResultContent {
+    pub r#type: String, // "tool_search_tool_search_result" or "tool_search_tool_result_error"
+    #[serde(default)]
+    pub tool_references: Vec<ToolReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// A single tool reference inside a `ToolSearchResultContent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolReference {
+    pub r#type: String, // "tool_reference"
+    pub tool_name: String,
 }
 
 impl ContentBlock {

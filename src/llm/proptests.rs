@@ -217,7 +217,16 @@ proptest! {
                 (ContentBlock::Text { .. }, AnthropicContentBlock::Text { .. })
                 | (ContentBlock::Image { .. }, AnthropicContentBlock::Image { .. })
                 | (ContentBlock::ToolUse { .. }, AnthropicContentBlock::ToolUse { .. })
-                | (ContentBlock::ToolResult { .. }, AnthropicContentBlock::ToolResult { .. }) => {}
+                | (ContentBlock::ToolResult { .. }, AnthropicContentBlock::ToolResult { .. })
+                | (ContentBlock::ServerToolUse { .. }, AnthropicContentBlock::ServerToolUse { .. })
+                | (ContentBlock::ToolSearchToolResult { .. }, AnthropicContentBlock::ToolSearchToolResult { .. })
+                | (ContentBlock::WebSearchToolResult { .. }, AnthropicContentBlock::WebSearchToolResult { .. })
+                | (ContentBlock::WebFetchToolResult { .. }, AnthropicContentBlock::WebFetchToolResult { .. })
+                | (ContentBlock::CodeExecutionToolResult { .. }, AnthropicContentBlock::CodeExecutionToolResult { .. })
+                | (ContentBlock::BashCodeExecutionToolResult { .. }, AnthropicContentBlock::BashCodeExecutionToolResult { .. })
+                | (ContentBlock::TextEditorCodeExecutionToolResult { .. }, AnthropicContentBlock::TextEditorCodeExecutionToolResult { .. })
+                | (ContentBlock::McpToolUse { .. }, AnthropicContentBlock::McpToolUse { .. })
+                | (ContentBlock::McpToolResult { .. }, AnthropicContentBlock::McpToolResult { .. }) => {}
                 _ => prop_assert!(false, "Type mismatch: {:?} vs {:?}", orig, trans),
             }
         }

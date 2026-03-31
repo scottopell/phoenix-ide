@@ -25,7 +25,11 @@ struct StreamAccumulator {
     current_tool_id: String,
     current_tool_name: String,
     current_tool_json: String,
-    /// Set true when `message_stop` is received — signals outer loop to stop
+    /// True when the current tool block is a `server_tool_use` (not a regular `tool_use`).
+    current_is_server_tool: bool,
+    /// Raw JSON for server-handled blocks that arrive complete in `content_block_start`.
+    current_server_block: Option<serde_json::Value>,
+    /// Set true when `message_stop` is received -- signals outer loop to stop
     pub done: bool,
 }
 
@@ -44,6 +48,8 @@ impl StreamAccumulator {
             current_tool_id: String::new(),
             current_tool_name: String::new(),
             current_tool_json: String::new(),
+            current_is_server_tool: false,
+            current_server_block: None,
             done: false,
         }
     }
@@ -115,6 +121,7 @@ impl StreamAccumulator {
             "tool_use" => {
                 self.current_index = Some(idx);
                 self.current_is_text = false;
+                self.current_is_server_tool = false;
                 self.current_tool_id = v
                     .pointer("/content_block/id")
                     .and_then(serde_json::Value::as_str)
@@ -128,18 +135,46 @@ impl StreamAccumulator {
                 self.current_tool_json.clear();
             }
             "server_tool_use" => {
-                // Server-side execution -- log but don't accumulate.
-                let name = v
+                // Server-side execution -- accumulate like tool_use for history.
+                self.current_index = Some(idx);
+                self.current_is_text = false;
+                self.current_is_server_tool = true;
+                self.current_tool_id = v
+                    .pointer("/content_block/id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_name = v
                     .pointer("/content_block/name")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                tracing::debug!(name, "Streaming: server_tool_use block (skipping)");
+                    .unwrap_or("")
+                    .to_string();
+                self.current_tool_json.clear();
+                let name = &self.current_tool_name;
+                tracing::debug!(name, "Streaming: server_tool_use block");
+            }
+            "tool_search_tool_result" | "web_search_tool_result" | "web_fetch_tool_result"
+            | "code_execution_tool_result" | "bash_code_execution_tool_result"
+            | "text_editor_code_execution_tool_result" | "mcp_tool_result" => {
+                // Server result blocks arrive complete -- capture the whole block.
+                if let Some(block) = v.get("content_block") {
+                    self.current_index = Some(idx);
+                    self.current_server_block = Some(block.clone());
+                    tracing::debug!(block_type, "Streaming: server result block captured");
+                }
+            }
+            "mcp_tool_use" => {
+                // MCP tool use blocks -- capture the whole block.
+                if let Some(block) = v.get("content_block") {
+                    self.current_index = Some(idx);
+                    self.current_server_block = Some(block.clone());
+                    tracing::debug!("Streaming: mcp_tool_use block captured");
+                }
             }
             other => {
-                // tool_search_tool_result, web_search_tool_result, etc.
-                tracing::debug!(
+                tracing::warn!(
                     block_type = other,
-                    "Streaming: skipping server-handled block"
+                    "Streaming: unknown block type -- may need code update"
                 );
             }
         }
@@ -185,6 +220,17 @@ impl StreamAccumulator {
         let Some(idx) = self.current_index.take() else {
             return;
         };
+        // Server result/mcp blocks captured whole from content_block_start.
+        if let Some(block) = self.current_server_block.take() {
+            if let Ok(parsed) = serde_json::from_value::<AnthropicContentBlock>(block) {
+                self.content_blocks.push((idx, parsed));
+            } else {
+                tracing::warn!(
+                    "Failed to deserialize server block from streaming content_block_start"
+                );
+            }
+            return;
+        }
         if self.current_is_text {
             if !self.current_text.is_empty() {
                 self.content_blocks.push((
@@ -198,17 +244,24 @@ impl StreamAccumulator {
         } else if !self.current_tool_name.is_empty() {
             let input: serde_json::Value = serde_json::from_str(&self.current_tool_json)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-            self.content_blocks.push((
-                idx,
+            let block = if self.current_is_server_tool {
+                AnthropicContentBlock::ServerToolUse {
+                    id: self.current_tool_id.clone(),
+                    name: self.current_tool_name.clone(),
+                    input,
+                }
+            } else {
                 AnthropicContentBlock::ToolUse {
                     id: self.current_tool_id.clone(),
                     name: self.current_tool_name.clone(),
                     input,
-                },
-            ));
+                }
+            };
+            self.content_blocks.push((idx, block));
             self.current_tool_json.clear();
             self.current_tool_name.clear();
             self.current_tool_id.clear();
+            self.current_is_server_tool = false;
         }
     }
 
@@ -467,6 +520,7 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
     }
 }
 
+#[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
 pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
     let role = match msg.role {
         MessageRole::User => "user",
@@ -522,6 +576,76 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                     is_error: *is_error,
                 }
             }
+            // Server-handled blocks: round-trip back to their Anthropic wire types.
+            ContentBlock::ServerToolUse { id, name, input } => {
+                AnthropicContentBlock::ServerToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }
+            }
+            ContentBlock::ToolSearchToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::ToolSearchToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::WebSearchToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::WebFetchToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::WebFetchToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::CodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::CodeExecutionToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::BashCodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::BashCodeExecutionToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::TextEditorCodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => AnthropicContentBlock::TextEditorCodeExecutionToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: content.clone(),
+            },
+            ContentBlock::McpToolUse {
+                id,
+                name,
+                server_name,
+                input,
+            } => AnthropicContentBlock::McpToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                server_name: server_name.clone(),
+                input: input.clone(),
+            },
+            ContentBlock::McpToolResult {
+                tool_use_id,
+                is_error,
+                content,
+            } => AnthropicContentBlock::McpToolResult {
+                tool_use_id: tool_use_id.clone(),
+                is_error: *is_error,
+                content: content.clone(),
+            },
         })
         .collect();
 
@@ -531,10 +655,9 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
     }
 }
 
+#[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
 pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
-    let raw_block_count = resp.content.len();
-    let mut server_handled_count: usize = 0;
 
     for block in resp.content {
         match block {
@@ -556,44 +679,145 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
                     "Unexpected tool_result block in Anthropic response",
                 ));
             }
-            AnthropicContentBlock::ServerToolUse { name, .. } => {
-                // Server-side tool execution (tool search, web search, etc.).
-                // These blocks are resolved by the API before we see them.
-                //
-                // OPEN QUESTION: Do these need to be preserved in conversation
-                // history for multi-turn? If the API requires them to re-expand
-                // deferred tool definitions on subsequent turns, stripping them
-                // would break multi-turn tool search. Needs empirical testing.
-                // See YF616 Step 2.
-                tracing::debug!(name = %name, "Server tool use in response (handled by API)");
-                server_handled_count += 1;
+            // Server-handled blocks: preserved in history for multi-turn correctness.
+            AnthropicContentBlock::ServerToolUse { id, name, input } => {
+                tracing::debug!(name = %name, "Server tool use in response");
+                content.push(ContentBlock::ServerToolUse { id, name, input });
+            }
+            AnthropicContentBlock::ToolSearchToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Tool search result in response");
+                content.push(ContentBlock::ToolSearchToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::WebSearchToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Web search tool result in response");
+                content.push(ContentBlock::WebSearchToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::WebFetchToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Web fetch tool result in response");
+                content.push(ContentBlock::WebFetchToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::CodeExecutionToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Code execution tool result in response");
+                content.push(ContentBlock::CodeExecutionToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::BashCodeExecutionToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Bash code execution tool result in response");
+                content.push(ContentBlock::BashCodeExecutionToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::TextEditorCodeExecutionToolResult {
+                tool_use_id,
+                content: c,
+            } => {
+                tracing::debug!("Text editor code execution tool result in response");
+                content.push(ContentBlock::TextEditorCodeExecutionToolResult {
+                    tool_use_id,
+                    content: c,
+                });
+            }
+            AnthropicContentBlock::McpToolUse {
+                id,
+                name,
+                server_name,
+                input,
+            } => {
+                tracing::debug!(name = %name, server = %server_name, "MCP tool use in response");
+                content.push(ContentBlock::McpToolUse {
+                    id,
+                    name,
+                    server_name,
+                    input,
+                });
+            }
+            AnthropicContentBlock::McpToolResult {
+                tool_use_id,
+                is_error,
+                content: c,
+            } => {
+                tracing::debug!("MCP tool result in response");
+                content.push(ContentBlock::McpToolResult {
+                    tool_use_id,
+                    is_error,
+                    content: c,
+                });
             }
             AnthropicContentBlock::Unknown => {
-                tracing::debug!("Skipping unknown content block type in response");
-                server_handled_count += 1;
+                // Anthropic added a new block type we don't know about.
+                // Log loudly -- this needs a code update.
+                tracing::error!(
+                    "Unknown Anthropic content block type encountered. \
+                     This likely means a new server tool type was added to the API. \
+                     Update AnthropicContentBlock enum to handle it."
+                );
             }
         }
     }
 
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
+    // Check if content has any "substantive" blocks (text, tool_use, or tool results).
+    // Server blocks alone don't count as empty -- they're preserved for history.
+    let has_substantive = content.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::Text { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. }
+        )
+    });
+
     // Empty content with end_turn is valid and documented Anthropic behavior:
     // the model completed a tool call loop with nothing further to say.
-    // Let it through as content: [] — the state machine handles this by
+    // Let it through as content: [] -- the state machine handles this by
     // transitioning to Idle without persisting an empty agent message.
     //
     // Empty content WITHOUT end_turn is genuinely unexpected.
-    if content.is_empty() && !end_turn {
+    if !has_substantive && !end_turn {
         tracing::warn!(
             stop_reason = ?resp.stop_reason,
             output_tokens = resp.usage.output_tokens,
-            raw_block_count = raw_block_count,
-            server_handled_count = server_handled_count,
             "Anthropic returned empty content without end_turn"
         );
         return Err(LlmError::invalid_response(format!(
-            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={}, raw_blocks={}, server_handled={})",
-            resp.stop_reason, resp.usage.output_tokens, raw_block_count, server_handled_count
+            "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={})",
+            resp.stop_reason, resp.usage.output_tokens
         )));
     }
 
@@ -601,9 +825,7 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
         tracing::debug!(
             stop_reason = ?resp.stop_reason,
             output_tokens = resp.usage.output_tokens,
-            raw_block_count = raw_block_count,
-            server_handled_count = server_handled_count,
-            "Anthropic end_turn with empty content — model has nothing to say"
+            "Anthropic end_turn with empty content -- model has nothing to say"
         );
     }
 
@@ -674,15 +896,50 @@ pub(crate) enum AnthropicContentBlock {
         is_error: bool,
     },
     /// Server-side tool invocation (tool search, web search, code execution).
-    /// Handled by Anthropic -- client skips these.
+    /// Handled by Anthropic -- Phoenix preserves these for multi-turn history.
     ServerToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
     },
-    /// Catch-all for block types we don't recognize (`tool_search_tool_result`,
-    /// `web_search_tool_result`, etc.). Prevents deserialization failures when
-    /// Anthropic adds new block types.
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: super::types::ToolSearchResultContent,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    BashCodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    TextEditorCodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: serde_json::Value,
+    },
+    McpToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        is_error: bool,
+        content: serde_json::Value,
+    },
+    /// Catch-all for truly unknown block types. Triggers a loud error in
+    /// `normalize_response` -- this means the API added something we need to handle.
     #[serde(other)]
     Unknown,
 }
@@ -897,29 +1154,41 @@ mod tests {
 
         let result = normalize_response(resp).unwrap();
 
-        // ServerToolUse is skipped -- only Text and ToolUse come through
-        assert_eq!(result.content.len(), 2);
+        // ServerToolUse is now PRESERVED -- Text, ServerToolUse, and ToolUse all come through
+        assert_eq!(result.content.len(), 3);
         assert!(
             matches!(&result.content[0], ContentBlock::Text { text } if text == "Here is my analysis.")
         );
         assert!(
-            matches!(&result.content[1], ContentBlock::ToolUse { id, name, .. } if id == "toolu_xyz789" && name == "bash")
+            matches!(&result.content[1], ContentBlock::ServerToolUse { id, name, .. } if id == "srvtoolu_abc123" && name == "tool_search")
+        );
+        assert!(
+            matches!(&result.content[2], ContentBlock::ToolUse { id, name, .. } if id == "toolu_xyz789" && name == "bash")
         );
     }
 
     #[test]
-    fn test_normalize_response_unknown_blocks() {
-        // Deserialize a block type we don't recognize -- should become Unknown
-        let json =
-            r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {}}"#;
+    fn test_normalize_response_known_server_blocks() {
+        // tool_search_tool_result now deserializes to a real variant
+        let json = r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {"type": "tool_search_tool_search_result", "tool_references": [{"type": "tool_reference", "tool_name": "bash"}]}}"#;
         let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
-        assert!(matches!(block, AnthropicContentBlock::Unknown));
+        assert!(
+            matches!(block, AnthropicContentBlock::ToolSearchToolResult { tool_use_id, .. } if tool_use_id == "srvtoolu_123")
+        );
 
-        // Also verify web_search_tool_result falls through
+        // web_search_tool_result also deserializes properly
         let json2 =
             r#"{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_456", "content": {}}"#;
         let block2: AnthropicContentBlock = serde_json::from_str(json2).unwrap();
-        assert!(matches!(block2, AnthropicContentBlock::Unknown));
+        assert!(
+            matches!(block2, AnthropicContentBlock::WebSearchToolResult { tool_use_id, .. } if tool_use_id == "srvtoolu_456")
+        );
+
+        // Truly unknown types still fall through to Unknown
+        let json3 =
+            r#"{"type": "some_future_block_type", "data": "whatever"}"#;
+        let block3: AnthropicContentBlock = serde_json::from_str(json3).unwrap();
+        assert!(matches!(block3, AnthropicContentBlock::Unknown));
     }
 
     #[test]
@@ -941,9 +1210,12 @@ mod tests {
 
         let result = normalize_response(resp).unwrap();
 
-        // All blocks were server-handled, content should be empty, and this is OK
-        // because stop_reason is end_turn
-        assert!(result.content.is_empty());
+        // Server blocks are now preserved in content
+        assert_eq!(result.content.len(), 1);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::ServerToolUse { name, .. } if name == "tool_search"
+        ));
         assert!(result.end_turn);
     }
 }
