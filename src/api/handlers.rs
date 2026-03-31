@@ -775,7 +775,14 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
     if trimmed.len() <= max_len {
         trimmed.to_string()
     } else {
-        format!("{}…", &trimmed[..max_len - 1])
+        // Find a char boundary at or before max_len - 1 to avoid slicing
+        // inside a multi-byte UTF-8 character (e.g., box-drawing chars).
+        let end = trimmed
+            .char_indices()
+            .take_while(|&(i, _)| i < max_len - 1)
+            .last()
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        format!("{}…", &trimmed[..end])
     }
 }
 
