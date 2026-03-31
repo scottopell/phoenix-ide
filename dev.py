@@ -1477,7 +1477,7 @@ def native_prod_stop():
 # =============================================================================
 
 
-def generate_launchd_plist(version: str, llm_gateway: str | None) -> str:
+def generate_launchd_plist(version: str, llm_gateway: str | None, extra_env: dict[str, str] | None = None) -> str:
     """Generate a launchd plist for the Phoenix IDE server."""
     env_vars = {
         "PHOENIX_DB_PATH": str(PROD_DB_PATH),
@@ -1486,6 +1486,9 @@ def generate_launchd_plist(version: str, llm_gateway: str | None) -> str:
     }
     if llm_gateway:
         env_vars["LLM_GATEWAY"] = llm_gateway
+    # Merge .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
+    if extra_env:
+        env_vars.update(extra_env)
 
     env_xml = "\n".join(
         f"      <key>{k}</key>\n      <string>{v}</string>"
@@ -1580,11 +1583,19 @@ def launchd_prod_deploy(version: str | None = None):
         check=True,
     )
 
-    # Detect LLM gateway
-    gateway = get_llm_gateway()
+    # Load .phoenix-ide.env and detect LLM gateway
+    env_overrides: dict[str, str] = {}
+    env_file = _load_env_file(env_overrides)
+    if env_file:
+        print(f"  Loaded env from {env_file}")
+
+    # Auto-detect gateway only if env file didn't provide LLM config
+    gateway = None
+    if not env_overrides.get("LLM_API_KEY_HELPER") and not env_overrides.get("LLM_GATEWAY"):
+        gateway = get_llm_gateway()
 
     # Generate and write plist
-    plist_content = generate_launchd_plist(version, gateway)
+    plist_content = generate_launchd_plist(version, gateway, env_overrides)
     LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST_PATH.write_text(plist_content)
 
