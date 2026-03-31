@@ -239,3 +239,195 @@ impl Usage {
         self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that ContentBlock server variants serialize to the correct
+    /// `type` tag strings and round-trip through JSON.
+    #[test]
+    fn content_block_server_variants_serde_round_trip() {
+        let blocks = vec![
+            ContentBlock::ServerToolUse {
+                id: "srvtoolu_123".into(),
+                name: "tool_search_tool_regex".into(),
+                input: serde_json::json!({"query": "weather"}),
+            },
+            ContentBlock::ToolSearchToolResult {
+                tool_use_id: "srvtoolu_123".into(),
+                content: ToolSearchResultContent {
+                    r#type: "tool_search_tool_search_result".into(),
+                    tool_references: vec![ToolReference {
+                        r#type: "tool_reference".into(),
+                        tool_name: "get_weather".into(),
+                    }],
+                    error_code: None,
+                },
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id: "srvtoolu_456".into(),
+                content: serde_json::json!({"type": "web_search_result"}),
+            },
+            ContentBlock::WebFetchToolResult {
+                tool_use_id: "srvtoolu_789".into(),
+                content: serde_json::json!({"type": "web_fetch_result"}),
+            },
+            ContentBlock::McpToolUse {
+                id: "mcptoolu_abc".into(),
+                name: "slack_send".into(),
+                server_name: "slack".into(),
+                input: serde_json::json!({"channel": "#general"}),
+            },
+            ContentBlock::McpToolResult {
+                tool_use_id: "mcptoolu_abc".into(),
+                is_error: false,
+                content: serde_json::json!([{"type": "text", "text": "sent"}]),
+            },
+        ];
+
+        for block in &blocks {
+            let json = serde_json::to_value(block).expect("serialize");
+
+            // Every block must have a "type" field
+            let type_str = json.get("type").and_then(|v| v.as_str())
+                .expect("missing type field");
+
+            // Round-trip: deserialize back and compare
+            let round_tripped: ContentBlock =
+                serde_json::from_value(json.clone()).unwrap_or_else(|e| {
+                    panic!("failed to deserialize {type_str}: {e}\njson: {json}")
+                });
+            assert_eq!(
+                block, &round_tripped,
+                "round-trip mismatch for {type_str}"
+            );
+        }
+    }
+
+    /// Verify the exact type tag strings match what the Anthropic API expects.
+    #[test]
+    fn content_block_type_tag_strings() {
+        let cases: Vec<(ContentBlock, &str)> = vec![
+            (
+                ContentBlock::ServerToolUse {
+                    id: "x".into(),
+                    name: "y".into(),
+                    input: serde_json::json!({}),
+                },
+                "server_tool_use",
+            ),
+            (
+                ContentBlock::ToolSearchToolResult {
+                    tool_use_id: "x".into(),
+                    content: ToolSearchResultContent {
+                        r#type: "tool_search_tool_search_result".into(),
+                        tool_references: vec![],
+                        error_code: None,
+                    },
+                },
+                "tool_search_tool_result",
+            ),
+            (
+                ContentBlock::WebSearchToolResult {
+                    tool_use_id: "x".into(),
+                    content: serde_json::json!({}),
+                },
+                "web_search_tool_result",
+            ),
+            (
+                ContentBlock::WebFetchToolResult {
+                    tool_use_id: "x".into(),
+                    content: serde_json::json!({}),
+                },
+                "web_fetch_tool_result",
+            ),
+            (
+                ContentBlock::CodeExecutionToolResult {
+                    tool_use_id: "x".into(),
+                    content: serde_json::json!({}),
+                },
+                "code_execution_tool_result",
+            ),
+            (
+                ContentBlock::BashCodeExecutionToolResult {
+                    tool_use_id: "x".into(),
+                    content: serde_json::json!({}),
+                },
+                "bash_code_execution_tool_result",
+            ),
+            (
+                ContentBlock::TextEditorCodeExecutionToolResult {
+                    tool_use_id: "x".into(),
+                    content: serde_json::json!({}),
+                },
+                "text_editor_code_execution_tool_result",
+            ),
+            (
+                ContentBlock::McpToolUse {
+                    id: "x".into(),
+                    name: "y".into(),
+                    server_name: "z".into(),
+                    input: serde_json::json!({}),
+                },
+                "mcp_tool_use",
+            ),
+            (
+                ContentBlock::McpToolResult {
+                    tool_use_id: "x".into(),
+                    is_error: false,
+                    content: serde_json::json!({}),
+                },
+                "mcp_tool_result",
+            ),
+        ];
+
+        for (block, expected_type) in cases {
+            let json = serde_json::to_value(&block).expect("serialize");
+            let actual_type = json.get("type").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(
+                actual_type, expected_type,
+                "wrong type tag for {:?}",
+                block
+            );
+        }
+    }
+
+    /// Verify that tool_uses() does NOT return ServerToolUse or McpToolUse --
+    /// only regular ToolUse blocks should be executed by Phoenix.
+    #[test]
+    fn tool_uses_excludes_server_blocks() {
+        let response = LlmResponse {
+            content: vec![
+                ContentBlock::Text { text: "hi".into() },
+                ContentBlock::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "tool_search".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+                ContentBlock::McpToolUse {
+                    id: "mcptoolu_1".into(),
+                    name: "slack".into(),
+                    server_name: "slack".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            end_turn: false,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        };
+
+        let uses = response.tool_uses();
+        assert_eq!(uses.len(), 1, "should only return regular ToolUse");
+        assert_eq!(uses[0].1, "bash");
+    }
+}
