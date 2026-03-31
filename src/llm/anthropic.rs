@@ -783,23 +783,13 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
 
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
-    // Check if content has any "substantive" blocks (text, tool_use, or tool results).
-    // Server blocks alone don't count as empty -- they're preserved for history.
-    let has_substantive = content.iter().any(|b| {
-        matches!(
-            b,
-            ContentBlock::Text { .. }
-                | ContentBlock::ToolUse { .. }
-                | ContentBlock::ServerToolUse { .. }
-                | ContentBlock::ToolSearchToolResult { .. }
-                | ContentBlock::WebSearchToolResult { .. }
-                | ContentBlock::WebFetchToolResult { .. }
-                | ContentBlock::CodeExecutionToolResult { .. }
-                | ContentBlock::BashCodeExecutionToolResult { .. }
-                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
-                | ContentBlock::McpToolUse { .. }
-                | ContentBlock::McpToolResult { .. }
-        )
+    // Check if content has any client-actionable blocks. Server blocks
+    // (ServerToolUse, ToolSearchToolResult, etc.) are preserved in content
+    // for history fidelity but don't satisfy the "non-empty" guard -- a
+    // response with only server blocks and stop_reason="tool_use" would
+    // leave the state machine with nothing to execute.
+    let has_client_content = content.iter().any(|b| {
+        matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. })
     });
 
     // Empty content with end_turn is valid and documented Anthropic behavior:
@@ -808,7 +798,7 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
     // transitioning to Idle without persisting an empty agent message.
     //
     // Empty content WITHOUT end_turn is genuinely unexpected.
-    if !has_substantive && !end_turn {
+    if !has_client_content && !end_turn {
         tracing::warn!(
             stop_reason = ?resp.stop_reason,
             output_tokens = resp.usage.output_tokens,
@@ -1216,6 +1206,33 @@ mod tests {
             ContentBlock::ServerToolUse { name, .. } if name == "tool_search"
         ));
         assert!(result.end_turn);
+    }
+
+    #[test]
+    fn test_normalize_response_only_server_blocks_with_tool_use_stop_reason() {
+        // Edge case: response has only ServerToolUse blocks (no regular ToolUse)
+        // with stop_reason="tool_use". This should be rejected -- there's nothing
+        // for the client to execute, so the state machine would be stuck.
+        let resp = AnthropicResponse {
+            content: vec![AnthropicContentBlock::ServerToolUse {
+                id: "srvtoolu_abc".to_string(),
+                name: "tool_search".to_string(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = normalize_response(resp);
+        assert!(
+            result.is_err(),
+            "Response with only server blocks and stop_reason=tool_use should be rejected"
+        );
     }
 }
 

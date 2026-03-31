@@ -644,29 +644,39 @@ impl McpClientManager {
                 .map(|(name, _)| name.clone())
                 .collect()
         };
-        if !needs_refresh.is_empty() {
-            let mut servers = self.servers.write().await;
-            for name in &needs_refresh {
-                if let Some(server) = servers.get_mut(name) {
-                    if server.tools_changed.swap(false, Ordering::AcqRel) {
-                        match server.list_tools().await {
-                            Ok(tools) => {
-                                tracing::info!(
-                                    server = %name,
-                                    tools = tools.len(),
-                                    "Refreshed tool list after list_changed notification"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    server = %name,
-                                    error = %e,
-                                    "Failed to refresh tools after list_changed"
-                                );
-                            }
-                        }
+        // Refresh servers outside the lock to avoid blocking all MCP
+        // operations during list_tools() I/O (up to 30s timeout per server).
+        // Same extract-refresh-reinsert pattern as call_tool() respawn.
+        for name in needs_refresh {
+            let server = {
+                let mut servers = self.servers.write().await;
+                match servers.get_mut(&name) {
+                    Some(s) if s.tools_changed.swap(false, Ordering::AcqRel) => {
+                        servers.remove(&name)
+                    }
+                    _ => None,
+                }
+            };
+            // Lock dropped -- list_tools() runs with no lock held.
+            if let Some(mut server) = server {
+                match server.list_tools().await {
+                    Ok(tools) => {
+                        tracing::info!(
+                            server = %name,
+                            tools = tools.len(),
+                            "Refreshed tool list after list_changed notification"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            server = %name,
+                            error = %e,
+                            "Failed to refresh tools after list_changed"
+                        );
                     }
                 }
+                // Reinsert under brief write lock.
+                self.servers.write().await.insert(name, server);
             }
         }
 
