@@ -503,12 +503,9 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     // Inject tool search tool when deferred tools exist
     if has_deferred {
-        let mut variant_config = std::collections::HashMap::new();
-        variant_config.insert(TOOL_SEARCH_VARIANT.to_string(), serde_json::json!({}));
         tools.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
             r#type: TOOL_SEARCH_VARIANT.to_string(),
             name: TOOL_SEARCH_NAME.to_string(),
-            variant: variant_config,
         }));
     }
 
@@ -976,10 +973,6 @@ struct AnthropicFunctionTool {
 struct AnthropicToolSearchTool {
     r#type: String,
     name: String,
-    /// The variant-specific config object. Key is the versioned variant name
-    /// (e.g., `tool_search_tool_regex_20251119`), value is an empty object.
-    #[serde(flatten)]
-    variant: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1067,9 +1060,11 @@ mod tests {
         // Third entry: tool_search with versioned type and short name
         assert_eq!(tools[2]["type"], TOOL_SEARCH_VARIANT);
         assert_eq!(tools[2]["name"], TOOL_SEARCH_NAME);
-        assert!(
-            tools[2].get(TOOL_SEARCH_VARIANT).is_some(),
-            "tool_search entry must contain the variant config object"
+        // No extra fields beyond type and name
+        assert_eq!(
+            tools[2].as_object().unwrap().len(),
+            2,
+            "tool_search entry should only have type and name"
         );
     }
 
