@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -55,6 +55,9 @@ pub struct McpServer {
     spawn_command: String,
     spawn_args: Vec<String>,
     spawn_env: HashMap<String, String>,
+    /// Set when the server sends `notifications/tools/list_changed`.
+    /// Cleared after the next `list_tools()` refresh.
+    tools_changed: AtomicBool,
     /// Handle to the stderr drain task -- aborted on shutdown/respawn.
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -121,6 +124,7 @@ impl McpServer {
             spawn_command: command.to_string(),
             spawn_args: args.to_vec(),
             spawn_env: env.clone(),
+            tools_changed: AtomicBool::new(false),
             stderr_task,
         })
     }
@@ -130,7 +134,9 @@ impl McpServer {
     pub async fn initialize(&mut self) -> Result<(), String> {
         let params = serde_json::json!({
             "protocolVersion": "2024-11-05",
-            "capabilities": {},
+            "capabilities": {
+                "tools": { "listChanged": true }
+            },
             "clientInfo": {
                 "name": "phoenix-ide",
                 "version": env!("CARGO_PKG_VERSION")
@@ -347,13 +353,22 @@ impl McpServer {
                     format!("MCP server '{}': invalid JSON from stdout: {e}", self.name)
                 })?;
 
-                // Skip server-initiated notifications (no "id" field).
+                // Handle server-initiated notifications (no "id" field).
                 if parsed.get("id").is_none() {
-                    tracing::debug!(
-                        server = %self.name,
-                        method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                        "Skipping server notification"
-                    );
+                    let notif_method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    if notif_method == "notifications/tools/list_changed" {
+                        tracing::info!(
+                            server = %self.name,
+                            "Server signaled tools/list_changed -- will refresh on next definitions() call"
+                        );
+                        self.tools_changed.store(true, Ordering::Release);
+                    } else {
+                        tracing::debug!(
+                            server = %self.name,
+                            method = notif_method,
+                            "Skipping server notification"
+                        );
+                    }
                     continue;
                 }
 
@@ -592,6 +607,44 @@ impl McpClientManager {
     /// Disabled servers are excluded. May return an empty list if background
     /// discovery hasn't finished yet.
     pub async fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
+        // Check if any server signaled tools/list_changed. If so, refresh
+        // under a write lock before reading. This adds latency on the first
+        // call after a change notification -- acceptable trade-off vs a
+        // background reader task per server.
+        let needs_refresh: Vec<String> = {
+            let servers = self.servers.read().await;
+            servers
+                .iter()
+                .filter(|(_, s)| s.tools_changed.load(Ordering::Acquire))
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        if !needs_refresh.is_empty() {
+            let mut servers = self.servers.write().await;
+            for name in &needs_refresh {
+                if let Some(server) = servers.get_mut(name) {
+                    if server.tools_changed.swap(false, Ordering::AcqRel) {
+                        match server.list_tools().await {
+                            Ok(tools) => {
+                                tracing::info!(
+                                    server = %name,
+                                    tools = tools.len(),
+                                    "Refreshed tool list after list_changed notification"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    server = %name,
+                                    error = %e,
+                                    "Failed to refresh tools after list_changed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let servers = self.servers.read().await;
         let disabled = self.disabled_servers.read().await;
         let mut out = Vec::new();
