@@ -10,6 +10,7 @@ import { createConversationSource } from './sources/ConversationSource';
 import { createFileSource } from './sources/FileSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
+import { useFocusScope } from '../../hooks/useFocusScope';
 
 const SEARCH_DEBOUNCE_MS = 120;
 
@@ -80,6 +81,15 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     },
     [actions],
   );
+
+  // Focus scope: register when palette is open, unregister when closed
+  const { pushScope, popScope } = useFocusScope();
+  useEffect(() => {
+    if (state.status === 'open') {
+      pushScope('command-palette');
+      return () => popScope('command-palette');
+    }
+  }, [state.status, pushScope, popScope]);
 
   // Async search effect — fires on query/mode change, debounced, abortable.
   // Depends on derived primitives, NOT on state object, to avoid re-firing

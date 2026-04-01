@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useFocusScope } from './useFocusScope';
 
 /**
  * Global keyboard shortcuts that work on all pages.
@@ -8,13 +9,14 @@ import { useNavigate, useLocation } from 'react-router-dom';
 export function useGlobalKeyboardShortcuts() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { hasActiveScope } = useFocusScope();
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Don't handle if user is typing in an input/textarea (except Escape)
       const target = e.target as HTMLElement;
-      const isInput = target.tagName === 'INPUT' || 
-                      target.tagName === 'TEXTAREA' || 
+      const isInput = target.tagName === 'INPUT' ||
+                      target.tagName === 'TEXTAREA' ||
                       target.isContentEditable;
 
       if (e.key === 'Escape') {
@@ -28,6 +30,8 @@ export function useGlobalKeyboardShortcuts() {
         if (document.querySelector('.conv-item-actions, [role="menu"], [role="dialog"], [role="popover"]')) {
           return;
         }
+        // Don't navigate away if an interactive panel is active
+        if (hasActiveScope) return;
         // If on conversation page, go back to list
         if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/') || location.pathname === '/new') {
           e.preventDefault();
@@ -52,7 +56,7 @@ export function useGlobalKeyboardShortcuts() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [navigate, location.pathname]);
+  }, [navigate, location.pathname, hasActiveScope]);
 }
 
 interface KeyboardNavOptions {
@@ -69,6 +73,7 @@ interface KeyboardNavOptions {
 export function useKeyboardNav(options: KeyboardNavOptions = {}) {
   const { items = [], onSelect, onNew, enabled = true } = options;
   const navigate = useNavigate();
+  const { hasActiveScope } = useFocusScope();
   const [selectedIndex, setSelectedIndex] = useState(-1);
 
   // Reset selection when items change
@@ -78,7 +83,7 @@ export function useKeyboardNav(options: KeyboardNavOptions = {}) {
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      if (!enabled) return;
+      if (!enabled || hasActiveScope) return;
 
       // Don't handle if user is typing in an input/textarea
       const target = e.target as HTMLElement;
@@ -141,7 +146,7 @@ export function useKeyboardNav(options: KeyboardNavOptions = {}) {
           break;
       }
     },
-    [enabled, items, selectedIndex, onSelect, onNew, navigate]
+    [enabled, hasActiveScope, items, selectedIndex, onSelect, onNew, navigate]
   );
 
   useEffect(() => {

@@ -16,6 +16,7 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateUUID } from '../utils/uuid';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
   X,
   MessageSquare,
@@ -183,6 +184,8 @@ export function TaskApprovalReader({
   onReject,
   onSendFeedback,
 }: TaskApprovalReaderProps) {
+  useRegisterFocusScope('task-approval');
+
   const [notes, setNotes] = useState<ReviewNote[]>([]);
   const [annotatingLine, setAnnotatingLine] = useState<{
     lineNumber: number;

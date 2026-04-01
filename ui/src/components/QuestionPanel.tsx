@@ -17,6 +17,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
@@ -41,6 +42,8 @@ export function QuestionPanel({
   conversationId,
   showToast,
 }: QuestionPanelProps) {
+  useRegisterFocusScope('question-panel');
+
   // --- Wizard step state ---
   const [currentStep, setCurrentStep] = useState(0);
   const [focusedIndex, setFocusedIndex] = useState(0);
