@@ -2,6 +2,7 @@
 //!
 //! REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 
+mod ask_user_question;
 mod bash;
 pub mod bash_check;
 pub mod browser;
@@ -15,6 +16,7 @@ mod search;
 mod subagent;
 mod think;
 
+pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -190,6 +192,7 @@ impl ToolRegistry {
             Arc::new(KeywordSearchTool),
             Arc::new(ReadImageTool),
             Arc::new(ProposePlanTool),
+            Arc::new(AskUserQuestionTool),
             Arc::new(SpawnAgentsTool),
             // Browser tools
             Arc::new(BrowserNavigateTool),
@@ -254,12 +257,13 @@ impl ToolRegistry {
         ];
 
         if is_sub_agent {
-            // Sub-agents get completion tools, no spawning
+            // Sub-agents get completion tools, no spawning, no ask_user_question (REQ-AUQ-006)
             tools.push(Arc::new(SubmitResultTool));
             tools.push(Arc::new(SubmitErrorTool));
         } else {
-            // Parent conversations can spawn sub-agents
+            // Parent conversations can spawn sub-agents and ask user questions
             tools.push(Arc::new(SpawnAgentsTool));
+            tools.push(Arc::new(AskUserQuestionTool));
         }
 
         Self { tools }

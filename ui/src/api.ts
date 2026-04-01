@@ -44,6 +44,19 @@ export interface SubAgentResult {
   outcome: SubAgentOutcome;
 }
 
+export interface UserQuestion {
+  question: string;
+  header: string;
+  options: QuestionOption[];
+  multiSelect: boolean;
+}
+
+export interface QuestionOption {
+  label: string;
+  description?: string;
+  preview?: string;
+}
+
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
@@ -55,6 +68,7 @@ export type ConversationState =
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
+  | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'error'; message: string }
   | { type: 'terminal' };
@@ -68,6 +82,7 @@ export function getDisplayState(stateType: string | undefined): 'idle' | 'workin
     case 'error': return 'error';
     case 'context_exhausted': return 'terminal';
     case 'awaiting_task_approval': return 'awaiting_approval';
+    case 'awaiting_user_response': return 'awaiting_approval';
     default: return stateType ? 'working' : 'idle';
   }
 }
@@ -462,6 +477,20 @@ export const api = {
       body: JSON.stringify({ annotations }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to send feedback'); }
+    return resp.json();
+  },
+
+  async respondToQuestion(
+    convId: string,
+    answers: Record<string, string>,
+    annotations?: Record<string, { notes?: string; preview?: string }>,
+  ): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/respond`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers, annotations }),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to respond to question'); }
     return resp.json();
   },
 
