@@ -3,8 +3,10 @@
 use crate::db::{ErrorKind, ImageData, ToolResult};
 use crate::llm::{ContentBlock, Usage};
 use crate::state_machine::state::{
-    PendingSubAgent, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
+    PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
+    UserQuestion,
 };
+use std::collections::HashMap;
 
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
@@ -84,5 +86,19 @@ pub enum Event {
     /// User responded to a proposed task plan
     TaskApprovalResponse {
         outcome: TaskApprovalOutcome,
+    },
+
+    // Ask user question events (REQ-AUQ-001)
+    /// Executor intercepted `ask_user_question` tool call, questions pending user input
+    #[allow(dead_code)] // Used by executor integration (later agent)
+    AskUserQuestionPending {
+        tool_use_id: String,
+        questions: Vec<UserQuestion>,
+    },
+    /// User answered the pending questions
+    #[allow(dead_code)] // Used by API handler (later agent)
+    UserQuestionResponse {
+        answers: HashMap<String, String>,
+        annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
 }

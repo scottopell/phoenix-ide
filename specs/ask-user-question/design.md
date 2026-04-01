@@ -1,72 +1,25 @@
-# Ask User Question Tool - Design Document
+# Ask User Question Tool - Technical Design
 
-## Overview
+## Architecture Overview
 
-The ask_user_question tool pauses agent execution and waits for user input. Unlike normal tools that execute and return immediately, this tool transitions the conversation to a waiting state until the user responds.
+The ask_user_question tool pauses agent execution and waits for user input.
+The execution flow is:
 
-## Tool Interface (REQ-AUQ-004)
+1. The LLM returns a tool_use block for ask_user_question
+2. The executor intercepts the tool call before normal dispatch
+3. The executor validates the input and emits an `AskUserQuestionPending` event
+4. The state machine transitions from `ToolExecuting` to `AwaitingUserResponse`,
+   persisting the questions and remaining tool state
+5. An SSE state_change event notifies the UI to display the question interface
+6. The user selects options and submits via `POST /api/conversations/{id}/respond`
+7. The API handler sends a `UserQuestionResponse` event to the state machine
+8. The state machine constructs a tool result from the answers and resumes:
+   either executing remaining tools or requesting the next LLM turn
 
-### Schema
+The tool struct exists for schema and description purposes. Execution is
+intercepted by the executor before reaching `Tool::run()`.
 
-```json
-{
-  "type": "object",
-  "required": ["questions"],
-  "properties": {
-    "questions": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 4,
-      "items": {
-        "type": "object",
-        "required": ["question", "options"],
-        "properties": {
-          "question": {
-            "type": "string",
-            "description": "The full question text to display"
-          },
-          "header": {
-            "type": "string",
-            "maxLength": 12,
-            "description": "Short label for the question"
-          },
-          "options": {
-            "type": "array",
-            "minItems": 2,
-            "maxItems": 4,
-            "items": {
-              "type": "object",
-              "required": ["label"],
-              "properties": {
-                "label": { "type": "string" },
-                "description": { "type": "string" }
-              }
-            }
-          },
-          "multiSelect": {
-            "type": "boolean",
-            "default": false
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-### Tool Description
-
-```
-Ask the user clarifying questions when you need input to proceed.
-Use when there are multiple valid approaches and user preference matters.
-
-Provide 1-4 questions with 2-4 options each. Keep questions focused
-and options clear. Users can also type custom answers.
-
-NOT available to sub-agents.
-```
-
-## Data Types (REQ-AUQ-001, REQ-AUQ-004)
+## Data Types (REQ-AUQ-001, REQ-AUQ-002, REQ-AUQ-003, REQ-AUQ-005)
 
 ```rust
 // src/state_machine/state.rs
@@ -74,8 +27,7 @@ NOT available to sub-agents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserQuestion {
     pub question: String,
-    #[serde(default)]
-    pub header: Option<String>,
+    pub header: String,
     pub options: Vec<QuestionOption>,
     #[serde(default, rename = "multiSelect")]
     pub multi_select: bool,
@@ -84,37 +36,56 @@ pub struct UserQuestion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionOption {
     pub label: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnnotation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskUserQuestionInput {
     pub questions: Vec<UserQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<QuestionMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 ```
 
-Add to ToolInput enum:
+Add to `ToolInput` enum:
+
 ```rust
 AskUserQuestion(AskUserQuestionInput),
 ```
 
-## State Machine Changes (REQ-AUQ-001, REQ-AUQ-003, REQ-AUQ-006)
+## State Machine Changes (REQ-AUQ-001, REQ-AUQ-004, REQ-AUQ-007)
 
 ### New State: AwaitingUserResponse
+
+The waiting state carries all context needed to resume execution: the tool use
+ID (for constructing the tool result), remaining tools (to continue executing
+after the response), and persisted tool IDs (to avoid re-persisting results
+from tools that completed before the question was asked).
 
 ```rust
 // src/state_machine/state.rs - add to ConvState enum
 
-/// Waiting for user to answer questions (parent conversations only)
 AwaitingUserResponse {
-    /// The questions being asked
     questions: Vec<UserQuestion>,
-    /// Tool use ID (needed to generate tool result)
     tool_use_id: String,
-    /// Remaining tools to execute after this one
     remaining_tools: Vec<ToolCall>,
-    /// Already persisted tool IDs
     persisted_tool_ids: HashSet<String>,
 },
 ```
@@ -122,340 +93,144 @@ AwaitingUserResponse {
 ### New Events
 
 ```rust
-// src/state_machine/event.rs
-
-/// ask_user_question tool detected, transitioning to waiting state
 AskUserQuestionPending {
     tool_use_id: String,
     questions: Vec<UserQuestion>,
 },
 
-/// User has responded to questions
 UserQuestionResponse {
-    /// Answers keyed by question text
     answers: HashMap<String, String>,
+    annotations: Option<HashMap<String, QuestionAnnotation>>,
 },
 ```
 
 ### State Transitions
 
-```rust
-// src/state_machine/transition.rs
+`ToolExecuting` + `AskUserQuestionPending` transitions to
+`AwaitingUserResponse`, persisting state and notifying clients via SSE.
 
-// ToolExecuting + AskUserQuestionPending -> AwaitingUserResponse (REQ-AUQ-001, REQ-AUQ-006)
-(
-    ConvState::ToolExecuting {
-        remaining_tools,
-        persisted_tool_ids,
-        ..
-    },
-    Event::AskUserQuestionPending {
-        tool_use_id,
-        questions,
-    },
-) => Ok(
-    TransitionResult::new(ConvState::AwaitingUserResponse {
-        questions: questions.clone(),
-        tool_use_id,
-        remaining_tools: remaining_tools.clone(),
-        persisted_tool_ids: persisted_tool_ids.clone(),
-    })
-    .with_effect(Effect::PersistState)
-    .with_effect(Effect::notify_state_change(
-        "awaiting_user_response",
-        json!({ "questions": questions }),
-    )),
-),
+`AwaitingUserResponse` + `UserQuestionResponse` constructs the tool result and
+resumes execution: if remaining tools exist, transitions to `ToolExecuting`
+for the next tool; otherwise transitions to `LlmRequesting`.
 
-// AwaitingUserResponse + UserQuestionResponse -> continue (REQ-AUQ-003)
-(
-    ConvState::AwaitingUserResponse {
-        tool_use_id,
-        remaining_tools,
-        mut persisted_tool_ids,
-        ..
-    },
-    Event::UserQuestionResponse { answers },
-) => {
-    let result_json = serde_json::json!({ "answers": answers });
-    let tool_result = ToolResult::success(tool_use_id.clone(), result_json.to_string());
-    persisted_tool_ids.insert(tool_use_id.clone());
+`AwaitingUserResponse` + `UserCancel` constructs an error tool result ("User
+declined to answer") and transitions to `Idle`.
 
-    if remaining_tools.is_empty() {
-        // No more tools, back to LLM
-        Ok(
-            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::PersistToolResults {
-                    results: vec![tool_result],
-                })
-                .with_effect(Effect::PersistState)
-                .with_effect(notify_llm_requesting(1))
-                .with_effect(Effect::RequestLlm),
-        )
-    } else {
-        // More tools to execute
-        let next = remaining_tools[0].clone();
-        let rest = remaining_tools[1..].to_vec();
+## Executor Integration (REQ-AUQ-001, REQ-AUQ-005, REQ-AUQ-006)
 
-        Ok(
-            TransitionResult::new(ConvState::ToolExecuting {
-                current_tool: next.clone(),
-                remaining_tools: rest,
-                persisted_tool_ids,
-                pending_sub_agents: vec![],
-            })
-            .with_effect(Effect::PersistToolResults {
-                results: vec![tool_result],
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::execute_tool(next)),
-        )
-    }
-},
+The executor intercepts `ask_user_question` before normal tool dispatch.
+Sub-agents never see the tool (it is excluded from `ToolRegistry::for_subagent`
+per REQ-AUQ-006), so the executor check is defense-in-depth.
 
-// AwaitingUserResponse + UserCancel -> Idle (REQ-AUQ-003)
-(ConvState::AwaitingUserResponse { tool_use_id, .. }, Event::UserCancel) => {
-    let tool_result = ToolResult::error(
-        tool_use_id.clone(),
-        "User cancelled the question".to_string(),
-    );
-    Ok(
-        TransitionResult::new(ConvState::Idle)
-            .with_effect(Effect::PersistToolResults {
-                results: vec![tool_result],
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_agent_done()),
-    )
-},
+Validation (REQ-AUQ-005):
+- 1-4 questions, 2-4 options per question
+- Question texts unique across the submission
+- Option labels unique within each question
+- Preview fields only on single-select questions
+
+On validation failure, the tool result is an error with a specific message.
+On success, the executor emits `AskUserQuestionPending`.
+
+## Tool Result Format (REQ-AUQ-004)
+
+The tool result delivered to the LLM is a formatted string, not raw JSON:
+
+```
+User has answered your questions: "Which library?" = "lodash" [user notes: but only for dates],
+"Auth method?" = "OAuth" selected preview:
+```oauth2
+grant_type=authorization_code
+```.
+You can now continue with the user's answers in mind.
 ```
 
-## Executor Integration (REQ-AUQ-001, REQ-AUQ-005)
+This format includes: the question text, the selected label, any preview content
+from the selected option, and any user-added notes. The trailing instruction
+reminds the model to incorporate the answers.
 
-```rust
-// src/runtime/executor.rs
-
-// In execute_tool dispatch, before normal tool execution:
-if tool.name() == "ask_user_question" {
-    return self.handle_ask_user_question(tool).await;
-}
-
-async fn handle_ask_user_question(
-    &mut self,
-    tool: ToolCall,
-) -> Result<Option<Event>, String> {
-    // REQ-AUQ-005: Sub-agents cannot ask questions
-    if self.context.is_sub_agent {
-        return Ok(Some(Event::ToolComplete {
-            tool_use_id: tool.id.clone(),
-            result: ToolResult::error(
-                tool.id,
-                "ask_user_question is not available to sub-agents",
-            ),
-        }));
-    }
-
-    // Parse and validate input
-    let input: AskUserQuestionInput = match serde_json::from_value(tool.input.to_value()) {
-        Ok(i) => i,
-        Err(e) => {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool.id.clone(),
-                result: ToolResult::error(tool.id, format!("Invalid input: {e}")),
-            }));
-        }
-    };
-
-    // Validate constraints
-    if input.questions.is_empty() || input.questions.len() > 4 {
-        return Ok(Some(Event::ToolComplete {
-            tool_use_id: tool.id.clone(),
-            result: ToolResult::error(tool.id, "Must have 1-4 questions"),
-        }));
-    }
-
-    for q in &input.questions {
-        if q.options.len() < 2 || q.options.len() > 4 {
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id: tool.id.clone(),
-                result: ToolResult::error(
-                    tool.id,
-                    format!("Question '{}' must have 2-4 options", q.question),
-                ),
-            }));
-        }
-    }
-
-    // Emit pending event to transition state
-    Ok(Some(Event::AskUserQuestionPending {
-        tool_use_id: tool.id,
-        questions: input.questions,
-    }))
-}
-```
-
-## Tool Implementation (REQ-AUQ-004)
-
-The tool struct exists for schema/description purposes only. Execution is handled by executor interception.
+## Tool Implementation (REQ-AUQ-001, REQ-AUQ-008)
 
 ```rust
 // src/tools/ask_user_question.rs
 
 pub struct AskUserQuestionTool;
 
-#[async_trait]
 impl Tool for AskUserQuestionTool {
-    fn name(&self) -> &str {
-        "ask_user_question"
-    }
+    fn name(&self) -> &str { "ask_user_question" }
 
     fn description(&self) -> String {
         "Ask the user clarifying questions when you need input to proceed. \
-         Use when there are multiple valid approaches and user preference matters. \
-         Provide 1-4 questions with 2-4 options each. \
-         NOT available to sub-agents."
+         Use when there are multiple valid approaches and user preference \
+         matters. Provide 1-4 questions with 2-4 options each. Users can \
+         also type custom answers."
             .to_string()
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["questions"],
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "description": "1-4 questions to ask the user",
-                    "minItems": 1,
-                    "maxItems": 4,
-                    "items": {
-                        "type": "object",
-                        "required": ["question", "options"],
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The full question text"
-                            },
-                            "header": {
-                                "type": "string",
-                                "description": "Short label (max 12 chars)"
-                            },
-                            "options": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 4,
-                                "items": {
-                                    "type": "object",
-                                    "required": ["label"],
-                                    "properties": {
-                                        "label": { "type": "string" },
-                                        "description": { "type": "string" }
-                                    }
-                                }
-                            },
-                            "multiSelect": {
-                                "type": "boolean",
-                                "default": false
-                            }
-                        }
-                    }
-                }
-            }
-        })
-    }
+    fn input_schema(&self) -> Value { /* see REQ-AUQ-001 schema */ }
 
-    async fn run(&self, _input: Value, _cancel: CancellationToken) -> ToolOutput {
-        // This should never be called - executor intercepts
+    async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+        // Executor intercepts -- this is unreachable
         ToolOutput::error("ask_user_question must be handled by executor")
     }
 }
 ```
 
-## API Endpoint (REQ-AUQ-002, REQ-AUQ-003)
+The tool is registered in all non-sub-agent registries (Explore, Standalone,
+Work). It is NOT registered in `ToolRegistry::for_subagent()`.
 
-```rust
-// src/api/routes.rs
+The tool uses `defer_loading: true` via the existing MCP tool search mechanism.
+On models without tool search support, it appears in the standard tool list.
 
-#[derive(Deserialize)]
-struct UserQuestionResponsePayload {
-    answers: HashMap<String, String>,
-}
+## API Endpoint (REQ-AUQ-003, REQ-AUQ-004)
 
-/// POST /conversations/{id}/respond
-async fn respond_to_question(
-    State(manager): State<Arc<RuntimeManager>>,
-    Path(conversation_id): Path<String>,
-    Json(payload): Json<UserQuestionResponsePayload>,
-) -> impl IntoResponse {
-    manager
-        .send_event(
-            &conversation_id,
-            Event::UserQuestionResponse {
-                answers: payload.answers,
-            },
-        )
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+```
+POST /api/conversations/{id}/respond
+```
+
+Request body:
+
+```json
+{
+  "answers": { "Which library?": "lodash", "Auth method?": "OAuth" },
+  "annotations": {
+    "Which library?": { "notes": "but only for dates" },
+    "Auth method?": { "preview": "grant_type=authorization_code\n..." }
+  }
 }
 ```
 
-## UI Components (REQ-AUQ-001, REQ-AUQ-002, REQ-AUQ-006)
+The handler sends a `UserQuestionResponse` event to the state machine.
+If the conversation is not in `AwaitingUserResponse` state, returns 409
+Conflict.
 
-When SSE state_change event arrives with `type: "awaiting_user_response"`:
+## UI Components (REQ-AUQ-001, REQ-AUQ-002, REQ-AUQ-003, REQ-AUQ-007)
 
-1. Display each question with its header and full text
-2. Show options as radio buttons (single-select) or checkboxes (multi-select)
-3. Include "Other" option with text input for free-text responses
-4. Submit button sends POST to `/conversations/{id}/respond`
-5. Cancel button sends POST to `/conversations/{id}/cancel`
+When SSE `state_change` event arrives with `type: "awaiting_user_response"`:
 
-## Tool Registry (REQ-AUQ-004, REQ-AUQ-005)
-
-```rust
-// src/tools.rs - in ToolRegistry::new_with_options
-
-if !is_sub_agent {
-    // Parent conversations can ask questions and spawn sub-agents
-    tools.push(Arc::new(AskUserQuestionTool));
-    tools.push(Arc::new(SpawnAgentsTool));
-}
-```
+1. Display each question with its header chip and full question text
+2. For single-select without previews: radio button list
+3. For single-select with previews: side-by-side layout (option list left,
+   preview right, updating on focus/hover)
+4. For multi-select: checkbox list (no preview support)
+5. Each question shows an "Other" text input as the last option
+6. Optional notes field per question for user annotations
+7. Submit button sends POST to `/api/conversations/{id}/respond`
+8. Decline button sends POST to `/api/conversations/{id}/cancel`
 
 ## Testing Strategy
 
 ### Unit Tests
-- Input validation (question/option counts)
-- State transitions (all paths)
-- Tool result formatting
-
-### Integration Tests
-- Full flow: tool call -> waiting state -> user response -> continuation
-- Sub-agent rejection
-- Cancellation path
-- Multiple questions with mixed single/multi-select
+- Input validation: question/option count constraints, uniqueness checks
+- State transitions: all three paths (respond, cancel, sub-agent rejection)
+- Tool result formatting: answers with/without previews and notes
 
 ### Property Tests
-```rust
-#[proptest]
-fn answers_always_valid_json(answers: HashMap<String, String>) {
-    let result = serde_json::json!({ "answers": answers });
-    assert!(serde_json::to_string(&result).is_ok());
-}
-```
+- Arbitrary valid `AskUserQuestionInput` round-trips through serde
+- `UserQuestionResponse` with arbitrary answer maps produces valid tool results
+- Uniqueness validation rejects inputs with duplicate question/option text
 
-## File Organization
-
-```
-src/
-├── tools/
-│   ├── mod.rs                  # Add AskUserQuestionTool export
-│   └── ask_user_question.rs    # Tool implementation (NEW)
-├── state_machine/
-│   ├── state.rs                # Add AwaitingUserResponse, types
-│   ├── event.rs                # Add events
-│   └── transition.rs           # Add transitions
-├── runtime/
-│   └── executor.rs             # Add interception logic
-└── api/
-    └── routes.rs               # Add /respond endpoint
-```
+### Integration Tests
+- Full flow: tool call -> waiting state -> user response -> LLM continuation
+- Cancellation mid-wait
+- Multiple questions with mixed single/multi-select
+- Preview rendering (visual QA)

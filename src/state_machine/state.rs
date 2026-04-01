@@ -5,6 +5,7 @@ use crate::llm::ContentBlock;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -83,6 +84,50 @@ pub struct ProposePlanInput {
     pub plan: String,
 }
 
+/// A single question presented to the user (REQ-AUQ-001)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    #[serde(default, rename = "multiSelect")]
+    pub multi_select: bool,
+}
+
+/// An option within a user question
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// Annotations the user can attach to an answer
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnnotation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Input for the `ask_user_question` tool (REQ-AUQ-001)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskUserQuestionInput {
+    pub questions: Vec<UserQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<QuestionMetadata>,
+}
+
+/// Optional metadata for an `ask_user_question` invocation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// Strongly typed tool input enum
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
@@ -96,6 +141,7 @@ pub enum ToolInput {
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
     ProposePlan(ProposePlanInput),
+    AskUserQuestion(AskUserQuestionInput),
     /// Fallback for unknown tools or parsing failures
     Unknown {
         name: String,
@@ -116,6 +162,7 @@ impl ToolInput {
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
             ToolInput::ProposePlan(_) => "propose_plan",
+            ToolInput::AskUserQuestion(_) => "ask_user_question",
             ToolInput::Unknown { name, .. } => name,
         }
     }
@@ -137,6 +184,7 @@ impl ToolInput {
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::ProposePlan(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::AskUserQuestion(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } => input.clone(),
         }
     }
@@ -206,6 +254,13 @@ impl ToolInput {
                     input: value,
                 },
                 ToolInput::ProposePlan,
+            ),
+            "ask_user_question" => serde_json::from_value(value.clone()).map_or_else(
+                |_| ToolInput::Unknown {
+                    name: name.to_string(),
+                    input: value,
+                },
+                ToolInput::AskUserQuestion,
             ),
             _ => ToolInput::Unknown {
                 name: name.to_string(),
@@ -381,6 +436,14 @@ pub enum ConvState {
         plan: String,
     },
 
+    /// Awaiting user answers to clarifying questions (REQ-AUQ-001)
+    AwaitingUserResponse {
+        questions: Vec<UserQuestion>,
+        tool_use_id: String,
+        remaining_tools: Vec<ToolCall>,
+        persisted_tool_ids: HashSet<String>,
+    },
+
     /// Context window exhausted - conversation is read-only
     ContextExhausted {
         /// The continuation summary
@@ -493,7 +556,8 @@ impl ConvState {
             | ConvState::CancellingSubAgents { .. }
             | ConvState::Error { .. }
             | ConvState::AwaitingContinuation { .. }
-            | ConvState::AwaitingTaskApproval { .. } => StepResult::Continue,
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. } => StepResult::Continue,
         }
     }
 
@@ -503,7 +567,9 @@ impl ConvState {
         match self {
             ConvState::Idle => DisplayState::Idle,
             ConvState::Error { .. } => DisplayState::Error,
-            ConvState::AwaitingTaskApproval { .. } => DisplayState::AwaitingApproval,
+            ConvState::AwaitingTaskApproval { .. } | ConvState::AwaitingUserResponse { .. } => {
+                DisplayState::AwaitingApproval
+            }
             ConvState::ContextExhausted { .. }
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }

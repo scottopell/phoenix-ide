@@ -20,6 +20,7 @@ use super::state::{
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -63,6 +64,8 @@ pub enum TransitionError {
     ContextExhausted,
     #[error("Conversation is awaiting task approval")]
     AwaitingTaskApproval,
+    #[error("Conversation is awaiting user response to questions")]
+    AwaitingUserResponse,
     #[error("Conversation has reached terminal state (completed or abandoned)")]
     ConversationTerminal,
     #[error("Invalid transition: {0}")]
@@ -118,6 +121,12 @@ pub fn transition(
             ConvState::AwaitingTaskApproval { .. },
             Event::UserMessage { .. } | Event::UserTriggerContinuation,
         ) => Err(TransitionError::AwaitingTaskApproval),
+
+        // AwaitingUserResponse + UserMessage -> Reject (REQ-AUQ-001)
+        (
+            ConvState::AwaitingUserResponse { .. },
+            Event::UserMessage { .. } | Event::UserTriggerContinuation,
+        ) => Err(TransitionError::AwaitingUserResponse),
 
         (
             ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. },
@@ -182,6 +191,45 @@ pub fn transition(
                     )));
                 }
                 unreachable!("propose_plan_tool matched but input was not ProposePlan");
+            }
+
+            // REQ-AUQ-001: Intercept ask_user_question
+            let ask_question_tool = tool_calls
+                .iter()
+                .find(|t| matches!(t.input, ToolInput::AskUserQuestion(_)));
+            if let Some(tool) = ask_question_tool {
+                if tool_calls.len() > 1 {
+                    return Err(TransitionError::InvalidTransition(
+                        "ask_user_question must be the only tool in response".to_string(),
+                    ));
+                }
+                if let ToolInput::AskUserQuestion(ref input) = tool.input {
+                    let tool_result = ToolResult::success(
+                        tool.id.clone(),
+                        "Questions submitted for user review".to_string(),
+                    );
+                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let assistant_message =
+                        AssistantMessage::new(content, Some(usage_data), display_data);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
+                            "ask_user_question produces exactly one tool_use and one result",
+                        );
+
+                    return Ok(TransitionResult::new(ConvState::AwaitingUserResponse {
+                        questions: input.questions.clone(),
+                        tool_use_id: tool.id.clone(),
+                        remaining_tools: vec![],
+                        persisted_tool_ids: HashSet::new(),
+                    })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change(
+                        "awaiting_user_response",
+                        json!({ "questions": input.questions }),
+                    )));
+                }
+                unreachable!("ask_question_tool matched but input was not AskUserQuestion");
             }
 
             // REQ-BED-019: Check context threshold BEFORE tool execution
@@ -990,6 +1038,72 @@ pub fn transition(
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()))
+        }
+
+        // ============================================================
+        // Ask User Question (REQ-AUQ-001)
+        // ============================================================
+
+        // AwaitingUserResponse + UserQuestionResponse -> LlmRequesting
+        (
+            ConvState::AwaitingUserResponse {
+                tool_use_id,
+                questions: _,
+                ..
+            },
+            Event::UserQuestionResponse {
+                answers,
+                annotations,
+            },
+        ) => {
+            // Format tool result as human-readable string
+            let answers_text = answers
+                .iter()
+                .map(|(q, a)| {
+                    let mut parts = vec![format!("\"{}\"=\"{}\"", q, a)];
+                    if let Some(ref anns) = annotations {
+                        if let Some(ann) = anns.get(q.as_str()) {
+                            if let Some(ref preview) = ann.preview {
+                                parts.push(format!("selected preview:\n{preview}"));
+                            }
+                            if let Some(ref notes) = ann.notes {
+                                parts.push(format!("user notes: {notes}"));
+                            }
+                        }
+                    }
+                    parts.join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let result_text = format!(
+                "User has answered your questions: {answers_text}. \
+                 You can now continue with the user's answers in mind."
+            );
+
+            Ok(
+                TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                    .with_effect(Effect::PersistToolResults {
+                        results: vec![ToolResult::success(tool_use_id.clone(), result_text)],
+                    })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::RequestLlm),
+            )
+        }
+
+        // AwaitingUserResponse + UserCancel -> Idle
+        (ConvState::AwaitingUserResponse { tool_use_id, .. }, Event::UserCancel) => {
+            Ok(TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistToolResults {
+                    results: vec![ToolResult::error(
+                        tool_use_id.clone(),
+                        "User declined to answer questions. Proceed using your own judgment."
+                            .to_string(),
+                    )],
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -1996,6 +2110,262 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
             "Parent should NOT have NotifyParent effect"
+        );
+    }
+
+    // ========================================================================
+    // Ask User Question Tests (REQ-AUQ-001)
+    // ========================================================================
+
+    fn make_ask_user_question_tool_call(tool_id: &str) -> ToolCall {
+        use crate::state_machine::state::{
+            AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion,
+        };
+        ToolCall::new(
+            tool_id,
+            ToolInput::AskUserQuestion(AskUserQuestionInput {
+                questions: vec![UserQuestion {
+                    question: "Which library?".to_string(),
+                    header: "Dependencies".to_string(),
+                    options: vec![
+                        QuestionOption {
+                            label: "lodash".to_string(),
+                            description: None,
+                            preview: None,
+                        },
+                        QuestionOption {
+                            label: "ramda".to_string(),
+                            description: None,
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+                metadata: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn test_llm_response_with_ask_user_question_goes_to_awaiting() {
+        use crate::llm::{ContentBlock, Usage};
+
+        let ctx = test_context();
+        let tool = make_ask_user_question_tool_call("tool-auq-1");
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ctx,
+            Event::LlmResponse {
+                content: vec![
+                    ContentBlock::text("Let me ask you something"),
+                    ContentBlock::ToolUse {
+                        id: "tool-auq-1".to_string(),
+                        name: "ask_user_question".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+                tool_calls: vec![tool],
+                end_turn: false,
+                usage: Usage::default(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::AwaitingUserResponse { .. }),
+            "Should go to AwaitingUserResponse, got {:?}",
+            result.new_state
+        );
+
+        // Should have PersistCheckpoint + PersistState
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+            "Should have PersistCheckpoint effect"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistState)),
+            "Should have PersistState effect"
+        );
+    }
+
+    #[test]
+    fn test_ask_user_question_must_be_only_tool() {
+        use crate::llm::{ContentBlock, Usage};
+        use crate::state_machine::state::{BashInput, BashMode, ToolInput};
+
+        let ctx = test_context();
+        let auq_tool = make_ask_user_question_tool_call("tool-auq-1");
+        let bash_tool = ToolCall::new(
+            "tool-bash-1",
+            ToolInput::Bash(BashInput {
+                command: "echo test".to_string(),
+                mode: BashMode::Default,
+            }),
+        );
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ctx,
+            Event::LlmResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "tool-auq-1".to_string(),
+                        name: "ask_user_question".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-bash-1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"command": "echo test"}),
+                    },
+                ],
+                tool_calls: vec![auq_tool, bash_tool],
+                end_turn: false,
+                usage: Usage::default(),
+            },
+        );
+
+        assert!(
+            matches!(result, Err(TransitionError::InvalidTransition(_))),
+            "Should reject ask_user_question with other tools, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_awaiting_user_response_with_answer_goes_to_llm_requesting() {
+        use crate::state_machine::state::UserQuestion;
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which library?".to_string(),
+                header: "Dependencies".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "tool-auq-1".to_string(),
+            remaining_tools: vec![],
+            persisted_tool_ids: std::collections::HashSet::new(),
+        };
+
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which library?".to_string(), "lodash".to_string());
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionResponse {
+                answers,
+                annotations: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+            "Should go to LlmRequesting, got {:?}",
+            result.new_state
+        );
+
+        // Should have PersistToolResults + PersistState + RequestLlm
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistToolResults { .. })),
+            "Should have PersistToolResults effect"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Should have RequestLlm effect"
+        );
+    }
+
+    #[test]
+    fn test_awaiting_user_response_cancel_goes_to_idle() {
+        use crate::state_machine::state::UserQuestion;
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which library?".to_string(),
+                header: "Dependencies".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "tool-auq-1".to_string(),
+            remaining_tools: vec![],
+            persisted_tool_ids: std::collections::HashSet::new(),
+        };
+
+        let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::Idle),
+            "Should go to Idle, got {:?}",
+            result.new_state
+        );
+
+        // Should have PersistToolResults with error result
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistToolResults { .. })),
+            "Should have PersistToolResults effect"
+        );
+
+        // Should have agent_done notification
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::NotifyClient { event_type, .. } if event_type == "agent_done"
+            )),
+            "Should have agent_done notification"
+        );
+    }
+
+    #[test]
+    fn test_awaiting_user_response_rejects_user_message() {
+        use crate::state_machine::state::UserQuestion;
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which library?".to_string(),
+                header: "Dependencies".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "tool-auq-1".to_string(),
+            remaining_tools: vec![],
+            persisted_tool_ids: std::collections::HashSet::new(),
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserMessage {
+                text: "hello".to_string(),
+                llm_text: None,
+                images: vec![],
+                message_id: "msg-1".to_string(),
+                user_agent: None,
+            },
+        );
+
+        assert!(
+            matches!(result, Err(TransitionError::AwaitingUserResponse)),
+            "Should reject user messages with AwaitingUserResponse error, got {:?}",
+            result
         );
     }
 }
