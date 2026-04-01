@@ -1,4 +1,4 @@
-/* --- Question Panel (inline, replaces InputArea) --- */
+/* --- Question Panel (wizard, one question at a time) --- */
 
 .question-panel {
   display: flex;
@@ -7,23 +7,37 @@
   border-top: 1px solid var(--border-color);
 }
 
-.question-panel-label {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-muted);
+/* Wizard header: step counter + decline button */
+.question-wizard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 8px 16px 0;
 }
 
-.question-panel-content {
-  overflow-y: auto;
-  max-height: 50vh;
+.question-step-indicator {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Single question content area */
+.question-wizard-content {
   padding: 8px 16px 12px;
-  -webkit-overflow-scrolling: touch;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+  animation: wizardFadeIn 150ms ease-out;
+}
+
+@keyframes wizardFadeIn {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 /* Individual question block */
@@ -105,7 +119,7 @@
   padding: 8px 10px;
   border-radius: 6px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s, box-shadow 0.15s;
   border: 1px solid transparent;
 }
 
@@ -113,13 +127,19 @@
   background: var(--bg-hover, var(--bg-tertiary));
 }
 
+/* Selection state: filled radio/checkbox visual */
 .question-option.selected {
   background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
   border-color: var(--accent-blue);
 }
 
-.question-option input[type="radio"],
-.question-option input[type="checkbox"] {
+/* Focus ring: visual indicator from keyboard navigation, separate from selection */
+.question-option.focused {
+  box-shadow: 0 0 0 2px var(--accent-blue);
+}
+
+.question-option input[type='radio'],
+.question-option input[type='checkbox'] {
   margin-top: 3px;
   flex-shrink: 0;
   accent-color: var(--accent-blue);
@@ -152,7 +172,7 @@
   padding: 8px 10px;
   border-radius: 6px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s, box-shadow 0.15s;
   border: 1px solid transparent;
 }
 
@@ -165,8 +185,12 @@
   border-color: var(--accent-blue);
 }
 
-.question-other input[type="radio"],
-.question-other input[type="checkbox"] {
+.question-other.focused {
+  box-shadow: 0 0 0 2px var(--accent-blue);
+}
+
+.question-other input[type='radio'],
+.question-other input[type='checkbox'] {
   margin-top: 3px;
   flex-shrink: 0;
   accent-color: var(--accent-blue);
@@ -279,10 +303,34 @@
   background: transparent;
   color: var(--accent-red);
   border: 1px solid var(--accent-red);
+  padding: 4px 10px;
+  font-size: 13px;
 }
 
 .question-btn--decline:hover:not(:disabled) {
   background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+}
+
+/* Navigation buttons (Back / Next) */
+.question-btn--nav {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.question-btn--nav:hover:not(:disabled) {
+  background: var(--bg-hover, var(--bg-tertiary));
+  border-color: var(--text-muted);
+}
+
+.question-btn--next {
+  background: var(--accent-blue);
+  color: #fff;
+  border-color: var(--accent-blue);
+}
+
+.question-btn--next:hover:not(:disabled) {
+  opacity: 0.9;
 }
 
 /* Inline feedback */
@@ -297,6 +345,12 @@
 }
 
 @keyframes questionFeedbackIn {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
