@@ -262,14 +262,24 @@ def stop_process(pid_file: Path, name: str) -> bool:
     if pid is None:
         return False
     try:
-        os.kill(pid, signal.SIGTERM)
+        # Kill the entire process group to catch child workers (e.g., Vite
+        # spawns node child processes that survive if only the parent is killed)
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
         # Wait briefly for graceful shutdown
         for _ in range(10):
             if not is_process_running(pid):
                 break
             time.sleep(0.1)
         else:
-            os.kill(pid, signal.SIGKILL)
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
         print(f"Stopped {name} (PID {pid})")
     except OSError as e:
         print(f"Could not stop {name}: {e}")
