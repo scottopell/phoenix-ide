@@ -78,10 +78,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/reject-task", post(reject_task))
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
         // User question response (REQ-AUQ-003)
-        .route(
-            "/api/conversations/:id/respond",
-            post(respond_to_question),
-        )
+        .route("/api/conversations/:id/respond", post(respond_to_question))
         // Task completion (REQ-PROJ-009)
         .route("/api/conversations/:id/complete-task", post(complete_task))
         .route(

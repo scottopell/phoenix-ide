@@ -167,6 +167,14 @@ pub trait Tool: Send + Sync {
     /// JSON schema for tool input
     fn input_schema(&self) -> Value;
 
+    /// Whether this tool's full definition should be deferred (lazy-loaded on demand).
+    /// Deferred tools send only name + description to the LLM initially, reducing
+    /// prompt size when there are many tools. Override to `true` for rarely-used
+    /// built-in tools (REQ-AUQ-008).
+    fn defer_loading(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with all context provided via `ToolContext`
     ///
     /// Tools that spawn long-running subprocesses should monitor
@@ -277,7 +285,7 @@ impl ToolRegistry {
                 name: t.name().to_string(),
                 description: t.description(),
                 input_schema: t.input_schema(),
-                defer_loading: false,
+                defer_loading: t.defer_loading(),
             })
             .collect()
     }
