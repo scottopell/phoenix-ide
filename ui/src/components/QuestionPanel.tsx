@@ -465,27 +465,32 @@ function QuestionItem({
         <div className="question-options">{renderOptions()}</div>
       )}
 
-      <div className="question-notes">
-        <button
-          className="question-notes-toggle"
-          onClick={() => onToggleNotes(q.question)}
-        >
-          {notesExpanded ? (
-            <ChevronDown size={14} />
-          ) : (
-            <ChevronRight size={14} />
+      {/* Notes only for single-select with previews -- users comparing
+          concrete artifacts may want to qualify their selection. For plain
+          single-select or multi-select, "Other" free-text is sufficient. */}
+      {isPreviewMode && (
+        <div className="question-notes">
+          <button
+            className="question-notes-toggle"
+            onClick={() => onToggleNotes(q.question)}
+          >
+            {notesExpanded ? (
+              <ChevronDown size={14} />
+            ) : (
+              <ChevronRight size={14} />
+            )}
+            Add notes
+          </button>
+          {notesExpanded && (
+            <textarea
+              placeholder="Optional notes for the agent..."
+              value={notesText}
+              onChange={(e) => onSetNotes(q.question, e.target.value)}
+              rows={2}
+            />
           )}
-          Add notes
-        </button>
-        {notesExpanded && (
-          <textarea
-            placeholder="Optional notes for the agent..."
-            value={notesText}
-            onChange={(e) => onSetNotes(q.question, e.target.value)}
-            rows={2}
-          />
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
