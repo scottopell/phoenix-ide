@@ -13,11 +13,8 @@ import { api } from '../api';
 import type { UserQuestion } from '../api';
 import {
   Check,
-  XCircle,
   ChevronDown,
   ChevronRight,
-  ChevronLeft,
-  ArrowRight,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 import './QuestionPanel.css';
@@ -456,23 +453,66 @@ export function QuestionPanel({
     showToast,
   ]);
 
+  // Per-question answered check for breadcrumb indicators
+  const isQuestionAnswered = useCallback(
+    (q: UserQuestion): boolean => {
+      if (q.multiSelect) {
+        const sel = multiSelections[q.question];
+        if (!sel || sel.size === 0) {
+          return (
+            answers[q.question] === OTHER_SENTINEL &&
+            (otherTexts[q.question] ?? '').trim().length > 0
+          );
+        }
+        if (sel.has(OTHER_SENTINEL)) {
+          return (otherTexts[q.question] ?? '').trim().length > 0;
+        }
+        return true;
+      }
+      const answer = answers[q.question];
+      if (!answer) return false;
+      if (answer === OTHER_SENTINEL) {
+        return (otherTexts[q.question] ?? '').trim().length > 0;
+      }
+      return true;
+    },
+    [answers, otherTexts, multiSelections]
+  );
+
   if (!currentQuestion) return null;
 
   return (
     <div className="question-panel">
-      <div className="question-wizard-header">
-        <span className="question-step-indicator">
-          {currentStep + 1} / {totalSteps}
-        </span>
-        <button
-          className="question-btn question-btn--decline"
-          onClick={handleDeclineClick}
-          disabled={submitting}
-        >
-          <XCircle size={16} />
-          Decline
-        </button>
-      </div>
+      {/* Breadcrumb navigation: each question's header as a clickable tab */}
+      {totalSteps > 1 && (
+        <div className="question-breadcrumbs">
+          {questions.map((q, i) => {
+            const isCurrent = i === currentStep;
+            const answered = isQuestionAnswered(q);
+            return (
+              <span key={q.question} className="question-breadcrumb-item">
+                {i > 0 && (
+                  <ChevronRight
+                    size={12}
+                    className="question-breadcrumb-separator"
+                  />
+                )}
+                <button
+                  className={`question-breadcrumb${isCurrent ? ' current' : ''}${answered && !isCurrent ? ' answered' : ''}${!answered && !isCurrent ? ' unanswered' : ''}`}
+                  onClick={() => goToStep(i)}
+                  disabled={submitting}
+                  title={q.question}
+                >
+                  {answered && !isCurrent && (
+                    <Check size={12} className="question-breadcrumb-check" />
+                  )}
+                  {q.header}
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      )}
 
       <div className="question-wizard-content">
         <QuestionItem
@@ -503,12 +543,11 @@ export function QuestionPanel({
 
       <div className="question-actions">
         <button
-          className="question-btn question-btn--nav"
-          onClick={goBack}
-          disabled={isFirstStep || submitting}
+          className="question-btn question-btn--decline-small"
+          onClick={handleDeclineClick}
+          disabled={submitting}
         >
-          <ChevronLeft size={16} />
-          Back
+          Decline
         </button>
 
         <ConfirmDialog
@@ -530,30 +569,19 @@ export function QuestionPanel({
               {feedback.message}
             </span>
           )}
-          {isLastStep ? (
-            <button
-              className="question-btn question-btn--submit"
-              onClick={handleSubmit}
-              disabled={!allAnswered || submitting}
-              title={
-                !allAnswered
-                  ? 'Answer all questions before submitting'
-                  : undefined
-              }
-            >
-              <Check size={16} />
-              {submitting ? 'Sending...' : 'Submit'}
-            </button>
-          ) : (
-            <button
-              className="question-btn question-btn--nav question-btn--next"
-              onClick={goNext}
-              disabled={submitting}
-            >
-              Next
-              <ArrowRight size={16} />
-            </button>
-          )}
+          <button
+            className="question-btn question-btn--submit"
+            onClick={handleSubmit}
+            disabled={!allAnswered || submitting}
+            title={
+              !allAnswered
+                ? 'Answer all questions before submitting'
+                : undefined
+            }
+          >
+            <Check size={16} />
+            {submitting ? 'Sending...' : 'Submit'}
+          </button>
         </div>
       </div>
     </div>
