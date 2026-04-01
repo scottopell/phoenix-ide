@@ -42,6 +42,12 @@ export function useGlobalKeyboardShortcuts() {
       // Don't handle other keys in inputs
       if (isInput) return;
 
+      if (e.key === '?') {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('toggle-shortcut-help'));
+        return;
+      }
+
       if (e.key === '/') {
         // Focus the message input if on conversation page
         if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/')) {
