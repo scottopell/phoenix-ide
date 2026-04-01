@@ -9,7 +9,6 @@ import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { useToast } from '../hooks/useToast';
-import { FocusScopeProvider } from '../hooks/useFocusScope';
 
 interface DesktopLayoutProps {
   children: React.ReactNode;
@@ -87,11 +86,10 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   );
 
   if (!isDesktop) {
-    return <FocusScopeProvider><FileExplorerProvider>{children}</FileExplorerProvider></FocusScopeProvider>;
+    return <FileExplorerProvider>{children}</FileExplorerProvider>;
   }
 
   return (
-    <FocusScopeProvider>
     <FileExplorerProvider>
       <div className="desktop-layout">
         <Sidebar
@@ -118,6 +116,5 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
     </FileExplorerProvider>
-    </FocusScopeProvider>
   );
 }

@@ -3,7 +3,7 @@ import { ConversationListPage } from './pages/ConversationListPage';
 import { ConversationPage } from './pages/ConversationPage';
 import { NewConversationPage } from './pages/NewConversationPage';
 import { DesktopLayout } from './components/DesktopLayout';
-import { useGlobalKeyboardShortcuts } from './hooks';
+import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
 import { ConversationProvider } from './conversation';
 import './index.css';
 
@@ -25,9 +25,11 @@ function AppRoutes() {
 function App() {
   return (
     <BrowserRouter>
-      <ConversationProvider>
-        <AppRoutes />
-      </ConversationProvider>
+      <FocusScopeProvider>
+        <ConversationProvider>
+          <AppRoutes />
+        </ConversationProvider>
+      </FocusScopeProvider>
     </BrowserRouter>
   );
 }
