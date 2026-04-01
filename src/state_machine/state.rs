@@ -5,7 +5,6 @@ use crate::llm::ContentBlock;
 use crate::tools::patch::types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -436,12 +435,12 @@ pub enum ConvState {
         plan: String,
     },
 
-    /// Awaiting user answers to clarifying questions (REQ-AUQ-001)
+    /// Awaiting user answers to clarifying questions (REQ-AUQ-001).
+    /// `ask_user_question` must be the sole tool in a response, so there are
+    /// no remaining tools or persisted tool IDs to carry.
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
-        remaining_tools: Vec<ToolCall>,
-        persisted_tool_ids: HashSet<String>,
     },
 
     /// Context window exhausted - conversation is read-only

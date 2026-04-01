@@ -20,7 +20,6 @@ use super::state::{
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -219,8 +218,6 @@ pub fn transition(
                     return Ok(TransitionResult::new(ConvState::AwaitingUserResponse {
                         questions: input.questions.clone(),
                         tool_use_id: tool.id.clone(),
-                        remaining_tools: vec![],
-                        persisted_tool_ids: HashSet::new(),
                     })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
@@ -1055,28 +1052,41 @@ pub fn transition(
         // message so the LLM sees them on the next turn without creating
         // a duplicate tool_result for the same tool_use_id.
         (
-            ConvState::AwaitingUserResponse { .. },
+            ConvState::AwaitingUserResponse { questions, .. },
             Event::UserQuestionResponse {
                 answers,
                 annotations,
             },
         ) => {
-            // Format answers as human-readable text for the user message
-            let answers_text = answers
+            // Format answers in question order (not HashMap iteration order)
+            // to produce deterministic, readable output for the LLM.
+            let answers_text = questions
                 .iter()
-                .map(|(q, a)| {
+                .filter_map(|q| {
+                    let a = answers.get(&q.question)?;
+                    let q = &q.question;
                     let mut parts = vec![format!("\"{}\" = \"{}\"", q, a)];
+                    // Derive preview from the server-side question state
+                    // (not from client-supplied annotation, which would be
+                    // a parallel representation of the same data).
+                    let question_data = questions.iter().find(|qq| qq.question == *q);
+                    if let Some(qd) = question_data {
+                        let selected_preview = qd.options.iter()
+                            .find(|o| o.label == *a)
+                            .and_then(|o| o.preview.as_deref());
+                        if let Some(preview) = selected_preview {
+                            parts.push(format!("selected preview:\n{preview}"));
+                        }
+                    }
+                    // Notes are user-supplied (not duplicated from server state)
                     if let Some(ref anns) = annotations {
                         if let Some(ann) = anns.get(q.as_str()) {
-                            if let Some(ref preview) = ann.preview {
-                                parts.push(format!("selected preview:\n{preview}"));
-                            }
                             if let Some(ref notes) = ann.notes {
                                 parts.push(format!("user notes: {notes}"));
                             }
                         }
                     }
-                    parts.join(" ")
+                    Some(parts.join(" "))
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -2257,8 +2267,6 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            remaining_tools: vec![],
-            persisted_tool_ids: std::collections::HashSet::new(),
         };
 
         let mut answers = std::collections::HashMap::new();
@@ -2309,8 +2317,6 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            remaining_tools: vec![],
-            persisted_tool_ids: std::collections::HashSet::new(),
         };
 
         let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
@@ -2352,8 +2358,6 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            remaining_tools: vec![],
-            persisted_tool_ids: std::collections::HashSet::new(),
         };
 
         let result = transition(

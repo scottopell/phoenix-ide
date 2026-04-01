@@ -1173,9 +1173,10 @@ async fn respond_to_question(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
-        return Err(AppError::BadRequest(
-            "Conversation is not awaiting a user response".to_string(),
-        ));
+        return Err(AppError::Conflict(ConflictErrorResponse {
+            error: "Conversation is not awaiting a user response".to_string(),
+            error_type: "wrong_state".to_string(),
+        }));
     }
 
     // 2. Dispatch response event to state machine

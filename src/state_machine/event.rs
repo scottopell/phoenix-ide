@@ -4,7 +4,6 @@ use crate::db::{ErrorKind, ImageData, ToolResult};
 use crate::llm::{ContentBlock, Usage};
 use crate::state_machine::state::{
     PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
-    UserQuestion,
 };
 use std::collections::HashMap;
 
@@ -89,14 +88,7 @@ pub enum Event {
     },
 
     // Ask user question events (REQ-AUQ-001)
-    /// Executor intercepted `ask_user_question` tool call, questions pending user input
-    #[allow(dead_code)] // Used by executor integration (later agent)
-    AskUserQuestionPending {
-        tool_use_id: String,
-        questions: Vec<UserQuestion>,
-    },
-    /// User answered the pending questions
-    #[allow(dead_code)] // Used by API handler (later agent)
+    /// User answered the pending questions (POST /api/conversations/{id}/respond)
     UserQuestionResponse {
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,

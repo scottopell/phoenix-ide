@@ -237,8 +237,6 @@ fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
         .prop_map(|(questions, tool_use_id)| ConvState::AwaitingUserResponse {
             questions,
             tool_use_id,
-            remaining_tools: vec![],
-            persisted_tool_ids: std::collections::HashSet::new(),
         })
 }
 
