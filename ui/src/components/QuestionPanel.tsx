@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
+import { formatShortcut } from '../utils';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
@@ -611,6 +612,7 @@ export function QuestionPanel({
           className="question-btn question-btn--decline-small"
           onClick={handleDeclineClick}
           disabled={submitting}
+          title="Escape to decline"
         >
           Decline
         </button>
@@ -641,7 +643,7 @@ export function QuestionPanel({
             title={
               !allAnswered
                 ? 'Answer all questions before submitting'
-                : undefined
+                : formatShortcut('Ctrl+Enter to submit')
             }
           >
             <Check size={16} />

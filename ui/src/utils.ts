@@ -2,6 +2,12 @@
 
 import type { ConversationState, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
 
+/** Format a keyboard shortcut for the current platform (Cmd on macOS, Ctrl elsewhere) */
+export function formatShortcut(shortcut: string): string {
+  const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+  return shortcut.replace(/Ctrl/g, isMac ? 'Cmd' : 'Ctrl');
+}
+
 export function escapeHtml(str: string): string {
   if (!str) return '';
   return str

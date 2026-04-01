@@ -14,7 +14,7 @@ import type { QueuedMessage } from '../hooks';
 import { useDraft } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
-import { isAgentWorking, isCancellingState } from '../utils';
+import { isAgentWorking, isCancellingState, formatShortcut } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
@@ -649,6 +649,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             id="send-btn"
             onClick={handleSend}
             disabled={!sendEnabled}
+            title="Enter to send"
           >
             Send
           </button>
