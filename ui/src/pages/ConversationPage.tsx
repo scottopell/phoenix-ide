@@ -10,8 +10,11 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { ProseReader } from '../components/ProseReader';
 import { TaskApprovalReader } from '../components/TaskApprovalReader';
+import { QuestionPanel } from '../components/QuestionPanel';
 import { FirstTaskWelcome } from '../components/FirstTaskWelcome';
 import { useMessageQueue, useConnection } from '../hooks';
+import { useToast } from '../hooks/useToast';
+import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
@@ -57,11 +60,15 @@ export function ConversationPage() {
   // App state for offline support
   const { isOnline, queueOperation } = useAppMachine();
 
+  // Toast for question panel feedback
+  const { toasts, dismissToast, showInfo } = useToast();
+
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
+  const [showQuestionPanel, setShowQuestionPanel] = useState(false);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // Message queue management
@@ -200,6 +207,15 @@ export function ConversationPage() {
       setShowTaskApproval(true);
     } else {
       setShowTaskApproval(false);
+    }
+  }, [atom.phase.type]);
+
+  // Auto-open/close question panel on state transitions
+  useEffect(() => {
+    if (atom.phase.type === 'awaiting_user_response') {
+      setShowQuestionPanel(true);
+    } else {
+      setShowQuestionPanel(false);
     }
   }, [atom.phase.type]);
 
@@ -551,7 +567,7 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
+      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'awaiting_user_response' ? (
         <>
         {conversationId && (
           <WorkActions
@@ -601,6 +617,16 @@ export function ConversationPage() {
           onSendFeedback={handleTaskFeedback}
         />
       )}
+
+      {/* Question panel overlay — agent asked for user input */}
+      {showQuestionPanel && atom.phase.type === 'awaiting_user_response' && (
+        <QuestionPanel
+          questions={atom.phase.questions}
+          conversationId={conversation.id}
+          showToast={showInfo}
+        />
+      )}
+      <Toast messages={toasts} onDismiss={dismissToast} />
 
       {/* First task welcome modal */}
       <FirstTaskWelcome
