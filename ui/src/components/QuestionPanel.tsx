@@ -300,25 +300,16 @@ export function QuestionPanel({
     }
   }, [isFirstStep, currentStep, goToStep]);
 
-  // --- Focus management: auto-focus on mount and step change ---
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // --- Focus management: auto-focus on mount and step change (REQ-KB-004) ---
   useEffect(() => {
     if (!currentQuestion) return;
-    // Determine initial focus for this step
-    let initialFocus = 0;
-    const ans = answers[currentQuestion.question];
-    if (ans) {
-      if (ans === OTHER_SENTINEL) {
-        initialFocus = currentQuestion.options.length;
-      } else {
-        const idx = currentQuestion.options.findIndex(
-          (o) => o.label === ans
-        );
-        if (idx >= 0) initialFocus = idx;
-      }
-    }
-    setFocusedIndex(initialFocus);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Only on mount
+    // Focus the panel root so it receives keyboard events
+    requestAnimationFrame(() => {
+      panelRef.current?.focus();
+    });
+  }, [currentStep, currentQuestion]);
 
   // --- Update focused preview when focusedIndex changes ---
   useEffect(() => {
@@ -362,101 +353,7 @@ export function QuestionPanel({
     }
   }, [currentQuestion, focusedIndex, toggleMultiSelect, setAnswer]);
 
-  // --- Keyboard handler ---
-  useEffect(() => {
-    if (!currentQuestion) return;
-
-    const handler = (e: KeyboardEvent) => {
-      // If confirm dialog is open, don't handle
-      if (showConfirmDecline) return;
-
-      const isInInput =
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement;
-
-      // Always handle Ctrl/Cmd+Enter for submit
-      if (
-        e.key === 'Enter' &&
-        (e.ctrlKey || e.metaKey)
-      ) {
-        e.preventDefault();
-        handleSubmit();
-        return;
-      }
-
-      // If typing in a text input, don't capture other keys
-      if (isInInput) return;
-
-      const count = optionCount(currentQuestion);
-
-      switch (e.key) {
-        case 'ArrowDown': {
-          e.preventDefault();
-          setFocusedIndex((prev) => Math.min(prev + 1, count - 1));
-          break;
-        }
-        case 'ArrowUp': {
-          e.preventDefault();
-          setFocusedIndex((prev) => Math.max(prev - 1, 0));
-          break;
-        }
-        case ' ': {
-          e.preventDefault();
-          selectFocusedOption();
-          break;
-        }
-        case 'Enter': {
-          e.preventDefault();
-          if (isLastStep) {
-            if (enterPressedOnLast) {
-              // Second press: submit
-              handleSubmit();
-            } else {
-              // First press: show toast
-              setEnterPressedOnLast(true);
-              showToast('Press Enter again to submit, or Ctrl+Enter', 3000);
-            }
-          } else {
-            goNext();
-          }
-          break;
-        }
-        case 'Tab': {
-          e.preventDefault();
-          if (e.shiftKey) {
-            goBack();
-          } else {
-            if (!isLastStep) {
-              goNext();
-            }
-          }
-          break;
-        }
-        case 'Escape': {
-          e.preventDefault();
-          setShowConfirmDecline(true);
-          break;
-        }
-      }
-    };
-
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [
-    currentQuestion,
-    currentStep,
-    focusedIndex,
-    isLastStep,
-    enterPressedOnLast,
-    showConfirmDecline,
-    handleSubmit,
-    selectFocusedOption,
-    goNext,
-    goBack,
-    showToast,
-  ]);
-
-  // Per-question answered check for breadcrumb indicators
+  // Per-question answered check (used by keyboard handler + breadcrumbs)
   const isQuestionAnswered = useCallback(
     (q: UserQuestion): boolean => {
       if (q.multiSelect) {
@@ -482,10 +379,175 @@ export function QuestionPanel({
     [answers, otherTexts, multiSelections]
   );
 
+  // --- Keyboard handler (component-level, not document) ---
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (!currentQuestion) return;
+
+      // If confirm dialog is open, don't handle
+      if (showConfirmDecline) return;
+
+      const isInInput =
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement;
+
+      // Always handle Ctrl/Cmd+Enter for submit, even in text inputs
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        e.stopPropagation();
+        handleSubmit();
+        return;
+      }
+
+      // Always handle Escape, with context-dependent behavior
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (isInInput) {
+          // Blur the notes textarea or other input
+          (e.target as HTMLElement).blur();
+          // Re-focus the panel so keyboard nav continues
+          panelRef.current?.focus();
+        } else {
+          setShowConfirmDecline(true);
+        }
+        return;
+      }
+
+      // If typing in a text input, don't capture other keys
+      if (isInInput) return;
+
+      const count = optionCount(currentQuestion);
+      const isMulti = currentQuestion.multiSelect;
+
+      switch (e.key) {
+        case 'ArrowDown': {
+          e.preventDefault();
+          e.stopPropagation();
+          setFocusedIndex((prev) => Math.min(prev + 1, count - 1));
+          break;
+        }
+        case 'ArrowUp': {
+          e.preventDefault();
+          e.stopPropagation();
+          setFocusedIndex((prev) => Math.max(prev - 1, 0));
+          break;
+        }
+        case ' ': {
+          // Space: select/toggle focused option. Never auto-advances.
+          e.preventDefault();
+          e.stopPropagation();
+          selectFocusedOption();
+          break;
+        }
+        case 'Enter': {
+          e.preventDefault();
+          e.stopPropagation();
+
+          if (isMulti) {
+            // Multi-select: Enter toggles, no auto-advance
+            selectFocusedOption();
+          } else {
+            // Single-select: Enter selects, then conditionally advances
+            selectFocusedOption();
+
+            if (isLastStep) {
+              // Compute whether all questions will be answered after
+              // this selection (current state doesn't reflect the
+              // selection yet since setState is async).
+              const focusedIsOther =
+                focusedIndex >= currentQuestion.options.length;
+              const thisWillBeAnswered = focusedIsOther
+                ? (otherTexts[currentQuestion.question] ?? '').trim().length > 0
+                : true;
+              const othersAnswered = questions.every((q, i) =>
+                i === currentStep ? true : isQuestionAnswered(q)
+              );
+              const willAllBeAnswered = thisWillBeAnswered && othersAnswered;
+
+              if (willAllBeAnswered) {
+                if (enterPressedOnLast) {
+                  // Second press on last step: submit
+                  handleSubmit();
+                } else {
+                  // First press on last step with all answered: toast
+                  setEnterPressedOnLast(true);
+                  showToast(
+                    'Press Enter again to submit, or Ctrl+Enter',
+                    3000
+                  );
+                }
+              }
+              // Last step but not all answered: just select, no submit attempt
+            } else {
+              // Not last step: auto-advance after 200ms delay
+              setTimeout(() => goNext(), 200);
+            }
+          }
+          break;
+        }
+        case 'Tab': {
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.shiftKey) {
+            goBack();
+          } else {
+            goNext();
+          }
+          break;
+        }
+        case 'n': {
+          // Toggle notes panel (preview questions only)
+          if (hasPreviewOptions(currentQuestion)) {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleNotes(currentQuestion.question);
+            // If opening notes, focus the textarea after render
+            if (!expandedNotes[currentQuestion.question]) {
+              setTimeout(() => {
+                const textarea = panelRef.current?.querySelector(
+                  '.question-notes textarea'
+                ) as HTMLTextAreaElement | null;
+                textarea?.focus();
+              }, 0);
+            }
+          }
+          break;
+        }
+        default:
+          // Don't consume keys we don't handle -- let them bubble
+          return;
+      }
+    },
+    [
+      currentQuestion,
+      currentStep,
+      focusedIndex,
+      showConfirmDecline,
+      isLastStep,
+      enterPressedOnLast,
+      expandedNotes,
+      otherTexts,
+      questions,
+      handleSubmit,
+      selectFocusedOption,
+      isQuestionAnswered,
+      goNext,
+      goBack,
+      showToast,
+      toggleNotes,
+    ]
+  );
+
   if (!currentQuestion) return null;
 
   return (
-    <div className="question-panel">
+    <div
+      className="question-panel"
+      ref={panelRef}
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
+    >
       {/* Breadcrumb navigation: each question's header as a clickable tab */}
       {totalSteps > 1 && (
         <div className="question-breadcrumbs">
