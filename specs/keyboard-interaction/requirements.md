@@ -41,8 +41,8 @@ scoping rules.
 
 WHILE any focus scope is active
 THE SYSTEM SHALL allow global shortcuts to pass through without being consumed
-AND global shortcuts include: Ctrl+P (command palette), Ctrl+K (quick actions),
-`?` (help panel)
+AND global shortcuts include: Ctrl+P / Cmd+P (command palette), `?` (help
+panel)
 
 IF a global shortcut conflicts with a scope-local key
 THE SYSTEM SHALL give priority to the global shortcut when a modifier key
@@ -90,6 +90,11 @@ WHEN Escape is pressed and an interactive panel is the topmost focus scope
 THE SYSTEM SHALL dismiss or close that panel (with confirmation if the panel
 has unsaved state)
 
+WHEN Escape is pressed and the topmost scope has a sub-context (e.g.,
+ProseReader with an open annotation input, or QuestionPanel with an open
+notes field)
+THE SYSTEM SHALL close the sub-context first, not the panel itself
+
 WHEN Escape is pressed and no interactive panel is active
 AND the user is on a conversation page
 THE SYSTEM SHALL navigate to the conversation list
@@ -97,32 +102,27 @@ THE SYSTEM SHALL navigate to the conversation list
 WHEN Escape is pressed and the user is in a text input
 THE SYSTEM SHALL blur the input without navigating
 
-IF Escape would dismiss a panel with unsaved user input
+IF Escape would dismiss a panel with unsaved user input (unanswered questions,
+in-progress annotations, draft prose feedback)
 THE SYSTEM SHALL show a confirmation dialog before dismissing
 
 **Rationale:** Escape is the universal "back out" key. Its behavior must be
 predictable: it always closes the nearest thing. Developers lose trust in
 keyboard shortcuts when Escape does something unexpected (like navigating away
-from a conversation while a modal is open).
+from a conversation while a prose reader has unsaved annotations).
 
 ---
 
-### REQ-KB-006: Context-Aware Shortcut Help Panel
+### REQ-KB-006: Shortcut Help Panel
 
 WHEN user presses `?` (and is not typing in a text input)
-THE SYSTEM SHALL display a panel listing all keyboard shortcuts available in
-the current context
-AND group shortcuts by scope (global, current panel, navigation)
+THE SYSTEM SHALL display a panel listing all keyboard shortcuts
+AND group shortcuts by scope (global, navigation, panels)
 AND dismiss the panel on Escape or `?` again
 
-WHEN the active focus scope changes
-THE SYSTEM SHALL update the help panel contents to reflect the new context
-(if the help panel is open)
-
 **Rationale:** Developers discover shortcuts by trying them or reading
-documentation. A contextual help panel (like GitHub's `?` modal) bridges the
-gap -- it shows what's available right now without requiring the user to read
-a spec.
+documentation. A help panel (like GitHub's `?` modal) bridges the gap -- it
+shows what's available without requiring the user to read a spec.
 
 ---
 
@@ -145,11 +145,7 @@ IF an interactive panel is the topmost focus scope
 THE SYSTEM SHALL NOT allow navigation keys (arrows, Tab, Enter, Space) to
 affect components outside that scope
 
-IF a keyboard event handler in a lower scope fires despite an active higher
-scope
-THE SYSTEM SHALL treat this as a bug (the scoping mechanism failed)
-
 **Rationale:** Key leak is the specific bug that triggered this spec. Arrow
-keys in the QuestionPanel also navigated the sidebar conversation list. This
-requirement makes key leak a structural violation, not just an undesirable
-behavior.
+keys in the QuestionPanel also navigated the sidebar conversation list. When
+REQ-KB-001 and REQ-KB-003 are correctly implemented, key leak is structurally
+impossible -- this requirement exists as a testable statement of that property.

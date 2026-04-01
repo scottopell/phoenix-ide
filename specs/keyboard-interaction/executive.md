@@ -5,7 +5,7 @@
 Phoenix IDE's keyboard interaction model defines how keyboard focus is scoped
 across UI panels to prevent key conflicts. When an interactive panel (question
 wizard, task approval, command palette) appears, it captures navigation keys
-while global shortcuts (Ctrl+P, Ctrl+K) pass through. Auto-focus ensures
+while global shortcuts (Ctrl+P / Cmd+P) pass through. Auto-focus ensures
 keyboard interaction starts immediately when panels appear. A context-aware
 help panel (`?` key) shows available shortcuts. Tooltip hints display shortcuts
 on hover. The spec serves as a guardrail for coding agents building new
@@ -30,7 +30,7 @@ keys and are never blocked by panel-level handlers.
 | **REQ-KB-003:** Scope-Local Key Consumption | ❌ Not Started | Fix existing key leak |
 | **REQ-KB-004:** Auto-Focus on Panel Appearance | 🔄 In Progress | QuestionPanel has partial auto-focus |
 | **REQ-KB-005:** Escape Key Behavior | ❌ Not Started | Current Escape behavior is inconsistent |
-| **REQ-KB-006:** Context-Aware Shortcut Help Panel | ❌ Not Started | `?` key triggers |
+| **REQ-KB-006:** Shortcut Help Panel | ❌ Not Started | `?` key triggers |
 | **REQ-KB-007:** Tooltip Shortcut Hints | ❌ Not Started | Platform-aware formatting |
 | **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ❌ Not Started | Arrow key sidebar bug |
 

@@ -17,10 +17,11 @@ seeing the event.
 ### Scope hierarchy (highest to lowest priority)
 
 1. **Modal dialogs** (ConfirmDialog, first-task welcome) -- captures all keys
-2. **Interactive panels** (QuestionPanel, TaskApprovalReader, command palette)
+2. **Interactive panels** (QuestionPanel, TaskApprovalReader, ProseReader,
+   command palette)
 3. **Input area** (message textarea, slash commands, bang commands)
 4. **Page-level navigation** (sidebar keyboard nav, Escape to go home)
-5. **Global shortcuts** (Ctrl+P, Ctrl+K, `?`) -- always active
+5. **Global shortcuts** (Ctrl+P / Cmd+P, `?`) -- always active
 
 ### Implementation pattern
 
@@ -41,24 +42,32 @@ pattern):
 - `QuestionPanel` -- registers on `document` (scope 2, needs migration to
   component-level)
 
-### Gating lower-priority handlers (REQ-KB-008)
+### Focus scope context (REQ-KB-001, REQ-KB-008)
 
-`useKeyboardNav` (sidebar navigation) must check whether a higher-priority
-scope is active before handling events. The check:
+A React context tracks the active focus scope stack. Components that accept
+keyboard input register themselves as a scope when they mount and unregister
+when they unmount.
 
-```
-// In useKeyboardNav's handler:
-// If any interactive panel is mounted, suppress sidebar nav keys
-if (document.querySelector(
-  '.question-panel, .task-approval-reader, [role="dialog"], .command-palette'
-)) {
-  return; // higher-priority scope is active
+```typescript
+interface FocusScopeContext {
+  /** Push a scope when an interactive panel mounts */
+  pushScope(id: string, priority: number): void;
+  /** Pop a scope when a panel unmounts */
+  popScope(id: string): void;
+  /** Check if a given scope is the topmost (active) scope */
+  isActiveScope(id: string): boolean;
+  /** Get the current topmost scope ID */
+  activeScope: string | null;
 }
 ```
 
-This is a pragmatic approach. A more formal approach would use a React context
-that tracks the active scope stack, but the DOM query is simpler and doesn't
-require threading context through the component tree.
+Lower-priority handlers (sidebar navigation) check
+`isActiveScope('sidebar-nav')` before handling events. If a higher-priority
+scope is active, the handler returns without consuming the event.
+
+Components that register on `window` or `document` must migrate to either:
+1. Component-level handlers with `stopPropagation`, or
+2. `window`-level handlers that check `isActiveScope` before acting
 
 ## Auto-Focus (REQ-KB-004)
 
@@ -83,11 +92,14 @@ Escape propagates upward through the scope stack. The first scope that handles
 it consumes it:
 
 1. ConfirmDialog open -> dismiss dialog
-2. QuestionPanel active (with unsaved answers) -> show confirm dialog
-3. QuestionPanel active (no answers) -> dismiss panel (decline)
-4. Input area focused -> blur input
-5. Conversation page, no panels -> navigate to list
-6. List page -> no-op
+2. Panel sub-context open (ProseReader annotation input, QuestionPanel notes
+   field) -> close sub-context, keep panel open
+3. QuestionPanel active (with unsaved answers) -> show confirm dialog
+4. ProseReader active (with unsaved annotations) -> show confirm dialog
+5. QuestionPanel/ProseReader active (no unsaved state) -> dismiss panel
+6. Input area focused -> blur input
+7. Conversation page, no panels -> navigate to list
+8. List page -> no-op
 
 The current `useGlobalKeyboardShortcuts` handles Escape at scope 5 (navigate
 to list). It must check whether a higher-priority scope consumed the event
@@ -108,27 +120,15 @@ priority but are not blocked by higher scopes because:
 
 ## Help Panel (REQ-KB-006)
 
-A modal overlay triggered by `?` that shows context-aware shortcuts.
-
-### Data model
-
-```typescript
-interface ShortcutEntry {
-  key: string;        // "ArrowDown", "Ctrl+Enter", "?"
-  description: string; // "Move to next option"
-  scope: string;       // "Question Panel", "Global", "Navigation"
-}
-```
-
-Each component exports a `getShortcuts(): ShortcutEntry[]` function. The help
-panel collects shortcuts from the active scope stack and renders them grouped
-by scope.
+A modal overlay triggered by `?` that lists all keyboard shortcuts grouped by
+scope. Static content -- the full shortcut list is defined in a single data
+file, not collected dynamically from components.
 
 ### Layout
 
 - Modal overlay (like GitHub's `?` panel)
 - Three columns: Key | Description | Scope
-- Grouped by scope with headers
+- Grouped by scope with headers (Global, Navigation, Question Panel, etc.)
 - Dismissed by Escape or `?` again
 
 ## Tooltip Hints (REQ-KB-007)
@@ -182,7 +182,7 @@ via `navigator.platform` or `navigator.userAgent`.
 |-----|--------|
 | Ctrl+P / Cmd+P | Open command palette |
 | ? | Open shortcut help panel |
-| Escape | Close active panel / navigate back |
+| Escape | Close nearest panel / navigate back |
 
 ## Testing Strategy
 
