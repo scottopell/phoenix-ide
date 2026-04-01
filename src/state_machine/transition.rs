@@ -1048,22 +1048,24 @@ pub fn transition(
         // ============================================================
 
         // AwaitingUserResponse + UserQuestionResponse -> LlmRequesting
+        //
+        // The tool result was already persisted in the checkpoint when the
+        // state transitioned to AwaitingUserResponse ("Questions submitted
+        // for user review"). The user's answers are delivered as a user
+        // message so the LLM sees them on the next turn without creating
+        // a duplicate tool_result for the same tool_use_id.
         (
-            ConvState::AwaitingUserResponse {
-                tool_use_id,
-                questions: _,
-                ..
-            },
+            ConvState::AwaitingUserResponse { .. },
             Event::UserQuestionResponse {
                 answers,
                 annotations,
             },
         ) => {
-            // Format tool result as human-readable string
+            // Format answers as human-readable text for the user message
             let answers_text = answers
                 .iter()
                 .map(|(q, a)| {
-                    let mut parts = vec![format!("\"{}\"=\"{}\"", q, a)];
+                    let mut parts = vec![format!("\"{}\" = \"{}\"", q, a)];
                     if let Some(ref anns) = annotations {
                         if let Some(ann) = anns.get(q.as_str()) {
                             if let Some(ref preview) = ann.preview {
@@ -1077,17 +1079,19 @@ pub fn transition(
                     parts.join(" ")
                 })
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join("\n");
 
-            let result_text = format!(
-                "User has answered your questions: {answers_text}. \
-                 You can now continue with the user's answers in mind."
+            let user_text = format!(
+                "Here are my answers:\n{answers_text}"
             );
 
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistToolResults {
-                        results: vec![ToolResult::success(tool_use_id.clone(), result_text)],
+                    .with_effect(Effect::PersistMessage {
+                        content: crate::db::MessageContent::user(user_text),
+                        display_data: None,
+                        usage_data: None,
+                        message_id: uuid::Uuid::new_v4().to_string(),
                     })
                     .with_effect(Effect::PersistState)
                     .with_effect(notify_llm_requesting(1))
@@ -1096,14 +1100,16 @@ pub fn transition(
         }
 
         // AwaitingUserResponse + UserCancel -> Idle
-        (ConvState::AwaitingUserResponse { tool_use_id, .. }, Event::UserCancel) => {
+        // Tool result already persisted in checkpoint. System message indicates decline.
+        (ConvState::AwaitingUserResponse { .. }, Event::UserCancel) => {
             Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistToolResults {
-                    results: vec![ToolResult::error(
-                        tool_use_id.clone(),
-                        "User declined to answer questions. Proceed using your own judgment."
-                            .to_string(),
-                    )],
+                .with_effect(Effect::PersistMessage {
+                    content: crate::db::MessageContent::system(
+                        "User declined to answer questions.",
+                    ),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -2274,13 +2280,13 @@ mod tests {
             result.new_state
         );
 
-        // Should have PersistToolResults + PersistState + RequestLlm
+        // Should have PersistMessage (user answers) + PersistState + RequestLlm
         assert!(
             result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::PersistToolResults { .. })),
-            "Should have PersistToolResults effect"
+                .any(|e| matches!(e, Effect::PersistMessage { .. })),
+            "Should have PersistMessage effect for user answers"
         );
         assert!(
             result
@@ -2315,13 +2321,13 @@ mod tests {
             result.new_state
         );
 
-        // Should have PersistToolResults with error result
+        // Should have PersistMessage (system: declined)
         assert!(
             result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::PersistToolResults { .. })),
-            "Should have PersistToolResults effect"
+                .any(|e| matches!(e, Effect::PersistMessage { .. })),
+            "Should have PersistMessage effect for decline"
         );
 
         // Should have agent_done notification
