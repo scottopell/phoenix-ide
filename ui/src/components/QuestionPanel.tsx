@@ -415,8 +415,40 @@ export function QuestionPanel({
         return;
       }
 
-      // If typing in a text input, don't capture other keys
-      if (isInInput) return;
+      // If typing in a text input (Other field), handle Enter for single-select
+      if (isInInput) {
+        if (e.key === 'Enter' && !e.shiftKey && !currentQuestion.multiSelect) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!isLastStep) {
+            setTimeout(() => goNext(), 200);
+          } else {
+            // Same double-enter-to-submit logic as regular Enter on last step
+            const focusedIsOther =
+              focusedIndex >= currentQuestion.options.length;
+            const thisWillBeAnswered = focusedIsOther
+              ? (otherTexts[currentQuestion.question] ?? '').trim().length > 0
+              : true;
+            const othersAnswered = questions.every((q, i) =>
+              i === currentStep ? true : isQuestionAnswered(q)
+            );
+            const willAllBeAnswered = thisWillBeAnswered && othersAnswered;
+
+            if (willAllBeAnswered) {
+              if (enterPressedOnLast) {
+                handleSubmit();
+              } else {
+                setEnterPressedOnLast(true);
+                showToast(
+                  'Press Enter again to submit, or Ctrl+Enter',
+                  3000
+                );
+              }
+            }
+          }
+        }
+        return;
+      }
 
       const count = optionCount(currentQuestion);
       const isMulti = currentQuestion.multiSelect;
@@ -498,8 +530,11 @@ export function QuestionPanel({
           break;
         }
         case 'n': {
-          // Toggle notes panel (preview questions only)
-          if (hasPreviewOptions(currentQuestion)) {
+          // Toggle notes panel (preview questions only, not when Other is selected)
+          if (
+            hasPreviewOptions(currentQuestion) &&
+            answers[currentQuestion.question] !== OTHER_SENTINEL
+          ) {
             e.preventDefault();
             e.stopPropagation();
             toggleNotes(currentQuestion.question);
@@ -529,6 +564,7 @@ export function QuestionPanel({
       enterPressedOnLast,
       expandedNotes,
       otherTexts,
+      answers,
       questions,
       handleSubmit,
       selectFocusedOption,
@@ -716,6 +752,86 @@ function QuestionItem({
     return q.options.find((o) => o.preview)?.preview;
   })();
 
+  /** Render the "Other" element. In preview mode, it's a plain radio (no inline input). */
+  const renderOtherOption = () => {
+    const otherIndex = q.options.length;
+    const isOtherFocused = focusedIndex === otherIndex;
+    const otherSelected = isMulti
+      ? multiSelected.has(OTHER_SENTINEL)
+      : answer === OTHER_SENTINEL;
+
+    // In preview mode: "Other" is a plain radio option (text input lives in the preview pane)
+    if (isPreviewMode) {
+      return (
+        <div
+          key="__other__"
+          className={`question-option${otherSelected ? ' selected' : ''}${isOtherFocused ? ' focused' : ''}`}
+          onClick={() => onSelect(q.question, OTHER_SENTINEL)}
+          onMouseEnter={() => onFocusIndex(otherIndex)}
+        >
+          <input
+            type="radio"
+            name={q.question}
+            checked={otherSelected}
+            onChange={() => onSelect(q.question, OTHER_SENTINEL)}
+            tabIndex={-1}
+          />
+          <span className="question-option-label">Other</span>
+        </div>
+      );
+    }
+
+    // Non-preview mode: "Other" with inline text input
+    return (
+      <div
+        key="__other__"
+        className={`question-other${otherSelected ? ' selected' : ''}${isOtherFocused ? ' focused' : ''}`}
+        onClick={() => {
+          if (isMulti) {
+            onMultiToggle(q.question, OTHER_SENTINEL);
+          } else {
+            onSelect(q.question, OTHER_SENTINEL);
+          }
+          setTimeout(() => otherInputRef.current?.focus(), 0);
+        }}
+        onMouseEnter={() => onFocusIndex(otherIndex)}
+      >
+        <input
+          type={isMulti ? 'checkbox' : 'radio'}
+          name={q.question}
+          checked={otherSelected}
+          onChange={() => {
+            if (isMulti) {
+              onMultiToggle(q.question, OTHER_SENTINEL);
+            } else {
+              onSelect(q.question, OTHER_SENTINEL);
+            }
+          }}
+          tabIndex={-1}
+        />
+        <input
+          ref={otherInputRef}
+          type="text"
+          className="question-other-input"
+          placeholder="Other..."
+          value={otherText}
+          onChange={(e) => onOtherText(q.question, e.target.value)}
+          onFocus={() => {
+            onFocusIndex(otherIndex);
+            if (isMulti) {
+              if (!multiSelected.has(OTHER_SENTINEL)) {
+                onMultiToggle(q.question, OTHER_SENTINEL);
+              }
+            } else {
+              onSelect(q.question, OTHER_SENTINEL);
+            }
+          }}
+          tabIndex={-1}
+        />
+      </div>
+    );
+  };
+
   const renderOptions = () => {
     const optionElements = q.options.map((opt, index) => {
       const isFocused = focusedIndex === index;
@@ -779,63 +895,7 @@ function QuestionItem({
       );
     });
 
-    // "Other" option
-    const otherIndex = q.options.length;
-    const isOtherFocused = focusedIndex === otherIndex;
-    const otherSelected = isMulti
-      ? multiSelected.has(OTHER_SENTINEL)
-      : answer === OTHER_SENTINEL;
-
-    const otherElement = (
-      <div
-        key="__other__"
-        className={`question-other${otherSelected ? ' selected' : ''}${isOtherFocused ? ' focused' : ''}`}
-        onClick={() => {
-          if (isMulti) {
-            onMultiToggle(q.question, OTHER_SENTINEL);
-          } else {
-            onSelect(q.question, OTHER_SENTINEL);
-          }
-          setTimeout(() => otherInputRef.current?.focus(), 0);
-        }}
-        onMouseEnter={() => onFocusIndex(otherIndex)}
-      >
-        <input
-          type={isMulti ? 'checkbox' : 'radio'}
-          name={q.question}
-          checked={otherSelected}
-          onChange={() => {
-            if (isMulti) {
-              onMultiToggle(q.question, OTHER_SENTINEL);
-            } else {
-              onSelect(q.question, OTHER_SENTINEL);
-            }
-          }}
-          tabIndex={-1}
-        />
-        <input
-          ref={otherInputRef}
-          type="text"
-          className="question-other-input"
-          placeholder="Other..."
-          value={otherText}
-          onChange={(e) => onOtherText(q.question, e.target.value)}
-          onFocus={() => {
-            onFocusIndex(otherIndex);
-            if (isMulti) {
-              if (!multiSelected.has(OTHER_SENTINEL)) {
-                onMultiToggle(q.question, OTHER_SENTINEL);
-              }
-            } else {
-              onSelect(q.question, OTHER_SENTINEL);
-            }
-          }}
-          tabIndex={-1}
-        />
-      </div>
-    );
-
-    return [...optionElements, otherElement];
+    return [...optionElements, renderOtherOption()];
   };
 
   return (
@@ -845,19 +905,34 @@ function QuestionItem({
 
       {isPreviewMode ? (
         <div className="question-preview-layout">
-          <div className="question-options">{renderOptions()}</div>
+          <div className="question-options">
+            {renderOptions()}
+            {answer !== OTHER_SENTINEL && (
+              <span className="question-notes-hint">Press n to add notes</span>
+            )}
+          </div>
           <div
-            className={`question-preview-pane${!activePreview ? ' question-preview-pane--empty' : ''}`}
+            className={`question-preview-pane${answer !== OTHER_SENTINEL && !activePreview ? ' question-preview-pane--empty' : ''}`}
           >
-            {activePreview || 'Select an option to preview'}
+            {answer === OTHER_SENTINEL ? (
+              <textarea
+                className="question-preview-other-input"
+                placeholder="Describe your preferred approach..."
+                value={otherText}
+                onChange={(e) => onOtherText(q.question, e.target.value)}
+                autoFocus
+              />
+            ) : (
+              activePreview || 'Select an option to preview'
+            )}
           </div>
         </div>
       ) : (
         <div className="question-options">{renderOptions()}</div>
       )}
 
-      {/* Notes only for single-select with previews */}
-      {isPreviewMode && (
+      {/* Notes only for single-select with previews, not when Other is selected */}
+      {isPreviewMode && answer !== OTHER_SENTINEL && (
         <div className="question-notes">
           <button
             className="question-notes-toggle"
