@@ -34,7 +34,17 @@ export function QuestionPanel({
 }: QuestionPanelProps) {
   // Per-question selected value (label or OTHER_SENTINEL for single-select,
   // comma-joined labels for multi-select)
-  const [answers, setAnswers] = useState<Record<string, string>>({});
+  // Pre-select the first option for single-select preview questions so the
+  // selection state matches the preview pane (which shows the first option).
+  const [answers, setAnswers] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    for (const q of questions) {
+      if (!q.multiSelect && hasPreviewOptions(q) && q.options.length > 0) {
+        initial[q.question] = q.options[0].label;
+      }
+    }
+    return initial;
+  });
   const [otherTexts, setOtherTexts] = useState<Record<string, string>>({});
   const [annotations, setAnnotations] = useState<
     Record<string, { notes?: string; preview?: string }>
