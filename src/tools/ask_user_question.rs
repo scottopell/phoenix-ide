@@ -92,12 +92,30 @@ impl Tool for AskUserQuestionTool {
         })
     }
 
-    async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
-        // This should never be called — ask_user_question is intercepted at the
-        // state machine level before entering ToolExecuting.
-        ToolOutput::error(
-            "ask_user_question was not intercepted by the state machine. \
-             This is a bug — please report it.",
-        )
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        // This runs when the input failed to parse as AskUserQuestionInput
+        // (fell through to ToolInput::Unknown) and wasn't intercepted by
+        // the state machine. Validate and return a specific error so the
+        // LLM can retry with corrected input.
+        let questions = input.get("questions").and_then(|v| v.as_array());
+        match questions {
+            None => ToolOutput::error(
+                "Invalid input: missing 'questions' array. \
+                 Provide 1-4 questions, each with 'question' (string), \
+                 'header' (string), and 'options' (array of 2-4 objects \
+                 with 'label' and optional 'description').",
+            ),
+            Some(qs) if qs.is_empty() => ToolOutput::error(
+                "Invalid input: 'questions' array is empty. \
+                 Provide at least 1 question (max 4).",
+            ),
+            Some(qs) => ToolOutput::error(format!(
+                "Invalid input: failed to parse {} question(s). \
+                 Each question must have 'question' (string), 'header' \
+                 (string), and 'options' (array of 2-4 objects with \
+                 'label' string). Check field names and types.",
+                qs.len()
+            )),
+        }
     }
 }
