@@ -68,7 +68,6 @@ export function ConversationPage() {
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
-  const [showQuestionPanel, setShowQuestionPanel] = useState(false);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // Message queue management
@@ -207,15 +206,6 @@ export function ConversationPage() {
       setShowTaskApproval(true);
     } else {
       setShowTaskApproval(false);
-    }
-  }, [atom.phase.type]);
-
-  // Auto-open/close question panel on state transitions
-  useEffect(() => {
-    if (atom.phase.type === 'awaiting_user_response') {
-      setShowQuestionPanel(true);
-    } else {
-      setShowQuestionPanel(false);
     }
   }, [atom.phase.type]);
 
@@ -567,7 +557,13 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'awaiting_user_response' ? (
+      ) : convStateForChildren.type === 'awaiting_user_response' ? (
+        <QuestionPanel
+          questions={convStateForChildren.questions}
+          conversationId={conversation.id}
+          showToast={showInfo}
+        />
+      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
         <>
         {conversationId && (
           <WorkActions
@@ -618,14 +614,6 @@ export function ConversationPage() {
         />
       )}
 
-      {/* Question panel overlay — agent asked for user input */}
-      {showQuestionPanel && atom.phase.type === 'awaiting_user_response' && (
-        <QuestionPanel
-          questions={atom.phase.questions}
-          conversationId={conversation.id}
-          showToast={showInfo}
-        />
-      )}
       <Toast messages={toasts} onDismiss={dismissToast} />
 
       {/* First task welcome modal */}

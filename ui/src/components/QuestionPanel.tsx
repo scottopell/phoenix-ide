@@ -8,10 +8,11 @@
  * Submit calls api.respondToQuestion; Decline calls api.cancelConversation.
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { api } from '../api';
 import type { UserQuestion } from '../api';
 import { Check, XCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { ConfirmDialog } from './ConfirmDialog';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
@@ -45,6 +46,7 @@ export function QuestionPanel({
     message: string;
     isError: boolean;
   } | null>(null);
+  const [showConfirmDecline, setShowConfirmDecline] = useState(false);
 
   // Multi-select: track selected labels as a Set per question
   const [multiSelections, setMultiSelections] = useState<Record<string, Set<string>>>({});
@@ -87,6 +89,17 @@ export function QuestionPanel({
       [questionText]: { ...prev[questionText], notes: notes || undefined },
     }));
   }, []);
+
+  // Escape key opens the decline confirmation dialog
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !showConfirmDecline) {
+        setShowConfirmDecline(true);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [showConfirmDecline]);
 
   // Check if every question has an answer
   const allAnswered = questions.every((q) => {
@@ -192,7 +205,13 @@ export function QuestionPanel({
     showToast,
   ]);
 
-  const handleDecline = useCallback(async () => {
+  const handleDeclineClick = useCallback(() => {
+    if (submitting) return;
+    setShowConfirmDecline(true);
+  }, [submitting]);
+
+  const handleConfirmDecline = useCallback(async () => {
+    setShowConfirmDecline(false);
     if (submitting) return;
     setSubmitting(true);
     setFeedback(null);
@@ -209,11 +228,7 @@ export function QuestionPanel({
 
   return (
     <div className="question-panel">
-      <div className="question-panel-header">
-        <h2 className="question-panel-header-title">
-          Agent needs your input
-        </h2>
-      </div>
+      <span className="question-panel-label">Agent needs your input</span>
 
       <div className="question-panel-content">
         {questions.map((q) => (
@@ -241,12 +256,22 @@ export function QuestionPanel({
       <div className="question-actions">
         <button
           className="question-btn question-btn--decline"
-          onClick={handleDecline}
+          onClick={handleDeclineClick}
           disabled={submitting}
         >
           <XCircle size={18} />
           Decline
         </button>
+        <ConfirmDialog
+          visible={showConfirmDecline}
+          title="Decline to answer?"
+          message="The agent will proceed using its own judgment."
+          confirmText="Decline"
+          cancelText="Cancel"
+          danger
+          onConfirm={handleConfirmDecline}
+          onCancel={() => setShowConfirmDecline(false)}
+        />
         <div className="question-actions-right">
           {feedback && (
             <span
