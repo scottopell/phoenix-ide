@@ -206,7 +206,7 @@ pub fn transition(
                 if let ToolInput::AskUserQuestion(ref input) = tool.input {
                     let tool_result = ToolResult::success(
                         tool.id.clone(),
-                        "Questions submitted for user review".to_string(),
+                        "Awaiting user response. See following message for answers.".to_string(),
                     );
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
                     let assistant_message =
