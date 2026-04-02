@@ -42,6 +42,14 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           &#9654;
         </button>
         <RecentFilesStrip files={recentFiles} onFileClick={handleRecentClick} />
+        <div className="fe-collapsed-badges">
+          <button className="fe-collapsed-badge" onClick={onToggle} title="MCP Servers">
+            MCP
+          </button>
+          <button className="fe-collapsed-badge" onClick={onToggle} title="Skills">
+            /
+          </button>
+        </div>
       </aside>
     );
   }
