@@ -71,7 +71,7 @@ export function ConversationPage() {
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // Message queue management
-  const { queuedMessages, enqueue, markSent, markFailed, retry } =
+  const { queuedMessages, enqueue, markSent, markFailed, retry, dismiss } =
     useMessageQueue(conversationId);
 
   // Connection lifecycle — receives dispatch and lastSequenceId from atom
@@ -585,6 +585,7 @@ export function ConversationPage() {
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
+          onDismissError={dismiss}
           onOpenFileBrowser={handleOpenFileBrowser}
         />
         </>

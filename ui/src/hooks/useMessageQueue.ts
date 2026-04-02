@@ -119,6 +119,11 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     );
   }, [updateMessages]);
 
+  // Dismiss a failed message (remove from queue without retrying)
+  const dismiss = useCallback((localId: string) => {
+    updateMessages(prev => prev.filter(m => m.localId !== localId));
+  }, [updateMessages]);
+
   // Get messages that need to be sent
   const getPending = useCallback((): QueuedMessage[] => {
     return messages.filter(m => m.status === 'sending');
@@ -130,6 +135,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     markSent,
     markFailed,
     retry,
+    dismiss,
     getPending,
   };
 }
