@@ -6,6 +6,7 @@
 //!
 //! Path (`./`) references are not expanded here — they are autocomplete-only (Task 572).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::system_prompt::discover_skills;
@@ -121,33 +122,47 @@ fn is_text_content(content: &[u8]) -> bool {
     !content.contains(&0) && std::str::from_utf8(content).is_ok()
 }
 
-/// Detect a `/skill-name` prefix in `text`.
+/// Detect a `/skill-name` token anywhere in the message text.
 ///
-/// Returns `(skill_name, arguments_str)` when the message starts with `/` followed
-/// by a non-empty, non-whitespace skill name. `arguments_str` is the text after the
-/// first token (trimmed), which may be empty.
+/// Returns `(skill_name, full_original_text)` when a valid skill reference is found.
+/// Validates against discovered skills to avoid false positives (e.g., "/path/to/file").
 ///
-/// Returns `None` when the message does not start with a `/` invocation.
-fn detect_skill_prefix(text: &str) -> Option<(String, String)> {
-    let text = text.trim_start();
-    let without_slash = text.strip_prefix('/')?;
+/// The full original text is returned as the second element so the LLM receives
+/// the complete user message as context.
+fn detect_skill_invocation(text: &str, working_dir: &Path) -> Option<(String, String)> {
+    let skills = discover_skills(working_dir);
+    let skill_names: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
 
-    // Extract the skill name — runs until whitespace or end of string
-    let name_end = without_slash
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(without_slash.len());
-    // Safety: `name_end` is from `find()` on `without_slash` (or its `.len()`)
-    #[allow(clippy::string_slice)]
-    let skill_name = &without_slash[..name_end];
+    // Scan for /word tokens
+    for (i, _) in text.match_indices('/') {
+        // Must be at start of message (after trimming) or preceded by whitespace
+        let trimmed_start = text.len() - text.trim_start().len();
+        if i > 0 && i != trimmed_start && !text.as_bytes()[i - 1].is_ascii_whitespace() {
+            continue;
+        }
 
-    if skill_name.is_empty() {
-        return None;
+        // Extract the name: runs until whitespace or end
+        // Safety: `i` is from `match_indices('/')` on `text`, and '/' is a single-byte
+        // ASCII char, so `i + 1` is a valid UTF-8 boundary.
+        #[allow(clippy::string_slice)]
+        let after_slash = &text[i + 1..];
+        let name_end = after_slash
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after_slash.len());
+        // Safety: `name_end` is from `find()` on `after_slash` (or its `.len()`)
+        #[allow(clippy::string_slice)]
+        let name = &after_slash[..name_end];
+
+        if name.is_empty() {
+            continue;
+        }
+
+        // Only match known skills (avoid matching file paths)
+        if skill_names.contains(name) {
+            return Some((name.to_string(), text.to_string()));
+        }
     }
-
-    // Safety: `name_end` is from `find()` on `without_slash` (or its `.len()`)
-    #[allow(clippy::string_slice)]
-    let arguments = without_slash[name_end..].trim().to_string();
-    Some((skill_name.to_string(), arguments))
+    None
 }
 
 /// Expand a skill invocation by loading SKILL.md and performing `$ARGUMENTS` substitution.
@@ -220,8 +235,8 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
     let mut llm_text = text.to_string();
 
-    if let Some((skill_name, arguments)) = detect_skill_prefix(text) {
-        llm_text = expand_skill(&skill_name, &arguments, working_dir)?;
+    if let Some((skill_name, full_text)) = detect_skill_invocation(text, working_dir) {
+        llm_text = expand_skill(&skill_name, &full_text, working_dir)?;
     }
 
     // --- File reference expansion (REQ-IR-001) --------------------------------
@@ -441,42 +456,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // detect_skill_prefix
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_detect_skill_prefix_simple() {
-        let result = detect_skill_prefix("/writing-style");
-        assert_eq!(result, Some(("writing-style".to_string(), String::new())));
-    }
-
-    #[test]
-    fn test_detect_skill_prefix_with_arguments() {
-        let result = detect_skill_prefix("/review help me with this");
-        assert_eq!(
-            result,
-            Some(("review".to_string(), "help me with this".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_detect_skill_prefix_no_slash() {
-        assert_eq!(detect_skill_prefix("hello world"), None);
-    }
-
-    #[test]
-    fn test_detect_skill_prefix_bare_slash() {
-        assert_eq!(detect_skill_prefix("/"), None);
-    }
-
-    #[test]
-    fn test_detect_skill_prefix_mid_message() {
-        // slash in middle of message should NOT match (must be at start)
-        assert_eq!(detect_skill_prefix("check /this out"), None);
-    }
-
-    // -------------------------------------------------------------------------
-    // expand_skill (REQ-IR-002, REQ-IR-003)
+    // Skill helpers
     // -------------------------------------------------------------------------
 
     fn write_skill(dir: &Path, skill_dir: &str, name: &str, description: &str, body: &str) {
@@ -489,8 +469,74 @@ mod tests {
         .unwrap();
     }
 
+    // -------------------------------------------------------------------------
+    // detect_skill_invocation
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn test_expand_skill_no_arguments() {
+    fn test_detect_skill_invocation_at_start() {
+        let tmp = make_tmp();
+        write_skill(tmp.path(), "review", "review", "Code review", "Review body.");
+
+        let result = detect_skill_invocation("/review src/main.rs", tmp.path());
+        assert_eq!(
+            result,
+            Some(("review".to_string(), "/review src/main.rs".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_detect_skill_invocation_mid_message() {
+        let tmp = make_tmp();
+        write_skill(tmp.path(), "build", "build", "Build skill", "Build body.");
+
+        let result = detect_skill_invocation("use /build to compile", tmp.path());
+        assert_eq!(
+            result,
+            Some(("build".to_string(), "use /build to compile".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_detect_skill_invocation_no_slash() {
+        let tmp = make_tmp();
+        assert_eq!(detect_skill_invocation("hello world", tmp.path()), None);
+    }
+
+    #[test]
+    fn test_detect_skill_invocation_bare_slash() {
+        let tmp = make_tmp();
+        assert_eq!(detect_skill_invocation("/", tmp.path()), None);
+    }
+
+    #[test]
+    fn test_detect_skill_invocation_unknown_skill_ignored() {
+        // File paths like /usr/bin/ls should not trigger expansion
+        let tmp = make_tmp();
+        assert_eq!(
+            detect_skill_invocation("run /usr/bin/ls please", tmp.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_skill_invocation_not_preceded_by_whitespace() {
+        // `/build` embedded in a word (e.g. "foo/build") should not match
+        let tmp = make_tmp();
+        write_skill(tmp.path(), "build", "build", "Build skill", "Build body.");
+
+        assert_eq!(
+            detect_skill_invocation("foo/build bar", tmp.path()),
+            None
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // expand with skills (REQ-IR-002, REQ-IR-003)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_expand_skill_prefix_only() {
         let tmp = make_tmp();
         write_skill(
             tmp.path(),
@@ -503,6 +549,8 @@ mod tests {
         let result = expand("/writing-style", tmp.path()).unwrap();
         assert_eq!(result.display_text, "/writing-style");
         assert!(result.llm_text.contains("Write in a formal tone."));
+        // Full message is passed as arguments
+        assert!(result.llm_text.contains("ARGUMENTS: /writing-style"));
     }
 
     #[test]
@@ -518,9 +566,10 @@ mod tests {
 
         let result = expand("/review src/main.rs", tmp.path()).unwrap();
         assert_eq!(result.display_text, "/review src/main.rs");
+        // $ARGUMENTS is replaced with the full original message
         assert!(result
             .llm_text
-            .contains("Please review src/main.rs carefully."));
+            .contains("Please review /review src/main.rs carefully."));
     }
 
     #[test]
@@ -537,19 +586,65 @@ mod tests {
         let result = expand("/deploy staging", tmp.path()).unwrap();
         assert_eq!(result.display_text, "/deploy staging");
         assert!(result.llm_text.contains("Run the deployment steps."));
-        assert!(result.llm_text.contains("ARGUMENTS: staging"));
+        // Full message appended as ARGUMENTS
+        assert!(result.llm_text.contains("ARGUMENTS: /deploy staging"));
+    }
+
+    #[test]
+    fn test_expand_skill_mid_message() {
+        let tmp = make_tmp();
+        write_skill(
+            tmp.path(),
+            "build",
+            "build",
+            "Build skill",
+            "Run the build steps.",
+        );
+
+        let result = expand("use /build to compile", tmp.path()).unwrap();
+        assert_eq!(result.display_text, "use /build to compile");
+        assert!(result.llm_text.contains("Run the build steps."));
+        assert!(
+            result
+                .llm_text
+                .contains("ARGUMENTS: use /build to compile")
+        );
+    }
+
+    #[test]
+    fn test_expand_skill_mid_message_with_placeholder() {
+        let tmp = make_tmp();
+        write_skill(
+            tmp.path(),
+            "review",
+            "review",
+            "Code review skill",
+            "Please review $ARGUMENTS carefully.",
+        );
+
+        let result = expand("use /review to check this PR", tmp.path()).unwrap();
+        assert_eq!(result.display_text, "use /review to check this PR");
+        assert!(result
+            .llm_text
+            .contains("Please review use /review to check this PR carefully."));
+    }
+
+    #[test]
+    fn test_expand_file_path_not_skill() {
+        // /usr/bin/ls should not trigger skill expansion
+        let tmp = make_tmp();
+        let result = expand("run /usr/bin/ls please", tmp.path()).unwrap();
+        assert_eq!(result.display_text, "run /usr/bin/ls please");
+        assert_eq!(result.llm_text, "run /usr/bin/ls please");
     }
 
     #[test]
     fn test_expand_skill_not_found_error() {
         let tmp = make_tmp();
-        let err = expand("/nonexistent", tmp.path()).unwrap_err();
-        assert!(matches!(
-            err,
-            ExpansionError::SkillNotFound { ref name, .. } if name == "nonexistent"
-        ));
-        assert_eq!(err.error_type(), "skill_not_found");
-        assert_eq!(err.reference(), "/nonexistent");
+        // With no skills defined, /nonexistent should pass through as plain text
+        // (detect_skill_invocation returns None for unknown skills)
+        let result = expand("/nonexistent", tmp.path()).unwrap();
+        assert_eq!(result.llm_text, "/nonexistent");
     }
 
     #[test]
@@ -557,12 +652,9 @@ mod tests {
         let tmp = make_tmp();
         write_skill(tmp.path(), "foo-skill", "foo", "Foo skill", "Foo body.");
 
-        let err = expand("/missing", tmp.path()).unwrap_err();
-        if let ExpansionError::SkillNotFound { available, .. } = err {
-            assert!(available.contains(&"foo".to_string()));
-        } else {
-            panic!("expected SkillNotFound");
-        }
+        // /missing is not a known skill, so it passes through as plain text
+        let result = expand("/missing", tmp.path()).unwrap();
+        assert_eq!(result.llm_text, "/missing");
     }
 
     #[test]

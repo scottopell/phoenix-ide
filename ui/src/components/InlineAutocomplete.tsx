@@ -153,32 +153,26 @@ export interface TriggerState {
  * Returns `null` when no trigger is active.
  *
  * Rules:
- *   - `/^<partial>` at the very start of input (no whitespace in partial) → skill mode
- *   - `@<partial>` anywhere (no whitespace in partial)                    → expand mode
- *   - `<word_boundary>./<partial>` anywhere                               → path mode
+ *   - `/<partial>` at start or after whitespace (no whitespace in partial) → skill mode
+ *   - `@<partial>` anywhere (no whitespace in partial)                     → expand mode
+ *   - `<word_boundary>./<partial>` anywhere                                → path mode
  *
- * Skill trigger is checked first: `/` at the start of the full value takes precedence.
+ * Skill trigger is checked first: `/` at start or after whitespace takes precedence.
  */
 export function detectTrigger(value: string, cursorPos: number): TriggerState | null {
   const beforeCursor = value.slice(0, cursorPos);
 
-  // ---- / skill trigger (must be at start of the full value) ------------------
-  // The cursor must still be within the first token (no whitespace after the skill name token)
-  if (value.trimStart().startsWith('/')) {
-    // Only active when the cursor is still in the first token
-    const stripped = value.trimStart();
-    const leadingSpaces = value.length - stripped.length;
-    // Trigger token spans from position 0 (or leading spaces) to first whitespace
-    const firstWhitespace = stripped.slice(1).search(/\s/);
-    const tokenEnd = firstWhitespace === -1
-      ? value.length
-      : leadingSpaces + 1 + firstWhitespace;
-    if (cursorPos <= tokenEnd) {
-      const query = stripped.slice(1, cursorPos - leadingSpaces); // text after '/'
+  // ---- / skill trigger (at start of value or after whitespace) ----------------
+  // Find the last `/` before the cursor that is at position 0 or preceded by whitespace.
+  // The cursor must still be within the token (no whitespace between `/` and cursor).
+  const slashIdx = findLastTriggerChar(beforeCursor, '/');
+  if (slashIdx !== null) {
+    const slashQuery = beforeCursor.slice(slashIdx + 1);
+    if (!containsWhitespace(slashQuery)) {
       return {
         mode: 'skill',
-        query,
-        triggerStart: leadingSpaces, // position of '/'
+        query: slashQuery,
+        triggerStart: slashIdx,
         triggerEnd: cursorPos,
       };
     }
