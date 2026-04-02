@@ -220,7 +220,13 @@ mod tests {
     // invoke_skill (integration with temp dir)
     // -------------------------------------------------------------------------
 
-    fn write_skill(dir: &std::path::Path, skill_dir: &str, name: &str, description: &str, body: &str) {
+    fn write_skill(
+        dir: &std::path::Path,
+        skill_dir: &str,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) {
         let skill_path = dir.join(".claude/skills").join(skill_dir);
         fs::create_dir_all(&skill_path).unwrap();
         fs::write(
@@ -233,7 +239,13 @@ mod tests {
     #[test]
     fn test_invoke_skill_found() {
         let tmp = TempDir::new().unwrap();
-        write_skill(tmp.path(), "build", "build", "Build the project", "Run cargo build.");
+        write_skill(
+            tmp.path(),
+            "build",
+            "build",
+            "Build the project",
+            "Run cargo build.",
+        );
 
         let result = invoke_skill("build", "", tmp.path()).unwrap();
         assert_eq!(result.name, "build");
