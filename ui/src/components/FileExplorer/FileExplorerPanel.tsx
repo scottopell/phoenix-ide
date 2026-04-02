@@ -27,6 +27,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
   const [selectedSkill, setSelectedSkill] = useState<SkillEntry | null>(null);
+  const [skillsPanelExpanded, setSkillsPanelExpanded] = useState(false);
 
   const handleFileSelect = (filePath: string, rootDir: string) => {
     addRecentFile(filePath);
@@ -78,7 +79,12 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
             />
           </div>
           <McpStatusPanel showToast={showToast} />
-          <SkillsPanel conversationId={conversationId} onSkillClick={setSelectedSkill} />
+          <SkillsPanel
+            conversationId={conversationId}
+            onSkillClick={setSelectedSkill}
+            expanded={skillsPanelExpanded}
+            onToggleExpanded={setSkillsPanelExpanded}
+          />
         </>
       )}
     </aside>

@@ -88,7 +88,7 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
     <div className="skill-viewer">
       <div className="skill-viewer-header">
         <button className="skill-viewer-back" onClick={onBack}>
-          &larr; Back to files
+          &larr; Back
         </button>
         <span className="skill-viewer-name">/{skill.name}</span>
       </div>

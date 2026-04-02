@@ -6,6 +6,8 @@ import './SkillsPanel.css';
 interface SkillsPanelProps {
   conversationId: string | undefined;
   onSkillClick?: (skill: SkillEntry) => void;
+  expanded?: boolean;
+  onToggleExpanded?: (expanded: boolean) => void;
 }
 
 /**
@@ -52,9 +54,12 @@ function groupSkills(skills: SkillEntry[]): Map<string, SkillEntry[]> {
   return groups;
 }
 
-export function SkillsPanel({ conversationId, onSkillClick }: SkillsPanelProps) {
+export function SkillsPanel({ conversationId, onSkillClick, expanded: controlledExpanded, onToggleExpanded }: SkillsPanelProps) {
   const [skills, setSkills] = useState<SkillEntry[]>([]);
-  const [expanded, setExpanded] = useState(false);
+  const [internalExpanded, setInternalExpanded] = useState(false);
+  // Use controlled state if provided, otherwise internal
+  const expanded = controlledExpanded ?? internalExpanded;
+  const setExpanded = onToggleExpanded ?? setInternalExpanded;
   /** Which groups are expanded (all by default once skills load) */
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
