@@ -7,6 +7,7 @@ import { useState, useCallback } from 'react';
 import { FileTree } from './FileTree';
 import { RecentFilesStrip } from './RecentFilesStrip';
 import { McpStatusPanel } from '../McpStatusPanel';
+import { SkillsPanel } from '../SkillsPanel';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { useRecentFiles } from '../../hooks/useRecentFiles';
 
@@ -62,6 +63,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         />
       </div>
       <McpStatusPanel showToast={showToast} />
+      <SkillsPanel conversationId={conversationId} />
     </aside>
   );
 }

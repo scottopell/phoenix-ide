@@ -206,6 +206,7 @@ export interface SkillEntry {
   name: string;
   description: string;
   argument_hint?: string | null;
+  source: string;
 }
 
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
