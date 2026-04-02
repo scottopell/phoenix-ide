@@ -10,6 +10,12 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 /// Tool that lets the LLM invoke a discovered skill by name.
+///
+/// TODO(REQ-SK-005): For full convergence with the user `/skill` path, this
+/// tool should produce a `MessageContent::Skill` (injected via state machine
+/// interception, like `ask_user_question`) rather than a plain `ToolOutput`.
+/// Currently the *content* is identical thanks to shared `invoke_skill()`, but
+/// the delivery mechanism differs (tool result vs. user message).
 pub struct SkillTool;
 
 #[async_trait]
@@ -57,53 +63,10 @@ impl Tool for SkillTool {
             return ToolOutput::error("skill_name is required");
         }
 
-        // Discover skills from the conversation's working directory
-        let skills = crate::system_prompt::discover_skills(&ctx.working_dir);
-
-        let Some(skill) = skills.iter().find(|s| s.name == skill_name) else {
-            let available: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-            return ToolOutput::error(format!(
-                "Skill '{}' not found. Available skills: {}",
-                skill_name,
-                if available.is_empty() {
-                    "none".to_string()
-                } else {
-                    available.join(", ")
-                }
-            ));
-        };
-
-        // Read the skill content
-        let content = match std::fs::read_to_string(&skill.path) {
-            Ok(c) => c,
-            Err(e) => return ToolOutput::error(format!("Failed to read skill: {e}")),
-        };
-
-        // Substitute $ARGUMENTS if present
-        let expanded = if content.contains("$ARGUMENTS") {
-            let mut result = content.clone();
-
-            // Replace positional patterns first ($ARGUMENTS[N] and $N) before
-            // the bare $ARGUMENTS, since $ARGUMENTS is a prefix of $ARGUMENTS[N].
-            let tokens: Vec<&str> = args.split_whitespace().collect();
-            for (i, token) in tokens.iter().enumerate() {
-                let n = i + 1;
-                result = result
-                    .replace(&format!("$ARGUMENTS[{n}]"), token)
-                    .replace(&format!("${n}"), token);
-            }
-
-            // Now replace bare $ARGUMENTS with the full args string
-            result = result.replace("$ARGUMENTS", args);
-
-            result
-        } else if !args.is_empty() {
-            format!("{content}\nARGUMENTS: {args}")
-        } else {
-            content
-        };
-
-        ToolOutput::success(expanded)
+        match crate::skills::invoke_skill(skill_name, args, &ctx.working_dir) {
+            Ok(invocation) => ToolOutput::success(invocation.body),
+            Err(e) => ToolOutput::error(e),
+        }
     }
 }
 
@@ -135,37 +98,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn test_skill_not_found() {
-        let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
-        let result = tool
-            .run(
-                json!({"skill_name": "nonexistent"}),
-                test_context(tmp.path().to_path_buf()),
-            )
-            .await;
-        assert!(!result.success);
-        assert!(result.output.contains("not found"));
-        assert!(result.output.contains("Available skills:"));
-    }
-
-    #[tokio::test]
-    async fn test_skill_not_found_lists_available() {
-        let tmp = TempDir::new().unwrap();
-        write_skill(tmp.path(), "build", "build", "Build stuff", "Build body.");
-
-        let tool = SkillTool;
-        let result = tool
-            .run(
-                json!({"skill_name": "deploy"}),
-                test_context(tmp.path().to_path_buf()),
-            )
-            .await;
-        assert!(!result.success);
-        assert!(result.output.contains("not found"));
-        assert!(result.output.contains("build"));
-    }
+    // -- Input validation (tool-level concerns) --
 
     #[tokio::test]
     async fn test_skill_empty_name() {
@@ -192,8 +125,40 @@ mod tests {
         assert!(result.output.contains("skill_name is required"));
     }
 
+    // -- Delegation to invoke_skill (smoke tests through the tool interface) --
+
     #[tokio::test]
-    async fn test_skill_found_no_args() {
+    async fn test_skill_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let tool = SkillTool;
+        let result = tool
+            .run(
+                json!({"skill_name": "nonexistent"}),
+                test_context(tmp.path().to_path_buf()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_not_found_lists_available() {
+        let tmp = TempDir::new().unwrap();
+        write_skill(tmp.path(), "build", "build", "Build stuff", "Build body.");
+
+        let tool = SkillTool;
+        let result = tool
+            .run(
+                json!({"skill_name": "deploy"}),
+                test_context(tmp.path().to_path_buf()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("build"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_found_returns_body() {
         let tmp = TempDir::new().unwrap();
         write_skill(
             tmp.path(),
@@ -211,11 +176,14 @@ mod tests {
             )
             .await;
         assert!(result.success);
+        // invoke_skill strips frontmatter and prepends base directory
         assert!(result.output.contains("Run cargo build."));
+        assert!(result.output.contains("Base directory for this skill:"));
+        assert!(!result.output.contains("---"));
     }
 
     #[tokio::test]
-    async fn test_skill_with_arguments_placeholder() {
+    async fn test_skill_with_args_substituted() {
         let tmp = TempDir::new().unwrap();
         write_skill(
             tmp.path(),
@@ -236,52 +204,5 @@ mod tests {
         assert!(result
             .output
             .contains("Please review src/main.rs carefully."));
-    }
-
-    #[tokio::test]
-    async fn test_skill_with_args_no_placeholder_appends() {
-        let tmp = TempDir::new().unwrap();
-        write_skill(
-            tmp.path(),
-            "deploy",
-            "deploy",
-            "Deploy skill",
-            "Run the deployment steps.",
-        );
-
-        let tool = SkillTool;
-        let result = tool
-            .run(
-                json!({"skill_name": "deploy", "args": "staging"}),
-                test_context(tmp.path().to_path_buf()),
-            )
-            .await;
-        assert!(result.success);
-        assert!(result.output.contains("Run the deployment steps."));
-        assert!(result.output.contains("ARGUMENTS: staging"));
-    }
-
-    #[tokio::test]
-    async fn test_skill_positional_arguments() {
-        let tmp = TempDir::new().unwrap();
-        write_skill(
-            tmp.path(),
-            "greet",
-            "greet",
-            "Greet someone",
-            "Hello $ARGUMENTS[1], welcome to $ARGUMENTS[2].",
-        );
-
-        let tool = SkillTool;
-        let result = tool
-            .run(
-                json!({"skill_name": "greet", "args": "Alice Wonderland"}),
-                test_context(tmp.path().to_path_buf()),
-            )
-            .await;
-        assert!(result.success);
-        assert!(result
-            .output
-            .contains("Hello Alice, welcome to Wonderland."));
     }
 }
