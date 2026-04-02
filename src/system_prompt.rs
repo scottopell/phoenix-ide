@@ -183,6 +183,67 @@ pub fn discover_skills_with_home(
         current = dir.parent().map(Path::to_path_buf);
     }
 
+    // Scan immediate child directories of working_dir for skills.
+    // Handles the "projects directory" case where CWD is a parent containing
+    // multiple project subdirs, each with their own .claude/skills/.
+    if let Ok(children) = std::fs::read_dir(working_dir) {
+        for child in children.flatten() {
+            if !child.path().is_dir() {
+                continue;
+            }
+            for skill_subdir in SKILL_DIRS {
+                let skills_dir = child.path().join(skill_subdir);
+                if !skills_dir.is_dir() {
+                    continue;
+                }
+                let canonical_dir =
+                    std::fs::canonicalize(&skills_dir).unwrap_or_else(|_| skills_dir.clone());
+                if !scanned_dirs.insert(canonical_dir) {
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if !entry.path().is_dir() {
+                        continue;
+                    }
+                    let skill_md = entry.path().join("SKILL.md");
+                    if !skill_md.is_file() {
+                        continue;
+                    }
+                    let canonical =
+                        std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
+                    if !seen_paths.insert(canonical) {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                        let content_hash = {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::hash::DefaultHasher::new();
+                            content.hash(&mut hasher);
+                            hasher.finish()
+                        };
+                        if !seen_content.insert(content_hash) {
+                            continue;
+                        }
+                        if let Some(fm) = parse_skill_frontmatter(&content) {
+                            if seen_names.insert(fm.name.clone()) {
+                                skills.push(SkillMetadata {
+                                    name: fm.name,
+                                    description: fm.description,
+                                    argument_hint: fm.argument_hint,
+                                    path: skill_md,
+                                    source: (*skill_subdir).to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Explicitly check $HOME/.claude/skills/ and $HOME/.agents/skills/
     // in case $HOME is not an ancestor of working_dir (e.g., different mount).
     // Skip if the walk-up already passed through $HOME.
