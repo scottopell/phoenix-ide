@@ -101,11 +101,30 @@ const SKILL_DIRS: &[&str] = &[".claude/skills", ".agents/skills"];
 /// `std::fs::canonicalize` so two paths resolving to the same file are
 /// counted once (first discovered wins).
 ///
+/// After the walk-up, explicitly scans `$HOME/.claude/skills/` and
+/// `$HOME/.agents/skills/` in case `$HOME` is not an ancestor of `working_dir`.
+/// Pass `home_override` to control which directory is treated as `$HOME`
+/// (useful for testing without mutating process-global env vars).
+///
 /// Returns skills sorted by name for deterministic output.
 pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
+    discover_skills_with_home(working_dir, None)
+}
+
+/// Inner implementation of [`discover_skills`] with an optional home directory
+/// override. When `home_override` is `Some`, that path is used instead of
+/// `$HOME` for the explicit home-directory skill scan. When `None`, falls back
+/// to `std::env::var("HOME")`.
+#[allow(clippy::too_many_lines)]
+pub fn discover_skills_with_home(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+) -> Vec<SkillMetadata> {
     let mut skills: Vec<SkillMetadata> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new(); // canonical paths for symlink dedup
+    let mut seen_content: HashSet<u64> = HashSet::new(); // content hash for copy dedup
+    let mut scanned_dirs: HashSet<PathBuf> = HashSet::new(); // directories already scanned
     let mut current = Some(working_dir.to_path_buf());
 
     while let Some(dir) = current {
@@ -113,6 +132,11 @@ pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
             let skills_dir = dir.join(skill_subdir);
             if !skills_dir.is_dir() {
                 continue;
+            }
+            let canonical_dir =
+                std::fs::canonicalize(&skills_dir).unwrap_or_else(|_| skills_dir.clone());
+            if !scanned_dirs.insert(canonical_dir) {
+                continue; // already scanned this directory
             }
             let Ok(entries) = std::fs::read_dir(&skills_dir) else {
                 continue;
@@ -132,6 +156,16 @@ pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
                     continue; // already seen via a different path
                 }
                 if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                    // Content dedup: hash file content to catch copies
+                    let content_hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::hash::DefaultHasher::new();
+                        content.hash(&mut hasher);
+                        hasher.finish()
+                    };
+                    if !seen_content.insert(content_hash) {
+                        continue;
+                    }
                     if let Some(fm) = parse_skill_frontmatter(&content) {
                         if seen_names.insert(fm.name.clone()) {
                             skills.push(SkillMetadata {
@@ -147,6 +181,66 @@ pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
             }
         }
         current = dir.parent().map(Path::to_path_buf);
+    }
+
+    // Explicitly check $HOME/.claude/skills/ and $HOME/.agents/skills/
+    // in case $HOME is not an ancestor of working_dir (e.g., different mount).
+    // Skip if the walk-up already passed through $HOME.
+    let resolved_home = match home_override {
+        Some(h) => Some(h.to_path_buf()),
+        None => std::env::var("HOME").ok().map(PathBuf::from),
+    };
+    if let Some(home) = resolved_home {
+        for skill_subdir in SKILL_DIRS {
+            let skills_dir = home.join(skill_subdir);
+            if !skills_dir.is_dir() {
+                continue;
+            }
+            let canonical_dir =
+                std::fs::canonicalize(&skills_dir).unwrap_or_else(|_| skills_dir.clone());
+            if !scanned_dirs.insert(canonical_dir) {
+                continue; // walk-up already scanned this
+            }
+            let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let skill_md = entry.path().join("SKILL.md");
+                if !skill_md.is_file() {
+                    continue;
+                }
+                let canonical =
+                    std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
+                if !seen_paths.insert(canonical) {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                    // Content dedup: hash the file content to catch copies
+                    let content_hash = {
+                        let mut hasher = std::hash::DefaultHasher::new();
+                        content.hash(&mut hasher);
+                        hasher.finish()
+                    };
+                    if !seen_content.insert(content_hash) {
+                        continue;
+                    }
+                    if let Some(fm) = parse_skill_frontmatter(&content) {
+                        if seen_names.insert(fm.name.clone()) {
+                            skills.push(SkillMetadata {
+                                name: fm.name,
+                                description: fm.description,
+                                argument_hint: fm.argument_hint,
+                                path: skill_md,
+                                source: skill_subdir.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -194,6 +288,18 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
 
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
+    build_system_prompt_with_home(working_dir, is_sub_agent, None)
+}
+
+/// Build the complete system prompt with an optional home directory override.
+///
+/// When `home_override` is `Some`, that path is used instead of `$HOME` for
+/// the explicit home-directory skill scan. See [`discover_skills_with_home`].
+pub fn build_system_prompt_with_home(
+    working_dir: &Path,
+    is_sub_agent: bool,
+    home_override: Option<&Path>,
+) -> String {
     let mut prompt = String::from(BASE_PROMPT);
 
     // Add guidance from discovered files
@@ -218,7 +324,7 @@ pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
     }
 
     // Inject skill catalog (metadata only — full instructions loaded on demand via bash)
-    let skills = discover_skills(working_dir);
+    let skills = discover_skills_with_home(working_dir, home_override);
     if !skills.is_empty() {
         prompt.push_str("\n\n<available_skills>\n");
         prompt.push_str("The following skills are available. To use a skill, read its SKILL.md file using bash (e.g. `cat /path/to/SKILL.md`) to load full instructions.\n");
@@ -399,7 +505,7 @@ mod tests {
     #[test]
     fn test_discover_skills_none() {
         let temp = TempDir::new().unwrap();
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert!(skills.is_empty());
     }
 
@@ -414,7 +520,7 @@ mod tests {
             "Does something useful. Use when you need something.",
         );
 
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "my-skill");
         assert!(skills[0].description.contains("Does something useful"));
@@ -438,7 +544,7 @@ mod tests {
             "An agents skill",
         );
 
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "my-skill");
         assert_eq!(skills[0].source, ".agents/skills");
@@ -462,7 +568,7 @@ mod tests {
             "First alphabetically",
         );
 
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].name, "aaa-skill");
         assert_eq!(skills[1].name, "zzz-skill");
@@ -492,7 +598,7 @@ mod tests {
         );
 
         // Discover from child -- child should win
-        let skills = discover_skills(&child);
+        let skills = discover_skills_with_home(&child, Some(temp.path()));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Child description");
     }
@@ -515,7 +621,7 @@ mod tests {
             "From .agents/skills",
         );
 
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert_eq!(skills.len(), 2);
         // sorted by name
         assert_eq!(skills[0].name, "agents-skill");
@@ -543,7 +649,7 @@ mod tests {
             "From agents",
         );
 
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "From claude");
         assert_eq!(skills[0].source, ".claude/skills");
@@ -561,7 +667,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills(temp.path());
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
         assert!(skills.is_empty());
     }
 
@@ -576,7 +682,7 @@ mod tests {
             "Deploy the app. Use when deploying.",
         );
 
-        let prompt = build_system_prompt(temp.path(), false);
+        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("</available_skills>"));
@@ -588,7 +694,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_no_skills() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt(temp.path(), false);
+        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
 
         assert!(!prompt.contains("<available_skills>"));
     }
