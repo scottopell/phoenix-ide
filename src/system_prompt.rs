@@ -526,9 +526,7 @@ mod tests {
         assert!(skills[0].description.contains("Does something useful"));
         assert_eq!(
             skills[0].path,
-            temp.path()
-                .join(".claude/skills/my-skill")
-                .join("SKILL.md")
+            temp.path().join(".claude/skills/my-skill").join("SKILL.md")
         );
         assert_eq!(skills[0].source, ".claude/skills");
     }

@@ -476,7 +476,13 @@ mod tests {
     #[test]
     fn test_detect_skill_invocation_at_start() {
         let tmp = make_tmp();
-        write_skill(tmp.path(), "review", "review", "Code review", "Review body.");
+        write_skill(
+            tmp.path(),
+            "review",
+            "review",
+            "Code review",
+            "Review body.",
+        );
 
         let result = detect_skill_invocation("/review src/main.rs", tmp.path());
         assert_eq!(
@@ -525,10 +531,7 @@ mod tests {
         let tmp = make_tmp();
         write_skill(tmp.path(), "build", "build", "Build skill", "Build body.");
 
-        assert_eq!(
-            detect_skill_invocation("foo/build bar", tmp.path()),
-            None
-        );
+        assert_eq!(detect_skill_invocation("foo/build bar", tmp.path()), None);
     }
 
     // -------------------------------------------------------------------------
@@ -604,11 +607,7 @@ mod tests {
         let result = expand("use /build to compile", tmp.path()).unwrap();
         assert_eq!(result.display_text, "use /build to compile");
         assert!(result.llm_text.contains("Run the build steps."));
-        assert!(
-            result
-                .llm_text
-                .contains("ARGUMENTS: use /build to compile")
-        );
+        assert!(result.llm_text.contains("ARGUMENTS: use /build to compile"));
     }
 
     #[test]
