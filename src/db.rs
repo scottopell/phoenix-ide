@@ -294,8 +294,7 @@ impl Database {
                     if attempts >= 10 {
                         // Last resort: full UUID fragment (UUIDs are ASCII, first 8 bytes always valid)
                         let uuid_str = uuid::Uuid::new_v4().to_string();
-                        actual_slug =
-                            format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
+                        actual_slug = format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
                     } else {
                         actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
                     }
@@ -578,10 +577,12 @@ impl Database {
         //   - context_exhausted: completed conversations that cannot accept new messages
         //   - awaiting_task_approval: user approval pending; state data (title/priority/plan)
         //     is in the JSON column and must survive restart
+        //   - awaiting_user_response: user questions pending; state data (questions/tool_use_id)
+        //     is in the JSON column and must survive restart
         //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval', 'terminal')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())

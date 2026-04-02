@@ -1,6 +1,12 @@
 // Utility functions
 
-import type { ConversationState, ToolCall, PendingSubAgent, SubAgentResult } from './api';
+import type { ConversationState, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
+
+/** Format a keyboard shortcut for the current platform (Cmd on macOS, Ctrl elsewhere) */
+export function formatShortcut(shortcut: string): string {
+  const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+  return shortcut.replace(/Ctrl/g, isMac ? 'Cmd' : 'Ctrl');
+}
 
 export function escapeHtml(str: string): string {
   if (!str) return '';
@@ -47,7 +53,7 @@ export function formatShortDateTime(isoStr: string): string {
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
     case 'idle': case 'error': case 'terminal': case 'context_exhausted':
-    case 'awaiting_task_approval':
+    case 'awaiting_task_approval': case 'awaiting_user_response':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -62,7 +68,7 @@ export function isCancellingState(state: ConversationState): boolean {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
     case 'idle': case 'error': case 'terminal': case 'context_exhausted':
-    case 'awaiting_task_approval':
+    case 'awaiting_task_approval': case 'awaiting_user_response':
     case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
       return false;
@@ -99,6 +105,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'ready';
     case 'awaiting_task_approval':
       return 'awaiting approval';
+    case 'awaiting_user_response':
+      return 'awaiting response';
     case 'error':
       return 'error';
     case 'context_exhausted':
@@ -144,6 +152,11 @@ export function parseConversationState(raw: unknown): ConversationState {
         title: (obj['title'] as string) ?? '',
         priority: (obj['priority'] as string) ?? '',
         plan: (obj['plan'] as string) ?? '',
+      };
+    case 'awaiting_user_response':
+      return {
+        type: 'awaiting_user_response',
+        questions: (obj['questions'] as UserQuestion[]) ?? [],
       };
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };

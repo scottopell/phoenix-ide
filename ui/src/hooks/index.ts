@@ -1,6 +1,7 @@
 export { useLocalStorage, useLocalStorageString } from './useLocalStorage';
 export { useKeyboardNav, useGlobalKeyboardShortcuts } from './useKeyboardNav';
 export { useDraft } from './useDraft';
+export { FocusScopeProvider, useFocusScope, useRegisterFocusScope } from './useFocusScope';
 export { useMessageQueue } from './useMessageQueue';
 export type { QueuedMessage, MessageStatus } from './useMessageQueue';
 export { useConnection } from './useConnection';

@@ -10,8 +10,11 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { ProseReader } from '../components/ProseReader';
 import { TaskApprovalReader } from '../components/TaskApprovalReader';
+import { QuestionPanel } from '../components/QuestionPanel';
 import { FirstTaskWelcome } from '../components/FirstTaskWelcome';
 import { useMessageQueue, useConnection } from '../hooks';
+import { useToast } from '../hooks/useToast';
+import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
@@ -56,6 +59,9 @@ export function ConversationPage() {
 
   // App state for offline support
   const { isOnline, queueOperation } = useAppMachine();
+
+  // Toast for question panel feedback
+  const { toasts, dismissToast, showInfo } = useToast();
 
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
@@ -551,6 +557,12 @@ export function ConversationPage() {
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
         />
+      ) : convStateForChildren.type === 'awaiting_user_response' ? (
+        <QuestionPanel
+          questions={convStateForChildren.questions}
+          conversationId={conversation.id}
+          showToast={showInfo}
+        />
       ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
         <>
         {conversationId && (
@@ -601,6 +613,8 @@ export function ConversationPage() {
           onSendFeedback={handleTaskFeedback}
         />
       )}
+
+      <Toast messages={toasts} onDismiss={dismissToast} />
 
       {/* First task welcome modal */}
       <FirstTaskWelcome

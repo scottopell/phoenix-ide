@@ -3,8 +3,9 @@
 use crate::db::{ErrorKind, ImageData, ToolResult};
 use crate::llm::{ContentBlock, Usage};
 use crate::state_machine::state::{
-    PendingSubAgent, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
+    PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
 };
+use std::collections::HashMap;
 
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
@@ -84,5 +85,12 @@ pub enum Event {
     /// User responded to a proposed task plan
     TaskApprovalResponse {
         outcome: TaskApprovalOutcome,
+    },
+
+    // Ask user question events (REQ-AUQ-001)
+    /// User answered the pending questions (POST /api/conversations/{id}/respond)
+    UserQuestionResponse {
+        answers: HashMap<String, String>,
+        annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
 }

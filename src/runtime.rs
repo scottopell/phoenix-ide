@@ -637,6 +637,7 @@ impl RuntimeManager {
 
         match &conv.state {
             ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::Terminal => {
                 tracing::debug!(

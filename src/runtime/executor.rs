@@ -319,6 +319,7 @@ where
                     ConvState::Error { .. } => "Error",
                     ConvState::ContextExhausted { .. } => "ContextExhausted",
                     ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
+                    ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
                     ConvState::Terminal => "Terminal",
                 }
             }
@@ -335,6 +336,7 @@ where
                         | ConvState::Error { .. }
                         | ConvState::ContextExhausted { .. }
                         | ConvState::AwaitingTaskApproval { .. }
+                        | ConvState::AwaitingUserResponse { .. }
                         | ConvState::Terminal
                 );
                 if notable {

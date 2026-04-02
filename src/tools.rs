@@ -2,6 +2,7 @@
 //!
 //! REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 
+mod ask_user_question;
 mod bash;
 pub mod bash_check;
 pub mod browser;
@@ -15,6 +16,7 @@ mod search;
 mod subagent;
 mod think;
 
+pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -165,6 +167,14 @@ pub trait Tool: Send + Sync {
     /// JSON schema for tool input
     fn input_schema(&self) -> Value;
 
+    /// Whether this tool's full definition should be deferred (lazy-loaded on demand).
+    /// Deferred tools send only name + description to the LLM initially, reducing
+    /// prompt size when there are many tools. Override to `true` for rarely-used
+    /// built-in tools (REQ-AUQ-008).
+    fn defer_loading(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with all context provided via `ToolContext`
     ///
     /// Tools that spawn long-running subprocesses should monitor
@@ -190,6 +200,7 @@ impl ToolRegistry {
             Arc::new(KeywordSearchTool),
             Arc::new(ReadImageTool),
             Arc::new(ProposePlanTool),
+            Arc::new(AskUserQuestionTool),
             Arc::new(SpawnAgentsTool),
             // Browser tools
             Arc::new(BrowserNavigateTool),
@@ -254,12 +265,13 @@ impl ToolRegistry {
         ];
 
         if is_sub_agent {
-            // Sub-agents get completion tools, no spawning
+            // Sub-agents get completion tools, no spawning, no ask_user_question (REQ-AUQ-006)
             tools.push(Arc::new(SubmitResultTool));
             tools.push(Arc::new(SubmitErrorTool));
         } else {
-            // Parent conversations can spawn sub-agents
+            // Parent conversations can spawn sub-agents and ask user questions
             tools.push(Arc::new(SpawnAgentsTool));
+            tools.push(Arc::new(AskUserQuestionTool));
         }
 
         Self { tools }
@@ -273,7 +285,7 @@ impl ToolRegistry {
                 name: t.name().to_string(),
                 description: t.description(),
                 input_schema: t.input_schema(),
-                defer_loading: false,
+                defer_loading: t.defer_loading(),
             })
             .collect()
     }

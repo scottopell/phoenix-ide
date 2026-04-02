@@ -208,6 +208,38 @@ fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
         })
 }
 
+fn arb_user_question() -> impl Strategy<Value = state::UserQuestion> {
+    (
+        "[a-zA-Z ]{1,30}",
+        "[a-zA-Z ]{1,20}",
+        proptest::collection::vec(
+            "[a-zA-Z ]{1,20}".prop_map(|label| state::QuestionOption {
+                label,
+                description: None,
+                preview: None,
+            }),
+            2..=4,
+        ),
+    )
+        .prop_map(|(question, header, options)| state::UserQuestion {
+            question,
+            header,
+            options,
+            multi_select: false,
+        })
+}
+
+fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
+    (
+        proptest::collection::vec(arb_user_question(), 1..=4),
+        "[a-z]{8}",
+    )
+        .prop_map(|(questions, tool_use_id)| ConvState::AwaitingUserResponse {
+            questions,
+            tool_use_id,
+        })
+}
+
 fn arb_state() -> impl Strategy<Value = ConvState> {
     prop_oneof![
         arb_idle_state(),
@@ -219,6 +251,7 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_awaiting_continuation_state(),
         arb_context_exhausted_state(),
         arb_awaiting_task_approval_state(),
+        arb_awaiting_user_response_state(),
         arb_terminal_state(),
     ]
 }
@@ -296,6 +329,18 @@ fn arb_task_approval_outcome() -> impl Strategy<Value = TaskApprovalOutcome> {
     ]
 }
 
+fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
+    proptest::collection::vec(("[a-zA-Z ]{1,20}", "[a-zA-Z ]{1,20}"), 1..=4).prop_map(|pairs| {
+        let answers = pairs
+            .into_iter()
+            .collect::<std::collections::HashMap<String, String>>();
+        Event::UserQuestionResponse {
+            answers,
+            annotations: None,
+        }
+    })
+}
+
 fn arb_task_approval_event() -> impl Strategy<Value = Event> {
     arb_task_approval_outcome().prop_map(|outcome| Event::TaskApprovalResponse { outcome })
 }
@@ -309,6 +354,7 @@ fn arb_event() -> impl Strategy<Value = Event> {
         arb_retry_timeout_event(),
         Just(Event::UserCancel),
         arb_task_approval_event(),
+        arb_user_question_response_event(),
     ]
 }
 

@@ -93,6 +93,10 @@ export function StateBar({
             dotClass += ' approval';
             stateText = 'awaiting approval';
             break;
+          case 'awaiting_user_response':
+            dotClass += ' approval';
+            stateText = 'awaiting response';
+            break;
           case 'error':
             dotClass += ' error';
             stateText = 'error';

@@ -77,6 +77,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/approve-task", post(approve_task))
         .route("/api/conversations/:id/reject-task", post(reject_task))
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
+        // User question response (REQ-AUQ-003)
+        .route("/api/conversations/:id/respond", post(respond_to_question))
         // Task completion (REQ-PROJ-009)
         .route("/api/conversations/:id/complete-task", post(complete_task))
         .route(
@@ -1137,6 +1139,54 @@ async fn task_feedback(
                 outcome: TaskApprovalOutcome::FeedbackProvided {
                     annotations: req.annotations,
                 },
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// User Question Response (REQ-AUQ-003)
+// ============================================================
+
+#[derive(Deserialize)]
+struct RespondToQuestionPayload {
+    answers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    annotations:
+        Option<std::collections::HashMap<String, crate::state_machine::state::QuestionAnnotation>>,
+}
+
+async fn respond_to_question(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RespondToQuestionPayload>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // 1. Validate conversation exists and is in AwaitingUserResponse state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+        return Err(AppError::Conflict(ConflictErrorResponse {
+            error: "Conversation is not awaiting a user response".to_string(),
+            error_type: "wrong_state".to_string(),
+        }));
+    }
+
+    // 2. Dispatch response event to state machine
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::UserQuestionResponse {
+                answers: req.answers,
+                annotations: req.annotations,
             },
         )
         .await
