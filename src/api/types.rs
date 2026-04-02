@@ -125,6 +125,8 @@ pub struct FileEntry {
     pub modified_time: Option<u64>, // Unix timestamp in seconds
     pub file_type: String, // folder, markdown, code, config, text, image, data, unknown
     pub is_text_file: bool,
+    #[serde(default)]
+    pub is_gitignored: bool,
 }
 
 /// Response for file listing

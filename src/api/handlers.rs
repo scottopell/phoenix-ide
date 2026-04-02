@@ -2148,6 +2148,22 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
         return Err(AppError::BadRequest("Path is not a directory".to_string()));
     }
 
+    // Build gitignore matcher by walking up to find .gitignore files
+    let gitignore = {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&path);
+        let mut search_dir = path.clone();
+        loop {
+            let gitignore_path = search_dir.join(".gitignore");
+            if gitignore_path.exists() {
+                builder.add(gitignore_path);
+            }
+            if !search_dir.pop() {
+                break;
+            }
+        }
+        builder.build().ok()
+    };
+
     let entries = fs::read_dir(&path)
         .map_err(|e| AppError::BadRequest(format!("Cannot read directory: {e}")))?;
 
@@ -2179,6 +2195,11 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
 
+            let is_gitignored = gitignore.as_ref().is_some_and(|gi| {
+                gi.matched_path_or_any_parents(&entry_path, is_directory)
+                    .is_ignore()
+            });
+
             FileEntry {
                 name,
                 path: full_path,
@@ -2187,6 +2208,7 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
                 modified_time,
                 file_type,
                 is_text_file,
+                is_gitignored,
             }
         })
         .collect();

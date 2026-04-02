@@ -107,6 +107,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             onToggle={() => setFileExplorerCollapsed(!fileExplorerCollapsed)}
             rootPath={activeConversation?.cwd || '/'}
             conversationId={activeConversation?.id}
+            showToast={showSuccess}
           />
         )}
         <div className="desktop-main">

@@ -26,6 +26,7 @@ export interface FileItem {
   modified_time?: number;
   file_type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'image' | 'data' | 'unknown';
   is_text_file: boolean;
+  is_gitignored: boolean;
 }
 
 interface FileTreeProps {
@@ -52,10 +53,6 @@ function extensionColor(name: string): string | undefined {
     case 'lock': return 'var(--text-muted)';
     default: return undefined;
   }
-}
-
-function isDimmed(name: string): boolean {
-  return ['node_modules', 'target', '.git', 'dist', 'build', '__pycache__', '.next', '.vite'].includes(name);
 }
 
 // API
@@ -195,7 +192,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
             'ft-item',
             isDisabled && 'ft-item--disabled',
             isActive && 'ft-item--active',
-            isDimmed(item.name) && 'ft-item--dimmed',
+            item.is_gitignored && 'ft-item--dimmed',
           ].filter(Boolean).join(' ')}
           style={{ paddingLeft: 12 + depth * 16 }}
           onClick={() => !isDisabled && handleItemClick(item)}

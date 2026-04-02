@@ -6,6 +6,7 @@
 import { useState, useCallback } from 'react';
 import { FileTree } from './FileTree';
 import { RecentFilesStrip } from './RecentFilesStrip';
+import { McpStatusPanel } from '../McpStatusPanel';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { useRecentFiles } from '../../hooks/useRecentFiles';
 
@@ -14,9 +15,10 @@ interface Props {
   onToggle: () => void;
   rootPath: string;
   conversationId: string | undefined;
+  showToast: (message: string, duration?: number) => void;
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const { recentFiles, addRecentFile } = useRecentFiles(conversationId);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -59,6 +61,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           refreshKey={refreshKey}
         />
       </div>
+      <McpStatusPanel showToast={showToast} />
     </aside>
   );
 }
