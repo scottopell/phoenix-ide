@@ -1,4 +1,4 @@
-export { FileTree, FileIcon } from './FileTree';
+export { FileTree } from './FileTree';
 export type { FileItem } from './FileTree';
 export { FileExplorerPanel } from './FileExplorerPanel';
 export { FileBrowserOverlay } from './FileBrowserOverlay';

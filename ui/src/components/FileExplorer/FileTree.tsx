@@ -11,18 +11,10 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import {
-  Folder,
-  FileText,
-  FileCode,
-  Settings,
-  File,
-  Image,
-  Database,
   ChevronRight,
   ChevronDown,
   Loader2,
   AlertCircle,
-  FolderOpen,
 } from 'lucide-react';
 
 // Types
@@ -41,6 +33,29 @@ interface FileTreeProps {
   onFileSelect: (filePath: string, rootDir: string) => void;
   activeFile?: string | null | undefined;
   conversationId?: string | undefined;
+  refreshKey?: number;
+}
+
+function extensionColor(name: string): string | undefined {
+  const ext = name.split('.').pop()?.toLowerCase();
+  switch (ext) {
+    case 'rs': return 'var(--accent-orange, #e8863a)';
+    case 'ts': case 'tsx': return 'var(--accent-blue, #5c9fd6)';
+    case 'js': case 'jsx': return 'var(--accent-yellow, #d4b84b)';
+    case 'py': return 'var(--accent-green, #6ab04c)';
+    case 'md': case 'txt': return 'var(--text-muted)';
+    case 'json': case 'toml': case 'yaml': case 'yml': return 'var(--accent-yellow, #d4b84b)';
+    case 'css': return '#c678dd';
+    case 'html': return '#e06c75';
+    case 'sh': case 'bash': return 'var(--accent-green, #6ab04c)';
+    case 'sql': return '#61afef';
+    case 'lock': return 'var(--text-muted)';
+    default: return undefined;
+  }
+}
+
+function isDimmed(name: string): boolean {
+  return ['node_modules', 'target', '.git', 'dist', 'build', '__pycache__', '.next', '.vite'].includes(name);
 }
 
 // API
@@ -73,31 +88,7 @@ function saveExpansion(convId: string, expanded: Set<string>) {
   localStorage.setItem(expansionKey(convId), JSON.stringify([...expanded]));
 }
 
-// Icon component
-export function FileIcon({ type, isExpanded }: { type: FileItem['file_type']; isExpanded?: boolean }) {
-  const iconProps = { size: 18, className: `file-icon file-icon-${type}` };
-
-  switch (type) {
-    case 'folder':
-      return isExpanded ? <FolderOpen {...iconProps} /> : <Folder {...iconProps} />;
-    case 'markdown':
-      return <FileText {...iconProps} />;
-    case 'code':
-      return <FileCode {...iconProps} />;
-    case 'config':
-      return <Settings {...iconProps} />;
-    case 'text':
-      return <FileText {...iconProps} />;
-    case 'image':
-      return <Image {...iconProps} />;
-    case 'data':
-      return <Database {...iconProps} />;
-    default:
-      return <File {...iconProps} />;
-  }
-}
-
-export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }: FileTreeProps) {
+export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, refreshKey }: FileTreeProps) {
   const [items, setItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -136,7 +127,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
       .catch(err => { if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [rootPath]);
+  }, [rootPath, refreshKey]);
 
   // Load children for expanded folder
   const loadChildren = useCallback(async (path: string) => {
@@ -204,6 +195,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
             'ft-item',
             isDisabled && 'ft-item--disabled',
             isActive && 'ft-item--active',
+            isDimmed(item.name) && 'ft-item--dimmed',
           ].filter(Boolean).join(' ')}
           style={{ paddingLeft: 12 + depth * 16 }}
           onClick={() => !isDisabled && handleItemClick(item)}
@@ -214,17 +206,21 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
           {item.is_directory && (
             <span className="ft-expand-icon">
               {isLoadingChildren ? (
-                <Loader2 size={14} className="spinning" />
+                <Loader2 size={12} className="spinning" />
               ) : isExpanded ? (
-                <ChevronDown size={14} />
+                <ChevronDown size={12} />
               ) : (
-                <ChevronRight size={14} />
+                <ChevronRight size={12} />
               )}
             </span>
           )}
           {!item.is_directory && <span className="ft-indent-spacer" />}
-          <FileIcon type={item.file_type} isExpanded={isExpanded} />
-          <span className="ft-name">{item.name}</span>
+          {!item.is_directory && (
+            <span className="ft-dot" style={{ color: extensionColor(item.name) || 'var(--text-muted)' }}>
+              &#8226;
+            </span>
+          )}
+          <span className={`ft-name ${item.is_directory ? 'ft-name--folder' : ''}`}>{item.name}</span>
         </div>
         {item.is_directory && isExpanded && (
           <div className="ft-children">
@@ -266,7 +262,6 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId }:
   if (items.length === 0) {
     return (
       <div className="ft-status">
-        <Folder size={20} />
         <span>Empty directory</span>
       </div>
     );
