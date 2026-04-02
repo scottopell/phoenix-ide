@@ -319,11 +319,11 @@ export function ConversationPage() {
     const msg = queuedMessages.find((m) => m.localId === localId);
     if (!msg) return;
 
-    retry(localId);
-
-    if (isConnected) {
-      sendMessage(localId, msg.text, msg.images);
-    }
+    // Populate the message back into the input area for review/editing
+    // instead of directly resending (the banner truncates content and
+    // the user may want to fix the issue that caused the failure).
+    dismiss(localId);
+    inputRef.current?.setDraft(msg.text);
   };
 
   const handleCancel = async () => {

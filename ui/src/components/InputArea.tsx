@@ -28,6 +28,7 @@ import { fuzzyMatch } from './CommandPalette/fuzzyMatch';
 
 export interface InputAreaHandle {
   appendToDraft: (text: string) => void;
+  setDraft: (text: string) => void;
 }
 
 interface InputAreaProps {
@@ -72,6 +73,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   useImperativeHandle(ref, () => ({
     appendToDraft: (text: string) => {
       setDraft(draft.trim() ? draft + '\n\n' + text : text);
+    },
+    setDraft: (text: string) => {
+      setDraft(text);
     },
   }), [draft, setDraft]);
 
