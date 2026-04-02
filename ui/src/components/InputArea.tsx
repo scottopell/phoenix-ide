@@ -45,6 +45,7 @@ interface InputAreaProps {
   onSend: (text: string, images: ImageData[]) => Promise<void> | void;
   onCancel: () => void;
   onRetry: (localId: string) => void;
+  onDismissError?: (localId: string) => void;
   onOpenFileBrowser?: () => void;
 }
 
@@ -58,6 +59,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onSend,
   onCancel,
   onRetry,
+  onDismissError,
   onOpenFileBrowser,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
@@ -527,6 +529,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               >
                 Retry
               </button>
+              {onDismissError && (
+                <button
+                  className="failed-message-dismiss"
+                  onClick={() => onDismissError(msg.localId)}
+                  title="Dismiss"
+                >
+                  x
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -568,6 +579,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         <div className="input-expansion-error" role="alert">
           <span className="input-expansion-error-icon">x</span>
           <span className="input-expansion-error-text">{expansionError}</span>
+          <button
+            className="input-expansion-error-dismiss"
+            onClick={() => setExpansionError(null)}
+            title="Dismiss"
+          >
+            x
+          </button>
         </div>
       )}
 

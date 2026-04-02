@@ -1978,6 +1978,37 @@ pre:hover .copy-btn {
   background: #d64545;
 }
 
+.failed-message-dismiss {
+  padding: 2px 6px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  border-radius: 4px;
+}
+
+.failed-message-dismiss:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.input-expansion-error-dismiss {
+  margin-left: auto;
+  padding: 2px 6px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  border-radius: 4px;
+}
+
+.input-expansion-error-dismiss:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
 /* State bar layout */
 #state-bar-left {
   display: flex;
