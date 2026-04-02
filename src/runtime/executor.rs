@@ -1236,6 +1236,14 @@ where
                     });
                 }
 
+                // Skill messages are delivered as user-role messages (REQ-SK-002)
+                MessageContent::Skill(skill_content) => {
+                    messages.push(LlmMessage {
+                        role: MessageRole::User,
+                        content: vec![ContentBlock::text(&skill_content.body)],
+                    });
+                }
+
                 // Ignore system, error, and continuation messages
                 MessageContent::System(_)
                 | MessageContent::Error(_)

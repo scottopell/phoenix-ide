@@ -9,6 +9,7 @@ mod llm;
 mod message_expander;
 mod platform;
 mod runtime;
+pub mod skills;
 mod state_machine;
 mod system_prompt;
 mod title_generator;

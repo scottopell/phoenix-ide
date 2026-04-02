@@ -217,9 +217,10 @@ export function conversationReducer(
         newMessages = [...atom.messages, action.message];
       }
 
-      // User message resets breadcrumbs to start a fresh agent turn
+      // User and skill messages reset breadcrumbs to start a fresh agent turn
       const isUserMessage =
-        action.message.message_type === 'user' || action.message.type === 'user';
+        action.message.message_type === 'user' || action.message.type === 'user'
+        || action.message.message_type === 'skill';
 
       let breadcrumbs: Breadcrumb[] = isUserMessage
         ? [{ type: 'user', label: 'User' }]

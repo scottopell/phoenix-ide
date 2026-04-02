@@ -509,6 +509,22 @@ pub struct ContinuationContent {
     pub summary: String,
 }
 
+/// Skill invocation content (REQ-SK-002)
+///
+/// Delivered as a user-role message to the LLM but marked as system-generated
+/// in conversation history. Carries the skill name, fully expanded body, and
+/// the original user text that triggered the invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillContent {
+    /// The skill name (e.g., "build")
+    pub name: String,
+    /// The fully expanded skill body (frontmatter stripped, base directory
+    /// prepended, arguments substituted)
+    pub body: String,
+    /// The original user text that triggered the invocation (for display)
+    pub trigger: String,
+}
+
 /// Typed message content
 ///
 /// This enum provides type safety for message content while maintaining
@@ -522,6 +538,9 @@ pub enum MessageContent {
     System(SystemContent),
     Error(ErrorContent),
     Continuation(ContinuationContent),
+    /// Skill invocation -- delivered as a user-role message to the LLM
+    /// but marked as system-generated in conversation history (REQ-SK-002)
+    Skill(SkillContent),
 }
 
 impl MessageContent {
@@ -534,6 +553,7 @@ impl MessageContent {
             Self::System(_) => MessageType::System,
             Self::Error(_) => MessageType::Error,
             Self::Continuation(_) => MessageType::Continuation,
+            Self::Skill(_) => MessageType::Skill,
         }
     }
 
@@ -546,6 +566,7 @@ impl MessageContent {
             Self::System(c) => serde_json::to_value(c).unwrap_or(Value::Null),
             Self::Error(c) => serde_json::to_value(c).unwrap_or(Value::Null),
             Self::Continuation(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+            Self::Skill(c) => serde_json::to_value(c).unwrap_or(Value::Null),
         }
     }
 
@@ -570,6 +591,9 @@ impl MessageContent {
             MessageType::Continuation => serde_json::from_value(value)
                 .map(Self::Continuation)
                 .map_err(|e| format!("Invalid continuation content: {e}")),
+            MessageType::Skill => serde_json::from_value(value)
+                .map(Self::Skill)
+                .map_err(|e| format!("Invalid skill content: {e}")),
         }
     }
 
@@ -632,6 +656,7 @@ impl Serialize for MessageContent {
             Self::System(c) => c.serialize(serializer),
             Self::Error(c) => c.serialize(serializer),
             Self::Continuation(c) => c.serialize(serializer),
+            Self::Skill(c) => c.serialize(serializer),
         }
     }
 }
@@ -660,6 +685,7 @@ pub enum MessageType {
     System,
     Error,
     Continuation,
+    Skill,
 }
 
 impl fmt::Display for MessageType {
@@ -671,6 +697,7 @@ impl fmt::Display for MessageType {
             MessageType::System => write!(f, "system"),
             MessageType::Error => write!(f, "error"),
             MessageType::Continuation => write!(f, "continuation"),
+            MessageType::Skill => write!(f, "skill"),
         }
     }
 }

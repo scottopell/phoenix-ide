@@ -96,7 +96,7 @@ export interface Message {
   message_id: string;
   sequence_id: number;
   conversation_id: string;
-  message_type: 'user' | 'agent' | 'tool' | 'system';
+  message_type: 'user' | 'agent' | 'tool' | 'system' | 'skill';
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown>; // For tool results with images (e.g., screenshots)
