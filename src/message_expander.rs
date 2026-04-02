@@ -6,7 +6,6 @@
 //!
 //! Path (`./`) references are not expanded here — they are autocomplete-only (Task 572).
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::system_prompt::discover_skills;
@@ -79,38 +78,66 @@ impl ExpansionError {
     }
 }
 
-/// Scan `text` for `@token` patterns and return each matched token's path
-/// (without the leading `@`).
+/// A reference found in user text (e.g., `@src/main.rs` or `/build`).
+#[derive(Debug, Clone, PartialEq)]
+struct InlineReference {
+    /// The sigil character (`'@'`, `'/'`)
+    sigil: char,
+    /// The token after the sigil (e.g., `"src/main.rs"`, `"build"`)
+    token: String,
+    /// Byte range in the original text (sigil + token)
+    span: std::ops::Range<usize>,
+}
+
+/// Scan `text` for inline references. A reference is a sigil character followed by
+/// a non-empty token (runs until whitespace or end of string).
 ///
-/// A token starts after `@` and runs until the next whitespace or end of string.
-/// Tokens that contain no path characters (e.g. a bare `@`) are ignored.
-fn extract_at_references(text: &str) -> Vec<String> {
+/// The sigil must be at the start of the text or preceded by whitespace.
+/// This prevents matching email addresses (`user@domain`), embedded paths
+/// (`foo/bar` when `/` is a sigil), etc.
+fn tokenize_references(text: &str, sigils: &[char]) -> Vec<InlineReference> {
     let mut refs = Vec::new();
 
     for (i, ch) in text.char_indices() {
-        if ch != '@' {
+        if !sigils.contains(&ch) {
             continue;
         }
 
-        // Collect the token after `@`
-        let start = i + 1;
-        let mut end = start;
-        // Safety: `start` is `i + 1` where `i` is from `char_indices()` on `text`
-        // and `@` is a single-byte ASCII char, so `start` is a valid boundary.
-        // `end` is computed from `char_indices()` on the same `text` slice.
+        // Must be at start of text or preceded by whitespace.
+        if i > 0 {
+            // Safety: `i` is from `char_indices()` on `text`, so it is a valid
+            // char boundary. Slicing `text[..i]` is safe.
+            #[allow(clippy::string_slice)]
+            let prev_char = text[..i].chars().next_back().unwrap_or(ch);
+            if !prev_char.is_whitespace() {
+                continue;
+            }
+        }
+
+        // Collect the token after the sigil.
+        let token_start = i + ch.len_utf8();
+        let mut token_end = token_start;
+        // Safety: `token_start` is `i + ch.len_utf8()` where `i` is from
+        // `char_indices()` on `text` and `ch` is the char at that index, so
+        // `token_start` is a valid UTF-8 boundary. `token_end` is computed
+        // from `char_indices()` on the same `text` slice.
         #[allow(clippy::string_slice)]
-        for (j, c) in text[start..].char_indices() {
+        for (j, c) in text[token_start..].char_indices() {
             if c.is_whitespace() {
                 break;
             }
-            end = start + j + c.len_utf8();
+            token_end = token_start + j + c.len_utf8();
         }
 
-        // Safety: `start` and `end` are from `char_indices()` on `text`
+        // Safety: `token_start` and `token_end` are from `char_indices()` on `text`.
         #[allow(clippy::string_slice)]
-        let token = &text[start..end];
+        let token = &text[token_start..token_end];
         if !token.is_empty() {
-            refs.push(token.to_string());
+            refs.push(InlineReference {
+                sigil: ch,
+                token: token.to_string(),
+                span: i..token_end,
+            });
         }
     }
 
@@ -120,49 +147,6 @@ fn extract_at_references(text: &str) -> Vec<String> {
 /// Determine whether `content` is valid UTF-8 text (no null bytes).
 fn is_text_content(content: &[u8]) -> bool {
     !content.contains(&0) && std::str::from_utf8(content).is_ok()
-}
-
-/// Detect a `/skill-name` token anywhere in the message text.
-///
-/// Returns `(skill_name, full_original_text)` when a valid skill reference is found.
-/// Validates against discovered skills to avoid false positives (e.g., "/path/to/file").
-///
-/// The full original text is returned as the second element so the LLM receives
-/// the complete user message as context.
-fn detect_skill_invocation(text: &str, working_dir: &Path) -> Option<(String, String)> {
-    let skills = discover_skills(working_dir);
-    let skill_names: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-
-    // Scan for /word tokens
-    for (i, _) in text.match_indices('/') {
-        // Must be at start of message (after trimming) or preceded by whitespace
-        let trimmed_start = text.len() - text.trim_start().len();
-        if i > 0 && i != trimmed_start && !text.as_bytes()[i - 1].is_ascii_whitespace() {
-            continue;
-        }
-
-        // Extract the name: runs until whitespace or end
-        // Safety: `i` is from `match_indices('/')` on `text`, and '/' is a single-byte
-        // ASCII char, so `i + 1` is a valid UTF-8 boundary.
-        #[allow(clippy::string_slice)]
-        let after_slash = &text[i + 1..];
-        let name_end = after_slash
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(after_slash.len());
-        // Safety: `name_end` is from `find()` on `after_slash` (or its `.len()`)
-        #[allow(clippy::string_slice)]
-        let name = &after_slash[..name_end];
-
-        if name.is_empty() {
-            continue;
-        }
-
-        // Only match known skills (avoid matching file paths)
-        if skill_names.contains(name) {
-            return Some((name.to_string(), text.to_string()));
-        }
-    }
-    None
 }
 
 /// Expand a skill invocation by loading SKILL.md and performing `$ARGUMENTS` substitution.
@@ -226,55 +210,72 @@ fn expand_skill(
 
 /// Expand all inline references in `text` relative to `working_dir`.
 ///
-/// Processing order (per spec): skill expansion runs first (it transforms the
-/// full message body), then `@file` references are resolved within the resulting text.
+/// Tokenizes the ORIGINAL text once for both `@` and `/` sigils, then:
+/// 1. Checks for skill invocations (`/` sigil, validated against discovered skills).
+///    Skill expansion replaces the entire message, so it takes priority and file
+///    references in the original text are not expanded.
+/// 2. If no skill matched, expands `@file` references by inlining file contents.
+///
+/// Tokenizing the original text (not skill-expanded text) prevents skill output
+/// from accidentally introducing `@` tokens that trigger file expansion.
 ///
 /// Returns `Ok(ExpandedMessage)` when all references resolve successfully.
 /// Returns the first `Err(ExpansionError)` encountered when any reference fails.
 pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, ExpansionError> {
-    // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
-    let mut llm_text = text.to_string();
+    let refs = tokenize_references(text, &['/', '@']);
 
-    if let Some((skill_name, full_text)) = detect_skill_invocation(text, working_dir) {
-        llm_text = expand_skill(&skill_name, &full_text, working_dir)?;
+    // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
+    // Check for skill invocation first. Skill expansion replaces the entire
+    // message, so it takes priority over file references.
+    if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
+        let skills = discover_skills(working_dir);
+        if skills.iter().any(|s| s.name == skill_ref.token) {
+            let llm_text = expand_skill(&skill_ref.token, text, working_dir)?;
+            return Ok(ExpandedMessage {
+                display_text: text.to_string(),
+                llm_text,
+            });
+        }
     }
 
     // --- File reference expansion (REQ-IR-001) --------------------------------
-    let refs = extract_at_references(&llm_text);
+    let mut llm_text = text.to_string();
+    let file_refs: Vec<_> = refs.iter().filter(|r| r.sigil == '@').collect();
 
-    for ref_path in refs {
-        let full_path = resolve_path(&ref_path, working_dir);
+    for file_ref in file_refs {
+        let full_path = resolve_path(&file_ref.token, working_dir);
 
         // Validate existence
         if !full_path.exists() {
             return Err(ExpansionError::FileNotFound {
-                path: ref_path.clone(),
+                path: file_ref.token.clone(),
             });
         }
 
         // Read contents
-        let content = std::fs::read(&full_path).map_err(|_| ExpansionError::FileNotFound {
-            path: ref_path.clone(),
-        })?;
+        let content =
+            std::fs::read(&full_path).map_err(|_| ExpansionError::FileNotFound {
+                path: file_ref.token.clone(),
+            })?;
 
         // Reject binary files
         if !is_text_content(&content) {
             return Err(ExpansionError::FileNotText {
-                path: ref_path.clone(),
+                path: file_ref.token.clone(),
             });
         }
 
-        let file_text = String::from_utf8(content).map_err(|_| ExpansionError::FileNotText {
-            path: ref_path.clone(),
-        })?;
+        let file_text =
+            String::from_utf8(content).map_err(|_| ExpansionError::FileNotText {
+                path: file_ref.token.clone(),
+            })?;
 
         // Replace `@ref_path` token with structured block
-        let token = format!("@{ref_path}");
-        let block = format!("<file path=\"{ref_path}\">\n{file_text}\n</file>");
+        let token = format!("@{}", file_ref.token);
+        let block = format!("<file path=\"{}\">\n{file_text}\n</file>", file_ref.token);
         llm_text = llm_text.replace(&token, &block);
     }
 
-    // If nothing changed, short-circuit (display_text == llm_text)
     Ok(ExpandedMessage {
         display_text: text.to_string(),
         llm_text,
@@ -304,37 +305,57 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // extract_at_references
+    // tokenize_references — @ sigil
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_extract_no_refs() {
-        assert!(extract_at_references("hello world").is_empty());
+    fn test_tokenize_no_refs() {
+        assert!(tokenize_references("hello world", &['@']).is_empty());
     }
 
     #[test]
-    fn test_extract_single_ref() {
-        let refs = extract_at_references("look at @src/main.rs please");
-        assert_eq!(refs, vec!["src/main.rs"]);
+    fn test_tokenize_single_at_ref() {
+        let refs = tokenize_references("look at @src/main.rs please", &['@']);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].sigil, '@');
+        assert_eq!(refs[0].token, "src/main.rs");
     }
 
     #[test]
-    fn test_extract_multiple_refs() {
-        let refs = extract_at_references("@a.rs and @b.rs");
-        assert_eq!(refs, vec!["a.rs", "b.rs"]);
+    fn test_tokenize_multiple_at_refs() {
+        let refs = tokenize_references("@a.rs and @b.rs", &['@']);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].token, "a.rs");
+        assert_eq!(refs[1].token, "b.rs");
     }
 
     #[test]
-    fn test_extract_bare_at_ignored() {
+    fn test_tokenize_bare_at_ignored() {
         // `@` with no following token is not a reference
-        let refs = extract_at_references("send @ me");
+        let refs = tokenize_references("send @ me", &['@']);
         assert!(refs.is_empty());
     }
 
     #[test]
-    fn test_extract_ref_at_end_of_string() {
-        let refs = extract_at_references("see @foo.rs");
-        assert_eq!(refs, vec!["foo.rs"]);
+    fn test_tokenize_at_ref_at_end_of_string() {
+        let refs = tokenize_references("see @foo.rs", &['@']);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].token, "foo.rs");
+    }
+
+    #[test]
+    fn test_tokenize_email_not_treated_as_ref() {
+        // @ embedded in an email address should not be treated as a file reference
+        let refs = tokenize_references("contact user@example.com for help", &['@']);
+        assert!(refs.is_empty(), "email @ should not be a reference: {refs:?}");
+    }
+
+    #[test]
+    fn test_tokenize_at_ref_after_newline() {
+        // @ at start of a new line (preceded by \n) is a valid reference
+        let refs = tokenize_references("check this:\n@src/main.rs", &['@']);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].token, "src/main.rs");
     }
 
     // -------------------------------------------------------------------------
@@ -470,68 +491,68 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // detect_skill_invocation
+    // tokenize_references — / sigil
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_detect_skill_invocation_at_start() {
-        let tmp = make_tmp();
-        write_skill(
-            tmp.path(),
-            "review",
-            "review",
-            "Code review",
-            "Review body.",
-        );
-
-        let result = detect_skill_invocation("/review src/main.rs", tmp.path());
-        assert_eq!(
-            result,
-            Some(("review".to_string(), "/review src/main.rs".to_string()))
-        );
+    fn test_tokenize_slash_at_start() {
+        let refs = tokenize_references("/review src/main.rs", &['/']);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].sigil, '/');
+        assert_eq!(refs[0].token, "review");
     }
 
     #[test]
-    fn test_detect_skill_invocation_mid_message() {
-        let tmp = make_tmp();
-        write_skill(tmp.path(), "build", "build", "Build skill", "Build body.");
-
-        let result = detect_skill_invocation("use /build to compile", tmp.path());
-        assert_eq!(
-            result,
-            Some(("build".to_string(), "use /build to compile".to_string()))
-        );
+    fn test_tokenize_slash_mid_message() {
+        let refs = tokenize_references("use /build to compile", &['/']);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].sigil, '/');
+        assert_eq!(refs[0].token, "build");
     }
 
     #[test]
-    fn test_detect_skill_invocation_no_slash() {
-        let tmp = make_tmp();
-        assert_eq!(detect_skill_invocation("hello world", tmp.path()), None);
+    fn test_tokenize_no_slash() {
+        let refs = tokenize_references("hello world", &['/']);
+        assert!(refs.is_empty());
     }
 
     #[test]
-    fn test_detect_skill_invocation_bare_slash() {
-        let tmp = make_tmp();
-        assert_eq!(detect_skill_invocation("/", tmp.path()), None);
+    fn test_tokenize_bare_slash() {
+        // "/" at end-of-string has no token after it
+        let refs = tokenize_references("/", &['/']);
+        assert!(refs.is_empty());
     }
 
     #[test]
-    fn test_detect_skill_invocation_unknown_skill_ignored() {
-        // File paths like /usr/bin/ls should not trigger expansion
-        let tmp = make_tmp();
-        assert_eq!(
-            detect_skill_invocation("run /usr/bin/ls please", tmp.path()),
-            None
-        );
-    }
-
-    #[test]
-    fn test_detect_skill_invocation_not_preceded_by_whitespace() {
+    fn test_tokenize_slash_not_preceded_by_whitespace() {
         // `/build` embedded in a word (e.g. "foo/build") should not match
-        let tmp = make_tmp();
-        write_skill(tmp.path(), "build", "build", "Build skill", "Build body.");
+        let refs = tokenize_references("foo/build bar", &['/']);
+        assert!(refs.is_empty());
+    }
 
-        assert_eq!(detect_skill_invocation("foo/build bar", tmp.path()), None);
+    // -------------------------------------------------------------------------
+    // tokenize_references — mixed sigils
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_tokenize_mixed_sigils() {
+        let refs = tokenize_references("use /build on @src/main.rs", &['/', '@']);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].sigil, '/');
+        assert_eq!(refs[0].token, "build");
+        assert_eq!(refs[1].sigil, '@');
+        assert_eq!(refs[1].token, "src/main.rs");
+    }
+
+    #[test]
+    fn test_tokenize_span_correctness() {
+        let text = "look at @foo.rs please";
+        let refs = tokenize_references(text, &['@']);
+        assert_eq!(refs.len(), 1);
+        // Safety: span indices come from the tokenizer which operates on `text`.
+        #[allow(clippy::string_slice)]
+        let spanned = &text[refs[0].span.clone()];
+        assert_eq!(spanned, "@foo.rs");
     }
 
     // -------------------------------------------------------------------------
@@ -641,7 +662,7 @@ mod tests {
     fn test_expand_skill_not_found_error() {
         let tmp = make_tmp();
         // With no skills defined, /nonexistent should pass through as plain text
-        // (detect_skill_invocation returns None for unknown skills)
+        // (tokenizer finds it but expand validates against known skills)
         let result = expand("/nonexistent", tmp.path()).unwrap();
         assert_eq!(result.llm_text, "/nonexistent");
     }
