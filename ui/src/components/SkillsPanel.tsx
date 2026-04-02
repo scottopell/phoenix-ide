@@ -22,12 +22,15 @@ function groupLabel(skillPath: string): string {
   for (const marker of markers) {
     const idx = skillPath.indexOf(marker);
     if (idx !== -1) {
-      // Get the path portion before the marker, strip trailing slash
       const prefix = skillPath.substring(0, idx).replace(/\/$/, '');
       const lastSlash = prefix.lastIndexOf('/');
       const dirName = lastSlash >= 0 ? prefix.substring(lastSlash + 1) : prefix;
-      // Home directory markers
       if (!dirName || dirName === '~' || dirName === '') return 'User';
+      // Detect home directory: prefix matches common home patterns
+      const home = prefix;
+      if (/^\/Users\/[^/]+$/.test(home) || /^\/home\/[^/]+$/.test(home) || home === '~') {
+        return 'User';
+      }
       return dirName;
     }
   }

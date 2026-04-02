@@ -44,11 +44,22 @@
 }
 
 .skills-panel-body {
-  padding: 0 12px 8px;
+  padding: 0 8px 8px;
 }
 
+/* Skill groups with colored left border for visual separation */
 .skill-group {
-  margin-bottom: 6px;
+  margin-bottom: 4px;
+  border-left: 2px solid var(--border-color);
+  padding-left: 8px;
+}
+
+.skill-group:nth-child(odd) {
+  border-left-color: var(--accent-blue, #5c9fd6);
+}
+
+.skill-group:nth-child(even) {
+  border-left-color: var(--accent-green, #6ab04c);
 }
 
 .skill-group-header {
@@ -56,13 +67,12 @@
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--text-muted);
-  opacity: 0.7;
+  color: var(--text-secondary, var(--text-muted));
   padding: 4px 0 2px;
 }
 
 .skill-item {
-  padding: 4px 0 4px 8px;
+  padding: 3px 4px;
   cursor: pointer;
   border-radius: 3px;
   transition: background 150ms ease;
