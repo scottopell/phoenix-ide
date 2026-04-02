@@ -1,0 +1,138 @@
+/* SkillViewer -- detail panel replacing file tree when a skill is selected */
+.skill-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.skill-viewer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.skill-viewer-back {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: background 150ms ease, color 150ms ease;
+  white-space: nowrap;
+}
+
+.skill-viewer-back:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.skill-viewer-name {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-viewer-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.skill-viewer-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.skill-viewer-section:last-child {
+  border-bottom: none;
+}
+
+.skill-viewer-section-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.skill-viewer-description {
+  color: var(--text-secondary, var(--text-primary));
+  line-height: 1.5;
+}
+
+.skill-viewer-detail-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.skill-viewer-detail-label {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  min-width: 50px;
+}
+
+.skill-viewer-detail-value {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.skill-viewer-prompt {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  background: var(--bg-secondary);
+  padding: 8px;
+  border-radius: 4px;
+  max-height: 400px;
+  overflow-y: auto;
+  color: var(--text-primary);
+}
+
+.skill-viewer-prompt-loading {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.skill-viewer-prompt-error {
+  color: var(--text-error, #f85149);
+  font-style: italic;
+}
+
+.skill-viewer-footer {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.skill-viewer-insert-btn {
+  width: 100%;
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.skill-viewer-insert-btn:hover {
+  background: var(--bg-hover);
+}

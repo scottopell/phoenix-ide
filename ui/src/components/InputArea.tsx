@@ -79,6 +79,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     },
   }), [draft, setDraft]);
 
+  // Listen for external insert-draft events (e.g., from SkillViewer)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text = (e as CustomEvent<{ text: string }>).detail?.text;
+      if (text) {
+        setDraft(text);
+        textareaRef.current?.focus();
+      }
+    };
+    window.addEventListener('phoenix:insert-draft', handler);
+    return () => window.removeEventListener('phoenix:insert-draft', handler);
+  }, [setDraft]);
+
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useState<string | null>(null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useState('');

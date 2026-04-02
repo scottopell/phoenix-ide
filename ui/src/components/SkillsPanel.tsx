@@ -1,11 +1,11 @@
 import { useState, useEffect, useMemo } from 'react';
 import { api } from '../api';
 import type { SkillEntry } from '../api';
-import { useFileExplorer } from '../hooks/useFileExplorer';
 import './SkillsPanel.css';
 
 interface SkillsPanelProps {
   conversationId: string | undefined;
+  onSkillClick?: (skill: SkillEntry) => void;
 }
 
 /**
@@ -52,10 +52,11 @@ function groupSkills(skills: SkillEntry[]): Map<string, SkillEntry[]> {
   return groups;
 }
 
-export function SkillsPanel({ conversationId }: SkillsPanelProps) {
+export function SkillsPanel({ conversationId, onSkillClick }: SkillsPanelProps) {
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [expanded, setExpanded] = useState(false);
-  const { openFile } = useFileExplorer();
+  /** Which groups are expanded (all by default once skills load) */
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!conversationId) {
@@ -68,7 +69,12 @@ export function SkillsPanel({ conversationId }: SkillsPanelProps) {
 
     api.listConversationSkills(conversationId, controller.signal)
       .then(resp => {
-        if (!cancelled) setSkills(resp.skills);
+        if (!cancelled) {
+          setSkills(resp.skills);
+          // Initialize all groups as expanded
+          const groups = groupSkills(resp.skills);
+          setExpandedGroups(new Set(groups.keys()));
+        }
       })
       .catch(() => {
         if (!cancelled) setSkills([]);
@@ -87,8 +93,21 @@ export function SkillsPanel({ conversationId }: SkillsPanelProps) {
   }
 
   const handleSkillClick = (skill: SkillEntry) => {
-    const skillDir = skill.path.substring(0, skill.path.lastIndexOf('/'));
-    openFile(skill.path, skillDir);
+    if (onSkillClick) {
+      onSkillClick(skill);
+    }
+  };
+
+  const toggleGroup = (group: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(group)) {
+        next.delete(group);
+      } else {
+        next.add(group);
+      }
+      return next;
+    });
   };
 
   return (
@@ -107,10 +126,22 @@ export function SkillsPanel({ conversationId }: SkillsPanelProps) {
           {skills.length === 0 ? (
             <div className="skills-empty">No skills discovered</div>
           ) : (
-            Array.from(grouped.entries()).map(([group, groupSkills]) => (
+            Array.from(grouped.entries()).map(([group, items]) => (
               <div key={group} className="skill-group">
-                <div className="skill-group-header">{group}</div>
-                {groupSkills.map(skill => (
+                <div
+                  className="skill-group-header"
+                  onClick={() => toggleGroup(group)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') toggleGroup(group);
+                  }}
+                >
+                  <span className={`skill-group-chevron ${expandedGroups.has(group) ? 'expanded' : ''}`}>&#9654;</span>
+                  <span>{group}</span>
+                  <span className="skill-group-count">({items.length})</span>
+                </div>
+                {expandedGroups.has(group) && items.map(skill => (
                   <div
                     key={skill.name}
                     className="skill-item"

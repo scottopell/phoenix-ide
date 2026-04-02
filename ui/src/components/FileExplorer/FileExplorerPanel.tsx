@@ -8,8 +8,10 @@ import { FileTree } from './FileTree';
 import { RecentFilesStrip } from './RecentFilesStrip';
 import { McpStatusPanel } from '../McpStatusPanel';
 import { SkillsPanel } from '../SkillsPanel';
+import { SkillViewer } from '../SkillViewer';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { useRecentFiles } from '../../hooks/useRecentFiles';
+import type { SkillEntry } from '../../api';
 
 interface Props {
   collapsed: boolean;
@@ -24,6 +26,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const { recentFiles, addRecentFile } = useRecentFiles(conversationId);
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
+  const [selectedSkill, setSelectedSkill] = useState<SkillEntry | null>(null);
 
   const handleFileSelect = (filePath: string, rootDir: string) => {
     addRecentFile(filePath);
@@ -61,17 +64,23 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         <span className="fe-title">Files</span>
         <button className="fe-refresh" onClick={handleRefresh} title="Refresh file tree">&#8635;</button>
       </div>
-      <div className="fe-tree-scroll">
-        <FileTree
-          rootPath={rootPath}
-          onFileSelect={handleFileSelect}
-          activeFile={activeFile}
-          conversationId={conversationId}
-          refreshKey={refreshKey}
-        />
-      </div>
-      <McpStatusPanel showToast={showToast} />
-      <SkillsPanel conversationId={conversationId} />
+      {selectedSkill ? (
+        <SkillViewer skill={selectedSkill} onBack={() => setSelectedSkill(null)} />
+      ) : (
+        <>
+          <div className="fe-tree-scroll">
+            <FileTree
+              rootPath={rootPath}
+              onFileSelect={handleFileSelect}
+              activeFile={activeFile}
+              conversationId={conversationId}
+              refreshKey={refreshKey}
+            />
+          </div>
+          <McpStatusPanel showToast={showToast} />
+          <SkillsPanel conversationId={conversationId} onSkillClick={setSelectedSkill} />
+        </>
+      )}
     </aside>
   );
 }

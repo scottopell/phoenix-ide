@@ -47,19 +47,10 @@
   padding: 0 8px 8px;
 }
 
-/* Skill groups with colored left border for visual separation */
+/* Skill groups */
 .skill-group {
   margin-bottom: 4px;
-  border-left: 2px solid var(--border-color);
   padding-left: 8px;
-}
-
-.skill-group:nth-child(odd) {
-  border-left-color: var(--accent-blue, #5c9fd6);
-}
-
-.skill-group:nth-child(even) {
-  border-left-color: var(--accent-green, #6ab04c);
 }
 
 .skill-group-header {
@@ -68,7 +59,34 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--text-secondary, var(--text-muted));
-  padding: 4px 0 2px;
+  padding: 4px 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 150ms ease;
+}
+
+.skill-group-header:hover {
+  background: var(--bg-hover);
+}
+
+.skill-group-chevron {
+  font-size: 8px;
+  transition: transform 200ms ease;
+  flex-shrink: 0;
+}
+
+.skill-group-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.skill-group-count {
+  color: var(--text-muted);
+  margin-left: auto;
 }
 
 .skill-item {
