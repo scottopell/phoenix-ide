@@ -17,6 +17,10 @@ use tokio::sync::{Mutex, RwLock};
 /// Timeout for a single JSON-RPC request-response round trip.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Longer timeout for initialize + tools/list during server connection.
+/// MCP-remote wrappers need time for OAuth discovery + transport negotiation.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 // ---------------------------------------------------------------------------
 // McpToolDef
 // ---------------------------------------------------------------------------
@@ -143,7 +147,9 @@ impl McpServer {
             }
         });
 
-        let _resp = self.send_request("initialize", params).await?;
+        let _resp = self
+            .send_request_with_timeout("initialize", params, CONNECT_TIMEOUT)
+            .await?;
 
         // Send the initialized notification (no id, no response expected).
         let notification = serde_json::json!({
@@ -169,7 +175,9 @@ impl McpServer {
                 None => serde_json::json!({}),
             };
 
-            let resp = self.send_request("tools/list", params).await?;
+            let resp = self
+                .send_request_with_timeout("tools/list", params, CONNECT_TIMEOUT)
+                .await?;
 
             let tools_arr = resp
                 .get("tools")
@@ -297,8 +305,18 @@ impl McpServer {
     /// little real benefit -- the MCP server is a single process that
     /// serializes work internally anyway, so parallel requests would just
     /// queue on the server side.
-    #[allow(clippy::too_many_lines)] // Protocol handling is inherently sequential; splitting would obscure the flow.
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.send_request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // Protocol handling is inherently sequential; splitting would obscure the flow.
+    async fn send_request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let request = serde_json::json!({
@@ -346,7 +364,7 @@ impl McpServer {
                 .map_err(|e| format!("MCP server '{}': stdin flush failed: {e}", self.name))
         };
 
-        tokio::time::timeout(REQUEST_TIMEOUT, write_fut)
+        tokio::time::timeout(timeout, write_fut)
             .await
             .map_err(|_| {
                 format!(
@@ -430,7 +448,7 @@ impl McpServer {
             }
         };
 
-        tokio::time::timeout(REQUEST_TIMEOUT, read_fut)
+        tokio::time::timeout(timeout, read_fut)
             .await
             .map_err(|_| {
                 format!(
