@@ -13,6 +13,7 @@ mod propose_plan;
 mod read_file;
 mod read_image;
 mod search;
+mod skill;
 mod subagent;
 mod think;
 
@@ -29,6 +30,7 @@ pub use propose_plan::ProposePlanTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
 pub use search::SearchTool;
+pub use skill::SkillTool;
 pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use think::ThinkTool;
 
@@ -201,6 +203,7 @@ impl ToolRegistry {
             Arc::new(ReadImageTool),
             Arc::new(ProposePlanTool),
             Arc::new(AskUserQuestionTool),
+            Arc::new(SkillTool),
             Arc::new(SpawnAgentsTool),
             // Browser tools
             Arc::new(BrowserNavigateTool),
@@ -269,9 +272,10 @@ impl ToolRegistry {
             tools.push(Arc::new(SubmitResultTool));
             tools.push(Arc::new(SubmitErrorTool));
         } else {
-            // Parent conversations can spawn sub-agents and ask user questions
+            // Parent conversations can spawn sub-agents, ask user questions, and invoke skills
             tools.push(Arc::new(SpawnAgentsTool));
             tools.push(Arc::new(AskUserQuestionTool));
+            tools.push(Arc::new(SkillTool));
         }
 
         Self { tools }
