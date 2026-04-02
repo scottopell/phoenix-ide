@@ -1619,18 +1619,27 @@ def launchd_prod_deploy(version: str | None = None):
         print(f"ERROR: launchctl bootstrap failed: {result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Health check
-    time.sleep(2)
-    try:
-        import urllib.request
-        with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=5) as resp:
-            health_version = resp.read().decode().strip()
-    except Exception as e:
-        print(f"WARNING: Server started but health check failed: {e}", file=sys.stderr)
-        health_version = None
+    # Health check with retry (server may take a few seconds to bind the port)
+    import urllib.request
+    health_version = None
+    for attempt in range(5):
+        time.sleep(2)
+        try:
+            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=5) as resp:
+                health_version = resp.read().decode().strip()
+            break
+        except Exception:
+            if attempt < 4:
+                continue
+            print("WARNING: Server started but health check failed after 10s", file=sys.stderr)
 
     write_deployed_sha()
-    llm_mode = f"gateway ({gateway})" if gateway else "no gateway detected"
+    if env_overrides.get("LLM_API_KEY_HELPER"):
+        llm_mode = "api_key_helper (from .phoenix-ide.env)"
+    elif gateway:
+        llm_mode = f"gateway ({gateway})"
+    else:
+        llm_mode = "no gateway detected"
     print(f"\n✓ Deployed {version} to production (launchd)")
     if health_version:
         print(f"  Version: {health_version}")
