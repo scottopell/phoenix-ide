@@ -513,6 +513,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
   const sendEnabled = (!agentWorking || isOffline) && hasContent && !expansionError;
 
+  // Rotating placeholder hints for discoverability
+  const placeholderHints = ['', '/ for skills', '@ to include files', '? for shortcuts'];
+  const [hintIndex, setHintIndex] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setHintIndex(i => (i + 1) % placeholderHints.length);
+    }, 4000);
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const hint = placeholderHints[hintIndex];
+  const placeholder = isOffline
+    ? 'Type a message (will send when back online)...'
+    : hint ? `Type a message... (${hint})` : 'Type a message...';
+
   // =========================================================================
   // Render
   // =========================================================================
@@ -597,7 +614,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       <textarea
         ref={textareaRef}
         id="message-input"
-        placeholder={isOffline ? 'Type a message (will send when back online)...' : 'Type a message...'}
+        placeholder={placeholder}
         rows={2}
         value={voiceBase !== null
           ? (voiceBase.trim()

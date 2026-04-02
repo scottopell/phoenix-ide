@@ -2433,6 +2433,7 @@ async fn list_conversation_skills(
             description: s.description,
             argument_hint: s.argument_hint,
             source: s.source,
+            path: s.path.to_string_lossy().to_string(),
         })
         .collect();
 

@@ -47,8 +47,22 @@
   padding: 0 12px 8px;
 }
 
+.skill-group {
+  margin-bottom: 6px;
+}
+
+.skill-group-header {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  opacity: 0.7;
+  padding: 4px 0 2px;
+}
+
 .skill-item {
-  padding: 4px 0;
+  padding: 4px 0 4px 8px;
   cursor: pointer;
   border-radius: 3px;
   transition: background 150ms ease;
@@ -71,13 +85,6 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-top: 1px;
-}
-
-.skill-source {
-  color: var(--text-muted);
-  font-size: 10px;
-  opacity: 0.7;
   margin-top: 1px;
 }
 

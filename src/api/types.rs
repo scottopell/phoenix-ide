@@ -223,6 +223,8 @@ pub struct SkillEntry {
     pub argument_hint: Option<String>,
     /// Where this skill was discovered (e.g., ".claude/skills" or ".agents/skills")
     pub source: String,
+    /// Absolute path to the SKILL.md file
+    pub path: String,
 }
 
 /// Response for the skills list endpoint (REQ-IR-005)

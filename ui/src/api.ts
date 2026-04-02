@@ -207,6 +207,8 @@ export interface SkillEntry {
   description: string;
   argument_hint?: string | null;
   source: string;
+  /** Absolute path to the SKILL.md file */
+  path: string;
 }
 
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
