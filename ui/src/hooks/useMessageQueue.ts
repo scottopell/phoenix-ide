@@ -23,6 +23,8 @@ interface UseMessageQueueReturn {
   markFailed: (localId: string) => void;
   /** Retry a failed message */
   retry: (localId: string) => void;
+  /** Dismiss a failed message (remove without retrying) */
+  dismiss: (localId: string) => void;
   /** Get messages ready to send */
   getPending: () => QueuedMessage[];
 }

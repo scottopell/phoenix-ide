@@ -71,7 +71,7 @@ export function ConversationPage() {
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // Message queue management
-  const { queuedMessages, enqueue, markSent, markFailed, retry, dismiss } =
+  const { queuedMessages, enqueue, markSent, markFailed, dismiss } =
     useMessageQueue(conversationId);
 
   // Connection lifecycle — receives dispatch and lastSequenceId from atom

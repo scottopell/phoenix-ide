@@ -253,10 +253,9 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
         }
 
         // Read contents
-        let content =
-            std::fs::read(&full_path).map_err(|_| ExpansionError::FileNotFound {
-                path: file_ref.token.clone(),
-            })?;
+        let content = std::fs::read(&full_path).map_err(|_| ExpansionError::FileNotFound {
+            path: file_ref.token.clone(),
+        })?;
 
         // Reject binary files
         if !is_text_content(&content) {
@@ -265,10 +264,9 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
             });
         }
 
-        let file_text =
-            String::from_utf8(content).map_err(|_| ExpansionError::FileNotText {
-                path: file_ref.token.clone(),
-            })?;
+        let file_text = String::from_utf8(content).map_err(|_| ExpansionError::FileNotText {
+            path: file_ref.token.clone(),
+        })?;
 
         // Replace `@ref_path` token with structured block
         let token = format!("@{}", file_ref.token);
@@ -347,7 +345,10 @@ mod tests {
     fn test_tokenize_email_not_treated_as_ref() {
         // @ embedded in an email address should not be treated as a file reference
         let refs = tokenize_references("contact user@example.com for help", &['@']);
-        assert!(refs.is_empty(), "email @ should not be a reference: {refs:?}");
+        assert!(
+            refs.is_empty(),
+            "email @ should not be a reference: {refs:?}"
+        );
     }
 
     #[test]

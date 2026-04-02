@@ -448,14 +448,12 @@ impl McpServer {
             }
         };
 
-        tokio::time::timeout(timeout, read_fut)
-            .await
-            .map_err(|_| {
-                format!(
-                    "MCP server '{}': timed out reading response for '{method}'",
-                    self.name
-                )
-            })?
+        tokio::time::timeout(timeout, read_fut).await.map_err(|_| {
+            format!(
+                "MCP server '{}': timed out reading response for '{method}'",
+                self.name
+            )
+        })?
     }
 
     /// Send a JSON-RPC notification (no id, no response expected).
