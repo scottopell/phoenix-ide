@@ -22,6 +22,24 @@ function skillDir(path: string): string {
   return lastSlash >= 0 ? path.substring(0, lastSlash + 1) : path;
 }
 
+/** Extract the project name or "User" from a skill's absolute path */
+function projectLabel(path: string): string {
+  const markers = ['.claude/skills', '.agents/skills'];
+  for (const marker of markers) {
+    const idx = path.indexOf(marker);
+    if (idx !== -1) {
+      const prefix = path.substring(0, idx).replace(/\/$/, '');
+      const lastSlash = prefix.lastIndexOf('/');
+      const dirName = lastSlash >= 0 ? prefix.substring(lastSlash + 1) : prefix;
+      if (!dirName || /^\/Users\/[^/]+$/.test(prefix) || /^\/home\/[^/]+$/.test(prefix)) {
+        return 'User';
+      }
+      return dirName;
+    }
+  }
+  return 'Unknown';
+}
+
 export function SkillViewer({ skill, onBack }: SkillViewerProps) {
   const [promptContent, setPromptContent] = useState<string | null>(null);
   const [promptError, setPromptError] = useState<string | null>(null);
@@ -85,6 +103,10 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
         {/* Details section */}
         <div className="skill-viewer-section">
           <div className="skill-viewer-section-title">Details</div>
+          <div className="skill-viewer-detail-row">
+            <span className="skill-viewer-detail-label">Project</span>
+            <span className="skill-viewer-detail-value">{projectLabel(skill.path)}</span>
+          </div>
           <div className="skill-viewer-detail-row">
             <span className="skill-viewer-detail-label">Source</span>
             <span className="skill-viewer-detail-value">{skill.source}</span>
