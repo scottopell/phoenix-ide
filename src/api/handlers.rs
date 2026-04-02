@@ -2432,6 +2432,7 @@ async fn list_conversation_skills(
             name: s.name,
             description: s.description,
             argument_hint: s.argument_hint,
+            source: s.source,
         })
         .collect();
 

@@ -221,6 +221,8 @@ pub struct SkillEntry {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
+    /// Where this skill was discovered (e.g., ".claude/skills" or ".agents/skills")
+    pub source: String,
 }
 
 /// Response for the skills list endpoint (REQ-IR-005)

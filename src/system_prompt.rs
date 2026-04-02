@@ -38,6 +38,8 @@ pub struct SkillMetadata {
     pub path: PathBuf,
     /// Optional argument hint shown in autocomplete (from `argument-hint:` frontmatter field)
     pub argument_hint: Option<String>,
+    /// Where this skill was discovered (e.g., ".claude/skills" or ".agents/skills")
+    pub source: String,
 }
 
 /// Parsed frontmatter fields from a SKILL.md file
@@ -86,37 +88,58 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
     })
 }
 
+/// Subdirectories to scan for skill directories at each level of the tree.
+const SKILL_DIRS: &[&str] = &[".claude/skills", ".agents/skills"];
+
 /// Discover skills by walking from `working_dir` up to the filesystem root.
 ///
-/// At each level, scans all immediate subdirectories for a `SKILL.md` file.
-/// Any directory containing `SKILL.md` is treated as a skill — no constraint
-/// on the containing directory name (e.g. `skills/`, `.claude/skills/`, etc.)
+/// At each level, scans `SKILL_DIRS` (`.claude/skills/` and `.agents/skills/`)
+/// for immediate child directories containing a `SKILL.md` file.
 ///
 /// When the same skill name appears at multiple levels, the one closer to
-/// `working_dir` wins (more specific overrides parent).
+/// `working_dir` wins (more specific overrides parent). Symlink dedup uses
+/// `std::fs::canonicalize` so two paths resolving to the same file are
+/// counted once (first discovered wins).
 ///
 /// Returns skills sorted by name for deterministic output.
 pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
     let mut skills: Vec<SkillMetadata> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new(); // canonical paths for symlink dedup
     let mut current = Some(working_dir.to_path_buf());
 
     while let Some(dir) = current {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
+        for skill_subdir in SKILL_DIRS {
+            let skills_dir = dir.join(skill_subdir);
+            if !skills_dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
                 let skill_md = entry.path().join("SKILL.md");
                 if !skill_md.is_file() {
                     continue;
                 }
+                // Symlink dedup: canonicalize to detect duplicates
+                let canonical =
+                    std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
+                if !seen_paths.insert(canonical) {
+                    continue; // already seen via a different path
+                }
                 if let Ok(content) = std::fs::read_to_string(&skill_md) {
                     if let Some(fm) = parse_skill_frontmatter(&content) {
-                        // cwd wins: only add if we haven't seen this name yet
                         if seen_names.insert(fm.name.clone()) {
                             skills.push(SkillMetadata {
                                 name: fm.name,
                                 description: fm.description,
                                 argument_hint: fm.argument_hint,
                                 path: skill_md,
+                                source: (*skill_subdir).to_string(),
                             });
                         }
                     }
@@ -319,8 +342,16 @@ mod tests {
     // Skill discovery tests
     // -------------------------------------------------------------------------
 
-    fn write_skill(dir: &Path, skill_dir_name: &str, name: &str, description: &str) {
-        let skill_dir = dir.join(skill_dir_name);
+    /// Write a skill under `{base}/{skills_subdir}/{skill_dir_name}/SKILL.md`.
+    /// `skills_subdir` should be one of SKILL_DIRS (e.g. ".claude/skills").
+    fn write_skill(
+        base: &Path,
+        skills_subdir: &str,
+        skill_dir_name: &str,
+        name: &str,
+        description: &str,
+    ) {
+        let skill_dir = base.join(skills_subdir).join(skill_dir_name);
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
@@ -373,10 +404,11 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_skills_found() {
+    fn test_discover_skills_found_claude_dir() {
         let temp = TempDir::new().unwrap();
         write_skill(
             temp.path(),
+            ".claude/skills",
             "my-skill",
             "my-skill",
             "Does something useful. Use when you need something.",
@@ -388,16 +420,43 @@ mod tests {
         assert!(skills[0].description.contains("Does something useful"));
         assert_eq!(
             skills[0].path,
-            temp.path().join("my-skill").join("SKILL.md")
+            temp.path()
+                .join(".claude/skills/my-skill")
+                .join("SKILL.md")
         );
+        assert_eq!(skills[0].source, ".claude/skills");
+    }
+
+    #[test]
+    fn test_discover_skills_found_agents_dir() {
+        let temp = TempDir::new().unwrap();
+        write_skill(
+            temp.path(),
+            ".agents/skills",
+            "my-skill",
+            "my-skill",
+            "An agents skill",
+        );
+
+        let skills = discover_skills(temp.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-skill");
+        assert_eq!(skills[0].source, ".agents/skills");
     }
 
     #[test]
     fn test_discover_skills_sorted_by_name() {
         let temp = TempDir::new().unwrap();
-        write_skill(temp.path(), "zzz-skill", "zzz-skill", "Last alphabetically");
         write_skill(
             temp.path(),
+            ".claude/skills",
+            "zzz-skill",
+            "zzz-skill",
+            "Last alphabetically",
+        );
+        write_skill(
+            temp.path(),
+            ".claude/skills",
             "aaa-skill",
             "aaa-skill",
             "First alphabetically",
@@ -418,33 +477,92 @@ mod tests {
         // Parent has skill with one description
         write_skill(
             temp.path(),
+            ".claude/skills",
             "shared-skill",
             "shared-skill",
             "Parent description",
         );
         // Child has same skill name with different description
-        write_skill(&child, "shared-skill", "shared-skill", "Child description");
+        write_skill(
+            &child,
+            ".claude/skills",
+            "shared-skill",
+            "shared-skill",
+            "Child description",
+        );
 
-        // Discover from child — child should win
+        // Discover from child -- child should win
         let skills = discover_skills(&child);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Child description");
     }
 
     #[test]
-    fn test_discover_skills_no_constraint_on_dir_name() {
+    fn test_discover_skills_both_dirs_scanned() {
         let temp = TempDir::new().unwrap();
-        // Skill not under a "skills/" directory — any subdir with SKILL.md counts
         write_skill(
             temp.path(),
-            "custom-dir-name",
-            "custom-skill",
-            "Uses a non-standard directory name",
+            ".claude/skills",
+            "claude-skill",
+            "claude-skill",
+            "From .claude/skills",
+        );
+        write_skill(
+            temp.path(),
+            ".agents/skills",
+            "agents-skill",
+            "agents-skill",
+            "From .agents/skills",
+        );
+
+        let skills = discover_skills(temp.path());
+        assert_eq!(skills.len(), 2);
+        // sorted by name
+        assert_eq!(skills[0].name, "agents-skill");
+        assert_eq!(skills[0].source, ".agents/skills");
+        assert_eq!(skills[1].name, "claude-skill");
+        assert_eq!(skills[1].source, ".claude/skills");
+    }
+
+    #[test]
+    fn test_discover_skills_claude_wins_over_agents_same_name() {
+        let temp = TempDir::new().unwrap();
+        // .claude/skills is scanned first, so it wins for same name
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "shared",
+            "shared",
+            "From claude",
+        );
+        write_skill(
+            temp.path(),
+            ".agents/skills",
+            "shared",
+            "shared",
+            "From agents",
         );
 
         let skills = discover_skills(temp.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "custom-skill");
+        assert_eq!(skills[0].description, "From claude");
+        assert_eq!(skills[0].source, ".claude/skills");
+    }
+
+    #[test]
+    fn test_discover_skills_ignores_arbitrary_subdirs() {
+        let temp = TempDir::new().unwrap();
+        // A SKILL.md directly in a random subdir should NOT be found
+        let random_dir = temp.path().join("random-dir");
+        fs::create_dir_all(&random_dir).unwrap();
+        fs::write(
+            random_dir.join("SKILL.md"),
+            "---\nname: stray\ndescription: Should not be found\n---\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills(temp.path());
+        assert!(skills.is_empty());
     }
 
     #[test]
@@ -452,6 +570,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write_skill(
             temp.path(),
+            ".claude/skills",
             "deploy-skill",
             "deploy-skill",
             "Deploy the app. Use when deploying.",

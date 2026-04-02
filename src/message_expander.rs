@@ -480,7 +480,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn write_skill(dir: &Path, skill_dir: &str, name: &str, description: &str, body: &str) {
-        let skill_path = dir.join(skill_dir);
+        let skill_path = dir.join(".claude/skills").join(skill_dir);
         fs::create_dir_all(&skill_path).unwrap();
         fs::write(
             skill_path.join("SKILL.md"),
