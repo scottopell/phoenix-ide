@@ -2303,7 +2303,9 @@ async fn search_conversation_files(
         .ignore(true)
         .build();
 
-    let mut items: Vec<FileSearchEntry> = Vec::new();
+    let mut items: Vec<(i32, FileSearchEntry)> = Vec::new();
+    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let mut buf: Vec<char> = Vec::new();
 
     for result in walker {
         let Ok(entry) = result else { continue };
@@ -2320,51 +2322,67 @@ async fn search_conversation_files(
             .to_string_lossy()
             .to_string();
 
-        // Apply fuzzy filter when a query is present
-        if !q.is_empty() && !fuzzy_path_matches(&rel_path, &q) {
-            continue;
-        }
-
         let (_, is_text_file) = detect_file_type(abs_path);
 
-        items.push(FileSearchEntry {
-            path: rel_path,
-            is_text_file,
-        });
-
-        if items.len() >= limit {
-            break;
+        if q.is_empty() {
+            // No query: return all files up to limit
+            items.push((0i32, FileSearchEntry { path: rel_path, is_text_file }));
+            if items.len() >= limit {
+                break;
+            }
+        } else {
+            // Score the match using nucleo (path-aware fuzzy matching).
+            // Prefer filename matches over deep path matches.
+            let score = fuzzy_score_path(&rel_path, &q, &mut matcher, &mut buf);
+            if let Some(s) = score {
+                items.push((s, FileSearchEntry { path: rel_path, is_text_file }));
+            }
         }
     }
 
-    // Sort alphabetically for stable ordering
-    items.sort_by(|a, b| a.path.cmp(&b.path));
+    // Sort by score (highest first) when query is present, alphabetically otherwise
+    if q.is_empty() {
+        items.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+    } else {
+        items.sort_by_key(|item| std::cmp::Reverse(item.0));
+        items.truncate(limit);
+    }
 
-    Ok(Json(FileSearchResponse { items }))
+    let results: Vec<FileSearchEntry> = items.into_iter().map(|(_, entry)| entry).collect();
+    Ok(Json(FileSearchResponse { items: results }))
 }
 
-/// Simple fuzzy match: check whether all query characters appear in order in `text`.
-fn fuzzy_path_matches(path: &str, query: &str) -> bool {
-    let path_lower = path.to_lowercase();
-    let query_lower = query.to_lowercase();
+/// Score a file path against a fuzzy query using nucleo-matcher.
+/// Returns None if the path doesn't match. Higher scores = better matches.
+/// Prefers filename matches over scattered path-segment matches.
+fn fuzzy_score_path(
+    path: &str,
+    query: &str,
+    matcher: &mut nucleo_matcher::Matcher,
+    buf: &mut Vec<char>,
+) -> Option<i32> {
+    use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 
-    // Fast path: substring match
-    if path_lower.contains(query_lower.as_str()) {
-        return true;
+    let pattern = Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy);
+
+    // Score against filename first (much more relevant for file search)
+    let filename = path.rsplit('/').next().unwrap_or(path);
+
+    buf.clear();
+    buf.extend(filename.chars());
+    let haystack = nucleo_matcher::Utf32Str::Unicode(buf);
+
+    if let Some(score) = pattern.score(haystack, matcher) {
+        // Filename match: boost score significantly
+        return Some(i32::try_from(score).unwrap_or(i32::MAX).saturating_add(1000));
     }
 
-    // Character-sequence match (all chars in order)
-    let mut qi = query_lower.chars();
-    let mut current = qi.next();
-    for c in path_lower.chars() {
-        if Some(c) == current {
-            current = qi.next();
-        }
-        if current.is_none() {
-            return true;
-        }
-    }
-    false
+    // Fall back to full path match (but with lower base score)
+    buf.clear();
+    buf.extend(path.chars());
+    let haystack = nucleo_matcher::Utf32Str::Unicode(buf);
+
+    pattern.score(haystack, matcher).map(|s| i32::try_from(s).unwrap_or(i32::MAX))
 }
 
 /// Discover skills available for the conversation's working directory (REQ-IR-005).
