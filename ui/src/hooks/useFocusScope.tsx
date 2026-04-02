@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- context provider + hooks in one file is idiomatic React */
 import { createContext, useContext, useCallback, useState, useEffect, type ReactNode } from 'react';
 
 interface FocusScopeContextValue {
@@ -31,7 +32,7 @@ export function FocusScopeProvider({ children }: { children: ReactNode }) {
     return scopes.length > 0 && scopes[scopes.length - 1] === id;
   }, [scopes]);
 
-  const activeScope = scopes.length > 0 ? scopes[scopes.length - 1] : null;
+  const activeScope: string | null = scopes.length > 0 ? scopes[scopes.length - 1]! : null;
 
   return (
     <FocusScopeContext.Provider value={{

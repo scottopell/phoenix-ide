@@ -55,7 +55,7 @@ export function QuestionPanel({
     const initial: Record<string, string> = {};
     for (const q of questions) {
       if (!q.multiSelect && hasPreviewOptions(q) && q.options.length > 0) {
-        initial[q.question] = q.options[0].label;
+        initial[q.question] = q.options[0]!.label;
       }
     }
     return initial;
@@ -129,7 +129,10 @@ export function QuestionPanel({
   const setNotes = useCallback((questionText: string, notes: string) => {
     setAnnotations((prev) => ({
       ...prev,
-      [questionText]: { ...prev[questionText], notes: notes || undefined },
+      [questionText]: {
+        ...prev[questionText],
+        ...(notes ? { notes } : {}),
+      },
     }));
   }, []);
 
@@ -200,7 +203,10 @@ export function QuestionPanel({
       }
 
       if (notes || preview) {
-        result[q.question] = { notes, preview };
+        result[q.question] = {
+          ...(notes ? { notes } : {}),
+          ...(preview ? { preview } : {}),
+        };
         hasAny = true;
       }
     }
@@ -262,6 +268,7 @@ export function QuestionPanel({
     (step: number) => {
       if (step < 0 || step >= totalSteps) return;
       const targetQ = questions[step];
+      if (!targetQ) return;
       // Determine initial focus: previously selected option, or first option
       let initialFocus = 0;
       const ans = answers[targetQ.question];
@@ -810,7 +817,7 @@ function QuestionItem({
           tabIndex={-1}
         />
         <input
-          ref={otherInputRef}
+          ref={otherInputRef as React.RefObject<HTMLInputElement>}
           type="text"
           className="question-other-input"
           placeholder="Other..."

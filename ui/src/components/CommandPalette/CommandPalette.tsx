@@ -89,6 +89,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
       pushScope('command-palette');
       return () => popScope('command-palette');
     }
+    return undefined;
   }, [state.status, pushScope, popScope]);
 
   // Async search effect — fires on query/mode change, debounced, abortable.

@@ -2326,7 +2326,13 @@ async fn search_conversation_files(
 
         if q.is_empty() {
             // No query: return all files up to limit
-            items.push((0i32, FileSearchEntry { path: rel_path, is_text_file }));
+            items.push((
+                0i32,
+                FileSearchEntry {
+                    path: rel_path,
+                    is_text_file,
+                },
+            ));
             if items.len() >= limit {
                 break;
             }
@@ -2335,7 +2341,13 @@ async fn search_conversation_files(
             // Prefer filename matches over deep path matches.
             let score = fuzzy_score_path(&rel_path, &q, &mut matcher, &mut buf);
             if let Some(s) = score {
-                items.push((s, FileSearchEntry { path: rel_path, is_text_file }));
+                items.push((
+                    s,
+                    FileSearchEntry {
+                        path: rel_path,
+                        is_text_file,
+                    },
+                ));
             }
         }
     }
@@ -2363,7 +2375,12 @@ fn fuzzy_score_path(
 ) -> Option<i32> {
     use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 
-    let pattern = Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy);
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
 
     // Score against filename first (much more relevant for file search)
     let filename = path.rsplit('/').next().unwrap_or(path);
@@ -2374,7 +2391,11 @@ fn fuzzy_score_path(
 
     if let Some(score) = pattern.score(haystack, matcher) {
         // Filename match: boost score significantly
-        return Some(i32::try_from(score).unwrap_or(i32::MAX).saturating_add(1000));
+        return Some(
+            i32::try_from(score)
+                .unwrap_or(i32::MAX)
+                .saturating_add(1000),
+        );
     }
 
     // Fall back to full path match (but with lower base score)
@@ -2382,7 +2403,9 @@ fn fuzzy_score_path(
     buf.extend(path.chars());
     let haystack = nucleo_matcher::Utf32Str::Unicode(buf);
 
-    pattern.score(haystack, matcher).map(|s| i32::try_from(s).unwrap_or(i32::MAX))
+    pattern
+        .score(haystack, matcher)
+        .map(|s| i32::try_from(s).unwrap_or(i32::MAX))
 }
 
 /// Discover skills available for the conversation's working directory (REQ-IR-005).

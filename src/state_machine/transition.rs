@@ -1071,7 +1071,9 @@ pub fn transition(
                     // a parallel representation of the same data).
                     let question_data = questions.iter().find(|qq| qq.question == *q);
                     if let Some(qd) = question_data {
-                        let selected_preview = qd.options.iter()
+                        let selected_preview = qd
+                            .options
+                            .iter()
                             .find(|o| o.label == *a)
                             .and_then(|o| o.preview.as_deref());
                         if let Some(preview) = selected_preview {
@@ -1091,9 +1093,7 @@ pub fn transition(
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let user_text = format!(
-                "Here are my answers:\n{answers_text}"
-            );
+            let user_text = format!("Here are my answers:\n{answers_text}");
 
             Ok(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })

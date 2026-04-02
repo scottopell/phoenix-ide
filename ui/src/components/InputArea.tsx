@@ -14,7 +14,7 @@ import type { QueuedMessage } from '../hooks';
 import { useDraft } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
-import { isAgentWorking, isCancellingState, formatShortcut } from '../utils';
+import { isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
