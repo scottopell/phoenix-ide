@@ -71,7 +71,7 @@ Do NOT delete regression files, work around problems silently, or say "this is u
 
 **Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust changes) or save (UI auto-reloads via Vite) → `./dev.py check` → commit
 
-**After any Rust change, always run `./dev.py restart`** and give the user the dev URL (`http://localhost:8042`) so they can immediately verify. UI-only changes (`.tsx`, `.css`) hot reload via Vite — no restart needed, but still tell the user the URL. The user should never have to ask for a restart or wonder if their running server has the latest code.
+**After any Rust change, always run `./dev.py restart`** and give the user the UI URL from its output so they can immediately verify. UI-only changes (`.tsx`, `.css`) hot reload via Vite — no restart needed, but still tell the user the URL. The user should never have to ask for a restart or wonder if their running server has the latest code.
 
 In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.
 

@@ -449,14 +449,21 @@ def cmd_down():
 
 def cmd_restart(phoenix_port: int | None = None):
     """Rebuild Rust and restart Phoenix (Vite stays for hot reload)."""
-    default_phoenix, _ = get_default_ports()
+    default_phoenix, default_vite = get_default_ports()
     phoenix_port = phoenix_port or default_phoenix
-    
+
     build_rust(release=True)
     stop_process(PHOENIX_PID_FILE, "Phoenix")
     time.sleep(0.5)
     start_phoenix(port=phoenix_port)
-    print("Phoenix restarted. Vite still running for UI hot reload.")
+    vite_pid = get_pid(VITE_PID_FILE)
+    if vite_pid:
+        print(f"Phoenix restarted. Vite still running for UI hot reload.")
+        print(f"  UI:  http://localhost:{default_vite}")
+        print(f"  API: http://localhost:{phoenix_port}")
+    else:
+        print(f"Phoenix restarted. Vite not running (start with ./dev.py up).")
+        print(f"  API: http://localhost:{phoenix_port}")
 
 
 def cmd_status():
