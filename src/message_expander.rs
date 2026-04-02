@@ -21,6 +21,10 @@ pub struct ExpandedMessage {
     pub display_text: String,
     /// Fully resolved text delivered to the LLM (REQ-IR-001)
     pub llm_text: String,
+    /// If the message triggered a skill invocation, this contains the details.
+    /// The chat handler uses this to persist as `MessageContent::Skill` instead
+    /// of `MessageContent::User`.
+    pub skill_invocation: Option<crate::skills::SkillInvocation>,
 }
 
 /// Errors produced during expansion (REQ-IR-007)
@@ -149,65 +153,6 @@ fn is_text_content(content: &[u8]) -> bool {
     !content.contains(&0) && std::str::from_utf8(content).is_ok()
 }
 
-/// Expand a skill invocation by loading SKILL.md and performing `$ARGUMENTS` substitution.
-///
-/// Implements REQ-IR-002 and REQ-IR-003:
-/// - Finds the named skill via `discover_skills`
-/// - Reads the full SKILL.md content
-/// - Substitutes `$ARGUMENTS` with the trailing text (REQ-IR-003)
-/// - If no `$ARGUMENTS` placeholder exists but arguments were provided, appends them
-/// - If no arguments were provided, returns the SKILL.md content unmodified
-fn expand_skill(
-    skill_name: &str,
-    arguments: &str,
-    working_dir: &Path,
-) -> Result<String, ExpansionError> {
-    let skills = discover_skills(working_dir);
-
-    let skill = skills
-        .iter()
-        .find(|s| s.name == skill_name)
-        .ok_or_else(|| {
-            let available = skills.iter().map(|s| s.name.clone()).collect();
-            ExpansionError::SkillNotFound {
-                name: skill_name.to_string(),
-                available,
-            }
-        })?;
-
-    // Read SKILL.md content
-    let skill_content =
-        std::fs::read_to_string(&skill.path).map_err(|_| ExpansionError::SkillNotFound {
-            name: skill_name.to_string(),
-            available: skills.iter().map(|s| s.name.clone()).collect(),
-        })?;
-
-    if arguments.is_empty() {
-        // No arguments — load skill content unmodified (REQ-IR-003)
-        return Ok(skill_content);
-    }
-
-    // Check for $ARGUMENTS placeholder
-    if skill_content.contains("$ARGUMENTS") {
-        // Substitute $ARGUMENTS with the full arguments string
-        let mut result = skill_content.replace("$ARGUMENTS", arguments);
-
-        // Also handle $ARGUMENTS[N] and $N (1-based positional)
-        let tokens: Vec<&str> = arguments.split_whitespace().collect();
-        for (i, token) in tokens.iter().enumerate() {
-            let n = i + 1;
-            result = result
-                .replace(&format!("$ARGUMENTS[{n}]"), token)
-                .replace(&format!("${n}"), token);
-        }
-
-        Ok(result)
-    } else {
-        // No placeholder — append arguments so the AI still receives them (REQ-IR-003)
-        Ok(format!("{skill_content}\nARGUMENTS: {arguments}"))
-    }
-}
-
 /// Expand all inline references in `text` relative to `working_dir`.
 ///
 /// Tokenizes the ORIGINAL text once for both `@` and `/` sigils, then:
@@ -230,11 +175,21 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
         let skills = discover_skills(working_dir);
         if skills.iter().any(|s| s.name == skill_ref.token) {
-            let llm_text = expand_skill(&skill_ref.token, text, working_dir)?;
-            return Ok(ExpandedMessage {
-                display_text: text.to_string(),
-                llm_text,
-            });
+            match crate::skills::invoke_skill(&skill_ref.token, text, working_dir) {
+                Ok(invocation) => {
+                    return Ok(ExpandedMessage {
+                        display_text: text.to_string(),
+                        llm_text: invocation.body.clone(),
+                        skill_invocation: Some(invocation),
+                    });
+                }
+                Err(_e) => {
+                    return Err(ExpansionError::SkillNotFound {
+                        name: skill_ref.token.clone(),
+                        available: skills.iter().map(|s| s.name.clone()).collect(),
+                    });
+                }
+            }
         }
     }
 
@@ -277,6 +232,7 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     Ok(ExpandedMessage {
         display_text: text.to_string(),
         llm_text,
+        skill_invocation: None,
     })
 }
 
@@ -369,6 +325,7 @@ mod tests {
         let result = expand("hello world", tmp.path()).unwrap();
         assert_eq!(result.display_text, "hello world");
         assert_eq!(result.llm_text, "hello world");
+        assert!(result.skill_invocation.is_none());
     }
 
     #[test]
@@ -381,6 +338,7 @@ mod tests {
         assert!(result.llm_text.contains("<file path=\"hello.txt\">"));
         assert!(result.llm_text.contains("contents here"));
         assert!(result.llm_text.contains("</file>"));
+        assert!(result.skill_invocation.is_none());
     }
 
     #[test]
@@ -576,6 +534,10 @@ mod tests {
         assert!(result.llm_text.contains("Write in a formal tone."));
         // Full message is passed as arguments
         assert!(result.llm_text.contains("ARGUMENTS: /writing-style"));
+        // Skill invocation is populated
+        let invocation = result.skill_invocation.as_ref().unwrap();
+        assert_eq!(invocation.name, "writing-style");
+        assert!(invocation.body.contains("Write in a formal tone."));
     }
 
     #[test]
@@ -595,6 +557,8 @@ mod tests {
         assert!(result
             .llm_text
             .contains("Please review /review src/main.rs carefully."));
+        let invocation = result.skill_invocation.as_ref().unwrap();
+        assert_eq!(invocation.name, "review");
     }
 
     #[test]
@@ -693,5 +657,6 @@ mod tests {
         let result = expand("hello world", tmp.path()).unwrap();
         assert_eq!(result.display_text, "hello world");
         assert_eq!(result.llm_text, "hello world");
+        assert!(result.skill_invocation.is_none());
     }
 }

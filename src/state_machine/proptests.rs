@@ -275,6 +275,7 @@ fn arb_user_message_event() -> impl Strategy<Value = Event> {
         images: vec![],
         message_id: uuid::Uuid::new_v4().to_string(),
         user_agent: None,
+        skill_invocation: None,
     })
 }
 
@@ -454,6 +455,7 @@ proptest! {
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
+            skill_invocation: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -525,6 +527,7 @@ proptest! {
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
+            skill_invocation: None,
         };
         let result = transition(&state, &test_context(), event);
         // Busy states either return AgentBusy, CancellationInProgress, or InvalidTransition
@@ -547,6 +550,7 @@ proptest! {
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
+            skill_invocation: None,
         };
         let result = transition(&state, &test_context(), event);
         prop_assert!(
@@ -602,6 +606,7 @@ proptest! {
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
+            skill_invocation: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -983,6 +988,7 @@ fn test_complete_tool_cycle() {
             images: vec![],
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
+            skill_invocation: None,
         },
     )
     .unwrap();
@@ -2199,6 +2205,7 @@ proptest! {
                 images: vec![],
                 message_id: "test-msg".to_string(),
                 user_agent: None,
+                skill_invocation: None,
             },
         ) {
             state = result.new_state;

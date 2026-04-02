@@ -148,16 +148,26 @@ impl Effect {
         images: Vec<ImageData>,
         message_id: String,
         user_agent: Option<String>,
+        skill_invocation: Option<crate::skills::SkillInvocation>,
     ) -> Self {
-        let content = match llm_text {
-            Some(expanded) => MessageContent::User(crate::db::UserContent::with_expansion(
-                text, expanded, images,
-            )),
-            None => {
-                if images.is_empty() {
-                    MessageContent::user(text)
-                } else {
-                    MessageContent::user_with_images(text, images)
+        let text = text.into();
+        let content = if let Some(invocation) = skill_invocation {
+            MessageContent::Skill(crate::db::SkillContent {
+                name: invocation.name,
+                body: invocation.body,
+                trigger: text,
+            })
+        } else {
+            match llm_text {
+                Some(expanded) => MessageContent::User(crate::db::UserContent::with_expansion(
+                    text, expanded, images,
+                )),
+                None => {
+                    if images.is_empty() {
+                        MessageContent::user(text)
+                    } else {
+                        MessageContent::user_with_images(text, images)
+                    }
                 }
             }
         };

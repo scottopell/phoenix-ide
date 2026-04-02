@@ -485,6 +485,7 @@ async fn create_conversation(
         images,
         message_id: req.message_id,
         user_agent: None,
+        skill_invocation: expanded_initial.skill_invocation,
     };
 
     state
@@ -995,6 +996,7 @@ async fn send_chat(
         images,
         message_id: req.message_id,
         user_agent: req.user_agent,
+        skill_invocation: expanded.skill_invocation,
     };
 
     state

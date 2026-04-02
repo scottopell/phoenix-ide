@@ -22,6 +22,9 @@ pub enum Event {
         message_id: String,
         /// Browser user agent for display (e.g., show iPhone icon in UI)
         user_agent: Option<String>,
+        /// If this message triggered a skill invocation, the details are here.
+        /// When present, the message is persisted as `MessageContent::Skill`.
+        skill_invocation: Option<crate::skills::SkillInvocation>,
     },
     UserCancel,
 

@@ -379,6 +379,7 @@ impl RuntimeManager {
                     images: vec![],
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: Some("Phoenix Sub-Agent".to_string()),
+                    skill_invocation: None,
                 })
                 .await;
 

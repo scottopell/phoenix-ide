@@ -517,6 +517,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
+                skill_invocation: None,
             })
             .await
             .expect("Failed to send message");
@@ -786,6 +787,7 @@ mod tests {
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
+                skill_invocation: None,
             })
             .await
             .unwrap();
@@ -896,6 +898,7 @@ mod tests {
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
+                skill_invocation: None,
             })
             .await
             .unwrap();
@@ -987,6 +990,7 @@ mod tests {
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
+                skill_invocation: None,
             })
             .await
             .unwrap();
@@ -1495,6 +1499,7 @@ mod tests {
                 images: vec![],
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
+                skill_invocation: None,
             })
             .await
             .unwrap();

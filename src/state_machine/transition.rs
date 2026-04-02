@@ -95,11 +95,17 @@ pub fn transition(
                 images,
                 message_id,
                 user_agent,
+                skill_invocation,
             },
         ) => Ok(
             TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::persist_user_message(
-                    text, llm_text, images, message_id, user_agent,
+                    text,
+                    llm_text,
+                    images,
+                    message_id,
+                    user_agent,
+                    skill_invocation,
                 ))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_llm_requesting(1))
@@ -1603,6 +1609,7 @@ mod tests {
                 images: vec![],
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
+                skill_invocation: None,
             },
         )
         .unwrap();
@@ -1625,6 +1632,7 @@ mod tests {
                 images: vec![],
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
+                skill_invocation: None,
             },
         );
 
@@ -1645,6 +1653,7 @@ mod tests {
                 images: vec![],
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
+                skill_invocation: None,
             },
         )
         .unwrap();
@@ -2369,6 +2378,7 @@ mod tests {
                 images: vec![],
                 message_id: "msg-1".to_string(),
                 user_agent: None,
+                skill_invocation: None,
             },
         );
 
