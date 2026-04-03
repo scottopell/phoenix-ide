@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Folder, ChevronRight } from 'lucide-react';
+import { Folder, ChevronRight, ChevronLeft } from 'lucide-react';
 import { api } from '../api';
 import { Skeleton } from './Skeleton';
 import type { DirStatus } from './SettingsFields';
@@ -13,6 +13,7 @@ interface DirectoryPickerProps {
   value: string;
   onChange: (path: string) => void;
   onStatusChange?: (status: DirStatus) => void;
+  onDismiss?: () => void;
   placeholder?: string;
   className?: string;
 }
@@ -45,7 +46,7 @@ function parsePath(value: string): { parentPath: string; partial: string } {
   return { parentPath: parent, partial };
 }
 
-export function DirectoryPicker({ value, onChange, onStatusChange, placeholder = '/path/to/project', className = '' }: DirectoryPickerProps) {
+export function DirectoryPicker({ value, onChange, onStatusChange, onDismiss, placeholder = '/path/to/project', className = '' }: DirectoryPickerProps) {
   const [suggestions, setSuggestions] = useState<DirectoryEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -155,6 +156,24 @@ export function DirectoryPicker({ value, onChange, onStatusChange, placeholder =
     return () => clearTimeout(timeoutId);
   }, [value]);
 
+  const handleConfirm = useCallback(() => {
+    setShowDropdown(false);
+    setSelectedIndex(-1);
+    inputRef.current?.blur();
+    onDismiss?.();
+  }, [onDismiss]);
+
+  const handleGoUp = useCallback(() => {
+    const trimmed = value.trim();
+    const { parentPath } = parsePath(trimmed);
+    // Navigate to parent of the current listing directory
+    const lastSlash = parentPath.lastIndexOf('/');
+    const grandParent = lastSlash === 0 ? '/' : parentPath.substring(0, lastSlash);
+    const newPath = grandParent === '/' ? '/' : grandParent + '/';
+    onChange(newPath);
+    inputRef.current?.focus();
+  }, [value, onChange]);
+
   const handleSelect = useCallback((entry: DirectoryEntry) => {
     const trimmed = value.trim();
     const { parentPath } = parsePath(trimmed);
@@ -254,9 +273,20 @@ export function DirectoryPicker({ value, onChange, onStatusChange, placeholder =
           placeholder={placeholder}
           autoComplete="off"
         />
-        <span className={`status-icon ${statusClass}`} title={statusTitle}>
-          {statusIcon}
-        </span>
+        {(dropdownVisible && (pathStatus === 'exists' || pathStatus === 'will-create')) ? (
+          <button
+            className={`status-icon status-icon-btn ${statusClass}`}
+            title="Use this directory"
+            onMouseDown={(e) => { e.preventDefault(); handleConfirm(); }}
+            tabIndex={-1}
+          >
+            {statusIcon}
+          </button>
+        ) : (
+          <span className={`status-icon ${statusClass}`} title={statusTitle}>
+            {statusIcon}
+          </span>
+        )}
         {dropdownVisible && (
           <div className="directory-list">
             {isLoading ? (
@@ -265,24 +295,45 @@ export function DirectoryPicker({ value, onChange, onStatusChange, placeholder =
                 <Skeleton width="45%" height={13} />
                 <Skeleton width="55%" height={13} />
               </div>
-            ) : suggestions.length === 0 ? (
-              <div className="list-empty">No subdirectories</div>
             ) : (
-              suggestions.map((entry, index) => (
-                <button
-                  key={entry.name}
-                  className={`directory-entry${index === selectedIndex ? ' selected' : ''}`}
-                  onMouseDown={(e) => {
-                    e.preventDefault(); // Prevent input blur
-                    handleSelect(entry);
-                  }}
-                  tabIndex={-1}
-                >
-                  <Folder size={14} className="entry-icon" />
-                  <span className="entry-name">{entry.name}</span>
-                  <ChevronRight size={14} className="entry-arrow" />
-                </button>
-              ))
+              <>
+                {(() => {
+                  const { parentPath } = parsePath(value.trim());
+                  const canGoUp = parentPath !== '/';
+                  const parentName = canGoUp
+                    ? parentPath.substring(0, parentPath.lastIndexOf('/')) || '/'
+                    : null;
+                  return canGoUp ? (
+                    <button
+                      className="directory-entry directory-entry-up"
+                      onMouseDown={(e) => { e.preventDefault(); handleGoUp(); }}
+                      tabIndex={-1}
+                    >
+                      <ChevronLeft size={14} className="entry-icon" />
+                      <span className="entry-name">{parentName}</span>
+                    </button>
+                  ) : null;
+                })()}
+                {suggestions.length === 0 ? (
+                  <div className="list-empty">No subdirectories</div>
+                ) : (
+                  suggestions.map((entry, index) => (
+                    <button
+                      key={entry.name}
+                      className={`directory-entry${index === selectedIndex ? ' selected' : ''}`}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        handleSelect(entry);
+                      }}
+                      tabIndex={-1}
+                    >
+                      <Folder size={14} className="entry-icon" />
+                      <span className="entry-name">{entry.name}</span>
+                      <ChevronRight size={14} className="entry-arrow" />
+                    </button>
+                  ))
+                )}
+              </>
             )}
           </div>
         )}

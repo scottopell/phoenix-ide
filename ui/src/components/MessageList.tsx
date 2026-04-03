@@ -32,11 +32,12 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [showJumpToNewest, setShowJumpToNewest] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottom = useRef(true); // Start pinned to bottom
-  const prevMessagesLength = useRef(messages.length);
   const scrollRestored = useRef(false);
   const initialMessageCount = useRef<number | null>(null);
   const lastScrollTop = useRef(0);
+  const prevMessagesHeight = useRef(0);
 
   // Check if user is near bottom of scroll
   const checkIfPinnedToBottom = useCallback(() => {
@@ -63,50 +64,34 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
     }
   }, []);
 
-  // Auto-scroll only when pinned to bottom and content changes
+  // Single ResizeObserver drives all auto-scroll.
+  // Fires after layout is complete (unlike rAF which fires before paint), so
+  // scrollHeight is always the settled value — no mid-render jumps.
+  // Triggers on any content growth: streaming tokens, new messages, new tool blocks.
+  // Does NOT trigger on phase-only state changes that produce no visible content.
   useEffect(() => {
-    // Always scroll to bottom when new messages are added (user sent or received new message)
-    const messagesAdded = messages.length > prevMessagesLength.current;
-    prevMessagesLength.current = messages.length;
+    const messagesEl = messagesRef.current;
+    if (!messagesEl) return;
 
-    if (messagesAdded && isPinnedToBottom.current) {
-      // Use requestAnimationFrame to ensure DOM has updated
-      requestAnimationFrame(() => {
-        scrollToBottom();
-      });
-    }
-  }, [messages.length, scrollToBottom]);
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const newHeight = entry.contentRect.height;
+        if (newHeight > prevMessagesHeight.current) {
+          if (isPinnedToBottom.current) {
+            // Content grew and user is pinned — follow it
+            mainRef.current!.scrollTop = mainRef.current!.scrollHeight;
+          } else {
+            // Content grew but user scrolled up — nudge them
+            setShowJumpToNewest(true);
+          }
+        }
+        prevMessagesHeight.current = newHeight;
+      }
+    });
 
-  // Also scroll when queued messages change (user is sending)
-  useEffect(() => {
-    if (isPinnedToBottom.current && queuedMessages.length > 0) {
-      requestAnimationFrame(() => {
-        scrollToBottom();
-      });
-    }
-  }, [queuedMessages.length, scrollToBottom]);
-
-  // Scroll on state changes only if pinned
-  useEffect(() => {
-    if (isPinnedToBottom.current) {
-      requestAnimationFrame(() => {
-        scrollToBottom();
-      });
-    }
-  }, [convState, scrollToBottom]);
-
-  // Auto-scroll when streaming buffer grows (REQ-UI-019)
-  useEffect(() => {
-    if (!streamingBuffer) return;
-    if (isPinnedToBottom.current) {
-      requestAnimationFrame(() => {
-        scrollToBottom();
-      });
-    } else {
-      // User has scrolled up — show "jump to live" affordance
-      setShowJumpToNewest(true);
-    }
-  }, [streamingBuffer?.text, scrollToBottom]); // eslint-disable-line react-hooks/exhaustive-deps
+    observer.observe(messagesEl);
+    return () => observer.disconnect();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save scroll position on unmount / visibility change (REQ-UI-013)
   useEffect(() => {
@@ -156,6 +141,8 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
   // Reset scrollRestored when conversation changes
   useEffect(() => {
     scrollRestored.current = false;
+    prevMessagesHeight.current = 0;
+    isPinnedToBottom.current = true; // Re-pin on every conversation switch
     setShowJumpToNewest(false);
     initialMessageCount.current = null;
   }, [conversationId]);
@@ -181,7 +168,7 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
   return (
     <main id="main-area" ref={mainRef} onScroll={handleScroll}>
       <section id="chat-view" className="view active">
-        <div id="messages">
+        <div id="messages" ref={messagesRef}>
           {systemPrompt && (
             <div className={`system-prompt-block${systemPromptExpanded ? ' expanded' : ''}`}>
               <div
