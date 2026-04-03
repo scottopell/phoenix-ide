@@ -966,7 +966,10 @@ pub fn transition(
         // Task Approval (REQ-BED-028)
         // ============================================================
 
-        // AwaitingTaskApproval + TaskApprovalResponse(Approved) -> Idle (Work mode)
+        // AwaitingTaskApproval + TaskApprovalResponse(Approved) -> LlmRequesting
+        // After approval, the agent automatically begins executing the plan.
+        // The system message about the branch + worktree is emitted by the
+        // executor after git operations succeed, giving the agent context.
         (
             ConvState::AwaitingTaskApproval {
                 title,
@@ -976,7 +979,7 @@ pub fn transition(
             Event::TaskApprovalResponse {
                 outcome: TaskApprovalOutcome::Approved,
             },
-        ) => Ok(TransitionResult::new(ConvState::Idle)
+        ) => Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
             .with_effect(Effect::ApproveTask {
                 title: title.clone(),
                 priority: priority.clone(),
@@ -985,7 +988,8 @@ pub fn transition(
             // System message with branch name is emitted by the executor after
             // git operations succeed (includes "You are on branch ...").
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_agent_done())),
+            .with_effect(notify_llm_requesting(1))
+            .with_effect(Effect::RequestLlm)),
 
         // AwaitingTaskApproval + TaskApprovalResponse(FeedbackProvided) -> LlmRequesting
         // The agent gets a new turn to revise the plan based on user feedback.
