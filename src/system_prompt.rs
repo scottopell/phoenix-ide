@@ -476,7 +476,8 @@ mod tests {
     #[test]
     fn test_build_system_prompt_no_guidance() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt(temp.path(), false);
+        // Use temp as home override to avoid $HOME skill contamination
+        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
 
         assert!(prompt.contains("helpful AI assistant"));
         assert!(!prompt.contains("<project_guidance>"));
@@ -488,7 +489,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("AGENTS.md"), "# Project Rules\nBe nice.").unwrap();
 
-        let prompt = build_system_prompt(temp.path(), false);
+        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
 
         assert!(prompt.contains("<project_guidance>"));
         assert!(prompt.contains("# Project Rules"));
@@ -499,7 +500,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_sub_agent() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt(temp.path(), true);
+        let prompt = build_system_prompt_with_home(temp.path(), true, Some(temp.path()));
 
         assert!(prompt.contains("sub-agent"));
         assert!(prompt.contains("submit_result"));

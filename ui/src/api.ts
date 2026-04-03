@@ -471,8 +471,9 @@ export const api = {
     return resp.json();
   },
 
-  async completeTask(convId: string): Promise<{ success: boolean; commit_message: string; task_not_done?: boolean }> {
-    const resp = await fetch(`/api/conversations/${convId}/complete-task`, { method: 'POST' });
+  async completeTask(convId: string, autoStash = false): Promise<{ success: boolean; commit_message: string; task_not_done?: boolean }> {
+    const qs = autoStash ? '?auto_stash=true' : '';
+    const resp = await fetch(`/api/conversations/${convId}/complete-task${qs}`, { method: 'POST' });
     if (!resp.ok) {
       const err = await resp.json();
       if (err.error_type === 'dirty_main_checkout') {

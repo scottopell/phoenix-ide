@@ -116,7 +116,7 @@ export function WorkActions({
                       setDirtyMainInfo(null);
                       setModalState({ type: 'loading' });
                       try {
-                        const result = await api.completeTask(conversationId);
+                        const result = await api.completeTask(conversationId, true);
                         setEditedMessage(result.commit_message);
                         setModalState({
                           type: 'confirm',

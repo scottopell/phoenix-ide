@@ -1208,10 +1208,17 @@ async fn respond_to_question(
 
 /// Pre-check endpoint: validates worktree state, detects conflicts, generates commit message.
 /// Does NOT merge -- the user reviews the commit message first.
+#[derive(Debug, Deserialize)]
+struct CompleteTaskQuery {
+    #[serde(default)]
+    auto_stash: bool,
+}
+
 #[allow(clippy::too_many_lines)] // Sequential validation + LLM call; splitting hurts readability
 async fn complete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<CompleteTaskQuery>,
 ) -> Result<Json<CompleteTaskResponse>, AppError> {
     // 1. Validate conversation exists, is Work mode, Idle state, project-scoped
     let conv = state
@@ -1262,6 +1269,7 @@ async fn complete_task(
 
     // Capture what we need for the blocking section
     let base_branch_clone = base_branch.clone();
+    let branch_name_clone = branch_name.clone();
 
     // 2. Pre-checks (blocking git operations)
     let prechecks = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
@@ -1275,25 +1283,28 @@ async fn complete_task(
             )));
         }
 
-        // 2b. Main checkout must be clean (or auto-stashable)
-        let main_status = run_git(&repo_root, &["status", "--porcelain"])
-            .map_err(AppError::Internal)?;
-        if !main_status.is_empty() {
-            let dirty_files: Vec<String> = main_status
-                .lines()
-                .map(|l| l.trim().to_string())
-                .collect();
+        // 2b. Main checkout must be clean (unless auto_stash was requested)
+        if !query.auto_stash {
+            let main_status = run_git(&repo_root, &["status", "--porcelain"])
+                .map_err(AppError::Internal)?;
+            if !main_status.is_empty() {
+                let dirty_files: Vec<String> = main_status
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .collect();
 
-            // Check if auto-stash would be safe: create a trial stash commit,
-            // then simulate applying it after the merge via merge-tree.
-            let can_auto_stash = check_auto_stash_safe(&repo_root, &base_branch_clone);
+                // Check if auto-stash would be safe: dirty files must not overlap
+                // with files changed by the task branch.
+                let can_auto_stash =
+                    check_auto_stash_safe(&repo_root, &base_branch_clone, &branch_name_clone);
 
-            return Err(AppError::Conflict(ConflictErrorResponse {
-                error: "Main checkout has uncommitted changes.".to_string(),
-                error_type: "dirty_main_checkout".to_string(),
-                dirty_files,
-                can_auto_stash,
-            }));
+                return Err(AppError::Conflict(ConflictErrorResponse {
+                    error: "Main checkout has uncommitted changes.".to_string(),
+                    error_type: "dirty_main_checkout".to_string(),
+                    dirty_files,
+                    can_auto_stash,
+                }));
+            }
         }
 
         // 2c. Conflict detection via merge-tree
@@ -2628,30 +2639,38 @@ async fn enable_mcp_server(
 
 /// Check if auto-stashing the dirty main checkout would be safe (pop won't conflict after merge).
 ///
-/// Uses `git stash create` to make a trial stash commit without modifying the working tree,
-/// then checks if that commit's changes overlap with the merge branch's changes.
-fn check_auto_stash_safe(repo_root: &std::path::Path, base_branch: &str) -> bool {
-    // Create a trial stash commit (doesn't modify working tree or stash list)
-    let stash_sha = match run_git(repo_root, &["stash", "create"]) {
-        Ok(sha) if !sha.is_empty() => sha,
-        _ => return false, // Can't create stash -- not safe
-    };
-
-    // Get the files that would be modified by the merge
+/// Check whether the dirty files on main overlap with files changed by the task branch.
+/// If no overlap, `git stash push` + merge + `git stash pop` is safe.
+fn check_auto_stash_safe(
+    repo_root: &std::path::Path,
+    base_branch: &str,
+    task_branch: &str,
+) -> bool {
+    // Get the files that the task branch changed (relative to base)
     let merge_diff = run_git(
         repo_root,
-        &["diff", "--name-only", &format!("{base_branch}...HEAD")],
+        &[
+            "diff",
+            "--name-only",
+            &format!("{base_branch}...{task_branch}"),
+        ],
     )
     .unwrap_or_default();
     let merge_files: std::collections::HashSet<&str> = merge_diff.lines().collect();
 
-    // Get the files in the stash
-    let stash_diff =
-        run_git(repo_root, &["diff", "--name-only", &stash_sha, "HEAD"]).unwrap_or_default();
-    let stash_files: std::collections::HashSet<&str> = stash_diff.lines().collect();
+    // Get the dirty files on main (tracked modified + untracked)
+    let status = run_git(repo_root, &["status", "--porcelain"]).unwrap_or_default();
+    let dirty_files: std::collections::HashSet<&str> = status
+        .lines()
+        .filter_map(|line| {
+            // git status --porcelain format: "XY filename" (3-char prefix)
+            let trimmed = line.get(3..)?;
+            Some(trimmed.trim())
+        })
+        .collect();
 
     // If no overlap, stash pop will succeed
-    let overlap: Vec<&&str> = merge_files.intersection(&stash_files).collect();
+    let overlap: Vec<&&str> = merge_files.intersection(&dirty_files).collect();
     if overlap.is_empty() {
         true
     } else {
