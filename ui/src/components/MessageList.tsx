@@ -210,16 +210,25 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                   return <UserMessage key={msg.sequence_id} message={msg} />;
                 } else if (type === 'skill') {
                   const skillContent = msg.content as { name?: string; trigger?: string };
-                  // Show trigger only if it has args beyond "/skill-name"
                   const skillTrigger = skillContent.trigger || '';
                   const triggerArgs = skillTrigger.replace(new RegExp(`^/?${skillContent.name || ''}\\s*`), '').trim();
                   return (
-                    <div key={msg.sequence_id} className="message skill">
-                      <div className="skill-indicator">
-                        <span className="skill-label" title={`Skill invocation: /${skillContent.name || 'skill'} -- loaded instructions from SKILL.md and delivered to the agent`}>/{skillContent.name || 'skill'}</span>
-                        {triggerArgs && (
-                          <span className="skill-trigger">{triggerArgs}</span>
+                    <div key={msg.sequence_id} className="message user" data-sequence-id={msg.sequence_id}>
+                      <div className="message-header">
+                        <span className="message-sender">You</span>
+                        {msg.created_at && (
+                          <span className="message-time" title={new Date(msg.created_at).toLocaleString()}>
+                            {formatMessageTime(msg.created_at)}
+                          </span>
                         )}
+                      </div>
+                      <div className="message-content">
+                        <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${skillContent.name || 'skill'}/SKILL.md and delivered to the agent`}>
+                          <span className="skill-label">skill: /{skillContent.name || 'skill'}</span>
+                          {triggerArgs && (
+                            <span className="skill-trigger">{triggerArgs}</span>
+                          )}
+                        </div>
                       </div>
                     </div>
                   );
