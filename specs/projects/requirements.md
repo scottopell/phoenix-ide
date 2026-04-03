@@ -461,3 +461,54 @@ THE SYSTEM SHALL commit the task file status update on `base_branch`
 working on a shared feature branch and want task work merged there. Recording the
 base branch at approval time supports this workflow without requiring the user to
 specify a merge target at completion time.
+
+---
+
+### REQ-PROJ-018: Direct Mode for Git Repositories
+
+WHEN the user creates a conversation targeting a git repository
+THE SYSTEM SHALL offer the option to start in Direct mode instead of Explore mode
+
+WHEN the user selects Direct mode for a git repository
+THE SYSTEM SHALL create the conversation with full tool access (bash, patch, all tools)
+AND set the working directory to the repository root (not a worktree)
+AND NOT associate the conversation with the Explore/Work lifecycle
+AND NOT offer propose_plan (Direct mode bypasses the plan/approve workflow)
+
+WHEN a Direct-mode conversation operates on a git repository
+THE SYSTEM SHALL NOT create worktrees, branches, or task files
+AND SHALL NOT restrict any tools based on git state
+
+THE SYSTEM SHALL visually distinguish Direct mode from Explore mode
+AND communicate that Direct mode bypasses safety features (no isolation, no review)
+
+**Rationale:** The Explore -> propose_plan -> approve -> Work workflow adds value for
+non-trivial changes but creates friction disproportionate to simple fixes. A one-line
+config change or quick experiment does not warrant the full ceremony. Without an escape
+hatch, users are forced to either endure the workflow overhead or create conversations
+in non-git directories and manually copy results. Direct mode gives the user an explicit
+opt-out with clear trade-off communication: full power, no safety net.
+
+---
+
+### REQ-PROJ-019: Conversation List Filtering and Auto-Archive
+
+WHEN the conversation list contains more than 20 conversations
+THE SYSTEM SHALL provide filtering by conversation mode (Explore, Work, Direct, Standalone)
+AND provide filtering by project
+
+WHEN a conversation has been in Terminal state for more than 7 days
+THE SYSTEM SHALL automatically archive it
+AND the conversation SHALL still be accessible via the archive view
+
+WHEN the user applies a mode filter
+THE SYSTEM SHALL show only conversations matching the selected mode
+AND persist the filter selection across page navigation
+
+**Rationale:** Active daily use produces dozens of conversations per week. Without
+filtering, the list becomes a flat chronological dump where active Work tasks are
+indistinguishable from three-day-old quick questions. Auto-archiving Terminal
+conversations prevents indefinite list growth from completed or abandoned tasks.
+Mode and project filters let the user focus on what matters: "show me my active
+Work conversations for this project."
+
