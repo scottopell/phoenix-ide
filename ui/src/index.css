@@ -5889,6 +5889,7 @@ html * {
   padding: 6px 12px;
   font-size: 12px;
   color: var(--text-secondary);
+  flex-wrap: wrap;
 }
 
 .work-actions-label {
@@ -5934,8 +5935,14 @@ html * {
 }
 
 .work-actions-error {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--accent-red, #ef4444);
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-red, #ef4444) 25%, transparent);
+  border-radius: 4px;
+  padding: 4px 10px;
+  width: 100%;
+  margin-top: 4px;
 }
 
 /* --- SSE Error Toast --- */
@@ -6091,8 +6098,36 @@ html * {
   border-radius: 4px;
 }
 
-.commit-modal-nudge-dismiss {
+.commit-modal-nudge-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-left: auto;
+  flex-shrink: 0;
+}
+
+.commit-modal-nudge-fix {
+  font-size: 11px;
+  color: var(--accent-blue, #3b82f6);
+  background: none;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 30%, transparent);
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.commit-modal-nudge-fix:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, transparent);
+  border-color: var(--accent-blue, #3b82f6);
+}
+
+.commit-modal-nudge-fix:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.commit-modal-nudge-dismiss {
   font-size: 11px;
   color: var(--text-muted);
   background: none;

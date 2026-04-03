@@ -572,6 +572,7 @@ export function ConversationPage() {
             phaseType={convStateForChildren.type}
             branchName={conversation.branch_name ?? undefined}
             baseBranch={conversation.base_branch}
+            onSendMessage={(text) => handleSend(text, [])}
           />
         )}
         <InputArea

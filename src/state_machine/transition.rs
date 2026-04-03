@@ -979,17 +979,19 @@ pub fn transition(
             Event::TaskApprovalResponse {
                 outcome: TaskApprovalOutcome::Approved,
             },
-        ) => Ok(TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
-            .with_effect(Effect::ApproveTask {
-                title: title.clone(),
-                priority: priority.clone(),
-                plan: plan.clone(),
-            })
-            // System message with branch name is emitted by the executor after
-            // git operations succeed (includes "You are on branch ...").
-            .with_effect(Effect::PersistState)
-            .with_effect(notify_llm_requesting(1))
-            .with_effect(Effect::RequestLlm)),
+        ) => Ok(
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::ApproveTask {
+                    title: title.clone(),
+                    priority: priority.clone(),
+                    plan: plan.clone(),
+                })
+                // System message with branch name is emitted by the executor after
+                // git operations succeed (includes "You are on branch ...").
+                .with_effect(Effect::PersistState)
+                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::RequestLlm),
+        ),
 
         // AwaitingTaskApproval + TaskApprovalResponse(FeedbackProvided) -> LlmRequesting
         // The agent gets a new turn to revise the plan based on user feedback.

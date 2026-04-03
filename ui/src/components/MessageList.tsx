@@ -91,7 +91,7 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
 
     observer.observe(messagesEl);
     return () => observer.disconnect();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // Save scroll position on unmount / visibility change (REQ-UI-013)
   useEffect(() => {

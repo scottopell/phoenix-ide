@@ -8,6 +8,8 @@ interface WorkActionsProps {
   phaseType: string;
   branchName: string | undefined;
   baseBranch: string | null | undefined;
+  /** Send a user message to the conversation (for "ask agent to fix" flows) */
+  onSendMessage?: (text: string) => void;
 }
 
 type ModalState =
@@ -21,6 +23,7 @@ export function WorkActions({
   phaseType,
   branchName,
   baseBranch,
+  onSendMessage,
 }: WorkActionsProps) {
   const [modalState, setModalState] = useState<ModalState>({ type: 'closed' });
   const [editedMessage, setEditedMessage] = useState('');
@@ -82,7 +85,7 @@ export function WorkActions({
           {abandoning ? 'Abandoning...' : 'Abandon'}
         </button>
         {error && (
-          <span className="work-actions-error">{error}</span>
+          <div className="work-actions-error">{error}</div>
         )}
       </div>
 
@@ -108,6 +111,13 @@ export function WorkActions({
             setModalState({ type: 'closed' });
             setEditedMessage('');
           }}
+          onAskAgentMarkDone={onSendMessage ? () => {
+            setModalState({ type: 'closed' });
+            setEditedMessage('');
+            onSendMessage(
+              'The task file is not marked as done yet. Please update the task file status to "done" so I can merge the work.'
+            );
+          } : undefined}
         />
       )}
     </>
@@ -122,6 +132,7 @@ interface CommitModalProps {
   confirming: boolean;
   onConfirm: () => void;
   onCancel: () => void;
+  onAskAgentMarkDone?: (() => void) | undefined;
 }
 
 function CommitModal({
@@ -132,6 +143,7 @@ function CommitModal({
   confirming,
   onConfirm,
   onCancel,
+  onAskAgentMarkDone,
 }: CommitModalProps) {
   const [nudgeDismissed, setNudgeDismissed] = useState(false);
 
@@ -175,12 +187,23 @@ function CommitModal({
         {taskNotDone && !nudgeDismissed && (
           <div className="commit-modal-nudge">
             <span>Task file not marked done.</span>
-            <button
-              className="commit-modal-nudge-dismiss"
-              onClick={() => setNudgeDismissed(true)}
-            >
-              Dismiss
-            </button>
+            <div className="commit-modal-nudge-actions">
+              {onAskAgentMarkDone && (
+                <button
+                  className="commit-modal-nudge-fix"
+                  onClick={onAskAgentMarkDone}
+                  disabled={confirming}
+                >
+                  Ask agent to fix
+                </button>
+              )}
+              <button
+                className="commit-modal-nudge-dismiss"
+                onClick={() => setNudgeDismissed(true)}
+              >
+                Dismiss
+              </button>
+            </div>
           </div>
         )}
         <label className="commit-modal-label">Commit message</label>
