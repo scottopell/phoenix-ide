@@ -12,6 +12,20 @@ import type { ImageData, ModelsResponse } from '../api';
 
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
+const RECENT_DIRS_KEY = 'phoenix-recent-dirs';
+const MAX_RECENT = 5;
+
+function getRecentDirs(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(RECENT_DIRS_KEY) || '[]');
+  } catch { return []; }
+}
+
+function addRecentDir(dir: string) {
+  const recent = getRecentDirs().filter(d => d !== dir);
+  recent.unshift(dir);
+  localStorage.setItem(RECENT_DIRS_KEY, JSON.stringify(recent.slice(0, MAX_RECENT)));
+}
 
 interface NewConversationPageProps {
   desktopMode?: boolean;
@@ -35,6 +49,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [creating, setCreating] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAllModels, setShowAllModels] = useState(false);
+
+  const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -125,9 +141,12 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       }
 
       const messageId = generateUUID();
+      const trimmedCwd = cwd.trim();
       const conv = await api.createConversation(
-        cwd.trim(), trimmed, messageId, selectedModel || undefined, images
+        trimmedCwd, trimmed, messageId, selectedModel || undefined, images
       );
+      addRecentDir(trimmedCwd);
+      setRecentDirs(getRecentDirs());
       if (background) {
         // Stay on page, reset form, show toast
         setDraft('');
@@ -192,7 +211,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         onChange={handleFileChange}
         style={{ display: 'none' }}
       />
-      
+
       {!desktopMode && (
         <header className="new-conv-header-minimal">
           <button className="back-link" onClick={() => navigate('/')}>← Back</button>
@@ -200,72 +219,86 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       )}
 
       <main className="new-conv-main">
-        <div className="new-conv-content">
-          <h1 className="new-conv-title">New conversation</h1>
-          <p className="new-conv-tagline">AI-powered coding assistant</p>
-
+        {/* Desktop: workbench card */}
+        <div className="new-conv-card desktop-only">
           <LlmStatusBanner models={models} />
           {error && <div className="new-conv-error">{error}</div>}
 
-          {/* Mobile: settings card at top */}
-          <div className="new-conv-settings-card mobile-only">
-            <SettingsFields {...settingsProps} />
-          </div>
+          {/* Recent projects */}
+          {recentDirs.length > 0 && (
+            <div className="new-conv-recent">
+              {recentDirs.map(dir => {
+                const label = dir.split('/').filter(Boolean).pop() || dir;
+                const isSelected = cwd.trim() === dir;
+                return (
+                  <button
+                    key={dir}
+                    className={`new-conv-recent-chip ${isSelected ? 'active' : ''}`}
+                    onClick={() => setCwd(dir)}
+                    title={dir}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
-          {/* Desktop: centered input box */}
-          <div className="new-conv-input-box desktop-only">
-            <ImageAttachments images={images} onRemove={handleRemoveImage} />
-            
-            <textarea
-              ref={textareaRef}
-              className="new-conv-textarea"
-              placeholder="What would you like to work on?"
-              rows={3}
-              value={textareaValue}
-              onChange={(e) => {
-                setDraft(e.target.value);
-                if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
-              }}
-              onKeyDown={handleKeyDown}
-              onPaste={handlePaste}
-              disabled={creating}
-            />
-            
-            <div className="new-conv-input-actions">
-              <div className="new-conv-input-left">
-                <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
-                {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
-              </div>
-              <div className="new-conv-input-right">
-                {desktopMode && (
-                  <button className="new-conv-send-bg" onClick={() => handleSend(true)} disabled={!canSend} title="Create conversation and stay on this page">Send & Stay</button>
-                )}
-                <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
-              </div>
+          {/* Main input */}
+          <ImageAttachments images={images} onRemove={handleRemoveImage} />
+          <textarea
+            ref={textareaRef}
+            className="new-conv-textarea"
+            placeholder="What would you like to work on?"
+            rows={3}
+            value={textareaValue}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              if (interimText) { setInterimText(''); draftBeforeVoiceRef.current = ''; }
+            }}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            disabled={creating}
+          />
+
+          {/* Actions row: settings chips + send */}
+          <div className="new-conv-actions">
+            <div className="new-conv-chips">
+              <span className="new-conv-chip" title={cwd}>
+                <span className={`chip-status ${dirStatusClass}`}>{dirStatusIcon}</span>
+                {cwdDisplay}
+              </span>
+              <span className="new-conv-chip">{modelDisplay}</span>
+              <button className="new-conv-chip new-conv-chip--settings" onClick={() => setShowSettings(!showSettings)}>
+                Settings {showSettings ? '▴' : '▾'}
+              </button>
+            </div>
+            <div className="new-conv-send-group">
+              <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
+              {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
+              {desktopMode && (
+                <button className="new-conv-send-bg" onClick={() => handleSend(true)} disabled={!canSend} title="Create conversation and stay on this page">Send & Stay</button>
+              )}
+              <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
             </div>
           </div>
 
-          {/* Desktop: collapsible settings row */}
-          <button className="settings-row desktop-only" onClick={() => setShowSettings(!showSettings)}>
-            <span className="settings-item" title="Working directory for this conversation">
-              <span className="settings-label">dir</span>
-              <span className={`settings-status ${dirStatusClass}`}>{dirStatusIcon}</span>
-              <span className="settings-value">{cwdDisplay}</span>
-            </span>
-            <span className="settings-dot">·</span>
-            <span className="settings-item" title="AI model used for this conversation">
-              <span className="settings-label">model</span>
-              <span className="settings-value">{modelDisplay}</span>
-            </span>
-            <span className={`settings-caret ${showSettings ? 'open' : ''}`} title="Settings">›</span>
-          </button>
-
-          <div className={`settings-panel desktop-only ${showSettings ? 'open' : ''}`}>
-            <div className="settings-panel-inner">
+          {/* Expanded settings */}
+          {showSettings && (
+            <div className="new-conv-settings-expanded">
               <SettingsFields {...settingsProps} />
             </div>
+          )}
+        </div>
+
+        {/* Mobile: keep existing layout */}
+        <div className="new-conv-content mobile-only">
+          <LlmStatusBanner models={models} />
+          {error && <div className="new-conv-error">{error}</div>}
+
+          <div className="new-conv-settings-card">
+            <SettingsFields {...settingsProps} />
           </div>
-          {bgToast && <div className="bg-toast">{bgToast}</div>}
         </div>
       </main>
 
