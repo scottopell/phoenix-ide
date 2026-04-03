@@ -623,6 +623,7 @@ where
                 let conv_id = self.context.conversation_id.clone();
                 let working_dir = self.context.working_dir.clone();
                 let is_sub_agent = self.context.is_sub_agent;
+                let mode_context = self.context.mode_context.clone();
 
                 // Token streaming channel (REQ-BED-025)
                 // Broadcast so the forwarding task can subscribe before the LLM task starts.
@@ -677,8 +678,9 @@ where
                         }
                     };
 
-                    // Build system prompt with AGENTS.md content
-                    let system_prompt = build_system_prompt(&working_dir, is_sub_agent);
+                    // Build system prompt with AGENTS.md content + mode context
+                    let system_prompt =
+                        build_system_prompt(&working_dir, is_sub_agent, mode_context.as_ref());
 
                     // Build request — normalize messages against current tool set
                     // to remove tool_use/tool_result blocks for tools no longer
@@ -1413,6 +1415,12 @@ where
                 // Field-level mutation (not full replacement) so we don't lose
                 // is_sub_agent, context_exhaustion_behavior, or future fields.
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
+
+                // Update mode context so the system prompt reflects Work mode
+                self.context.mode_context = Some(crate::system_prompt::ModeContext::Work {
+                    branch_name: approval_result.branch_name.clone(),
+                    base_branch: approval_result.base_branch.clone(),
+                });
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.

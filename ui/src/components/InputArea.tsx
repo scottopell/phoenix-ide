@@ -39,7 +39,7 @@ interface InputAreaProps {
   isOffline: boolean;
   queuedMessages: QueuedMessage[];
   /** Conversation mode label (e.g. "Explore", "Work", "Standalone") */
-  convModeLabel?: string;
+  convModeLabel?: string | undefined;
   /**
    * Called when the user sends a message.
    * May reject with an expansion error (REQ-IR-007) — the component will

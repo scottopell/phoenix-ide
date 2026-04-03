@@ -1826,6 +1826,7 @@ mod tests {
 
         // Create a sub-agent context
         let subagent_ctx = ConvContext {
+            mode_context: None,
             conversation_id: "subagent-1".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
@@ -1937,6 +1938,7 @@ mod tests {
         use crate::state_machine::state::ContextExhaustionBehavior;
 
         let subagent_ctx = ConvContext {
+            mode_context: None,
             conversation_id: "subagent-1".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
@@ -2033,6 +2035,7 @@ mod tests {
         use crate::state_machine::state::ContextExhaustionBehavior;
 
         let subagent_ctx = ConvContext {
+            mode_context: None,
             conversation_id: "subagent-1".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
@@ -2075,6 +2078,7 @@ mod tests {
         use crate::state_machine::state::ContextExhaustionBehavior;
 
         let subagent_ctx = ConvContext {
+            mode_context: None,
             conversation_id: "subagent-1".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),

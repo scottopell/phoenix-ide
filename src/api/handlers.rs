@@ -562,7 +562,7 @@ async fn get_system_prompt(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let system_prompt = crate::system_prompt::build_system_prompt(&cwd, false);
+    let system_prompt = crate::system_prompt::build_system_prompt(&cwd, false, None);
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }

@@ -27,9 +27,10 @@ use crate::tools::{BrowserSessionManager, ToolRegistry};
 pub type ProductionRuntime =
     ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
-use crate::db::Database;
+use crate::db::{ConvMode, Database};
 use crate::llm::ModelRegistry;
 use crate::state_machine::{ConvContext, ConvState, Event};
+use crate::system_prompt::ModeContext;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -460,9 +461,8 @@ impl RuntimeManager {
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id().to_string());
         let context_window = self.llm_registry.context_window(&model_id);
-        let context = if is_sub_agent {
-            // Sub-agent being resumed - we don't have the original task
-            // This is an edge case that shouldn't happen in normal operation
+        let mode_context = conv_mode_to_context(&conv.conv_mode);
+        let mut context = if is_sub_agent {
             ConvContext::sub_agent(
                 &conv.id,
                 PathBuf::from(&conv.cwd),
@@ -477,6 +477,7 @@ impl RuntimeManager {
                 context_window,
             )
         };
+        context.mode_context = Some(mode_context);
 
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, _) = broadcast::channel(128);
@@ -690,5 +691,21 @@ impl RuntimeManager {
     #[allow(dead_code)] // For future API use
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
         &self.llm_registry
+    }
+}
+
+/// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
+fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
+    match mode {
+        ConvMode::Explore => ModeContext::Explore,
+        ConvMode::Work {
+            branch_name,
+            base_branch,
+            ..
+        } => ModeContext::Work {
+            branch_name: branch_name.clone(),
+            base_branch: base_branch.clone(),
+        },
+        ConvMode::Standalone => ModeContext::Standalone,
     }
 }

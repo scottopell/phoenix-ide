@@ -23,6 +23,21 @@ const SUB_AGENT_SUFFIX: &str = r"
 
 You are a sub-agent working on a specific task. When you complete your task, call submit_result with your findings. If you encounter an unrecoverable error, call submit_error. Your conversation will end after calling either tool.";
 
+/// Conversation mode context for system prompt injection.
+/// Carries only the stable, display-oriented fields the prompt needs.
+#[derive(Debug, Clone)]
+pub enum ModeContext {
+    /// Read-only git project. Agent can investigate and propose tasks.
+    Explore,
+    /// Isolated worktree with write access for an approved task.
+    Work {
+        branch_name: String,
+        base_branch: String,
+    },
+    /// Non-git directory or explicit opt-out. Full tool access.
+    Standalone,
+}
+
 /// A discovered guidance file with its path and content
 #[derive(Debug, Clone)]
 pub struct GuidanceFile {
@@ -348,8 +363,12 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
 }
 
 /// Build the complete system prompt for a conversation.
-pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
-    build_system_prompt_with_home(working_dir, is_sub_agent, None)
+pub fn build_system_prompt(
+    working_dir: &Path,
+    is_sub_agent: bool,
+    mode: Option<&ModeContext>,
+) -> String {
+    build_system_prompt_with_home(working_dir, is_sub_agent, mode, None)
 }
 
 /// Build the complete system prompt with an optional home directory override.
@@ -359,6 +378,7 @@ pub fn build_system_prompt(working_dir: &Path, is_sub_agent: bool) -> String {
 pub fn build_system_prompt_with_home(
     working_dir: &Path,
     is_sub_agent: bool,
+    mode: Option<&ModeContext>,
     home_override: Option<&Path>,
 ) -> String {
     let mut prompt = String::from(BASE_PROMPT);
@@ -411,6 +431,45 @@ pub fn build_system_prompt_with_home(
             "\n\nYou are working in a git worktree. Your working directory is the worktree, \
              not the main checkout at {project_root}. Stay grounded here for file operations."
         );
+    }
+
+    // Add mode context so the agent understands its capabilities
+    if let Some(mode) = mode {
+        match mode {
+            ModeContext::Explore => {
+                prompt.push_str(
+                    "\n\nYou are in Explore mode. This conversation is read-only \
+                     -- you can read files, search, analyze, and discuss the codebase, \
+                     but you cannot modify files.\n\n\
+                     When the user wants to make changes, use the propose_task tool to \
+                     propose a plan. The user will review the plan and can approve, \
+                     request revisions, or reject. On approval, an isolated workspace \
+                     is created and you gain write access.\n\n\
+                     Do not attempt to use bash for writes or the patch tool -- they \
+                     are not available in this mode. If the user asks you to make a \
+                     change directly, explain that you need to propose a task first.",
+                );
+            }
+            ModeContext::Work {
+                branch_name,
+                base_branch,
+            } => {
+                let _ = write!(
+                    prompt,
+                    "\n\nYou are in Work mode on branch {branch_name}, targeting \
+                     {base_branch}. You have full write access to the worktree. Make \
+                     changes using bash and the patch tool.\n\n\
+                     When the work is complete, let the user know. They will initiate \
+                     the merge to {base_branch} when ready."
+                );
+            }
+            ModeContext::Standalone => {
+                prompt.push_str(
+                    "\n\nYou have full tool access. This directory is not a git project, \
+                     so there is no plan/approve workflow or branch isolation.",
+                );
+            }
+        }
     }
 
     // Add sub-agent suffix if applicable
@@ -477,7 +536,7 @@ mod tests {
     fn test_build_system_prompt_no_guidance() {
         let temp = TempDir::new().unwrap();
         // Use temp as home override to avoid $HOME skill contamination
-        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
+        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
 
         assert!(prompt.contains("helpful AI assistant"));
         assert!(!prompt.contains("<project_guidance>"));
@@ -489,7 +548,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("AGENTS.md"), "# Project Rules\nBe nice.").unwrap();
 
-        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
+        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
 
         assert!(prompt.contains("<project_guidance>"));
         assert!(prompt.contains("# Project Rules"));
@@ -500,7 +559,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_sub_agent() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt_with_home(temp.path(), true, Some(temp.path()));
+        let prompt = build_system_prompt_with_home(temp.path(), true, None, Some(temp.path()));
 
         assert!(prompt.contains("sub-agent"));
         assert!(prompt.contains("submit_result"));
@@ -742,7 +801,7 @@ mod tests {
             "Deploy the app. Use when deploying.",
         );
 
-        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
+        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("</available_skills>"));
@@ -754,7 +813,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_no_skills() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt_with_home(temp.path(), false, Some(temp.path()));
+        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
 
         assert!(!prompt.contains("<available_skills>"));
     }

@@ -651,6 +651,8 @@ pub struct ConvContext {
     pub context_window: usize,
     /// How this conversation handles context exhaustion
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
+    /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
+    pub mode_context: Option<crate::system_prompt::ModeContext>,
 }
 
 /// Default context window for unknown models (conservative)
@@ -670,6 +672,7 @@ impl ConvContext {
             is_sub_agent: false,
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
+            mode_context: None,
         }
     }
 
@@ -687,6 +690,7 @@ impl ConvContext {
             is_sub_agent: true,
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            mode_context: None,
         }
     }
 }
