@@ -66,14 +66,15 @@ async function readFile(path: string): Promise<string> {
 }
 
 // Detect file type from extension
-function getFileType(path: string): 'markdown' | 'code' | 'text' {
+function getFileType(path: string): 'markdown' | 'html' | 'code' | 'text' {
   const ext = path.split('.').pop()?.toLowerCase();
   if (!ext) return 'text';
 
   if (['md', 'markdown'].includes(ext)) return 'markdown';
+  if (['html', 'htm'].includes(ext)) return 'html';
   if ([
     'rs', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'java', 'cpp', 'c', 'h', 'hpp',
-    'css', 'html', 'htm', 'vue', 'svelte', 'php', 'rb', 'swift', 'kt', 'scala',
+    'css', 'vue', 'svelte', 'php', 'rb', 'swift', 'kt', 'scala',
     'sh', 'bash', 'zsh', 'json', 'yaml', 'yml', 'toml', 'xml', 'sql', 'graphql'
   ].includes(ext)) return 'code';
 
@@ -239,6 +240,7 @@ export function ProseReader({
   const [showNotesPanel, setShowNotesPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
+  const [htmlViewMode, setHtmlViewMode] = useState<'preview' | 'source'>('preview');
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -528,6 +530,15 @@ export function ProseReader({
           {fileName}
         </div>
         <div className="prose-reader-actions">
+          {fileType === 'html' && (
+            <button
+              className={`prose-reader-view-toggle ${htmlViewMode === 'preview' ? 'active' : ''}`}
+              onClick={() => setHtmlViewMode(htmlViewMode === 'preview' ? 'source' : 'preview')}
+              title={htmlViewMode === 'preview' ? 'Show source' : 'Show preview'}
+            >
+              {htmlViewMode === 'preview' ? '</>' : 'Preview'}
+            </button>
+          )}
           {notes.length > 0 && (
             <>
               <button
@@ -576,7 +587,16 @@ export function ProseReader({
           <div className="prose-reader-markdown">
             {renderMarkdown}
           </div>
-        ) : fileType === 'code' ? (
+        ) : fileType === 'html' && htmlViewMode === 'preview' ? (
+          <div className="prose-reader-html-preview">
+            <iframe
+              srcDoc={content || ''}
+              sandbox="allow-same-origin"
+              title="HTML Preview"
+              className="prose-reader-iframe"
+            />
+          </div>
+        ) : (fileType === 'html' && htmlViewMode === 'source') || fileType === 'code' ? (
           <div className="prose-reader-code">
             <SyntaxHighlighter
               style={oneDark}

@@ -126,6 +126,25 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     return () => { cancelled = true; };
   }, [rootPath, refreshKey]);
 
+  // Auto-refresh every ~10s while page is visible
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    function scheduleRefresh() {
+      const jitter = Math.random() * 4000 - 2000; // +/- 2s
+      timer = setTimeout(async () => {
+        if (document.visibilityState === 'visible') {
+          try {
+            const result = await listFiles(rootPath);
+            setItems(result);
+          } catch { /* silent -- next tick will retry */ }
+        }
+        scheduleRefresh();
+      }, 10000 + jitter);
+    }
+    scheduleRefresh();
+    return () => clearTimeout(timer);
+  }, [rootPath]);
+
   // Load children for expanded folder
   const loadChildren = useCallback(async (path: string) => {
     setLoadingPaths(prev => new Set(prev).add(path));
@@ -267,8 +286,23 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   // Filter out dotfiles/directories at root level by default
   const visibleItems = items.filter(item => !item.name.startsWith('.'));
 
+  // Compact display: last two path segments or ~/dir
+  const dirLabel = (() => {
+    const home = '/Users/';
+    if (rootPath.startsWith(home)) {
+      const rest = rootPath.slice(home.length);
+      const parts = rest.split('/').filter(Boolean);
+      if (parts.length <= 2) return '~/' + parts.join('/');
+      return '.../' + parts.slice(-2).join('/');
+    }
+    const parts = rootPath.split('/').filter(Boolean);
+    if (parts.length <= 2) return '/' + parts.join('/');
+    return '.../' + parts.slice(-2).join('/');
+  })();
+
   return (
     <div className="ft-root">
+      <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
       {visibleItems.map(item => renderItem(item, 0))}
     </div>
   );

@@ -3391,6 +3391,44 @@ html * {
   border-radius: 0 !important;
 }
 
+/* HTML preview */
+.prose-reader-html-preview {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.prose-reader-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #fff;
+  flex: 1;
+}
+
+.prose-reader-view-toggle {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 150ms, color 150ms;
+}
+
+.prose-reader-view-toggle:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.prose-reader-view-toggle.active {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
 /* Annotation Dialog (REQ-PF-007) */
 .prose-reader-annotation-overlay {
   position: fixed;
@@ -5513,6 +5551,18 @@ html * {
 /* FileTree styles */
 .ft-root {
   padding: 4px 0;
+}
+
+.ft-dir-label {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+  padding: 2px 12px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 2px;
 }
 
 .ft-item {
