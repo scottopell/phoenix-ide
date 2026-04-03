@@ -216,7 +216,7 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                   return (
                     <div key={msg.sequence_id} className="message skill">
                       <div className="skill-indicator">
-                        <span className="skill-label">/{skillContent.name || 'skill'}</span>
+                        <span className="skill-label" title={`Skill invocation: /${skillContent.name || 'skill'} -- loaded instructions from SKILL.md and delivered to the agent`}>/{skillContent.name || 'skill'}</span>
                         {triggerArgs && (
                           <span className="skill-trigger">{triggerArgs}</span>
                         )}
