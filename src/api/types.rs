@@ -286,6 +286,9 @@ pub struct CompleteTaskResponse {
 #[derive(Debug, Deserialize)]
 pub struct ConfirmCompleteRequest {
     pub commit_message: String,
+    /// If true, auto-stash dirty main checkout before merge and pop after.
+    #[serde(default)]
+    pub auto_stash: bool,
 }
 
 /// Response for confirm-complete endpoint (REQ-PROJ-009)
@@ -300,6 +303,23 @@ pub struct ConfirmCompleteResponse {
 pub struct ConflictErrorResponse {
     pub error: String,
     pub error_type: String,
+    /// Dirty files on the main checkout (only for `dirty_main_checkout`)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dirty_files: Vec<String>,
+    /// Whether auto-stash is safe (stash will pop cleanly after merge)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub can_auto_stash: bool,
+}
+
+impl ConflictErrorResponse {
+    pub fn new(error: impl Into<String>, error_type: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            error_type: error_type.into(),
+            dirty_files: vec![],
+            can_auto_stash: false,
+        }
+    }
 }
 
 /// Error response

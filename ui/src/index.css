@@ -6008,6 +6008,34 @@ html * {
   margin-top: 4px;
 }
 
+.work-actions-dirty-details {
+  margin-top: 6px;
+}
+
+.work-actions-dirty-files {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  max-height: 100px;
+  overflow-y: auto;
+  margin-bottom: 6px;
+}
+
+.work-actions-dirty-file {
+  padding: 1px 0;
+  color: var(--text-secondary);
+}
+
+.work-actions-stash {
+  font-size: 11px;
+  color: var(--accent-blue, #58a6ff);
+  border-color: color-mix(in srgb, var(--accent-blue, #58a6ff) 40%, transparent);
+}
+
+.work-actions-stash:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 10%, transparent);
+  border-color: var(--accent-blue, #58a6ff);
+}
+
 /* --- SSE Error Toast --- */
 
 /* --- Skill Invocation Messages --- */

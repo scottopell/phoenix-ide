@@ -240,6 +240,18 @@ export class ExpansionError extends Error {
   }
 }
 
+export class DirtyMainError extends Error {
+  readonly dirtyFiles: string[];
+  readonly canAutoStash: boolean;
+
+  constructor(message: string, dirtyFiles: string[], canAutoStash: boolean) {
+    super(message);
+    this.name = 'DirtyMainError';
+    this.dirtyFiles = dirtyFiles;
+    this.canAutoStash = canAutoStash;
+  }
+}
+
 export interface McpServerStatus {
   name: string;
   tool_count: number;
@@ -461,15 +473,21 @@ export const api = {
 
   async completeTask(convId: string): Promise<{ success: boolean; commit_message: string; task_not_done?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/complete-task`, { method: 'POST' });
-    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to start completion'); }
+    if (!resp.ok) {
+      const err = await resp.json();
+      if (err.error_type === 'dirty_main_checkout') {
+        throw new DirtyMainError(err.error, err.dirty_files || [], err.can_auto_stash || false);
+      }
+      throw new Error(err.error || 'Failed to start completion');
+    }
     return resp.json();
   },
 
-  async confirmComplete(convId: string, commitMessage: string): Promise<{ success: boolean; commit_sha: string }> {
+  async confirmComplete(convId: string, commitMessage: string, autoStash = false): Promise<{ success: boolean; commit_sha: string }> {
     const resp = await fetch(`/api/conversations/${convId}/confirm-complete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ commit_message: commitMessage }),
+      body: JSON.stringify({ commit_message: commitMessage, auto_stash: autoStash }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to confirm completion'); }
     return resp.json();

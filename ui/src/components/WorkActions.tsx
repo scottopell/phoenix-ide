@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { api } from '../api';
+import { api, DirtyMainError } from '../api';
 
 interface WorkActionsProps {
   conversationId: string;
@@ -15,7 +15,7 @@ interface WorkActionsProps {
 type ModalState =
   | { type: 'closed' }
   | { type: 'loading' }
-  | { type: 'confirm'; commitMessage: string; taskNotDone: boolean };
+  | { type: 'confirm'; commitMessage: string; taskNotDone: boolean; autoStash?: boolean | undefined };
 
 export function WorkActions({
   conversationId,
@@ -28,12 +28,14 @@ export function WorkActions({
   const [modalState, setModalState] = useState<ModalState>({ type: 'closed' });
   const [editedMessage, setEditedMessage] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [dirtyMainInfo, setDirtyMainInfo] = useState<{ files: string[]; canAutoStash: boolean } | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
 
   // Clear stale errors when the agent runs (phaseType leaves idle then returns)
   useEffect(() => {
     setError(null);
+    setDirtyMainInfo(null);
   }, [phaseType]);
 
   // Only render for idle Work conversations (phaseType is live from atom, not stale)
@@ -62,7 +64,13 @@ export function WorkActions({
               });
             } catch (err) {
               setModalState({ type: 'closed' });
-              setError(err instanceof Error ? err.message : 'Failed to prepare completion');
+              if (err instanceof DirtyMainError) {
+                setError(err.message);
+                setDirtyMainInfo({ files: err.dirtyFiles, canAutoStash: err.canAutoStash });
+              } else {
+                setDirtyMainInfo(null);
+                setError(err instanceof Error ? err.message : 'Failed to prepare completion');
+              }
             }
           }}
         >
@@ -90,7 +98,44 @@ export function WorkActions({
           {abandoning ? 'Abandoning...' : 'Abandon'}
         </button>
         {error && (
-          <div className="work-actions-error">{error}</div>
+          <div className="work-actions-error">
+            {error}
+            {dirtyMainInfo && (
+              <div className="work-actions-dirty-details">
+                <div className="work-actions-dirty-files">
+                  {dirtyMainInfo.files.map((f, i) => (
+                    <div key={i} className="work-actions-dirty-file">{f}</div>
+                  ))}
+                </div>
+                {dirtyMainInfo.canAutoStash && (
+                  <button
+                    className="work-actions-btn work-actions-stash"
+                    disabled={isLoading}
+                    onClick={async () => {
+                      setError(null);
+                      setDirtyMainInfo(null);
+                      setModalState({ type: 'loading' });
+                      try {
+                        const result = await api.completeTask(conversationId);
+                        setEditedMessage(result.commit_message);
+                        setModalState({
+                          type: 'confirm',
+                          commitMessage: result.commit_message,
+                          taskNotDone: !!result.task_not_done,
+                          autoStash: true,
+                        });
+                      } catch (err2) {
+                        setModalState({ type: 'closed' });
+                        setError(err2 instanceof Error ? err2.message : 'Failed to prepare completion');
+                      }
+                    }}
+                  >
+                    Stash and merge
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         )}
       </div>
 
@@ -104,7 +149,7 @@ export function WorkActions({
           onConfirm={async () => {
             setConfirming(true);
             try {
-              await api.confirmComplete(conversationId, editedMessage);
+              await api.confirmComplete(conversationId, editedMessage, modalState.autoStash);
               setModalState({ type: 'closed' });
               setError(null);
             } catch (err) {

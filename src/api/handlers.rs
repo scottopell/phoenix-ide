@@ -1180,10 +1180,10 @@ async fn respond_to_question(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
-        return Err(AppError::Conflict(ConflictErrorResponse {
-            error: "Conversation is not awaiting a user response".to_string(),
-            error_type: "wrong_state".to_string(),
-        }));
+        return Err(AppError::Conflict(ConflictErrorResponse::new(
+            "Conversation is not awaiting a user response",
+            "wrong_state",
+        )));
     }
 
     // 2. Dispatch response event to state machine
@@ -1269,19 +1269,30 @@ async fn complete_task(
         let wt_status = run_git(&worktree_dir, &["status", "--porcelain"])
             .map_err(AppError::Internal)?;
         if !wt_status.is_empty() {
-            return Err(AppError::Conflict(ConflictErrorResponse {
-                error: "Worktree has uncommitted changes. Ask the agent to commit or stash before completing.".to_string(),
-                error_type: "dirty_worktree".to_string(),
-            }));
+            return Err(AppError::Conflict(ConflictErrorResponse::new(
+                "Worktree has uncommitted changes. Ask the agent to commit or stash before completing.",
+                "dirty_worktree",
+            )));
         }
 
-        // 2b. Main checkout must be clean
+        // 2b. Main checkout must be clean (or auto-stashable)
         let main_status = run_git(&repo_root, &["status", "--porcelain"])
             .map_err(AppError::Internal)?;
         if !main_status.is_empty() {
+            let dirty_files: Vec<String> = main_status
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect();
+
+            // Check if auto-stash would be safe: create a trial stash commit,
+            // then simulate applying it after the merge via merge-tree.
+            let can_auto_stash = check_auto_stash_safe(&repo_root, &base_branch_clone);
+
             return Err(AppError::Conflict(ConflictErrorResponse {
-                error: "Main checkout has uncommitted changes. Commit or stash them before completing.".to_string(),
+                error: "Main checkout has uncommitted changes.".to_string(),
                 error_type: "dirty_main_checkout".to_string(),
+                dirty_files,
+                can_auto_stash,
             }));
         }
 
@@ -1299,12 +1310,10 @@ async fn complete_task(
         .unwrap_or_default();
         // merge-tree outputs conflict markers if there are conflicts
         if merge_tree_output.contains("<<<<<<") || merge_tree_output.contains("changed in both") {
-            return Err(AppError::Conflict(ConflictErrorResponse {
-                error: format!(
-                    "Merge conflicts detected between your branch and {base_branch_clone}. Rebase first."
-                ),
-                error_type: "merge_conflicts".to_string(),
-            }));
+            return Err(AppError::Conflict(ConflictErrorResponse::new(
+                format!("Merge conflicts detected between your branch and {base_branch_clone}. Rebase first."),
+                "merge_conflicts",
+            )));
         }
 
         // 2d. Get diff for commit message generation
@@ -1446,6 +1455,7 @@ async fn confirm_complete(
     let repo_root_str = repo_root.display().to_string();
 
     let commit_message = req.commit_message;
+    let auto_stash = req.auto_stash;
     let base_branch_for_msg = base_branch.clone();
 
     // 2. Execute merge sequence (blocking, under global mutex)
@@ -1454,16 +1464,30 @@ async fn confirm_complete(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // 2a. Repo root must be clean
+        // 2a. Repo root must be clean (or auto-stashed)
         let status = run_git(&repo_root, &["status", "--porcelain"]).map_err(AppError::Internal)?;
-        if !status.is_empty() {
-            return Err(AppError::Conflict(ConflictErrorResponse {
-                error:
-                    "Main checkout has uncommitted changes. Commit or stash them before completing."
-                        .to_string(),
-                error_type: "dirty_main_checkout".to_string(),
-            }));
-        }
+        let did_stash = if status.is_empty() {
+            false
+        } else if auto_stash {
+            run_git(
+                &repo_root,
+                &[
+                    "stash",
+                    "push",
+                    "--include-untracked",
+                    "-m",
+                    "phoenix: auto-stash before merge",
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("Auto-stash failed: {e}")))?;
+            tracing::info!("Auto-stashed dirty main checkout before merge");
+            true
+        } else {
+            return Err(AppError::Conflict(ConflictErrorResponse::new(
+                "Main checkout has uncommitted changes. Commit or stash them before completing.",
+                "dirty_main_checkout",
+            )));
+        };
 
         // 2b. Checkout base branch
         run_git(&repo_root, &["checkout", &base_branch])
@@ -1514,6 +1538,18 @@ async fn confirm_complete(
                 branch = %branch_name,
                 "Failed to delete branch (non-fatal)"
             );
+        }
+
+        // 2h. Pop auto-stash if we stashed earlier
+        if did_stash {
+            if let Err(e) = run_git(&repo_root, &["stash", "pop"]) {
+                // This shouldn't happen -- we checked for conflicts before offering
+                // the button. But if it does, the stash is preserved and the user
+                // can recover manually.
+                tracing::warn!(error = %e, "Auto-stash pop failed (stash preserved)");
+            } else {
+                tracing::info!("Auto-stash popped successfully after merge");
+            }
         }
 
         Ok(short_sha)
@@ -1682,12 +1718,10 @@ async fn abandon_task(
         let status =
             run_git(&repo_root_clone, &["status", "--porcelain"]).map_err(AppError::Internal)?;
         if !status.is_empty() {
-            return Err(AppError::Conflict(ConflictErrorResponse {
-                error:
-                    "Main checkout has uncommitted changes. Commit or stash them before abandoning."
-                        .to_string(),
-                error_type: "dirty_main_checkout".to_string(),
-            }));
+            return Err(AppError::Conflict(ConflictErrorResponse::new(
+                "Main checkout has uncommitted changes. Commit or stash them before abandoning.",
+                "dirty_main_checkout",
+            )));
         }
 
         // Checkout base branch
@@ -2590,6 +2624,43 @@ async fn enable_mcp_server(
     state.mcp_manager.enable_server(&name).await;
     tracing::info!(server = %name, "MCP server enabled");
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// Check if auto-stashing the dirty main checkout would be safe (pop won't conflict after merge).
+///
+/// Uses `git stash create` to make a trial stash commit without modifying the working tree,
+/// then checks if that commit's changes overlap with the merge branch's changes.
+fn check_auto_stash_safe(repo_root: &std::path::Path, base_branch: &str) -> bool {
+    // Create a trial stash commit (doesn't modify working tree or stash list)
+    let stash_sha = match run_git(repo_root, &["stash", "create"]) {
+        Ok(sha) if !sha.is_empty() => sha,
+        _ => return false, // Can't create stash -- not safe
+    };
+
+    // Get the files that would be modified by the merge
+    let merge_diff = run_git(
+        repo_root,
+        &["diff", "--name-only", &format!("{base_branch}...HEAD")],
+    )
+    .unwrap_or_default();
+    let merge_files: std::collections::HashSet<&str> = merge_diff.lines().collect();
+
+    // Get the files in the stash
+    let stash_diff =
+        run_git(repo_root, &["diff", "--name-only", &stash_sha, "HEAD"]).unwrap_or_default();
+    let stash_files: std::collections::HashSet<&str> = stash_diff.lines().collect();
+
+    // If no overlap, stash pop will succeed
+    let overlap: Vec<&&str> = merge_files.intersection(&stash_files).collect();
+    if overlap.is_empty() {
+        true
+    } else {
+        tracing::debug!(
+            overlap = ?overlap,
+            "Auto-stash not safe: dirty files overlap with merge"
+        );
+        false
+    }
 }
 
 // ============================================================
