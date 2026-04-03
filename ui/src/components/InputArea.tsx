@@ -526,17 +526,21 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
   const sendEnabled = (!agentWorking || isOffline) && hasContent && !expansionError;
 
-  // Rotating placeholder hints for discoverability
+  // Cycle placeholder hint each time the input clears (e.g., after send).
+  // Advances only when draft goes empty, not on a timer.
   const placeholderHints = ['', '/ for skills', '@ to include files', '? for shortcuts'];
   const [hintIndex, setHintIndex] = useState(0);
+  const prevDraftRef = useRef(draft);
 
   useEffect(() => {
-    const interval = setInterval(() => {
+    const wasFilled = prevDraftRef.current.trim().length > 0;
+    const nowEmpty = draft.trim().length === 0;
+    if (wasFilled && nowEmpty) {
       setHintIndex(i => (i + 1) % placeholderHints.length);
-    }, 4000);
-    return () => clearInterval(interval);
+    }
+    prevDraftRef.current = draft;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [draft]);
 
   const hint = placeholderHints[hintIndex];
   const placeholder = isOffline
