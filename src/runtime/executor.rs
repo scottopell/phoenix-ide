@@ -705,6 +705,15 @@ where
                                 })
                                 .collect();
 
+                            let usage = &response.usage;
+                            tracing::info!(
+                                input = usage.input_tokens,
+                                output = usage.output_tokens,
+                                cache_write = usage.cache_creation_tokens,
+                                cache_read = usage.cache_read_tokens,
+                                "LLM response token usage"
+                            );
+
                             LlmOutcome::Response {
                                 content: response.content,
                                 tool_calls,

@@ -488,15 +488,28 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
+    let tool_count = request.tools.len();
     let mut tools: Vec<AnthropicToolEntry> = request
         .tools
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
+            // Place cache_control on the last tool to cache the entire tools prefix.
+            // If tool search is appended after, it becomes the last entry and we skip
+            // caching here (tool search entry can't carry cache_control).
+            let is_last = i == tool_count - 1 && !has_deferred;
             AnthropicToolEntry::Function(AnthropicFunctionTool {
                 name: t.name.clone(),
                 description: t.description.clone(),
                 input_schema: t.input_schema.clone(),
                 defer_loading: if has_deferred { t.defer_loading } else { false },
+                cache_control: if is_last {
+                    Some(CacheControl {
+                        r#type: "ephemeral".to_string(),
+                    })
+                } else {
+                    None
+                },
             })
         })
         .collect();
@@ -512,6 +525,11 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
     AnthropicRequest {
         model: spec.api_name.clone(),
         max_tokens: request.max_tokens.unwrap_or(16_384),
+        // Top-level automatic caching: API auto-places breakpoint on last
+        // cacheable message block, walks back up to 20 blocks for prior writes.
+        cache_control: Some(CacheControl {
+            r#type: "ephemeral".to_string(),
+        }),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
@@ -836,6 +854,9 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
 struct AnthropicRequest {
     model: String,
     max_tokens: u32,
+    /// Top-level automatic caching: API places breakpoint on last cacheable block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
     system: Vec<AnthropicSystemBlock>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -957,6 +978,8 @@ struct AnthropicFunctionTool {
     input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     defer_loading: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
