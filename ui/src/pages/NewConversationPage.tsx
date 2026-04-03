@@ -264,21 +264,17 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           {/* Actions row: settings chips + send */}
           <div className="new-conv-actions">
             <div className="new-conv-chips">
-              <span className="new-conv-chip" title={cwd}>
+              <button className="new-conv-chip" title={cwd} onClick={() => setShowSettings(true)}>
                 <span className={`chip-status ${dirStatusClass}`}>{dirStatusIcon}</span>
                 {cwdDisplay}
-              </span>
-              <span className="new-conv-chip">{modelDisplay}</span>
-              <button className="new-conv-chip new-conv-chip--settings" onClick={() => setShowSettings(!showSettings)}>
-                Settings {showSettings ? '▴' : '▾'}
+              </button>
+              <button className="new-conv-chip" onClick={() => setShowSettings(true)}>
+                {modelDisplay}
               </button>
             </div>
             <div className="new-conv-send-group">
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={creating}>📎</button>
               {voiceSupported && <VoiceRecorder onSpeech={handleVoiceFinal} onInterim={handleVoiceInterim} disabled={creating} />}
-              {desktopMode && (
-                <button className="new-conv-send-bg" onClick={() => handleSend(true)} disabled={!canSend} title="Create conversation and stay on this page">Send & Stay</button>
-              )}
               <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
             </div>
           </div>

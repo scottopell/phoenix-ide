@@ -3852,23 +3852,20 @@ html * {
   font-size: 11px;
   color: var(--text-muted);
   background: var(--bg-tertiary);
+  border: 1px solid transparent;
   border-radius: 3px;
   font-family: var(--font-mono, ui-monospace, monospace);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 180px;
-  border: none;
-}
-
-.new-conv-chip--settings {
   cursor: pointer;
-  font-family: inherit;
-  transition: color 0.15s;
+  transition: color 150ms, border-color 150ms;
 }
 
-.new-conv-chip--settings:hover {
+.new-conv-chip:hover {
   color: var(--text-primary);
+  border-color: var(--border-color);
 }
 
 .chip-status {
