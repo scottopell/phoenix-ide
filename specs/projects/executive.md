@@ -1,4 +1,4 @@
-# Projects — Executive Summary
+# Projects -- Executive Summary
 
 ## Requirements Summary
 
@@ -8,12 +8,12 @@ with no setup or risk. Users explore, ask questions, and plan freely. When an ag
 ready to make real changes, it proposes a task via `propose_plan`. The task file
 (written to `tasks/` on main) is presented for human review using the prose reader.
 Users can annotate the plan, request revisions, or approve. On approval, a dedicated
-branch is created and the conversation enters Work mode. When work is complete, the user initiates a Complete action which squash merges the
-task branch into the base branch with an LLM-generated commit message; alternatively,
-the user can Abandon the task, which destructively discards the worktree and branch.
-Both actions transition the conversation to Terminal state. Task files on main give
-every conversation project-wide awareness of what is in-progress, planned, or done
-without any special API.
+branch is created and the conversation enters Work mode. When work is complete, the user
+initiates a Complete action which squash merges the task branch into the base branch with
+an LLM-generated commit message; alternatively, the user can Abandon the task, which
+destructively discards the worktree and branch. Both actions transition the conversation
+to Terminal state. Task files on main give every conversation project-wide awareness of
+what is in-progress, planned, or done without any special API.
 
 ## Technical Summary
 
@@ -36,36 +36,43 @@ commits-behind indicator shows base branch advancement in the StateBar.
 
 | Requirement | Status | Notes |
 |-------------|--------|-----------|
-| **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 0601 (M1) |
-| **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 0601 (M1) |
-| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ❌ Not Started | - |
-| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ❌ Not Started | - |
-| **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ❌ Not Started | - |
-| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ❌ Not Started | - |
-| **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ❌ Not Started | - |
-| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ❌ Not Started | - |
-| **REQ-PROJ-009:** Complete a Task (Squash Merge) | ❌ Not Started | User-initiated, squash merge to base_branch, Terminal state |
-| **REQ-PROJ-010:** Abandon a Task (Destructive Discard) | ❌ Not Started | Delete worktree+branch, task to wont-do, Terminal state |
-| **REQ-PROJ-011:** Passive Commits-Behind Indicator | ❌ Not Started | Poll-based, badge in StateBar, no rebase automation |
-| **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ❌ Not Started | Pure data carrier, intercepted like submit_result |
-| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 0601 (M1) |
-| **REQ-PROJ-014:** Project UI | ✅ Complete | Task 0601 (M1). Project tabs, mode badges |
+| **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 08601 (M1) |
+| **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 08601 (M1) |
+| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_plan tool |
+| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Task 08602 (M2). TaskApprovalReader + prose feedback |
+| **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
+| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | Task 08602 (M2). taskmd-core integration |
+| **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
+| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | 🔄 Partial | Sub-agents work but missing: mode parameter (explore/work), model override, one-writer constraint, MCP access |
+| **REQ-PROJ-009:** Complete a Task (Squash Merge) | ✅ Complete | Task 08604 (M4). Auto-stash support added |
+| **REQ-PROJ-010:** Abandon a Task (Destructive Discard) | ✅ Complete | Task 08604 (M4). Worktree+branch deleted, task wont-do |
+| **REQ-PROJ-011:** Passive Commits-Behind Indicator | ✅ Complete | Task 08604 (M4). StateBar badge |
+| **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
+| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
+| **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
-| **REQ-PROJ-016:** Standalone Conversation Mode | ✅ Complete | Task 0601 (M1). Non-git dirs get full tools, no project |
-| **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ❌ Not Started | ConvMode::Work stores base_branch from approval time |
+| **REQ-PROJ-016:** Standalone Conversation Mode | ✅ Complete | Task 08601 (M1). Non-git dirs get full tools, no project |
+| **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Task 08603 (M3). ConvMode::Work stores base_branch |
 
-**Progress:** 5 of 17 complete
+**Progress:** 15 of 17 complete (1 descoped, 1 partial)
 
-## Known Gaps
+## Remaining Work
 
-- **Sidebar mode badge lag:** When conv_mode changes (e.g., Explore to Work on
-  approve), the sidebar badge updates on the next 5-second poll, not instantly.
-  Acceptable for M2. Real-time push from conversation atom to sidebar is a future
-  optimization.
+REQ-PROJ-008 (Work Sub-Agents) is the only incomplete requirement. Needed:
+
+1. **Agent mode parameter** on spawn_agents: `mode: "explore" | "work"`. Explore gets
+   read-only tools + cheaper model. Work gets full tools + parent model.
+2. **One-writer constraint**: Only one Work sub-agent per parent at a time. Multiple
+   Explore sub-agents allowed in parallel.
+3. **MCP access**: Explore sub-agents get search-oriented MCP tools (deferred). Work
+   sub-agents get the full MCP set.
+4. **Model selection**: Explore defaults to haiku. Work inherits parent. Optional
+   override per task.
+5. **Max turns limit**: Per-agent turn cap (replaces or supplements 5-minute timeout).
 
 ## Dependencies
 
-- `specs/bedrock/` — REQ-BED-027, REQ-BED-028, REQ-BED-029 (mode state, approval states)
-- `specs/bash/` — REQ-BASH-008, REQ-BASH-009 (Explore mode read-only enforcement)
-- `specs/patch/` — REQ-PATCH-009 (patch disabled in Explore mode)
-- `specs/prose-feedback/` — REQ-PF-015, REQ-PF-016 (programmatic task approval trigger)
+- `specs/bedrock/` -- REQ-BED-027, REQ-BED-028, REQ-BED-029 (mode state, approval states)
+- `specs/bash/` -- REQ-BASH-008, REQ-BASH-009 (Explore mode read-only enforcement)
+- `specs/patch/` -- REQ-PATCH-009 (patch disabled in Explore mode)
+- `specs/prose-feedback/` -- REQ-PF-015, REQ-PF-016 (programmatic task approval trigger)
