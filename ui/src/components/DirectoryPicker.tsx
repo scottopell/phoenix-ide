@@ -13,7 +13,7 @@ interface DirectoryPickerProps {
   value: string;
   onChange: (path: string) => void;
   onStatusChange?: (status: DirStatus) => void;
-  onGitStatusChange?: (isGit: boolean) => void;
+  onGitStatusChange?: ((isGit: boolean) => void) | undefined;
   onDismiss?: () => void;
   placeholder?: string;
   className?: string;
