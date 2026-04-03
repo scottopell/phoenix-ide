@@ -18,10 +18,23 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::net::TcpListener;
 
 /// Flag indicating SIGHUP was received (reload requested)
 static HOT_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Tracks process start time for uptime reporting on shutdown
+static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Call at startup to record the process start time.
+pub fn record_start_time() {
+    START_TIME.get_or_init(Instant::now);
+}
+
+fn uptime_secs() -> u64 {
+    START_TIME.get().map_or(0, |t| t.elapsed().as_secs())
+}
 
 /// Tracks whether we're running under systemd socket activation
 static SOCKET_ACTIVATED: AtomicBool = AtomicBool::new(false);
@@ -80,19 +93,17 @@ pub async fn shutdown_signal() {
         _ = sighup.recv() => {
             HOT_RESTART_REQUESTED.store(true, Ordering::SeqCst);
             if is_socket_activated() {
-                // Socket-activated: exit immediately, systemd owns the socket
-                // and will pass it to the new process. This enables zero-downtime.
-                tracing::info!("Received SIGHUP (socket-activated) - exiting immediately");
+                tracing::info!(uptime_secs = uptime_secs(), "Received SIGHUP (socket-activated) - exiting immediately");
                 std::process::exit(0);
             } else {
-                tracing::info!("Received SIGHUP (non-socket-activated) - graceful shutdown");
+                tracing::info!(uptime_secs = uptime_secs(), "Received SIGHUP (non-socket-activated) - graceful shutdown");
             }
         }
         _ = sigterm.recv() => {
-            tracing::info!("Received SIGTERM - shutting down");
+            tracing::info!(uptime_secs = uptime_secs(), signal = "SIGTERM", "Shutting down (likely deploy or manual stop)");
         }
         _ = sigint.recv() => {
-            tracing::info!("Received SIGINT - shutting down");
+            tracing::info!(uptime_secs = uptime_secs(), signal = "SIGINT", "Shutting down (interactive interrupt)");
         }
     }
 }

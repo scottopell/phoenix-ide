@@ -48,6 +48,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    hot_restart::record_start_time();
+
+    // Log startup context: binary path, version, and whether this looks like a deploy
+    let exe_path =
+        std::env::current_exe().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string());
+    let is_prod = std::env::var("PHOENIX_DB_PATH")
+        .ok()
+        .is_some_and(|p| p.contains("prod"));
+    tracing::info!(
+        exe = %exe_path,
+        pid = std::process::id(),
+        mode = if is_prod { "production" } else { "development" },
+        "Phoenix IDE starting"
+    );
+
     // Configuration
     let db_path = std::env::var("PHOENIX_DB_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
