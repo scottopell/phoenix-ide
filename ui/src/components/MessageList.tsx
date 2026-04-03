@@ -10,6 +10,7 @@ import {
   formatMessageTime,
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
+import { MessageContextMenu } from './MessageContextMenu';
 
 interface MessageListProps {
   messages: Message[];
@@ -264,6 +265,7 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
           ↓ New messages
         </button>
       )}
+      <MessageContextMenu messages={messages} />
     </main>
   );
 }
