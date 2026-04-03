@@ -159,11 +159,13 @@ export function NewConversationSheet({ isOpen, onClose }: NewConversationSheetPr
         className={`bottom-sheet ${isAnimating ? 'animating' : ''}`}
         style={{ transform: `translateY(${translateY}px)` }}
         onClick={(e) => e.stopPropagation()}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
       >
-        <div className="bottom-sheet-handle">
+        <div
+          className="bottom-sheet-handle"
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+        >
           <div className="bottom-sheet-handle-bar" />
         </div>
         <div className="bottom-sheet-content">
