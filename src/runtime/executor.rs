@@ -680,11 +680,18 @@ where
                     // Build system prompt with AGENTS.md content
                     let system_prompt = build_system_prompt(&working_dir, is_sub_agent);
 
-                    // Build request
+                    // Build request — normalize messages against current tool set
+                    // to remove tool_use/tool_result blocks for tools no longer
+                    // available (e.g., propose_plan after Explore→Work transition).
+                    let tools = tool_executor.definitions().await;
+                    let tool_names: std::collections::HashSet<&str> =
+                        tools.iter().map(|t| t.name.as_str()).collect();
+                    let messages = strip_unavailable_tool_blocks(messages, &tool_names);
+
                     let request = LlmRequest {
                         system: vec![SystemContent::cached(&system_prompt)],
                         messages,
-                        tools: tool_executor.definitions().await,
+                        tools,
                         max_tokens: Some(16_384),
                     };
 
@@ -1481,6 +1488,70 @@ struct TaskApprovalResult {
     worktree_path: String,
     /// The branch that was checked out when the task was approved (merge target)
     base_branch: String,
+}
+
+/// Remove `tool_use` and `tool_result` blocks that reference tools not in the current set.
+///
+/// Handles mode transitions (e.g., Explore -> Work) where the tool set changes
+/// but the conversation history contains `tool_use` blocks for the old set.
+/// Anthropic's API rejects requests where `tool_use` blocks reference unavailable tools.
+///
+/// The DB history is not modified -- this operates on the in-memory message Vec only.
+fn strip_unavailable_tool_blocks(
+    messages: Vec<LlmMessage>,
+    available_tools: &std::collections::HashSet<&str>,
+) -> Vec<LlmMessage> {
+    use crate::llm::ContentBlock;
+
+    // First pass: collect IDs of tool_use blocks we're going to strip
+    let mut stripped_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in &messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
+                if !available_tools.contains(name.as_str()) {
+                    stripped_ids.insert(id.clone());
+                }
+            }
+        }
+    }
+
+    if stripped_ids.is_empty() {
+        return messages;
+    }
+
+    tracing::debug!(
+        count = stripped_ids.len(),
+        "Stripping tool_use/tool_result blocks for unavailable tools"
+    );
+
+    // Second pass: filter out the tool_use blocks and their matching tool_result blocks
+    messages
+        .into_iter()
+        .map(|msg| {
+            let filtered: Vec<ContentBlock> = msg
+                .content
+                .into_iter()
+                .filter(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => !stripped_ids.contains(id),
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        !stripped_ids.contains(tool_use_id)
+                    }
+                    // Also strip tool_search results that reference stripped tools
+                    ContentBlock::ToolSearchToolResult { content, .. } => !content
+                        .tool_references
+                        .iter()
+                        .any(|r| !available_tools.contains(r.tool_name.as_str())),
+                    _ => true,
+                })
+                .collect();
+            LlmMessage {
+                role: msg.role,
+                content: filtered,
+            }
+        })
+        // Drop messages that became empty after filtering
+        .filter(|msg| !msg.content.is_empty())
+        .collect()
 }
 
 /// Get the next task ID using taskmd-core library.
