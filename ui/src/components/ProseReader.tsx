@@ -240,7 +240,7 @@ export function ProseReader({
   const [showNotesPanel, setShowNotesPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
-  const [htmlViewMode, setHtmlViewMode] = useState<'preview' | 'source'>('preview');
+  const [htmlViewMode, setHtmlViewMode] = useState<'preview' | 'source'>('source');
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -531,13 +531,24 @@ export function ProseReader({
         </div>
         <div className="prose-reader-actions">
           {fileType === 'html' && (
-            <button
-              className={`prose-reader-view-toggle ${htmlViewMode === 'preview' ? 'active' : ''}`}
-              onClick={() => setHtmlViewMode(htmlViewMode === 'preview' ? 'source' : 'preview')}
-              title={htmlViewMode === 'preview' ? 'Show source' : 'Show preview'}
-            >
-              {htmlViewMode === 'preview' ? '</>' : 'Preview'}
-            </button>
+            <>
+              <button
+                className={`prose-reader-view-toggle ${htmlViewMode === 'preview' ? 'active' : ''}`}
+                onClick={() => setHtmlViewMode(htmlViewMode === 'preview' ? 'source' : 'preview')}
+                title={htmlViewMode === 'preview' ? 'Show source' : 'Show sandboxed preview (no scripts)'}
+              >
+                {htmlViewMode === 'preview' ? '</>' : 'Preview'}
+              </button>
+              <a
+                className="prose-reader-view-toggle"
+                href={`/api/files/raw?path=${encodeURIComponent(absolutePath)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open in new tab (full render with scripts)"
+              >
+                Open in browser
+              </a>
+            </>
           )}
           {notes.length > 0 && (
             <>

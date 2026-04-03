@@ -110,6 +110,7 @@ pub fn create_router(state: AppState) -> Router {
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
         .route("/api/files/read", get(read_file))
+        .route("/api/files/raw", get(serve_file_raw))
         .route(
             "/api/conversations/:id/files/search",
             get(search_conversation_files),
@@ -2211,6 +2212,40 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
         content: text,
         encoding: "utf-8".to_string(),
     }))
+}
+
+/// Serve a file with its native Content-Type (for "Open in browser" links).
+/// Only allows files up to 10MB, same as `read_file`.
+async fn serve_file_raw(
+    Query(query): Query<PathQuery>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+
+    let path = PathBuf::from(&query.path);
+
+    if !path.exists() {
+        return Err(AppError::NotFound("File does not exist".to_string()));
+    }
+    if path.is_dir() {
+        return Err(AppError::BadRequest("Path is a directory".to_string()));
+    }
+
+    let metadata = fs::metadata(&path)
+        .map_err(|e| AppError::BadRequest(format!("Cannot read file metadata: {e}")))?;
+    if metadata.len() > 10 * 1024 * 1024 {
+        return Err(AppError::BadRequest(
+            "File too large (max 10MB)".to_string(),
+        ));
+    }
+
+    let content =
+        fs::read(&path).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
+
+    let content_type = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .to_string();
+
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], content).into_response())
 }
 
 // ============================================================
