@@ -9,7 +9,7 @@ pub mod browser;
 mod keyword_search;
 pub mod mcp;
 pub mod patch;
-mod propose_plan;
+mod propose_task;
 mod read_file;
 mod read_image;
 mod search;
@@ -26,7 +26,7 @@ pub use browser::{
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
-pub use propose_plan::ProposePlanTool;
+pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
 pub use search::SearchTool;
@@ -201,7 +201,7 @@ impl ToolRegistry {
             Arc::new(SearchTool),
             Arc::new(KeywordSearchTool),
             Arc::new(ReadImageTool),
-            Arc::new(ProposePlanTool),
+            Arc::new(ProposeTaskTool),
             Arc::new(AskUserQuestionTool),
             Arc::new(SkillTool),
             Arc::new(SpawnAgentsTool),
@@ -222,10 +222,10 @@ impl ToolRegistry {
 
     /// Create tool registry for Explore mode WITH sandbox.
     /// REQ-PROJ-013: All tools available, bash sandboxed read-only.
-    /// Adds `propose_plan` (Explore-only gateway to Work mode).
+    /// Adds `propose_task` (Explore-only gateway to Work mode).
     pub fn explore_with_sandbox() -> Self {
         let mut registry = Self::new_with_options(false);
-        registry.tools.push(Arc::new(ProposePlanTool));
+        registry.tools.push(Arc::new(ProposeTaskTool));
         registry
     }
 
@@ -300,7 +300,7 @@ impl ToolRegistry {
     pub fn blocked_tool_error(tool_name: &str) -> ToolOutput {
         ToolOutput::error(format!(
             "The '{tool_name}' tool is not available in Explore mode. \
-             Use propose_plan to propose work that requires write access."
+             Use propose_task to propose work that requires write access."
         ))
     }
 

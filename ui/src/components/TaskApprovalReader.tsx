@@ -1,7 +1,7 @@
 /**
  * TaskApprovalReader Component
  *
- * Renders a task plan for approval. The user MUST choose one of:
+ * Renders a task for approval. The user MUST choose one of:
  * Approve, Discard, or Send Feedback. The overlay cannot be dismissed
  * by Escape, back button, or clicking outside.
  *
@@ -284,7 +284,7 @@ export function TaskApprovalReader({
     if (notes.length === 0) return;
 
     const formatted =
-      `Review notes for \`task plan\`:\n\n` +
+      `Review notes for \`task\`:\n\n` +
       notes
         .map((n) => `> Line ${n.lineNumber}: \`${n.lineContent}\`\n${n.note}`)
         .join('\n\n');
@@ -549,7 +549,7 @@ export function TaskApprovalReader({
             onClick={(e) => e.stopPropagation()}
           >
             <p>
-              Discard this task plan? The agent will be informed the plan was
+              Discard this task? The agent will be informed the task was
               rejected.
             </p>
             <div className="prose-reader-confirm-actions">

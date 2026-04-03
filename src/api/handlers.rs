@@ -1062,7 +1062,7 @@ async fn approve_task(
         ));
     }
 
-    // 2. Non-project conversations cannot approve tasks (propose_plan is project-only)
+    // 2. Non-project conversations cannot approve tasks (propose_task is project-only)
     if conv.project_id.is_none() {
         return Err(AppError::BadRequest(
             "Task approval requires a project-scoped conversation".to_string(),

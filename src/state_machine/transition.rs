@@ -155,19 +155,19 @@ pub fn transition(
                 usage: usage_data,
             },
         ) => {
-            // REQ-BED-028: Intercept propose_plan BEFORE context exhaustion check.
-            // If the LLM proposes a plan at >90% context, we still want to surface it
+            // REQ-BED-028: Intercept propose_task BEFORE context exhaustion check.
+            // If the LLM proposes a task at >90% context, we still want to surface it
             // for approval rather than diverting to the continuation flow.
-            let propose_plan_tool = tool_calls
+            let propose_task_tool = tool_calls
                 .iter()
-                .find(|t| matches!(t.input, ToolInput::ProposePlan(_)));
-            if let Some(tool) = propose_plan_tool {
+                .find(|t| matches!(t.input, ToolInput::ProposeTask(_)));
+            if let Some(tool) = propose_task_tool {
                 if tool_calls.len() > 1 {
                     return Err(TransitionError::InvalidTransition(
-                        "propose_plan must be the only tool in response".to_string(),
+                        "propose_task must be the only tool in response".to_string(),
                     ));
                 }
-                if let ToolInput::ProposePlan(ref input) = tool.input {
+                if let ToolInput::ProposeTask(ref input) = tool.input {
                     let tool_result = ToolResult::success(
                         tool.id.clone(),
                         "Plan submitted for review".to_string(),
@@ -177,7 +177,7 @@ pub fn transition(
                         AssistantMessage::new(content, Some(usage_data), display_data);
                     let checkpoint =
                         CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("propose_plan produces exactly one tool_use and one result");
+                            .expect("propose_task produces exactly one tool_use and one result");
 
                     return Ok(TransitionResult::new(ConvState::AwaitingTaskApproval {
                         title: input.title.clone(),
@@ -195,7 +195,7 @@ pub fn transition(
                         }),
                     )));
                 }
-                unreachable!("propose_plan_tool matched but input was not ProposePlan");
+                unreachable!("propose_task_tool matched but input was not ProposeTask");
             }
 
             // REQ-AUQ-001: Intercept ask_user_question
@@ -236,7 +236,7 @@ pub fn transition(
             }
 
             // REQ-BED-019: Check context threshold BEFORE tool execution
-            // (but after propose_plan interception above)
+            // (but after propose_task interception above)
             if should_trigger_continuation(&usage_data, context.context_window) {
                 return Ok(handle_context_exhaustion(
                     context, content, tool_calls, usage_data,
@@ -1005,7 +1005,7 @@ pub fn transition(
                 .with_effect(Effect::PersistMessage {
                     content: crate::db::MessageContent::system(
                         "Plan not approved. The user provided feedback below. \
-                         You must call propose_plan again with a revised plan \
+                         You must call propose_task again with a revised plan \
                          that addresses their feedback.",
                     ),
                     display_data: None,

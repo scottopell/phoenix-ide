@@ -684,7 +684,7 @@ where
 
                     // Build request — normalize messages against current tool set
                     // to remove tool_use/tool_result blocks for tools no longer
-                    // available (e.g., propose_plan after Explore→Work transition).
+                    // available (e.g., propose_task after Explore→Work transition).
                     let tools = tool_executor.definitions().await;
                     let tool_names: std::collections::HashSet<&str> =
                         tools.iter().map(|t| t.name.as_str()).collect();

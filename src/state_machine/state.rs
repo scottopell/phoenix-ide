@@ -75,9 +75,9 @@ pub struct SubmitErrorInput {
     pub error: String,
 }
 
-/// Input for the `propose_plan` tool (task approval workflow)
+/// Input for the `propose_task` tool (task approval workflow)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProposePlanInput {
+pub struct ProposeTaskInput {
     pub title: String,
     pub priority: String,
     pub plan: String,
@@ -139,7 +139,7 @@ pub enum ToolInput {
     SpawnAgents(SpawnAgentsInput),
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
-    ProposePlan(ProposePlanInput),
+    ProposeTask(ProposeTaskInput),
     AskUserQuestion(AskUserQuestionInput),
     /// Fallback for unknown tools or parsing failures
     Unknown {
@@ -160,7 +160,7 @@ impl ToolInput {
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
-            ToolInput::ProposePlan(_) => "propose_plan",
+            ToolInput::ProposeTask(_) => "propose_task",
             ToolInput::AskUserQuestion(_) => "ask_user_question",
             ToolInput::Unknown { name, .. } => name,
         }
@@ -182,7 +182,7 @@ impl ToolInput {
             ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
-            ToolInput::ProposePlan(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::ProposeTask(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::AskUserQuestion(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } => input.clone(),
         }
@@ -247,12 +247,12 @@ impl ToolInput {
                 },
                 ToolInput::SubmitError,
             ),
-            "propose_plan" => serde_json::from_value(value.clone()).map_or_else(
+            "propose_task" => serde_json::from_value(value.clone()).map_or_else(
                 |_| ToolInput::Unknown {
                     name: name.to_string(),
                     input: value,
                 },
-                ToolInput::ProposePlan,
+                ToolInput::ProposeTask,
             ),
             "ask_user_question" => serde_json::from_value(value.clone()).map_or_else(
                 |_| ToolInput::Unknown {
