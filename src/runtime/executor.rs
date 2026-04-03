@@ -1524,24 +1524,47 @@ fn strip_unavailable_tool_blocks(
         "Stripping tool_use/tool_result blocks for unavailable tools"
     );
 
-    // Second pass: filter out the tool_use blocks and their matching tool_result blocks
+    // Second pass: filter out stripped tool_use/tool_result blocks.
+    // For ToolSearchToolResult, remove individual bad references but keep the block
+    // (it's paired with a ServerToolUse that we must not orphan).
     messages
         .into_iter()
         .map(|msg| {
             let filtered: Vec<ContentBlock> = msg
                 .content
                 .into_iter()
-                .filter(|block| match block {
-                    ContentBlock::ToolUse { id, .. } => !stripped_ids.contains(id),
-                    ContentBlock::ToolResult { tool_use_id, .. } => {
-                        !stripped_ids.contains(tool_use_id)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { ref id, .. } => {
+                        if stripped_ids.contains(id) {
+                            None
+                        } else {
+                            Some(block)
+                        }
                     }
-                    // Also strip tool_search results that reference stripped tools
-                    ContentBlock::ToolSearchToolResult { content, .. } => !content
-                        .tool_references
-                        .iter()
-                        .any(|r| !available_tools.contains(r.tool_name.as_str())),
-                    _ => true,
+                    ContentBlock::ToolResult {
+                        ref tool_use_id, ..
+                    } => {
+                        if stripped_ids.contains(tool_use_id) {
+                            None
+                        } else {
+                            Some(block)
+                        }
+                    }
+                    // Filter individual unavailable references but keep the block
+                    ContentBlock::ToolSearchToolResult {
+                        tool_use_id,
+                        mut content,
+                    } => {
+                        content
+                            .tool_references
+                            .retain(|r| available_tools.contains(r.tool_name.as_str()));
+                        Some(ContentBlock::ToolSearchToolResult {
+                            tool_use_id,
+                            content,
+                        })
+                    }
+                    // ServerToolUse blocks are server-side — never strip
+                    _ => Some(block),
                 })
                 .collect();
             LlmMessage {
