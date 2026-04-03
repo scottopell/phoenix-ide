@@ -553,6 +553,13 @@ export function ConversationPage() {
       )}
       {convStateForChildren.type === 'terminal' && (
         <div className="terminal-banner">
+          {(() => {
+            const lastSystemMsg = [...atom.messages].reverse().find(m => m.message_type === 'system');
+            const systemText = lastSystemMsg && 'text' in (lastSystemMsg.content as Record<string, unknown>)
+              ? (lastSystemMsg.content as { text: string }).text
+              : null;
+            return systemText ? <p className="terminal-banner-context">{systemText}</p> : null;
+          })()}
           <button
             className="btn-primary"
             onClick={() => navigate('/new')}

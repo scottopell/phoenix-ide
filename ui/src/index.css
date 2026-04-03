@@ -2250,8 +2250,17 @@ pre:hover .copy-btn {
 .terminal-banner {
   flex: 0 0 auto;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
   padding: 16px;
+}
+
+.terminal-banner-context {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
 }
 
 /* Directory Picker */
