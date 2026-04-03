@@ -3996,6 +3996,14 @@ html * {
   flex-shrink: 0;
 }
 
+/* Mode preview subtitle below actions */
+.new-conv-mode-preview {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  padding-left: 2px;
+}
+
 /* Expanded settings inside card */
 .new-conv-settings-expanded {
   margin-top: 16px;

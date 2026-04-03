@@ -1990,6 +1990,7 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
         return Json(ValidateCwdResponse {
             valid: false,
             error: Some("Directory does not exist".to_string()),
+            is_git: false,
         });
     }
 
@@ -1997,12 +1998,28 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
         return Json(ValidateCwdResponse {
             valid: false,
             error: Some("Path is not a directory".to_string()),
+            is_git: false,
         });
     }
+
+    // Check if this directory is inside a git repository by walking up to find .git
+    let is_git = {
+        let mut check = path.as_path();
+        loop {
+            if check.join(".git").exists() {
+                break true;
+            }
+            match check.parent() {
+                Some(parent) => check = parent,
+                None => break false,
+            }
+        }
+    };
 
     Json(ValidateCwdResponse {
         valid: true,
         error: None,
+        is_git,
     })
 }
 

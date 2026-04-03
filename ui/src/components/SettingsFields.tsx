@@ -11,7 +11,7 @@ export const DIR_STATUS_CONFIG = {
 } as const;
 
 export function SettingsFields({
-  cwd, setCwd, dirStatus, onDirStatusChange,
+  cwd, setCwd, dirStatus, onDirStatusChange, onGitStatusChange,
   selectedModel, setSelectedModel, models,
   showAllModels, setShowAllModels
 }: {
@@ -19,6 +19,7 @@ export function SettingsFields({
   setCwd: (v: string) => void;
   dirStatus: DirStatus;
   onDirStatusChange: (status: DirStatus) => void;
+  onGitStatusChange?: (isGit: boolean) => void;
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
   models: ModelsResponse | null;
@@ -58,6 +59,7 @@ export function SettingsFields({
           value={cwd}
           onChange={setCwd}
           onStatusChange={onDirStatusChange}
+          onGitStatusChange={onGitStatusChange}
           className="settings-input"
         />
       </label>

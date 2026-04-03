@@ -49,6 +49,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [creating, setCreating] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAllModels, setShowAllModels] = useState(false);
+  const [isGitDir, setIsGitDir] = useState<boolean | null>(null);
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
 
@@ -199,7 +200,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const buttonText = creating ? (dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
   const textareaValue = interimText ? (draft.trim() ? draft.trimEnd() + ' ' + interimText : interimText) : draft;
 
-  const settingsProps = { cwd, setCwd, dirStatus, onDirStatusChange: setDirStatus, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
+  const settingsProps = { cwd, setCwd, dirStatus, onDirStatusChange: setDirStatus, onGitStatusChange: setIsGitDir, selectedModel, setSelectedModel, models, showAllModels, setShowAllModels };
 
   return (
     <div className="new-conv-page">
@@ -278,6 +279,15 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               <button className="new-conv-send" onClick={() => handleSend(false)} disabled={!canSend}>{buttonText}</button>
             </div>
           </div>
+
+          {/* Mode preview subtitle */}
+          {dirStatus === 'exists' && isGitDir !== null && (
+            <div className="new-conv-mode-preview">
+              {isGitDir
+                ? 'Git project \u2014 starts in Explore mode (read-only)'
+                : 'Direct mode \u2014 full tool access'}
+            </div>
+          )}
 
           {/* Expanded settings */}
           {showSettings && (

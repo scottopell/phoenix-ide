@@ -90,6 +90,8 @@ pub struct ValidateCwdResponse {
     pub valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether the directory is inside a git repository.
+    pub is_git: bool,
 }
 
 /// Response for directory listing

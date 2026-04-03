@@ -337,7 +337,7 @@ export const api = {
     return (await resp.json()).system_prompt;
   },
 
-  async validateCwd(path: string): Promise<{ valid: boolean; error?: string }> {
+  async validateCwd(path: string): Promise<{ valid: boolean; error?: string; is_git: boolean }> {
     const resp = await fetch(`/api/validate-cwd?path=${encodeURIComponent(path)}`);
     return resp.json();
   },

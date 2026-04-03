@@ -13,6 +13,7 @@ interface DirectoryPickerProps {
   value: string;
   onChange: (path: string) => void;
   onStatusChange?: (status: DirStatus) => void;
+  onGitStatusChange?: (isGit: boolean) => void;
   onDismiss?: () => void;
   placeholder?: string;
   className?: string;
@@ -46,7 +47,7 @@ function parsePath(value: string): { parentPath: string; partial: string } {
   return { parentPath: parent, partial };
 }
 
-export function DirectoryPicker({ value, onChange, onStatusChange, onDismiss, placeholder = '/path/to/project', className = '' }: DirectoryPickerProps) {
+export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusChange, onDismiss, placeholder = '/path/to/project', className = '' }: DirectoryPickerProps) {
   const [suggestions, setSuggestions] = useState<DirectoryEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -61,6 +62,8 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onDismiss, pl
   const blurTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
+  const onGitStatusChangeRef = useRef(onGitStatusChange);
+  onGitStatusChangeRef.current = onGitStatusChange;
 
   // Cache fetched entries by parent path to avoid redundant API calls
   const cachedParentRef = useRef<string>('');
@@ -140,16 +143,19 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onDismiss, pl
         if (validation.valid) {
           setPathStatus('exists');
           onStatusChangeRef.current?.('exists');
+          onGitStatusChangeRef.current?.(validation.is_git);
         } else {
           const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
           const parentValidation = await api.validateCwd(parentPath);
           const status: DirStatus = parentValidation.valid ? 'will-create' : 'invalid';
           setPathStatus(status);
           onStatusChangeRef.current?.(status);
+          onGitStatusChangeRef.current?.(false);
         }
       } catch {
         setPathStatus('invalid');
         onStatusChangeRef.current?.('invalid');
+        onGitStatusChangeRef.current?.(false);
       }
     }, 300);
 
