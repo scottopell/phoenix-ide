@@ -253,7 +253,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
       let replacement: string;
       if (activeTrigger.mode === 'expand') {
-        replacement = `@${item.label}`;
+        replacement = `@${item.label} `;
       } else if (activeTrigger.mode === 'skill') {
         // Insert `/skill-name ` with a trailing space (REQ-IR-005)
         replacement = `/${item.label} `;
@@ -265,8 +265,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setSkillArgumentHint(null);
         }
       } else {
-        // path mode
-        replacement = `./${item.label}`;
+        // path mode — trailing space dismisses autocomplete popup
+        replacement = `./${item.label} `;
       }
 
       const { newValue, newCursorPos } = applyCompletion(currentValue, activeTrigger, replacement);
