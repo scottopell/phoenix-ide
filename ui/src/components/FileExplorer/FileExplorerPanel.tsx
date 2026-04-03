@@ -5,14 +5,12 @@
 
 import { useState, useCallback } from 'react';
 import { FileTree } from './FileTree';
-import { RecentFilesStrip } from './RecentFilesStrip';
 import { McpStatusPanel } from '../McpStatusPanel';
 import { SkillsPanel } from '../SkillsPanel';
 import { SkillViewer } from '../SkillViewer';
 import { TasksPanel } from '../TasksPanel';
 import { TaskViewer } from '../TaskViewer';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import { useRecentFiles } from '../../hooks/useRecentFiles';
 import type { SkillEntry, TaskEntry } from '../../api';
 
 interface Props {
@@ -34,7 +32,6 @@ function extractTaskId(branchName: string | null | undefined): string | undefine
 
 export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, branchName }: Props) {
   const { openFile, activeFile } = useFileExplorer();
-  const { recentFiles, addRecentFile } = useRecentFiles(conversationId);
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
   const [selectedSkill, setSelectedSkill] = useState<SkillEntry | null>(null);
@@ -44,13 +41,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const currentTaskId = extractTaskId(branchName);
 
   const handleFileSelect = (filePath: string, rootDir: string) => {
-    addRecentFile(filePath);
     openFile(filePath, rootDir);
-  };
-
-  const handleRecentClick = (path: string) => {
-    addRecentFile(path);
-    openFile(path, rootPath);
   };
 
   if (collapsed) {
@@ -59,8 +50,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         <button className="fe-toggle" onClick={onToggle} title="Expand file explorer">
           &#9654;
         </button>
-        <RecentFilesStrip files={recentFiles} onFileClick={handleRecentClick} />
         <div className="fe-collapsed-badges">
+          <button className="fe-collapsed-badge" onClick={onToggle} title="Files">
+            Files
+          </button>
           <button className="fe-collapsed-badge" onClick={onToggle} title="MCP Servers">
             MCP
           </button>
