@@ -210,12 +210,15 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                   return <UserMessage key={msg.sequence_id} message={msg} />;
                 } else if (type === 'skill') {
                   const skillContent = msg.content as { name?: string; trigger?: string };
+                  // Show trigger only if it has args beyond "/skill-name"
+                  const skillTrigger = skillContent.trigger || '';
+                  const triggerArgs = skillTrigger.replace(new RegExp(`^/?${skillContent.name || ''}\\s*`), '').trim();
                   return (
                     <div key={msg.sequence_id} className="message skill">
                       <div className="skill-indicator">
                         <span className="skill-label">/{skillContent.name || 'skill'}</span>
-                        {skillContent.trigger && (
-                          <span className="skill-trigger">{skillContent.trigger}</span>
+                        {triggerArgs && (
+                          <span className="skill-trigger">{triggerArgs}</span>
                         )}
                       </div>
                     </div>
