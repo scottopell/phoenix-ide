@@ -250,25 +250,144 @@ the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
 
 ## Work Sub-Agent Mode Inheritance
 
-### REQ-PROJ-008 — Sub-agent working directory and mode
+### REQ-PROJ-008 — Sub-agent working directory, mode, and resource controls
 
-When a Work conversation spawns sub-agents via `spawn_agents`, each sub-agent spec
-includes a `mode` field:
+Sub-agents have a mode that determines their tool set, model, MCP access, and
+write capabilities. The parent conversation's mode constrains what sub-agent
+modes are available.
+
+#### spawn_agents Tool Schema
+
+The `spawn_agents` tool accepts a `tasks` array. Each task spec carries optional
+fields for mode, model, and turn budget:
 
 ```
+SubAgentTaskSpec {
+  task: String,              // required — task description for the sub-agent
+  cwd: Option<String>,       // optional — working directory override
+  mode: SubAgentMode,        // optional — defaults based on parent mode (see below)
+  model: Option<String>,     // optional — LLM model override (e.g., "haiku", "sonnet")
+  max_turns: Option<u32>,    // optional — maximum LLM turns before forced completion
+}
+
 SubAgentMode {
-  Explore,  // read-only, cwd = parent's worktree_path (reads current state)
-  Work,     // read-write, cwd = parent's worktree_path (only one allowed at a time)
+  Explore,   // read-only tools, cheaper model default
+  Work,      // full tool suite, inherits parent model
 }
 ```
 
-The executor validates at spawn time:
-- `mode: Work` is only valid if parent is in Work mode
-- `mode: Work` is rejected if parent already has a pending Work sub-agent
-- `mode: Work` sub-agent inherits `worktree_path` and `branch` from parent context
+Default mode resolution:
+- Parent in Explore mode: all sub-agents default to `Explore`. `Work` is rejected.
+- Parent in Work mode: sub-agents default to `Explore`. `Work` is available on request.
+- Parent in Standalone mode: all sub-agents default to `Explore` (no worktree context).
 
-Explore sub-agents from any conversation type always read their assigned directory;
-they cannot write regardless of which directory they operate in.
+#### Tool Registry Per Mode
+
+Each sub-agent mode gets a distinct tool registry:
+
+| Tool | Explore sub-agent | Work sub-agent |
+|------|-------------------|----------------|
+| `think` | Yes | Yes |
+| `bash` | Yes (read-only enforced) | Yes (write enabled in worktree) |
+| `patch` | No | Yes (scoped to worktree) |
+| `keyword_search` | Yes | Yes |
+| `read_image` | Yes | Yes |
+| `browser_*` | Yes | Yes |
+| `spawn_agents` | No | No |
+| `ask_user_question` | No | No |
+| `skill` | No | No |
+| `propose_plan` | No | No |
+| `submit_result` | Yes | Yes |
+| `submit_error` | Yes | Yes |
+| MCP tools | Yes (deferred, search-oriented) | Yes (full set, deferred) |
+
+Explore sub-agents get read-only bash and no patch — they investigate and report.
+Work sub-agents get the full tool suite scoped to the parent's worktree — they
+implement changes.
+
+Neither mode gets `spawn_agents` (no recursive spawning), `ask_user_question`
+(sub-agents cannot interact with the end user), `skill` (parent handles skill
+invocation), or `propose_plan` (parent handles task proposals).
+
+#### Model Selection
+
+Each mode has a default model. The parent can override per-task.
+
+| Mode | Default model | Rationale |
+|------|--------------|-----------|
+| Explore | `claude-haiku-4-5` | Read-only research is latency-sensitive and cost-sensitive. Haiku is 5-10x cheaper than Opus for tasks that don't require deep reasoning. |
+| Work | Parent's model (inherited) | Implementation work benefits from the same model quality the parent uses. |
+
+The optional `model` field on `SubAgentTaskSpec` overrides the default. Valid
+values are model IDs known to the LLM registry (e.g., `"claude-sonnet-4-6"`,
+`"claude-haiku-4-5"`). Invalid model IDs produce a tool error at spawn time.
+
+#### One-Writer Constraint
+
+A worktree has at most one writer at any time. Multiple readers are safe.
+
+The executor enforces this at spawn time by tracking active Work sub-agents per
+parent conversation. The tracking state is a counter on the parent's runtime
+handle (not persisted — sub-agents don't survive restarts).
+
+- Spawning a Work sub-agent when another Work sub-agent is active for the same
+  parent: rejected with a tool error explaining the constraint.
+- Spawning multiple Explore sub-agents: always allowed, no limit beyond system
+  resources.
+- A Work sub-agent completing or failing decrements the counter immediately,
+  releasing the slot for the next spawn.
+
+Mixed spawns in a single `spawn_agents` call (e.g., 3 Explore + 1 Work) are
+valid as long as at most one task has `mode: Work`.
+
+#### MCP Tool Access
+
+MCP tools use the `defer_loading` mechanism (tool search). The parent's MCP
+client manager is shared with sub-agents — no per-agent MCP server connections.
+
+Explore sub-agents receive the full set of MCP tool definitions with
+`defer_loading: true`. When the model discovers a tool via tool search, the
+MCP client manager handles the call. This gives Explore agents access to
+search-oriented MCP tools (Atlassian search, Google Workspace search, etc.)
+without loading all tool schemas into the prompt.
+
+Work sub-agents receive the same MCP tool set as Explore sub-agents. The MCP
+tools themselves are stateless RPC calls — the one-writer constraint applies
+to filesystem writes via bash/patch, not to MCP tool invocations.
+
+#### Max Turns Limit
+
+Each sub-agent has a maximum number of LLM request turns. When the limit is
+reached, the sub-agent's current turn completes normally, then the runtime
+injects a forced completion as if the agent had called `submit_error` with
+"Reached maximum turn limit (N)".
+
+| Mode | Default max_turns | Rationale |
+|------|-------------------|-----------|
+| Explore | 20 | Research tasks that take >20 turns are likely stuck in a loop. |
+| Work | 50 | Implementation tasks legitimately require more turns (multi-file edits, test iteration). |
+
+The optional `max_turns` field on `SubAgentTaskSpec` overrides the default.
+The existing 5-minute timeout remains as a secondary safety net — whichever
+limit fires first terminates the agent.
+
+Turn counting: each transition through `LlmRequesting` increments the counter.
+Tool execution turns (where the LLM is not called) do not count. This means
+a 20-turn Explore agent can execute up to 20 LLM requests, each of which may
+invoke multiple tools.
+
+#### Working Directory Assignment
+
+| Parent mode | Sub-agent mode | Sub-agent cwd |
+|-------------|---------------|---------------|
+| Explore | Explore | Parent's cwd (main checkout) |
+| Work | Explore | Parent's worktree path (reads current work state) |
+| Work | Work | Parent's worktree path (writes to worktree) |
+| Standalone | Explore | Parent's cwd |
+
+The `cwd` field on `SubAgentTaskSpec` overrides this default. The override is
+validated: Work sub-agents cannot write outside the parent's worktree even if
+`cwd` is overridden to a different directory.
 
 ## Persistence
 
