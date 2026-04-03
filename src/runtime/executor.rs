@@ -1474,62 +1474,9 @@ struct TaskApprovalResult {
     base_branch: String,
 }
 
-/// Derive a slug from a task title: lowercase, spaces to hyphens, strip non-alphanumeric
-/// except hyphens, truncate at 40 chars, trim trailing hyphens.
-fn derive_slug(title: &str) -> String {
-    let slug: String = title
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    let truncated = if slug.len() > 40 {
-        // Truncate at last hyphen within 40 chars to avoid cutting mid-word
-        // Safety: `slug` is built from ASCII alphanumeric chars and hyphens only,
-        // so byte offset 40 is always a valid char boundary. `rfind` returns a
-        // valid byte offset within the same slice.
-        #[allow(clippy::string_slice)]
-        let s = &slug[..40];
-        #[allow(clippy::string_slice)]
-        let truncated_inner = s.rfind('-').map_or(s, |i| &s[..i]);
-        truncated_inner.to_string()
-    } else {
-        slug
-    };
-    truncated.trim_end_matches('-').to_string()
-}
-
-/// Get the next task ID by shelling out to `taskmd next`.
-/// Returns an ID like "YF042". Falls back to a timestamp-based ID if taskmd
-/// is not installed, so task approval still works without the CLI.
-fn get_next_task_id(cwd: &std::path::Path) -> String {
-    let result = std::process::Command::new("taskmd")
-        .args(["next", "--output", "text"])
-        .current_dir(cwd)
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            tracing::warn!(error = %stderr, "taskmd next failed, using fallback ID");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "taskmd not available, using fallback ID");
-        }
-    }
-
-    // Fallback: timestamp-based ID that sorts correctly and won't collide
-    let now = chrono::Local::now();
-    format!("T{}", now.format("%y%m%d%H%M"))
+/// Get the next task ID using taskmd-core library.
+fn get_next_task_id(tasks_dir: &std::path::Path) -> String {
+    taskmd_core::ids::next_id(tasks_dir)
 }
 
 /// Run a git command in the given directory, returning stdout on success or an error message.
@@ -1585,24 +1532,24 @@ fn execute_approve_task_blocking(
     // Track whether tasks/ existed before we create it
     let first_task = !tasks_dir.exists();
 
-    // 2. Assign task ID via taskmd (falls back to timestamp if unavailable)
-    let task_id = get_next_task_id(cwd);
-
-    // 3. Create tasks/ directory if needed
+    // 2. Create tasks/ directory if needed
     if first_task {
         std::fs::create_dir_all(&tasks_dir)
             .map_err(|e| format!("Failed to create tasks/ directory: {e}"))?;
         tracing::info!("Created tasks/ directory (first task for this project)");
     }
 
+    // 3. Assign task ID via taskmd-core
+    let task_id = get_next_task_id(&tasks_dir);
+
     // 4. Derive slug from title
-    let slug = derive_slug(title);
+    let slug = taskmd_core::filename::derive_slug(title);
     if slug.is_empty() {
         return Err("Cannot derive a valid slug from the task title".to_string());
     }
 
-    // 5. Write task file (taskmd format: AANNN-pX-status--slug.md)
-    let filename = format!("{task_id}-{priority}-in-progress--{slug}.md");
+    // 5. Write task file (taskmd format: DDNNN-pX-status--slug.md)
+    let filename = taskmd_core::filename::format_filename(&task_id, priority, "in-progress", &slug);
     let filepath = tasks_dir.join(&filename);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let branch_name = format!("task-{task_id}-{slug}");

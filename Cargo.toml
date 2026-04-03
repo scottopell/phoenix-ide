@@ -58,6 +58,7 @@ regex = "1"
 # Browser automation
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime", "_fetcher-rustls-tokio"] }
 brush-parser = "0.3.0"
+taskmd-core = { git = "https://github.com/scottopell/taskmd.git" }
 listenfd = "1.0.2"
 nucleo-matcher = "0.3.1"
 

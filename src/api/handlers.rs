@@ -11,7 +11,8 @@ use super::types::{
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
     ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, TaskApprovalResponse, TaskFeedbackRequest, ValidateCwdResponse,
+    SystemPromptResponse, TaskApprovalResponse, TaskEntry, TaskFeedbackRequest, TasksResponse,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
@@ -118,6 +119,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/skills",
             get(list_conversation_skills),
         )
+        // Task listing
+        .route("/api/conversations/:id/tasks", get(list_conversation_tasks))
         // Projects (REQ-PROJ-014)
         .route("/api/projects", get(list_projects))
         // Model info (REQ-API-009)
@@ -1572,49 +1575,14 @@ async fn confirm_complete(
     }))
 }
 
-/// Check if the task file for a given task number has status `done`.
+/// Check if the task file for a given task ID has status `done`.
 /// Returns true if the task file exists and its status is NOT done.
 fn check_task_file_status(worktree_path: &std::path::Path, task_id: &str) -> bool {
     let tasks_dir = worktree_path.join("tasks");
-    if !tasks_dir.exists() {
-        return false;
+    match taskmd_core::tasks::find_task_by_id(&tasks_dir, task_id) {
+        Some(task) => task.status != "done",
+        None => false, // No matching task file found
     }
-
-    let prefix = format!("{task_id}-");
-    let Ok(entries) = std::fs::read_dir(&tasks_dir) else {
-        return false;
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with(&prefix) && name_str.ends_with(".md") {
-            // Read the file and check frontmatter for status: done
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                // Simple frontmatter parse: look for `status: done` between `---` delimiters
-                if let Some(fm) = extract_frontmatter(&content) {
-                    return !fm.contains("status: done");
-                }
-            }
-            // File found but couldn't parse -- assume not done
-            return true;
-        }
-    }
-
-    // No matching task file found
-    false
-}
-
-/// Extract frontmatter content (between `---` delimiters) from a markdown file.
-fn extract_frontmatter(content: &str) -> Option<&str> {
-    let content = content.trim_start();
-    if !content.starts_with("---") {
-        return None;
-    }
-    let rest = content.strip_prefix("---")?;
-    // Safety: `end` is from `find()` on `rest`
-    #[allow(clippy::string_slice)]
-    rest.find("---").map(|end| &rest[..end])
 }
 
 /// Abandon a Work-mode task: delete worktree/branch, mark task file wont-do, go Terminal.
@@ -1718,78 +1686,57 @@ async fn abandon_task(
 
         // Scan tasks/ for matching task file and rename to wont-do
         let tasks_dir = repo_root_clone.join("tasks");
-        let prefix = format!("{task_id}-");
+        match taskmd_core::tasks::find_task_by_id(&tasks_dir, &task_id) {
+            Some(task) => {
+                let old_filename = task
+                    .path
+                    .file_name()
+                    .expect("task path has filename")
+                    .to_string_lossy()
+                    .to_string();
+                let new_filename = taskmd_core::filename::format_filename(
+                    &task.id,
+                    &task.priority,
+                    "wont-do",
+                    &task.slug,
+                );
 
-        let mut found_file = None;
-        if tasks_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy().to_string();
-                    if name_str.starts_with(&prefix)
-                        && std::path::Path::new(&name_str)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                    {
-                        found_file = Some(name_str);
-                        break;
+                // Update frontmatter status in-place before renaming
+                if let Ok(content) = std::fs::read_to_string(&task.path) {
+                    let updated = taskmd_core::tasks::update_status_in_content(&content, "wont-do");
+                    if let Err(e) = std::fs::write(&task.path, updated) {
+                        tracing::warn!(error = %e, "Failed to update task frontmatter (non-fatal)");
                     }
+                }
+
+                // Use git mv so the rename is tracked
+                let old_path = format!("tasks/{old_filename}");
+                let new_path = format!("tasks/{new_filename}");
+
+                if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
+                    tracing::warn!(
+                        error = %e,
+                        old = %old_path,
+                        new = %new_path,
+                        "Failed to git mv task file (non-fatal)"
+                    );
+                } else if let Err(e) = run_git(
+                    &repo_root_clone,
+                    &["commit", "-m", &format!("task {task_id}: mark wont-do")],
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to commit task file rename (non-fatal)"
+                    );
+                    let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
                 }
             }
-        }
-
-        if let Some(old_filename) = found_file {
-            // Parse: everything before `--` is `AANNN-pX-status`, everything after is `slug.md`
-            if let Some(double_dash_pos) = old_filename.find("--") {
-                // Safety: `double_dash_pos` is from `find()` on `old_filename`
-                #[allow(clippy::string_slice)]
-                let before_dd = &old_filename[..double_dash_pos];
-                #[allow(clippy::string_slice)]
-                let after_dd = &old_filename[double_dash_pos..]; // includes "--slug.md"
-
-                // before_dd is like "0042-p1-in-progress" -- find the second '-' to locate status
-                // Split: first part is NNNN, second is pX, rest is status
-                let parts: Vec<&str> = before_dd.splitn(3, '-').collect();
-                if parts.len() == 3 {
-                    let new_filename = format!("{}-{}-wont-do{}", parts[0], parts[1], after_dd);
-                    let old_path = format!("tasks/{old_filename}");
-                    let new_path = format!("tasks/{new_filename}");
-
-                    if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
-                        tracing::warn!(
-                            error = %e,
-                            old = %old_path,
-                            new = %new_path,
-                            "Failed to git mv task file (non-fatal)"
-                        );
-                    } else if let Err(e) = run_git(
-                        &repo_root_clone,
-                        &["commit", "-m", &format!("task {task_id}: mark wont-do")],
-                    ) {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to commit task file rename (non-fatal)"
-                        );
-                        // Reset staged changes
-                        let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
-                    }
-                } else {
-                    tracing::warn!(
-                        filename = %old_filename,
-                        "Task filename does not match expected AANNN-pX-status--slug.md format"
-                    );
-                }
-            } else {
+            None => {
                 tracing::warn!(
-                    filename = %old_filename,
-                    "Task filename missing '--' separator"
+                    task_id = task_id,
+                    "No task file found for task number (may have been manually deleted)"
                 );
             }
-        } else {
-            tracing::warn!(
-                task_id = task_id,
-                "No task file found for task number (may have been manually deleted)"
-            );
         }
 
         Ok(())
@@ -2442,6 +2389,38 @@ async fn list_conversation_skills(
     Ok(Json(SkillsResponse {
         skills: skill_entries,
     }))
+}
+
+// ============================================================
+// Tasks
+// ============================================================
+
+/// List task files from the conversation's project tasks/ directory.
+async fn list_conversation_tasks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TasksResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let cwd = std::path::PathBuf::from(&conversation.cwd);
+    let tasks_dir = cwd.join("tasks");
+
+    let tasks = taskmd_core::tasks::list_tasks(&tasks_dir)
+        .into_iter()
+        .map(|t| TaskEntry {
+            id: t.id,
+            priority: t.priority,
+            status: t.status,
+            slug: t.slug,
+        })
+        .collect();
+
+    Ok(Json(TasksResponse { tasks }))
 }
 
 // ============================================================

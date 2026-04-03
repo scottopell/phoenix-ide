@@ -966,6 +966,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gethostname"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
+dependencies = [
+ "rustix",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1686,6 +1696,7 @@ dependencies = [
  "serde_json",
  "similar",
  "sqlx",
+ "taskmd-core",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2454,6 +2465,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "taskmd-core"
+version = "0.1.0"
+source = "git+https://github.com/scottopell/taskmd.git#43e36632ae5de8cc598f3b5ffea8d07643fdfdd5"
+dependencies = [
+ "chrono",
+ "gethostname",
+ "regex",
+ "sha2",
 ]
 
 [[package]]

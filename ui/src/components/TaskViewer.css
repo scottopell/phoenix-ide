@@ -1,0 +1,118 @@
+/* TaskViewer -- detail panel replacing file tree when a task is selected */
+.task-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.task-viewer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.task-viewer-back {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: background 150ms ease, color 150ms ease;
+  white-space: nowrap;
+}
+
+.task-viewer-back:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.task-viewer-name {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-viewer-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.task-viewer-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.task-viewer-section:last-child {
+  border-bottom: none;
+}
+
+.task-viewer-section-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.task-viewer-detail-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.task-viewer-detail-label {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  min-width: 50px;
+}
+
+.task-viewer-detail-value {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+/* Status colors in detail view */
+.task-viewer-status-in-progress { color: var(--accent-green, #3fb950); }
+.task-viewer-status-ready { color: var(--accent-blue, #58a6ff); }
+.task-viewer-status-blocked { color: var(--accent-yellow, #d29922); }
+.task-viewer-status-brainstorming { color: var(--text-muted); }
+.task-viewer-status-done { color: var(--text-muted); }
+.task-viewer-status-wont-do { color: var(--text-muted); }
+
+.task-viewer-content {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  background: var(--bg-secondary);
+  padding: 8px;
+  border-radius: 4px;
+  max-height: 400px;
+  overflow-y: auto;
+  color: var(--text-primary);
+}
+
+.task-viewer-content-loading {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.task-viewer-content-error {
+  color: var(--text-error, #f85149);
+  font-style: italic;
+}

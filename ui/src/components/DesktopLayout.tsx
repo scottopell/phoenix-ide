@@ -108,6 +108,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             rootPath={activeConversation?.cwd || '/'}
             conversationId={activeConversation?.id}
             showToast={showSuccess}
+            branchName={activeConversation?.branch_name}
           />
         )}
         <div className="desktop-main">

@@ -1,0 +1,209 @@
+/* Tasks Panel - collapsible sidebar panel for project task files */
+.tasks-panel {
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.tasks-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  transition: background 150ms ease;
+}
+
+.tasks-panel-header:hover {
+  background: var(--bg-hover);
+}
+
+.tasks-panel-chevron {
+  font-size: 10px;
+  transition: transform 200ms ease;
+  flex-shrink: 0;
+}
+
+.tasks-panel-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.tasks-panel-summary {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tasks-done-count {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+/* ISSUE-001 fix: constrain panel height with independent scroll */
+.tasks-panel-body {
+  padding: 0 8px 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.tasks-loading,
+.tasks-empty {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Status groups */
+.tasks-group {
+  margin-bottom: 2px;
+}
+
+.tasks-group-header {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary, var(--text-muted));
+  padding: 3px 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  border: none;
+  cursor: pointer;
+  user-select: none;
+  transition: background 150ms ease;
+}
+
+.tasks-group-header:hover {
+  background: var(--bg-hover);
+}
+
+.tasks-group-terminal {
+  opacity: 0.5;
+}
+
+.tasks-group-terminal:hover {
+  opacity: 0.8;
+}
+
+.tasks-group-chevron {
+  font-size: 8px;
+  transition: transform 200ms ease;
+  flex-shrink: 0;
+}
+
+.tasks-group-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+/* Status dots */
+.tasks-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tasks-status-in-progress { background: var(--accent-green, #3fb950); }
+.tasks-status-ready { background: var(--accent-blue, #58a6ff); }
+.tasks-status-blocked { background: var(--accent-yellow, #d29922); }
+.tasks-status-brainstorming { background: var(--text-muted); }
+.tasks-status-done { background: var(--text-muted); opacity: 0.5; }
+.tasks-status-wont-do { background: var(--text-muted); opacity: 0.3; }
+
+.tasks-group-label {
+  flex: 1;
+}
+
+.tasks-group-count {
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+/* Task items */
+.tasks-group-items {
+  padding-left: 8px;
+}
+
+.tasks-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  min-height: 20px;
+  cursor: pointer;
+  transition: background 60ms;
+}
+
+.tasks-item:hover {
+  background: var(--bg-hover);
+}
+
+.tasks-item-terminal {
+  opacity: 0.4;
+}
+
+/* ISSUE-004 fix: highlight current conversation's task */
+.tasks-item-current {
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 12%, transparent);
+  border-left: 2px solid var(--accent-blue, #58a6ff);
+  padding-left: 2px;
+}
+
+.tasks-item-current:hover {
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 18%, transparent);
+}
+
+.tasks-current-badge {
+  font-size: 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent-blue, #58a6ff);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* Priority badges */
+.tasks-pri {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 0 3px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  line-height: 16px;
+  text-transform: uppercase;
+}
+
+.tasks-pri-p0 { color: var(--accent-red, #f85149); background: color-mix(in srgb, var(--accent-red, #f85149) 15%, transparent); }
+.tasks-pri-p1 { color: #e3b341; background: color-mix(in srgb, #e3b341 12%, transparent); }
+.tasks-pri-p2 { color: var(--accent-blue, #58a6ff); background: color-mix(in srgb, var(--accent-blue, #58a6ff) 12%, transparent); }
+.tasks-pri-p3 { color: var(--text-muted); background: color-mix(in srgb, var(--text-muted) 10%, transparent); }
+.tasks-pri-p4 { color: var(--text-muted); opacity: 0.5; background: color-mix(in srgb, var(--text-muted) 6%, transparent); }
+
+.tasks-id {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.tasks-slug {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

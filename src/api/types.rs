@@ -233,6 +233,21 @@ pub struct SkillsResponse {
     pub skills: Vec<SkillEntry>,
 }
 
+/// A task file entry returned by the tasks list endpoint.
+#[derive(Debug, Serialize)]
+pub struct TaskEntry {
+    pub id: String,
+    pub priority: String,
+    pub status: String,
+    pub slug: String,
+}
+
+/// Response for the tasks list endpoint.
+#[derive(Debug, Serialize)]
+pub struct TasksResponse {
+    pub tasks: Vec<TaskEntry>,
+}
+
 /// Expansion error detail returned to the frontend (REQ-IR-007)
 #[derive(Debug, Serialize)]
 pub struct ExpansionErrorResponse {

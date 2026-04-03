@@ -211,6 +211,13 @@ export interface SkillEntry {
   path: string;
 }
 
+export interface TaskEntry {
+  id: string;
+  priority: string;
+  status: string;
+  slug: string;
+}
+
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
@@ -420,6 +427,19 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to list skills');
+    return resp.json();
+  },
+
+  /** List tasks from the conversation's project tasks/ directory */
+  async listConversationTasks(
+    convId: string,
+    signal?: AbortSignal,
+  ): Promise<{ tasks: TaskEntry[] }> {
+    const resp = await fetch(
+      `/api/conversations/${convId}/tasks`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to list tasks');
     return resp.json();
   },
 
