@@ -55,6 +55,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/phoenix.svg", get(serve_favicon))
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
+        // Preview: serves files from absolute paths so relative references work
+        .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
         .route(
@@ -110,7 +112,6 @@ pub fn create_router(state: AppState) -> Router {
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
         .route("/api/files/read", get(read_file))
-        .route("/api/files/raw", get(serve_file_raw))
         .route(
             "/api/conversations/:id/files/search",
             get(search_conversation_files),
@@ -2214,19 +2215,37 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
     }))
 }
 
-/// Serve a file with its native Content-Type (for "Open in browser" links).
-/// Only allows files up to 10MB, same as `read_file`.
-async fn serve_file_raw(
-    Query(query): Query<PathQuery>,
+/// Serve a file from an absolute path with native Content-Type.
+/// Used by "Open in browser" for HTML preview -- the path-based URL means
+/// relative references (CSS, JS, images) resolve correctly against the
+/// file's directory.
+///
+/// URL: `/preview/Users/scott/dev/site/index.html`
+/// A `<link href="style.css">` resolves to `/preview/Users/scott/dev/site/style.css`
+async fn serve_preview_file(
+    Path(filepath): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    let path = PathBuf::from(&query.path);
+    // filepath comes without leading slash from the wildcard capture
+    let path = PathBuf::from(format!("/{filepath}"));
 
     if !path.exists() {
         return Err(AppError::NotFound("File does not exist".to_string()));
     }
     if path.is_dir() {
+        // Try index.html for directory requests
+        let index = path.join("index.html");
+        if index.exists() {
+            let content = fs::read(&index)
+                .map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
+            let content_type = mime_guess::from_path(&index)
+                .first_or_octet_stream()
+                .to_string();
+            return Ok(
+                ([(axum::http::header::CONTENT_TYPE, content_type)], content).into_response(),
+            );
+        }
         return Err(AppError::BadRequest("Path is a directory".to_string()));
     }
 

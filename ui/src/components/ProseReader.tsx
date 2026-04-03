@@ -541,7 +541,7 @@ export function ProseReader({
               </button>
               <a
                 className="prose-reader-view-toggle"
-                href={`/api/files/raw?path=${encodeURIComponent(absolutePath)}`}
+                href={`/preview${absolutePath}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 title="Open in new tab (full render with scripts)"
@@ -601,7 +601,7 @@ export function ProseReader({
         ) : fileType === 'html' && htmlViewMode === 'preview' ? (
           <div className="prose-reader-html-preview">
             <iframe
-              srcDoc={content || ''}
+              src={`/preview${absolutePath}`}
               sandbox="allow-same-origin"
               title="HTML Preview"
               className="prose-reader-iframe"
