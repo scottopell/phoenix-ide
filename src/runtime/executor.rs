@@ -1416,12 +1416,6 @@ where
                 // is_sub_agent, context_exhaustion_behavior, or future fields.
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
 
-                // Update mode context so the system prompt reflects Work mode
-                self.context.mode_context = Some(crate::system_prompt::ModeContext::Work {
-                    branch_name: approval_result.branch_name.clone(),
-                    base_branch: approval_result.base_branch.clone(),
-                });
-
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
                 self.tool_executor.upgrade_to_work_mode();
@@ -1719,24 +1713,22 @@ fn execute_approve_task_blocking(
         tracing::info!("Added .phoenix/ to .gitignore");
     }
 
-    // 6. Git commit the task file (and .gitignore if modified)
+    // 6. Stage the task file (do NOT commit yet -- commit after worktree creation
+    //    so a worktree failure doesn't leave orphaned commits on main)
     let relative_path = format!("tasks/{filename}");
     run_git(cwd, &["add", &relative_path])?;
-    let commit_msg = format!("task {task_id}: {title}");
-    // Use `git commit` without `--only` so both staged files are included
-    run_git(cwd, &["commit", "-m", &commit_msg])?;
-    tracing::info!(commit_msg = %commit_msg, "Task file committed");
 
     // 7. Branch collision check
     let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
     if branch_exists {
-        // Check if fully merged into current branch
         let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
         if merge_base.is_ok() {
-            // Fully merged — safe to delete
             run_git(cwd, &["branch", "-d", &branch_name])?;
             tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
         } else {
+            // Clean up staged files before returning error
+            let _ = run_git(cwd, &["reset", "HEAD"]);
+            let _ = std::fs::remove_file(&filepath);
             return Err(format!(
                 "Branch '{branch_name}' already exists and is not fully merged. \
                  Please resolve this manually before approving."
@@ -1744,22 +1736,38 @@ fn execute_approve_task_blocking(
         }
     }
 
-    // 8. Create worktree with new branch (atomic: creates branch + attaches worktree)
+    // 8. Create branch, then worktree, then commit.
+    //    Separated so we can clean up if worktree creation fails.
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
         .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
 
     let worktree_path = phoenix_dir.join(conv_id);
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
-    run_git(
-        cwd,
-        &["worktree", "add", &worktree_path_str, "-b", &branch_name],
-    )?;
+
+    if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
+        let _ = run_git(cwd, &["reset", "HEAD"]);
+        let _ = std::fs::remove_file(&filepath);
+        return Err(format!("Failed to create branch '{branch_name}': {e}"));
+    }
+
+    if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
+        let _ = run_git(cwd, &["branch", "-D", &branch_name]);
+        let _ = run_git(cwd, &["reset", "HEAD"]);
+        let _ = std::fs::remove_file(&filepath);
+        return Err(format!("Failed to create worktree: {e}"));
+    }
+
     tracing::info!(
         branch = %branch_name,
         worktree = %worktree_path_str,
         "Created git worktree"
     );
+
+    // 9. NOW commit -- safe because worktree already exists
+    let commit_msg = format!("task {task_id}: {title}");
+    run_git(cwd, &["commit", "-m", &commit_msg])?;
+    tracing::info!(commit_msg = %commit_msg, "Task file committed");
 
     Ok(TaskApprovalResult {
         task_id,
