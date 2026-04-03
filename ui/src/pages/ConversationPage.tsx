@@ -593,6 +593,7 @@ export function ConversationPage() {
           setImages={setImages}
           isOffline={isOffline}
           queuedMessages={queuedMessages}
+          convModeLabel={conversation.conv_mode_label}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}

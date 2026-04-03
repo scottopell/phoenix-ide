@@ -85,9 +85,13 @@ export function StateBar({
       case 'connected': {
         // When connected, show agent state
         switch (convState.type) {
-          case 'idle': case 'terminal':
+          case 'idle':
             dotClass += ' idle';
             stateText = 'ready';
+            break;
+          case 'terminal':
+            dotClass += ' terminal';
+            stateText = 'completed';
             break;
           case 'awaiting_task_approval':
             dotClass += ' approval';

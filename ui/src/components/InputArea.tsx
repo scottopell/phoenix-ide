@@ -38,6 +38,8 @@ interface InputAreaProps {
   setImages: (images: ImageData[]) => void;
   isOffline: boolean;
   queuedMessages: QueuedMessage[];
+  /** Conversation mode label (e.g. "Explore", "Work", "Standalone") */
+  convModeLabel?: string;
   /**
    * Called when the user sends a message.
    * May reject with an expansion error (REQ-IR-007) — the component will
@@ -57,6 +59,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   setImages,
   isOffline,
   queuedMessages,
+  convModeLabel,
   onSend,
   onCancel,
   onRetry,
@@ -543,9 +546,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [draft]);
 
   const hint = placeholderHints[hintIndex];
+  const isExplore = convModeLabel?.toLowerCase() === 'explore';
+  const baseText = isExplore
+    ? 'Explore this codebase or describe a change to plan...'
+    : 'Type a message...';
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
-    : hint ? `Type a message... (${hint})` : 'Type a message...';
+    : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
   // Render

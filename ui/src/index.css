@@ -154,6 +154,7 @@ body {
 }
 
 .dot.idle { background: var(--accent-green); }
+.dot.terminal { background: var(--text-muted); }
 .dot.working { background: var(--accent-yellow); animation: pulse 1.5s infinite; }
 .dot.error { background: var(--accent-red); }
 .dot.connecting { background: var(--text-muted); animation: pulse 1s infinite; }
