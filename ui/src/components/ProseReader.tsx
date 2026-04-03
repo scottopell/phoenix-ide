@@ -16,6 +16,7 @@ import { Prism as SyntaxHighlighter, createElement } from 'react-syntax-highligh
 import type { createElementProps } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateUUID } from '../utils/uuid';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
   ArrowLeft,
   X,
@@ -228,6 +229,7 @@ export function ProseReader({
   patchContext,
   inline,
 }: ProseReaderProps) {
+  useRegisterFocusScope('prose-reader');
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

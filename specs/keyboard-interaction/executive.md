@@ -25,16 +25,16 @@ keys and are never blocked by panel-level handlers.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-KB-001:** Layered Focus Scoping | ❌ Not Started | Core architecture |
-| **REQ-KB-002:** Global Shortcuts Pass Through | ❌ Not Started | - |
-| **REQ-KB-003:** Scope-Local Key Consumption | ❌ Not Started | Fix existing key leak |
-| **REQ-KB-004:** Auto-Focus on Panel Appearance | 🔄 In Progress | QuestionPanel has partial auto-focus |
-| **REQ-KB-005:** Escape Key Behavior | ❌ Not Started | Current Escape behavior is inconsistent |
-| **REQ-KB-006:** Shortcut Help Panel | ❌ Not Started | `?` key triggers |
-| **REQ-KB-007:** Tooltip Shortcut Hints | ❌ Not Started | Platform-aware formatting |
-| **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ❌ Not Started | Arrow key sidebar bug |
+| **REQ-KB-001:** Layered Focus Scoping | ✅ Complete | `FocusScopeContext` in `useFocusScope.tsx` |
+| **REQ-KB-002:** Global Shortcuts Pass Through | ✅ Complete | `useGlobalKeyboardShortcuts` checks `hasActiveScope` |
+| **REQ-KB-003:** Scope-Local Key Consumption | ✅ Complete | QuestionPanel uses component-level `onKeyDown` with `stopPropagation` |
+| **REQ-KB-004:** Auto-Focus on Panel Appearance | ✅ Complete | QuestionPanel auto-focuses first option on mount and step change |
+| **REQ-KB-005:** Escape Key Behavior | ✅ Complete | QuestionPanel, ShortcutHelpPanel, ProseReader, TaskApprovalReader all register as focus scopes. Escape hierarchy: sub-context -> confirm if unsaved -> dismiss -> navigate |
+| **REQ-KB-006:** Shortcut Help Panel | ✅ Complete | `?` key opens `ShortcutHelpPanel` |
+| **REQ-KB-007:** Tooltip Shortcut Hints | ✅ Complete | Submit, Decline, Send buttons show shortcuts |
+| **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ✅ Complete | `useKeyboardNav` gated by `hasActiveScope` |
 
-**Progress:** 0 of 8 complete (1 in progress)
+**Progress:** 8 of 8 complete
 
 ## Cross-Spec References
 
