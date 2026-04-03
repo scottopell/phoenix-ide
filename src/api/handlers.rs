@@ -1443,6 +1443,7 @@ async fn confirm_complete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let repo_root = PathBuf::from(&project.canonical_path);
+    let repo_root_str = repo_root.display().to_string();
 
     let commit_message = req.commit_message;
     let base_branch_for_msg = base_branch.clone();
@@ -1536,7 +1537,14 @@ async fn confirm_complete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 5. Inject system message
+    // 5. Update cwd from deleted worktree to repo root
+    state
+        .db
+        .update_conversation_cwd(&id, &repo_root_str)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 6. Inject system message
     let system_msg =
         format!("Task completed. Squash merged to {base_branch_for_msg} as {short_sha}.");
     let msg_id = uuid::Uuid::new_v4().to_string();
@@ -1552,7 +1560,7 @@ async fn confirm_complete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 6. Broadcast SSE events so the frontend updates in real-time
+    // 7. Broadcast SSE events so the frontend updates in real-time
     if let Ok(handle) = state.runtime.get_or_create(&id).await {
         let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
         let _ = handle.broadcast_tx.send(SseEvent::StateChange {
@@ -1561,7 +1569,7 @@ async fn confirm_complete(
         });
         let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
             update: crate::runtime::ConversationMetadataUpdate {
-                cwd: None,
+                cwd: Some(repo_root_str),
                 branch_name: None,
                 worktree_path: None,
                 conv_mode_label: Some("Explore".to_string()),
@@ -1760,7 +1768,15 @@ async fn abandon_task(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 5. Inject system message
+    // 5. Update cwd from deleted worktree to repo root
+    let repo_root_str = repo_root.display().to_string();
+    state
+        .db
+        .update_conversation_cwd(&id, &repo_root_str)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // 6. Inject system message
     let msg_id = uuid::Uuid::new_v4().to_string();
     let msg = state
         .db
@@ -1774,7 +1790,7 @@ async fn abandon_task(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 6. Broadcast SSE events so the frontend updates in real-time
+    // 7. Broadcast SSE events so the frontend updates in real-time
     if let Ok(handle) = state.runtime.get_or_create(&id).await {
         let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
         let _ = handle.broadcast_tx.send(SseEvent::StateChange {
@@ -1783,7 +1799,7 @@ async fn abandon_task(
         });
         let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
             update: crate::runtime::ConversationMetadataUpdate {
-                cwd: None,
+                cwd: Some(repo_root_str),
                 branch_name: None,
                 worktree_path: None,
                 conv_mode_label: Some("Explore".to_string()),
