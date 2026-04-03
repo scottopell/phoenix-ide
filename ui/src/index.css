@@ -2218,6 +2218,14 @@ pre:hover .copy-btn {
   background: var(--accent-blue-hover, #2563eb);
 }
 
+/* Terminal conversation banner */
+.terminal-banner {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  padding: 16px;
+}
+
 /* Directory Picker */
 .directory-picker {
   display: flex;

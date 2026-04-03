@@ -551,6 +551,16 @@ export function ConversationPage() {
           </div>
         </div>
       )}
+      {convStateForChildren.type === 'terminal' && (
+        <div className="terminal-banner">
+          <button
+            className="btn-primary"
+            onClick={() => navigate('/new')}
+          >
+            Start new conversation
+          </button>
+        </div>
+      )}
       {convStateForChildren.type === 'error' ? (
         <ErrorBanner
           message={convStateForChildren.message}
@@ -563,7 +573,7 @@ export function ConversationPage() {
           conversationId={conversation.id}
           showToast={showInfo}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' ? (
+      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
           <WorkActions
