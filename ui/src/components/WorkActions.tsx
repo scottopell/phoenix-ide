@@ -31,6 +31,11 @@ export function WorkActions({
   const [confirming, setConfirming] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
 
+  // Clear stale errors when the agent runs (phaseType leaves idle then returns)
+  useEffect(() => {
+    setError(null);
+  }, [phaseType]);
+
   // Only render for idle Work conversations (phaseType is live from atom, not stale)
   if (convModeLabel !== 'Work') return null;
   if (phaseType !== 'idle') return null;
@@ -101,6 +106,7 @@ export function WorkActions({
             try {
               await api.confirmComplete(conversationId, editedMessage);
               setModalState({ type: 'closed' });
+              setError(null);
             } catch (err) {
               setError(err instanceof Error ? err.message : 'Failed to confirm completion');
             } finally {
@@ -110,6 +116,7 @@ export function WorkActions({
           onCancel={() => {
             setModalState({ type: 'closed' });
             setEditedMessage('');
+            setError(null);
           }}
           onAskAgentMarkDone={onSendMessage ? () => {
             setModalState({ type: 'closed' });
