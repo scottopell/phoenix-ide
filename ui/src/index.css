@@ -2046,6 +2046,33 @@ pre:hover .copy-btn {
   white-space: nowrap;
 }
 
+/* StateBar mode indicator pill */
+.statebar-mode {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.statebar-mode--explore {
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 15%, transparent);
+  color: var(--accent-blue, #3b82f6);
+}
+
+.statebar-mode--work {
+  background: color-mix(in srgb, var(--accent-green, #22c55e) 15%, transparent);
+  color: var(--accent-green, #22c55e);
+}
+
+.statebar-mode--direct {
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+}
+
 #state-bar-right {
   display: flex;
   align-items: center;

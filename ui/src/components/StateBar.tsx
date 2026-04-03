@@ -183,6 +183,21 @@ export function StateBar({
                 {conversation.slug}
               </Link>
               <div className="conv-meta">
+                {conversation.conv_mode_label && (() => {
+                  const mode = conversation.conv_mode_label.toLowerCase();
+                  const label = mode === 'standalone' ? 'Direct' : conversation.conv_mode_label;
+                  const suffix = mode === 'explore' ? ' (read-only)' : '';
+                  const modeClass = `statebar-mode statebar-mode--${mode === 'standalone' ? 'direct' : mode}`;
+                  return (
+                    <span className={modeClass} title={
+                      mode === 'explore' ? 'Read-only mode (git project)' :
+                      mode === 'work' ? 'Write mode (task branch)' :
+                      'Full access (no git workflow)'
+                    }>
+                      {label}{suffix}
+                    </span>
+                  );
+                })()}
                 <span className="conv-model" title={`Model: ${conversation.model}`}>
                   {conversation.model}
                 </span>
