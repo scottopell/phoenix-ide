@@ -20,3 +20,4 @@ static/dist/
 # Tools
 .claude/
 .playwright-mcp/
+.phoenix/
