@@ -37,9 +37,9 @@
     "eslint-plugin-react-hooks": "^4.6.2",
     "eslint-plugin-react-refresh": "^0.4.7",
     "fast-check": "^4.5.3",
-    "jsdom": "^28.0.0",
+    "happy-dom": "^20.8.9",
     "typescript": "^5.2.2",
     "vite": "^5.3.4",
-    "vitest": "^1.6.1"
+    "vitest": "^3.2.4"
   }
 }
