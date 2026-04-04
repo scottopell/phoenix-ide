@@ -1516,6 +1516,12 @@ async fn confirm_complete(
         //       touch the main checkout). rename_status updates frontmatter
         //       and renames the file; we then `git add` both old and new paths
         //       so the change is included in the squash merge commit.
+        //
+        //       ORDERING INVARIANT: This runs after auto-stash (2a) and
+        //       merge --squash (2c), so the working tree is clean plus the
+        //       branch's changes. find_task_by_id reads the filesystem, so
+        //       it sees the merged state — not any dirty files that were
+        //       stashed. Do not reorder above the stash/merge steps.
         if !task_id.is_empty() {
             let tasks_dir = repo_root.join("tasks");
             match taskmd_core::tasks::find_task_by_id(&tasks_dir, &task_id) {

@@ -4631,100 +4631,6 @@ html * {
   color: #dc2626;
 }
 
-/* Bottom Sheet - New Conversation (REQ-UI-015) */
-.bottom-sheet-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  z-index: 1000;
-  display: flex;
-  align-items: flex-end;
-  animation: sheet-overlay-in 200ms ease;
-}
-
-@keyframes sheet-overlay-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-.bottom-sheet {
-  width: 100%;
-  max-height: 85vh;
-  background: var(--bg-primary);
-  border-radius: 16px 16px 0 0;
-  overflow-y: auto;
-  animation: sheet-slide-up 250ms ease;
-}
-
-.bottom-sheet.animating {
-  transition: transform 250ms ease;
-}
-
-@keyframes sheet-slide-up {
-  from { transform: translateY(100%); }
-  to { transform: translateY(0); }
-}
-
-.bottom-sheet-handle {
-  display: flex;
-  justify-content: center;
-  padding: 12px 0 8px;
-  cursor: grab;
-  touch-action: none;
-}
-
-.bottom-sheet-handle-bar {
-  width: 36px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--text-muted);
-  opacity: 0.4;
-}
-
-.bottom-sheet-content {
-  padding: 0 16px 24px;
-  padding-bottom: max(24px, env(safe-area-inset-bottom));
-}
-
-.bottom-sheet-title {
-  font-size: 18px;
-  font-weight: 600;
-  margin-bottom: 16px;
-  color: var(--text-primary);
-}
-
-.bottom-sheet-settings {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.bottom-sheet-textarea {
-  width: 100%;
-  min-height: 80px;
-  max-height: 150px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  font-size: 15px;
-  font-family: inherit;
-  resize: vertical;
-  margin-bottom: 12px;
-  box-sizing: border-box;
-}
-
-.bottom-sheet-textarea:focus {
-  outline: none;
-  border-color: var(--accent-blue, #3b82f6);
-}
-
-.bottom-sheet-send {
-  width: 100%;
-}
-
 /* ======================================================== */
 /* Desktop Sidebar Layout (REQ-UI-016, 017, 018)           */
 /* ======================================================== */
@@ -5025,99 +4931,6 @@ html * {
 }
 
 /* --- Sidebar Inline New Form (REQ-UI-018) --- */
-.sidebar-new-form {
-  padding: 8px 12px 12px;
-  border-bottom: 1px solid var(--border-color);
-  background: var(--bg-primary);
-  flex-shrink: 0;
-}
-
-.sidebar-new-form-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.sidebar-new-form-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.sidebar-new-form-close {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: 18px;
-  padding: 0 4px;
-  line-height: 1;
-}
-
-.sidebar-new-form-close:hover {
-  color: var(--text-primary);
-}
-
-.sidebar-new-form-fields {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.sidebar-new-form-fields .settings-field {
-  margin-bottom: 0;
-}
-
-.sidebar-new-form-fields .settings-field-label {
-  font-size: 11px;
-}
-
-.sidebar-new-form-fields .settings-input,
-.sidebar-new-form-fields .settings-select {
-  font-size: 13px;
-  padding: 6px 8px;
-}
-
-.sidebar-new-form-textarea {
-  width: 100%;
-  min-height: 50px;
-  max-height: 100px;
-  padding: 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  font-size: 13px;
-  font-family: inherit;
-  resize: vertical;
-  margin-bottom: 8px;
-  box-sizing: border-box;
-}
-
-.sidebar-new-form-textarea:focus {
-  outline: none;
-  border-color: var(--accent-blue, #3b82f6);
-}
-
-.sidebar-new-form-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.sidebar-new-form-bg {
-  flex: 1;
-  font-size: 12px;
-  padding: 5px 8px;
-}
-
-.sidebar-new-form-send {
-  flex: 1;
-  font-size: 12px;
-  padding: 5px 8px;
-}
-
 /* --- Desktop main area overrides --- */
 .desktop-main #app {
   height: 100%;
@@ -5131,48 +4944,7 @@ html * {
   height: 100%;
 }
 
-/* Background toast */
-.bg-toast {
-  position: fixed;
-  bottom: 80px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--accent-green, #22c55e);
-  color: #fff;
-  padding: 8px 20px;
-  border-radius: 20px;
-  font-size: 13px;
-  font-weight: 500;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.3);
-  z-index: 1000;
-  animation: bg-toast-in 200ms ease;
-}
 
-@keyframes bg-toast-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
-  to { opacity: 1; transform: translateX(-50%) translateY(0); }
-}
-
-/* Send in Background button */
-.new-conv-send-bg {
-  background: none;
-  border: 1px solid var(--border-color);
-  color: var(--text-secondary);
-  padding: 6px 12px;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.new-conv-send-bg:hover:not(:disabled) {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
-.new-conv-send-bg:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
 
 .new-conv-input-right {
   display: flex;
@@ -5246,8 +5018,9 @@ html * {
 /* Individual item */
 .iac-item {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 2px;
   width: 100%;
   padding: 6px 10px;
   background: none;
@@ -5266,7 +5039,7 @@ html * {
 }
 
 .iac-item-label {
-  flex: 1;
+  width: 100%;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -5276,7 +5049,11 @@ html * {
 .iac-item-subtitle {
   font-size: 11px;
   color: var(--text-muted);
-  flex-shrink: 0;
+  width: 100%;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Inline expansion error (REQ-IR-007) */
