@@ -589,12 +589,13 @@ def cmd_check():
                 "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
             ])
 
-    print("Running 8 checks in parallel...\n")
+    print("Running 9 checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
         threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
+        threading.Thread(target=run_step, args=("vitest", ["npx", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
     ]
