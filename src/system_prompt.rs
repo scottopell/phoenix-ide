@@ -33,6 +33,7 @@ pub enum ModeContext {
     Work {
         branch_name: String,
         base_branch: String,
+        worktree_path: String,
     },
     /// Non-git directory or explicit opt-out. Full tool access.
     Standalone,
@@ -453,14 +454,19 @@ pub fn build_system_prompt_with_home(
             ModeContext::Work {
                 branch_name,
                 base_branch,
+                worktree_path,
             } => {
                 let _ = write!(
                     prompt,
                     "\n\nYou are in Work mode on branch {branch_name}, targeting \
-                     {base_branch}. You have full write access to the worktree. Make \
-                     changes using bash and the patch tool.\n\n\
+                     {base_branch}.\n\
+                     Your working directory is {worktree_path}. All file edits and \
+                     bash commands MUST stay inside this worktree. Do NOT modify \
+                     files in the main checkout or repo root.\n\
+                     Use bash and the patch tool to make changes.\n\n\
                      When the work is complete, let the user know. They will initiate \
-                     the merge to {base_branch} when ready."
+                     the merge to {base_branch} when ready. Task-file status renames \
+                     are handled automatically during merge."
                 );
             }
             ModeContext::Standalone => {
@@ -816,5 +822,23 @@ mod tests {
         let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
 
         assert!(!prompt.contains("<available_skills>"));
+    }
+
+    #[test]
+    fn test_work_mode_prompt_includes_worktree_boundary() {
+        let temp = TempDir::new().unwrap();
+        let mode = ModeContext::Work {
+            branch_name: "task-42-fix-bug".to_string(),
+            base_branch: "main".to_string(),
+            worktree_path: "/home/user/project/worktrees/abc123".to_string(),
+        };
+        let prompt =
+            build_system_prompt_with_home(temp.path(), false, Some(&mode), Some(temp.path()));
+
+        assert!(prompt.contains("Work mode"));
+        assert!(prompt.contains("task-42-fix-bug"));
+        assert!(prompt.contains("/home/user/project/worktrees/abc123"));
+        assert!(prompt.contains("MUST stay inside this worktree"));
+        assert!(prompt.contains("Task-file status renames"));
     }
 }

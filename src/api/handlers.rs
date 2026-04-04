@@ -1434,16 +1434,17 @@ async fn confirm_complete(
         ));
     }
 
-    let (branch_name, worktree_path, base_branch) = match &conv.conv_mode {
+    let (branch_name, worktree_path, base_branch, task_id) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
             base_branch,
-            ..
+            task_id,
         } => (
             branch_name.clone(),
             worktree_path.clone(),
             base_branch.clone(),
+            task_id.clone(),
         ),
         _ => {
             return Err(AppError::BadRequest(
@@ -1509,6 +1510,42 @@ async fn confirm_complete(
             // Attempt to recover by aborting the merge
             let _ = run_git(&repo_root, &["merge", "--abort"]);
             return Err(AppError::Internal(format!("Squash merge failed: {e}")));
+        }
+
+        // 2c½. Mark task file as done (server-side, so agents don't need to
+        //       touch the main checkout). rename_status updates frontmatter
+        //       and renames the file; we then `git add` both old and new paths
+        //       so the change is included in the squash merge commit.
+        if !task_id.is_empty() {
+            let tasks_dir = repo_root.join("tasks");
+            match taskmd_core::tasks::find_task_by_id(&tasks_dir, &task_id) {
+                Some(task) if task.status != "done" => {
+                    match taskmd_core::tasks::rename_status(&tasks_dir, &task_id, "done") {
+                        Ok((old_filename, new_filename)) => {
+                            tracing::info!(
+                                old = %old_filename,
+                                new = %new_filename,
+                                "Server-side task rename to done during merge"
+                            );
+                            // Stage both the removal of the old file and addition of the new
+                            let _ = run_git(&repo_root, &["add", &format!("tasks/{old_filename}"), &format!("tasks/{new_filename}")]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                task_id = %task_id,
+                                "Failed to rename task file to done (non-fatal)"
+                            );
+                        }
+                    }
+                }
+                Some(_) => {
+                    tracing::debug!(task_id = %task_id, "Task file already marked done");
+                }
+                None => {
+                    tracing::debug!(task_id = %task_id, "No task file found (may have been deleted)");
+                }
+            }
         }
 
         // 2d. Commit (skip if merge --squash produced no changes, e.g., only task file)

@@ -701,10 +701,12 @@ fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
         ConvMode::Work {
             branch_name,
             base_branch,
+            worktree_path,
             ..
         } => ModeContext::Work {
             branch_name: branch_name.clone(),
             base_branch: base_branch.clone(),
+            worktree_path: worktree_path.clone(),
         },
         ConvMode::Standalone => ModeContext::Standalone,
     }
