@@ -3,7 +3,6 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getDisplayState } from '../api';
 import type { Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
-import { SidebarNewForm } from './SidebarNewForm';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
 
@@ -14,7 +13,6 @@ interface SidebarProps {
   archivedConversations: Conversation[];
   activeSlug: string | null;
   onConversationCreated: () => void;
-  showToast: (message: string, duration?: number) => void;
 }
 
 export function Sidebar({
@@ -24,11 +22,9 @@ export function Sidebar({
   archivedConversations,
   activeSlug,
   onConversationCreated,
-  showToast,
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [showNewForm, setShowNewForm] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
@@ -52,29 +48,13 @@ export function Sidebar({
     return archivedConversations.filter(c => c.project_id === activeProjectId);
   }, [archivedConversations, activeProjectId]);
 
-  // Close inline form when navigating to root (where full form is visible)
-  useEffect(() => {
-    if (location.pathname === '/' || location.pathname === '/new') {
-      setShowNewForm(false);
-    }
-  }, [location.pathname]);
-
   const handleNewClick = useCallback(() => {
-    if (location.pathname === '/' || location.pathname === '/new') {
-      return; // No-op, already on new conversation
-    }
-    setShowNewForm(true);
-  }, [location.pathname]);
-
-  const handleConversationClick = useCallback((conv: Conversation) => {
-    setShowNewForm(false);
-    navigate(`/c/${conv.slug}`);
+    navigate('/new');
   }, [navigate]);
 
-  const handleFormCreated = useCallback(() => {
-    setShowNewForm(false);
-    onConversationCreated();
-  }, [onConversationCreated]);
+  const handleConversationClick = useCallback((conv: Conversation) => {
+    navigate(`/c/${conv.slug}`);
+  }, [navigate]);
 
   const handleArchive = useCallback(async (conv: Conversation) => {
     try {
@@ -172,13 +152,6 @@ export function Sidebar({
           + New
         </button>
       </div>
-      {showNewForm && (
-        <SidebarNewForm
-          onClose={() => setShowNewForm(false)}
-          onCreated={handleFormCreated}
-          showToast={showToast}
-        />
-      )}
       {projects.length > 0 && (
         <div className="project-tabs">
           <button

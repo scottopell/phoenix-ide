@@ -99,7 +99,6 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           archivedConversations={archivedConversations}
           activeSlug={activeSlug}
           onConversationCreated={() => loadConversations(true)}
-          showToast={showSuccess}
         />
         {activeSlug && (
           <FileExplorerPanel

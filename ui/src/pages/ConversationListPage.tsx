@@ -8,7 +8,6 @@ import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
-import { NewConversationSheet } from '../components/NewConversationSheet';
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -38,8 +37,6 @@ export function ConversationListPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
 
-  // Bottom sheet for new conversation on mobile (REQ-UI-015)
-  const [showNewSheet, setShowNewSheet] = useState(false);
 
   // Listen for storage warnings
   useEffect(() => {
@@ -153,12 +150,7 @@ export function ConversationListPage() {
   }, [navigate]);
 
   const handleNewConversation = () => {
-    // Mobile: show bottom sheet. Desktop: navigate to /new page.
-    if (window.matchMedia('(max-width: 767px)').matches) {
-      setShowNewSheet(true);
-    } else {
-      navigate('/new');
-    }
+    navigate('/new');
   };
 
   const handleArchive = async (conv: Conversation) => {
@@ -352,10 +344,6 @@ export function ConversationListPage() {
           setRenameTarget(null);
           setRenameError(undefined);
         }}
-      />
-      <NewConversationSheet
-        isOpen={showNewSheet}
-        onClose={() => setShowNewSheet(false)}
       />
     </div>
   );
