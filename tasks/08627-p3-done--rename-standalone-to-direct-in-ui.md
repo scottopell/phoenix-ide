@@ -1,7 +1,7 @@
 ---
 created: 2026-04-03
 priority: p3
-status: ready
+status: done
 artifact: ui/src/components/ConversationList.tsx
 ---
 
