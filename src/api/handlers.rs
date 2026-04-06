@@ -188,6 +188,27 @@ fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &
     }
 }
 
+/// How many commits the task branch is ahead of the base branch.
+/// Shells out to `git rev-list --count`. Returns 0 on any error.
+///
+/// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
+fn commits_ahead(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
+    let range = format!("{base_branch}..{task_branch}");
+    match run_git(repo_root, &["rev-list", "--count", &range]) {
+        Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
+        Err(e) => {
+            tracing::debug!(
+                repo = %repo_root.display(),
+                base_branch,
+                task_branch,
+                error = %e,
+                "commits_ahead check failed, returning 0"
+            );
+            0
+        }
+    }
+}
+
 /// Merge pre-computed `display_data` into content blocks.
 ///
 /// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
@@ -873,15 +894,32 @@ async fn stream_conversation(
         _ => None,
     };
 
-    let initial_commits_behind = if let Some((ref repo_root, ref base, ref task)) = work_git_info {
-        let root = repo_root.clone();
-        let base = base.clone();
-        let task = task.clone();
-        tokio::task::spawn_blocking(move || commits_behind(&root, &base, &task))
-            .await
-            .unwrap_or(0)
+    let (initial_commits_behind, initial_commits_ahead) =
+        if let Some((ref repo_root, ref base, ref task)) = work_git_info {
+            let root1 = repo_root.clone();
+            let base1 = base.clone();
+            let task1 = task.clone();
+            let root2 = repo_root.clone();
+            let base2 = base.clone();
+            let task2 = task.clone();
+            let (behind, ahead) = tokio::join!(
+                tokio::task::spawn_blocking(move || commits_behind(&root1, &base1, &task1)),
+                tokio::task::spawn_blocking(move || commits_ahead(&root2, &base2, &task2)),
+            );
+            (behind.unwrap_or(0), ahead.unwrap_or(0))
+        } else {
+            (0, 0)
+        };
+
+    // Derive project_name from the project's canonical_path (repo root dirname).
+    let project_name = if let Some(ref project_id) = conversation.project_id {
+        state.db.get_project(project_id).await.ok().and_then(|p| {
+            std::path::Path::new(&p.canonical_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
     } else {
-        0
+        None
     };
 
     // Create init event with typed data -- serialization deferred to SSE layer
@@ -895,26 +933,35 @@ async fn stream_conversation(
         model_context_window,
         breadcrumbs,
         commits_behind: initial_commits_behind,
+        commits_ahead: initial_commits_ahead,
+        project_name,
     };
 
-    // Spawn periodic commits-behind polling for Work conversations (REQ-PROJ-011)
+    // Spawn periodic git delta polling for Work conversations (REQ-PROJ-011)
     if let Some((repo_root, base_branch, task_branch)) = work_git_info {
         let broadcast_tx = handle.broadcast_tx.clone();
         tokio::spawn(async move {
-            let mut last_value = initial_commits_behind;
+            let mut last_behind = initial_commits_behind;
+            let mut last_ahead = initial_commits_ahead;
             loop {
                 tokio::time::sleep(std::time::Duration::from_mins(1)).await;
 
-                let root = repo_root.clone();
-                let base = base_branch.clone();
-                let task = task_branch.clone();
-                let new_value =
-                    tokio::task::spawn_blocking(move || commits_behind(&root, &base, &task))
-                        .await
-                        .unwrap_or(last_value);
+                let root1 = repo_root.clone();
+                let base1 = base_branch.clone();
+                let task1 = task_branch.clone();
+                let root2 = repo_root.clone();
+                let base2 = base_branch.clone();
+                let task2 = task_branch.clone();
+                let (new_behind, new_ahead) = tokio::join!(
+                    tokio::task::spawn_blocking(move || commits_behind(&root1, &base1, &task1)),
+                    tokio::task::spawn_blocking(move || commits_ahead(&root2, &base2, &task2)),
+                );
+                let new_behind = new_behind.unwrap_or(last_behind);
+                let new_ahead = new_ahead.unwrap_or(last_ahead);
 
-                if new_value != last_value {
-                    last_value = new_value;
+                if new_behind != last_behind || new_ahead != last_ahead {
+                    last_behind = new_behind;
+                    last_ahead = new_ahead;
                     let result = broadcast_tx.send(SseEvent::ConversationUpdate {
                         update: crate::runtime::ConversationMetadataUpdate {
                             cwd: None,
@@ -922,7 +969,8 @@ async fn stream_conversation(
                             worktree_path: None,
                             conv_mode_label: None,
                             base_branch: None,
-                            commits_behind: Some(new_value),
+                            commits_behind: Some(new_behind),
+                            commits_ahead: Some(new_ahead),
                         },
                     });
                     // No receivers left -- client disconnected, exit polling loop
@@ -931,7 +979,7 @@ async fn stream_conversation(
                     }
                 }
             }
-            tracing::debug!("commits-behind polling task exited");
+            tracing::debug!("git delta polling task exited");
         });
     }
 
@@ -1677,6 +1725,7 @@ async fn confirm_complete(
                 conv_mode_label: Some("Explore".to_string()),
                 base_branch: None,
                 commits_behind: None,
+                commits_ahead: None,
             },
         });
     }
@@ -1897,6 +1946,7 @@ async fn abandon_task(
                 conv_mode_label: Some("Explore".to_string()),
                 base_branch: None,
                 commits_behind: None,
+                commits_ahead: None,
             },
         });
     }

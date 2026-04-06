@@ -13,9 +13,11 @@ export interface Conversation {
   worktree_path?: string | null;
   base_branch?: string | null;
   commits_behind?: number;
+  commits_ahead?: number;
   archived?: boolean;
   project_id?: string | null;
   conv_mode_label?: string;
+  project_name?: string | null;
 }
 
 export interface Project {
@@ -161,6 +163,8 @@ export interface SseInitData {
   breadcrumbs?: SseBreadcrumb[];
   /** How many commits the base branch is ahead of the task branch (Work mode only) */
   commits_behind?: number;
+  commits_ahead?: number;
+  project_name?: string | null;
 }
 
 export interface SseMessageData {

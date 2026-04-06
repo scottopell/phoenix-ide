@@ -91,6 +91,8 @@ pub struct ConversationMetadataUpdate {
     pub base_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commits_behind: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commits_ahead: Option<u32>,
 }
 
 /// A conversation enriched with derived display fields for the API layer.
@@ -140,6 +142,10 @@ pub enum SseEvent {
         /// How many commits the base branch is ahead of this conversation's task branch.
         /// Only populated for Work-mode conversations. 0 means up-to-date or not applicable.
         commits_behind: u32,
+        /// How many commits the task branch is ahead of the base branch.
+        commits_ahead: u32,
+        /// Human-readable project name derived from the repo root directory name.
+        project_name: Option<String>,
     },
     Message {
         message: crate::db::Message,

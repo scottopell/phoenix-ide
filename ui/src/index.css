@@ -8,7 +8,7 @@
 
 :root {
   /* Layout constants */
-  --state-bar-height: 52px;
+  --state-bar-height: 42px;
   --breadcrumb-height: 36px;
   --input-area-height: 60px;
   --offline-banner-height: 36px;
@@ -173,31 +173,7 @@ body {
   white-space: nowrap;
 }
 
-#conv-slug {
-  font-size: 13px;
-  color: var(--text-secondary);
-  cursor: pointer;
-  text-decoration: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-#conv-slug:hover {
-  color: var(--accent-blue);
-}
-
-#conv-slug .back-arrow {
-  font-size: 16px;
-  opacity: 0.7;
-}
-
-#conv-slug:hover .back-arrow {
-  opacity: 1;
-}
+/* (conv-slug replaced by .statebar-slug in state bar layout section) */
 
 /* Breadcrumb Bar */
 #breadcrumb-bar {
@@ -2018,32 +1994,147 @@ pre:hover .copy-btn {
   justify-content: center;
   min-width: 0;
   overflow: hidden;
-  gap: 2px;
+  gap: 1px;
 }
 
-.conv-meta {
+/* Line 1: slug + mode pill + model */
+.statebar-line1 {
   display: flex;
   align-items: center;
   gap: 6px;
   font-size: 11px;
   color: var(--text-muted);
-  padding-left: 22px; /* Align with slug text after arrow */
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Hide slug/back-arrow on desktop when sidebar is visible */
+@media (min-width: 1025px) {
+  .statebar-slug {
+    display: none;
+  }
+}
+
+.statebar-slug {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+  font-size: 12px;
+}
+
+.statebar-slug:hover {
+  color: var(--text-primary);
+}
+
+.statebar-slug .back-arrow {
+  flex-shrink: 0;
+}
+
+.statebar-slug .slug-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .conv-model {
   color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
-.conv-separator {
+/* Line 2: git flow + delta badges + project name */
+.statebar-line2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Git flow: base <- branch */
+.git-flow {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.git-base {
+  color: var(--text-secondary);
+  font-family: monospace;
+  font-size: 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.git-arrow {
+  color: var(--text-muted);
   opacity: 0.5;
+  flex-shrink: 0;
+  font-size: 10px;
 }
 
-.conv-cwd {
-  opacity: 0.8;
-  max-width: 200px;
+.git-branch {
+  color: var(--text-muted);
+  font-family: monospace;
+  font-size: 10px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.git-branch-solo {
+  font-family: monospace;
+  font-size: 10px;
+  color: var(--text-muted);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+/* Git delta badges */
+.git-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-family: monospace;
+  padding: 0 4px;
+  border-radius: 4px;
+  white-space: nowrap;
+  font-weight: 500;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+.git-badge--ahead {
+  color: var(--accent-green);
+  background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+}
+
+.git-badge--behind {
+  color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
+}
+
+/* Project name -- right-aligned via margin-left auto */
+.statebar-project {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 10px;
+  opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
 }
 
 /* StateBar mode indicator pill */
@@ -2056,6 +2147,7 @@ pre:hover .copy-btn {
   letter-spacing: 0.3px;
   white-space: nowrap;
   line-height: 1.4;
+  flex-shrink: 0;
 }
 
 .statebar-mode--explore {
@@ -5576,23 +5668,7 @@ html * {
   background: var(--accent-purple, #7c3aed);
 }
 
-/* --- Branch name display --- */
-
-.conv-branch {
-  display: inline-block;
-  font-size: 11px;
-  color: var(--text-muted);
-  font-family: monospace;
-  padding: 1px 6px;
-  background: var(--bg-tertiary);
-  border-radius: 4px;
-  margin-left: 8px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 200px;
-  vertical-align: middle;
-}
+/* (conv-branch replaced by .git-branch in state bar layout section) */
 
 /* --- Task Approval Reader --- */
 
@@ -5750,20 +5826,7 @@ html * {
   text-decoration: underline;
 }
 
-/* --- Commits-behind badge --- */
-
-.conv-behind-badge {
-  display: inline-block;
-  font-size: 10px;
-  color: var(--accent-yellow, #eab308);
-  font-family: monospace;
-  padding: 1px 5px;
-  background: color-mix(in srgb, var(--accent-yellow, #eab308) 12%, transparent);
-  border-radius: 4px;
-  margin-left: 4px;
-  white-space: nowrap;
-  vertical-align: middle;
-}
+/* (conv-behind-badge replaced by .git-badge--behind in state bar layout section) */
 
 /* --- Work Actions (inline bar above input area) --- */
 
@@ -5775,10 +5838,13 @@ html * {
   font-size: 12px;
   color: var(--text-secondary);
   flex-wrap: wrap;
+  border-top: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--bg-tertiary) 50%, transparent);
 }
 
 .work-actions-label {
-  margin-right: auto;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .work-actions-btn {

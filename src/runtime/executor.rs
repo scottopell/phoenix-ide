@@ -1590,6 +1590,7 @@ where
                         conv_mode_label: Some("Work".to_string()),
                         base_branch: Some(approval_result.base_branch.clone()),
                         commits_behind: None,
+                        commits_ahead: None,
                     },
                 });
 

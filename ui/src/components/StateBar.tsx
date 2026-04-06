@@ -22,6 +22,34 @@ interface StateBarProps {
   onTriggerContinuation?: () => void;
 }
 
+/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-4o" -> "gpt-4o" */
+function abbreviateModel(model: string): string {
+  // Claude models: strip "claude-" prefix, convert trailing version hyphen to dot
+  if (!model.startsWith('claude-')) return model;
+  const inner = model.slice(7); // strip "claude-"
+  const lastHyphen = inner.lastIndexOf('-');
+  if (lastHyphen > 0 && /^\d+$/.test(inner.slice(lastHyphen + 1))) {
+    return inner.slice(0, lastHyphen) + '.' + inner.slice(lastHyphen + 1);
+  }
+  return inner;
+}
+
+/** Extract project name from cwd, project_name field, or worktree path */
+function getProjectName(conversation: Conversation): string | null {
+  // Prefer explicit project_name from backend
+  if (conversation.project_name) return conversation.project_name;
+
+  // For non-work modes, extract from cwd
+  const cwd = conversation.cwd;
+  if (!cwd) return null;
+
+  // Skip worktree UUIDs -- they're meaningless
+  if (cwd.includes('.phoenix/worktrees/')) return null;
+
+  const parts = cwd.replace(/\/$/, '').split('/');
+  return parts[parts.length - 1] || null;
+}
+
 export function StateBar({
   conversation,
   convState,
@@ -150,20 +178,6 @@ export function StateBar({
 
   const tooltipText = `Context window usage: ${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%). When full, the conversation will need to be summarized.`;
 
-  // Format cwd for display - replace home dir with ~, show last 2 path components
-  const formatCwd = (cwd: string): string => {
-    // Replace /Users/<name> or /home/<name> with ~
-    const homeMatch = cwd.match(/^(\/(?:Users|home)\/[^/]+)/);
-    let display = cwd;
-    if (homeMatch?.[1]) {
-      display = '~' + cwd.slice(homeMatch[1].length);
-      if (display === '~') display = '~/';
-    }
-    const parts = display.split('/').filter(Boolean);
-    if (parts.length <= 2) return display;
-    return '.../' + parts.slice(-2).join('/');
-  };
-
   // Show menu trigger only when warning threshold reached and in idle state
   const canTriggerContinuation = contextWarning && convState.type === 'idle' && onTriggerContinuation;
 
@@ -172,63 +186,89 @@ export function StateBar({
     onTriggerContinuation?.();
   };
 
+  // Derived display values
+  const mode = conversation?.conv_mode_label?.toLowerCase();
+  const isWork = mode === 'work';
+  const isExplore = mode === 'explore';
+  const modeLabel = mode === 'standalone' ? 'Direct' : conversation?.conv_mode_label;
+  const modeSuffix = isExplore ? ' (read-only)' : '';
+  const modeClass = `statebar-mode statebar-mode--${mode === 'standalone' ? 'direct' : mode}`;
+  const modelAbbrev = conversation ? abbreviateModel(conversation.model) : '';
+  const projectName = conversation ? getProjectName(conversation) : null;
+
+  // Git delta badges
+  const ahead = conversation?.commits_ahead;
+  const behind = conversation?.commits_behind;
+  const baseBranch = conversation?.base_branch;
+  const branchName = conversation?.branch_name;
+
   return (
     <>
       <header id="state-bar">
         <div id="state-bar-left">
           {conversation ? (
             <>
-              <Link to="/" id="conv-slug" title="Back to conversations">
-                <span className="back-arrow">←</span>
-                {conversation.slug}
-              </Link>
-              <div className="conv-meta">
-                {conversation.conv_mode_label && (() => {
-                  const mode = conversation.conv_mode_label.toLowerCase();
-                  const label = mode === 'standalone' ? 'Direct' : conversation.conv_mode_label;
-                  const suffix = mode === 'explore' ? ' (read-only)' : '';
-                  const modeClass = `statebar-mode statebar-mode--${mode === 'standalone' ? 'direct' : mode}`;
-                  return (
-                    <span className={modeClass} title={
-                      mode === 'explore' ? 'Read-only mode (git project)' :
-                      mode === 'work' ? 'Write mode (task branch)' :
-                      'Full access (no git workflow)'
-                    }>
-                      {label}{suffix}
-                    </span>
-                  );
-                })()}
+              {/* Line 1: nav slug + mode + model */}
+              <div className="statebar-line1">
+                <Link to="/" className="statebar-slug" title="Back to conversations">
+                  <span className="back-arrow">&larr;</span>
+                  <span className="slug-text">{conversation.slug}</span>
+                </Link>
+                {modeLabel && (
+                  <span className={modeClass} title={
+                    isExplore ? 'Read-only mode (git project)' :
+                    isWork ? 'Write mode (task branch)' :
+                    'Full access (no git workflow)'
+                  }>
+                    {modeLabel}{modeSuffix}
+                  </span>
+                )}
                 <span className="conv-model" title={`Model: ${conversation.model}`}>
-                  {conversation.model}
-                </span>
-                <span className="conv-separator">•</span>
-                <span className="conv-cwd" title={conversation.cwd}>
-                  {formatCwd(conversation.cwd)}
+                  {modelAbbrev}
                 </span>
               </div>
-              {conversation.branch_name && (
-                <>
-                  <span
-                    className="conv-branch"
-                    title={conversation.worktree_path
-                      ? `Branch: ${conversation.branch_name}\nWorktree: ${conversation.worktree_path}`
-                      : `Branch: ${conversation.branch_name}`}
-                  >
-                    {conversation.branch_name}
-                  </span>
-                  {conversation.commits_behind != null && conversation.commits_behind > 0 && (
-                    <span
-                      className="conv-behind-badge"
-                      title={`${conversation.commits_behind} commit(s) behind ${conversation.base_branch || 'base branch'}`}
-                    >
-                      {conversation.commits_behind} behind
+
+              {/* Line 2: git info (Work/Explore) or project name */}
+              {(branchName || projectName) && (
+                <div className="statebar-line2">
+                  {branchName && baseBranch && (
+                    <span className="git-flow" title={`${baseBranch} <- ${branchName}`}>
+                      <span className="git-base">{baseBranch}</span>
+                      <span className="git-arrow">&larr;</span>
+                      <span className="git-branch">{branchName}</span>
                     </span>
                   )}
-                </>
+                  {branchName && !baseBranch && (
+                    <span className="git-branch-solo" title={`Branch: ${branchName}`}>
+                      {branchName}
+                    </span>
+                  )}
+                  {ahead != null && ahead > 0 && (
+                    <span
+                      className="git-badge git-badge--ahead"
+                      title={`${ahead} commit(s) ahead of ${baseBranch || 'base'}`}
+                    >
+                      +{ahead}
+                    </span>
+                  )}
+                  {behind != null && behind > 0 && (
+                    <span
+                      className="git-badge git-badge--behind"
+                      title={`${behind} commit(s) behind ${baseBranch || 'base'} -- may need rebase`}
+                    >
+                      -{behind}
+                    </span>
+                  )}
+                  {projectName && (
+                    <span className="statebar-project" title={conversation.cwd}>
+                      {projectName}
+                    </span>
+                  )}
+                </div>
               )}
             </>
           ) : (
-            <span id="conv-slug">—</span>
+            <span className="statebar-slug">&mdash;</span>
           )}
         </div>
         <div id="state-bar-right">
@@ -237,30 +277,30 @@ export function StateBar({
             <span id="state-text">{stateText}</span>
           </div>
           {conversation && contextWindowUsed > 0 && (
-            <div 
-              className={contextClass} 
+            <div
+              className={contextClass}
               title={tooltipText}
               ref={menuRef}
             >
-              <div 
+              <div
                 className="context-bar-wrapper"
                 onClick={() => canTriggerContinuation && setMenuOpen(!menuOpen)}
                 style={{ cursor: canTriggerContinuation ? 'pointer' : 'default' }}
               >
                 <div className="context-bar">
-                  <div 
-                    className="context-fill" 
+                  <div
+                    className="context-fill"
                     style={{ width: `${contextPercent}%` }}
                   />
                 </div>
                 <span className="context-label">{formatTokens(contextWindowUsed)}</span>
                 {canTriggerContinuation && (
-                  <span className="context-menu-indicator">▼</span>
+                  <span className="context-menu-indicator">&#9660;</span>
                 )}
               </div>
               {menuOpen && canTriggerContinuation && (
                 <div className="context-menu">
-                  <button 
+                  <button
                     className="context-menu-item"
                     onClick={handleTriggerContinuation}
                   >
@@ -277,7 +317,6 @@ export function StateBar({
       </header>
       {showOfflineBanner && (
         <div className="offline-banner">
-          <span className="offline-banner-icon">📡</span>
           <span className="offline-banner-text">
             Connection lost. Reconnecting in {nextRetryIn}s...
           </span>
