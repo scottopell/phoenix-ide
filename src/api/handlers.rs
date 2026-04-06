@@ -1471,7 +1471,7 @@ async fn confirm_complete(
     let base_branch_for_msg = base_branch.clone();
 
     // 2. Execute merge sequence (blocking, under global mutex)
-    let merge_result = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+    let merge_result = tokio::task::spawn_blocking(move || -> Result<(String, Option<String>), AppError> {
         let _guard = TASK_APPROVAL_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1608,48 +1608,47 @@ async fn confirm_complete(
         }
 
         // 2h. Pop auto-stash if we stashed earlier
-        if did_stash {
+        let stash_warning = if did_stash {
             if let Err(e) = run_git(&repo_root, &["stash", "pop"]) {
-                // This shouldn't happen -- we checked for conflicts before offering
-                // the button. But if it does, the stash is preserved and the user
-                // can recover manually.
                 tracing::warn!(error = %e, "Auto-stash pop failed (stash preserved)");
+                Some(format!(
+                    "Warning: your uncommitted changes could not be restored automatically \
+                     (git stash pop failed: {e}). Run `git stash pop` manually to recover them."
+                ))
             } else {
                 tracing::info!("Auto-stash popped successfully after merge");
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        Ok(short_sha)
+        Ok((short_sha, stash_warning))
     })
     .await
     .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?;
 
-    let short_sha = merge_result?;
+    let (short_sha, stash_warning) = merge_result?;
 
-    // 3. Update conversation state to Terminal
+    // 3. Atomically update state, mode, and cwd in a single transaction
     state
         .db
-        .update_conversation_state(&id, &ConvState::Terminal)
+        .finalize_conversation(
+            &id,
+            &ConvState::Terminal,
+            &ConvMode::Explore,
+            &repo_root_str,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 4. Update conv_mode to Explore
-    state
-        .db
-        .update_conversation_mode(&id, &ConvMode::Explore)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 5. Update cwd from deleted worktree to repo root
-    state
-        .db
-        .update_conversation_cwd(&id, &repo_root_str)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 6. Inject system message
-    let system_msg =
+    // 4. Inject system message (include stash warning if pop failed)
+    let mut system_msg =
         format!("Task completed. Squash merged to {base_branch_for_msg} as {short_sha}.");
+    if let Some(ref warning) = stash_warning {
+        use std::fmt::Write;
+        let _ = write!(system_msg, "\n\n{warning}");
+    }
     let msg_id = uuid::Uuid::new_v4().to_string();
     let msg = state
         .db
@@ -1685,6 +1684,7 @@ async fn confirm_complete(
     Ok(Json(ConfirmCompleteResponse {
         success: true,
         commit_sha: short_sha,
+        warning: stash_warning,
     }))
 }
 
@@ -1855,29 +1855,20 @@ async fn abandon_task(
     .await
     .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
 
-    // 3. Update conversation state to Terminal
-    state
-        .db
-        .update_conversation_state(&id, &ConvState::Terminal)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 4. Update conv_mode to Explore
-    state
-        .db
-        .update_conversation_mode(&id, &ConvMode::Explore)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 5. Update cwd from deleted worktree to repo root
+    // 3. Atomically update state, mode, and cwd in a single transaction
     let repo_root_str = repo_root.display().to_string();
     state
         .db
-        .update_conversation_cwd(&id, &repo_root_str)
+        .finalize_conversation(
+            &id,
+            &ConvState::Terminal,
+            &ConvMode::Explore,
+            &repo_root_str,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // 6. Inject system message
+    // 4. Inject system message
     let msg_id = uuid::Uuid::new_v4().to_string();
     let msg = state
         .db

@@ -1,7 +1,7 @@
 ---
 created: 2026-04-06
 priority: p1
-status: ready
+status: done
 artifact: src/tools/subagent.rs
 ---
 
