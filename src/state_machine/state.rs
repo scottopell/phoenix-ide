@@ -55,6 +55,12 @@ pub struct SubAgentTask {
     pub task: String,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub mode: Option<SubAgentMode>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 /// Input for the `spawn_agents` tool (parent only)
@@ -588,6 +594,17 @@ impl ConvState {
 // Sub-Agent Types
 // ============================================================================
 
+/// Mode for sub-agent execution (REQ-PROJ-008)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentMode {
+    /// Read-only tools, cheaper model default (haiku)
+    #[default]
+    Explore,
+    /// Full tool suite, inherits parent model
+    Work,
+}
+
 /// Outcome of a sub-agent execution - pit of success design
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -608,6 +625,8 @@ pub enum SubAgentOutcome {
 pub struct PendingSubAgent {
     pub agent_id: String,
     pub task: String,
+    #[serde(default)]
+    pub mode: SubAgentMode,
 }
 
 /// Result from a completed sub-agent
@@ -626,6 +645,12 @@ pub struct SubAgentSpec {
     pub cwd: String,
     /// Mandatory timeout — caller must make a conscious decision (REQ-SA-006)
     pub timeout: Duration,
+    /// Sub-agent execution mode (REQ-PROJ-008)
+    pub mode: SubAgentMode,
+    /// Resolved model ID for this sub-agent
+    pub model_id: String,
+    /// Maximum LLM turns before forced completion
+    pub max_turns: u32,
 }
 
 /// How a conversation handles approaching context limits
@@ -653,6 +678,8 @@ pub struct ConvContext {
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
     pub mode_context: Option<crate::system_prompt::ModeContext>,
+    /// Maximum LLM turns for this conversation (0 = unlimited, for parent conversations)
+    pub max_turns: u32,
 }
 
 /// Default context window for unknown models (conservative)
@@ -673,6 +700,7 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
+            max_turns: 0,
         }
     }
 
@@ -691,6 +719,7 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
+            max_turns: 0,
         }
     }
 }

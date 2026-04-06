@@ -1833,6 +1833,7 @@ mod tests {
             is_sub_agent: true,
             context_window: 100_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
         };
 
         let result = handle_context_exhaustion(
@@ -1945,6 +1946,7 @@ mod tests {
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
         };
 
         let result = transition(
@@ -2042,6 +2044,7 @@ mod tests {
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -2085,6 +2088,7 @@ mod tests {
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
         };
 
         // Non-retryable error at attempt 1 → immediate failure

@@ -241,9 +241,48 @@ impl ToolRegistry {
         Self::new_with_options(false)
     }
 
+    /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
+    /// Read-only tools + `submit_result`/`submit_error`. No patch, no spawn, no `ask_user`, no skill, no `propose_task`.
+    // TODO: read-only bash enforcement not yet implemented --
+    // uses regular bash. See REQ-BASH-008 for the planned sandbox approach.
+    pub fn for_subagent_explore() -> Self {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ThinkTool),
+            Arc::new(BashTool),
+            Arc::new(ReadFileTool),
+            Arc::new(SearchTool),
+            Arc::new(KeywordSearchTool),
+            Arc::new(ReadImageTool),
+            // Browser tools
+            Arc::new(BrowserNavigateTool),
+            Arc::new(BrowserEvalTool),
+            Arc::new(BrowserTakeScreenshotTool),
+            Arc::new(BrowserRecentConsoleLogsTool),
+            Arc::new(BrowserClearConsoleLogsTool),
+            Arc::new(BrowserResizeTool),
+            Arc::new(BrowserWaitForSelectorTool),
+            Arc::new(BrowserClickTool),
+            Arc::new(BrowserTypeTool),
+            Arc::new(BrowserKeyPressTool),
+            // Sub-agent terminal tools
+            Arc::new(SubmitResultTool),
+            Arc::new(SubmitErrorTool),
+        ];
+        Self { tools }
+    }
+
+    /// Tool registry for Work-mode sub-agents (REQ-PROJ-008).
+    /// Everything Explore has PLUS patch. No spawn, no `ask_user`, no skill, no `propose_task`.
+    pub fn for_subagent_work() -> Self {
+        let mut registry = Self::for_subagent_explore();
+        registry.tools.push(Arc::new(PatchTool::default()));
+        registry
+    }
+
     /// Create tool registry for sub-agents (different tool set)
+    #[deprecated(note = "Use for_subagent_explore() or for_subagent_work() instead")]
     pub fn for_subagent() -> Self {
-        Self::new_with_options(true)
+        Self::for_subagent_explore()
     }
 
     /// Create tool registry with options

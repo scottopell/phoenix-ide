@@ -14,20 +14,20 @@ use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolOutcome};
-use crate::state_machine::state::{ToolCall, ToolInput};
+use crate::state_machine::state::{SubAgentMode, ToolCall, ToolInput};
 use crate::state_machine::{
     handle_outcome, transition, ConvContext, ConvState, Effect, Event, StepResult,
 };
-use crate::system_prompt::build_system_prompt;
+use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// Default timeout for sub-agents: 5 minutes (REQ-SA-006, FM-6 prevention).
-/// Long enough for real work, short enough to catch stuck agents.
-const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(5);
+/// Safety-net wall-clock timeout for sub-agents (REQ-SA-006).
+/// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
+const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
@@ -63,6 +63,10 @@ where
     sub_agent_result_buffer: Vec<Event>,
     /// Deadline for sub-agent completion — set when entering `AwaitingSubAgents` (REQ-SA-006)
     sub_agent_deadline: Option<tokio::time::Instant>,
+    /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
+    active_work_subagents: u32,
+    /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
+    llm_turn_count: u32,
     /// Typed outcome channel — background tasks send `EffectOutcome` here.
     /// Each task gets a typed `oneshot::Sender<T>` that constrains what it can send,
     /// then the forwarder wraps the result in `EffectOutcome` for this channel.
@@ -113,6 +117,8 @@ where
             cancel_tx: None,
             sub_agent_result_buffer: Vec::new(),
             sub_agent_deadline: None,
+            active_work_subagents: 0,
+            llm_turn_count: 0,
             outcome_tx,
             outcome_rx,
         }
@@ -266,6 +272,20 @@ where
         let mut events_to_process = vec![event];
 
         while let Some(current_event) = events_to_process.pop() {
+            // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
+            if let Event::SubAgentResult { ref agent_id, .. } = current_event {
+                if let ConvState::AwaitingSubAgents { ref pending, .. }
+                | ConvState::CancellingSubAgents { ref pending, .. } = self.state
+                {
+                    if let Some(agent) = pending.iter().find(|p| p.agent_id == *agent_id) {
+                        if agent.mode == SubAgentMode::Work {
+                            self.active_work_subagents =
+                                self.active_work_subagents.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+
             // Pure state transition
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
@@ -463,6 +483,7 @@ where
     /// 1. Parse tasks and generate agent IDs
     /// 2. Send spawn requests to `RuntimeManager` for each task
     /// 3. Return `SpawnAgentsComplete` event
+    #[allow(clippy::too_many_lines)]
     async fn handle_spawn_agents_tool(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         use crate::state_machine::state::{PendingSubAgent, SpawnAgentsInput, SubAgentSpec};
 
@@ -496,6 +517,57 @@ where
         // Bounded buffer: pre-allocate with capacity = sub-agent count (FM-6 prevention)
         self.sub_agent_result_buffer = Vec::with_capacity(input.tasks.len());
 
+        // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
+        let parent_allows_work =
+            matches!(self.context.mode_context, Some(ModeContext::Work { .. }));
+
+        let mut work_count_in_batch = 0u32;
+        for task in &input.tasks {
+            let mode = task.mode.unwrap_or_default();
+            if mode == SubAgentMode::Work {
+                if !parent_allows_work {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        "Work sub-agents require the parent to be in Work mode. \
+                         Use mode: \"explore\" or omit mode for read-only sub-agents."
+                            .to_string(),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+                work_count_in_batch += 1;
+            }
+        }
+
+        if work_count_in_batch > 1 {
+            let result = ToolResult::error(
+                tool_use_id.clone(),
+                "Only one Work sub-agent can be spawned per call. \
+                 Split into separate spawn_agents calls if you need sequential Work sub-agents."
+                    .to_string(),
+            );
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }));
+        }
+
+        if work_count_in_batch > 0 && self.active_work_subagents > 0 {
+            let result = ToolResult::error(
+                tool_use_id.clone(),
+                "A Work sub-agent is already active. Only one Work sub-agent \
+                 can run at a time per parent conversation. Wait for it to complete \
+                 before spawning another."
+                    .to_string(),
+            );
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }));
+        }
+
         // Generate agent IDs and prepare spawn specs
         let mut spawned = Vec::new();
         let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
@@ -503,10 +575,44 @@ where
         for task in &input.tasks {
             let agent_id = uuid::Uuid::new_v4().to_string();
             let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
+            let mode = task.mode.unwrap_or_default();
+
+            // Resolve model (REQ-PROJ-008)
+            let resolved_model = if let Some(ref model) = task.model {
+                if self.llm_registry.get(model).is_none() {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Unknown model '{}'. Available: {:?}",
+                            model,
+                            self.llm_registry.available_models()
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+                model.clone()
+            } else {
+                match mode {
+                    SubAgentMode::Explore => self
+                        .llm_registry
+                        .cheap_model_id_for_provider(&self.context.model_id),
+                    SubAgentMode::Work => self.context.model_id.clone(),
+                }
+            };
+
+            // Resolve max turns (REQ-PROJ-008)
+            let max_turns = task.max_turns.unwrap_or(match mode {
+                SubAgentMode::Explore => 20,
+                SubAgentMode::Work => 50,
+            });
 
             spawned.push(PendingSubAgent {
                 agent_id: agent_id.clone(),
                 task: task.task.clone(),
+                mode,
             });
 
             // Send spawn request to RuntimeManager
@@ -516,12 +622,14 @@ where
                     task: task.task.clone(),
                     cwd,
                     timeout: DEFAULT_SUBAGENT_TIMEOUT,
+                    mode,
+                    model_id: resolved_model,
+                    max_turns,
                 };
                 let request = SubAgentSpawnRequest {
                     spec,
                     parent_conversation_id: self.context.conversation_id.clone(),
                     parent_event_tx: self.event_tx.clone(),
-                    model_id: self.context.model_id.clone(),
                 };
                 if let Err(e) = spawn_tx.send(request).await {
                     tracing::error!(error = %e, "Failed to send spawn request");
@@ -546,6 +654,9 @@ where
                 }));
             }
         }
+
+        // Track active Work sub-agents for one-writer constraint (REQ-PROJ-008)
+        self.active_work_subagents += work_count_in_batch;
 
         // Build success result
         let agent_ids: Vec<&str> = spawned.iter().map(|p| p.agent_id.as_str()).collect();
@@ -612,6 +723,22 @@ where
             }
 
             Effect::RequestLlm => {
+                // Max turns enforcement (REQ-PROJ-008): sub-agents have a finite turn
+                // budget. If exceeded, send UserCancel to gracefully stop the agent.
+                if self.context.max_turns > 0 {
+                    self.llm_turn_count += 1;
+                    if self.llm_turn_count > self.context.max_turns {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            turns = self.llm_turn_count,
+                            max = self.context.max_turns,
+                            "Sub-agent exceeded max turn limit, sending cancel"
+                        );
+                        let _ = self.event_tx.send(Event::UserCancel).await;
+                        return Ok(None);
+                    }
+                }
+
                 // Typed oneshot channel: background task gets Sender<LlmOutcome>,
                 // physically cannot send a ToolOutcome or other type.
                 let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();

@@ -1547,6 +1547,7 @@ fn pending_agent(id: &str) -> PendingSubAgent {
     PendingSubAgent {
         agent_id: id.to_string(),
         task: format!("Task for {id}"),
+        mode: SubAgentMode::Explore,
     }
 }
 
@@ -1777,10 +1778,12 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
             PendingSubAgent {
                 agent_id: "agent-1".to_string(),
                 task: "Task 1".to_string(),
+                mode: SubAgentMode::Explore,
             },
             PendingSubAgent {
                 agent_id: "agent-2".to_string(),
                 task: "Task 2".to_string(),
+                mode: SubAgentMode::Explore,
             },
         ],
         assistant_message: assistant_message_for_tools(&["t1"]),
@@ -1832,6 +1835,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
         pending_sub_agents: vec![PendingSubAgent {
             agent_id: "existing-agent".to_string(),
             task: "Existing task".to_string(),
+            mode: SubAgentMode::Explore,
         }],
         assistant_message: AssistantMessage::default(),
     };
@@ -1850,10 +1854,12 @@ fn test_spawn_agents_complete_accumulates_ids() {
             PendingSubAgent {
                 agent_id: "new-agent-1".to_string(),
                 task: "New task 1".to_string(),
+                mode: SubAgentMode::Explore,
             },
             PendingSubAgent {
                 agent_id: "new-agent-2".to_string(),
                 task: "New task 2".to_string(),
+                mode: SubAgentMode::Explore,
             },
         ],
     };

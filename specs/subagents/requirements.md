@@ -14,13 +14,13 @@ AND execute all sub-agent conversations in parallel
 
 WHEN spawning sub-agents
 THE SYSTEM SHALL assign a mandatory time limit to each sub-agent
-AND require the LLM to specify a mode (explore or work) for each sub-agent
-AND require the LLM to specify a model tier (fast or capable) for each sub-agent
+AND default mode to Explore if not specified (see REQ-PROJ-008)
+AND enforce a max turn limit per sub-agent (Explore: 20, Work: 50, overridable)
 
 WHEN more than 10 sub-agents are requested in a single spawn call
 THE SYSTEM SHALL reject the call with an error
 
-**Rationale:** Users benefit from parallel task execution for code review, exploration, and divide-and-conquer problem solving. Spawning sub-agents keeps the parent's context clean for synthesis. Required mode and tier fields force the LLM to make conscious decisions about each sub-agent's capabilities and cost.
+**Rationale:** Users benefit from parallel task execution for code review, exploration, and divide-and-conquer problem solving. Spawning sub-agents keeps the parent's context clean for synthesis. Mode defaults to Explore (cheap, read-only) to minimize cost unless the LLM explicitly opts into Work mode.
 
 **Dependencies:** REQ-BED-008
 
@@ -104,23 +104,26 @@ THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
 ---
 
-### REQ-SA-007: Model Tier Selection
+### REQ-SA-007: Model Selection
 
-WHEN spawning a sub-agent with tier "fast"
-THE SYSTEM SHALL select the fastest available model in the parent's model family
+**Superseded by REQ-PROJ-008 (sub-agent modes).** The tier concept (fast/capable)
+is replaced by mode-based defaults with optional explicit model override:
 
-WHEN spawning a sub-agent with tier "capable"
-THE SYSTEM SHALL select the most capable available model in the parent's model family
+- Explore mode defaults to the cheapest available model (haiku cascade)
+- Work mode inherits the parent's model
+- The `model` field on the task spec allows explicit override with any registry model ID
 
-WHEN the requested tier is not available in the parent's model family
-THE SYSTEM SHALL reject the sub-agent spawn with an error
-AND NOT fall back to a different tier silently
+WHEN spawning a sub-agent without an explicit model
+THE SYSTEM SHALL select the default model for that mode
+(Explore: cheapest available; Work: parent's model)
 
-**Rationale:** Research and search tasks should use cheap, fast models. Implementation
-and review tasks need more capable models. Intent-based tiers decouple the LLM from
-knowing specific model IDs while ensuring cost-appropriate allocation. Failing on
-unavailable tiers forces the parent to handle the situation explicitly rather than
-silently producing lower-quality results.
+WHEN spawning a sub-agent with an explicit model ID
+THE SYSTEM SHALL validate the model exists in the registry
+AND reject the spawn with an error if the model is unknown
+
+**Rationale:** Mode-based defaults cover the same cost/capability trade-off that
+tiers addressed, while the explicit model override handles edge cases. Two layers
+of indirection (mode defaults + tier resolution) added complexity without benefit.
 
 ---
 

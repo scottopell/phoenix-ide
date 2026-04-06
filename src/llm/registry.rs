@@ -796,6 +796,25 @@ impl ModelRegistry {
         // Fall back to default model if no cheap model available
         self.default()
     }
+
+    /// Get the cheapest available model ID from the same provider family as `parent_model_id`.
+    /// Falls back to `parent_model_id` if no cheap model is available for that provider.
+    pub fn cheap_model_id_for_provider(&self, parent_model_id: &str) -> String {
+        use crate::llm::models::Provider;
+
+        let parent_provider = self.specs.get(parent_model_id).map(|s| s.provider);
+
+        let candidates: &[&str] = match parent_provider {
+            Some(Provider::Anthropic) => &["claude-haiku-4-5"],
+            Some(Provider::OpenAI) => &["gpt-4o-mini", "gpt-5-mini"],
+            None => return parent_model_id.to_string(),
+        };
+
+        candidates
+            .iter()
+            .find(|id| self.services.contains_key(**id))
+            .map_or_else(|| parent_model_id.to_string(), |id| id.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ pub use executor::ConversationRuntime;
 pub use traits::*;
 
 use crate::platform::PlatformCapability;
-use crate::state_machine::state::{SubAgentOutcome, SubAgentSpec};
+use crate::state_machine::state::{SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::{BrowserSessionManager, ToolRegistry};
 
 /// Type alias for production runtime with concrete implementations
@@ -42,7 +42,6 @@ pub struct SubAgentSpawnRequest {
     pub spec: SubAgentSpec,
     pub parent_conversation_id: String,
     pub parent_event_tx: mpsc::Sender<Event>,
-    pub model_id: String,
 }
 
 /// Request to cancel sub-agents
@@ -246,7 +245,6 @@ impl RuntimeManager {
             spec,
             parent_conversation_id,
             parent_event_tx,
-            model_id,
         } = req;
 
         tracing::info!(
@@ -266,7 +264,7 @@ impl RuntimeManager {
                 &spec.cwd,
                 false, // user_initiated = false
                 Some(&parent_conversation_id),
-                Some(&model_id), // inherit parent's model
+                Some(&spec.model_id), // inherit parent's model
             )
             .await
         {
@@ -308,14 +306,15 @@ impl RuntimeManager {
             return;
         }
 
-        // 3. Create sub-agent context
-        let context_window = self.llm_registry.context_window(&model_id);
-        let conv_context = ConvContext::sub_agent(
+        // 3. Create sub-agent context with max_turns from spec (REQ-PROJ-008)
+        let context_window = self.llm_registry.context_window(&spec.model_id);
+        let mut conv_context = ConvContext::sub_agent(
             &conv.id,
             PathBuf::from(&conv.cwd),
-            &model_id,
+            &spec.model_id,
             context_window,
         );
+        conv_context.max_turns = spec.max_turns;
 
         // 4. Create channels for the sub-agent runtime
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -323,10 +322,14 @@ impl RuntimeManager {
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
-        // Sub-agents use the standard sub-agent tool set for now.
-        // Mode inheritance (REQ-BED-018) will be refined in M2.
-        let tool_executor = ToolRegistryExecutor::builtin_only(ToolRegistry::for_subagent());
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone());
+        // Select tool registry based on sub-agent mode (REQ-PROJ-008).
+        // Sub-agents get MCP access via the parent's MCP manager.
+        let registry = match spec.mode {
+            SubAgentMode::Explore => ToolRegistry::for_subagent_explore(),
+            SubAgentMode::Work => ToolRegistry::for_subagent_work(),
+        };
+        let tool_executor = ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone());
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -490,7 +493,12 @@ impl RuntimeManager {
         // Sub-agents get a restricted tool set (no MCP, no spawn_agents) -- they only
         // have SubmitResult/SubmitError for completion signaling.
         let tool_executor = if is_sub_agent {
-            ToolRegistryExecutor::builtin_only(ToolRegistry::for_subagent())
+            // Resumed sub-agents default to Explore registry (mode not persisted).
+            // This is a rare path -- sub-agents don't normally survive restarts.
+            ToolRegistryExecutor::with_mcp(
+                ToolRegistry::for_subagent_explore(),
+                self.mcp_manager.clone(),
+            )
         } else {
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {

@@ -117,10 +117,17 @@ struct SpawnAgentsInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Fields consumed in Phase 2 when mode resolution is wired up
 struct TaskSpec {
     task: String,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    mode: Option<String>, // "explore" or "work"
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
 }
 
 #[async_trait]
@@ -151,11 +158,26 @@ impl Tool for SpawnAgentsTool {
                             "cwd": {
                                 "type": "string",
                                 "description": "Working directory (defaults to parent's cwd)"
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["explore", "work"],
+                                "description": "Sub-agent mode. Explore (default): read-only tools, haiku model. Work: full tool suite, inherits parent model. Work mode requires the parent to be in Work mode."
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "LLM model override (e.g., 'claude-haiku-4-5', 'claude-sonnet-4-6'). Defaults based on mode."
+                            },
+                            "max_turns": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Maximum LLM turns before forced completion. Defaults to 20 (explore) or 50 (work)."
                             }
                         }
                     },
                     "minItems": 1,
-                    "description": "List of tasks to execute in parallel"
+                    "maxItems": 10,
+                    "description": "List of tasks to execute in parallel (max 10)"
                 }
             }
         })
