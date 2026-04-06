@@ -1502,13 +1502,23 @@ async fn confirm_complete(
         };
 
         // 2b. Checkout base branch
-        run_git(&repo_root, &["checkout", &base_branch])
-            .map_err(|e| AppError::Internal(format!("Failed to checkout {base_branch}: {e}")))?;
+        if let Err(e) = run_git(&repo_root, &["checkout", &base_branch]) {
+            if did_stash {
+                let _ = run_git(&repo_root, &["stash", "pop"]);
+            }
+            return Err(AppError::Internal(format!(
+                "Failed to checkout {base_branch}: {e}"
+            )));
+        }
 
         // 2c. Squash merge
         if let Err(e) = run_git(&repo_root, &["merge", "--squash", &branch_name]) {
-            // Attempt to recover by aborting the merge
-            let _ = run_git(&repo_root, &["merge", "--abort"]);
+            // Squash merges don't create MERGE_HEAD, so `merge --abort` is a no-op.
+            // Use `reset --hard` to restore the checkout to a clean state.
+            let _ = run_git(&repo_root, &["reset", "--hard", "HEAD"]);
+            if did_stash {
+                let _ = run_git(&repo_root, &["stash", "pop"]);
+            }
             return Err(AppError::Internal(format!("Squash merge failed: {e}")));
         }
 
@@ -1558,7 +1568,10 @@ async fn confirm_complete(
         let has_staged = run_git(&repo_root, &["diff", "--cached", "--quiet"]).is_err();
         if has_staged {
             if let Err(e) = run_git(&repo_root, &["commit", "-m", &commit_message]) {
-                let _ = run_git(&repo_root, &["reset", "HEAD"]);
+                let _ = run_git(&repo_root, &["reset", "--hard", "HEAD"]);
+                if did_stash {
+                    let _ = run_git(&repo_root, &["stash", "pop"]);
+                }
                 return Err(AppError::Internal(format!("Commit failed: {e}")));
             }
         } else {
