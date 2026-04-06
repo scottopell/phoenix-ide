@@ -2836,20 +2836,33 @@ enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
-            AppError::BadRequest(msg) => {
-                (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(msg))).into_response()
+            AppError::BadRequest(ref msg) => {
+                tracing::debug!(error = %msg, "400 Bad Request");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(msg.clone())),
+                )
+                    .into_response()
             }
-            AppError::NotFound(msg) => {
-                (StatusCode::NOT_FOUND, Json(ErrorResponse::new(msg))).into_response()
+            AppError::NotFound(ref msg) => {
+                tracing::debug!(error = %msg, "404 Not Found");
+                (StatusCode::NOT_FOUND, Json(ErrorResponse::new(msg.clone()))).into_response()
             }
-            AppError::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(msg)),
-            )
-                .into_response(),
-            AppError::Conflict(detail) => (StatusCode::CONFLICT, Json(detail)).into_response(),
-            AppError::UnprocessableEntity(detail) => {
-                (StatusCode::UNPROCESSABLE_ENTITY, Json(detail)).into_response()
+            AppError::Internal(ref msg) => {
+                tracing::error!(error = %msg, "500 Internal Server Error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(msg.clone())),
+                )
+                    .into_response()
+            }
+            AppError::Conflict(detail) => {
+                tracing::warn!(error_type = %detail.error_type, error = %detail.error, "409 Conflict");
+                (StatusCode::CONFLICT, Json(detail)).into_response()
+            }
+            AppError::UnprocessableEntity(ref detail) => {
+                tracing::warn!(error = %detail.error, "422 Unprocessable Entity");
+                (StatusCode::UNPROCESSABLE_ENTITY, Json(detail.clone())).into_response()
             }
         }
     }

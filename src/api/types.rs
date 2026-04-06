@@ -251,7 +251,7 @@ pub struct TasksResponse {
 }
 
 /// Expansion error detail returned to the frontend (REQ-IR-007)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExpansionErrorResponse {
     pub error: String,
     pub error_type: String,
