@@ -9,7 +9,7 @@ import {
   ClipboardEvent,
   ChangeEvent,
 } from 'react';
-import { FolderOpen } from 'lucide-react';
+// Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
 import type { QueuedMessage } from '../hooks';
 import { useDraft } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
@@ -49,7 +49,6 @@ interface InputAreaProps {
   onCancel: () => void;
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
-  onOpenFileBrowser?: () => void;
 }
 
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
@@ -64,7 +63,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onCancel,
   onRetry,
   onDismissError,
-  onOpenFileBrowser,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
   const isCancelling = isCancellingState(convState);
@@ -552,7 +550,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     : 'Type a message...';
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
-    : hint ? `${baseText} (${hint})` : baseText;
+    : agentWorking
+      ? 'Agent working... draft your next message'
+      : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
   // Render
@@ -634,62 +634,42 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         </div>
       )}
 
-      {/* Full-width textarea */}
-      <textarea
-        ref={textareaRef}
-        id="message-input"
-        placeholder={placeholder}
-        rows={2}
-        value={voiceBase !== null
-          ? (voiceBase.trim()
-              ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
-              : voiceInterim)
-          : draft}
-        onChange={(e) => {
-          const newVal = e.target.value;
-          if (voiceBase !== null) {
-            setVoiceBase(newVal);
-            setVoiceInterim('');
-          } else {
-            setDraft(newVal);
-          }
-          handleTextChange(newVal);
-        }}
-        onKeyDown={handleKeyDown}
-        onPaste={handlePaste}
-        onSelect={() => {
-          // Re-detect trigger on cursor movement (arrow keys, click)
-          const ta = textareaRef.current;
-          if (ta) {
-            const currentVal = voiceBase !== null ? voiceBase : draft;
-            const trigger = detectTrigger(currentVal, ta.selectionStart);
-            setActiveTrigger(trigger);
-          }
-        }}
-      />
-
-      {/* Action row: icons left, send/cancel right */}
-      <div id="input-actions">
-        <div className="input-actions-left">
-          {onOpenFileBrowser && (
-            <button
-              className="file-browse-btn"
-              onClick={onOpenFileBrowser}
-              title="Browse files"
-              aria-label="Browse files"
-            >
-              <FolderOpen size={20} />
-            </button>
-          )}
-          <button
-            className="attach-btn"
-            onClick={() => fileInputRef.current?.click()}
-            title="Attach image"
-            aria-label="Attach image"
-          >
-            📎
-          </button>
-          {voiceSupported && (
+      {/* Textarea container -- Send/Stop button always inside */}
+      <div className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}>
+        <textarea
+          ref={textareaRef}
+          id="message-input"
+          placeholder={placeholder}
+          rows={2}
+          value={voiceBase !== null
+            ? (voiceBase.trim()
+                ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
+                : voiceInterim)
+            : draft}
+          onChange={(e) => {
+            const newVal = e.target.value;
+            if (voiceBase !== null) {
+              setVoiceBase(newVal);
+              setVoiceInterim('');
+            } else {
+              setDraft(newVal);
+            }
+            handleTextChange(newVal);
+          }}
+          onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          onSelect={() => {
+            // Re-detect trigger on cursor movement (arrow keys, click)
+            const ta = textareaRef.current;
+            if (ta) {
+              const currentVal = voiceBase !== null ? voiceBase : draft;
+              const trigger = detectTrigger(currentVal, ta.selectionStart);
+              setActiveTrigger(trigger);
+            }
+          }}
+        />
+        <div className="input-inline-actions">
+          {!agentWorking && voiceSupported && (
             <VoiceRecorder
               onStart={handleVoiceStart}
               onEnd={handleVoiceEnd}
@@ -698,25 +678,26 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               disabled={agentWorking}
             />
           )}
+          {agentWorking ? (
+            <button
+              className="input-stop-btn"
+              onClick={onCancel}
+              disabled={isCancelling || isOffline}
+              title="Stop agent (Esc)"
+            >
+              {isCancelling ? 'Stopping...' : 'Stop'}
+            </button>
+          ) : (
+            <button
+              className="input-send-btn"
+              onClick={handleSend}
+              disabled={!sendEnabled}
+              title="Enter to send"
+            >
+              Send
+            </button>
+          )}
         </div>
-        {agentWorking ? (
-          <button
-            id="cancel-btn"
-            onClick={onCancel}
-            disabled={isCancelling || isOffline}
-          >
-            {isCancelling ? 'Cancelling...' : 'Cancel'}
-          </button>
-        ) : (
-          <button
-            id="send-btn"
-            onClick={handleSend}
-            disabled={!sendEnabled}
-            title="Enter to send"
-          >
-            Send
-          </button>
-        )}
       </div>
     </footer>
   );

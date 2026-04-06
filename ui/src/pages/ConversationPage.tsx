@@ -377,9 +377,7 @@ export function ConversationPage() {
     }
   };
 
-  const handleOpenFileBrowser = useCallback(() => {
-    setShowFileBrowser(true);
-  }, []);
+  // File browser opened from sidebar on desktop; mobile overlay triggered elsewhere
 
   const handleFileSelect = useCallback(
     (filePath: string, rootDir: string) => {
@@ -605,7 +603,6 @@ export function ConversationPage() {
           onCancel={handleCancel}
           onRetry={handleRetry}
           onDismissError={dismiss}
-          onOpenFileBrowser={handleOpenFileBrowser}
         />
         </>
       ) : null}

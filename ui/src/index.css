@@ -1302,14 +1302,33 @@ pre:hover .copy-btn {
 #input-area {
   flex: 0 0 auto;
   background: var(--bg-secondary);
-  border-top: 1px solid var(--border-color);
-  padding: 8px 12px;
-  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  padding: 6px 12px;
+  padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+}
+
+/* Textarea wrapper -- positions Stop button inside */
+.input-textarea-wrap {
+  position: relative;
+}
+
+.input-textarea-wrap--working {
+  --pulse-color: var(--accent-purple, #a371f7);
+}
+
+.input-textarea-wrap--working #message-input {
+  border-color: color-mix(in srgb, var(--pulse-color) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-primary) 90%, var(--pulse-color));
+  animation: input-pulse 2s ease-in-out infinite;
+}
+
+@keyframes input-pulse {
+  0%, 100% { border-color: color-mix(in srgb, var(--pulse-color) 30%, transparent); }
+  50% { border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent); }
 }
 
 #message-input {
   width: 100%;
-  padding: 10px 12px;
+  padding: 10px 80px 10px 12px; /* right padding reserves space for inline buttons */
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -1321,6 +1340,7 @@ pre:hover .copy-btn {
   max-height: 120px;
   line-height: 1.4;
   box-sizing: border-box;
+  transition: border-color 0.2s, background 0.2s;
 }
 
 #message-input:focus {
@@ -1328,74 +1348,72 @@ pre:hover .copy-btn {
   border-color: var(--accent-blue);
 }
 
+/* When working + focused, keep the pulse color (don't override with blue) */
+.input-textarea-wrap--working #message-input:focus {
+  border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent);
+}
+
 #message-input:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
 
-#input-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 6px;
-}
-
-.input-actions-left {
+/* Inline action buttons -- inside textarea container, bottom-right */
+.input-inline-actions {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
   display: flex;
   align-items: center;
   gap: 4px;
+  z-index: 1;
 }
 
-#send-btn {
-  padding: 8px 14px;
+/* Send button -- inside textarea */
+.input-send-btn {
+  padding: 4px 12px;
   background: var(--accent-blue);
   color: white;
   border: none;
-  border-radius: 6px;
-  font-size: 14px;
+  border-radius: 4px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
-  min-width: 56px;
-  min-height: 36px;
+  line-height: 1.4;
+  transition: background 0.15s;
 }
 
-#send-btn:hover:not(:disabled) {
+.input-send-btn:hover:not(:disabled) {
   background: #4c9aed;
 }
 
-#send-btn:disabled {
-  opacity: 0.5;
+.input-send-btn:disabled {
+  opacity: 0.35;
   cursor: not-allowed;
 }
 
-#send-btn.hidden {
-  display: none;
-}
-
-#cancel-btn {
-  padding: 8px 14px;
-  background: var(--accent-red);
-  color: white;
-  border: none;
-  border-radius: 6px;
-  font-size: 14px;
+/* Stop button -- inside textarea */
+.input-stop-btn {
+  padding: 4px 10px;
+  font-size: 12px;
   font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
   cursor: pointer;
-  min-width: 64px;
-  min-height: 36px;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 
-#cancel-btn:hover:not(:disabled) {
-  background: #d64545;
+.input-stop-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-tertiary) 60%, transparent);
 }
 
-#cancel-btn:disabled {
-  opacity: 0.5;
+.input-stop-btn:disabled {
+  opacity: 0.4;
   cursor: not-allowed;
-}
-
-#cancel-btn.hidden {
-  display: none;
 }
 
 /* Buttons */
@@ -2609,21 +2627,24 @@ html * {
   border-color: var(--accent-red);
 }
 
-/* Attach Button */
+/* Attach Button (Lucide icon, consistent with file-browse-btn) */
 .attach-btn {
   background: transparent;
   border: none;
-  font-size: 20px;
+  color: var(--text-secondary);
   cursor: pointer;
-  padding: 8px;
+  padding: 6px;
   border-radius: 6px;
-  transition: background 0.15s;
-  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
   flex-shrink: 0;
 }
 
 .attach-btn:hover {
   background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 /* Conversation Item Actions */
@@ -3934,7 +3955,7 @@ html * {
   border: none;
   color: var(--text-secondary);
   cursor: pointer;
-  padding: 8px;
+  padding: 6px;
   border-radius: 6px;
   display: flex;
   align-items: center;
