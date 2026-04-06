@@ -1,11 +1,16 @@
 ---
 created: 2026-03-28
 priority: p2
-status: ready
+status: done
 artifact: src/runtime/
 ---
 
 # Sub-agent timeout wastes tokens on network I/O
+
+**Resolution:** Absorbed into task 08629 (sub-agent modes, REQ-PROJ-008).
+Max-turn enforcement (20 explore / 50 work) replaces wall-clock timeout as
+primary runaway prevention. Wall-clock timeout bumped from 5 to 20 minutes
+as a generous safety net for stuck tool execution.
 
 ## Summary
 
