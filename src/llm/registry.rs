@@ -813,7 +813,10 @@ impl ModelRegistry {
         candidates
             .iter()
             .find(|id| self.services.contains_key(**id))
-            .map_or_else(|| parent_model_id.to_string(), std::string::ToString::to_string)
+            .map_or_else(
+                || parent_model_id.to_string(),
+                std::string::ToString::to_string,
+            )
     }
 }
 
