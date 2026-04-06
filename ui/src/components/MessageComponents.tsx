@@ -110,21 +110,22 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
 // ============================================================================
 
 export function UserMessage({ message }: { message: Message }) {
-  const content = message.content as { text?: string; images?: { data: string; media_type: string }[] };
+  const content = message.content as { text?: string; images?: { data: string; media_type: string }[]; is_meta?: boolean };
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
+  const isMeta = content.is_meta === true;
   const timestamp = message.created_at;
 
   return (
-    <div className="message user" data-sequence-id={message.sequence_id}>
+    <div className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
-        <span className="message-sender">You</span>
+        {!isMeta && <span className="message-sender">You</span>}
         {timestamp && (
           <span className="message-time" title={new Date(timestamp).toLocaleString()}>
             {formatMessageTime(timestamp)}
           </span>
         )}
-        <span className="message-status sent" title="Sent">✓</span>
+        {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
       </div>
       <div className="message-content">
         {text}

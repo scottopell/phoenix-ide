@@ -154,6 +154,7 @@ mod tests {
                 text: text.to_string(),
                 images: vec![],
                 llm_text: None,
+                is_meta: false,
             }),
             display_data: None,
             usage_data: None,
@@ -612,6 +613,7 @@ mod proptests {
             MessageType::User => MessageContent::User(UserContent {
                 text: "user message".to_string(),
                 images: vec![],
+                is_meta: false,
                 llm_text: None,
             }),
             MessageType::Agent => {
@@ -637,6 +639,7 @@ mod proptests {
                 text: "fallback".to_string(),
                 images: vec![],
                 llm_text: None,
+                is_meta: false,
             }),
         };
 

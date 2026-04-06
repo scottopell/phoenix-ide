@@ -412,6 +412,10 @@ pub struct UserContent {
     /// `#[serde(default)]` handles old DB rows that predate this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_text: Option<String>,
+    /// System-generated user message (e.g., task approval). Delivered to the LLM
+    /// as user role but rendered distinctly in the UI (no "You" label).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_meta: bool,
 }
 
 impl UserContent {
@@ -420,6 +424,7 @@ impl UserContent {
             text: text.into(),
             images: Vec::new(),
             llm_text: None,
+            is_meta: false,
         }
     }
 
@@ -428,6 +433,7 @@ impl UserContent {
             text: text.into(),
             images,
             llm_text: None,
+            is_meta: false,
         }
     }
 
@@ -442,6 +448,18 @@ impl UserContent {
             text: display_text.into(),
             images,
             llm_text: Some(llm_text.into()),
+            is_meta: false,
+        }
+    }
+
+    /// Create a system-generated user message (task approval, mode transitions).
+    /// Delivered to the LLM as user role but rendered distinctly in the UI.
+    pub fn meta(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+            llm_text: None,
+            is_meta: true,
         }
     }
 

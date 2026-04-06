@@ -5909,6 +5909,15 @@ html * {
   max-width: 80%;
 }
 
+/* --- Meta Messages (system-generated user messages: approvals, mode transitions) --- */
+
+.message.meta {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-style: dashed;
+  opacity: 0.85;
+}
+
 /* --- SSE Error Toast --- */
 
 .sse-error-toast {

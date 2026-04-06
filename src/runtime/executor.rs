@@ -1555,13 +1555,24 @@ where
                     "Task approved — worktree created"
                 );
 
-                // Persist a system message with the branch + worktree path
+                // Persist as a user message so the LLM sees the approval + plan context.
+                // The propose_task tool_use/result get stripped from history (tool not in
+                // Work registry), so this message carries the plan forward. Must be the
+                // last message before the next LLM call to avoid ending on an assistant
+                // message (Anthropic rejects trailing assistant as "prefill").
                 let branch_msg = format!(
-                    "Task approved. You are on branch {} in {}.",
-                    approval_result.branch_name, approval_result.worktree_path
+                    "Task approved. You are on branch {} in {}.\n\n\
+                     ## Approved plan: {}\n\n\
+                     Priority: {}\n\n\
+                     {}",
+                    approval_result.branch_name,
+                    approval_result.worktree_path,
+                    title_backup,
+                    priority_backup,
+                    plan_backup,
                 );
                 let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::system(&branch_msg);
+                let content = MessageContent::User(crate::db::UserContent::meta(&branch_msg));
                 let msg = self
                     .storage
                     .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
