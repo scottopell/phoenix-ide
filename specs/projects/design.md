@@ -13,14 +13,54 @@ The isolation model has two layers:
    conversations on the same project occupy different directories and cannot touch
    each other's files by construction.
 
-2. **Enforcement (Linux with Landlock):** Explore conversations can have their
-   read-only constraint enforced at kernel level via Landlock (see `specs/bash/`
-   REQ-BASH-008). On platforms without Landlock, read-only is an application-level
-   constraint enforced by tool configuration.
+2. **Enforcement (planned, not yet implemented):** Explore conversations can have
+   their read-only constraint enforced at kernel level via Landlock on Linux or
+   sandbox-exec on macOS (see `specs/bash/` REQ-BASH-008). On platforms without
+   sandboxing, read-only is an application-level constraint enforced by tool
+   configuration.
 
 The state machine knows about `ConvMode` as a field on conversations. It does not
 know about git, worktrees, or projects — those are executor-layer concerns triggered
 by state machine effects.
+
+## Platform Capability Detection
+
+### REQ-PROJ-013 — Sandbox detection and tool registry selection
+
+At startup, the server probes for kernel-level sandboxing:
+
+```
+PlatformCapability {
+  None,          // no sandbox available
+  Landlock,      // Linux 5.13+ with Landlock LSM enabled
+  MacOSSandbox,  // macOS with sandbox-exec available
+}
+```
+
+Detection is automatic (no configuration):
+- Linux: checks `/sys/kernel/security/landlock` exists
+- macOS: checks `sandbox-exec -n no-network true` succeeds
+- Other: `None`
+
+The result gates which tool registry Explore conversations receive:
+
+| `has_sandbox()` | Explore tool set | Bash available? |
+|-----------------|-----------------|-----------------|
+| `true` | `explore_with_sandbox()` — full tools including bash | Yes |
+| `false` | `explore_no_sandbox()` — restricted to ReadFile, Search, Think, keyword_search, browser tools. No bash, no patch. | No |
+
+**Current implementation state:** Sandbox detection works. Tool registry
+selection works. Actual bash sandboxing (Landlock wrappers, sandbox-exec
+profiles) is **not implemented**. The `explore_with_sandbox()` path gives
+bash but does not apply any kernel restrictions to bash processes. This means
+Explore mode with `has_sandbox() = true` has bash but the read-only constraint
+is enforced only by the system prompt, not by the kernel.
+
+This is an acceptable interim state: the system prompt tells the agent it is
+read-only, and the agent respects this in practice. The sandboxing
+implementation (REQ-BASH-008, REQ-BASH-009) will add defense-in-depth when
+built, without requiring any changes to the detection or registry selection
+code. The plumbing is in place — only the bash execution wrapper is missing.
 
 ## Data Models
 
