@@ -107,6 +107,82 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
 /// Subdirectories to scan for skill directories at each level of the tree.
 const SKILL_DIRS: &[&str] = &[".claude/skills", ".agents/skills"];
 
+/// Collect skills from a single skills directory (e.g., `.claude/skills/`).
+///
+/// Scans immediate child directories for `SKILL.md` files. For each skill found,
+/// also recursively scans a `skills/` subdirectory for namespaced sub-skills
+/// (e.g., `allium/skills/distill/SKILL.md` becomes `allium:distill`).
+fn collect_skills_from_dir(
+    skills_dir: &Path,
+    source: &str,
+    namespace_prefix: &str,
+    skills: &mut Vec<SkillMetadata>,
+    seen_names: &mut HashSet<String>,
+    seen_paths: &mut HashSet<PathBuf>,
+    seen_content: &mut HashSet<u64>,
+) {
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let skill_md = entry.path().join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        // Symlink dedup: canonicalize to detect duplicates
+        let canonical = std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
+        if !seen_paths.insert(canonical) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&skill_md) else {
+            continue;
+        };
+        // Content dedup: hash file content to catch copies
+        let content_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            content.hash(&mut hasher);
+            hasher.finish()
+        };
+        if !seen_content.insert(content_hash) {
+            continue;
+        }
+        if let Some(fm) = parse_skill_frontmatter(&content) {
+            // Build the full namespaced name (e.g., "allium:distill")
+            let full_name = if namespace_prefix.is_empty() {
+                fm.name.clone()
+            } else {
+                format!("{namespace_prefix}:{}", fm.name)
+            };
+            if seen_names.insert(full_name.clone()) {
+                skills.push(SkillMetadata {
+                    name: full_name.clone(),
+                    description: fm.description,
+                    argument_hint: fm.argument_hint,
+                    path: skill_md,
+                    source: source.to_string(),
+                });
+            }
+            // Recurse into skills/ subdirectory for namespaced sub-skills
+            let sub_skills_dir = entry.path().join("skills");
+            if sub_skills_dir.is_dir() {
+                collect_skills_from_dir(
+                    &sub_skills_dir,
+                    source,
+                    &full_name,
+                    skills,
+                    seen_names,
+                    seen_paths,
+                    seen_content,
+                );
+            }
+        }
+    }
+}
+
 /// Discover skills by walking from `working_dir` up to the filesystem root.
 ///
 /// At each level, scans `SKILL_DIRS` (`.claude/skills/` and `.agents/skills/`)
@@ -154,47 +230,15 @@ pub fn discover_skills_with_home(
             if !scanned_dirs.insert(canonical_dir) {
                 continue; // already scanned this directory
             }
-            let Ok(entries) = std::fs::read_dir(&skills_dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let skill_md = entry.path().join("SKILL.md");
-                if !skill_md.is_file() {
-                    continue;
-                }
-                // Symlink dedup: canonicalize to detect duplicates
-                let canonical =
-                    std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
-                if !seen_paths.insert(canonical) {
-                    continue; // already seen via a different path
-                }
-                if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    // Content dedup: hash file content to catch copies
-                    let content_hash = {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = std::hash::DefaultHasher::new();
-                        content.hash(&mut hasher);
-                        hasher.finish()
-                    };
-                    if !seen_content.insert(content_hash) {
-                        continue;
-                    }
-                    if let Some(fm) = parse_skill_frontmatter(&content) {
-                        if seen_names.insert(fm.name.clone()) {
-                            skills.push(SkillMetadata {
-                                name: fm.name,
-                                description: fm.description,
-                                argument_hint: fm.argument_hint,
-                                path: skill_md,
-                                source: (*skill_subdir).to_string(),
-                            });
-                        }
-                    }
-                }
-            }
+            collect_skills_from_dir(
+                &skills_dir,
+                skill_subdir,
+                "",
+                &mut skills,
+                &mut seen_names,
+                &mut seen_paths,
+                &mut seen_content,
+            );
         }
         current = dir.parent().map(Path::to_path_buf);
     }
@@ -217,45 +261,15 @@ pub fn discover_skills_with_home(
                 if !scanned_dirs.insert(canonical_dir) {
                     continue;
                 }
-                let Ok(entries) = std::fs::read_dir(&skills_dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    let skill_md = entry.path().join("SKILL.md");
-                    if !skill_md.is_file() {
-                        continue;
-                    }
-                    let canonical =
-                        std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
-                    if !seen_paths.insert(canonical) {
-                        continue;
-                    }
-                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                        let content_hash = {
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = std::hash::DefaultHasher::new();
-                            content.hash(&mut hasher);
-                            hasher.finish()
-                        };
-                        if !seen_content.insert(content_hash) {
-                            continue;
-                        }
-                        if let Some(fm) = parse_skill_frontmatter(&content) {
-                            if seen_names.insert(fm.name.clone()) {
-                                skills.push(SkillMetadata {
-                                    name: fm.name,
-                                    description: fm.description,
-                                    argument_hint: fm.argument_hint,
-                                    path: skill_md,
-                                    source: (*skill_subdir).to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
+                collect_skills_from_dir(
+                    &skills_dir,
+                    skill_subdir,
+                    "",
+                    &mut skills,
+                    &mut seen_names,
+                    &mut seen_paths,
+                    &mut seen_content,
+                );
             }
         }
     }
@@ -278,45 +292,15 @@ pub fn discover_skills_with_home(
             if !scanned_dirs.insert(canonical_dir) {
                 continue; // walk-up already scanned this
             }
-            let Ok(entries) = std::fs::read_dir(&skills_dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let skill_md = entry.path().join("SKILL.md");
-                if !skill_md.is_file() {
-                    continue;
-                }
-                let canonical =
-                    std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
-                if !seen_paths.insert(canonical) {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    // Content dedup: hash the file content to catch copies
-                    let content_hash = {
-                        let mut hasher = std::hash::DefaultHasher::new();
-                        content.hash(&mut hasher);
-                        hasher.finish()
-                    };
-                    if !seen_content.insert(content_hash) {
-                        continue;
-                    }
-                    if let Some(fm) = parse_skill_frontmatter(&content) {
-                        if seen_names.insert(fm.name.clone()) {
-                            skills.push(SkillMetadata {
-                                name: fm.name,
-                                description: fm.description,
-                                argument_hint: fm.argument_hint,
-                                path: skill_md,
-                                source: skill_subdir.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
+            collect_skills_from_dir(
+                &skills_dir,
+                skill_subdir,
+                "",
+                &mut skills,
+                &mut seen_names,
+                &mut seen_paths,
+                &mut seen_content,
+            );
         }
     }
 
@@ -823,6 +807,107 @@ mod tests {
         let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
 
         assert!(!prompt.contains("<available_skills>"));
+    }
+
+    #[test]
+    fn test_discover_sub_skills_namespaced() {
+        let temp = TempDir::new().unwrap();
+        // Parent skill: allium
+        write_skill(
+            temp.path(),
+            ".agents/skills",
+            "allium",
+            "allium",
+            "Allium parent skill",
+        );
+        // Sub-skills inside allium/skills/
+        let sub_dir = temp.path().join(".agents/skills/allium/skills/distill");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(
+            sub_dir.join("SKILL.md"),
+            "---\nname: distill\ndescription: Distill a spec from code\n---\n\n# distill\n",
+        )
+        .unwrap();
+
+        let sub_dir2 = temp.path().join(".agents/skills/allium/skills/elicit");
+        fs::create_dir_all(&sub_dir2).unwrap();
+        fs::write(
+            sub_dir2.join("SKILL.md"),
+            "---\nname: elicit\ndescription: Elicit requirements\n---\n\n# elicit\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"allium"),
+            "parent skill should be discovered"
+        );
+        assert!(
+            names.contains(&"allium:distill"),
+            "sub-skill should be namespaced: got {names:?}"
+        );
+        assert!(
+            names.contains(&"allium:elicit"),
+            "sub-skill should be namespaced: got {names:?}"
+        );
+        assert_eq!(skills.len(), 3);
+    }
+
+    #[test]
+    fn test_discover_sub_skills_recursive_depth() {
+        let temp = TempDir::new().unwrap();
+        // a -> a/skills/b -> a/skills/b/skills/c
+        write_skill(temp.path(), ".claude/skills", "a", "a", "Skill A");
+
+        let b_dir = temp.path().join(".claude/skills/a/skills/b");
+        fs::create_dir_all(&b_dir).unwrap();
+        fs::write(
+            b_dir.join("SKILL.md"),
+            "---\nname: b\ndescription: Skill B\n---\n",
+        )
+        .unwrap();
+
+        let c_dir = temp.path().join(".claude/skills/a/skills/b/skills/c");
+        fs::create_dir_all(&c_dir).unwrap();
+        fs::write(
+            c_dir.join("SKILL.md"),
+            "---\nname: c\ndescription: Skill C\n---\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"a:b"));
+        assert!(
+            names.contains(&"a:b:c"),
+            "deep nesting should work: got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_sub_skills_without_parent_skill_md_not_discovered() {
+        // If a directory has skills/ but no SKILL.md, the sub-skills shouldn't be found
+        // because the parent directory isn't recognized as a skill
+        let temp = TempDir::new().unwrap();
+        let parent_dir = temp.path().join(".claude/skills/notaskill");
+        fs::create_dir_all(&parent_dir).unwrap();
+        // No SKILL.md in notaskill/
+
+        let sub_dir = parent_dir.join("skills/child");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(
+            sub_dir.join("SKILL.md"),
+            "---\nname: child\ndescription: Orphan child\n---\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        assert!(
+            skills.is_empty(),
+            "sub-skills of non-skill dirs should not be found"
+        );
     }
 
     #[test]
