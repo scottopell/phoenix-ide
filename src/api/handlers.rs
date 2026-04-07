@@ -1831,78 +1831,96 @@ async fn abandon_task(
             );
         }
 
-        // Phase 2: task file update (UNDER mutex)
+        // Phase 2: best-effort task file update (UNDER mutex)
+        // This is bookkeeping -- nothing here should block the abandon.
         let _guard = TASK_APPROVAL_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Check main checkout is clean
-        let status =
-            run_git(&repo_root_clone, &["status", "--porcelain"]).map_err(AppError::Internal)?;
-        if !status.is_empty() {
-            return Err(AppError::Conflict(ConflictErrorResponse::new(
-                "Main checkout has uncommitted changes. Commit or stash them before abandoning.",
-                "dirty_main_checkout",
-            )));
-        }
+        // Check main checkout is clean enough to do git operations
+        let main_clean = match run_git(&repo_root_clone, &["status", "--porcelain"]) {
+            Ok(status) => status.is_empty(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to check main checkout status");
+                false
+            }
+        };
 
-        // Checkout base branch
-        run_git(&repo_root_clone, &["checkout", &base_branch])
-            .map_err(|e| AppError::Internal(format!("Failed to checkout {base_branch}: {e}")))?;
-
-        // Scan tasks/ for matching task file and rename to wont-do
-        let tasks_dir = repo_root_clone.join("tasks");
-        match taskmd_core::tasks::find_task_by_id(&tasks_dir, &task_id) {
-            Some(task) => {
-                let old_filename = task
-                    .path
-                    .file_name()
-                    .expect("task path has filename")
-                    .to_string_lossy()
-                    .to_string();
-                let new_filename = taskmd_core::filename::format_filename(
-                    &task.id,
-                    &task.priority,
-                    "wont-do",
-                    &task.slug,
+        if main_clean {
+            // Checkout base branch so task file rename happens on the right branch
+            if let Err(e) = run_git(&repo_root_clone, &["checkout", &base_branch]) {
+                tracing::warn!(
+                    error = %e,
+                    branch = %base_branch,
+                    "Failed to checkout base branch -- skipping task file update"
                 );
+            } else {
+                // Scan tasks/ for matching task file and rename to wont-do
+                let tasks_dir = repo_root_clone.join("tasks");
+                match taskmd_core::tasks::find_task_by_id(&tasks_dir, &task_id) {
+                    Some(task) => {
+                        let old_filename = task
+                            .path
+                            .file_name()
+                            .expect("task path has filename")
+                            .to_string_lossy()
+                            .to_string();
+                        let new_filename = taskmd_core::filename::format_filename(
+                            &task.id,
+                            &task.priority,
+                            "wont-do",
+                            &task.slug,
+                        );
 
-                // Update frontmatter status in-place before renaming
-                if let Ok(content) = std::fs::read_to_string(&task.path) {
-                    let updated = taskmd_core::tasks::update_status_in_content(&content, "wont-do");
-                    if let Err(e) = std::fs::write(&task.path, updated) {
-                        tracing::warn!(error = %e, "Failed to update task frontmatter (non-fatal)");
+                        // Update frontmatter status in-place before renaming
+                        if let Ok(content) = std::fs::read_to_string(&task.path) {
+                            let updated =
+                                taskmd_core::tasks::update_status_in_content(&content, "wont-do");
+                            if let Err(e) = std::fs::write(&task.path, updated) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Failed to update task frontmatter (non-fatal)"
+                                );
+                            }
+                        }
+
+                        // Use git mv so the rename is tracked
+                        let old_path = format!("tasks/{old_filename}");
+                        let new_path = format!("tasks/{new_filename}");
+
+                        if let Err(e) =
+                            run_git(&repo_root_clone, &["mv", &old_path, &new_path])
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                old = %old_path,
+                                new = %new_path,
+                                "Failed to git mv task file (non-fatal)"
+                            );
+                        } else if let Err(e) = run_git(
+                            &repo_root_clone,
+                            &["commit", "-m", &format!("task {task_id}: mark wont-do")],
+                        ) {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to commit task file rename (non-fatal)"
+                            );
+                            let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            task_id = task_id,
+                            "No task file found for task number (may have been manually deleted)"
+                        );
                     }
                 }
-
-                // Use git mv so the rename is tracked
-                let old_path = format!("tasks/{old_filename}");
-                let new_path = format!("tasks/{new_filename}");
-
-                if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
-                    tracing::warn!(
-                        error = %e,
-                        old = %old_path,
-                        new = %new_path,
-                        "Failed to git mv task file (non-fatal)"
-                    );
-                } else if let Err(e) = run_git(
-                    &repo_root_clone,
-                    &["commit", "-m", &format!("task {task_id}: mark wont-do")],
-                ) {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to commit task file rename (non-fatal)"
-                    );
-                    let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
-                }
             }
-            None => {
-                tracing::warn!(
-                    task_id = task_id,
-                    "No task file found for task number (may have been manually deleted)"
-                );
-            }
+        } else {
+            tracing::warn!(
+                task_id = %task_id,
+                "Main checkout has uncommitted changes -- skipping task file update"
+            );
         }
 
         Ok(())
