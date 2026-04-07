@@ -12,13 +12,13 @@ Expansion references route through a `MessageExpander` layer in `send_chat`, pro
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-IR-001:** Include File Contents by Reference | ❌ Not Started | File read API exists; expansion layer does not |
-| **REQ-IR-002:** Load Skill Context by Name | ❌ Not Started | `discover_skills()` exists; expansion layer does not |
-| **REQ-IR-003:** Pass Additional Context to Skill Invocations | ❌ Not Started | Depends on REQ-IR-002 |
-| **REQ-IR-004:** Discover Files via Inline Autocomplete | ❌ Not Started | Shared by `@` and `./` triggers |
-| **REQ-IR-005:** Discover Skills via Inline Autocomplete | ❌ Not Started | Skills endpoint needed |
-| **REQ-IR-006:** Preserve Original Shorthand in Conversation History | ❌ Not Started | Applies to `@` and `/` only; `./` is already literal |
-| **REQ-IR-007:** Graceful Handling of Unresolvable Expansion References | ❌ Not Started | Applies to `@` and `/` only |
-| **REQ-IR-008:** Reference Files by Path Without Expansion | ❌ Not Started | Frontend autocomplete only; no backend expansion |
+| **REQ-IR-001:** Include File Contents by Reference | ✅ Complete | `src/message_expander.rs`; wired in `src/api/handlers.rs` |
+| **REQ-IR-002:** Load Skill Context by Name | ✅ Complete | `/skill-name` expansion via `discover_skills()` in `message_expander.rs` |
+| **REQ-IR-003:** Pass Additional Context to Skill Invocations | ✅ Complete | `$ARGUMENTS` substitution in `message_expander.rs` |
+| **REQ-IR-004:** Discover Files via Inline Autocomplete | ✅ Complete | `InlineAutocomplete.tsx` (`expand`/`path` modes); `GET /api/conversations/:id/files/search` |
+| **REQ-IR-005:** Discover Skills via Inline Autocomplete | ✅ Complete | `InlineAutocomplete.tsx` (`skill` mode); `GET /api/conversations/:id/skills` |
+| **REQ-IR-006:** Preserve Original Shorthand in Conversation History | ✅ Complete | `display_text`/`llm_text` separation in DB schema, state machine, and handlers |
+| **REQ-IR-007:** Graceful Handling of Unresolvable Expansion References | ✅ Complete | `ExpansionError` enum (backend), HTTP 422, `ExpansionError` class in `ui/src/api.ts` |
+| **REQ-IR-008:** Reference Files by Path Without Expansion | ✅ Complete | `./` mode inserts literal path only; no server-side expansion |
 
-**Progress:** 0 of 8 complete
+**Progress:** 8 of 8 complete

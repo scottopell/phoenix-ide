@@ -25,13 +25,13 @@ selected labels, preview content, and user notes.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-AUQ-001:** Structured Question Presentation | ❌ Not Started | - |
-| **REQ-AUQ-002:** Rich Option Previews | ❌ Not Started | - |
-| **REQ-AUQ-003:** Flexible Response Collection | ❌ Not Started | - |
-| **REQ-AUQ-004:** Response Delivery to Agent | ❌ Not Started | - |
-| **REQ-AUQ-005:** Prevent Ambiguous Question Responses | ❌ Not Started | - |
-| **REQ-AUQ-006:** Parent Conversation Availability | ❌ Not Started | - |
-| **REQ-AUQ-007:** Real-Time Waiting Feedback | ❌ Not Started | - |
-| **REQ-AUQ-008:** Low-Overhead Tool Availability | ❌ Not Started | - |
+| **REQ-AUQ-001:** Structured Question Presentation | ✅ Complete | `src/tools/ask_user_question.rs`, `AwaitingUserResponse` state, `QuestionPanel.tsx` |
+| **REQ-AUQ-002:** Rich Option Previews | ✅ Complete | Side-by-side `question-preview-layout` in `QuestionPanel.tsx`/`.css` |
+| **REQ-AUQ-003:** Flexible Response Collection | ✅ Complete | `OTHER_SENTINEL`, `otherTexts`, `multiSelections`, notes/annotations |
+| **REQ-AUQ-004:** Response Delivery to Agent | ✅ Complete | `POST /api/conversations/:id/respond`, `UserQuestionResponse` event |
+| **REQ-AUQ-005:** Prevent Ambiguous Question Responses | ✅ Complete | Schema constraints in tool; `AwaitingUserResponse` blocks `UserMessage` in `transition.rs` |
+| **REQ-AUQ-006:** Parent Conversation Availability | ✅ Complete | Excluded from sub-agent `ToolRegistry` in `src/tools.rs` |
+| **REQ-AUQ-007:** Real-Time Waiting Feedback | ✅ Complete | `awaiting_user_response` in `ConversationState` SSE union in `ui/src/api.ts` |
+| **REQ-AUQ-008:** Low-Overhead Tool Availability | ✅ Complete | `defer_loading() -> bool { true }` in `ask_user_question.rs` |
 
-**Progress:** 0 of 8 complete
+**Progress:** 8 of 8 complete

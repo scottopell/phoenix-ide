@@ -12,12 +12,12 @@ Implementation uses the Web Speech API where available, with automatic fallback 
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-VOICE-001:** Voice Dictation Activation | ❌ Not Started | Microphone button and native keyboard support |
-| **REQ-VOICE-002:** Recording State Feedback | ❌ Not Started | Visual indicators for all states |
-| **REQ-VOICE-003:** Transcription Review | ❌ Not Started | Edit before sending capability |
-| **REQ-VOICE-004:** Stop Recording Control | ❌ Not Started | Stop recording without losing content |
-| **REQ-VOICE-005:** Error Handling | ❌ Not Started | Permission, network, compatibility errors |
-| **REQ-VOICE-006:** Integration with Message Composition | ❌ Not Started | Append to drafts, preserve images |
-| **REQ-VOICE-007:** Mobile Optimization | ❌ Not Started | Keyboard management, interruption handling |
+| **REQ-VOICE-001:** Voice Dictation Activation | ✅ Complete | `VoiceButton.tsx`; `isWebSpeechSupported()` hides button on unsupported browsers |
+| **REQ-VOICE-002:** Recording State Feedback | ✅ Complete | `VoiceState` union, pulse animation CSS, processing spinner in `VoiceRecorder.tsx` |
+| **REQ-VOICE-003:** Transcription Review | ✅ Complete | `voiceBase`/`voiceInterim` state in `InputArea.tsx` renders transcription as editable draft |
+| **REQ-VOICE-004:** Stop Recording Control | ✅ Complete | `recognition.abort()` on button re-tap; Escape key handler |
+| **REQ-VOICE-005:** Error Handling | ✅ Complete | `VoicePermission.tsx` with `permission`/`not-supported`/`unknown` error types and retry |
+| **REQ-VOICE-006:** Integration with Message Composition | ✅ Complete | `voiceBase` appended to existing draft on stop; cleared on send; image attachments preserved |
+| **REQ-VOICE-007:** Mobile Optimization | ⚠️ Manual verification only | CSS has `@media (max-width: 480px)` and 44×44px touch target; keyboard suppression and orientation/interruption handling not found in code |
 
-**Progress:** 0 of 7 complete
+**Progress:** 6 of 7 complete (1 partial)
