@@ -235,9 +235,9 @@ impl ToolRegistry {
         Self::new_with_options(false)
     }
 
-    /// Create tool registry for Standalone mode (non-git directories).
-    /// Full tool suite, same as standard/Work mode.
-    pub fn standalone() -> Self {
+    /// Create tool registry for Direct mode.
+    /// Full tool suite -- same as Work mode.
+    pub fn direct() -> Self {
         Self::new_with_options(false)
     }
 

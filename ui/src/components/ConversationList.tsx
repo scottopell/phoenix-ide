@@ -134,11 +134,11 @@ export function ConversationList({
                   {conv.slug}
                   {conv.conv_mode_label && (
                     <span className="conv-mode-badge" title={
-                      conv.conv_mode_label.toLowerCase() === 'explore' ? 'Read-only mode (git project)' :
-                      conv.conv_mode_label.toLowerCase() === 'work' ? 'Write mode (task branch)' :
-                      conv.conv_mode_label.toLowerCase() === 'standalone' ? 'Full access (no git workflow)' :
+                      conv.conv_mode_label.toLowerCase() === 'explore' ? 'Managed mode (read-only exploration)' :
+                      conv.conv_mode_label.toLowerCase() === 'work' ? 'Managed mode (task branch)' :
+                      conv.conv_mode_label.toLowerCase() === 'direct' ? 'Full access (Direct mode)' :
                       conv.conv_mode_label
-                    }>{conv.conv_mode_label.toLowerCase() === 'standalone' ? 'Direct' : conv.conv_mode_label}</span>
+                    }>{conv.conv_mode_label}</span>
                   )}
                 </div>
                 <div className="conv-item-meta">

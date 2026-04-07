@@ -101,6 +101,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             recentDirs={conv.recentDirs}
             isGitDir={conv.isGitDir}
             error={conv.error}
+            mode={conv.mode}
+            setMode={conv.setMode}
           />
 
           {/* Main input */}
@@ -169,6 +171,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             setShowAllModels={conv.setShowAllModels}
             isGitDir={conv.isGitDir}
             error={conv.error}
+            mode={conv.mode}
+            setMode={conv.setMode}
           />
         </div>
       </main>

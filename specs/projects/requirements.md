@@ -47,25 +47,27 @@ safety features, letting users choose their level of structure.
 
 ---
 
-### REQ-PROJ-002: Start Every Project Conversation in Explore Mode
+### REQ-PROJ-002: Default Conversation Mode Selection
 
-WHEN a conversation is created for a project (directory is inside a git repository)
+WHEN a conversation is created for any directory
+THE SYSTEM SHALL initialize the conversation in Direct mode by default
+AND provide full tool access (bash, patch, all tools)
+
+WHEN a conversation is created for a git repository AND the user selects "Managed" mode
 THE SYSTEM SHALL initialize the conversation in Explore mode
 AND record the HEAD commit of the main branch as the conversation's pinned snapshot
 AND configure all tools in read-only mode
 
-WHILE a conversation is in Explore mode
+WHILE a conversation is in Explore mode (Managed workflow)
 THE SYSTEM SHALL prevent file writes to the project via any tool
 AND SHALL allow unrestricted file reading, directory listing, and read-only command execution
 
-WHEN a new conversation is started
-THE SYSTEM SHALL pin it to the current HEAD of main at that moment
-AND NOT automatically repin if main advances during the conversation
+WHEN the user selects "Managed" mode for a non-git directory
+THE SYSTEM SHALL reject the request (Managed mode requires a git repository)
 
-**Rationale:** Exploration is the natural, zero-friction starting point. Users can
-freely ask questions, read code, and plan without any risk of accidentally modifying
-anything. Multiple Explore conversations on the same project can coexist safely because
-none of them write anything.
+**Rationale:** Direct mode is the natural, zero-friction starting point for most work.
+The Managed (Explore/Work) lifecycle adds value for non-trivial changes that benefit
+from plan review and worktree isolation, but should be opt-in rather than mandatory.
 
 ---
 
@@ -464,30 +466,29 @@ specify a merge target at completion time.
 
 ---
 
-### REQ-PROJ-018: Direct Mode for Git Repositories
+### REQ-PROJ-018: Direct Mode (Implemented)
 
-WHEN the user creates a conversation targeting a git repository
-THE SYSTEM SHALL offer the option to start in Direct mode instead of Explore mode
+Direct mode is the default for all new conversations (git and non-git). It replaces
+the former `Standalone` mode and is now the primary conversation mode.
 
-WHEN the user selects Direct mode for a git repository
-THE SYSTEM SHALL create the conversation with full tool access (bash, patch, all tools)
-AND set the working directory to the repository root (not a worktree)
-AND NOT associate the conversation with the Explore/Work lifecycle
-AND NOT offer propose_plan (Direct mode bypasses the plan/approve workflow)
+WHEN a conversation is created in Direct mode
+THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
+AND set the working directory to the target directory (not a worktree)
+AND NOT include `propose_task` in the tool registry
+AND NOT create worktrees, branches, or task files
 
-WHEN a Direct-mode conversation operates on a git repository
-THE SYSTEM SHALL NOT create worktrees, branches, or task files
+THE SYSTEM SHALL visually distinguish Direct mode from Explore mode in the UI
+AND present the mode choice (Direct vs Managed) on the new conversation page
+with descriptions explaining the trade-offs
+
+WHEN a Direct-mode conversation targets a git repository
+THE SYSTEM SHALL associate it with the project (for MCP config, filtering, etc.)
 AND SHALL NOT restrict any tools based on git state
 
-THE SYSTEM SHALL visually distinguish Direct mode from Explore mode
-AND communicate that Direct mode bypasses safety features (no isolation, no review)
-
-**Rationale:** The Explore -> propose_plan -> approve -> Work workflow adds value for
-non-trivial changes but creates friction disproportionate to simple fixes. A one-line
-config change or quick experiment does not warrant the full ceremony. Without an escape
-hatch, users are forced to either endure the workflow overhead or create conversations
-in non-git directories and manually copy results. Direct mode gives the user an explicit
-opt-out with clear trade-off communication: full power, no safety net.
+**Rationale:** The Explore/Work ceremony adds value for non-trivial changes that
+benefit from plan review and worktree isolation, but creates friction disproportionate
+to simple fixes. Direct mode is the zero-friction default; the Managed workflow is
+opt-in for users who want structured project management.
 
 ---
 

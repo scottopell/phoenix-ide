@@ -190,9 +190,9 @@ export function StateBar({
   const mode = conversation?.conv_mode_label?.toLowerCase();
   const isWork = mode === 'work';
   const isExplore = mode === 'explore';
-  const modeLabel = mode === 'standalone' ? 'Direct' : conversation?.conv_mode_label;
+  const modeLabel = conversation?.conv_mode_label;
   const modeSuffix = isExplore ? ' (read-only)' : '';
-  const modeClass = `statebar-mode statebar-mode--${mode === 'standalone' ? 'direct' : mode}`;
+  const modeClass = `statebar-mode statebar-mode--${mode}`;
   const modelAbbrev = conversation ? abbreviateModel(conversation.model) : '';
   const projectName = conversation ? getProjectName(conversation) : null;
 

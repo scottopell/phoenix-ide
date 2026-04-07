@@ -287,12 +287,13 @@ export const api = {
     text: string,
     messageId: string,
     model?: string,
-    images: ImageData[] = []
+    images: ImageData[] = [],
+    mode?: 'direct' | 'managed'
   ): Promise<Conversation> {
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cwd, model, text, message_id: messageId, images }),
+      body: JSON.stringify({ cwd, model, text, message_id: messageId, images, mode }),
     });
     if (!resp.ok) {
       const err = await resp.json();

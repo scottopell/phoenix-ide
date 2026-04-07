@@ -4118,12 +4118,53 @@ html * {
   flex-shrink: 0;
 }
 
-/* Mode preview subtitle below actions */
-.new-conv-mode-preview {
+/* Mode selector (Direct vs Managed) */
+.new-conv-mode-selector {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mode-option {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 150ms, background 150ms;
+}
+
+.mode-option:hover {
+  border-color: var(--text-muted);
+}
+
+.mode-option--active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.mode-option input[type="radio"] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.mode-option-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mode-option-content strong {
+  font-size: 12px;
+}
+
+.mode-option-desc {
   font-size: 11px;
   color: var(--text-muted);
-  margin-top: 6px;
-  padding-left: 2px;
+  line-height: 1.4;
 }
 
 /* Expanded settings inside card */

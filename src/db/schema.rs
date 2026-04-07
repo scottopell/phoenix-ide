@@ -115,11 +115,15 @@ ALTER TABLE messages RENAME COLUMN id TO message_id;
 #[serde(tag = "mode")]
 pub enum ConvMode {
     /// Read-only mode. No file writes, no bash (unless sandboxed).
+    /// Opt-in "Managed" workflow: `propose_task` available, gateway to Work.
     #[default]
     Explore,
-    /// Standalone mode for non-git directories. Full tool suite, no project association.
-    Standalone,
-    /// Write mode on a task branch. Full tool suite with file write access.
+    /// Direct mode: full tool access, no lifecycle ceremony.
+    /// Default for all new conversations (git and non-git).
+    /// Serde alias ensures old DB rows with "Standalone" deserialize correctly.
+    #[serde(alias = "Standalone")]
+    Direct,
+    /// Write mode on a task branch (Managed workflow). Full tool suite with file write access.
     Work {
         /// The git branch name for this work conversation (e.g., `task-0042-fix-bug`)
         branch_name: String,
@@ -147,7 +151,7 @@ impl ConvMode {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Explore => "Explore",
-            Self::Standalone => "Standalone",
+            Self::Direct => "Direct",
             Self::Work { .. } => "Work",
         }
     }
@@ -156,7 +160,7 @@ impl ConvMode {
     pub fn branch_name(&self) -> Option<&str> {
         match self {
             Self::Work { branch_name, .. } => Some(branch_name),
-            Self::Explore | Self::Standalone => None,
+            Self::Explore | Self::Direct => None,
         }
     }
 
@@ -164,7 +168,7 @@ impl ConvMode {
     pub fn worktree_path(&self) -> Option<&str> {
         match self {
             Self::Work { worktree_path, .. } => Some(worktree_path),
-            Self::Explore | Self::Standalone => None,
+            Self::Explore | Self::Direct => None,
         }
     }
 
@@ -172,7 +176,7 @@ impl ConvMode {
     pub fn base_branch(&self) -> Option<&str> {
         match self {
             Self::Work { base_branch, .. } => Some(base_branch),
-            Self::Explore | Self::Standalone => None,
+            Self::Explore | Self::Direct => None,
         }
     }
 
@@ -181,7 +185,7 @@ impl ConvMode {
     pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::Work { task_id, .. } => Some(task_id),
-            Self::Explore | Self::Standalone => None,
+            Self::Explore | Self::Direct => None,
         }
     }
 }
@@ -722,6 +726,33 @@ impl fmt::Display for MessageType {
 
 /// Type alias for backward compatibility — `Usage` is the canonical type.
 pub type UsageData = crate::llm::Usage;
+
+#[cfg(test)]
+mod conv_mode_tests {
+    use super::*;
+
+    #[test]
+    fn test_direct_serialization() {
+        let json = serde_json::to_string(&ConvMode::Direct).unwrap();
+        assert_eq!(json, r#"{"mode":"Direct"}"#);
+        let parsed: ConvMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ConvMode::Direct);
+    }
+
+    #[test]
+    fn test_standalone_alias_deserializes_to_direct() {
+        let old_json = r#"{"mode":"Standalone"}"#;
+        let parsed: ConvMode = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed, ConvMode::Direct);
+    }
+
+    #[test]
+    fn test_explore_still_works() {
+        let json = r#"{"mode":"Explore"}"#;
+        let parsed: ConvMode = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, ConvMode::Explore);
+    }
+}
 
 #[cfg(test)]
 mod error_kind_tests {

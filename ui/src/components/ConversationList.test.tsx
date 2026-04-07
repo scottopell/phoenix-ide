@@ -60,7 +60,7 @@ describe('SIDE-02: Conversation list should show project labels', () => {
 
     // Each item should have a dedicated project label element.
     // This is distinct from .conv-item-cwd (which shows the working directory)
-    // and .conv-mode-badge (which shows EXPLORE/WORK/STANDALONE).
+    // and .conv-mode-badge (which shows EXPLORE/WORK/DIRECT).
     // A project label identifies which git repository the conversation belongs to.
     const projectLabels = container.querySelectorAll('.conv-project-label');
     expect(projectLabels.length).toBe(2);

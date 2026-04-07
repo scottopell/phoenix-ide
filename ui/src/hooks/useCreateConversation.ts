@@ -39,6 +39,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [creating, setCreating] = useState(false);
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
+  const [mode, setMode] = useState<'direct' | 'managed'>('direct');
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -63,6 +64,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
+
+  // Reset to Direct when directory is not a git repo (Managed requires git)
+  useEffect(() => { if (isGitDir === false) setMode('direct'); }, [isGitDir]);
 
   const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
 
@@ -127,7 +131,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
       const conv = await api.createConversation(
-        trimmedCwd, trimmed, messageId, selectedModel || undefined, images
+        trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
@@ -157,6 +161,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
     error,
     creating,
     canSend,
+    mode,
+    setMode,
     recentDirs,
     addImages,
     removeImage,

@@ -518,8 +518,10 @@ where
         self.sub_agent_result_buffer = Vec::with_capacity(input.tasks.len());
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work =
-            matches!(self.context.mode_context, Some(ModeContext::Work { .. }));
+        let parent_allows_work = matches!(
+            self.context.mode_context,
+            Some(ModeContext::Work { .. } | ModeContext::Direct)
+        );
 
         let mut work_count_in_batch = 0u32;
         for task in &input.tasks {

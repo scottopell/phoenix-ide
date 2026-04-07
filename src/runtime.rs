@@ -515,13 +515,13 @@ impl RuntimeManager {
                         ToolRegistry::explore_no_sandbox()
                     }
                 }
-                ConvMode::Standalone => {
-                    // Full tool suite for non-git directories
-                    ToolRegistry::standalone()
+                ConvMode::Direct => {
+                    // Full tool suite for Direct mode
+                    ToolRegistry::direct()
                 }
                 ConvMode::Work { .. } => {
-                    // Full tool suite for Work mode (same as standalone for now)
-                    ToolRegistry::standalone()
+                    // Full tool suite for Work mode (same as Direct)
+                    ToolRegistry::direct()
                 }
             };
             // MCP tools resolved live from the manager on every definitions()
@@ -722,6 +722,6 @@ fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.clone(),
             worktree_path: worktree_path.clone(),
         },
-        ConvMode::Standalone => ModeContext::Standalone,
+        ConvMode::Direct => ModeContext::Direct,
     }
 }

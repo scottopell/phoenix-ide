@@ -38,7 +38,7 @@ interface InputAreaProps {
   setImages: (images: ImageData[]) => void;
   isOffline: boolean;
   queuedMessages: QueuedMessage[];
-  /** Conversation mode label (e.g. "Explore", "Work", "Standalone") */
+  /** Conversation mode label (e.g. "Explore", "Work", "Direct") */
   convModeLabel?: string | undefined;
   /**
    * Called when the user sends a message.

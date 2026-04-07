@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import { LlmStatusBanner } from './LlmStatusBanner';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
@@ -20,6 +21,10 @@ interface ConversationSettingsProps {
   isGitDir?: boolean | null;
   /** Error message to display */
   error?: string | null;
+  /** Selected conversation mode */
+  mode?: 'direct' | 'managed';
+  /** Callback to change mode */
+  setMode?: (m: 'direct' | 'managed') => void;
 }
 
 export function ConversationSettings({
@@ -36,7 +41,10 @@ export function ConversationSettings({
   recentDirs,
   isGitDir,
   error,
+  mode = 'direct',
+  setMode,
 }: ConversationSettingsProps) {
+  const radioGroupName = useId();
   return (
     <>
       <LlmStatusBanner models={models} />
@@ -75,10 +83,43 @@ export function ConversationSettings({
       />
 
       {dirStatus === 'exists' && isGitDir !== null && isGitDir !== undefined && (
-        <div className="new-conv-mode-preview">
-          {isGitDir
-            ? 'Git project \u2014 starts in Explore mode (read-only)'
-            : 'Direct mode \u2014 full tool access'}
+        <div className="new-conv-mode-selector">
+          <label
+            className={`mode-option ${mode === 'direct' ? 'mode-option--active' : ''}`}
+            onClick={() => setMode?.('direct')}
+          >
+            <input
+              type="radio"
+              name={radioGroupName}
+              checked={mode === 'direct'}
+              onChange={() => setMode?.('direct')}
+            />
+            <span className="mode-option-content">
+              <strong>Direct</strong>
+              <span className="mode-option-desc">
+                Full tool access. Changes happen on your current branch.
+              </span>
+            </span>
+          </label>
+          {isGitDir && (
+            <label
+              className={`mode-option ${mode === 'managed' ? 'mode-option--active' : ''}`}
+              onClick={() => setMode?.('managed')}
+            >
+              <input
+                type="radio"
+                name={radioGroupName}
+                checked={mode === 'managed'}
+                onChange={() => setMode?.('managed')}
+              />
+              <span className="mode-option-content">
+                <strong>Managed</strong>
+                <span className="mode-option-desc">
+                  Read-only exploration first. Proposes a task plan for your approval, then works on an isolated worktree.
+                </span>
+              </span>
+            </label>
+          )}
         </div>
       )}
     </>

@@ -457,11 +457,17 @@ async fn create_conversation(
         None
     };
 
-    // Create conversation (REQ-PROJ-002: Explore for git repos, Standalone otherwise)
-    let conv_mode = if project_id.is_some() {
-        crate::db::ConvMode::Explore
-    } else {
-        crate::db::ConvMode::Standalone
+    // Direct mode is the default. "managed" opts in to Explore/Work lifecycle (requires git).
+    let conv_mode = match req.mode.as_deref() {
+        Some("managed") => {
+            if project_id.is_none() {
+                return Err(AppError::BadRequest(
+                    "Managed mode requires a git repository".to_string(),
+                ));
+            }
+            crate::db::ConvMode::Explore
+        }
+        _ => crate::db::ConvMode::Direct,
     };
     let conversation = state
         .runtime

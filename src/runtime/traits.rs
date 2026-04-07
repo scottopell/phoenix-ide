@@ -490,7 +490,7 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        self.swap_registry(ToolRegistry::standalone());
+        self.swap_registry(ToolRegistry::direct());
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
 }

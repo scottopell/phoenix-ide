@@ -14,6 +14,10 @@ pub struct CreateConversationRequest {
     /// Optional image attachments
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    /// Conversation mode: "managed" for Explore/Work lifecycle, omit or "direct" for full access.
+    /// "managed" requires a git repository.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Request to send a chat message

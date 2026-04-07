@@ -35,8 +35,8 @@ pub enum ModeContext {
         base_branch: String,
         worktree_path: String,
     },
-    /// Non-git directory or explicit opt-out. Full tool access.
-    Standalone,
+    /// Direct mode: full tool access, no lifecycle ceremony.
+    Direct,
 }
 
 /// A discovered guidance file with its path and content
@@ -469,10 +469,11 @@ pub fn build_system_prompt_with_home(
                      are handled automatically during merge."
                 );
             }
-            ModeContext::Standalone => {
+            ModeContext::Direct => {
                 prompt.push_str(
-                    "\n\nYou have full tool access. This directory is not a git project, \
-                     so there is no plan/approve workflow or branch isolation.",
+                    "\n\nYou have full tool access. You are working directly in this directory \
+                     with no plan/approve workflow or branch isolation. Changes happen on the \
+                     current branch.",
                 );
             }
         }
