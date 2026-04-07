@@ -1,6 +1,11 @@
 {
   "version": 1,
   "skills": {
+    "allium": {
+      "source": "juxt/allium",
+      "sourceType": "github",
+      "computedHash": "99290e411cdb1c0042d7f3b69ead087cea973dfd6b6198e5942731968f3e7be4"
+    },
     "vercel-react-best-practices": {
       "source": "vercel-labs/agent-skills",
       "sourceType": "github",
