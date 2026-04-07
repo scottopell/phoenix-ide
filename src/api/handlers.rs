@@ -1825,7 +1825,11 @@ async fn abandon_task(
         )
         .unwrap_or_default();
 
-        // Full diff (uncommitted changes)
+        // Stage untracked files as intent-to-add so they appear in the diff.
+        // Agent-created files are typically untracked (patch tool doesn't git-add).
+        let _ = run_git(&wt, &["add", "-N", "."]);
+
+        // Full diff (uncommitted + newly created files)
         let diff = run_git(&wt, &["diff", "HEAD"]).unwrap_or_default();
 
         if commit_log.is_empty() && diff.is_empty() {
