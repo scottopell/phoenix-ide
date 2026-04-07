@@ -34,11 +34,8 @@ pub enum ExpansionError {
     FileNotFound { path: String },
     /// `@` reference points to a binary file
     FileNotText { path: String },
-    /// `/skill-name` does not match any discovered skill
-    SkillNotFound {
-        name: String,
-        available: Vec<String>,
-    },
+    /// Skill was found but invocation failed (e.g., file read error)
+    SkillInvocationFailed { name: String, error: String },
 }
 
 impl std::fmt::Display for ExpansionError {
@@ -48,16 +45,8 @@ impl std::fmt::Display for ExpansionError {
             Self::FileNotText { path } => {
                 write!(f, "File is binary and cannot be included: {path}")
             }
-            Self::SkillNotFound { name, available } => {
-                if available.is_empty() {
-                    write!(f, "Skill not found: {name} (no skills are available)")
-                } else {
-                    write!(
-                        f,
-                        "Skill not found: {name}. Available skills: {}",
-                        available.join(", ")
-                    )
-                }
+            Self::SkillInvocationFailed { name, error } => {
+                write!(f, "Skill '{name}' failed: {error}")
             }
         }
     }
@@ -69,7 +58,7 @@ impl ExpansionError {
         match self {
             Self::FileNotFound { .. } => "file_not_found",
             Self::FileNotText { .. } => "file_not_text",
-            Self::SkillNotFound { .. } => "skill_not_found",
+            Self::SkillInvocationFailed { .. } => "skill_invocation_failed",
         }
     }
 
@@ -77,7 +66,7 @@ impl ExpansionError {
     pub fn reference(&self) -> String {
         match self {
             Self::FileNotFound { path } | Self::FileNotText { path } => format!("@{path}"),
-            Self::SkillNotFound { name, .. } => format!("/{name}"),
+            Self::SkillInvocationFailed { name, .. } => format!("/{name}"),
         }
     }
 }
@@ -183,10 +172,10 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
                         skill_invocation: Some(invocation),
                     });
                 }
-                Err(_e) => {
-                    return Err(ExpansionError::SkillNotFound {
+                Err(e) => {
+                    return Err(ExpansionError::SkillInvocationFailed {
                         name: skill_ref.token.clone(),
-                        available: skills.iter().map(|s| s.name.clone()).collect(),
+                        error: e,
                     });
                 }
             }
@@ -412,12 +401,12 @@ mod tests {
             "file_not_text"
         );
         assert_eq!(
-            ExpansionError::SkillNotFound {
+            ExpansionError::SkillInvocationFailed {
                 name: "x".to_string(),
-                available: vec![]
+                error: "oops".to_string()
             }
             .error_type(),
-            "skill_not_found"
+            "skill_invocation_failed"
         );
     }
 
@@ -428,9 +417,9 @@ mod tests {
         };
         assert_eq!(err.reference(), "@src/foo.rs");
 
-        let err2 = ExpansionError::SkillNotFound {
+        let err2 = ExpansionError::SkillInvocationFailed {
             name: "my-skill".to_string(),
-            available: vec![],
+            error: "read failed".to_string(),
         };
         assert_eq!(err2.reference(), "/my-skill");
     }

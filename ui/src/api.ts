@@ -225,7 +225,7 @@ export interface TaskEntry {
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
-  error_type: 'file_not_found' | 'file_not_text' | 'skill_not_found';
+  error_type: 'file_not_found' | 'file_not_text' | 'skill_invocation_failed';
   reference: string;
 }
 
