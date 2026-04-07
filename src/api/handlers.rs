@@ -24,6 +24,7 @@ use crate::runtime::executor::{run_git, TASK_APPROVAL_MUTEX};
 use crate::runtime::SseEvent;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
+use std::fmt::Write as _;
 
 use axum::{
     extract::{Path, Query, State},
@@ -1805,7 +1806,87 @@ async fn abandon_task(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let repo_root = PathBuf::from(&project.canonical_path);
 
-    // 2. Execute abandon sequence (blocking)
+    // 2a. Capture diff snapshot from worktree BEFORE deleting it (blocking)
+    let worktree_path_clone = worktree_path.clone();
+    let base_branch_clone = base_branch.clone();
+    let diff_snapshot: Option<String> = tokio::task::spawn_blocking(move || {
+        const MAX_DIFF_BYTES: usize = 100 * 1024; // 100KiB
+
+        let wt = PathBuf::from(&worktree_path_clone);
+        if !wt.exists() {
+            tracing::warn!(worktree = %worktree_path_clone, "Worktree gone before diff capture");
+            return None;
+        }
+
+        // Commit log of unmerged work
+        let commit_log = run_git(
+            &wt,
+            &["log", "--oneline", &format!("{base_branch_clone}..HEAD")],
+        )
+        .unwrap_or_default();
+
+        // Full diff (uncommitted changes)
+        let diff = run_git(&wt, &["diff", "HEAD"]).unwrap_or_default();
+
+        if commit_log.is_empty() && diff.is_empty() {
+            return None;
+        }
+
+        let mut snapshot = String::from("## Abandoned work snapshot\n");
+
+        if !commit_log.is_empty() {
+            snapshot.push_str("\n### Unmerged commits\n```\n");
+            snapshot.push_str(&commit_log);
+            snapshot.push_str("\n```\n");
+        }
+
+        if !diff.is_empty() {
+            snapshot.push_str("\n### Uncommitted changes\n```diff\n");
+            if diff.len() > MAX_DIFF_BYTES {
+                // Truncate at a valid UTF-8 char boundary
+                let end = diff.floor_char_boundary(MAX_DIFF_BYTES);
+                snapshot.push_str(diff.get(..end).unwrap_or(&diff));
+                let _ = write!(
+                    snapshot,
+                    "\n\n[truncated -- diff was {}KiB, showing first 100KiB]",
+                    diff.len() / 1024
+                );
+            } else {
+                snapshot.push_str(&diff);
+            }
+            snapshot.push_str("\n```\n");
+        }
+
+        Some(snapshot)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Diff capture failed: {e}")))?;
+
+    // 2b. Write diff snapshot as a system message (before worktree deletion)
+    let snapshot_msg = if let Some(ref snapshot) = diff_snapshot {
+        let snap_msg_id = uuid::Uuid::new_v4().to_string();
+        match state
+            .db
+            .add_message(
+                &snap_msg_id,
+                &id,
+                &MessageContent::system(snapshot),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 2c. Delete worktree/branch + best-effort task file update (blocking)
     let repo_root_clone = repo_root.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         // Phase 1: worktree cleanup (BEFORE mutex -- these don't touch the main checkout)
@@ -1888,9 +1969,7 @@ async fn abandon_task(
                         let old_path = format!("tasks/{old_filename}");
                         let new_path = format!("tasks/{new_filename}");
 
-                        if let Err(e) =
-                            run_git(&repo_root_clone, &["mv", &old_path, &new_path])
-                        {
+                        if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
                             tracing::warn!(
                                 error = %e,
                                 old = %old_path,
@@ -1957,6 +2036,12 @@ async fn abandon_task(
 
     // 7. Broadcast SSE events so the frontend updates in real-time
     if let Ok(handle) = state.runtime.get_or_create(&id).await {
+        // Broadcast diff snapshot first (shows above the "abandoned" message)
+        if let Some(snap_msg) = snapshot_msg {
+            let _ = handle
+                .broadcast_tx
+                .send(SseEvent::Message { message: snap_msg });
+        }
         let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
         let _ = handle.broadcast_tx.send(SseEvent::StateChange {
             state: ConvState::Terminal,
