@@ -3,8 +3,7 @@
 //! Both the user `/skill` path (`message_expander`) and the LLM Skill tool
 //! (`tools/skill.rs`) call `invoke_skill()` to produce identical output.
 
-use crate::system_prompt::discover_skills;
-use std::path::Path;
+use crate::system_prompt::SkillMetadata;
 
 /// The result of invoking a skill.
 #[derive(Debug, Clone)]
@@ -18,8 +17,8 @@ pub struct SkillInvocation {
     pub skill_dir: String,
 }
 
-/// Invoke a skill by name: discover, read SKILL.md, strip frontmatter,
-/// prepend base directory, substitute arguments.
+/// Invoke a skill by name: look up in pre-discovered skills, read SKILL.md,
+/// strip frontmatter, prepend base directory, substitute arguments.
 ///
 /// # Errors
 ///
@@ -27,10 +26,8 @@ pub struct SkillInvocation {
 pub fn invoke_skill(
     skill_name: &str,
     arguments: &str,
-    working_dir: &Path,
+    skills: &[SkillMetadata],
 ) -> Result<SkillInvocation, String> {
-    let skills = discover_skills(working_dir);
-
     let skill = skills
         .iter()
         .find(|s| s.name == skill_name)
@@ -247,7 +244,8 @@ mod tests {
             "Run cargo build.",
         );
 
-        let result = invoke_skill("build", "", tmp.path()).unwrap();
+        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let result = invoke_skill("build", "", &skills).unwrap();
         assert_eq!(result.name, "build");
         assert!(result.body.contains("Base directory for this skill:"));
         assert!(result.body.contains("Run cargo build."));
@@ -266,14 +264,16 @@ mod tests {
             "Deploy to $ARGUMENTS environment.",
         );
 
-        let result = invoke_skill("deploy", "staging", tmp.path()).unwrap();
+        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let result = invoke_skill("deploy", "staging", &skills).unwrap();
         assert!(result.body.contains("Deploy to staging environment."));
     }
 
     #[test]
     fn test_invoke_skill_not_found() {
         let tmp = TempDir::new().unwrap();
-        let err = invoke_skill("nonexistent", "", tmp.path()).unwrap_err();
+        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let err = invoke_skill("nonexistent", "", &skills).unwrap_err();
         assert!(err.contains("not found"));
         assert!(err.contains("nonexistent"));
     }
@@ -284,7 +284,8 @@ mod tests {
         write_skill(tmp.path(), "build", "build", "Build it", "body");
         write_skill(tmp.path(), "lint", "lint", "Lint it", "body");
 
-        let err = invoke_skill("deploy", "", tmp.path()).unwrap_err();
+        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let err = invoke_skill("deploy", "", &skills).unwrap_err();
         assert!(err.contains("deploy"));
         assert!(err.contains("build"));
         assert!(err.contains("lint"));
@@ -301,7 +302,8 @@ mod tests {
             "Do the thing.",
         );
 
-        let result = invoke_skill("simple", "extra args", tmp.path()).unwrap();
+        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let result = invoke_skill("simple", "extra args", &skills).unwrap();
         assert!(result.body.contains("ARGUMENTS: extra args"));
     }
 }

@@ -175,7 +175,7 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
         let skills = discover_skills(working_dir);
         if skills.iter().any(|s| s.name == skill_ref.token) {
-            match crate::skills::invoke_skill(&skill_ref.token, text, working_dir) {
+            match crate::skills::invoke_skill(&skill_ref.token, text, &skills) {
                 Ok(invocation) => {
                     return Ok(ExpandedMessage {
                         display_text: text.to_string(),
