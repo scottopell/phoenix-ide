@@ -736,7 +736,15 @@ where
                             max = self.context.max_turns,
                             "Sub-agent exceeded max turn limit, sending cancel"
                         );
-                        let _ = self.event_tx.send(Event::UserCancel).await;
+                        let _ = self
+                            .event_tx
+                            .send(Event::UserCancel {
+                                reason: Some(format!(
+                                    "Sub-agent exceeded turn limit ({}/{})",
+                                    self.llm_turn_count, self.context.max_turns
+                                )),
+                            })
+                            .await;
                         return Ok(None);
                     }
                 }

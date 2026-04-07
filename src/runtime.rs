@@ -371,7 +371,11 @@ impl RuntimeManager {
             tokio::spawn(async move {
                 tokio::time::sleep(timeout_duration).await;
                 tracing::info!("Sub-agent timeout reached, sending cancel");
-                let _ = event_tx.send(Event::UserCancel).await;
+                let _ = event_tx
+                    .send(Event::UserCancel {
+                        reason: Some("Sub-agent timed out".to_string()),
+                    })
+                    .await;
             })
         };
 
@@ -420,7 +424,10 @@ impl RuntimeManager {
         for agent_id in ids {
             if let Some(handle) = runtimes.get(&agent_id) {
                 tracing::info!(agent_id = %agent_id, "Sending cancel to sub-agent");
-                let _ = handle.event_tx.send(Event::UserCancel).await;
+                let _ = handle
+                    .event_tx
+                    .send(Event::UserCancel { reason: None })
+                    .await;
             } else {
                 // Runtime not found - synthesize failure result
                 tracing::warn!(agent_id = %agent_id, "Sub-agent runtime not found, synthesizing failure");

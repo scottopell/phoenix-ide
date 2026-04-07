@@ -353,7 +353,7 @@ fn arb_event() -> impl Strategy<Value = Event> {
         arb_tool_complete_event(),
         arb_llm_error_event(),
         arb_retry_timeout_event(),
-        Just(Event::UserCancel),
+        Just(Event::UserCancel { reason: None }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
     ]
@@ -469,7 +469,7 @@ proptest! {
     // Invariant 3: Cancel from any working state reaches a cancelling state
     #[test]
     fn prop_cancel_stops_work(state in arb_working_state()) {
-        let result = transition(&state, &test_context(), Event::UserCancel);
+        let result = transition(&state, &test_context(), Event::UserCancel { reason: None });
         prop_assert!(result.is_ok(), "Cancel failed: {:?}", result);
         let new_state = result.unwrap().new_state;
         prop_assert!(
@@ -763,7 +763,7 @@ proptest! {
     #[test]
     fn prop_llm_cancel_goes_to_idle(_dummy in Just(())) {
         let state = ConvState::LlmRequesting { attempt: 1 };
-        let result = transition(&state, &test_context(), Event::UserCancel);
+        let result = transition(&state, &test_context(), Event::UserCancel { reason: None });
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
@@ -791,7 +791,7 @@ proptest! {
             assistant_message: AssistantMessage::default(),
         };
 
-        let result = transition(&state, &test_context(), Event::UserCancel);
+        let result = transition(&state, &test_context(), Event::UserCancel { reason: None });
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
@@ -1359,7 +1359,7 @@ fn test_cancel_mid_tool_chain() {
     };
 
     // Phase 1: UserCancel -> CancellingTool + AbortTool effect
-    let result = transition(&state, &ctx, Event::UserCancel).unwrap();
+    let result = transition(&state, &ctx, Event::UserCancel { reason: None }).unwrap();
 
     assert!(
         matches!(result.new_state, ConvState::CancellingTool { .. }),
@@ -1704,7 +1704,7 @@ proptest! {
         spawn_tool_id: None,
     };
 
-    let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
+    let result = transition(&state, &test_context(), Event::UserCancel { reason: None }).unwrap();
 
     match result.new_state {
         ConvState::CancellingSubAgents {

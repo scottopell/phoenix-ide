@@ -689,7 +689,7 @@ pub fn transition(
         // ============================================================
 
         // LlmRequesting + UserCancel -> Idle (fire-and-forget abort)
-        (ConvState::LlmRequesting { .. }, Event::UserCancel) if !context.is_sub_agent => {
+        (ConvState::LlmRequesting { .. }, Event::UserCancel { .. }) if !context.is_sub_agent => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::AbortLlm)
@@ -697,7 +697,7 @@ pub fn transition(
         }
 
         // AwaitingLlm + UserCancel -> Idle (parent) or Failed (sub-agent)
-        (ConvState::AwaitingLlm, Event::UserCancel) if !context.is_sub_agent => {
+        (ConvState::AwaitingLlm, Event::UserCancel { .. }) if !context.is_sub_agent => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
@@ -710,7 +710,7 @@ pub fn transition(
                 completed_results,
                 ..
             },
-            Event::UserCancel,
+            Event::UserCancel { .. },
         ) => {
             let ids: Vec<String> = pending.iter().map(|p| p.agent_id.clone()).collect();
             Ok(TransitionResult::new(ConvState::CancellingSubAgents {
@@ -730,7 +730,7 @@ pub fn transition(
                 pending_sub_agents,
                 assistant_message,
             },
-            Event::UserCancel,
+            Event::UserCancel { .. },
         ) if !context.is_sub_agent => {
             let mut result = TransitionResult::new(ConvState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
@@ -947,16 +947,19 @@ pub fn transition(
         // ============================================================
         // Sub-Agent Cancellation (wildcard for non-terminal states)
         // ============================================================
-        (state, Event::UserCancel) if context.is_sub_agent && !state.is_terminal() => {
+        (state, Event::UserCancel { reason }) if context.is_sub_agent && !state.is_terminal() => {
             use crate::state_machine::state::SubAgentOutcome;
+            let error = reason
+                .clone()
+                .unwrap_or_else(|| "Cancelled by parent".to_string());
             Ok(TransitionResult::new(ConvState::Failed {
-                error: "Cancelled by parent".to_string(),
+                error: error.clone(),
                 error_kind: ErrorKind::Cancelled,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
                 outcome: SubAgentOutcome::Failure {
-                    error: "Cancelled by parent".to_string(),
+                    error,
                     error_kind: ErrorKind::Cancelled,
                 },
             }))
@@ -1040,7 +1043,7 @@ pub fn transition(
             .with_effect(Effect::notify_agent_done())),
 
         // AwaitingTaskApproval + UserCancel -> treat as Rejected
-        (ConvState::AwaitingTaskApproval { .. }, Event::UserCancel) => {
+        (ConvState::AwaitingTaskApproval { .. }, Event::UserCancel { .. }) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistMessage {
                     content: crate::db::MessageContent::system("Task rejected."),
@@ -1123,7 +1126,7 @@ pub fn transition(
 
         // AwaitingUserResponse + UserCancel -> Idle
         // Tool result already persisted in checkpoint. System message indicates decline.
-        (ConvState::AwaitingUserResponse { .. }, Event::UserCancel) => {
+        (ConvState::AwaitingUserResponse { .. }, Event::UserCancel { .. }) => {
             Ok(TransitionResult::new(ConvState::Idle)
                 .with_effect(Effect::PersistMessage {
                     content: crate::db::MessageContent::system(
@@ -1166,7 +1169,7 @@ pub fn transition(
         }
 
         // UserCancel during continuation -> ContextExhausted with cancelled message
-        (ConvState::AwaitingContinuation { .. }, Event::UserCancel) => {
+        (ConvState::AwaitingContinuation { .. }, Event::UserCancel { .. }) => {
             let cancelled =
                 "Continuation cancelled by user. Please start a new conversation.".to_string();
             Ok(TransitionResult::new(ConvState::ContextExhausted {
@@ -1718,7 +1721,7 @@ mod tests {
                 assistant_message,
             },
             &test_context(),
-            Event::UserCancel,
+            Event::UserCancel { reason: None },
         )
         .unwrap();
 
@@ -2342,7 +2345,8 @@ mod tests {
             tool_use_id: "tool-auq-1".to_string(),
         };
 
-        let result = transition(&state, &test_context(), Event::UserCancel).unwrap();
+        let result =
+            transition(&state, &test_context(), Event::UserCancel { reason: None }).unwrap();
 
         assert!(
             matches!(result.new_state, ConvState::Idle),

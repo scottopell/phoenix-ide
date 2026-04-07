@@ -526,7 +526,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     /// Send cancel event
     pub async fn send_cancel(&self) {
         self.event_tx
-            .send(Event::UserCancel)
+            .send(Event::UserCancel { reason: None })
             .await
             .expect("Failed to send cancel");
     }
@@ -798,7 +798,10 @@ mod tests {
             .expect("LLM request should start");
 
         // Cancel immediately after request starts
-        event_tx.send(Event::UserCancel).await.unwrap();
+        event_tx
+            .send(Event::UserCancel { reason: None })
+            .await
+            .unwrap();
 
         // Wait for idle state (cancellation complete)
         let mut done = false;
@@ -909,7 +912,10 @@ mod tests {
             .expect("Tool execution should start");
 
         // Cancel immediately
-        event_tx.send(Event::UserCancel).await.unwrap();
+        event_tx
+            .send(Event::UserCancel { reason: None })
+            .await
+            .unwrap();
 
         // Wait for AgentDone
         let mut done = false;
@@ -1007,7 +1013,10 @@ mod tests {
         let cancel_start = tokio::time::Instant::now();
 
         // Send cancel
-        event_tx.send(Event::UserCancel).await.unwrap();
+        event_tx
+            .send(Event::UserCancel { reason: None })
+            .await
+            .unwrap();
 
         // Wait for AgentDone event
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -1097,7 +1106,7 @@ mod tests {
         };
 
         // Phase 1: UserCancel -> CancellingTool with AbortTool
-        let result = transition(&state, &context, Event::UserCancel).unwrap();
+        let result = transition(&state, &context, Event::UserCancel { reason: None }).unwrap();
 
         assert!(
             matches!(result.new_state, ConvState::CancellingTool { .. }),
@@ -1261,7 +1270,7 @@ mod tests {
         ];
 
         for state in states {
-            let result = transition(&state, &context, Event::UserCancel).unwrap();
+            let result = transition(&state, &context, Event::UserCancel { reason: None }).unwrap();
 
             match &result.new_state {
                 ConvState::Failed { error, error_kind } => {

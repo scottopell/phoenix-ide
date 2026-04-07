@@ -26,7 +26,10 @@ pub enum Event {
         /// When present, the message is persisted as `MessageContent::Skill`.
         skill_invocation: Option<crate::skills::SkillInvocation>,
     },
-    UserCancel,
+    UserCancel {
+        /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
+        reason: Option<String>,
+    },
 
     // LLM events
     LlmResponse {

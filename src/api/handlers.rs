@@ -1074,7 +1074,7 @@ async fn cancel_conversation(
 ) -> Result<Json<CancelResponse>, AppError> {
     state
         .runtime
-        .send_event(&id, Event::UserCancel)
+        .send_event(&id, Event::UserCancel { reason: None })
         .await
         .map_err(AppError::BadRequest)?;
 
