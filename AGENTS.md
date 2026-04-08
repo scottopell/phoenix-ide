@@ -77,6 +77,8 @@ In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is emb
 
 Each git worktree gets unique ports and database automatically.
 
+**Logs:** Dev server logs to `phoenix.log` in the project root. Production logs to `~/.phoenix-ide/prod.log`.
+
 ⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py`.
 
 ---
