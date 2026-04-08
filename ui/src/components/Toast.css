@@ -3,7 +3,8 @@
 .toast-container {
   position: fixed;
   bottom: 72px;
-  left: 50%;
+  /* On desktop, offset right to account for ~240px sidebar */
+  left: calc(50% + 120px);
   transform: translateX(-50%);
   z-index: 1000;
   pointer-events: none;
@@ -13,6 +14,16 @@
   gap: 4px;
   max-width: 480px;
   width: max-content;
+}
+
+/* Mobile: move to top-center, no sidebar offset */
+@media (max-width: 1024px) {
+  .toast-container {
+    bottom: auto;
+    top: 8px;
+    left: 50%;
+    flex-direction: column;
+  }
 }
 
 .toast {
@@ -97,6 +108,26 @@
     opacity: 1;
     transform: translateY(0) scale(1);
   }
+}
+
+/* Mobile: animate from top */
+@media (max-width: 1024px) {
+  .toast {
+    animation-name: toast-in-top;
+  }
+  .toast--leaving {
+    animation-name: toast-out-top;
+  }
+}
+
+@keyframes toast-in-top {
+  from { opacity: 0; transform: translateY(-8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes toast-out-top {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(-8px) scale(0.97); }
 }
 
 /* Debug trigger strip -- remove when no longer needed */
