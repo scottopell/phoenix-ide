@@ -71,10 +71,10 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
           const input = walkEl.querySelector('.tool-block-input');
           const output = walkEl.querySelector('.tool-block-output-content');
           if (input || output) {
-            toolContext = {
-              command: input?.textContent?.trim(),
-              output: output?.textContent?.trim(),
-            };
+            const ctx: ToolContext = {};
+            if (input?.textContent) ctx.command = input.textContent.trim();
+            if (output?.textContent) ctx.output = output.textContent.trim();
+            toolContext = ctx;
           }
         }
         walkEl = walkEl.parentElement;
@@ -92,7 +92,9 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       if (!msg) return;
 
       e.preventDefault();
-      setMenu({ x: e.clientX, y: e.clientY, message: msg, toolContext });
+      const newMenu: MenuState = { x: e.clientX, y: e.clientY, message: msg };
+      if (toolContext) newMenu.toolContext = toolContext;
+      setMenu(newMenu);
     },
     [messages]
   );
