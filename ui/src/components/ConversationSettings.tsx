@@ -113,7 +113,7 @@ export function ConversationSettings({
                 onChange={() => setMode?.('managed')}
               />
               <span className="mode-option-content">
-                <strong>Managed</strong>
+                <strong>Managed <span className="beta-badge">BETA</span></strong>
                 <span className="mode-option-desc">
                   Read-only exploration first. Proposes a task plan for your approval, then works on an isolated worktree.
                 </span>
