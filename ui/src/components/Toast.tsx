@@ -1,4 +1,3 @@
-// Toast.tsx
 import { useEffect, useState } from 'react';
 import './Toast.css';
 
@@ -15,6 +14,13 @@ interface ToastProps {
   messages: ToastMessage[];
   onDismiss: (id: string) => void;
 }
+
+const SYMBOLS: Record<ToastType, string> = {
+  success: '\u2713',
+  error: '\u2717',
+  warning: '!',
+  info: '\u2014',
+};
 
 export function Toast({ messages, onDismiss }: ToastProps) {
   return (
@@ -33,8 +39,8 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
     if (toast.duration !== 0) {
       const timer = setTimeout(() => {
         setIsLeaving(true);
-        setTimeout(() => onDismiss(toast.id), 300);
-      }, toast.duration ?? 5000);
+        setTimeout(() => onDismiss(toast.id), 200);
+      }, toast.duration ?? 4000);
 
       return () => clearTimeout(timer);
     }
@@ -43,21 +49,16 @@ function ToastItem({ toast, onDismiss }: { toast: ToastMessage; onDismiss: (id: 
 
   const handleDismiss = () => {
     setIsLeaving(true);
-    setTimeout(() => onDismiss(toast.id), 300);
+    setTimeout(() => onDismiss(toast.id), 200);
   };
 
   return (
-    <div 
-      className={`toast toast-${toast.type} ${isLeaving ? 'toast-leaving' : ''}`}
+    <div
+      className={`toast toast--${toast.type} ${isLeaving ? 'toast--leaving' : ''}`}
       onClick={handleDismiss}
     >
-      <div className="toast-icon">
-        {toast.type === 'warning' && '⚠️'}
-        {toast.type === 'error' && '❌'}
-        {toast.type === 'success' && '✅'}
-        {toast.type === 'info' && 'ℹ️'}
-      </div>
-      <div className="toast-message">{toast.message}</div>
+      <span className="toast-symbol">{SYMBOLS[toast.type]}</span>
+      <span className="toast-text">{toast.message}</span>
     </div>
   );
 }
