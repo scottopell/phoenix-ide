@@ -166,7 +166,7 @@ export function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage
             onClick={() => onRetry(message.localId)}
             style={{ cursor: 'pointer' }}
           >
-            ⚠️
+            !
           </span>
         )}
       </div>

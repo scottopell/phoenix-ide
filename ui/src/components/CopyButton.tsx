@@ -39,7 +39,7 @@ export function CopyButton({ text, className = '', title = 'Copy to clipboard' }
       title={copied ? 'Copied!' : title}
       aria-label={copied ? 'Copied!' : title}
     >
-      {copied ? '✓' : '📋'}
+      {copied ? '\u2713' : '\u2750'}
     </button>
   );
 }

@@ -131,7 +131,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               </button>
             </div>
             <div className="new-conv-send-group">
-              <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>📎</button>
+              <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
               {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
               <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
             </div>
@@ -192,7 +192,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         />
         <div className="new-conv-input-row">
           <div className="new-conv-input-left">
-            <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>📎</button>
+            <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
             {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
           </div>
           <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
