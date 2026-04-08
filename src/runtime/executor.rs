@@ -482,10 +482,11 @@ where
 
     /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`):
     /// extract last assistant text from conversation history and notify parent.
+    ///
+    /// Extract partial result from conversation history and send `GraceTurnExhausted`
+    /// event to the state machine. The SM handles the transition and emits `NotifyParent`.
     async fn handle_grace_turn_hard_stop(&mut self) {
-        use crate::state_machine::state::SubAgentOutcome;
-
-        // Extract last assistant text from conversation history
+        // Extract last assistant text from conversation history (I/O — belongs in executor)
         let partial_result = match self
             .storage
             .get_messages(&self.context.conversation_id)
@@ -517,44 +518,13 @@ where
             }
         };
 
-        // Send result to parent
-        if let Some(ref parent_tx) = self.parent_event_tx {
-            let outcome = if let Some(ref text) = partial_result {
-                tracing::info!(
-                    conv_id = %self.context.conversation_id,
-                    text_len = text.len(),
-                    "Extracted partial result from grace turn hard stop"
-                );
-                SubAgentOutcome::Success {
-                    result: text.clone(),
-                }
-            } else {
-                tracing::info!(
-                    conv_id = %self.context.conversation_id,
-                    "No assistant text found after grace turn"
-                );
-                SubAgentOutcome::Failure {
-                    error: "Sub-agent exceeded turn limit with no output".to_string(),
-                    error_kind: crate::db::ErrorKind::Cancelled,
-                }
-            };
-
-            let _ = parent_tx
-                .send(Event::SubAgentResult {
-                    agent_id: self.context.conversation_id.clone(),
-                    outcome,
-                })
-                .await;
-        }
-
-        // Send UserCancel to self to transition to terminal state
+        // Send GraceTurnExhausted event to the state machine.
+        // The state machine handles the transition to Completed/Failed
+        // and emits NotifyParent as an effect.
         let _ = self
             .event_tx
-            .send(Event::UserCancel {
-                reason: Some(format!(
-                    "Sub-agent turn limit hard stop ({}/{})",
-                    self.llm_turn_count, self.context.max_turns
-                )),
+            .send(Event::GraceTurnExhausted {
+                result: partial_result,
             })
             .await;
     }
@@ -834,11 +804,16 @@ where
                             "Sub-agent reached turn limit, granting grace turn"
                         );
 
-                        // Inject system message prompting submit_result
+                        // Inject a meta user message prompting submit_result.
+                        // Uses UserContent::meta() so it appears in the LLM context
+                        // via the existing User message path (not System, which is
+                        // UI-only bookkeeping and not sent to the LLM).
                         let msg_id = uuid::Uuid::new_v4().to_string();
-                        let content = MessageContent::system(
-                            "You have reached your turn limit. Please call submit_result now \
-                             with whatever findings you have so far. Do not call any other tools.",
+                        let content = MessageContent::User(
+                            crate::db::UserContent::meta(
+                                "You have reached your turn limit. Please call submit_result now \
+                                 with whatever findings you have so far. Do not call any other tools.",
+                            ),
                         );
                         if let Err(e) = self
                             .storage
@@ -851,12 +826,12 @@ where
                             )
                             .await
                         {
-                            tracing::warn!(error = %e, "Failed to persist grace turn system message");
+                            tracing::warn!(error = %e, "Failed to persist grace turn message");
                         }
 
                         // Allow the normal LLM request to proceed (don't return, don't
-                        // send UserCancel). The system message will appear in the next
-                        // build_llm_messages call via the User-role inclusion of System messages.
+                        // send UserCancel). The meta message will appear in the next
+                        // build_llm_messages call as a user-role message.
                     }
                 }
 
@@ -1518,17 +1493,13 @@ where
                     });
                 }
 
-                // System messages are delivered as user-role messages so they
-                // appear in the LLM context (e.g., grace turn prompt, REQ-BED-026).
-                MessageContent::System(sys) => {
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content: vec![ContentBlock::text(&sys.text)],
-                    });
-                }
-
-                // Ignore error and continuation messages
-                MessageContent::Error(_) | MessageContent::Continuation(_) => {}
+                // Ignore system, error, and continuation messages.
+                // System messages are UI-only bookkeeping (restart markers, task
+                // file renames, diff snapshots). LLM-directed messages use
+                // MessageContent::User with is_meta (e.g., grace turn prompt).
+                MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_) => {}
             }
         }
 

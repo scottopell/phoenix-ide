@@ -1010,6 +1010,40 @@ pub fn transition(
         }
 
         // ============================================================
+        // Sub-Agent Grace Turn Exhausted (REQ-BED-026 SubAgentTurnLimitHardStop)
+        // ============================================================
+        (state, Event::GraceTurnExhausted { result: Some(text) })
+            if context.is_sub_agent && !state.is_terminal() =>
+        {
+            use crate::state_machine::state::SubAgentOutcome;
+            Ok(TransitionResult::new(ConvState::Completed {
+                result: text.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyParent {
+                outcome: SubAgentOutcome::Success { result: text },
+            }))
+        }
+
+        (state, Event::GraceTurnExhausted { result: None })
+            if context.is_sub_agent && !state.is_terminal() =>
+        {
+            use crate::state_machine::state::SubAgentOutcome;
+            let error = "Sub-agent exceeded turn limit with no output".to_string();
+            Ok(TransitionResult::new(ConvState::Failed {
+                error: error.clone(),
+                error_kind: ErrorKind::Cancelled,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyParent {
+                outcome: SubAgentOutcome::Failure {
+                    error,
+                    error_kind: ErrorKind::Cancelled,
+                },
+            }))
+        }
+
+        // ============================================================
         // Sub-Agent Cancellation (wildcard for non-terminal states)
         // ============================================================
         (state, Event::UserCancel { reason }) if context.is_sub_agent && !state.is_terminal() => {
