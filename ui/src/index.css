@@ -2074,9 +2074,9 @@ pre:hover .copy-btn {
   letter-spacing: 0.03em;
   line-height: 16px;
   border-radius: 3px;
-  color: #f0c040;
-  border: 1px solid color-mix(in srgb, #f0c040 50%, transparent);
-  background: color-mix(in srgb, #f0c040 15%, transparent);
+  color: #c4a5ff;
+  border: 1px solid color-mix(in srgb, #c4a5ff 45%, transparent);
+  background: color-mix(in srgb, #9b6dff 18%, transparent);
   vertical-align: 1px;
 }
 
