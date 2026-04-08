@@ -298,7 +298,7 @@ export const api = {
   ): Promise<Conversation> {
     const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
     if (baseBranch) {
-      body.base_branch = baseBranch;
+      body['base_branch'] = baseBranch;
     }
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',
