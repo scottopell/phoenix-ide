@@ -164,10 +164,6 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
     )
 }
 
-fn arb_awaiting_llm_state() -> impl Strategy<Value = ConvState> {
-    Just(ConvState::AwaitingLlm)
-}
-
 fn arb_awaiting_continuation_state() -> impl Strategy<Value = ConvState> {
     (proptest::collection::vec(arb_tool_call(), 0..3), 1u32..5).prop_map(
         |(rejected_tool_calls, attempt)| ConvState::AwaitingContinuation {
@@ -247,7 +243,6 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_tool_executing_state(),
         arb_error_state(),
         arb_cancelling_tool_state(),
-        arb_awaiting_llm_state(),
         arb_awaiting_continuation_state(),
         arb_context_exhausted_state(),
         arb_awaiting_task_approval_state(),
@@ -257,11 +252,7 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
 }
 
 fn arb_working_state() -> impl Strategy<Value = ConvState> {
-    prop_oneof![
-        arb_llm_requesting_state(),
-        arb_tool_executing_state(),
-        Just(ConvState::AwaitingLlm),
-    ]
+    prop_oneof![arb_llm_requesting_state(), arb_tool_executing_state(),]
 }
 
 fn arb_busy_state() -> impl Strategy<Value = ConvState> {

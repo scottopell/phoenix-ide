@@ -114,8 +114,7 @@ pub fn transition(
 
         // Busy states + UserMessage -> Reject (REQ-BED-002)
         (
-            ConvState::AwaitingLlm
-            | ConvState::LlmRequesting { .. }
+            ConvState::LlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::AwaitingSubAgents { .. },
             Event::UserMessage { .. },
@@ -141,9 +140,6 @@ pub fn transition(
         // ============================================================
         // LLM Response Processing (REQ-BED-003)
         // ============================================================
-
-        // AwaitingLlm is an intermediate state - immediately transition to LlmRequesting
-        // This is handled in the runtime, not here
 
         // LlmRequesting + LlmResponse with tools -> ToolExecuting (or terminal for sub-agents)
         (
@@ -696,13 +692,6 @@ pub fn transition(
                 .with_effect(Effect::notify_agent_done()))
         }
 
-        // AwaitingLlm + UserCancel -> Idle (parent) or Failed (sub-agent)
-        (ConvState::AwaitingLlm, Event::UserCancel { .. }) if !context.is_sub_agent => {
-            Ok(TransitionResult::new(ConvState::Idle)
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
-        }
-
         // AwaitingSubAgents + UserCancel -> CancellingSubAgents
         (
             ConvState::AwaitingSubAgents {
@@ -737,6 +726,7 @@ pub fn transition(
                 skipped_tools: remaining_tools.clone(),
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
+                pending_sub_agents: pending_sub_agents.clone(),
             })
             .with_effect(Effect::AbortTool {
                 tool_use_id: current_tool.id.clone(),
@@ -755,13 +745,14 @@ pub fn transition(
             Ok(result)
         }
 
-        // CancellingTool + ToolAborted -> Idle with atomic checkpoint
+        // CancellingTool + ToolAborted -> Idle or CancellingSubAgents
         (
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
                 completed_results,
                 assistant_message,
+                pending_sub_agents,
             },
             Event::ToolAborted {
                 tool_use_id: aborted_id,
@@ -784,19 +775,32 @@ pub fn transition(
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in cancellation transition");
 
-            Ok(TransitionResult::new(ConvState::Idle)
+            if pending_sub_agents.is_empty() {
+                // No sub-agents to wait for -> go directly to Idle
+                Ok(TransitionResult::new(ConvState::Idle)
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_agent_done()))
+            } else {
+                // Phase 2: wait for cancelled sub-agents to report back
+                Ok(TransitionResult::new(ConvState::CancellingSubAgents {
+                    pending: pending_sub_agents.clone(),
+                    completed_results: vec![],
+                })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
+                .with_effect(Effect::PersistState))
+            }
         }
 
-        // CancellingTool + ToolComplete -> Idle (tool finished before abort, use synthetic anyway)
+        // CancellingTool + ToolComplete -> Idle or CancellingSubAgents
+        // (tool finished before abort, use synthetic anyway)
         (
             ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
                 completed_results,
                 assistant_message,
+                pending_sub_agents,
             },
             Event::ToolComplete {
                 tool_use_id: completed_id,
@@ -820,10 +824,47 @@ pub fn transition(
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
 
-            Ok(TransitionResult::new(ConvState::Idle)
+            if pending_sub_agents.is_empty() {
+                Ok(TransitionResult::new(ConvState::Idle)
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_agent_done()))
+            } else {
+                // Phase 2: wait for cancelled sub-agents to report back
+                Ok(TransitionResult::new(ConvState::CancellingSubAgents {
+                    pending: pending_sub_agents.clone(),
+                    completed_results: vec![],
+                })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
+                .with_effect(Effect::PersistState))
+            }
+        }
+
+        // CancellingTool + SubAgentResult -> CancellingTool (absorb early sub-agent results)
+        // Sub-agents may report back before the tool abort completes.
+        (
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            },
+            Event::SubAgentResult { agent_id, .. },
+        ) if pending_sub_agents.iter().any(|p| p.agent_id == agent_id) => {
+            let new_pending: Vec<_> = pending_sub_agents
+                .iter()
+                .filter(|p| p.agent_id != agent_id)
+                .cloned()
+                .collect();
+            Ok(TransitionResult::new(ConvState::CancellingTool {
+                tool_use_id: tool_use_id.clone(),
+                skipped_tools: skipped_tools.clone(),
+                completed_results: completed_results.clone(),
+                assistant_message: assistant_message.clone(),
+                pending_sub_agents: new_pending,
+            })
+            .with_effect(Effect::PersistState))
         }
 
         // ============================================================
@@ -1258,6 +1299,21 @@ pub fn transition(
             // Log but don't error - terminal states ignore events
             Ok(TransitionResult::new(state.clone()))
         }
+
+        // Task resolution: Idle + TaskResolved -> Terminal (REQ-BED-029)
+        // Git operations are completed by the API handler before this event is sent.
+        // The state machine enforces the precondition (must be Idle).
+        (
+            ConvState::Idle,
+            Event::TaskResolved {
+                system_message,
+                repo_root,
+            },
+        ) => Ok(TransitionResult::new(ConvState::Terminal)
+            .with_effect(Effect::ResolveTask {
+                system_message,
+                repo_root,
+            })),
 
         // Terminal rejects ALL events (REQ-BED-029)
         (ConvState::Terminal, Event::UserMessage { .. }) => {

@@ -1,0 +1,457 @@
+-- allium: 3
+-- projects.allium
+--
+-- Phoenix Project Lifecycle: Behavioural Specification
+--
+-- Scope: Git-backed project lifecycle around bedrock conversations
+-- Includes: Project detection, mode selection, task approval git operations,
+--           worktree lifecycle, task file lifecycle, complete flow, abandon flow,
+--           write scoping, sub-agent worktree inheritance
+-- Excludes:
+--   - Conversation state machine (see bedrock.allium)
+--   - LLM commit message generation (implementation detail)
+--   - Platform capability detection (infrastructure)
+--   - UI elements (confirmation dialogs, project switcher, badges)
+--   - .gitignore management (infrastructure)
+--   - Auto-stash mechanics (implementation detail)
+--   - Diff snapshot capture (implementation detail of abandon)
+--
+-- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-019
+-- (1 descoped: REQ-PROJ-015)
+
+use "./bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A git repository on disk. This spec does not govern git internals,
+-- only what operations the project lifecycle performs.
+external entity GitRepository {
+    root_path: String
+    current_branch: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value WorktreePath {
+    -- Always `.phoenix/worktrees/{conversation_id}` relative to repo root.
+    -- Unique by construction: derived from conversation ID.
+    absolute_path: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum TaskFileStatus { in_progress | done | wont_do }
+
+enum TaskResolutionOutcome { completed | abandoned }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A git-backed project with conversations and task files.
+-- Non-git directories do not have a Project entity.
+entity Project {
+    repo: GitRepository
+
+    -- Relationships
+    conversations: bedrock/Conversation with project = this
+    task_files: TaskFile with project = this
+
+    -- Projections
+    active_task_files: task_files where status = in_progress
+    work_conversations: conversations where mode = work
+}
+
+-- A task file in the tasks/ directory, committed to main.
+entity TaskFile {
+    project: Project
+    task_id: String                -- NNNN format (date-based sequential)
+    title: String
+    priority: String               -- p0, p1, p2, p3
+    slug: String
+    status: TaskFileStatus
+    created_at: Timestamp
+
+    -- Filename: {task_id}-{priority}-{status}--{slug}.md
+    filename: derive_filename(task_id, priority, status, slug)
+
+    transitions status {
+        in_progress -> done
+        in_progress -> wont_do
+        terminal: done, wont_do
+    }
+
+    -- Entity-level invariants
+    invariant FilenameMatchesFrontmatter {
+        filename = derive_filename(task_id, priority, status, slug)
+    }
+}
+
+-- A git worktree for an isolated Work conversation.
+-- Exists only while the conversation is in Work mode.
+entity Worktree {
+    conversation: bedrock/Conversation
+    project: Project
+    path: WorktreePath
+    branch_name: String            -- task-{NNNN}-{slug}
+    base_branch: String            -- recorded at approval time
+    task_file: TaskFile
+
+    -- Derived
+    is_clean: git_status_clean(path)
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    worktree_base_dir: String = ".phoenix/worktrees"
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ===========================================================
+-- 1. PROJECT DETECTION & MODE (REQ-PROJ-001, 002, 016, 018)
+-- ===========================================================
+
+-- REQ-PROJ-001: Git directory detected as project
+rule GitDirectoryDetected {
+    when: ConversationCreated(conversation, directory)
+
+    requires: is_git_repository(directory)
+
+    ensures: Project.created(
+        repo: git_repo_at(directory)
+    )
+
+    @guidance
+        -- The project is associated with the git repository root,
+        -- not the provided directory (which may be a subdirectory).
+}
+
+-- REQ-PROJ-002/018: Default mode is Direct
+rule DefaultModeIsDirect {
+    when: ConversationCreated(conversation, directory)
+
+    ensures: conversation.mode = direct
+
+    @guidance
+        -- Direct is zero-friction default for all conversations.
+        -- Managed (Explore/Work) is opt-in via "Managed" selection.
+}
+
+-- REQ-PROJ-002: User selects Managed mode for git repo
+rule ManagedModeSelected {
+    when: UserSelectsManaged(conversation)
+
+    requires: is_git_repository(conversation.working_dir)
+
+    ensures: conversation.mode = explore
+}
+
+-- REQ-PROJ-016/018: Non-git or Direct mode has no project features
+-- (No propose_plan tool, no worktrees, no task files)
+-- Enforced by tool registry configuration, not by rules.
+
+-- ===========================================================
+-- 2. TASK APPROVAL — GIT OPERATIONS (REQ-PROJ-003, 004, 006, 012)
+-- ===========================================================
+
+-- REQ-PROJ-003/012: propose_plan tool intercepted by bedrock.
+-- No git operations during propose/feedback loop. Plan exists only in memory.
+-- Tool availability (Explore only, no sub-agents) enforced by bedrock.
+
+-- REQ-PROJ-004/006: User approves task — git operations execute
+rule TaskApprovalExecuted {
+    when: bedrock/UserApprovesTask(conversation, decision)
+
+    -- Bedrock handles the state transition (AwaitingTaskApproval → LlmRequesting).
+    -- This rule specifies the git side effects.
+
+    let project = conversation.project
+    let proposal = conversation.proposal
+    let task_id = next_task_id(project)
+    let slug = derive_slug(proposal.title)
+    let base_branch = project.repo.current_branch
+    let branch_name = "task-" + task_id + "-" + slug
+    let worktree_path = project.repo.root_path + "/" + config.worktree_base_dir + "/" + conversation.id
+
+    ensures: TaskFile.created(
+        project: project,
+        task_id: task_id,
+        title: proposal.title,
+        priority: proposal.priority,
+        slug: slug,
+        status: in_progress,
+        created_at: now
+    )
+    ensures: TaskFileCommitted(project, task_id)
+    ensures: Worktree.created(
+        conversation: conversation,
+        project: project,
+        path: WorktreePath { absolute_path: worktree_path },
+        branch_name: branch_name,
+        base_branch: base_branch,
+        task_file: TaskFile{task_id: task_id}
+    )
+    -- Mode transition to Work with all fields
+    ensures: conversation.branch_name = branch_name
+    ensures: conversation.worktree_path = worktree_path
+    ensures: conversation.base_branch = base_branch
+    ensures: conversation.task_id = task_id
+
+    @guidance
+        -- Git operations sequence: detect base_branch, write task file,
+        -- commit task file to base_branch, THEN create branch from HEAD
+        -- (which now includes the task file), then create worktree.
+        -- Branch and worktree start from a commit that includes the task
+        -- file, so the agent can update it via patch tool (REQ-PROJ-006).
+        -- If worktree creation fails, revert the commit (git reset --hard
+        -- HEAD~1) and delete the branch.
+        -- Task ID assigned under mutex to prevent collisions.
+}
+
+-- REQ-PROJ-004: User provides feedback — no git operations
+rule TaskFeedbackNoGitOps {
+    when: bedrock/UserProvidesFeedback(conversation, decision)
+
+    -- No git operations. Plan exists only in memory.
+    -- Agent may revise and call propose_plan again.
+    ensures: NoGitOperations(conversation)
+}
+
+-- REQ-PROJ-004: User rejects task — no git operations
+rule TaskRejectionNoGitOps {
+    when: bedrock/UserRejectsTask(conversation, decision)
+
+    -- Nothing was written to disk. Free to discard.
+    ensures: NoGitOperations(conversation)
+}
+
+-- ===========================================================
+-- 3. TASK COMPLETION (REQ-PROJ-009, REQ-PROJ-017)
+-- ===========================================================
+
+-- REQ-PROJ-009: Pre-checks before completion
+rule CompleteTaskPrechecks {
+    when: UserInitiatesComplete(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+
+    requires: conversation.status = idle
+    requires: conversation.mode = work
+    requires: worktree.is_clean
+    requires: git_main_clean(worktree.project.repo)
+    requires: not git_has_conflicts(worktree, worktree.base_branch)
+
+    ensures: CompletionPrechecksPass(conversation, worktree)
+
+    @guidance
+        -- If worktree is dirty: agent must commit or stash.
+        -- If main is dirty: auto-stash may be offered if safe.
+        -- If merge conflicts: agent must resolve first.
+        -- Pre-check failures are actionable (user stays in Work mode).
+}
+
+-- REQ-PROJ-009: User confirms completion
+rule ConfirmComplete {
+    when: UserConfirmsComplete(conversation, commit_message)
+
+    let worktree = Worktree{conversation: conversation}
+    let task_file = worktree.task_file
+
+    requires: conversation.status = idle
+    requires: conversation.mode = work
+
+    -- Git operations (under mutex)
+    ensures: SquashMerged(worktree, commit_message)
+    ensures: task_file.status = done
+    ensures: not exists worktree
+    ensures: bedrock/TaskResolved(
+        conversation,
+        system_message: "Task completed. Squash merged to " + worktree.base_branch
+    )
+
+    @guidance
+        -- Sequence under per-project mutex:
+        -- 1. Checkout base_branch
+        -- 2. git merge --squash {branch}
+        -- 3. Update task file status to done (non-fatal if fails)
+        -- 4. git commit -m {commit_message}
+        -- 5. Delete worktree and branch
+        -- 6. Send TaskResolved event to state machine
+}
+
+-- ===========================================================
+-- 4. TASK ABANDONMENT (REQ-PROJ-010)
+-- ===========================================================
+
+-- REQ-PROJ-010: User confirms abandonment
+rule ConfirmAbandon {
+    when: UserConfirmsAbandon(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+    let task_file = worktree.task_file
+
+    requires: conversation.status = idle
+    requires: conversation.mode = work
+
+    -- Worktree and branch deleted (no merge)
+    ensures: not exists worktree
+    ensures: task_file.status = wont_do
+    ensures: bedrock/TaskResolved(
+        conversation,
+        system_message: "Task abandoned. Worktree and branch deleted."
+    )
+
+    @guidance
+        -- Sequence:
+        -- 1. Capture diff snapshot as system message (non-fatal)
+        -- 2. Delete worktree and branch (no mutex needed)
+        -- 3. Under mutex: checkout base_branch, update task file to wont-do, commit
+        -- 4. Send TaskResolved event to state machine
+        -- If checkout base_branch fails after worktree deletion, the
+        -- operation returns an error (not silent success). The worktree
+        -- is already gone but the user is informed the task file is stale.
+        -- Task file update on base_branch is best-effort for other failures.
+        -- All uncommitted work in the worktree is permanently lost.
+}
+
+-- ===========================================================
+-- 5. WRITE SCOPING (REQ-PROJ-007)
+-- ===========================================================
+
+-- REQ-PROJ-007: Writes scoped to worktree
+rule WriteBlockedOutsideWorktree {
+    when: WriteAttempted(conversation, target_path)
+
+    requires: conversation.mode = work
+    requires: not is_within(target_path, conversation.worktree_path)
+
+    ensures: WriteRejected(conversation, target_path,
+        reason: "Write target is outside the worktree")
+}
+
+-- ===========================================================
+-- 6. SUB-AGENT WORKTREE INHERITANCE (REQ-PROJ-008)
+-- ===========================================================
+
+-- REQ-PROJ-008: Work sub-agent inherits parent worktree
+rule WorkSubAgentInheritsWorktree {
+    when: SubAgentSpawned(parent, sub_agent, mode)
+
+    requires: parent.mode = work
+    requires: mode = work
+
+    -- Sub-agent works in same worktree
+    ensures: sub_agent.working_dir = parent.worktree_path
+
+    @guidance
+        -- One Work sub-agent per parent (enforced by bedrock invariant).
+        -- Sub-agent has write access to parent's worktree.
+}
+
+-- REQ-PROJ-008: Explore sub-agent reads from worktree or main
+rule ExploreSubAgentDirectory {
+    when: SubAgentSpawned(parent, sub_agent, mode)
+
+    requires: mode = explore
+
+    ensures:
+        if parent.mode = work:
+            sub_agent.working_dir = parent.worktree_path
+        else:
+            sub_agent.working_dir = parent.working_dir
+
+    @guidance
+        -- Explore sub-agents are read-only regardless of parent mode.
+        -- Multiple Explore sub-agents allowed in parallel.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-PROJ-005: Worktree paths unique by construction
+invariant WorktreePathDerivedFromConversation {
+    for w in Worktrees:
+        w.path.absolute_path = w.project.repo.root_path
+            + "/" + config.worktree_base_dir + "/" + w.conversation.id
+}
+
+-- REQ-PROJ-005: No two worktrees share a path
+invariant WorktreePathsUnique {
+    for a in Worktrees:
+        for b in Worktrees:
+            a != b implies a.path != b.path
+}
+
+-- One worktree per Work conversation
+invariant OneWorktreePerConversation {
+    for a in Worktrees:
+        for b in Worktrees:
+            a != b implies a.conversation != b.conversation
+}
+
+-- REQ-PROJ-017: Base branch is immutable once recorded
+-- (Enforced by construction: base_branch is set at approval time
+-- and never modified. No rule updates it.)
+
+-- Task file exists on base_branch after approval
+invariant TaskFileExistsAfterApproval {
+    for w in Worktrees:
+        exists w.task_file
+}
+
+-- Task file status consistency with conversation lifecycle
+invariant TaskFileStatusMatchesLifecycle {
+    for t in TaskFiles:
+        t.status = in_progress implies
+            t.project.work_conversations.any(c => c.task_id = t.task_id)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ProjectManagement {
+    facing user: bedrock/User
+
+    context conversation: bedrock/Conversation
+        where mode = work and status = idle
+
+    let worktree = Worktree{conversation: conversation}
+
+    exposes:
+        worktree.branch_name
+        worktree.base_branch
+        worktree.is_clean
+        worktree.task_file.status
+
+    provides:
+        UserInitiatesComplete(conversation)
+            when worktree.is_clean
+        UserConfirmsComplete(conversation, commit_message)
+        UserConfirmsAbandon(conversation)
+
+    @guarantee MutexSerialisation
+        -- Git operations that modify the main checkout (merge, task file
+        -- update) are serialised under a per-project mutex. The mutex
+        -- is held only during checkout+merge+commit, not during LLM calls.
+
+    @guarantee NonFatalBookkeeping
+        -- Task file status updates are best-effort. If they fail,
+        -- the completion/abandonment still proceeds. Failures are logged.
+}
+
+-- No open questions. All requirements are either modeled or explicitly
+-- excluded by scope (UI, platform detection, descoped registry).

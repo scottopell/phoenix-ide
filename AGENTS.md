@@ -27,6 +27,8 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 `phoenix-client.py` is a standalone CLI for the Phoenix API (spec: `specs/simple_client/`). LLM agents should prefer it over browser automation for testing conversations.
 
+**Allium specs** (`.allium` files in `specs/`) are formal behavioral specifications that complement spEARS prose. See [Behavioral Specifications](#behavioral-specifications-allium) below.
+
 ---
 
 ## Task Tracking
@@ -113,6 +115,46 @@ See [`src/tools/think.rs`](src/tools/think.rs) as the simplest example.
 
 ---
 
+## Behavioral Specifications (Allium)
+
+spEARS specs (`requirements.md`, `design.md`, `executive.md`) capture *why* something should be built and track implementation status. Allium specs (`.allium` files) capture *what exactly* the system does — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
+
+**spEARS without Allium:** rigorous about whether to build, vague about what exactly to build.
+**Allium without spEARS:** precise about behaviour, unmoored from user need and project reality.
+**Together:** user story → requirement ID → precise behavioral spec → testable implementation → status tracking, all traceable end-to-end.
+
+### When to use Allium
+
+- **State machines** with multiple states and complex transitions (bedrock, projects)
+- **Lifecycle flows** with preconditions that must hold (task approval, complete, abandon)
+- **Multi-step operations** where ordering matters and partial failure is possible
+- **Cross-boundary contracts** where two specs interact (projects importing bedrock)
+
+Do NOT use for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle.
+
+### Current Allium specs
+
+| Spec | Imports | Scope |
+|------|---------|-------|
+| `specs/bedrock/bedrock.allium` | — | Conversation state machine (14 states, 48 rules) |
+| `specs/projects/projects.allium` | bedrock | Project lifecycle, git operations (12 rules) |
+
+### Working with Allium specs
+
+```bash
+# Distill a new spec from existing code
+/allium:distill
+
+# Generate tests from a spec
+/allium:propagate
+```
+
+**Resolving open questions is mandatory.** An open question in an Allium spec is not documentation — it's an unresolved ambiguity that may hide a bug. When distilling, present each open question to the user via `AskUserQuestion` with concrete options (not open-ended). The user decides; you implement the fix. Do not leave open questions as prose notes or "future work." Every ambiguity either becomes a code fix or an explicit design decision before the spec is merged.
+
+**The spec is authoritative for behavior.** If the code disagrees with the Allium spec, one of them is wrong. The transition graph, preconditions, and invariants in the `.allium` file define correct behavior. `@guidance` blocks describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
+
+---
+
 ## Production
 
 ```bash
@@ -196,6 +238,47 @@ if !images.is_empty() {
                     "dropping images from tool result — unsupported by this provider");
 }
 ```
+
+### Comments are local facts, not distributed specifications
+
+A comment is safe when it describes a local fact about the line it's on. A comment is dangerous when it describes a design decision, an invariant, or an operation sequence that could silently become wrong.
+
+**The test:** "If this comment becomes false, will anything fail?" If the answer is no, the comment is a liability — it will eventually lie, and the lie will make the next reader skip the code path that contains the bug.
+
+**Keep:**
+```rust
+// --force required: worktree may have uncommitted files
+run_git(cwd, &["worktree", "remove", &path, "--force"])?;
+
+// serde(default) rollout shim — migration tracked in task 0087
+#[serde(default)]
+pub worktree_path: String,
+```
+
+**Move to spec, then delete:**
+```rust
+// ❌ Design rationale belongs in spEARS design.md or Allium @guidance
+// "Commit after worktree creation so a worktree failure
+//  doesn't leave orphaned commits on main"
+
+// ❌ Invariant belongs in Allium invariant block
+// "pending.count + completed.count = total spawned"
+
+// ❌ Operation sequence belongs in Allium @guidance
+// "Sequence: checkout base_branch, merge --squash, update task file, commit"
+```
+
+**Delete outright:**
+```rust
+// ❌ Restates what the code does
+// Stage the task file
+run_git(cwd, &["add", &relative_path])?;
+
+// ❌ Section divider with no information
+// ============ Tool Execution ============
+```
+
+When an Allium spec exists for a module, the spec is the authoritative source for design rationale, invariants, and operation sequences. Comments in the code that duplicate spec content will diverge and mislead. If the spec doesn't exist yet, a comment is acceptable as a stopgap, but it must be migrated when the spec is created.
 
 ---
 

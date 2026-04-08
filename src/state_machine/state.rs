@@ -352,9 +352,6 @@ pub enum ConvState {
     #[default]
     Idle,
 
-    /// User message received, preparing LLM request
-    AwaitingLlm,
-
     /// LLM request in flight, with retry tracking
     LlmRequesting { attempt: u32 },
 
@@ -390,6 +387,9 @@ pub enum ConvState {
         completed_results: Vec<ToolResult>,
         /// Assistant message held for atomic persistence
         assistant_message: AssistantMessage,
+        /// Sub-agents spawned earlier in this tool round, awaiting cancellation.
+        /// Empty when no spawn_agents ran before the cancel.
+        pending_sub_agents: Vec<PendingSubAgent>,
     },
 
     /// Waiting for sub-agents to complete
@@ -553,7 +553,6 @@ impl ConvState {
             }
             ConvState::Terminal => StepResult::Terminal(TerminalOutcome::TaskResolved),
             ConvState::Idle
-            | ConvState::AwaitingLlm
             | ConvState::LlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
@@ -579,8 +578,7 @@ impl ConvState {
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }
             | ConvState::Terminal => DisplayState::Terminal,
-            ConvState::AwaitingLlm
-            | ConvState::LlmRequesting { .. }
+            ConvState::LlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }

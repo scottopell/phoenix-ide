@@ -321,13 +321,11 @@ where
 
         // Log notable state transitions at INFO. "Notable" means transitions that cross
         // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
-        // terminal states). Internal bookkeeping transitions (e.g. AwaitingLlm→LlmRequesting)
-        // are logged at DEBUG to keep steady-state noise low.
+        // terminal states) are logged at DEBUG to keep steady-state noise low.
         {
             fn state_name(s: &ConvState) -> &'static str {
                 match s {
                     ConvState::Idle => "Idle",
-                    ConvState::AwaitingLlm => "AwaitingLlm",
                     ConvState::LlmRequesting { .. } => "LlmRequesting",
                     ConvState::ToolExecuting { .. } => "ToolExecuting",
                     ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
@@ -1315,6 +1313,15 @@ where
                 self.execute_approve_task(title, priority, plan).await?;
                 Ok(None)
             }
+
+            Effect::ResolveTask {
+                system_message,
+                repo_root,
+            } => {
+                self.execute_resolve_task(system_message, repo_root)
+                    .await?;
+                Ok(None)
+            }
         }
     }
 
@@ -1505,6 +1512,60 @@ where
     ///
     /// On failure: revert in-memory state to `AwaitingTaskApproval` so the user can retry.
     /// Collision check on retry handles partial state.
+    /// Handle task resolution: finalize conversation state/mode/cwd, inject system message,
+    /// and broadcast SSE events. Called after git operations have already completed.
+    async fn execute_resolve_task(
+        &mut self,
+        system_message: String,
+        repo_root: String,
+    ) -> Result<(), String> {
+        let conv_id = &self.context.conversation_id;
+
+        // Atomically update state, mode, and cwd
+        self.storage
+            .update_state(conv_id, &ConvState::Terminal)
+            .await?;
+        self.storage
+            .update_conversation_mode(conv_id, &crate::db::ConvMode::Explore)
+            .await?;
+        self.storage
+            .update_conversation_cwd(conv_id, &repo_root)
+            .await?;
+
+        // Inject system message
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let msg = self
+            .storage
+            .add_message(
+                &msg_id,
+                conv_id,
+                &MessageContent::system(&system_message),
+                None,
+                None,
+            )
+            .await?;
+
+        // Broadcast SSE events
+        let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+        let _ = self.broadcast_tx.send(SseEvent::StateChange {
+            state: ConvState::Terminal,
+            display_state: ConvState::Terminal.display_state().as_str().to_string(),
+        });
+        let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
+            update: crate::runtime::ConversationMetadataUpdate {
+                cwd: Some(repo_root),
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: Some("Explore".to_string()),
+                base_branch: None,
+                commits_behind: None,
+                commits_ahead: None,
+            },
+        });
+
+        Ok(())
+    }
+
     async fn execute_approve_task(
         &mut self,
         title: String,
@@ -1872,33 +1933,13 @@ fn execute_approve_task_blocking(
         tracing::info!("Added .phoenix/ to .gitignore");
     }
 
-    // 6. Stage the task file (do NOT commit yet -- commit after worktree creation
-    //    so a worktree failure doesn't leave orphaned commits on main)
+    // 6. Stage and commit the task file BEFORE creating the branch.
+    //    This ensures the branch (and worktree) include the task file,
+    //    so the agent can update it during Work (REQ-PROJ-006).
+    //    If worktree creation fails later, we revert the commit.
     let relative_path = format!("tasks/{filename}");
     run_git(cwd, &["add", &relative_path])?;
 
-    // 7. Branch collision check
-    let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
-    if branch_exists {
-        let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
-        if merge_base.is_ok() {
-            run_git(cwd, &["branch", "-d", &branch_name])?;
-            tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
-        } else {
-            // Clean up staged files before returning error
-            let _ = run_git(cwd, &["reset", "HEAD"]);
-            let _ = std::fs::remove_file(&filepath);
-            return Err(format!(
-                "Branch '{branch_name}' already exists and is not fully merged. \
-                 Please resolve this manually before approving."
-            ));
-        }
-    }
-
-    // 8. Commit task file, then create branch + worktree.
-    //    Committing first means a failure in worktree creation leaves only
-    //    a harmless commit on main (easily reverted). The reverse order
-    //    leaves an orphaned worktree that blocks retry.
     let commit_msg = format!("task {task_id}: {title}");
     if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
         let _ = run_git(cwd, &["reset", "HEAD"]);
@@ -1907,7 +1948,36 @@ fn execute_approve_task_blocking(
     }
     tracing::info!(commit_msg = %commit_msg, "Task file committed");
 
-    // 9. Create branch + worktree from the commit we just made.
+    // 7. Branch collision check (now checking against the commit that includes the task file)
+    let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
+    if branch_exists {
+        let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
+        if merge_base.is_ok() {
+            run_git(cwd, &["branch", "-d", &branch_name])?;
+            tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
+        } else {
+            // Revert the commit before returning error
+            let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
+            return Err(format!(
+                "Branch '{branch_name}' already exists and is not fully merged. \
+                 Please resolve this manually before approving."
+            ));
+        }
+    }
+
+    // 8. Commit task file, then create branch + worktree.
+    //    Committing first ensures the branch includes the task file
+    //    so the agent can update it during Work (REQ-PROJ-006).
+    //    If branch/worktree creation fails, revert the commit.
+    let commit_msg = format!("task {task_id}: {title}");
+    if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
+        let _ = run_git(cwd, &["reset", "HEAD"]);
+        let _ = std::fs::remove_file(&filepath);
+        return Err(format!("Failed to commit task file: {e}"));
+    }
+    tracing::info!(commit_msg = %commit_msg, "Task file committed");
+
+    // 9. Create branch + worktree from the commit that includes the task file.
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
         .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
@@ -1916,11 +1986,13 @@ fn execute_approve_task_blocking(
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
     if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
+        let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
         return Err(format!("Failed to create branch '{branch_name}': {e}"));
     }
 
     if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
         let _ = run_git(cwd, &["branch", "-D", &branch_name]);
+        let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
         return Err(format!("Failed to create worktree: {e}"));
     }
 
