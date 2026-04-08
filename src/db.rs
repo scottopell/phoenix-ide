@@ -483,42 +483,6 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically finalize a conversation after task completion or abandonment.
-    /// Updates state, mode, and cwd in a single transaction so a crash between
-    /// writes can't leave the conversation in an inconsistent state.
-    pub async fn finalize_conversation(
-        &self,
-        id: &str,
-        state: &ConvState,
-        mode: &ConvMode,
-        cwd: &str,
-    ) -> DbResult<()> {
-        let now = Utc::now().to_rfc3339();
-        let state_json = serde_json::to_string(state).unwrap();
-        let mode_json = serde_json::to_string(mode).unwrap();
-
-        let mut tx = self.pool.begin().await?;
-
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2, \
-             conv_mode = ?3, cwd = ?4 WHERE id = ?5",
-        )
-        .bind(&state_json)
-        .bind(&now)
-        .bind(&mode_json)
-        .bind(cwd)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(id.to_string()));
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Get all non-archived Work conversations (for startup worktree reconciliation).
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(

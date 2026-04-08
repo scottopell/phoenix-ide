@@ -1263,10 +1263,7 @@ mod tests {
             ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
 
         // Can be in various states when cancelled
-        let states = [
-            ConvState::Idle,
-            ConvState::LlmRequesting { attempt: 1 },
-        ];
+        let states = [ConvState::Idle, ConvState::LlmRequesting { attempt: 1 }];
 
         for state in states {
             let result = transition(&state, &context, Event::UserCancel { reason: None }).unwrap();

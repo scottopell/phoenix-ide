@@ -159,6 +159,7 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
                 skipped_tools,
                 completed_results: vec![],
                 assistant_message: AssistantMessage::new(content_blocks, None, None),
+                pending_sub_agents: vec![],
             }
         },
     )
@@ -836,6 +837,7 @@ proptest! {
             skipped_tools: skipped.clone(),
             completed_results: vec![],
             assistant_message,
+            pending_sub_agents: vec![],
         };
 
         let result = transition(
@@ -890,6 +892,7 @@ proptest! {
             skipped_tools: skipped.clone(),
             completed_results: vec![],
             assistant_message,
+            pending_sub_agents: vec![],
         };
 
         // Tool completes naturally before abort takes effect
@@ -2143,6 +2146,7 @@ proptest! {
             skipped_tools: vec![],
             completed_results: vec![],
             assistant_message: AssistantMessage::new(content_blocks, None, None),
+            pending_sub_agents: vec![],
         };
         let outcome = EffectOutcome::Tool(ToolOutcome::Aborted {
             tool_use_id,

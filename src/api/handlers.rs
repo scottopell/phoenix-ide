@@ -1958,10 +1958,11 @@ async fn abandon_task(
         if main_clean {
             // Checkout base branch so task file rename happens on the right branch
             if let Err(e) = run_git(&repo_root_clone, &["checkout", &base_branch]) {
-                return Err(AppError::Internal(format!(
-                    "Worktree and branch deleted but failed to checkout {base_branch} \
-                     for task file update: {e}. Task file may be stale."
-                )));
+                tracing::warn!(
+                    error = %e,
+                    branch = %base_branch,
+                    "Failed to checkout base branch -- skipping task file update"
+                );
             } else {
                 // Scan tasks/ for matching task file and rename to wont-do
                 let tasks_dir = repo_root_clone.join("tasks");

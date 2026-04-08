@@ -1318,8 +1318,7 @@ where
                 system_message,
                 repo_root,
             } => {
-                self.execute_resolve_task(system_message, repo_root)
-                    .await?;
+                self.execute_resolve_task(system_message, repo_root).await?;
                 Ok(None)
             }
         }

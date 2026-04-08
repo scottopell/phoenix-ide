@@ -1309,11 +1309,12 @@ pub fn transition(
                 system_message,
                 repo_root,
             },
-        ) => Ok(TransitionResult::new(ConvState::Terminal)
-            .with_effect(Effect::ResolveTask {
+        ) => Ok(
+            TransitionResult::new(ConvState::Terminal).with_effect(Effect::ResolveTask {
                 system_message,
                 repo_root,
-            })),
+            }),
+        ),
 
         // Terminal rejects ALL events (REQ-BED-029)
         (ConvState::Terminal, Event::UserMessage { .. }) => {

@@ -388,7 +388,7 @@ pub enum ConvState {
         /// Assistant message held for atomic persistence
         assistant_message: AssistantMessage,
         /// Sub-agents spawned earlier in this tool round, awaiting cancellation.
-        /// Empty when no spawn_agents ran before the cancel.
+        /// Empty when no `spawn_agents` ran before the cancel.
         pending_sub_agents: Vec<PendingSubAgent>,
     },
 
