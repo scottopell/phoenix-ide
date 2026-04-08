@@ -16,6 +16,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
 import { ConfirmDialog } from './ConfirmDialog';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { formatShortcut } from '../utils';
@@ -908,7 +909,9 @@ function QuestionItem({
   return (
     <div className="question-item">
       <span className="question-header">{q.header}</span>
-      <span className="question-text">{q.question}</span>
+      <div className="question-text">
+        <ReactMarkdown>{q.question}</ReactMarkdown>
+      </div>
 
       {isPreviewMode ? (
         <div className="question-preview-layout">
