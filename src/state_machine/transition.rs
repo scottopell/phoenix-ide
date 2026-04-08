@@ -159,9 +159,16 @@ pub fn transition(
                 .find(|t| matches!(t.input, ToolInput::ProposeTask(_)));
             if let Some(tool) = propose_task_tool {
                 if tool_calls.len() > 1 {
-                    return Err(TransitionError::InvalidTransition(
-                        "propose_task must be the only tool in response".to_string(),
-                    ));
+                    let msg = "propose_task must be the only tool in response".to_string();
+                    return Ok(TransitionResult::new(ConvState::Error {
+                        message: msg.clone(),
+                        error_kind: ErrorKind::InvalidRequest,
+                    })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change(
+                        "error",
+                        json!({ "message": msg }),
+                    )));
                 }
                 if let ToolInput::ProposeTask(ref input) = tool.input {
                     let tool_result = ToolResult::success(
@@ -200,9 +207,16 @@ pub fn transition(
                 .find(|t| matches!(t.input, ToolInput::AskUserQuestion(_)));
             if let Some(tool) = ask_question_tool {
                 if tool_calls.len() > 1 {
-                    return Err(TransitionError::InvalidTransition(
-                        "ask_user_question must be the only tool in response".to_string(),
-                    ));
+                    let msg = "ask_user_question must be the only tool in response".to_string();
+                    return Ok(TransitionResult::new(ConvState::Error {
+                        message: msg.clone(),
+                        error_kind: ErrorKind::InvalidRequest,
+                    })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change(
+                        "error",
+                        json!({ "message": msg }),
+                    )));
                 }
                 if let ToolInput::AskUserQuestion(ref input) = tool.input {
                     let tool_result = ToolResult::success(
@@ -288,10 +302,20 @@ pub fn transition(
                 if let Some(tool) = terminal_tool {
                     // Terminal tool must be the only tool
                     if tool_calls.len() > 1 {
-                        return Err(TransitionError::InvalidTransition(
-                            "submit_result/submit_error must be the only tool in response"
-                                .to_string(),
-                        ));
+                        use crate::state_machine::state::SubAgentOutcome;
+                        let msg = "submit_result/submit_error must be the only tool in response"
+                            .to_string();
+                        return Ok(TransitionResult::new(ConvState::Failed {
+                            error: msg.clone(),
+                            error_kind: ErrorKind::InvalidRequest,
+                        })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::NotifyParent {
+                            outcome: SubAgentOutcome::Failure {
+                                error: msg,
+                                error_kind: ErrorKind::InvalidRequest,
+                            },
+                        }));
                     }
 
                     // Transition directly to terminal state
@@ -2331,10 +2355,11 @@ mod tests {
             },
         );
 
+        let result = result.expect("Should produce Ok transition to Error state");
         assert!(
-            matches!(result, Err(TransitionError::InvalidTransition(_))),
-            "Should reject ask_user_question with other tools, got {:?}",
-            result
+            matches!(result.new_state, ConvState::Error { .. }),
+            "Should transition to Error when ask_user_question mixed with other tools, got {:?}",
+            result.new_state
         );
     }
 

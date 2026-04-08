@@ -440,6 +440,27 @@ rule SubAgentSubmitsError {
     ensures: SubAgentCompleted(conversation)
 }
 
+-- Intercepted tool mixed with other tools → error
+-- If the LLM returns propose_task, ask_user_question, submit_result,
+-- or submit_error alongside other tool calls, the response is malformed.
+-- These tools require sole-tool interception and cannot be combined.
+rule InterceptedToolNotSole {
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+
+    requires: conversation.status = llm_requesting
+    requires: tool_calls.count > 1
+    requires: tool_calls.any(t => is_intercepted_tool(t.name))
+
+    ensures: conversation.status = error
+    ensures: conversation.error_message =
+        intercepted_tool_name(tool_calls) + " must be the only tool in response"
+
+    @guidance
+        -- The state machine transitions to Error (parent) or Failed
+        -- (sub-agent), persists the state, and notifies via SSE/parent.
+        -- The user can retry from Error state by sending a new message.
+}
+
 -- REQ-BED-019: Context threshold reached during LLM response (parent)
 rule ContextThresholdReachedParent {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
@@ -579,12 +600,12 @@ rule ToolAbortConfirmed {
 
     ensures: CancellationCheckpointed(conversation)
     ensures:
-        if conversation.pending_sub_agents.count = 0:
+        if conversation.pending_sub_agents_cancelling.count = 0:
             conversation.status = idle
             AgentDone(conversation)
         else:
             conversation.status = cancelling_sub_agents
-            conversation.sub_agents_pending = conversation.pending_sub_agents
+            conversation.sub_agents_pending = conversation.pending_sub_agents_cancelling
             conversation.sub_agents_completed = {}
 
     @guidance
@@ -604,12 +625,12 @@ rule ToolCompletesDuringCancellation {
     -- Actual result is discarded; synthetic results used instead
     ensures: CancellationCheckpointed(conversation)
     ensures:
-        if conversation.pending_sub_agents.count = 0:
+        if conversation.pending_sub_agents_cancelling.count = 0:
             conversation.status = idle
             AgentDone(conversation)
         else:
             conversation.status = cancelling_sub_agents
-            conversation.sub_agents_pending = conversation.pending_sub_agents
+            conversation.sub_agents_pending = conversation.pending_sub_agents_cancelling
             conversation.sub_agents_completed = {}
 }
 
@@ -619,7 +640,7 @@ rule SubAgentResultDuringToolCancel {
 
     requires: conversation.status = cancelling_tool
 
-    ensures: conversation.pending_sub_agents.remove(result.agent)
+    ensures: conversation.pending_sub_agents_cancelling.remove(result.agent)
 }
 
 -- REQ-BED-005: Cancel during sub-agent wait

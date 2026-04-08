@@ -1964,19 +1964,7 @@ fn execute_approve_task_blocking(
         }
     }
 
-    // 8. Commit task file, then create branch + worktree.
-    //    Committing first ensures the branch includes the task file
-    //    so the agent can update it during Work (REQ-PROJ-006).
-    //    If branch/worktree creation fails, revert the commit.
-    let commit_msg = format!("task {task_id}: {title}");
-    if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
-        let _ = run_git(cwd, &["reset", "HEAD"]);
-        let _ = std::fs::remove_file(&filepath);
-        return Err(format!("Failed to commit task file: {e}"));
-    }
-    tracing::info!(commit_msg = %commit_msg, "Task file committed");
-
-    // 9. Create branch + worktree from the commit that includes the task file.
+    // 8. Create branch + worktree from the commit that includes the task file.
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
         .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;

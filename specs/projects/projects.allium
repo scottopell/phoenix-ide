@@ -6,7 +6,8 @@
 -- Scope: Git-backed project lifecycle around bedrock conversations
 -- Includes: Project detection, mode selection, task approval git operations,
 --           worktree lifecycle, task file lifecycle, complete flow, abandon flow,
---           write scoping, sub-agent worktree inheritance
+--           write scoping, sub-agent worktree inheritance,
+--           server restart worktree reconciliation
 -- Excludes:
 --   - Conversation state machine (see bedrock.allium)
 --   - LLM commit message generation (implementation detail)
@@ -210,14 +211,31 @@ rule TaskApprovalExecuted {
     ensures: conversation.task_id = task_id
 
     @guidance
-        -- Git operations sequence: detect base_branch, write task file,
-        -- commit task file to base_branch, THEN create branch from HEAD
-        -- (which now includes the task file), then create worktree.
-        -- Branch and worktree start from a commit that includes the task
-        -- file, so the agent can update it via patch tool (REQ-PROJ-006).
-        -- If worktree creation fails, revert the commit (git reset --hard
-        -- HEAD~1) and delete the branch.
-        -- Task ID assigned under mutex to prevent collisions.
+        -- All operations run under a global mutex to prevent concurrent
+        -- approvals from getting the same task number.
+        --
+        -- Sequence:
+        --   1. Detect base_branch (current branch via rev-parse)
+        --   2. Create tasks/ directory if first task for this project
+        --   3. Assign task ID (date-based sequential via taskmd-core)
+        --   4. Write task file to tasks/ (in-progress status)
+        --   5. Ensure .gitignore contains `.phoenix/` (append if
+        --      missing; stage with git add)
+        --   6. Stage task file, commit both task file and .gitignore
+        --      to base_branch
+        --   7. Branch collision check: if branch_name already exists
+        --      and is fully merged, delete it; if not fully merged,
+        --      revert the commit (reset --hard HEAD~1) and error
+        --   8. Create branch (git branch), then worktree
+        --      (git worktree add). Branch and worktree start from
+        --      the commit that includes the task file, so the agent
+        --      can update it via patch tool (REQ-PROJ-006).
+        --
+        -- Rollback:
+        --   - Commit failure (step 6): git reset HEAD, remove file
+        --   - Branch failure (step 8): git reset --hard HEAD~1
+        --   - Worktree failure (step 8): git branch -D, then
+        --     git reset --hard HEAD~1
 }
 
 -- REQ-PROJ-004: User provides feedback — no git operations
@@ -250,21 +268,28 @@ rule CompleteTaskPrechecks {
     requires: conversation.status = idle
     requires: conversation.mode = work
     requires: worktree.is_clean
-    requires: git_main_clean(worktree.project.repo)
+    requires:
+        git_main_clean(worktree.project.repo)
+        or auto_stash_safe(worktree.project.repo, worktree.base_branch)
     requires: not git_has_conflicts(worktree, worktree.base_branch)
 
     ensures: CompletionPrechecksPass(conversation, worktree)
 
     @guidance
         -- If worktree is dirty: agent must commit or stash.
-        -- If main is dirty: auto-stash may be offered if safe.
+        -- If main is dirty AND auto_stash was requested: check whether
+        --   dirty files overlap with the merge. If no overlap, report
+        --   can_auto_stash=true so ConfirmComplete can stash/pop.
+        --   If overlap, fail with actionable error.
+        -- If main is dirty AND auto_stash not requested: fail with
+        --   actionable error.
         -- If merge conflicts: agent must resolve first.
         -- Pre-check failures are actionable (user stays in Work mode).
 }
 
 -- REQ-PROJ-009: User confirms completion
 rule ConfirmComplete {
-    when: UserConfirmsComplete(conversation, commit_message)
+    when: UserConfirmsComplete(conversation, commit_message, auto_stash)
 
     let worktree = Worktree{conversation: conversation}
     let task_file = worktree.task_file
@@ -282,13 +307,35 @@ rule ConfirmComplete {
     )
 
     @guidance
-        -- Sequence under per-project mutex:
-        -- 1. Checkout base_branch
-        -- 2. git merge --squash {branch}
-        -- 3. Update task file status to done (non-fatal if fails)
-        -- 4. git commit -m {commit_message}
-        -- 5. Delete worktree and branch
-        -- 6. Send TaskResolved event to state machine
+        -- All operations run in a single blocking task under the global
+        -- TASK_APPROVAL_MUTEX.
+        --
+        -- Sequence:
+        --   1. Auto-stash: if main checkout is dirty and auto_stash=true,
+        --      run `git stash push --include-untracked -m "phoenix: ..."`.
+        --      If dirty and auto_stash=false, return conflict error.
+        --   2. `git checkout {base_branch}`
+        --      On failure: pop stash (if stashed), return error.
+        --   3. `git merge --squash {branch_name}`
+        --      On failure: `git reset --hard HEAD`, pop stash, return error.
+        --   4. Task file rename: use taskmd rename_status to update
+        --      frontmatter and rename file from in-progress to done.
+        --      Stage both old and new paths with `git add`.
+        --      Non-fatal if fails — merge still proceeds.
+        --      ORDERING: must run after stash+merge so filesystem reads
+        --      see merged state, not stashed files.
+        --   5. Check `git diff --cached --quiet`. If nothing staged
+        --      (task-file-only branch with no code changes), skip commit.
+        --   6. `git commit -m {commit_message}`
+        --      On failure: `git reset --hard HEAD`, pop stash, return error.
+        --   7. `git rev-parse --short HEAD` for system message.
+        --   8. `git worktree remove {path} --force`
+        --      On failure (non-fatal): `rm -rf` + `git worktree prune`.
+        --   9. `git branch -D {branch_name}` (non-fatal if fails).
+        --  10. Pop auto-stash if stashed in step 1.
+        --      If pop fails: return warning (stash preserved, user
+        --      must `git stash pop` manually).
+        --  11. Send TaskResolved event.
 }
 
 -- ===========================================================
@@ -305,24 +352,53 @@ rule ConfirmAbandon {
     requires: conversation.status = idle
     requires: conversation.mode = work
 
-    -- Worktree and branch deleted (no merge)
+    -- Worktree and branch deleted (no merge).
+    -- The critical postcondition is worktree deletion; task file
+    -- update is best-effort bookkeeping. The endpoint returns
+    -- success once the worktree is gone, regardless of whether
+    -- task file operations succeed.
     ensures: not exists worktree
-    ensures: task_file.status = wont_do
+    ensures: task_file.status = wont_do         -- best-effort
     ensures: bedrock/TaskResolved(
         conversation,
         system_message: "Task abandoned. Worktree and branch deleted."
     )
 
     @guidance
+        -- Design decision: abandon always succeeds from the user's
+        -- perspective. The worktree is the critical resource; its
+        -- deletion is the gate. Task file bookkeeping (step 4) is
+        -- entirely non-fatal — failures are logged but the endpoint
+        -- still returns success and TaskResolved still fires.
+        --
+        -- The only post-deletion error path is if the state machine
+        -- event dispatch itself fails (send_event for TaskResolved),
+        -- which indicates runtime corruption, not a git problem.
+        --
         -- Sequence:
-        -- 1. Capture diff snapshot as system message (non-fatal)
-        -- 2. Delete worktree and branch (no mutex needed)
-        -- 3. Under mutex: checkout base_branch, update task file to wont-do, commit
-        -- 4. Send TaskResolved event to state machine
-        -- If checkout base_branch fails after worktree deletion, the
-        -- operation returns an error (not silent success). The worktree
-        -- is already gone but the user is informed the task file is stale.
-        -- Task file update on base_branch is best-effort for other failures.
+        --   1. Capture diff snapshot (blocking, before worktree deletion):
+        --      a. `git log --oneline {base_branch}..HEAD` (commit log)
+        --      b. `git add -N .` (stage untracked for diff visibility)
+        --      c. `git diff HEAD` (uncommitted changes)
+        --      d. Truncate to 100 KiB if larger
+        --      e. Non-fatal: if capture fails, skip snapshot
+        --   2. Persist snapshot as system message in database
+        --      (non-fatal, broadcast via SSE after state transition)
+        --   3. Delete worktree and branch (NO MUTEX):
+        --      a. `git worktree remove {path} --force`
+        --         On failure: `rm -rf` + `git worktree prune`
+        --      b. `git branch -D {branch}` (non-fatal if fails)
+        --   4. Task file update (UNDER MUTEX, all non-fatal):
+        --      a. `git status --porcelain` on main checkout.
+        --         If dirty, skip task file update entirely.
+        --      b. `git checkout {base_branch}`
+        --      c. Update frontmatter status in file content (fs write)
+        --      d. `git mv tasks/{old_filename} tasks/{new_filename}`
+        --         (renames from in-progress to wont-do)
+        --      e. `git commit -m "task {id}: mark wont-do"`
+        --         On failure: `git reset HEAD`
+        --   5. Send TaskResolved event to state machine
+        --
         -- All uncommitted work in the worktree is permanently lost.
 }
 
@@ -375,6 +451,61 @@ rule ExploreSubAgentDirectory {
     @guidance
         -- Explore sub-agents are read-only regardless of parent mode.
         -- Multiple Explore sub-agents allowed in parallel.
+}
+
+-- ===========================================================
+-- 7. WORKTREE RECONCILIATION ON SERVER RESTART
+-- ===========================================================
+
+-- Worktree reconciliation on server restart.
+-- Complements bedrock's ServerRestart rule (which resets conversation
+-- status to idle) with project-level cleanup: detect orphaned worktrees
+-- and revert affected conversations to Explore mode.
+--
+-- REQ-PROJ-015 descoped the dedicated registry, but acknowledged that
+-- startup reconciliation handles orphan detection via ConvMode::Work
+-- queries. This rule models that existing behaviour.
+rule ServerRestartWorktreeReconciliation {
+    when: bedrock/ServerRestarted(conversation)
+
+    requires: conversation.mode = work
+
+    -- Detection: worktree is orphaned if any of these hold
+    let orphaned =
+        conversation.worktree_path = ""
+        or conversation.base_branch = ""
+        or not exists_on_disk(conversation.worktree_path)
+
+    ensures:
+        if orphaned:
+            conversation.mode = explore
+            conversation.working_dir = project_root(conversation)
+            GitWorktreePruned(conversation.project)
+        -- else: worktree is intact, no action needed
+
+    @guidance
+        -- Runs once per Work conversation at server startup, before
+        -- any conversation becomes active.
+        --
+        -- Sequence per affected conversation:
+        --   1. Query all Work-mode conversations from database
+        --   2. For each: check worktree_path and base_branch non-empty,
+        --      and worktree directory exists on disk
+        --   3. If any check fails:
+        --      a. Update conversation mode to Explore in database
+        --      b. Derive project root from worktree path
+        --         ({root}/.phoenix/worktrees/{id} → {root})
+        --      c. Reset conversation cwd to project root
+        --      d. Run `git worktree prune` in project root (once per
+        --         unique root, deduplicated across conversations)
+        --   4. Log summary: "{reverted} reverted out of {total} Work"
+        --
+        -- Error handling:
+        --   - Database update failure: logged, conversation skipped
+        --   - CWD reset failure: logged, pruning still attempted
+        --   - git worktree prune failure: logged at debug (non-fatal)
+        --   - No exceptions propagated; process continues for remaining
+        --     conversations
 }
 
 ------------------------------------------------------------

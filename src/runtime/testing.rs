@@ -1334,8 +1334,9 @@ mod tests {
 
         let result = transition(&state, &context, event);
 
-        // Should be rejected
-        assert!(matches!(result, Err(TransitionError::InvalidTransition(_))));
+        // Should transition to Failed (not stuck in LlmRequesting)
+        let result = result.expect("Should produce Ok transition to Failed state");
+        assert!(matches!(result.new_state, ConvState::Failed { .. }));
     }
 
     /// Test that parent conversations don't handle terminal tools specially
