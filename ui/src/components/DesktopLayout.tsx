@@ -21,7 +21,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const location = useLocation();
-  const { toasts, dismissToast, showSuccess } = useToast();
+  const { toasts, dismissToast, showSuccess, showError, showWarning, showInfo } = useToast();
   const loadingRef = useRef(false);
 
   // Media query listener
@@ -114,6 +114,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           {children}
         </div>
         <CommandPalette conversations={conversations} />
+        {/* Debug: toast test triggers */}
+        <div className="toast-debug">
+          <button onClick={() => showSuccess('Operation completed', 3000)} title="Test success toast">ok</button>
+          <button onClick={() => showError('Something went wrong', 3000)} title="Test error toast">err</button>
+          <button onClick={() => showWarning('Approaching limit', 3000)} title="Test warning toast">warn</button>
+          <button onClick={() => showInfo('Processing...', 3000)} title="Test info toast">info</button>
+        </div>
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
     </FileExplorerProvider>

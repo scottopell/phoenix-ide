@@ -99,6 +99,31 @@
   }
 }
 
+/* Debug trigger strip -- remove when no longer needed */
+.toast-debug {
+  position: fixed;
+  bottom: 4px;
+  left: 4px;
+  z-index: 999;
+  display: flex;
+  gap: 2px;
+}
+
+.toast-debug button {
+  all: unset;
+  cursor: pointer;
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  opacity: 0.4;
+}
+
+.toast-debug button:hover {
+  opacity: 1;
+}
+
 @keyframes toast-out {
   from {
     opacity: 1;
