@@ -2065,6 +2065,21 @@ pre:hover .copy-btn {
   white-space: nowrap;
 }
 
+.model-1m-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  line-height: 16px;
+  border-radius: 3px;
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  vertical-align: 1px;
+}
+
 /* Line 2: git flow + delta badges + project name */
 .statebar-line2 {
   display: flex;

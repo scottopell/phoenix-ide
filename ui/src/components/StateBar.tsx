@@ -193,7 +193,8 @@ export function StateBar({
   const modeLabel = conversation?.conv_mode_label;
   const modeSuffix = isExplore ? ' (read-only)' : '';
   const modeClass = `statebar-mode statebar-mode--${mode}`;
-  const modelAbbrev = conversation ? abbreviateModel(conversation.model) : '';
+  const is1m = conversation?.model?.endsWith('-1m') ?? false;
+  const modelAbbrev = conversation ? abbreviateModel(conversation.model.replace(/-1m$/, '')) : '';
   const projectName = conversation ? getProjectName(conversation) : null;
 
   // Git delta badges
@@ -225,6 +226,7 @@ export function StateBar({
                 )}
                 <span className="conv-model" title={`Model: ${conversation.model}`}>
                   {modelAbbrev}
+                  {is1m && <span className="model-1m-badge">1M</span>}
                 </span>
               </div>
 
