@@ -407,6 +407,19 @@ export function ProseReader({
           handleClose();
         }
       }
+
+      // Cmd/Ctrl+A: select all text in the prose reader content, not the whole page
+      if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+        const container = contentRef.current;
+        if (container) {
+          e.preventDefault();
+          const range = document.createRange();
+          range.selectNodeContents(container);
+          const sel = window.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(range);
+        }
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
