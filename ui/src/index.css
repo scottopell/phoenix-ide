@@ -2063,6 +2063,90 @@ pre:hover .copy-btn {
   color: var(--text-secondary);
   font-size: 11px;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Purple badge shown when conversation is on a 1M model */
+.model-1m-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 4px;
+  line-height: 1.5;
+  color: var(--accent-purple);
+  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
+  letter-spacing: 0.3px;
+}
+
+/* Upgrade-to-1M affordance next to model display */
+.model-upgrade {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.model-upgrade-btn {
+  all: unset;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 4px;
+  line-height: 1.5;
+  letter-spacing: 0.3px;
+  color: var(--text-muted);
+  border: 1px dashed color-mix(in srgb, var(--accent-purple) 40%, transparent);
+  transition: color 150ms, border-color 150ms, background 150ms;
+}
+
+.model-upgrade-btn:hover {
+  color: var(--accent-purple);
+  border-color: var(--accent-purple);
+  background: color-mix(in srgb, var(--accent-purple) 8%, transparent);
+}
+
+/* Inline confirmation for model upgrade */
+.model-upgrade-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.model-upgrade-prompt {
+  color: var(--text-secondary);
+}
+
+.model-upgrade-yes,
+.model-upgrade-no {
+  all: unset;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 4px;
+  line-height: 1.6;
+}
+
+.model-upgrade-yes {
+  color: var(--accent-purple);
+  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
+}
+
+.model-upgrade-yes:hover {
+  background: color-mix(in srgb, var(--accent-purple) 25%, transparent);
+}
+
+.model-upgrade-no {
+  color: var(--text-muted);
+}
+
+.model-upgrade-no:hover {
+  color: var(--text-secondary);
 }
 
 .model-1m-badge {

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, ExpansionError, type Conversation, type ImageData } from '../api';
+import { api, ExpansionError, type Conversation, type ImageData, type ModelInfo } from '../api';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
@@ -65,6 +65,9 @@ export function ConversationPage() {
 
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
+
+  // Available models (for upgrade detection)
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
@@ -199,6 +202,13 @@ export function ConversationPage() {
       .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp }))
       .catch((err) => console.warn('Failed to load system prompt:', err));
   }, [conversationId, dispatch]);
+
+  // Fetch available models once (for upgrade detection in StateBar)
+  useEffect(() => {
+    api.listModels()
+      .then((resp) => setAvailableModels(resp.models))
+      .catch((err) => console.warn('Failed to load models:', err));
+  }, []);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
@@ -344,6 +354,18 @@ export function ConversationPage() {
       await api.triggerContinuation(conversationId);
     } catch (err) {
       console.error('Failed to trigger continuation:', err);
+    }
+  };
+
+  const handleUpgradeModel = async (newModelId: string) => {
+    if (!conversationId || atom.phase.type !== 'idle') return;
+
+    try {
+      await api.upgradeModel(conversationId, newModelId);
+      // Backend evicts the runtime on upgrade; reload to reconnect with new model
+      window.location.reload();
+    } catch (err) {
+      console.error('Failed to upgrade model:', err);
     }
   };
 
@@ -615,8 +637,10 @@ export function ConversationPage() {
         nextRetryIn={connectionInfo.nextRetryIn}
         contextWindowUsed={atom.contextWindow.used}
         modelContextWindow={atom.contextWindow.total}
+        availableModels={availableModels}
         onRetryNow={connectionInfo.retryNow}
         onTriggerContinuation={handleTriggerContinuation}
+        onUpgradeModel={handleUpgradeModel}
       />
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}

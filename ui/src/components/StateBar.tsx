@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import type { Conversation, ConversationState } from '../api';
+import type { Conversation, ConversationState, ModelInfo } from '../api';
 import type { ConnectionState } from '../hooks';
 import { getStateDescription } from '../utils';
 
@@ -17,16 +17,24 @@ interface StateBarProps {
   contextWindowUsed: number;
   /** Model's maximum context window in tokens */
   modelContextWindow: number;
+  /** Available models from the API (used to detect 1M upgrade availability) */
+  availableModels?: ModelInfo[];
   onRetryNow?: () => void;
   /** Callback to manually trigger continuation */
   onTriggerContinuation?: () => void;
+  /** Callback to upgrade the conversation to a 1M model variant */
+  onUpgradeModel?: (newModelId: string) => void;
 }
 
-/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-4o" -> "gpt-4o" */
+/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-4o" -> "gpt-4o"
+ *  For 1M variants, strip the "-1m" suffix (the 1M badge handles display). */
 function abbreviateModel(model: string): string {
-  // Claude models: strip "claude-" prefix, convert trailing version hyphen to dot
+  // Claude models: strip "claude-" prefix, strip "-1m" suffix, convert trailing version hyphen to dot
   if (!model.startsWith('claude-')) return model;
-  const inner = model.slice(7); // strip "claude-"
+  let inner = model.slice(7); // strip "claude-"
+  if (inner.endsWith('-1m')) {
+    inner = inner.slice(0, -3);
+  }
   const lastHyphen = inner.lastIndexOf('-');
   if (lastHyphen > 0 && /^\d+$/.test(inner.slice(lastHyphen + 1))) {
     return inner.slice(0, lastHyphen) + '.' + inner.slice(lastHyphen + 1);
@@ -58,11 +66,15 @@ export function StateBar({
   nextRetryIn,
   contextWindowUsed,
   modelContextWindow,
+  availableModels,
   onRetryNow,
   onTriggerContinuation,
+  onUpgradeModel,
 }: StateBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [upgradeConfirm, setUpgradeConfirm] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const upgradeRef = useRef<HTMLSpanElement>(null);
 
   // Close menu on outside click
   useEffect(() => {
@@ -75,6 +87,18 @@ export function StateBar({
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
   }, [menuOpen]);
+
+  // Close upgrade confirmation on outside click
+  useEffect(() => {
+    if (!upgradeConfirm) return;
+    const handleClick = (e: MouseEvent) => {
+      if (upgradeRef.current && !upgradeRef.current.contains(e.target as Node)) {
+        setUpgradeConfirm(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [upgradeConfirm]);
 
   let dotClass = 'dot';
   let stateText = '';
@@ -197,6 +221,28 @@ export function StateBar({
   const modelAbbrev = conversation ? abbreviateModel(conversation.model.replace(/-1m$/, '')) : '';
   const projectName = conversation ? getProjectName(conversation) : null;
 
+  // Model upgrade detection: check if a 1M variant exists for the current model
+  const currentModel = conversation?.model ?? '';
+  const is1m = currentModel.endsWith('-1m');
+  const upgradeModelId = is1m ? null : currentModel + '-1m';
+  const canUpgrade = !!(
+    upgradeModelId &&
+    availableModels?.some(m => m.id === upgradeModelId) &&
+    convState.type === 'idle' &&
+    onUpgradeModel
+  );
+
+  const handleUpgradeClick = () => {
+    if (!canUpgrade) return;
+    setUpgradeConfirm(true);
+  };
+
+  const handleUpgradeConfirm = () => {
+    if (!upgradeModelId || !onUpgradeModel) return;
+    setUpgradeConfirm(false);
+    onUpgradeModel(upgradeModelId);
+  };
+
   // Git delta badges
   const ahead = conversation?.commits_ahead;
   const behind = conversation?.commits_behind;
@@ -228,6 +274,36 @@ export function StateBar({
                   {modelAbbrev}
                   {is1m && <span className="model-1m-badge">1M</span>}
                 </span>
+                {canUpgrade && (
+                  <span className="model-upgrade" ref={upgradeRef}>
+                    {upgradeConfirm ? (
+                      <span className="model-upgrade-confirm">
+                        <span className="model-upgrade-prompt">Switch to 1M?</span>
+                        <button
+                          className="model-upgrade-yes"
+                          onClick={handleUpgradeConfirm}
+                          title="Upgrade to 1M context window"
+                        >
+                          Yes
+                        </button>
+                        <button
+                          className="model-upgrade-no"
+                          onClick={() => setUpgradeConfirm(false)}
+                        >
+                          No
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        className="model-upgrade-btn"
+                        onClick={handleUpgradeClick}
+                        title="Upgrade to 1M context window"
+                      >
+                        1M
+                      </button>
+                    )}
+                  </span>
+                )}
               </div>
 
               {/* Line 2: git info (Work/Explore) or project name */}
