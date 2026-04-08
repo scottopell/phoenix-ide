@@ -1734,10 +1734,20 @@ fn get_next_task_id(tasks_dir: &std::path::Path) -> String {
 }
 
 /// Run a git command in the given directory, returning stdout on success or an error message.
+///
+/// All git operations use a dedicated bot identity and disable commit signing
+/// to avoid depending on the user's SSH agent (which breaks in workspaces/tmux).
 pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "phoenix-ide-bot")
+        .env("GIT_AUTHOR_EMAIL", "phoenix-ide-bot@noreply.local")
+        .env("GIT_COMMITTER_NAME", "phoenix-ide-bot")
+        .env("GIT_COMMITTER_EMAIL", "phoenix-ide-bot@noreply.local")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .output()
         .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
     if output.status.success() {
