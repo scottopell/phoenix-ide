@@ -1371,6 +1371,17 @@ pub fn transition(
         (ConvState::Idle, Event::LlmResponse { .. }) => Ok(TransitionResult::new(ConvState::Idle)),
 
         // ============================================================
+        // Stale Events (absorb silently)
+        // ============================================================
+
+        // TaskApprovalResponse arriving after the state has already moved on
+        // (e.g., double-click approve, SSE reconnect resend). No-op.
+        (_state, Event::TaskApprovalResponse { .. }) => {
+            tracing::debug!("Absorbing stale TaskApprovalResponse");
+            Ok(TransitionResult::new(_state.clone()))
+        }
+
+        // ============================================================
         // Invalid Transitions
         // ============================================================
         (state, event) => Err(TransitionError::InvalidTransition(format!(
