@@ -2070,13 +2070,13 @@ pre:hover .copy-btn {
   margin-left: 4px;
   padding: 0 4px;
   font-size: 9px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.03em;
   line-height: 16px;
   border-radius: 3px;
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: #f0c040;
+  border: 1px solid color-mix(in srgb, #f0c040 50%, transparent);
+  background: color-mix(in srgb, #f0c040 15%, transparent);
   vertical-align: 1px;
 }
 
