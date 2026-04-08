@@ -25,6 +25,14 @@ interface ConversationSettingsProps {
   mode?: 'direct' | 'managed';
   /** Callback to change mode */
   setMode?: (m: 'direct' | 'managed') => void;
+  /** Available git branches for the current directory */
+  branches?: string[];
+  /** Currently checked-out branch */
+  currentBranch?: string | null;
+  /** User-selected base branch (null means use current) */
+  baseBranch?: string | null;
+  /** Callback to change base branch selection */
+  setBaseBranch?: (b: string | null) => void;
 }
 
 export function ConversationSettings({
@@ -43,6 +51,10 @@ export function ConversationSettings({
   error,
   mode = 'direct',
   setMode,
+  branches,
+  currentBranch,
+  baseBranch,
+  setBaseBranch,
 }: ConversationSettingsProps) {
   const radioGroupName = useId();
   return (
@@ -121,6 +133,32 @@ export function ConversationSettings({
             </label>
           )}
         </div>
+      )}
+
+      {isGitDir && mode === 'managed' && branches && branches.length > 0 && (
+        <label className="settings-field branch-selector">
+          <span className="settings-field-label">Branch</span>
+          <select
+            className="settings-select"
+            value={baseBranch ?? currentBranch ?? ''}
+            onChange={(e) => {
+              const val = e.target.value;
+              setBaseBranch?.(val === currentBranch ? null : val);
+            }}
+          >
+            {currentBranch && (
+              <option value={currentBranch}>
+                {currentBranch} (current)
+              </option>
+            )}
+            {branches
+              .filter(b => b !== currentBranch)
+              .sort((a, b) => a.localeCompare(b))
+              .map(b => (
+                <option key={b} value={b}>{b}</option>
+              ))}
+          </select>
+        </label>
       )}
     </>
   );

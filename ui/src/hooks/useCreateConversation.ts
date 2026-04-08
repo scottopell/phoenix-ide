@@ -40,6 +40,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
   const [mode, setMode] = useState<'direct' | 'managed'>('direct');
+  const [branches, setBranches] = useState<string[]>([]);
+  const [currentBranch, setCurrentBranch] = useState<string | null>(null);
+  const [baseBranch, setBaseBranch] = useState<string | null>(null);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -67,6 +70,34 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   // Reset to Direct when directory is not a git repo (Managed requires git)
   useEffect(() => { if (isGitDir === false) setMode('direct'); }, [isGitDir]);
+
+  // Fetch branches when git dir is confirmed and mode is managed
+  useEffect(() => {
+    if (!isGitDir || mode !== 'managed') {
+      setBranches([]);
+      setCurrentBranch(null);
+      setBaseBranch(null);
+      return;
+    }
+    const trimmedCwd = cwd.trim();
+    if (!trimmedCwd) return;
+
+    let cancelled = false;
+    api.listGitBranches(trimmedCwd).then(resp => {
+      if (cancelled) return;
+      setBranches(resp.branches);
+      setCurrentBranch(resp.current);
+      setBaseBranch(null);
+    }).catch(err => {
+      if (cancelled) return;
+      console.warn('Failed to fetch git branches:', err);
+      setBranches([]);
+      setCurrentBranch(null);
+      setBaseBranch(null);
+    });
+
+    return () => { cancelled = true; };
+  }, [isGitDir, mode, cwd]);
 
   const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
 
@@ -131,7 +162,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
       const conv = await api.createConversation(
-        trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode
+        trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode,
+        mode === 'managed' ? baseBranch : null,
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
@@ -163,6 +195,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
     canSend,
     mode,
     setMode,
+    branches,
+    currentBranch,
+    baseBranch,
+    setBaseBranch,
     recentDirs,
     addImages,
     removeImage,

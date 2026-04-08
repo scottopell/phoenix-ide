@@ -269,6 +269,11 @@ export interface McpReloadResult {
   unchanged: string[];
 }
 
+export interface GitBranchesResponse {
+  branches: string[];
+  current: string;
+}
+
 export const api = {
   async getProjects(): Promise<Project[]> {
     const resp = await fetch('/api/projects');
@@ -288,12 +293,17 @@ export const api = {
     messageId: string,
     model?: string,
     images: ImageData[] = [],
-    mode?: 'direct' | 'managed'
+    mode?: 'direct' | 'managed',
+    baseBranch?: string | null,
   ): Promise<Conversation> {
+    const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
+    if (baseBranch) {
+      body.base_branch = baseBranch;
+    }
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cwd, model, text, message_id: messageId, images, mode }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) {
       const err = await resp.json();
@@ -344,6 +354,12 @@ export const api = {
 
   async validateCwd(path: string): Promise<{ valid: boolean; error?: string; is_git: boolean }> {
     const resp = await fetch(`/api/validate-cwd?path=${encodeURIComponent(path)}`);
+    return resp.json();
+  },
+
+  async listGitBranches(cwd: string): Promise<GitBranchesResponse> {
+    const resp = await fetch(`/api/git/branches?cwd=${encodeURIComponent(cwd)}`);
+    if (!resp.ok) throw new Error('Failed to list git branches');
     return resp.json();
   },
 

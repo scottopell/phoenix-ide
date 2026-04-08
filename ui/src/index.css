@@ -4281,6 +4281,16 @@ html * {
   line-height: 1.4;
 }
 
+/* Branch selector (appears in Managed mode) */
+.branch-selector {
+  margin-top: 8px;
+}
+
+.branch-selector .settings-select {
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
 /* Expanded settings inside card */
 .new-conv-settings-expanded {
   margin-top: 16px;

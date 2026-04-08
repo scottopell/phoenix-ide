@@ -103,6 +103,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             error={conv.error}
             mode={conv.mode}
             setMode={conv.setMode}
+            branches={conv.branches}
+            currentBranch={conv.currentBranch}
+            baseBranch={conv.baseBranch}
+            setBaseBranch={conv.setBaseBranch}
           />
 
           {/* Main input */}
@@ -173,6 +177,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             error={conv.error}
             mode={conv.mode}
             setMode={conv.setMode}
+            branches={conv.branches}
+            currentBranch={conv.currentBranch}
+            baseBranch={conv.baseBranch}
+            setBaseBranch={conv.setBaseBranch}
           />
         </div>
       </main>
