@@ -729,44 +729,52 @@ rule SubAgentTurnLimitGraceTurn {
         -- build_llm_messages call, prompting it to call submit_result.
 }
 
+-- SubAgentTurnLimitHardStop: the grace turn was consumed but the model
+-- did not call submit_result. The executor extracts the last assistant
+-- text and sends Event::GraceTurnExhausted to the state machine.
+-- This is a proper state machine event (not direct mutation) so the
+-- transition table remains the authoritative specification of all
+-- sub-agent terminal paths.
+
 rule SubAgentTurnLimitHardStop {
-    when: TurnLimitReached(conversation)
+    when: GraceTurnExhausted(conversation, partial_result)
 
     requires: conversation.is_sub_agent
     requires: conversation.grace_turn_granted = true
 
-    -- Extract the last assistant text as a partial result.
-    -- Walk backward through conversation messages to find the most
-    -- recent assistant message with text content blocks.
-    let last_text = last_assistant_text(conversation)
-
     ensures: conversation.status = completed
-        if last_text != null
-    ensures: conversation.completion_result = last_text
-        if last_text != null
+        if partial_result != null
+    ensures: conversation.completion_result = partial_result
+        if partial_result != null
     ensures: SubAgentCompleted(conversation) with outcome = success
-        if last_text != null
+        if partial_result != null
 
     ensures: conversation.status = failed
-        if last_text = null
+        if partial_result = null
     ensures: conversation.failure_error = "Turn limit exceeded, no output"
-        if last_text = null
+        if partial_result = null
     ensures: SubAgentCompleted(conversation) with outcome = failure
-        if last_text = null
+        if partial_result = null
 
     @guidance
-        -- Implementation: in the executor's turn-count check, when
-        -- llm_turn_count > max_turns and grace_turn_granted is true:
-        --   1. Call self.storage.get_messages() to get conversation history
-        --   2. Walk backward for last assistant message with text blocks
-        --   3. If found: send Event::SubAgentResult with Success to parent
-        --   4. If not found: send Event::SubAgentResult with Failure
-        --   5. Transition to terminal state and exit the loop
+        -- The executor is responsible for text extraction and event creation:
+        --   1. Detect grace_turn_granted = true and turn limit exceeded
+        --   2. Read conversation messages via self.storage.get_messages()
+        --   3. Walk backward for last assistant message with text blocks
+        --   4. Send Event::GraceTurnExhausted { result: Option<String> }
+        --      to the state machine via self.event_tx
+        --   5. The state machine handles the event, transitions to
+        --      Completed/Failed, and emits NotifyParent as an effect
+        --   6. The executor handles NotifyParent normally (no direct send)
+        --
+        -- This keeps the executor free of notification logic. The state
+        -- machine owns the (event, state) -> (terminal, NotifyParent)
+        -- contract. The executor only owns text extraction (I/O).
         --
         -- The happy path: the grace turn prompted the model to call
         -- submit_result, which already completed via the normal
-        -- SubAgentSubmitsResult rule. This hard-stop only fires if
-        -- the model called another tool instead of submit_result.
+        -- SubAgentSubmitsResult rule. GraceTurnExhausted only fires
+        -- if the model called another tool instead of submit_result.
 }
 
 -- ===========================================================
@@ -1116,6 +1124,15 @@ rule ServerRestart {
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
+
+-- Sub-agent notifies parent exactly once
+invariant SubAgentNotifiesParentOnce {
+    for c in Conversations where c.is_sub_agent:
+        count(SubAgentCompleted(c)) <= 1
+    -- Every terminal path (submit_result, forcible termination,
+    -- GraceTurnExhausted, context exhaustion) emits exactly one
+    -- SubAgentCompleted. No path may emit two.
+}
 
 -- Sub-agent grace turn: turn limit produces success, not failure
 invariant GraceTurnOutcome {
