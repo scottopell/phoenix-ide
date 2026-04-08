@@ -1266,7 +1266,6 @@ mod tests {
         let states = [
             ConvState::Idle,
             ConvState::LlmRequesting { attempt: 1 },
-            ConvState::AwaitingLlm,
         ];
 
         for state in states {

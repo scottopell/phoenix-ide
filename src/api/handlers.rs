@@ -1740,57 +1740,26 @@ async fn confirm_complete(
 
     let (short_sha, stash_warning) = merge_result?;
 
-    // 3. Atomically update state, mode, and cwd in a single transaction
-    state
-        .db
-        .finalize_conversation(
-            &id,
-            &ConvState::Terminal,
-            &ConvMode::Explore,
-            &repo_root_str,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 4. Inject system message (include stash warning if pop failed)
+    // 3. Build system message
     let mut system_msg =
         format!("Task completed. Squash merged to {base_branch_for_msg} as {short_sha}.");
     if let Some(ref warning) = stash_warning {
         use std::fmt::Write;
         let _ = write!(system_msg, "\n\n{warning}");
     }
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let msg = state
-        .db
-        .add_message(
-            &msg_id,
+
+    // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
+    state
+        .runtime
+        .send_event(
             &id,
-            &MessageContent::system(&system_msg),
-            None,
-            None,
+            Event::TaskResolved {
+                system_message: system_msg,
+                repo_root: repo_root_str,
+            },
         )
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 7. Broadcast SSE events so the frontend updates in real-time
-    if let Ok(handle) = state.runtime.get_or_create(&id).await {
-        let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
-        let _ = handle.broadcast_tx.send(SseEvent::StateChange {
-            state: ConvState::Terminal,
-            display_state: ConvState::Terminal.display_state().as_str().to_string(),
-        });
-        let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
-            update: crate::runtime::ConversationMetadataUpdate {
-                cwd: Some(repo_root_str),
-                branch_name: None,
-                worktree_path: None,
-                conv_mode_label: Some("Explore".to_string()),
-                base_branch: None,
-                commits_behind: None,
-                commits_ahead: None,
-            },
-        });
-    }
+        .map_err(AppError::BadRequest)?;
 
     Ok(Json(ConfirmCompleteResponse {
         success: true,
@@ -1989,11 +1958,10 @@ async fn abandon_task(
         if main_clean {
             // Checkout base branch so task file rename happens on the right branch
             if let Err(e) = run_git(&repo_root_clone, &["checkout", &base_branch]) {
-                tracing::warn!(
-                    error = %e,
-                    branch = %base_branch,
-                    "Failed to checkout base branch -- skipping task file update"
-                );
+                return Err(AppError::Internal(format!(
+                    "Worktree and branch deleted but failed to checkout {base_branch} \
+                     for task file update: {e}. Task file may be stale."
+                )));
             } else {
                 // Scan tasks/ for matching task file and rename to wont-do
                 let tasks_dir = repo_root_clone.join("tasks");
@@ -2066,58 +2034,28 @@ async fn abandon_task(
     .await
     .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
 
-    // 3. Atomically update state, mode, and cwd in a single transaction
-    let repo_root_str = repo_root.display().to_string();
-    state
-        .db
-        .finalize_conversation(
-            &id,
-            &ConvState::Terminal,
-            &ConvMode::Explore,
-            &repo_root_str,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 4. Inject system message
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let msg = state
-        .db
-        .add_message(
-            &msg_id,
-            &id,
-            &MessageContent::system("Task abandoned. Worktree and branch deleted."),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 7. Broadcast SSE events so the frontend updates in real-time
-    if let Ok(handle) = state.runtime.get_or_create(&id).await {
-        // Broadcast diff snapshot first (shows above the "abandoned" message)
-        if let Some(snap_msg) = snapshot_msg {
+    // 3. Broadcast diff snapshot (persisted above, before state transition)
+    if let Some(snap_msg) = snapshot_msg {
+        if let Ok(handle) = state.runtime.get_or_create(&id).await {
             let _ = handle
                 .broadcast_tx
                 .send(SseEvent::Message { message: snap_msg });
         }
-        let _ = handle.broadcast_tx.send(SseEvent::Message { message: msg });
-        let _ = handle.broadcast_tx.send(SseEvent::StateChange {
-            state: ConvState::Terminal,
-            display_state: ConvState::Terminal.display_state().as_str().to_string(),
-        });
-        let _ = handle.broadcast_tx.send(SseEvent::ConversationUpdate {
-            update: crate::runtime::ConversationMetadataUpdate {
-                cwd: Some(repo_root_str),
-                branch_name: None,
-                worktree_path: None,
-                conv_mode_label: Some("Explore".to_string()),
-                base_branch: None,
-                commits_behind: None,
-                commits_ahead: None,
-            },
-        });
     }
+
+    // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
+    let repo_root_str = repo_root.display().to_string();
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskResolved {
+                system_message: "Task abandoned. Worktree and branch deleted.".to_string(),
+                repo_root: repo_root_str,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
 }

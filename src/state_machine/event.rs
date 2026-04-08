@@ -99,4 +99,14 @@ pub enum Event {
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
+
+    // Task resolution events (REQ-BED-029)
+    /// Task completed or abandoned — transitions conversation to Terminal.
+    /// Sent by the API handler after git operations succeed.
+    TaskResolved {
+        /// System message describing the outcome (e.g., "Task completed. Squash merged...")
+        system_message: String,
+        /// The repo root path to restore as cwd
+        repo_root: String,
+    },
 }
