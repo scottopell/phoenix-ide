@@ -21,3 +21,4 @@ static/dist/
 .claude/
 .playwright-mcp/
 .phoenix/
+dogfood-output
