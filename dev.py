@@ -504,14 +504,25 @@ def cmd_check():
     results_lock = threading.Lock()
     t_start = time.monotonic()
 
+    CHECK_TIMEOUT = 300  # 5 minutes per step -- kill and fail if exceeded
+
     def run_step(name, cmd, cwd=ROOT):
         t0 = time.monotonic()
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-        elapsed = time.monotonic() - t0
-        output = (proc.stdout + proc.stderr).strip()
+        try:
+            proc = subprocess.run(
+                cmd, cwd=cwd, capture_output=True, text=True,
+                timeout=CHECK_TIMEOUT,
+            )
+            elapsed = time.monotonic() - t0
+            output = (proc.stdout + proc.stderr).strip()
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
+            output = f"TIMEOUT after {CHECK_TIMEOUT}s"
+            rc = 1
         with results_lock:
-            ok = "\u2713" if proc.returncode == 0 else "\u2717"
-            results.append((name, proc.returncode, elapsed, output))
+            ok = "\u2713" if rc == 0 else "\u2717"
+            results.append((name, rc, elapsed, output))
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
@@ -602,7 +613,10 @@ def cmd_check():
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        # Timeout on join so Ctrl+C is responsive (subprocess.run timeout
+        # handles the actual deadline; this just prevents infinite wait
+        # if a thread somehow survives)
+        t.join(timeout=CHECK_TIMEOUT + 30)
 
     total_elapsed = time.monotonic() - t_start
     failures = [(n, out) for n, rc, _, out in results if rc != 0]
