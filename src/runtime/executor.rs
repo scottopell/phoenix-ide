@@ -1895,8 +1895,19 @@ fn execute_approve_task_blocking(
         }
     }
 
-    // 8. Create branch, then worktree, then commit.
-    //    Separated so we can clean up if worktree creation fails.
+    // 8. Commit task file, then create branch + worktree.
+    //    Committing first means a failure in worktree creation leaves only
+    //    a harmless commit on main (easily reverted). The reverse order
+    //    leaves an orphaned worktree that blocks retry.
+    let commit_msg = format!("task {task_id}: {title}");
+    if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
+        let _ = run_git(cwd, &["reset", "HEAD"]);
+        let _ = std::fs::remove_file(&filepath);
+        return Err(format!("Failed to commit task file: {e}"));
+    }
+    tracing::info!(commit_msg = %commit_msg, "Task file committed");
+
+    // 9. Create branch + worktree from the commit we just made.
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
         .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
@@ -1905,15 +1916,11 @@ fn execute_approve_task_blocking(
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
     if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
-        let _ = run_git(cwd, &["reset", "HEAD"]);
-        let _ = std::fs::remove_file(&filepath);
         return Err(format!("Failed to create branch '{branch_name}': {e}"));
     }
 
     if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
         let _ = run_git(cwd, &["branch", "-D", &branch_name]);
-        let _ = run_git(cwd, &["reset", "HEAD"]);
-        let _ = std::fs::remove_file(&filepath);
         return Err(format!("Failed to create worktree: {e}"));
     }
 
@@ -1922,11 +1929,6 @@ fn execute_approve_task_blocking(
         worktree = %worktree_path_str,
         "Created git worktree"
     );
-
-    // 9. NOW commit -- safe because worktree already exists
-    let commit_msg = format!("task {task_id}: {title}");
-    run_git(cwd, &["commit", "-m", &commit_msg])?;
-    tracing::info!(commit_msg = %commit_msg, "Task file committed");
 
     Ok(TaskApprovalResult {
         task_id,
