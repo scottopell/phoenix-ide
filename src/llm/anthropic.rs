@@ -344,6 +344,10 @@ pub async fn complete_streaming(
     if has_deferred {
         builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
     }
+    // 1M context requires the context-1m beta header.
+    if spec.context_window >= 1_000_000 {
+        builder = builder.header("anthropic-beta", "context-1m-2025-08-07");
+    }
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -432,6 +436,9 @@ pub async fn complete(
     };
     if has_deferred {
         builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    }
+    if spec.context_window >= 1_000_000 {
+        builder = builder.header("anthropic-beta", "context-1m-2025-08-07");
     }
     builder = builder
         .header("anthropic-version", "2023-06-01")

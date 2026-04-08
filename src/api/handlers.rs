@@ -12,7 +12,7 @@ use super::types::{
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
     ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
     SystemPromptResponse, TaskApprovalResponse, TaskEntry, TaskFeedbackRequest, TasksResponse,
-    ValidateCwdResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
@@ -128,6 +128,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/projects", get(list_projects))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
+        .route(
+            "/api/conversations/:id/upgrade-model",
+            post(upgrade_conversation_model),
+        )
         // Environment info
         .route("/api/env", get(get_env))
         // MCP management
@@ -1079,6 +1083,57 @@ async fn cancel_conversation(
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(CancelResponse { ok: true }))
+}
+
+/// Upgrade a conversation's model (e.g., from 200k to 1M context).
+/// Requires the conversation to be idle -- cannot upgrade mid-turn.
+async fn upgrade_conversation_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpgradeModelRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate the target model exists
+    if state.llm_registry.get(&req.model).is_none() {
+        return Err(AppError::BadRequest(format!(
+            "Unknown model '{}'. Available: {:?}",
+            req.model,
+            state.llm_registry.available_models()
+        )));
+    }
+
+    // Validate conversation exists and is idle
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to upgrade model".to_string(),
+        ));
+    }
+
+    // Update in DB
+    state
+        .runtime
+        .db()
+        .update_conversation_model(&id, &req.model)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Evict the active runtime so it gets recreated with the new model
+    state.runtime.evict_runtime(&id).await;
+
+    tracing::info!(
+        conv_id = %id,
+        old_model = conv.model.as_deref().unwrap_or("default"),
+        new_model = %req.model,
+        "Conversation model upgraded"
+    );
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 /// Manually trigger context continuation (REQ-BED-023)

@@ -619,6 +619,12 @@ impl RuntimeManager {
     }
 
     /// Send an event to a conversation
+    /// Evict an active runtime so it gets recreated with fresh config on next access.
+    /// Used after model upgrades to pick up the new model and context window.
+    pub async fn evict_runtime(&self, conversation_id: &str) {
+        self.runtimes.write().await.remove(conversation_id);
+    }
+
     pub async fn send_event(
         self: &Arc<Self>,
         conversation_id: &str,

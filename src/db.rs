@@ -467,6 +467,22 @@ impl Database {
         Ok(())
     }
 
+    /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
+    pub async fn update_conversation_model(&self, id: &str, model: &str) -> DbResult<()> {
+        let now = Utc::now();
+        let result =
+            sqlx::query("UPDATE conversations SET model = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(model)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Atomically finalize a conversation after task completion or abandonment.
     /// Updates state, mode, and cwd in a single transaction so a crash between
     /// writes can't leave the conversation in an inconsistent state.

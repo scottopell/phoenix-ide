@@ -20,6 +20,13 @@ pub struct CreateConversationRequest {
     pub mode: Option<String>,
 }
 
+/// Request to upgrade a conversation's model
+#[derive(Debug, Deserialize)]
+pub struct UpgradeModelRequest {
+    /// Target model ID (e.g., "claude-sonnet-4-6-1m")
+    pub model: String,
+}
+
 /// Request to send a chat message
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {

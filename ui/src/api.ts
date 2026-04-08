@@ -547,6 +547,18 @@ export const api = {
     return resp.json();
   },
 
+  async upgradeModel(conversationId: string, model: string): Promise<void> {
+    const resp = await fetch(`/api/conversations/${conversationId}/upgrade-model`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.error || 'Failed to upgrade model');
+    }
+  },
+
   async reloadMcp(): Promise<McpReloadResult> {
     const resp = await fetch('/api/mcp/reload', { method: 'POST' });
     if (!resp.ok) throw new Error('Failed to reload MCP servers');
