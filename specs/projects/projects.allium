@@ -182,7 +182,7 @@ rule TaskApprovalExecuted {
     let proposal = conversation.proposal
     let task_id = next_task_id(project)
     let slug = derive_slug(proposal.title)
-    let base_branch = project.repo.current_branch
+    let base_branch = conversation.desired_base_branch or project.repo.current_branch
     let branch_name = "task-" + task_id + "-" + slug
     let worktree_path = project.repo.root_path + "/" + config.worktree_base_dir + "/" + conversation.id
 
@@ -214,28 +214,31 @@ rule TaskApprovalExecuted {
         -- All operations run under a global mutex to prevent concurrent
         -- approvals from getting the same task number.
         --
-        -- Sequence:
-        --   1. Detect base_branch (current branch via rev-parse)
+        -- Sequence (two paths based on whether desired base is current HEAD):
+        --
+        -- Path A (on base branch, or no desired_base_branch):
+        --   1. Detect base_branch (desired_base_branch or current HEAD)
         --   2. Create tasks/ directory if first task for this project
         --   3. Assign task ID (date-based sequential via taskmd-core)
         --   4. Write task file to tasks/ (in-progress status)
-        --   5. Ensure .gitignore contains `.phoenix/` (append if
-        --      missing; stage with git add)
-        --   6. Stage task file, commit both task file and .gitignore
-        --      to base_branch
-        --   7. Branch collision check: if branch_name already exists
-        --      and is fully merged, delete it; if not fully merged,
-        --      revert the commit (reset --hard HEAD~1) and error
-        --   8. Create branch (git branch), then worktree
-        --      (git worktree add). Branch and worktree start from
-        --      the commit that includes the task file, so the agent
-        --      can update it via patch tool (REQ-PROJ-006).
+        --   5. Ensure .gitignore contains `.phoenix/`
+        --   6. Stage task file, commit to base_branch
+        --   7. Branch collision check
+        --   8. Create branch (git branch), then worktree (git worktree add)
+        --
+        -- Path B (desired base differs from current HEAD):
+        --   1. Validate desired_base_branch exists (rev-parse --verify)
+        --   2. Assign task ID
+        --   3. Create worktree + branch in one step:
+        --      `git worktree add -b <branch> <path> <base_branch>`
+        --   4. Write task file and .gitignore in the WORKTREE
+        --   5. Commit in the worktree (not the main checkout)
+        --   Main checkout is not modified in Path B.
         --
         -- Rollback:
-        --   - Commit failure (step 6): git reset HEAD, remove file
-        --   - Branch failure (step 8): git reset --hard HEAD~1
-        --   - Worktree failure (step 8): git branch -D, then
-        --     git reset --hard HEAD~1
+        --   Path A: commit failure -> git reset HEAD, remove file
+        --           worktree failure -> git branch -D
+        --   Path B: worktree failure -> git branch -D (no main checkout changes to revert)
 }
 
 -- REQ-PROJ-004: User provides feedback — no git operations
@@ -534,8 +537,9 @@ invariant OneWorktreePerConversation {
 }
 
 -- REQ-PROJ-017: Base branch is immutable once recorded
--- (Enforced by construction: base_branch is set at approval time
--- and never modified. No rule updates it.)
+-- (Enforced by construction: base_branch is resolved at approval time
+-- from desired_base_branch or current HEAD, then stored in ConvMode::Work.
+-- No rule updates it after approval.)
 
 -- Task file exists on base_branch after approval
 invariant TaskFileExistsAfterApproval {
