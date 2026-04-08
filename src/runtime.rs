@@ -494,6 +494,7 @@ impl RuntimeManager {
             )
         };
         context.mode_context = Some(mode_context);
+        context.desired_base_branch = conv.desired_base_branch.clone();
 
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, _) = broadcast::channel(128);

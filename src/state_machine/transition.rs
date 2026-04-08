@@ -1918,6 +1918,7 @@ mod tests {
             context_window: 100_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
+            desired_base_branch: None,
         };
 
         let result = handle_context_exhaustion(
@@ -2031,6 +2032,7 @@ mod tests {
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
+            desired_base_branch: None,
         };
 
         let result = transition(
@@ -2129,6 +2131,7 @@ mod tests {
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
+            desired_base_branch: None,
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -2173,6 +2176,7 @@ mod tests {
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
+            desired_base_branch: None,
         };
 
         // Non-retryable error at attempt 1 → immediate failure

@@ -112,6 +112,11 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Add desired_base_branch for Managed mode branch selection
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN desired_base_branch TEXT")
+            .execute(&self.pool)
+            .await;
+
         // Create mcp_disabled_servers table (idempotent via IF NOT EXISTS)
         let _ = sqlx::raw_sql(MIGRATION_CREATE_MCP_DISABLED_SERVERS)
             .execute(&self.pool)
@@ -242,6 +247,7 @@ impl Database {
             model,
             None,
             &ConvMode::Explore,
+            None,
         )
         .await
     }
@@ -258,6 +264,7 @@ impl Database {
         model: Option<&str>,
         project_id: Option<&str>,
         conv_mode: &ConvMode,
+        desired_base_branch: Option<&str>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -270,8 +277,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -284,6 +291,7 @@ impl Database {
             .bind(model)
             .bind(project_id)
             .bind(&conv_mode_json)
+            .bind(desired_base_branch)
             .execute(&self.pool)
             .await;
 
@@ -319,6 +327,7 @@ impl Database {
             model: model.map(String::from),
             project_id: project_id.map(String::from),
             conv_mode: conv_mode.clone(),
+            desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
         })
     }
@@ -895,6 +904,10 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .unwrap_or(None)
         .or_else(|| slug.as_deref().map(schema::title_from_slug));
 
+    let desired_base_branch: Option<String> = row
+        .try_get::<Option<String>, _>("desired_base_branch")
+        .unwrap_or(None);
+
     Ok(Conversation {
         id: row.try_get("id")?,
         slug,
@@ -912,6 +925,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
             .try_get::<Option<String>, _>("project_id")
             .unwrap_or(None),
         conv_mode,
+        desired_base_branch,
         message_count: row.try_get("message_count")?,
     })
 }

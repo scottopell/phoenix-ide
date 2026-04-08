@@ -9,10 +9,10 @@ use super::types::{
     ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, TaskApprovalResponse, TaskEntry, TaskFeedbackRequest, TasksResponse,
-    UpgradeModelRequest, ValidateCwdResponse,
+    GatewayStatusApi, GitBranchesQuery, GitBranchesResponse, ListDirectoryResponse,
+    ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskApprovalResponse, TaskEntry,
+    TaskFeedbackRequest, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
@@ -132,6 +132,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/upgrade-model",
             post(upgrade_conversation_model),
         )
+        // Git utilities
+        .route("/api/git/branches", get(list_git_branches))
         // Environment info
         .route("/api/env", get(get_env))
         // MCP management
@@ -474,6 +476,11 @@ async fn create_conversation(
         }
         _ => crate::db::ConvMode::Direct,
     };
+    let desired_base_branch = if matches!(req.mode.as_deref(), Some("managed")) {
+        req.base_branch.as_deref()
+    } else {
+        None
+    };
     let conversation = state
         .runtime
         .db()
@@ -486,6 +493,7 @@ async fn create_conversation(
             req.model.as_deref(), // selected model
             project_id.as_deref(),
             &conv_mode,
+            desired_base_branch,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -2225,6 +2233,30 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
         error: None,
         is_git,
     })
+}
+
+async fn list_git_branches(
+    Query(params): Query<GitBranchesQuery>,
+) -> Result<Json<GitBranchesResponse>, AppError> {
+    let cwd = PathBuf::from(&params.cwd);
+    if !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+
+    let output = run_git(&cwd, &["branch", "--list", "--format=%(refname:short)"])
+        .map_err(|e| AppError::Internal(format!("Failed to list branches: {e}")))?;
+    let branches: Vec<String> = output
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let current = run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map_err(|e| AppError::Internal(format!("Failed to get current branch: {e}")))?
+        .trim()
+        .to_string();
+
+    Ok(Json(GitBranchesResponse { branches, current }))
 }
 
 async fn list_directory(

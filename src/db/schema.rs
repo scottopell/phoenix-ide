@@ -245,6 +245,10 @@ pub struct Conversation {
     /// Conversation mode — determines tool availability. Default: Explore.
     #[serde(default)]
     pub conv_mode: ConvMode,
+    /// Desired base branch for Managed mode (set at creation, consumed at task approval).
+    /// `#[serde(default)]` handles old DB rows that predate this column.
+    #[serde(default)]
+    pub desired_base_branch: Option<String>,
     #[serde(default)]
     pub message_count: i64,
 }

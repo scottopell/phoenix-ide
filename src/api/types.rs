@@ -18,6 +18,9 @@ pub struct CreateConversationRequest {
     /// "managed" requires a git repository.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Desired base branch for Managed mode. If None, uses currently checked-out branch.
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 /// Request to upgrade a conversation's model
@@ -336,6 +339,19 @@ impl ConflictErrorResponse {
             can_auto_stash: false,
         }
     }
+}
+
+/// Query parameters for listing git branches
+#[derive(Debug, Deserialize)]
+pub struct GitBranchesQuery {
+    pub cwd: String,
+}
+
+/// Response for git branch listing
+#[derive(Debug, Serialize)]
+pub struct GitBranchesResponse {
+    pub branches: Vec<String>,
+    pub current: String,
 }
 
 /// Error response

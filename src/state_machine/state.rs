@@ -678,6 +678,8 @@ pub struct ConvContext {
     pub mode_context: Option<crate::system_prompt::ModeContext>,
     /// Maximum LLM turns for this conversation (0 = unlimited, for parent conversations)
     pub max_turns: u32,
+    /// Desired base branch for Managed mode (set at creation, consumed at task approval)
+    pub desired_base_branch: Option<String>,
 }
 
 /// Default context window for unknown models (conservative)
@@ -699,6 +701,7 @@ impl ConvContext {
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
             max_turns: 0,
+            desired_base_branch: None,
         }
     }
 
@@ -718,6 +721,7 @@ impl ConvContext {
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
             max_turns: 0,
+            desired_base_branch: None,
         }
     }
 }

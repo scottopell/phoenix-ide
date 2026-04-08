@@ -1573,6 +1573,7 @@ where
     ) -> Result<(), String> {
         let cwd = self.context.working_dir.clone();
         let conv_id = self.context.conversation_id.clone();
+        let desired_base_branch = self.context.desired_base_branch.clone();
         let storage = self.storage.clone();
 
         // Clone for state revert on failure (originals moved into spawn_blocking)
@@ -1582,7 +1583,14 @@ where
 
         // Run blocking git/fs operations on a blocking thread
         let result = tokio::task::spawn_blocking(move || {
-            execute_approve_task_blocking(&cwd, &conv_id, &title, &priority, &plan)
+            execute_approve_task_blocking(
+                &cwd,
+                &conv_id,
+                &title,
+                &priority,
+                &plan,
+                desired_base_branch.as_deref(),
+            )
         })
         .await
         .map_err(|e| format!("Task approval join error: {e}"))?;
@@ -1832,6 +1840,7 @@ fn execute_approve_task_blocking(
     title: &str,
     priority: &str,
     plan: &str,
+    desired_base_branch: Option<&str>,
 ) -> Result<TaskApprovalResult, String> {
     use std::io::Write;
 
@@ -1841,15 +1850,28 @@ fn execute_approve_task_blocking(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // 0. Detect the current branch before any mutations (used as merge target for Complete)
-    let base_branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let base_branch = base_branch.trim().to_string();
-    if base_branch.is_empty() || base_branch == "HEAD" {
-        return Err(
-            "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
-                .to_string(),
-        );
-    }
+    // 0. Determine the base branch: use desired if set, otherwise current HEAD.
+    let base_branch = if let Some(desired) = desired_base_branch {
+        run_git(cwd, &["rev-parse", "--verify", desired])
+            .map_err(|_| format!("Selected base branch '{desired}' no longer exists"))?;
+        desired.to_string()
+    } else {
+        let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let branch = branch.trim().to_string();
+        if branch.is_empty() || branch == "HEAD" {
+            return Err(
+                "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
+                    .to_string(),
+            );
+        }
+        branch
+    };
+
+    let current_head = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let on_base_branch = base_branch == current_head;
 
     let tasks_dir = cwd.join("tasks");
 
@@ -1902,9 +1924,129 @@ fn execute_approve_task_blocking(
         .map_err(|e| format!("Failed to write task file: {e}"))?;
     tracing::info!(file = %filepath.display(), "Task file written");
 
-    // 5. Ensure .gitignore contains .phoenix/ (worktree dir lives there)
-    let gitignore_path = cwd.join(".gitignore");
-    let gitignore_needs_update = if gitignore_path.exists() {
+    // 5. Create .phoenix/worktrees/ directory for the worktree.
+    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
+    std::fs::create_dir_all(&phoenix_dir)
+        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
+
+    let worktree_path = phoenix_dir.join(conv_id);
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    // 6. Branch collision check
+    let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
+    if branch_exists {
+        let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
+        if merge_base.is_ok() {
+            run_git(cwd, &["branch", "-d", &branch_name])?;
+            tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
+        } else {
+            return Err(format!(
+                "Branch '{branch_name}' already exists and is not fully merged. \
+                 Please resolve this manually before approving."
+            ));
+        }
+    }
+
+    if on_base_branch {
+        // 7a. On base branch: commit task file to cwd first, then create branch + worktree.
+        //     This ensures the branch (and worktree) include the task file.
+
+        // Ensure .gitignore contains .phoenix/
+        ensure_gitignore_has_phoenix(cwd)?;
+
+        let relative_path = format!("tasks/{filename}");
+        run_git(cwd, &["add", &relative_path])?;
+
+        let commit_msg = format!("task {task_id}: {title}");
+        if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
+            let _ = run_git(cwd, &["reset", "HEAD"]);
+            let _ = std::fs::remove_file(&filepath);
+            return Err(format!("Failed to commit task file: {e}"));
+        }
+        tracing::info!(commit_msg = %commit_msg, "Task file committed on base branch");
+
+        if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
+            let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
+            return Err(format!("Failed to create branch '{branch_name}': {e}"));
+        }
+
+        if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
+            let _ = run_git(cwd, &["branch", "-D", &branch_name]);
+            let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
+            return Err(format!("Failed to create worktree: {e}"));
+        }
+    } else {
+        // 7b. Off base branch: create worktree + branch from desired base in one step,
+        //     then write and commit the task file in the worktree.
+        if let Err(e) = run_git(
+            cwd,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                &worktree_path_str,
+                &base_branch,
+            ],
+        ) {
+            return Err(format!(
+                "Failed to create worktree from base '{base_branch}': {e}"
+            ));
+        }
+
+        // Remove the task file from cwd (it was written there for ID generation)
+        // and re-create it in the worktree's tasks/ directory.
+        let _ = std::fs::remove_file(&filepath);
+
+        let wt_tasks_dir = worktree_path.join("tasks");
+        std::fs::create_dir_all(&wt_tasks_dir)
+            .map_err(|e| format!("Failed to create tasks/ in worktree: {e}"))?;
+
+        let wt_filepath = wt_tasks_dir.join(&filename);
+        let mut wt_file = std::fs::File::create(&wt_filepath)
+            .map_err(|e| format!("Failed to create task file in worktree: {e}"))?;
+        wt_file
+            .write_all(task_content.as_bytes())
+            .map_err(|e| format!("Failed to write task file in worktree: {e}"))?;
+
+        // Ensure .gitignore contains .phoenix/ in the worktree
+        ensure_gitignore_has_phoenix(&worktree_path)?;
+
+        let relative_path = format!("tasks/{filename}");
+        run_git(&worktree_path, &["add", &relative_path])?;
+
+        let commit_msg = format!("task {task_id}: {title}");
+        if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
+            let _ = run_git(cwd, &["worktree", "remove", &worktree_path_str, "--force"]);
+            let _ = run_git(cwd, &["branch", "-D", &branch_name]);
+            return Err(format!("Failed to commit task file in worktree: {e}"));
+        }
+        tracing::info!(commit_msg = %commit_msg, "Task file committed in worktree");
+    }
+
+    tracing::info!(
+        branch = %branch_name,
+        worktree = %worktree_path_str,
+        on_base_branch,
+        "Created git worktree"
+    );
+
+    Ok(TaskApprovalResult {
+        task_id,
+        branch_name,
+        first_task,
+        worktree_path: worktree_path_str,
+        base_branch,
+    })
+}
+
+/// Ensure .gitignore in the given directory contains `.phoenix/`.
+/// Creates .gitignore if it doesn't exist. Stages the change if modified.
+fn ensure_gitignore_has_phoenix(dir: &std::path::Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let gitignore_path = dir.join(".gitignore");
+    let needs_update = if gitignore_path.exists() {
         let content = std::fs::read_to_string(&gitignore_path)
             .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
         !content.lines().any(|line| line.trim() == ".phoenix/")
@@ -1912,9 +2054,7 @@ fn execute_approve_task_blocking(
         true
     };
 
-    if gitignore_needs_update {
-        use std::io::Write as _;
-        // Ensure we don't corrupt the last line if .gitignore lacks a trailing newline
+    if needs_update {
         let needs_leading_newline = gitignore_path.exists()
             && std::fs::read(&gitignore_path)
                 .ok()
@@ -1928,74 +2068,11 @@ fn execute_approve_task_blocking(
             writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
         writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        run_git(cwd, &["add", ".gitignore"])?;
-        tracing::info!("Added .phoenix/ to .gitignore");
+        run_git(dir, &["add", ".gitignore"])?;
+        tracing::info!(dir = %dir.display(), "Added .phoenix/ to .gitignore");
     }
 
-    // 6. Stage and commit the task file BEFORE creating the branch.
-    //    This ensures the branch (and worktree) include the task file,
-    //    so the agent can update it during Work (REQ-PROJ-006).
-    //    If worktree creation fails later, we revert the commit.
-    let relative_path = format!("tasks/{filename}");
-    run_git(cwd, &["add", &relative_path])?;
-
-    let commit_msg = format!("task {task_id}: {title}");
-    if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
-        let _ = run_git(cwd, &["reset", "HEAD"]);
-        let _ = std::fs::remove_file(&filepath);
-        return Err(format!("Failed to commit task file: {e}"));
-    }
-    tracing::info!(commit_msg = %commit_msg, "Task file committed");
-
-    // 7. Branch collision check (now checking against the commit that includes the task file)
-    let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
-    if branch_exists {
-        let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
-        if merge_base.is_ok() {
-            run_git(cwd, &["branch", "-d", &branch_name])?;
-            tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
-        } else {
-            // Revert the commit before returning error
-            let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
-            return Err(format!(
-                "Branch '{branch_name}' already exists and is not fully merged. \
-                 Please resolve this manually before approving."
-            ));
-        }
-    }
-
-    // 8. Create branch + worktree from the commit that includes the task file.
-    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
-    std::fs::create_dir_all(&phoenix_dir)
-        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
-
-    let worktree_path = phoenix_dir.join(conv_id);
-    let worktree_path_str = worktree_path.to_string_lossy().to_string();
-
-    if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
-        let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
-        return Err(format!("Failed to create branch '{branch_name}': {e}"));
-    }
-
-    if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
-        let _ = run_git(cwd, &["branch", "-D", &branch_name]);
-        let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
-        return Err(format!("Failed to create worktree: {e}"));
-    }
-
-    tracing::info!(
-        branch = %branch_name,
-        worktree = %worktree_path_str,
-        "Created git worktree"
-    );
-
-    Ok(TaskApprovalResult {
-        task_id,
-        branch_name,
-        first_task,
-        worktree_path: worktree_path_str,
-        base_branch,
-    })
+    Ok(())
 }
 
 /// Build the continuation prompt (REQ-BED-020)
