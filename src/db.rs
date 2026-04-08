@@ -337,7 +337,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode,
+                    c.project_id, c.conv_mode, c.desired_base_branch,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -356,7 +356,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode,
+                    c.project_id, c.conv_mode, c.desired_base_branch,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -375,7 +375,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode,
+                    c.project_id, c.conv_mode, c.desired_base_branch,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -393,7 +393,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode,
+                    c.project_id, c.conv_mode, c.desired_base_branch,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -497,7 +497,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode,
+                    c.project_id, c.conv_mode, c.desired_base_branch,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0

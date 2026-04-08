@@ -1923,6 +1923,9 @@ async fn abandon_task(
     };
 
     // 2c. Delete worktree/branch + best-effort task file update (blocking)
+    // If desired_base_branch was set, the task file was committed in the worktree
+    // (not the main checkout), so skip the checkout + rename on main.
+    let was_off_head = conv.desired_base_branch.is_some();
     let repo_root_clone = repo_root.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         // Phase 1: worktree cleanup (BEFORE mutex -- these don't touch the main checkout)
@@ -1950,6 +1953,16 @@ async fn abandon_task(
 
         // Phase 2: best-effort task file update (UNDER mutex)
         // This is bookkeeping -- nothing here should block the abandon.
+        // Skip entirely for off-HEAD conversations: the task file was committed
+        // in the worktree (now deleted), not on the main checkout.
+        if was_off_head {
+            tracing::info!(
+                task_id = %task_id,
+                "Off-HEAD conversation -- skipping task file rename (file was in worktree)"
+            );
+            return Ok(());
+        }
+
         let _guard = TASK_APPROVAL_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
