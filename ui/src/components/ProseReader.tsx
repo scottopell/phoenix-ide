@@ -420,11 +420,37 @@ export function ProseReader({
           sel?.addRange(range);
         }
       }
+
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [annotatingLine, showCloseConfirm, handleAddNote, handleClose]);
+
+  // Intercept copy events inside the prose reader to fix double-newlines.
+  // Each line is a block <div>, so the browser's selection serialization
+  // adds \n between blocks on top of the logical line content. We collapse
+  // runs of \n\n into \n to match the original file content.
+  useEffect(() => {
+    const container = contentRef.current;
+    if (!container) return;
+
+    const handleCopy = (e: ClipboardEvent) => {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      if (!container.contains(range.startContainer)) return;
+
+      const rawText = sel.toString();
+      // Collapse double newlines from block-element boundaries into single newlines
+      const cleaned = rawText.replace(/\n\n/g, '\n');
+      e.preventDefault();
+      e.clipboardData?.setData('text/plain', cleaned);
+    };
+
+    container.addEventListener('copy', handleCopy);
+    return () => container.removeEventListener('copy', handleCopy);
+  }, []);
 
   // Render lines for text files
   const renderLines = useMemo(() => {

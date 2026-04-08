@@ -2,10 +2,16 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Message, ContentBlock } from '../api';
 import './MessageContextMenu.css';
 
+interface ToolContext {
+  command?: string;
+  output?: string;
+}
+
 interface MenuState {
   x: number;
   y: number;
   message: Message;
+  toolContext?: ToolContext;
 }
 
 interface MessageContextMenuProps {
@@ -46,6 +52,34 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
     (e: MouseEvent) => {
       // Walk up from target to find .message element
       let el = e.target as HTMLElement | null;
+
+      // Detect tool context while walking up
+      let toolContext: ToolContext | undefined;
+      let walkEl = e.target as HTMLElement | null;
+      while (walkEl && !walkEl.classList.contains('message')) {
+        // Check for tool block input (command)
+        if (walkEl.classList.contains('tool-block-input')) {
+          toolContext = { ...toolContext, command: walkEl.textContent?.trim() ?? '' };
+        }
+        // Check for tool block output
+        if (walkEl.classList.contains('tool-block-output-content') || walkEl.classList.contains('tool-block-output')) {
+          const outputContent = walkEl.querySelector('.tool-block-output-content');
+          toolContext = { ...toolContext, output: (outputContent ?? walkEl).textContent?.trim() ?? '' };
+        }
+        // Check for the tool block itself (grab both if not yet found)
+        if (walkEl.classList.contains('tool-block') && !toolContext) {
+          const input = walkEl.querySelector('.tool-block-input');
+          const output = walkEl.querySelector('.tool-block-output-content');
+          if (input || output) {
+            toolContext = {
+              command: input?.textContent?.trim(),
+              output: output?.textContent?.trim(),
+            };
+          }
+        }
+        walkEl = walkEl.parentElement;
+      }
+
       while (el && !el.classList.contains('message')) {
         el = el.parentElement;
       }
@@ -58,7 +92,7 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       if (!msg) return;
 
       e.preventDefault();
-      setMenu({ x: e.clientX, y: e.clientY, message: msg });
+      setMenu({ x: e.clientX, y: e.clientY, message: msg, toolContext });
     },
     [messages]
   );
@@ -148,6 +182,20 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
     setMenu(null);
   };
 
+  const copyCommand = () => {
+    if (menu.toolContext?.command) {
+      navigator.clipboard.writeText(menu.toolContext.command);
+    }
+    setMenu(null);
+  };
+
+  const copyOutput = () => {
+    if (menu.toolContext?.output) {
+      navigator.clipboard.writeText(menu.toolContext.output);
+    }
+    setMenu(null);
+  };
+
   return (
     <div
       ref={menuRef}
@@ -155,6 +203,17 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       style={{ left: menu.x, top: menu.y }}
       onMouseDown={(e) => e.stopPropagation()}
     >
+      {menu.toolContext?.command && (
+        <button className="msg-context-item" onClick={copyCommand}>
+          Copy command
+        </button>
+      )}
+      {menu.toolContext?.output && (
+        <button className="msg-context-item" onClick={copyOutput}>
+          Copy output
+        </button>
+      )}
+      {menu.toolContext && <div className="msg-context-divider" />}
       <button className="msg-context-item" onClick={copyMarkdown}>
         Copy as Markdown
       </button>
