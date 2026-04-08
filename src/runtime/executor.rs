@@ -67,6 +67,8 @@ where
     active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
     llm_turn_count: u32,
+    /// Whether this sub-agent has been given its grace turn (one extra LLM turn to call `submit_result`)
+    grace_turn_granted: bool,
     /// Typed outcome channel — background tasks send `EffectOutcome` here.
     /// Each task gets a typed `oneshot::Sender<T>` that constrains what it can send,
     /// then the forwarder wraps the result in `EffectOutcome` for this channel.
@@ -119,6 +121,7 @@ where
             sub_agent_deadline: None,
             active_work_subagents: 0,
             llm_turn_count: 0,
+            grace_turn_granted: false,
             outcome_tx,
             outcome_rx,
         }
@@ -477,6 +480,85 @@ where
         }
     }
 
+    /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`):
+    /// extract last assistant text from conversation history and notify parent.
+    async fn handle_grace_turn_hard_stop(&mut self) {
+        use crate::state_machine::state::SubAgentOutcome;
+
+        // Extract last assistant text from conversation history
+        let partial_result = match self
+            .storage
+            .get_messages(&self.context.conversation_id)
+            .await
+        {
+            Ok(messages) => {
+                // Walk backward to find the last assistant message with text content blocks
+                let mut text = None;
+                for msg in messages.iter().rev() {
+                    if let MessageContent::Agent(blocks) = &msg.content {
+                        let text_parts: Vec<&str> = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        if !text_parts.is_empty() {
+                            text = Some(text_parts.join("\n\n"));
+                            break;
+                        }
+                    }
+                }
+                text
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read messages for partial result extraction");
+                None
+            }
+        };
+
+        // Send result to parent
+        if let Some(ref parent_tx) = self.parent_event_tx {
+            let outcome = if let Some(ref text) = partial_result {
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    text_len = text.len(),
+                    "Extracted partial result from grace turn hard stop"
+                );
+                SubAgentOutcome::Success {
+                    result: text.clone(),
+                }
+            } else {
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    "No assistant text found after grace turn"
+                );
+                SubAgentOutcome::Failure {
+                    error: "Sub-agent exceeded turn limit with no output".to_string(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                }
+            };
+
+            let _ = parent_tx
+                .send(Event::SubAgentResult {
+                    agent_id: self.context.conversation_id.clone(),
+                    outcome,
+                })
+                .await;
+        }
+
+        // Send UserCancel to self to transition to terminal state
+        let _ = self
+            .event_tx
+            .send(Event::UserCancel {
+                reason: Some(format!(
+                    "Sub-agent turn limit hard stop ({}/{})",
+                    self.llm_turn_count, self.context.max_turns
+                )),
+            })
+            .await;
+    }
+
     /// Handle the `spawn_agents` tool specially:
     /// 1. Parse tasks and generate agent IDs
     /// 2. Send spawn requests to `RuntimeManager` for each task
@@ -723,27 +805,58 @@ where
             }
 
             Effect::RequestLlm => {
-                // Max turns enforcement (REQ-PROJ-008): sub-agents have a finite turn
-                // budget. If exceeded, send UserCancel to gracefully stop the agent.
+                // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
+                // finite turn budget. Grace turn mechanism gives the model one extra LLM
+                // turn to call submit_result before hard-stopping.
                 if self.context.max_turns > 0 {
                     self.llm_turn_count += 1;
                     if self.llm_turn_count > self.context.max_turns {
+                        if self.grace_turn_granted {
+                            // Second hit: hard stop with partial result extraction
+                            // (REQ-BED-026 SubAgentTurnLimitHardStop)
+                            tracing::info!(
+                                conv_id = %self.context.conversation_id,
+                                turns = self.llm_turn_count,
+                                max = self.context.max_turns,
+                                "Sub-agent grace turn exhausted, extracting partial results"
+                            );
+
+                            self.handle_grace_turn_hard_stop().await;
+                            return Ok(None);
+                        }
+
+                        // First hit: grant grace turn (REQ-BED-026 SubAgentTurnLimitGraceTurn)
+                        self.grace_turn_granted = true;
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
                             turns = self.llm_turn_count,
                             max = self.context.max_turns,
-                            "Sub-agent exceeded max turn limit, sending cancel"
+                            "Sub-agent reached turn limit, granting grace turn"
                         );
-                        let _ = self
-                            .event_tx
-                            .send(Event::UserCancel {
-                                reason: Some(format!(
-                                    "Sub-agent exceeded turn limit ({}/{})",
-                                    self.llm_turn_count, self.context.max_turns
-                                )),
-                            })
-                            .await;
-                        return Ok(None);
+
+                        // Inject system message prompting submit_result
+                        let msg_id = uuid::Uuid::new_v4().to_string();
+                        let content = MessageContent::system(
+                            "You have reached your turn limit. Please call submit_result now \
+                             with whatever findings you have so far. Do not call any other tools.",
+                        );
+                        if let Err(e) = self
+                            .storage
+                            .add_message(
+                                &msg_id,
+                                &self.context.conversation_id,
+                                &content,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "Failed to persist grace turn system message");
+                        }
+
+                        // Allow the normal LLM request to proceed (don't return, don't
+                        // send UserCancel). The system message will appear in the next
+                        // build_llm_messages call via the User-role inclusion of System messages.
                     }
                 }
 
@@ -1405,10 +1518,17 @@ where
                     });
                 }
 
-                // Ignore system, error, and continuation messages
-                MessageContent::System(_)
-                | MessageContent::Error(_)
-                | MessageContent::Continuation(_) => {}
+                // System messages are delivered as user-role messages so they
+                // appear in the LLM context (e.g., grace turn prompt, REQ-BED-026).
+                MessageContent::System(sys) => {
+                    messages.push(LlmMessage {
+                        role: MessageRole::User,
+                        content: vec![ContentBlock::text(&sys.text)],
+                    });
+                }
+
+                // Ignore error and continuation messages
+                MessageContent::Error(_) | MessageContent::Continuation(_) => {}
             }
         }
 
