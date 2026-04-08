@@ -1,7 +1,7 @@
 ---
 created: 2026-04-07
 priority: p3
-status: ready
+status: done
 artifact: ui/src/components/MessageList.tsx
 ---
 
