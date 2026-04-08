@@ -839,6 +839,17 @@ rule CancelDuringTaskApproval {
     ensures: AgentDone(conversation)
 }
 
+-- Stale TaskApprovalDecided events are absorbed as no-ops.
+-- This handles double-click approve, SSE reconnect resend, or any
+-- delivery after the state has already moved past awaiting_task_approval.
+rule StaleTaskApprovalAbsorbed {
+    when: TaskApprovalDecided(conversation, decision)
+
+    requires: conversation.status != awaiting_task_approval
+
+    ensures: conversation.status = conversation.status  -- no change
+}
+
 -- ===========================================================
 -- 8. USER QUESTION RESPONSE
 -- ===========================================================
