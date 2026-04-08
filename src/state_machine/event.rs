@@ -100,6 +100,13 @@ pub enum Event {
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
 
+    /// Grace turn exhausted -- sub-agent used its extra turn without calling `submit_result`.
+    /// The executor extracted the last assistant text (if any) before sending this event.
+    GraceTurnExhausted {
+        /// The partial result extracted from the last assistant text, or None if no text found.
+        result: Option<String>,
+    },
+
     // Task resolution events (REQ-BED-029)
     /// Task completed or abandoned — transitions conversation to Terminal.
     /// Sent by the API handler after git operations succeed.

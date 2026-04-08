@@ -223,6 +223,9 @@ entity Conversation {
     -- Context exhaustion (REQ-BED-021)
     continuation_summary: String when status = context_exhausted
 
+    -- Sub-agent turn limit (REQ-BED-026)
+    grace_turn_granted: Boolean = false when is_sub_agent
+
     -- Sub-agent terminal data
     completion_result: String when status = completed
     failure_error: String when status = failed
@@ -687,8 +690,91 @@ rule SubAgentForciblyTerminated {
     requires: not conversation.is_terminal
 
     ensures: conversation.status = failed
-    ensures: conversation.failure_error = "Cancelled"
+    ensures: conversation.failure_error = UserCancels.reason or "Cancelled"
     ensures: SubAgentCompleted(conversation)
+}
+
+-- REQ-BED-026: Sub-agent turn limit grace turn
+-- When a sub-agent reaches its max_turns, it gets one final LLM turn
+-- to call submit_result with partial findings, rather than being killed.
+-- This avoids wasting all tokens spent on the sub-agent's prior turns.
+--
+-- The grace turn is NOT a state transition -- the conversation stays in
+-- llm_requesting. It is an executor-level concern: the executor injects
+-- a system message and allows one more LLM request before hard-stopping.
+
+rule SubAgentTurnLimitGraceTurn {
+    when: TurnLimitReached(conversation)
+
+    requires: conversation.is_sub_agent
+    requires: not conversation.grace_turn_granted
+
+    ensures: conversation.grace_turn_granted = true
+    ensures: SystemMessageInjected(conversation,
+        "You have reached your turn limit. Please call submit_result "
+        "now with whatever findings you have so far. Do not call any "
+        "other tools.")
+    ensures: LlmRequestDispatched(conversation)
+    -- Status stays at llm_requesting (no transition).
+    -- The next TurnLimitReached triggers SubAgentTurnLimitHardStop.
+
+    @guidance
+        -- Implementation: in the executor's turn-count check, when
+        -- llm_turn_count == max_turns and grace_turn_granted is false:
+        --   1. Set grace_turn_granted = true
+        --   2. Persist a system message via self.storage.add_message()
+        --   3. Allow the normal LLM request flow to proceed
+        --   4. Do NOT send UserCancel
+        -- The system message appears in the LLM's context on the next
+        -- build_llm_messages call, prompting it to call submit_result.
+}
+
+-- SubAgentTurnLimitHardStop: the grace turn was consumed but the model
+-- did not call submit_result. The executor extracts the last assistant
+-- text and sends Event::GraceTurnExhausted to the state machine.
+-- This is a proper state machine event (not direct mutation) so the
+-- transition table remains the authoritative specification of all
+-- sub-agent terminal paths.
+
+rule SubAgentTurnLimitHardStop {
+    when: GraceTurnExhausted(conversation, partial_result)
+
+    requires: conversation.is_sub_agent
+    requires: conversation.grace_turn_granted = true
+
+    ensures: conversation.status = completed
+        if partial_result != null
+    ensures: conversation.completion_result = partial_result
+        if partial_result != null
+    ensures: SubAgentCompleted(conversation) with outcome = success
+        if partial_result != null
+
+    ensures: conversation.status = failed
+        if partial_result = null
+    ensures: conversation.failure_error = "Turn limit exceeded, no output"
+        if partial_result = null
+    ensures: SubAgentCompleted(conversation) with outcome = failure
+        if partial_result = null
+
+    @guidance
+        -- The executor is responsible for text extraction and event creation:
+        --   1. Detect grace_turn_granted = true and turn limit exceeded
+        --   2. Read conversation messages via self.storage.get_messages()
+        --   3. Walk backward for last assistant message with text blocks
+        --   4. Send Event::GraceTurnExhausted { result: Option<String> }
+        --      to the state machine via self.event_tx
+        --   5. The state machine handles the event, transitions to
+        --      Completed/Failed, and emits NotifyParent as an effect
+        --   6. The executor handles NotifyParent normally (no direct send)
+        --
+        -- This keeps the executor free of notification logic. The state
+        -- machine owns the (event, state) -> (terminal, NotifyParent)
+        -- contract. The executor only owns text extraction (I/O).
+        --
+        -- The happy path: the grace turn prompted the model to call
+        -- submit_result, which already completed via the normal
+        -- SubAgentSubmitsResult rule. GraceTurnExhausted only fires
+        -- if the model called another tool instead of submit_result.
 }
 
 -- ===========================================================
@@ -1038,6 +1124,25 @@ rule ServerRestart {
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
+
+-- Sub-agent notifies parent exactly once
+invariant SubAgentNotifiesParentOnce {
+    for c in Conversations where c.is_sub_agent:
+        count(SubAgentCompleted(c)) <= 1
+    -- Every terminal path (submit_result, forcible termination,
+    -- GraceTurnExhausted, context exhaustion) emits exactly one
+    -- SubAgentCompleted. No path may emit two.
+}
+
+-- Sub-agent grace turn: turn limit produces success, not failure
+invariant GraceTurnOutcome {
+    for c in Conversations:
+        c.is_sub_agent and c.grace_turn_granted and c.is_terminal
+            implies (c.status = completed or c.status = failed)
+    -- Grace turn always resolves to a terminal state.
+    -- completed (with partial text) is preferred over failed.
+    -- failed only when no assistant text exists at all.
+}
 
 -- REQ-BED-001: Pure state transitions
 -- Determinism (same inputs → same outputs) is a property of the

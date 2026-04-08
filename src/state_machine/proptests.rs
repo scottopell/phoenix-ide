@@ -338,6 +338,11 @@ fn arb_task_approval_event() -> impl Strategy<Value = Event> {
     arb_task_approval_outcome().prop_map(|outcome| Event::TaskApprovalResponse { outcome })
 }
 
+fn arb_grace_turn_exhausted_event() -> impl Strategy<Value = Event> {
+    proptest::option::of("[a-zA-Z0-9 ]{0,100}")
+        .prop_map(|result| Event::GraceTurnExhausted { result })
+}
+
 fn arb_event() -> impl Strategy<Value = Event> {
     prop_oneof![
         arb_user_message_event(),
@@ -348,6 +353,7 @@ fn arb_event() -> impl Strategy<Value = Event> {
         Just(Event::UserCancel { reason: None }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
+        arb_grace_turn_exhausted_event(),
     ]
 }
 
