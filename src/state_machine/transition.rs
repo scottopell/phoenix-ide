@@ -1376,9 +1376,9 @@ pub fn transition(
 
         // TaskApprovalResponse arriving after the state has already moved on
         // (e.g., double-click approve, SSE reconnect resend). No-op.
-        (_state, Event::TaskApprovalResponse { .. }) => {
+        (state, Event::TaskApprovalResponse { .. }) => {
             tracing::debug!("Absorbing stale TaskApprovalResponse");
-            Ok(TransitionResult::new(_state.clone()))
+            Ok(TransitionResult::new(state.clone()))
         }
 
         // ============================================================
