@@ -3,6 +3,7 @@
 //! Implements exact matching with fuzzy fallbacks for common whitespace issues.
 
 use super::types::{EditSpec, PatchError};
+use unicode_security::skeleton;
 
 /// Find a unique match for `old_text` in `content`
 ///
@@ -23,6 +24,11 @@ pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, Patc
 
     // 3. Try trimmed line match
     if let Some(spec) = find_trimmed_match(content, old_text) {
+        return Ok(spec);
+    }
+
+    // 4. Try NFKC-normalised match (handles lookalike characters)
+    if let Some(spec) = find_normalised_match(content, old_text) {
         return Ok(spec);
     }
 
@@ -98,6 +104,58 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<EditSpec> {
     }
 
     None
+}
+
+/// Find match using Unicode TR39 confusable skeleton mapping.
+///
+/// Maps both content and old_text to their "skeleton" forms (visually
+/// confusable characters collapse to a common representation), then
+/// finds the match in skeleton space and maps the offset back to the
+/// original content's byte positions.
+///
+/// Handles lookalike characters: em dash vs hyphen, curly vs straight
+/// quotes, fullwidth vs ASCII, etc.
+fn find_normalised_match(content: &str, old_text: &str) -> Option<EditSpec> {
+    let skel_old: String = skeleton(old_text).collect();
+
+    // If skeleton didn't change old_text, this strategy can't help
+    if skel_old == old_text {
+        return None;
+    }
+
+    // Build skeleton content with a byte-offset map back to original.
+    let mut skel_content = String::new();
+    let mut skel_to_orig: Vec<usize> = Vec::new();
+
+    for (orig_byte_offset, ch) in content.char_indices() {
+        let ch_str = String::from(ch);
+        for skel_ch in skeleton(&ch_str) {
+            let start = skel_content.len();
+            skel_content.push(skel_ch);
+            let end = skel_content.len();
+            for _ in start..end {
+                skel_to_orig.push(orig_byte_offset);
+            }
+        }
+    }
+    // Sentinel: map one past the end to content.len()
+    skel_to_orig.push(content.len());
+
+    // Find unique match in skeleton content
+    let spec = find_exact_unique(&skel_content, &skel_old)?;
+
+    // Map skeleton byte range back to original byte range
+    let orig_start = skel_to_orig[spec.offset];
+    let orig_end = if spec.offset + spec.length < skel_to_orig.len() {
+        skel_to_orig[spec.offset + spec.length]
+    } else {
+        content.len()
+    };
+
+    Some(EditSpec {
+        offset: orig_start,
+        length: orig_end - orig_start,
+    })
 }
 
 /// Get leading whitespace from a string
@@ -210,5 +268,55 @@ mod tests {
         let text = "  line1\n  line2";
         let result = reindent_text(text, "  ", "    ");
         assert_eq!(result, "    line1\n    line2");
+    }
+
+    #[test]
+    fn test_normalised_match_em_dash() {
+        // File has em dash, old_text has em dash -- byte-identical, should match exact.
+        // But if LLM sends a different dash, normalised match catches it.
+        let content = "before \u{2014} after"; // em dash
+        let old_text = "before \u{2014} after";
+        let spec = find_unique_match(content, old_text).unwrap();
+        assert_eq!(spec.offset, 0);
+        assert_eq!(spec.length, content.len());
+    }
+
+    #[test]
+    fn test_normalised_match_curly_quotes() {
+        // File has straight quotes, old_text has curly quotes
+        let content = r#"say "hello" please"#;
+        let old_text = "say \u{201C}hello\u{201D} please"; // curly double quotes
+        let spec = find_unique_match(content, old_text).unwrap();
+        assert_eq!(spec.offset, 0);
+        assert_eq!(spec.length, content.len());
+    }
+
+    #[test]
+    fn test_normalised_match_ellipsis() {
+        // File has three dots, old_text has ellipsis character
+        let content = "wait... done";
+        let old_text = "wait\u{2026} done"; // ellipsis character
+        let spec = find_unique_match(content, old_text).unwrap();
+        assert_eq!(spec.offset, 0);
+        assert_eq!(spec.length, content.len());
+    }
+
+    #[test]
+    fn test_normalised_match_offset_correct() {
+        // Ensure the returned offset points to the right bytes in original content
+        let content = "prefix \u{201C}target\u{201D} suffix";
+        let old_text = "\"target\""; // straight quotes in old_text
+        let spec = find_unique_match(content, old_text).unwrap();
+        #[allow(clippy::string_slice)]
+        let matched = &content[spec.offset..spec.offset + spec.length];
+        assert_eq!(matched, "\u{201C}target\u{201D}");
+    }
+
+    #[test]
+    fn test_normalised_no_help_when_text_absent() {
+        // Normalisation can't help if the text simply isn't there
+        let content = "hello world";
+        let err = find_unique_match(content, "goodbye").unwrap_err();
+        assert_eq!(err, PatchError::OldTextNotFound);
     }
 }

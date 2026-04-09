@@ -70,6 +70,7 @@ nucleo-matcher = "0.3.1"
 ratatui = "0.29"
 crossterm = "0.28"
 ureq = { version = "2", features = ["json"] }
+unicode-security = "0.1.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -104,18 +105,6 @@ debug = true  # Include debug symbols for production debugging
 [profile.dev.package.chromiumoxide]
 opt-level = 3
 
-[profile.dev.package.chromiumoxide_cdp]
-opt-level = 3
-
-[profile.dev.package.chromiumoxide_types]
-opt-level = 3
-
-[profile.dev.package.chromiumoxide_fetcher]
-opt-level = 3
-
-[profile.dev.package.chromiumoxide_pdl]
-opt-level = 3
-
 # Heavy async/web dependencies
 [profile.dev.package.tokio]
 opt-level = 3
@@ -123,39 +112,6 @@ opt-level = 3
 [profile.dev.package.reqwest]
 opt-level = 3
 
-[profile.dev.package.hyper]
-opt-level = 3
-
-
-# Compression/encoding (CPU intensive)
-[profile.dev.package.zstd]
-opt-level = 3
-
-[profile.dev.package.zstd-sys]
-opt-level = 3
-
-[profile.dev.package.brotli]
-opt-level = 3
-
-[profile.dev.package.flate2]
-opt-level = 3
-
 # Database (rarely debugged)
 [profile.dev.package.sqlx]
-opt-level = 3
-
-[profile.dev.package.sqlx-core]
-opt-level = 3
-
-[profile.dev.package.sqlx-sqlite]
-opt-level = 3
-
-# TLS/crypto (never debug these)
-[profile.dev.package.rustls]
-opt-level = 3
-
-[profile.dev.package.ring]
-opt-level = 3
-
-[profile.dev.package.rustls-webpki]
 opt-level = 3

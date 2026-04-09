@@ -1,7 +1,7 @@
 ---
 created: 2026-03-29
 priority: p2
-status: ready
+status: done
 artifact: src/tools/patch.rs
 ---
 
