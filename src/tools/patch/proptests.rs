@@ -44,6 +44,20 @@ fn arb_nonempty_indent() -> impl Strategy<Value = String> {
     ]
 }
 
+/// Count overlapping occurrences of `needle` in `haystack`.
+///
+/// `str::matches()` skips overlapping matches, which can hide cases where
+/// a substring appears at multiple overlapping positions.
+fn count_overlapping(haystack: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + 1;
+    }
+    count
+}
+
 /// Truncate a string at a valid UTF-8 char boundary
 fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -169,8 +183,8 @@ proptest! {
         // Ensure parts are distinct and don't create overlapping substrings
         prop_assume!(prefix != middle && middle != suffix && prefix != suffix);
         let original = format!("{}{}{}", prefix, middle, suffix);
-        // middle must appear exactly once in the combined string
-        prop_assume!(original.matches(&middle).count() == 1);
+        // middle must appear exactly once (counting overlapping occurrences)
+        prop_assume!(count_overlapping(&original, &middle) == 1);
         let mut planner = PatchPlanner::new();
         let mut fs = VirtualFs::with_files([(path.clone(), original.clone())]);
 
