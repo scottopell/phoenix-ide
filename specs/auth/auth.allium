@@ -1,0 +1,191 @@
+-- Auth & Share Specification
+--
+-- Single-user password authentication and read-only share mode.
+-- Imports bedrock for the Conversation entity and UserConversation surface.
+
+use "./specs/bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- When set, all endpoints require authentication.
+    -- When empty/unset, auth is disabled (open access).
+    password: String?
+    auth_enabled: password != null
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A share token grants read-only access to a single conversation.
+-- Created on demand when the owner navigates to /share/c/{slug}.
+entity ShareToken {
+    conversation: bedrock/Conversation
+    token: String               -- random, unguessable
+    created_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The authenticated owner. Identified by a valid password in the request.
+-- When auth is disabled, all users are implicitly Owner.
+actor Owner {
+    identified_by: Request where config.auth_enabled implies password_matches(request)
+}
+
+-- An unauthenticated viewer holding a valid share token.
+actor Viewer {
+    identified_by: ShareToken
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The owner's full-access surface. Wraps bedrock/UserConversation
+-- with an auth precondition. When auth is disabled, this is
+-- equivalent to the base UserConversation (no additional constraints).
+surface OwnerConversation {
+    facing owner: Owner
+
+    context conversation: bedrock/Conversation where not is_sub_agent
+
+    -- Exposes everything the base UserConversation exposes
+    exposes:
+        conversation.status
+        conversation.mode
+        conversation.context_usage_ratio
+        conversation.context_warning
+        conversation.proposal when conversation.status = awaiting_task_approval
+        conversation.pending_questions when conversation.status = awaiting_user_response
+        conversation.error_message when conversation.status = error
+        conversation.continuation_summary when conversation.status = context_exhausted
+        conversation.share_token?
+
+    -- Provides everything the base UserConversation provides, plus share management
+    provides:
+        UserSendsMessage(conversation, text, images?)
+            when conversation.status in { idle, error }
+        UserCancels(conversation)
+            when conversation.is_busy
+                 or conversation.status in {
+                    awaiting_task_approval,
+                    awaiting_user_response,
+                    awaiting_continuation
+                 }
+        TaskApprovalDecided(conversation, decision)
+            when conversation.status = awaiting_task_approval
+        UserAnswersQuestion(conversation, answers, annotations?)
+            when conversation.status = awaiting_user_response
+        UserTriggersContinuation(conversation)
+            when conversation.status = idle and conversation.context_warning
+        CreateShareToken(conversation)
+        RevokeShareToken(conversation)
+            when conversation.share_token != null
+}
+
+-- Read-only surface for viewers with a valid share token.
+-- Full conversation history + live SSE stream, no mutations.
+surface SharedConversation {
+    facing viewer: Viewer
+
+    context token: ShareToken
+    context conversation: token.conversation
+
+    exposes:
+        conversation.status
+        conversation.mode
+        conversation.messages
+        conversation.context_usage_ratio
+
+    -- No provides block: viewers cannot trigger any actions.
+
+    @guarantee LiveUpdates
+        -- Viewer receives real-time SSE events for new messages,
+        -- state changes, and breadcrumb updates. Same stream as
+        -- the owner, filtered to exclude sensitive metadata.
+
+    @guarantee FullHistory
+        -- Viewer sees all messages from conversation creation,
+        -- not just messages arriving after they connect.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Owner navigates to /share/c/{slug} to create a share token.
+-- If a token already exists for the conversation, redirect to it.
+-- If not, create one and redirect.
+rule CreateShareToken {
+    when: CreateShareToken(conversation)
+
+    requires: config.auth_enabled
+    requires: conversation.share_token = null
+
+    ensures: ShareToken.created(
+        conversation: conversation,
+        token: random_token(),
+        created_at: now
+    )
+
+    @guidance
+        -- The /share/c/{slug} route is the creation trigger.
+        -- GET /share/c/{slug} (authenticated):
+        --   1. Look up conversation by slug
+        --   2. If share_token exists, redirect to /s/{token}
+        --   3. If not, create token, persist, redirect to /s/{token}
+        -- The redirect makes /s/{token} the canonical share URL.
+}
+
+-- Owner revokes a share token, invalidating all viewer access.
+rule RevokeShareToken {
+    when: RevokeShareToken(conversation)
+
+    requires: conversation.share_token != null
+
+    ensures: not exists conversation.share_token
+
+    @guidance
+        -- DELETE /api/conversations/{id}/share-token
+        -- After revocation, /s/{old-token} returns 404.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Share tokens are unique across all conversations
+invariant UniqueShareTokens {
+    for a in ShareTokens:
+        for b in ShareTokens:
+            a != b implies a.token != b.token
+}
+
+-- When auth is disabled, no share tokens should exist
+-- (sharing is meaningless when everything is already public)
+invariant NoTokensWithoutAuth {
+    not config.auth_enabled implies ShareTokens.count = 0
+}
+
+-- Auth check: password comparison must be constant-time
+-- to prevent timing attacks.
+-- (This is an implementation constraint, not a state invariant.
+-- Noted here for the implementer.)
+@invariant ConstantTimePasswordCheck
+    -- The server compares the request password against
+    -- config.password using constant-time comparison.
+    -- No early-exit on first differing byte.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- RESOLVED: Share tokens are persisted to DB (share_tokens table).
+-- They represent a user decision and should survive restarts.
+-- Migration: CREATE TABLE share_tokens (conversation_id TEXT, token TEXT, created_at TEXT).
