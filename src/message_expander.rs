@@ -137,6 +137,32 @@ fn tokenize_references(text: &str, sigils: &[char]) -> Vec<InlineReference> {
     refs
 }
 
+/// Known file extensions that indicate an @ token is an intentional file reference.
+/// A token like @AGENTS.md is a file reference; @username is not.
+const PATH_LIKE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "md", "json", "yaml", "yml", "toml", "txt", "css",
+    "scss", "html", "htm", "sh", "bash", "sql", "xml", "allium", "cfg", "conf", "env", "lock",
+    "mod", "sum", "c", "h", "cpp", "hpp", "java", "kt", "swift", "rb", "php", "ex", "exs", "hs",
+    "ml", "zig", "scala", "proto", "graphql", "vue", "svelte", "csv", "log",
+];
+
+/// Determine whether a token after @ looks like an intentional file path reference.
+/// Returns true if the token contains `/` (path separator) or ends with a known
+/// file extension. Returns false for bare words like "username" or "param".
+fn looks_like_file_path(token: &str) -> bool {
+    // Contains a path separator -- clearly a file path
+    if token.contains('/') {
+        return true;
+    }
+    // Check for known file extension
+    if let Some(ext) = token.rsplit('.').next() {
+        if ext != token && PATH_LIKE_EXTENSIONS.contains(&ext) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Determine whether `content` is valid UTF-8 text (no null bytes).
 fn is_text_content(content: &[u8]) -> bool {
     !content.contains(&0) && std::str::from_utf8(content).is_ok()
@@ -182,11 +208,17 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
         }
     }
 
-    // --- File reference expansion (REQ-IR-001) --------------------------------
+    // --- File reference expansion (REQ-IR-001, REQ-IR-007) ---------------------
     let mut llm_text = text.to_string();
     let file_refs: Vec<_> = refs.iter().filter(|r| r.sigil == '@').collect();
 
     for file_ref in file_refs {
+        // ClassifyAtReference: only treat path-like tokens as file references.
+        // Bare words (@username, @param) pass through as literal text.
+        if !looks_like_file_path(&file_ref.token) {
+            continue;
+        }
+
         let full_path = resolve_path(&file_ref.token, working_dir);
 
         // Validate existence
@@ -372,14 +404,15 @@ mod tests {
     #[test]
     fn test_expand_binary_file_error() {
         let tmp = make_tmp();
-        // Write a file with a null byte — triggers binary detection
-        fs::write(tmp.path().join("bin.dat"), b"hello\x00world").unwrap();
+        // Write a file with a null byte -- triggers binary detection.
+        // Uses .txt extension so ClassifyAtReference treats it as a file reference.
+        fs::write(tmp.path().join("bin.txt"), b"hello\x00world").unwrap();
 
-        let err = expand("check @bin.dat", tmp.path()).unwrap_err();
+        let err = expand("check @bin.txt", tmp.path()).unwrap_err();
         assert_eq!(
             err,
             ExpansionError::FileNotText {
-                path: "bin.dat".to_string()
+                path: "bin.txt".to_string()
             }
         );
     }
@@ -647,5 +680,58 @@ mod tests {
         assert_eq!(result.display_text, "hello world");
         assert_eq!(result.llm_text, "hello world");
         assert!(result.skill_invocation.is_none());
+    }
+
+    // --- ClassifyAtReference / AtTokenPassThrough (REQ-IR-007) ----
+
+    #[test]
+    fn test_bare_at_word_passes_through() {
+        let tmp = make_tmp();
+        let result = expand("hello @username how are you", tmp.path()).unwrap();
+        assert_eq!(result.llm_text, "hello @username how are you");
+    }
+
+    #[test]
+    fn test_at_param_passes_through() {
+        let tmp = make_tmp();
+        let result = expand("use @param annotation", tmp.path()).unwrap();
+        assert_eq!(result.llm_text, "use @param annotation");
+    }
+
+    #[test]
+    fn test_at_with_extension_treated_as_file_ref() {
+        let tmp = make_tmp();
+        // This has .md extension -- looks like a file, should try to resolve
+        let result = expand("check @MISSING.md please", tmp.path());
+        assert!(result.is_err()); // FileNotFound because the file doesn't exist
+    }
+
+    #[test]
+    fn test_at_with_slash_treated_as_file_ref() {
+        let tmp = make_tmp();
+        // Contains / -- looks like a path, should try to resolve
+        let result = expand("check @src/main.rs please", tmp.path());
+        assert!(result.is_err()); // FileNotFound
+    }
+
+    #[test]
+    fn test_at_existing_file_with_extension_expands() {
+        let tmp = make_tmp();
+        fs::write(tmp.path().join("test.txt"), "file content").unwrap();
+        let result = expand("see @test.txt here", tmp.path()).unwrap();
+        assert!(result.llm_text.contains("file content"));
+        assert!(result.llm_text.contains("<file"));
+    }
+
+    #[test]
+    fn test_looks_like_file_path_function() {
+        assert!(looks_like_file_path("src/main.rs"));
+        assert!(looks_like_file_path("AGENTS.md"));
+        assert!(looks_like_file_path("config.toml"));
+        assert!(looks_like_file_path("test.txt"));
+        assert!(!looks_like_file_path("username"));
+        assert!(!looks_like_file_path("param"));
+        assert!(!looks_like_file_path("override"));
+        assert!(!looks_like_file_path("TODO"));
     }
 }
