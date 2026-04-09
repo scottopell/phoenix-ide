@@ -29,6 +29,7 @@ use std::fmt::Write as _;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -143,6 +144,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
         // Version
         .route("/version", get(get_version))
+        // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
+        .route("/api/auth/status", get(super::auth::auth_status))
+        .route("/api/auth/login", post(super::auth::auth_login))
+        // Auth middleware — runs before all route handlers (REQ-AUTH-001)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::auth::auth_middleware,
+        ))
         .with_state(state)
 }
 

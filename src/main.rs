@@ -120,8 +120,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     mcp_manager.start_background_discovery();
 
+    // Read optional auth password (REQ-AUTH-001)
+    let password = std::env::var("PHOENIX_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty());
+    if password.is_some() {
+        tracing::info!("Password authentication enabled (PHOENIX_PASSWORD is set)");
+    }
+
     // Create application state
-    let state = AppState::new(db, llm_registry, platform, mcp_manager).await;
+    let state = AppState::new(db, llm_registry, platform, mcp_manager, password).await;
 
     // Create router
     let cors = CorsLayer::new()

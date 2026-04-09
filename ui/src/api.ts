@@ -274,7 +274,30 @@ export interface GitBranchesResponse {
   current: string;
 }
 
+export interface AuthStatus {
+  auth_required: boolean;
+  authenticated: boolean;
+}
+
 export const api = {
+  async authStatus(): Promise<AuthStatus> {
+    const resp = await fetch('/api/auth/status');
+    if (!resp.ok) throw new Error('Failed to check auth status');
+    return resp.json();
+  },
+
+  async login(password: string): Promise<void> {
+    const resp = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json() as { error?: string };
+      throw new Error(err.error ?? 'Login failed');
+    }
+  },
+
   async getProjects(): Promise<Project[]> {
     const resp = await fetch('/api/projects');
     if (!resp.ok) throw new Error('Failed to list projects');

@@ -3,6 +3,7 @@
 //! REQ-API-001 through REQ-API-010
 
 mod assets;
+pub mod auth;
 mod handlers;
 mod sse;
 mod types;
@@ -27,6 +28,8 @@ pub struct AppState {
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
     pub mcp_manager: Arc<McpClientManager>,
+    /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
+    pub password: Option<String>,
 }
 
 impl AppState {
@@ -36,6 +39,7 @@ impl AppState {
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
         mcp_manager: Arc<McpClientManager>,
+        password: Option<String>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
@@ -50,6 +54,7 @@ impl AppState {
             db,
             platform,
             mcp_manager,
+            password,
         }
     }
 }
