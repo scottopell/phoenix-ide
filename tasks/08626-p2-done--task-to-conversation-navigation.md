@@ -1,7 +1,7 @@
 ---
 created: 2026-04-03
 priority: p2
-status: ready
+status: done
 artifact: ui/src/components/TasksPanel.tsx
 ---
 

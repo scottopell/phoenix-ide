@@ -1650,6 +1650,7 @@ where
                 base_branch: None,
                 commits_behind: None,
                 commits_ahead: None,
+                task_title: None,
             },
         });
 
@@ -1694,6 +1695,7 @@ where
                     worktree_path: approval_result.worktree_path.clone(),
                     base_branch: approval_result.base_branch.clone(),
                     task_id: approval_result.task_id.clone(),
+                    task_title: approval_result.task_title.clone(),
                 };
                 storage
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)
@@ -1760,6 +1762,7 @@ where
                         base_branch: Some(approval_result.base_branch.clone()),
                         commits_behind: None,
                         commits_ahead: None,
+                        task_title: Some(approval_result.task_title.clone()),
                     },
                 });
 
@@ -1792,6 +1795,7 @@ where
 /// Result of a successful task approval
 struct TaskApprovalResult {
     task_id: String,
+    task_title: String,
     branch_name: String,
     first_task: bool,
     /// Absolute path to the git worktree created for this conversation
@@ -2124,6 +2128,7 @@ fn execute_approve_task_blocking(
 
     Ok(TaskApprovalResult {
         task_id,
+        task_title: title.to_string(),
         branch_name,
         first_task,
         worktree_path: worktree_path_str,

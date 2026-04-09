@@ -12,6 +12,7 @@ export interface Conversation {
   branch_name?: string | null;
   worktree_path?: string | null;
   base_branch?: string | null;
+  task_title?: string | null;
   commits_behind?: number;
   commits_ahead?: number;
   archived?: boolean;
@@ -220,6 +221,8 @@ export interface TaskEntry {
   priority: string;
   status: string;
   slug: string;
+  /** Slug of the conversation working on this task, if any. */
+  conversation_slug?: string;
 }
 
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */

@@ -2176,6 +2176,16 @@ pre:hover .copy-btn {
   overflow: hidden;
 }
 
+/* Task title (Work mode primary label) */
+.statebar-task-title {
+  color: var(--text-primary);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+
 /* Git flow: base <- branch */
 .git-flow {
   display: inline-flex;
@@ -2183,6 +2193,12 @@ pre:hover .copy-btn {
   gap: 3px;
   min-width: 0;
   overflow: hidden;
+}
+
+/* When task title is shown, demote git flow to secondary */
+.git-flow--secondary {
+  opacity: 0.6;
+  font-size: 9px;
 }
 
 .git-base {

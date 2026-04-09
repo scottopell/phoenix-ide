@@ -207,3 +207,20 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.tasks-conv-link {
+  margin-left: auto;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent-blue, #58a6ff);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+
+.tasks-item:hover .tasks-conv-link {
+  opacity: 1;
+}

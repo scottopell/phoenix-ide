@@ -116,3 +116,18 @@
   color: var(--text-error, #f85149);
   font-style: italic;
 }
+
+.task-viewer-conv-link {
+  background: none;
+  border: none;
+  color: var(--accent-blue, #58a6ff);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  text-decoration: none;
+  transition: opacity 150ms ease;
+}
+
+.task-viewer-conv-link:hover {
+  opacity: 0.8;
+}

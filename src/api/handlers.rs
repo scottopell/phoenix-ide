@@ -251,6 +251,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
             .base_branch()
             .filter(|s| !s.is_empty())
             .map(String::from),
+        task_title: conv.conv_mode.task_title().map(String::from),
         inner: conv.clone(),
     }
 }
@@ -1007,6 +1008,7 @@ async fn stream_conversation(
                             base_branch: None,
                             commits_behind: Some(new_behind),
                             commits_ahead: Some(new_ahead),
+                            task_title: None,
                         },
                     });
                     // No receivers left -- client disconnected, exit polling loop
@@ -1375,6 +1377,7 @@ async fn complete_task(
             worktree_path,
             base_branch,
             task_id,
+            ..
         } => (
             branch_name.clone(),
             worktree_path.clone(),
@@ -1575,6 +1578,7 @@ async fn confirm_complete(
             worktree_path,
             base_branch,
             task_id,
+            ..
         } => (
             branch_name.clone(),
             worktree_path.clone(),
@@ -1830,6 +1834,7 @@ async fn abandon_task(
             worktree_path,
             base_branch,
             task_id,
+            ..
         } => (
             branch_name.clone(),
             worktree_path.clone(),
@@ -2808,13 +2813,28 @@ async fn list_conversation_tasks(
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     let tasks_dir = cwd.join("tasks");
 
+    // Build task_id -> conversation_slug map from active Work conversations
+    let all_convs = state.runtime.db().list_conversations().await.unwrap_or_default();
+    let task_to_slug: std::collections::HashMap<String, String> = all_convs
+        .iter()
+        .filter_map(|c| {
+            let task_id = c.conv_mode.task_id()?;
+            let slug = c.slug.as_deref()?;
+            Some((task_id.to_string(), slug.to_string()))
+        })
+        .collect();
+
     let tasks = taskmd_core::tasks::list_tasks(&tasks_dir)
         .into_iter()
-        .map(|t| TaskEntry {
-            id: t.id,
-            priority: t.priority,
-            status: t.status,
-            slug: t.slug,
+        .map(|t| {
+            let conversation_slug = task_to_slug.get(&t.id).cloned();
+            TaskEntry {
+                id: t.id,
+                priority: t.priority,
+                status: t.status,
+                slug: t.slug,
+                conversation_slug,
+            }
         })
         .collect();
 

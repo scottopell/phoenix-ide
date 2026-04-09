@@ -156,6 +156,10 @@ pub enum ConvMode {
         /// `#[serde(default)]` is a rollout shim for existing Work rows.
         #[serde(default)]
         task_id: String,
+        /// Human-readable task title (e.g., "Fix auth middleware token storage").
+        /// `#[serde(default)]` is a rollout shim for existing Work rows.
+        #[serde(default)]
+        task_title: String,
     },
 }
 
@@ -198,6 +202,16 @@ impl ConvMode {
     pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::Work { task_id, .. } => Some(task_id),
+            Self::Explore | Self::Direct => None,
+        }
+    }
+
+    /// The task title if in Work mode, None otherwise.
+    pub fn task_title(&self) -> Option<&str> {
+        match self {
+            Self::Work { task_title, .. } => {
+                if task_title.is_empty() { None } else { Some(task_title) }
+            }
             Self::Explore | Self::Direct => None,
         }
     }

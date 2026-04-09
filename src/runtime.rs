@@ -93,6 +93,8 @@ pub struct ConversationMetadataUpdate {
     pub commits_behind: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commits_ahead: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
 }
 
 /// A conversation enriched with derived display fields for the API layer.
@@ -108,6 +110,8 @@ pub struct EnrichedConversation {
     pub branch_name: Option<String>,
     pub worktree_path: Option<String>,
     pub base_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.

@@ -247,6 +247,7 @@ export function StateBar({
   const behind = conversation?.commits_behind;
   const baseBranch = conversation?.base_branch;
   const branchName = conversation?.branch_name;
+  const taskTitle = conversation?.task_title;
 
   return (
     <>
@@ -305,11 +306,16 @@ export function StateBar({
                 )}
               </div>
 
-              {/* Line 2: git info (Work/Explore) or project name */}
-              {(branchName || projectName) && (
+              {/* Line 2: task title (Work) + git info, or project name */}
+              {(taskTitle || branchName || projectName) && (
                 <div className="statebar-line2">
+                  {taskTitle && (
+                    <span className="statebar-task-title" title={branchName ? `Branch: ${branchName}` : undefined}>
+                      {taskTitle}
+                    </span>
+                  )}
                   {branchName && baseBranch && (
-                    <span className="git-flow" title={`${baseBranch} <- ${branchName}`}>
+                    <span className={`git-flow${taskTitle ? ' git-flow--secondary' : ''}`} title={`${baseBranch} <- ${branchName}`}>
                       <span className="git-base">{baseBranch}</span>
                       <span className="git-arrow">&larr;</span>
                       <span className="git-branch">{branchName}</span>

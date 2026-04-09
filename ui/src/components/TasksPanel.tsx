@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { TaskEntry } from '../api';
 import './TasksPanel.css';
@@ -31,6 +32,7 @@ const PRIORITY_CLASS: Record<string, string> = {
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 
 export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: TasksPanelProps) {
+  const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -148,6 +150,18 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
                             <span className="tasks-id">{task.id}</span>
                             <span className="tasks-slug">{task.slug}</span>
                             {isCurrent && <span className="tasks-current-badge">current</span>}
+                            {task.conversation_slug && !isCurrent && (
+                              <button
+                                className="tasks-conv-link"
+                                title="Go to conversation"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  navigate(`/c/${task.conversation_slug}`);
+                                }}
+                              >
+                                &rarr;
+                              </button>
+                            )}
                           </div>
                         );
                       })}

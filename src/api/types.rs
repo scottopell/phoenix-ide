@@ -256,6 +256,9 @@ pub struct TaskEntry {
     pub priority: String,
     pub status: String,
     pub slug: String,
+    /// Slug of the conversation working on this task (if any active Work conversation owns it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_slug: Option<String>,
 }
 
 /// Response for the tasks list endpoint.

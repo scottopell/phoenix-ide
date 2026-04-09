@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import type { TaskEntry } from '../api';
 import './TaskViewer.css';
 
@@ -18,6 +19,7 @@ const STATUS_CLASS: Record<string, string> = {
 };
 
 export function TaskViewer({ task, tasksDir, onBack }: TaskViewerProps) {
+  const navigate = useNavigate();
   const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -86,6 +88,17 @@ export function TaskViewer({ task, tasksDir, onBack }: TaskViewerProps) {
             <span className="task-viewer-detail-label">File</span>
             <span className="task-viewer-detail-value">{filename}</span>
           </div>
+          {task.conversation_slug && (
+            <div className="task-viewer-detail-row">
+              <span className="task-viewer-detail-label">Conversation</span>
+              <button
+                className="task-viewer-conv-link"
+                onClick={() => navigate(`/c/${task.conversation_slug}`)}
+              >
+                Go to conversation &rarr;
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Content section */}
