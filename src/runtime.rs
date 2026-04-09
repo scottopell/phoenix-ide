@@ -299,7 +299,7 @@ impl RuntimeManager {
                 Some(&spec.model_id), // inherit parent's model
                 None,                 // project_id
                 &sub_conv_mode,
-                None,                 // desired_base_branch
+                None, // desired_base_branch
             )
             .await
         {

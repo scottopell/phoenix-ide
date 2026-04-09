@@ -304,7 +304,7 @@ impl Database {
 
     // ==================== Conversation Operations ====================
 
-    /// Create a new conversation
+    #[cfg(test)]
     pub async fn create_conversation(
         &self,
         id: &str,
