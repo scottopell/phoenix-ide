@@ -252,14 +252,8 @@ fn parse_state_fields(state_json: Option<&str>) -> (String, Option<String>) {
         .unwrap_or("?")
         .to_string();
     let outcome = match state_type.as_str() {
-        "completed" => v
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        "error" => v
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        "completed" => v.get("result").and_then(Value::as_str).map(str::to_string),
+        "error" => v.get("message").and_then(Value::as_str).map(str::to_string),
         _ => None,
     };
     (state_type, outcome)
@@ -754,7 +748,11 @@ fn render_conv_list(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::List;
     let title = format!(
         "CONVERSATIONS  total:{total} idle:{idle} active:{working}{}",
-        if focused { "  [↑↓ nav · Enter inspect]" } else { "" }
+        if focused {
+            "  [↑↓ nav · Enter inspect]"
+        } else {
+            ""
+        }
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -920,7 +918,12 @@ fn render_messages_tab(lines: &mut Vec<Line>, detail: &ConversationDetailRespons
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_subagents_tab(lines: &mut Vec<Line>, sub_agents: &[SubAgentInfo], cursor: usize, focused: bool) {
+fn render_subagents_tab(
+    lines: &mut Vec<Line>,
+    sub_agents: &[SubAgentInfo],
+    cursor: usize,
+    focused: bool,
+) {
     if sub_agents.is_empty() {
         lines.push(Line::from(Span::styled(
             "No sub-agents found in DB for this conversation.",
@@ -959,7 +962,10 @@ fn render_subagents_tab(lines: &mut Vec<Line>, sub_agents: &[SubAgentInfo], curs
             Style::default().fg(Color::DarkGray),
         ),
         if focused {
-            Span::styled("  [↑↓ nav · Enter open]", Style::default().fg(Color::DarkGray))
+            Span::styled(
+                "  [↑↓ nav · Enter open]",
+                Style::default().fg(Color::DarkGray),
+            )
         } else {
             Span::raw("")
         },
@@ -980,9 +986,13 @@ fn render_subagents_tab(lines: &mut Vec<Line>, sub_agents: &[SubAgentInfo], curs
 
         let selector = if selected { "> " } else { "  " };
         let slug_style = if selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         };
 
         lines.push(Line::from(vec![
@@ -1022,10 +1032,7 @@ fn render_subagents_tab(lines: &mut Vec<Line>, sub_agents: &[SubAgentInfo], curs
             };
             lines.push(Line::from(vec![
                 Span::styled(label, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{preview}{truncated}"),
-                    Style::default().fg(ocol),
-                ),
+                Span::styled(format!("{preview}{truncated}"), Style::default().fg(ocol)),
             ]));
         }
 
@@ -1612,16 +1619,19 @@ fn print_conv_detail(d: &ConversationDetailResponse) {
     }
 
     // Sub-agents from DB
-    let conv_id = conv
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let conv_id = conv.get("id").and_then(Value::as_str).unwrap_or_default();
     let sub_agents = fetch_sub_agents(&prod_db_path(), conv_id);
     if !sub_agents.is_empty() {
         println!();
         println!("=== SUB-AGENTS ({}) ===", sub_agents.len());
-        let done = sub_agents.iter().filter(|a| a.state_type == "completed").count();
-        let errs = sub_agents.iter().filter(|a| a.state_type == "error").count();
+        let done = sub_agents
+            .iter()
+            .filter(|a| a.state_type == "completed")
+            .count();
+        let errs = sub_agents
+            .iter()
+            .filter(|a| a.state_type == "error")
+            .count();
         println!("done:{done}  errors:{errs}  total:{}", sub_agents.len());
         println!();
         for sa in &sub_agents {
