@@ -193,14 +193,13 @@
 /* Side-by-side layout for preview mode */
 .question-preview-layout {
   display: flex;
+  flex-direction: column;
   gap: 12px;
   margin-top: 4px;
 }
 
 .question-preview-layout .question-options {
   flex: 0 0 auto;
-  min-width: 200px;
-  max-width: 320px;
 }
 
 .question-preview-pane {
@@ -223,6 +222,18 @@
   color: var(--text-muted);
   font-style: italic;
   font-family: inherit;
+}
+
+/* Side-by-side only on wide viewports */
+@media (min-width: 600px) {
+  .question-preview-layout {
+    flex-direction: row;
+  }
+
+  .question-preview-layout .question-options {
+    min-width: 200px;
+    max-width: 320px;
+  }
 }
 
 /* Single option (radio/checkbox + label + description) */
