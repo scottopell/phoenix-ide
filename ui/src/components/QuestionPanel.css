@@ -5,6 +5,9 @@
   flex-direction: column;
   background: var(--bg-primary);
   border-top: 1px solid var(--border-color);
+  position: relative;
+  z-index: 2;
+  overflow: hidden;
 }
 
 /* Breadcrumb navigation: question headers as clickable tabs */
