@@ -7,6 +7,9 @@
   border-top: 1px solid var(--border-color);
   position: relative;
   z-index: 2;
+  flex-shrink: 0;
+  max-height: 60vh;
+  max-height: 60dvh;
   overflow: hidden;
 }
 
@@ -77,6 +80,8 @@
 .question-wizard-content {
   padding: 8px 16px 12px;
   animation: wizardFadeIn 150ms ease-out;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 @keyframes wizardFadeIn {
