@@ -106,15 +106,27 @@ AND SHALL deliver the fully expanded content to the AI
 
 ### REQ-IR-007: Graceful Handling of Unresolvable Expansion References
 
-WHEN a message contains an `@` reference to a file path that does not exist
+WHEN a message contains `@` followed by a token that looks like a file path
+(contains `/` or `.` with a recognized file extension)
+AND the referenced file does not exist
 THE SYSTEM SHALL present the user with a clear error identifying the missing file
 AND SHALL NOT send the message until the reference is removed or corrected
 
-WHEN a message begins with `/skill-name` that matches no available skill
-THE SYSTEM SHALL present the user with a clear error and list available skill names
-AND SHALL NOT send the message until the reference is removed or corrected
+WHEN a message contains `@` followed by a token that does NOT look like a
+file path (bare word, email address, `@mention`-style text)
+THE SYSTEM SHALL treat the `@` as literal text
+AND SHALL send the message without expansion or error
 
-**Rationale:** A silently broken expansion reference — where the AI receives nothing for a `@file` or `/skill` — causes confusing responses. Blocking send with a clear error is safer than silent failure. `./path` references are not validated at send time (see REQ-IR-008).
+WHEN a message begins with `/skill-name` that matches no available skill
+THE SYSTEM SHALL treat the `/` as literal text (no error, no block)
+
+**Rationale:** `@` appears in email addresses, `@mention` conventions, code
+annotations (`@param`, `@override`), and casual text. Blocking send for
+these false positives is more disruptive than the original risk of silently
+broken references. The heuristic (path-like = intentional reference) catches
+real file references while letting casual `@` usage pass through. `/skill`
+already falls through silently when no skill matches (the token is ignored).
+`./path` references are not validated at send time (see REQ-IR-008).
 
 ---
 

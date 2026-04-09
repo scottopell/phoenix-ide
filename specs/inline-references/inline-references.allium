@@ -1,0 +1,302 @@
+-- Inline References Specification
+--
+-- How @file, /skill, and ./path references are tokenized, resolved,
+-- expanded, and delivered. Spans both frontend (autocomplete, validation)
+-- and backend (expansion, LLM delivery).
+--
+-- This spec covers the message input lifecycle from keystroke to LLM request.
+
+use "./specs/bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value InlineReference {
+    sigil: "@" | "/" | "./"
+    token: String               -- text after the sigil, until whitespace
+    span: Range                 -- byte range in original text
+}
+
+enum ReferenceIntent {
+    file_expansion              -- @path/to/file -> expand contents
+    skill_invocation            -- /skill-name -> load skill
+    path_literal                -- ./path -> pass through as text
+    not_a_reference             -- @username, user@email -> literal text
+}
+
+value ExpansionResult {
+    display_text: String        -- original text (stored in DB, shown in history)
+    llm_text: String            -- expanded text (delivered to LLM)
+    skill_invocation: SkillInvocation?
+}
+
+value SkillInvocation {
+    name: String
+    body: String                -- skill content with base dir + args substituted
+    skill_dir: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- File extensions recognized as "path-like" for @ reference heuristic.
+    -- A token after @ is treated as an intentional file reference when it
+    -- contains "/" or ends with one of these extensions.
+    path_like_extensions: Set<String> = {
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "md", "json",
+        "yaml", "yml", "toml", "txt", "css", "html", "sh", "sql",
+        "allium", "cfg", "conf", "env", "lock", "mod"
+    }
+}
+
+------------------------------------------------------------
+-- Rules: Tokenization
+------------------------------------------------------------
+
+-- Tokenization extracts potential references from raw message text.
+-- Runs on the original text before any expansion.
+
+rule TokenizeReferences {
+    when: UserComposesMessage(text)
+
+    -- For each character in text that is a sigil (@, /):
+    --   - Must be at position 0 or preceded by whitespace
+    --   - Token = characters after sigil until whitespace
+    --   - ./ trigger: must be preceded by whitespace or at start
+
+    ensures: references = extract_references(text, sigils: {"@", "/"})
+
+    @guidance
+        -- Implementation: tokenize_references() in message_expander.rs
+        -- The "/" sigil is only checked for skill invocation (must be at
+        -- message start or after whitespace). It is NOT checked mid-text
+        -- to avoid false positives from file paths like "src/lib.rs".
+}
+
+------------------------------------------------------------
+-- Rules: Intent Classification (NEW)
+------------------------------------------------------------
+
+-- Classify each @ reference as intentional file reference or literal text.
+-- This is the key change: not every @ token is a file reference.
+
+rule ClassifyAtReference {
+    when: reference: InlineReference where sigil = "@"
+
+    let token = reference.token
+    let looks_like_path =
+        token.contains("/")
+        or token.split(".").last in config.path_like_extensions
+
+    ensures: reference.intent = file_expansion
+        if looks_like_path
+    ensures: reference.intent = not_a_reference
+        if not looks_like_path
+
+    @guidance
+        -- Examples of classification:
+        --   @src/main.rs       -> file_expansion (contains /)
+        --   @AGENTS.md         -> file_expansion (.md is a known extension)
+        --   @username          -> not_a_reference (bare word, no / or extension)
+        --   @param             -> not_a_reference (bare word)
+        --   user@email.com     -> not tokenized (@ not preceded by whitespace)
+        --
+        -- Implementation: in expand(), after tokenizing, check each @ ref.
+        -- If intent = not_a_reference, skip it (leave as literal text).
+        -- If intent = file_expansion, resolve the file.
+}
+
+------------------------------------------------------------
+-- Rules: Expansion
+------------------------------------------------------------
+
+-- File expansion: resolve @file references to file contents.
+rule ExpandFileReference {
+    when: reference: InlineReference where intent = file_expansion
+
+    let path = resolve_path(reference.token, working_dir)
+
+    requires: path.exists
+    requires: path.is_text_file
+
+    ensures: reference.expanded_content = read_file(path)
+
+    @guidance
+        -- Replaces the @token span in llm_text with:
+        --   <file path="absolute/path">file contents</file>
+        -- Display text retains the original @token.
+}
+
+-- File expansion failure: path looks like a file but doesn't exist.
+rule FileReferenceNotFound {
+    when: reference: InlineReference where intent = file_expansion
+
+    requires: not resolve_path(reference.token, working_dir).exists
+
+    ensures: ExpansionBlocked(reference)
+    -- Message is NOT sent. User sees error identifying the missing file.
+
+    @guidance
+        -- Returns ExpansionError::FileNotFound { path }.
+        -- Frontend shows the error inline. User must fix or remove the @ref.
+}
+
+-- Non-reference @ tokens: pass through as literal text.
+rule AtTokenPassThrough {
+    when: reference: InlineReference where intent = not_a_reference
+
+    ensures: reference.expanded_content = null
+    -- Token is left as-is in both display_text and llm_text.
+    -- No error, no expansion, no blocking.
+}
+
+-- Skill invocation: /skill-name at message start.
+rule ExpandSkillReference {
+    when: reference: InlineReference where sigil = "/"
+
+    let skills = discover_skills(working_dir)
+    let matched = skills where name = reference.token
+
+    requires: matched.count > 0
+
+    ensures: SkillInvoked(reference, matched.first)
+    -- Skill expansion replaces the entire message content.
+    -- File @references in the original text are NOT expanded
+    -- (skill output might contain @ that shouldn't trigger expansion).
+}
+
+-- Unmatched /skill: pass through silently (not an error).
+rule SkillTokenPassThrough {
+    when: reference: InlineReference where sigil = "/"
+
+    let skills = discover_skills(working_dir)
+    let matched = skills where name = reference.token
+
+    requires: matched.count = 0
+
+    ensures: reference.expanded_content = null
+    -- / followed by a non-skill word is treated as literal text.
+    -- No error, no blocking. Common in normal prose ("use /tmp").
+}
+
+------------------------------------------------------------
+-- Rules: Frontend Autocomplete
+------------------------------------------------------------
+
+-- These rules describe the frontend behavior, not backend processing.
+-- They are normative: the frontend must implement these interactions.
+
+rule FileAutocompleteTriggered {
+    when: UserTypes(input, character: "@")
+
+    requires: character_at_start_or_after_whitespace(input, "@")
+
+    ensures: AutocompleteShown(mode: "file", query: text_after_sigil)
+
+    @guidance
+        -- Frontend: detectTrigger() in InlineAutocomplete.tsx
+        -- Shows file suggestions from api.searchConversationFiles()
+        -- Fuzzy match on file path as user continues typing.
+}
+
+rule SkillAutocompleteTriggered {
+    when: UserTypes(input, character: "/")
+
+    requires: character_at_start_of_message(input, "/")
+
+    ensures: AutocompleteShown(mode: "skill", query: text_after_sigil)
+
+    @guidance
+        -- Frontend: detectTrigger() in InlineAutocomplete.tsx
+        -- Shows skill suggestions from api.listConversationSkills()
+        -- Filtered by fuzzy match on skill name.
+}
+
+rule PathAutocompleteTriggered {
+    when: UserTypes(input, sequence: "./")
+
+    requires: sequence_at_start_or_after_whitespace(input, "./")
+
+    ensures: AutocompleteShown(mode: "path", query: text_after_sequence)
+
+    @guidance
+        -- Frontend: detectTrigger() in InlineAutocomplete.tsx
+        -- Shows same file suggestions as @ mode.
+        -- Selection inserts ./path (literal, no expansion at send time).
+}
+
+rule AutocompleteDismissed {
+    when: UserPresses(key: "Escape")
+    requires: AutocompleteShown
+    ensures: not AutocompleteShown
+}
+
+rule AutocompleteSelected {
+    when: UserSelectsCompletion(suggestion)
+    requires: AutocompleteShown
+
+    ensures: InsertedAtCursor(suggestion.formatted_text)
+    ensures: not AutocompleteShown
+}
+
+------------------------------------------------------------
+-- Rules: Message Delivery
+------------------------------------------------------------
+
+rule MessageExpanded {
+    when: UserSendsMessage(conversation, text)
+
+    let refs = extract_references(text)
+    let file_refs = refs where sigil = "@" and intent = file_expansion
+    let skill_ref = refs where sigil = "/" | first
+
+    -- Skill invocation takes priority: replaces entire message.
+    -- If a skill matches, @ refs in the original text are NOT expanded.
+    ensures: ExpansionResult.created(
+        display_text: text,
+        llm_text: skill_body,
+        skill_invocation: skill
+    ) if skill_ref and skill_matched(skill_ref)
+
+    -- No skill: expand @ file references.
+    ensures: ExpansionResult.created(
+        display_text: text,
+        llm_text: expand_file_refs(text, file_refs),
+        skill_invocation: null
+    ) if not skill_matched(skill_ref)
+
+    -- Blocked if any file_expansion ref fails to resolve.
+    ensures: ExpansionBlocked(failed_ref)
+        if any ref in file_refs: not ref.resolved
+
+    @guidance
+        -- Implementation: expand() in message_expander.rs
+        -- Called by the chat handler before persisting the message.
+        -- Returns Ok(ExpandedMessage) or Err(ExpansionError).
+        -- The handler stores display_text in DB and sends llm_text to the LLM.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Display text is always the original user input, never expanded.
+invariant DisplayTextIsOriginal {
+    for m in Messages where m.has_expansion:
+        m.display_text = m.original_input
+}
+
+-- Skill expansion and file expansion are mutually exclusive per message.
+invariant SkillXorFileExpansion {
+    for m in Messages:
+        m.skill_invocation != null implies m.file_expansions.count = 0
+}
+
+-- @ tokens classified as not_a_reference never cause errors.
+invariant NonReferenceNeverBlocks {
+    for ref in InlineReferences where ref.intent = not_a_reference:
+        not ExpansionBlocked(ref)
+}
