@@ -53,6 +53,13 @@ function App() {
   const [authState, setAuthState] = useState<AuthState>({ status: 'checking' });
 
   useEffect(() => {
+    // Share pages are auth-exempt -- skip the check entirely so we don't
+    // flash a login screen while the /api/auth/status round-trip resolves.
+    if (window.location.pathname.startsWith('/s/')) {
+      setAuthState({ status: 'authenticated' });
+      return;
+    }
+
     let cancelled = false;
     api.authStatus().then((result) => {
       if (cancelled) return;
