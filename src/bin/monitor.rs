@@ -1545,6 +1545,7 @@ fn headless_conversations() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_conv_detail(d: &ConversationDetailResponse) {
     let conv = &d.conversation;
 
