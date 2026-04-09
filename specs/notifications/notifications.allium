@@ -1,0 +1,240 @@
+-- Notifications Specification
+--
+-- Browser desktop notifications when conversations need user attention.
+-- Driven by SSE state_change events, configured via server-side settings.
+
+use "./specs/bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum NotificationEventType {
+    task_approval_needed
+    question_asked
+    agent_error
+    agent_finished
+}
+
+enum BrowserPermission {
+    default         -- not yet asked
+    granted
+    denied
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- Global notification preferences (single row, not per-conversation).
+entity NotificationSettings {
+    enabled: Boolean = true
+
+    -- Per-event-type toggles
+    notify_task_approval: Boolean = true
+    notify_question: Boolean = true
+    notify_error: Boolean = true
+    notify_idle: Boolean = true
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Default settings for new installations
+    default_notifications_enabled: Boolean = true
+    default_notify_task_approval: Boolean = true
+    default_notify_question: Boolean = true
+    default_notify_error: Boolean = true
+    default_notify_idle: Boolean = true
+}
+
+------------------------------------------------------------
+-- Rules: Event Detection
+------------------------------------------------------------
+
+-- Map conversation state transitions to notification events.
+-- These rules fire in the frontend when SSE state_change arrives.
+
+rule DetectTaskApprovalNeeded {
+    when: conversation: bedrock/Conversation.status
+        transitions_to awaiting_task_approval
+
+    ensures: NotificationEvent(
+        type: task_approval_needed,
+        conversation: conversation,
+        title: "Task approval needed",
+        body: conversation.slug
+    )
+}
+
+rule DetectQuestionAsked {
+    when: conversation: bedrock/Conversation.status
+        transitions_to awaiting_user_response
+
+    ensures: NotificationEvent(
+        type: question_asked,
+        conversation: conversation,
+        title: "Question asked",
+        body: conversation.slug
+    )
+}
+
+rule DetectAgentError {
+    when: conversation: bedrock/Conversation.status
+        transitions_to error
+
+    ensures: NotificationEvent(
+        type: agent_error,
+        conversation: conversation,
+        title: "Agent error",
+        body: conversation.slug
+    )
+
+    @guidance
+        -- Also fires for context_exhausted state.
+        -- Implementation: check for both "error" and "context_exhausted"
+        -- in the SSE state_change handler.
+}
+
+rule DetectAgentFinished {
+    when: conversation: bedrock/Conversation.status
+        transitions_to idle
+
+    -- Only notify when transitioning FROM a busy state, not on page load
+    -- when conversations are already idle.
+    requires: conversation.previous_status in {
+        llm_requesting, executing_tools, awaiting_sub_agents,
+        cancelling_tool, cancelling_sub_agents
+    }
+
+    ensures: NotificationEvent(
+        type: agent_finished,
+        conversation: conversation,
+        title: "Agent finished",
+        body: conversation.slug
+    )
+}
+
+------------------------------------------------------------
+-- Rules: Notification Delivery
+------------------------------------------------------------
+
+rule DeliverNotification {
+    when: NotificationEvent(type, conversation, title, body)
+
+    let settings = NotificationSettings
+    let event_enabled = match type {
+        task_approval_needed: settings.notify_task_approval
+        question_asked: settings.notify_question
+        agent_error: settings.notify_error
+        agent_finished: settings.notify_idle
+    }
+
+    requires: settings.enabled
+    requires: event_enabled
+    requires: BrowserPermission = granted
+    requires: not tab_is_focused
+
+    ensures: BrowserNotificationShown(title, body, conversation)
+
+    @guidance
+        -- Implementation: new Notification(title, { body, tag: conversation.id })
+        -- The tag prevents duplicate notifications for the same conversation.
+        -- If the tab IS focused, the user is already looking -- no notification.
+}
+
+rule NotificationClicked {
+    when: UserClicksNotification(notification)
+
+    ensures: TabFocused
+    ensures: NavigatedTo(notification.conversation)
+
+    @guidance
+        -- Implementation: notification.onclick = () => {
+        --   window.focus();
+        --   navigate(`/c/${conversation.slug}`);
+        -- }
+}
+
+------------------------------------------------------------
+-- Rules: Settings Management
+------------------------------------------------------------
+
+rule UpdateNotificationSettings {
+    when: UserUpdatesSettings(new_settings)
+
+    ensures: NotificationSettings.enabled = new_settings.enabled
+    ensures: NotificationSettings.notify_task_approval = new_settings.notify_task_approval
+    ensures: NotificationSettings.notify_question = new_settings.notify_question
+    ensures: NotificationSettings.notify_error = new_settings.notify_error
+    ensures: NotificationSettings.notify_idle = new_settings.notify_idle
+
+    @guidance
+        -- PUT /api/settings/notifications { enabled, notify_task_approval, ... }
+        -- Settings are persisted server-side (notification_settings table).
+}
+
+rule RequestBrowserPermission {
+    when: UserRequestsPermission
+
+    requires: BrowserPermission = default
+
+    ensures: BrowserPermissionPrompted
+
+    @guidance
+        -- Notification.requestPermission().then(permission => { ... })
+        -- Can only be called from a user gesture (click handler).
+        -- If permission is "denied", cannot re-prompt -- show guidance
+        -- to change it in browser settings.
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface NotificationSettingsPanel {
+    facing user: bedrock/User
+
+    context settings: NotificationSettings
+
+    exposes:
+        settings.enabled
+        settings.notify_task_approval
+        settings.notify_question
+        settings.notify_error
+        settings.notify_idle
+        BrowserPermission
+
+    provides:
+        UpdateNotificationSettings(new_settings)
+        RequestBrowserPermission
+            when BrowserPermission = default
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- When master toggle is off, no notifications fire regardless of per-event settings.
+invariant MasterToggleOverrides {
+    not NotificationSettings.enabled implies
+        for event in NotificationEvents:
+            not BrowserNotificationShown(event)
+}
+
+-- Notifications never fire when the tab is focused.
+invariant NoNotificationWhenFocused {
+    tab_is_focused implies
+        for event in NotificationEvents:
+            not BrowserNotificationShown(event)
+}
+
+-- Duplicate notifications for the same conversation are collapsed.
+-- (Enforced by using conversation.id as the Notification tag.)
+invariant NoDuplicateNotifications {
+    for a in BrowserNotifications:
+        for b in BrowserNotifications:
+            a != b implies a.conversation != b.conversation
+}
