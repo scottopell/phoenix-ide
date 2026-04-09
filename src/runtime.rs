@@ -260,17 +260,46 @@ impl RuntimeManager {
             "Spawning sub-agent"
         );
 
-        // 1. Create conversation in DB
+        // 1. Look up parent conversation to inherit its conv_mode
+        let parent_conv = match self.db.get_conversation(&parent_conversation_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to look up parent conversation");
+                let _ = parent_event_tx
+                    .send(Event::SubAgentResult {
+                        agent_id: spec.agent_id,
+                        outcome: SubAgentOutcome::Failure {
+                            error: format!("Failed to look up parent conversation: {e}"),
+                            error_kind: crate::db::ErrorKind::SubAgentError,
+                        },
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        // Derive sub-agent conv_mode from spec.mode + parent's mode.
+        // Explore sub-agents are always Explore. Work sub-agents inherit
+        // the parent's Work mode (branch, base_branch, worktree_path).
+        let sub_conv_mode = match spec.mode {
+            SubAgentMode::Explore => ConvMode::Explore,
+            SubAgentMode::Work => parent_conv.conv_mode.clone(),
+        };
+
+        // 2. Create conversation in DB with correct conv_mode
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
             .db
-            .create_conversation(
+            .create_conversation_with_project(
                 &spec.agent_id,
                 &slug,
                 &spec.cwd,
                 false, // user_initiated = false
                 Some(&parent_conversation_id),
                 Some(&spec.model_id), // inherit parent's model
+                None,                 // project_id
+                &sub_conv_mode,
+                None,                 // desired_base_branch
             )
             .await
         {
@@ -321,6 +350,7 @@ impl RuntimeManager {
             context_window,
         );
         conv_context.max_turns = spec.max_turns;
+        conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
 
         // 4. Create channels for the sub-agent runtime
         let (event_tx, event_rx) = mpsc::channel(32);

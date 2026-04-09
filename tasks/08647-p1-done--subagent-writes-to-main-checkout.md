@@ -1,7 +1,7 @@
 ---
 created: 2025-07-05
 priority: p1
-status: ready
+status: done
 artifact: src/runtime/executor.rs
 ---
 

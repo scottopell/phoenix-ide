@@ -1,7 +1,7 @@
 ---
 created: 2026-04-07
 priority: p2
-status: ready
+status: done
 artifact: src/system_prompt.rs
 ---
 

@@ -440,6 +440,9 @@ pub fn build_system_prompt_with_home(
                 base_branch,
                 worktree_path,
             } => {
+                let task_prefix = taskmd_core::ids::prefix_for(
+                    &std::path::PathBuf::from(&worktree_path).join("tasks"),
+                );
                 let _ = write!(
                     prompt,
                     "\n\nYou are in Work mode on branch {branch_name}, targeting \
@@ -447,6 +450,8 @@ pub fn build_system_prompt_with_home(
                      Your working directory is {worktree_path}. All file edits and \
                      bash commands MUST stay inside this worktree. Do NOT modify \
                      files in the main checkout or repo root.\n\
+                     Your task ID prefix is {task_prefix}. Task files in this worktree \
+                     use IDs starting with {task_prefix} (e.g., {task_prefix}001).\n\
                      Use bash and the patch tool to make changes.\n\n\
                      When the work is complete, let the user know. They will initiate \
                      the merge to {base_branch} when ready. Task-file status renames \
@@ -926,5 +931,6 @@ mod tests {
         assert!(prompt.contains("/home/user/project/worktrees/abc123"));
         assert!(prompt.contains("MUST stay inside this worktree"));
         assert!(prompt.contains("Task-file status renames"));
+        assert!(prompt.contains("Your task ID prefix is"));
     }
 }
