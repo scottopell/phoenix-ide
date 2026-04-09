@@ -26,6 +26,7 @@ import {
   ChevronDown,
   Check,
   XCircle,
+  Loader2,
 } from 'lucide-react';
 
 // Reuse ReviewNote type shape
@@ -186,6 +187,7 @@ export function TaskApprovalReader({
 }: TaskApprovalReaderProps) {
   useRegisterFocusScope('task-approval');
 
+  const [approving, setApproving] = useState(false);
   const [notes, setNotes] = useState<ReviewNote[]>([]);
   const [annotatingLine, setAnnotatingLine] = useState<{
     lineNumber: number;
@@ -448,10 +450,23 @@ export function TaskApprovalReader({
         </button>
         <button
           className="task-approval-btn task-approval-btn--approve"
-          onClick={onApprove}
+          disabled={approving}
+          onClick={() => {
+            setApproving(true);
+            onApprove();
+          }}
         >
-          <Check size={18} />
-          Approve
+          {approving ? (
+            <>
+              <Loader2 size={18} className="spinning" />
+              Approving...
+            </>
+          ) : (
+            <>
+              <Check size={18} />
+              Approve
+            </>
+          )}
         </button>
       </div>
 
