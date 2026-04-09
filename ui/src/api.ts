@@ -614,6 +614,20 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to enable MCP server');
   },
 
+  /** Fetch conversation data via share token (REQ-AUTH-006) */
+  async getSharedConversation(token: string): Promise<{
+    conversation: Conversation;
+    messages: Message[];
+    agent_working: boolean;
+    display_state: string;
+    context_window_size: number;
+  }> {
+    const resp = await fetch(`/api/share/${encodeURIComponent(token)}/conversation`);
+    if (resp.status === 404) throw new Error('Share link not found or has been revoked');
+    if (!resp.ok) throw new Error('Failed to load shared conversation');
+    return resp.json();
+  },
+
   streamConversation(
     convId: string,
     onEvent: (eventType: SseEventType, data: SseEventData) => void

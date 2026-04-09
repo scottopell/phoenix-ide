@@ -30,7 +30,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     middleware,
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -147,6 +147,14 @@ pub fn create_router(state: AppState) -> Router {
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
+        // Share mode (REQ-AUTH-004 through REQ-AUTH-008)
+        .route("/share/c/:slug", get(create_or_redirect_share))
+        .route("/s/:token", get(serve_share_page))
+        .route(
+            "/api/share/:token/conversation",
+            get(get_shared_conversation),
+        )
+        .route("/api/share/:token/events", get(shared_sse_stream))
         // Auth middleware — runs before all route handlers (REQ-AUTH-001)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3032,6 +3040,188 @@ fn generate_slug() -> String {
     let noun = words.choose(&mut rng).unwrap_or(&"sky");
 
     format!("{day}-{time}-{adjective}-{noun}")
+}
+
+// ============================================================
+// Share Mode (REQ-AUTH-004 through REQ-AUTH-008)
+// ============================================================
+
+/// Create a share token for a conversation (by slug) and redirect to the share URL.
+///
+/// REQ-AUTH-004: If a token already exists, reuses it. Always redirects to `/s/{token}`.
+async fn create_or_redirect_share(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Redirect, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation_by_slug(&slug)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let token = state
+        .db
+        .create_share_token(&conversation.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Redirect::to(&format!("/s/{token}")))
+}
+
+/// Serve the SPA for a share link. The frontend handles rendering in read-only mode.
+///
+/// REQ-AUTH-005: Validates that the token exists before serving the page.
+async fn serve_share_page(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    // Validate token exists
+    state
+        .db
+        .get_share_token_by_token(&token)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| {
+            AppError::NotFound("Share link not found or has been revoked".to_string())
+        })?;
+
+    match get_index_html() {
+        Some(content) => Ok(Html(content).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Html("<h1>404 - UI not found. Build with: cd ui && npm run build</h1>".to_string()),
+        )
+            .into_response()),
+    }
+}
+
+/// Return conversation data + messages for a shared conversation.
+///
+/// REQ-AUTH-006: Validates share token instead of password.
+async fn get_shared_conversation(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
+    let (conversation_id, _) = state
+        .db
+        .get_share_token_by_token(&token)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Invalid share token".to_string()))?;
+
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let messages = state
+        .runtime
+        .db()
+        .get_messages(&conversation_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
+
+    let context_window_size = messages
+        .iter()
+        .filter_map(|m| m.usage_data.as_ref())
+        .next_back()
+        .map_or(0, crate::db::UsageData::context_window_used);
+
+    Ok(Json(ConversationWithMessagesResponse {
+        conversation: conversation_to_json(&conversation),
+        messages: json_msgs,
+        agent_working: conversation.is_agent_working(),
+        display_state: conversation.state.display_state().as_str().to_string(),
+        context_window_size,
+    }))
+}
+
+/// SSE stream for a shared conversation. Validates token, then subscribes.
+///
+/// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
+async fn shared_sse_stream(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let (conversation_id, _) = state
+        .db
+        .get_share_token_by_token(&token)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Invalid share token".to_string()))?;
+
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let messages = state
+        .runtime
+        .db()
+        .get_messages(&conversation_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let last_sequence_id = state
+        .runtime
+        .db()
+        .get_last_sequence_id(&conversation_id)
+        .await
+        .unwrap_or(0);
+
+    let context_window_size = messages
+        .iter()
+        .filter_map(|m| m.usage_data.as_ref())
+        .next_back()
+        .map_or(0, crate::db::UsageData::context_window_used);
+
+    let breadcrumbs = extract_breadcrumbs(&messages);
+
+    let handle = state
+        .runtime
+        .get_or_create(&conversation_id)
+        .await
+        .map_err(AppError::Internal)?;
+    let broadcast_rx = handle.broadcast_tx.subscribe();
+
+    let model_id = conversation
+        .model
+        .as_deref()
+        .unwrap_or(state.llm_registry.default_model_id());
+    let model_context_window = state.llm_registry.context_window(model_id);
+
+    let project_name = if let Some(ref project_id) = conversation.project_id {
+        state.db.get_project(project_id).await.ok().and_then(|p| {
+            std::path::Path::new(&p.canonical_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    } else {
+        None
+    };
+
+    let init_event = SseEvent::Init {
+        conversation: Box::new(enrich_conversation(&conversation)),
+        messages,
+        agent_working: conversation.is_agent_working(),
+        display_state: conversation.state.display_state().as_str().to_string(),
+        last_sequence_id,
+        context_window_size,
+        model_context_window,
+        breadcrumbs,
+        commits_behind: 0,
+        commits_ahead: 0,
+        project_name,
+    };
+
+    Ok(sse_stream(init_event, broadcast_rx))
 }
 
 // ============================================================

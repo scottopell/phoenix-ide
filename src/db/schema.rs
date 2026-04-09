@@ -97,6 +97,19 @@ CREATE TABLE IF NOT EXISTS mcp_disabled_servers (
 );
 ";
 
+/// Migration SQL to create `share_tokens` table (REQ-AUTH-008).
+pub const MIGRATION_CREATE_SHARE_TOKENS: &str = r"
+CREATE TABLE IF NOT EXISTS share_tokens (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_share_tokens_token ON share_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_share_tokens_conversation ON share_tokens(conversation_id);
+";
+
 /// Migration SQL to add `local_id` column for idempotent message sends
 /// Migration to rename `messages.id` to `messages.message_id`
 /// `SQLite` 3.25+ supports ALTER TABLE RENAME COLUMN

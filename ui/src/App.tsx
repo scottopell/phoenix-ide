@@ -4,6 +4,7 @@ import { ConversationListPage } from './pages/ConversationListPage';
 import { ConversationPage } from './pages/ConversationPage';
 import { NewConversationPage } from './pages/NewConversationPage';
 import { LoginPage } from './pages/LoginPage';
+import { SharePage } from './pages/SharePage';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -29,13 +30,20 @@ function AppRoutes() {
 
   return (
     <>
-      <DesktopLayout>
-        <Routes>
-          <Route path="/" element={<ConversationListPage />} />
-          <Route path="/new" element={<NewConversationPage />} />
-          <Route path="/c/:slug" element={<ConversationPage />} />
-        </Routes>
-      </DesktopLayout>
+      <Routes>
+        {/* Share view: minimal layout, no sidebar, no auth required */}
+        <Route path="/s/:token" element={<SharePage />} />
+        {/* Main app routes: full layout with sidebar */}
+        <Route path="*" element={
+          <DesktopLayout>
+            <Routes>
+              <Route path="/" element={<ConversationListPage />} />
+              <Route path="/new" element={<NewConversationPage />} />
+              <Route path="/c/:slug" element={<ConversationPage />} />
+            </Routes>
+          </DesktopLayout>
+        } />
+      </Routes>
       <ShortcutHelpPanel visible={showHelp} onClose={() => setShowHelp(false)} />
     </>
   );

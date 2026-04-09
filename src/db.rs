@@ -7,7 +7,8 @@ mod schema;
 pub use schema::*;
 use schema::{
     MIGRATION_CREATE_MCP_DISABLED_SERVERS, MIGRATION_CREATE_PROJECTS,
-    MIGRATION_REMOVE_UNKNOWN_ERROR_KIND, MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
+    MIGRATION_CREATE_SHARE_TOKENS, MIGRATION_REMOVE_UNKNOWN_ERROR_KIND,
+    MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
 };
 
 use chrono::{DateTime, Utc};
@@ -122,6 +123,11 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Create share_tokens table (REQ-AUTH-008, idempotent via IF NOT EXISTS)
+        let _ = sqlx::raw_sql(MIGRATION_CREATE_SHARE_TOKENS)
+            .execute(&self.pool)
+            .await;
+
         Ok(())
     }
 
@@ -148,6 +154,76 @@ impl Database {
     pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
         sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
             .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Share Token Operations (REQ-AUTH-008) ====================
+
+    /// Create a share token for a conversation, or return existing one.
+    ///
+    /// Returns the token string. If a token already exists for this conversation,
+    /// returns it instead of creating a duplicate.
+    pub async fn create_share_token(&self, conversation_id: &str) -> DbResult<String> {
+        // Check for existing token first
+        if let Some(existing) = self
+            .get_share_token_by_conversation(conversation_id)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO share_tokens (id, conversation_id, token, created_at) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&id)
+        .bind(conversation_id)
+        .bind(&token)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(token)
+    }
+
+    /// Look up a share token record by its token string.
+    ///
+    /// Returns `(conversation_id, token)` if found, `None` otherwise.
+    pub async fn get_share_token_by_token(
+        &self,
+        token: &str,
+    ) -> DbResult<Option<(String, String)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT conversation_id, token FROM share_tokens WHERE token = ?1")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Get the share token for a conversation, if one exists.
+    pub async fn get_share_token_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT token FROM share_tokens WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(t,)| t))
+    }
+
+    /// Delete the share token for a conversation (revoke sharing).
+    #[allow(dead_code)] // Will be used by future revoke-share endpoint
+    pub async fn delete_share_token(&self, conversation_id: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM share_tokens WHERE conversation_id = ?1")
+            .bind(conversation_id)
             .execute(&self.pool)
             .await?;
         Ok(())

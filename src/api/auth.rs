@@ -84,8 +84,9 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
-    // Share routes (Phase 2) — exempt so read-only shares work without auth
-    if path.starts_with("/s/") {
+    // Share routes — exempt so read-only shares work without auth
+    // /s/{token} serves the share page, /api/share/{token}/* serves share API
+    if path.starts_with("/s/") || path.starts_with("/api/share/") {
         return true;
     }
 
