@@ -67,9 +67,44 @@ def _detect_api_url() -> str:
 
 
 class PhoenixClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, password: str | None = None):
         self.base_url = base_url.rstrip('/')
-        self.http = httpx.Client(timeout=30.0)
+        self.password = password
+        cookies = {"phoenix-auth": password} if password else {}
+        self.http = httpx.Client(timeout=30.0, cookies=cookies)
+
+    def check_auth(self) -> dict:
+        """Check auth status. Returns { auth_required, authenticated }."""
+        resp = self.http.get(f"{self.base_url}/api/auth/status")
+        resp.raise_for_status()
+        return resp.json()
+
+    def ensure_authenticated(self):
+        """Check if auth is required and we're authenticated. Prompt if needed."""
+        status = self.check_auth()
+        if not status.get('auth_required', False):
+            return  # No auth needed
+        if status.get('authenticated', False):
+            return  # Already authenticated (password in cookie worked)
+
+        # Auth required but not authenticated
+        if self.password:
+            # Password was provided but didn't work
+            raise PhoenixError(
+                "Authentication failed: incorrect password. "
+                "Check PHOENIX_PASSWORD or --password value."
+            )
+        # No password provided -- prompt
+        import getpass
+        pw = getpass.getpass("Phoenix password: ")
+        self.password = pw
+        self.http = httpx.Client(
+            timeout=30.0, cookies={"phoenix-auth": pw}
+        )
+        # Verify
+        status = self.check_auth()
+        if not status.get('authenticated', False):
+            raise PhoenixError("Authentication failed: incorrect password.")
 
     def get_conversation(self, id_or_slug: str) -> dict:
         """Get conversation by ID or slug."""
@@ -149,7 +184,8 @@ class PhoenixClient:
             pool=10.0,
         )
 
-        with httpx.Client(timeout=sse_timeout) as client:
+        cookies = {"phoenix-auth": self.password} if self.password else {}
+        with httpx.Client(timeout=sse_timeout, cookies=cookies) as client:
             with connect_sse(client, "GET", url) as event_source:
                 for event in event_source.iter_sse():
                     # Check overall timeout
@@ -353,7 +389,9 @@ def format_response(data: dict) -> str:
 @click.option('--timeout', default=600, help='Timeout in seconds')
 @click.option('--poll-interval', default=1.0, help='Polling interval in seconds (with --poll)')
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
-def main(message, conversation, directory, images, model, list_models, list_projects, api_url, timeout, poll_interval, poll):
+@click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
+              help='Password for authenticated access (or set PHOENIX_PASSWORD)')
+def main(message, conversation, directory, images, model, list_models, list_projects, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -383,7 +421,8 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         phoenix-client.py --poll "Hello"
     """
     resolved_url = api_url or _detect_api_url()
-    client = PhoenixClient(resolved_url)
+    client = PhoenixClient(resolved_url, password=password)
+    client.ensure_authenticated()
 
     if list_models:
         data = client.get_models()
