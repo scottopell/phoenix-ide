@@ -20,7 +20,6 @@ import threading
 import time
 from pathlib import Path
 
-import taskmd
 
 ROOT = Path(__file__).parent.resolve()
 
@@ -51,7 +50,7 @@ EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
 LOCAL_AI_PROXY = "http://127.0.0.1:8462"
 
-# Dev ports: 8030-8050 range, matching Lima port forwards.
+# Dev ports: 8030-8050 range, offset by worktree path hash to avoid collisions.
 # 8031 is reserved for prod. Dev uses two blocks offset by worktree hash:
 #   Phoenix API: 8032-8040  (PORT_RANGE=9, offsets 0-8)
 #   Vite:        8041-8049  (PORT_RANGE=9, offsets 0-8)
@@ -143,8 +142,7 @@ def get_worktree_hash() -> str:
 
 def get_port_offset() -> int:
     """Get deterministic port offset from worktree path hash."""
-    h = hashlib.md5(str(ROOT).encode()).hexdigest()
-    return int(h[:4], 16) % PORT_RANGE
+    return int(get_worktree_hash()[:4], 16) % PORT_RANGE
 
 
 def get_default_ports() -> tuple[int, int]:
@@ -550,37 +548,6 @@ def cmd_check():
             results.append(("task validation", 0 if ok else 1, elapsed, ""))
             print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
-    def check_bundle_size():
-        """Build UI and fail if JS bundle exceeds size limit."""
-        BUNDLE_LIMIT_KB = 1200  # raise consciously when adding large deps
-        t0 = time.monotonic()
-        proc = subprocess.run(
-            ["npx", "vite", "build"],
-            cwd=UI_DIR, capture_output=True, text=True,
-        )
-        elapsed = time.monotonic() - t0
-        if proc.returncode != 0:
-            with results_lock:
-                results.append(("bundle size", 1, elapsed, proc.stderr.strip()))
-                print(f"  \u2717 {'bundle size':<18s} ({elapsed:.1f}s)")
-            return
-        # Parse the JS chunk size from vite output
-        import re as _re
-        js_match = _re.search(r'index-\S+\.js\s+([\d,]+(?:\.\d+)?)\s+kB', proc.stdout)
-        if not js_match:
-            # Can't parse — pass with warning
-            with results_lock:
-                results.append(("bundle size", 0, elapsed, ""))
-                print(f"  \u2713 {'bundle size':<18s} ({elapsed:.1f}s)")
-            return
-        size_kb = float(js_match.group(1).replace(",", ""))
-        ok = size_kb <= BUNDLE_LIMIT_KB
-        msg = f"{size_kb:.0f} KB" + (f" (limit: {BUNDLE_LIMIT_KB} KB)" if not ok else "")
-        with results_lock:
-            sym = "\u2713" if ok else "\u2717"
-            results.append(("bundle size", 0 if ok else 1, elapsed, msg if not ok else ""))
-            print(f"  {sym} {'bundle size':<18s} ({elapsed:.1f}s) {size_kb:.0f} KB")
-
     def check_ast_grep():
         """Run structural lint rules via ast-grep (one result entry per rule file)."""
         import shutil
@@ -600,7 +567,7 @@ def cmd_check():
                 "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
             ])
 
-    print("Running 9 checks in parallel...\n")
+    print("Running checks in parallel...\n")
 
     threads = [
         threading.Thread(target=lane_rust),
@@ -677,6 +644,7 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
 
     Returns True if all tasks pass, False otherwise.
     """
+    import taskmd
     tasks_dir = ROOT / "tasks"
     result = taskmd.validate(tasks_dir)
 
@@ -698,6 +666,7 @@ def cmd_tasks_fix() -> bool:
 
     Returns True if all files are now correct, False on errors.
     """
+    import taskmd
     tasks_dir = ROOT / "tasks"
     result = taskmd.fix(tasks_dir)
 
@@ -762,7 +731,7 @@ def check_systemd_available() -> bool:
             capture_output=True, text=True, timeout=5
         )
         return result.returncode == 0 and "systemd" in result.stdout.strip()
-    except:
+    except Exception:
         return False
 
 
@@ -863,22 +832,16 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
 
 
 # =============================================================================
-# Systemd Unit Generation (shared by native and Lima)
+# Systemd Unit Generation
 # =============================================================================
 
 @dataclasses.dataclass
 class SystemdConfig:
-    """Configuration for systemd unit generation.
-    
-    Using a dataclass ensures native and Lima deployments use identical
-    unit file structure - they can only differ in these explicit parameters.
-    """
+    """Configuration for systemd unit generation."""
     user: str
     db_path: str
     install_dir: str
     port: int
-    # For Lima: uses EnvironmentFile for API key; for native: uses LLM_GATEWAY env var
-    env_file: str | None = None
     llm_gateway: str | None = None
     # When set, injects Environment=HOME=<path> so the service user can find
     # ~/.claude/.credentials.json for per-request OAuth token reads.
@@ -952,10 +915,7 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
         f"Environment=PHOENIX_VERSION={version}",
     ]
 
-    if config.env_file:
-        # Lima mode: use EnvironmentFile for API key
-        env_lines.insert(0, f"EnvironmentFile={config.env_file}")
-    elif config.llm_gateway:
+    if config.llm_gateway:
         # Native mode: use LLM_GATEWAY directly
         env_lines.append(f"Environment=LLM_GATEWAY={config.llm_gateway}")
 
@@ -1002,7 +962,7 @@ def native_prod_deploy(version: str | None = None):
         print("This system is running in a container or non-systemd environment.", file=sys.stderr)
         print("Options:", file=sys.stderr)
         print("  - Use './dev.py up' for development mode instead", file=sys.stderr)
-        print("  - Use './dev.py lima create' to set up a Lima VM with systemd", file=sys.stderr)
+        print("  - This system does not have systemd available", file=sys.stderr)
         sys.exit(1)
 
     # Build
