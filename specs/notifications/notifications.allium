@@ -118,6 +118,54 @@ rule DetectAgentFinished {
 }
 
 ------------------------------------------------------------
+-- Rules: Catch-Up on SSE Reconnect
+------------------------------------------------------------
+
+-- When SSE reconnects (tab woke up, network restored, page refreshed),
+-- check all conversations for states that need attention. Fire
+-- notifications for any that were missed while the tab was suspended.
+
+rule CatchUpOnReconnect {
+    when: SseReconnected
+
+    for conversation in Conversations where not is_sub_agent:
+        let state = conversation.status
+
+        ensures: NotificationEvent(
+            type: task_approval_needed,
+            conversation: conversation,
+            title: "Task approval needed",
+            body: conversation.slug
+        ) if state = awaiting_task_approval
+
+        ensures: NotificationEvent(
+            type: question_asked,
+            conversation: conversation,
+            title: "Question asked",
+            body: conversation.slug
+        ) if state = awaiting_user_response
+
+        ensures: NotificationEvent(
+            type: agent_error,
+            conversation: conversation,
+            title: "Agent error",
+            body: conversation.slug
+        ) if state in { error, context_exhausted }
+
+    -- Intentionally does NOT notify for idle conversations on reconnect.
+    -- Idle is only notification-worthy on live transition (busy -> idle).
+    -- On catch-up, idle is ambiguous (may have been idle for hours).
+
+    @guidance
+        -- Implementation: in the SSE init handler (which fires on every
+        -- connect/reconnect), iterate the conversation list and check
+        -- each conversation's state. Use the same DeliverNotification
+        -- pipeline (checks settings, permission, tab focus).
+        -- This runs AFTER the conversation list is loaded from the init
+        -- event, so all data is available.
+}
+
+------------------------------------------------------------
 -- Rules: Notification Delivery
 ------------------------------------------------------------
 
