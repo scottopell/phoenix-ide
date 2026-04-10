@@ -63,7 +63,7 @@ if ! command -v x86_64-linux-musl-gcc &>/dev/null; then
 fi
 
 if ! command -v node &>/dev/null; then
-    MISSING_PKGS+=(nodejs npm)
+    MISSING_PKGS+=(nodejs)
 fi
 
 if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
