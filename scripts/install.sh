@@ -38,6 +38,12 @@ need_cmd() {
     command -v "$1" &>/dev/null || die "Required command not found: $1"
 }
 
+run() {
+    # Print the command, then run it with full output visible
+    printf '\033[0;90m  $ %s\033[0m\n' "$*"
+    "$@"
+}
+
 # ── os check ─────────────────────────────────────────────────────────────────
 
 [[ "$(uname -s)" == "Linux" ]]  || die "Linux only (got $(uname -s))"
@@ -63,12 +69,11 @@ fi
 if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
     info "Installing: ${MISSING_PKGS[*]}"
     need_cmd apt-get
-    # Add NodeSource LTS repo if nodejs is missing
     if ! command -v node &>/dev/null; then
         info "Adding NodeSource LTS repo"
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | run sudo -E bash -
     fi
-    sudo apt-get install -y "${MISSING_PKGS[@]}"
+    run sudo apt-get install -y "${MISSING_PKGS[@]}"
     ok "System packages installed"
 else
     ok "System packages present"
@@ -79,10 +84,9 @@ fi
 info "Checking uv"
 if ! command -v uv &>/dev/null; then
     info "Installing uv"
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    # uv installs to ~/.local/bin — make sure it's on PATH for this session
+    run curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
-    ok "uv installed"
+    ok "uv installed ($(uv --version))"
 else
     ok "uv present ($(uv --version))"
 fi
@@ -92,13 +96,11 @@ fi
 info "Checking Rust toolchain"
 if ! command -v cargo &>/dev/null; then
     info "Installing rustup"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-    # Source for this session
+    run curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
     # shellcheck source=/dev/null
     source "$HOME/.cargo/env"
     ok "Rust installed ($(rustc --version))"
 else
-    # Source cargo env in case this shell doesn't have it yet
     # shellcheck source=/dev/null
     [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
     ok "Rust present ($(rustc --version))"
@@ -106,7 +108,7 @@ fi
 
 info "Checking musl target"
 if ! rustup target list --installed | grep -q x86_64-unknown-linux-musl; then
-    rustup target add x86_64-unknown-linux-musl
+    run rustup target add x86_64-unknown-linux-musl
     ok "musl target added"
 else
     ok "musl target present"
@@ -116,10 +118,10 @@ fi
 
 info "Fetching phoenix-ide source"
 if [[ -d "$BUILD_DIR/.git" ]]; then
-    git -C "$BUILD_DIR" pull --ff-only --depth 1
+    run git -C "$BUILD_DIR" pull --ff-only --depth 1
     ok "Repo updated ($(git -C "$BUILD_DIR" rev-parse --short HEAD))"
 else
-    git clone --depth 1 "$REPO_URL" "$BUILD_DIR"
+    run git clone --depth 1 "$REPO_URL" "$BUILD_DIR"
     ok "Repo cloned ($(git -C "$BUILD_DIR" rev-parse --short HEAD))"
 fi
 
@@ -135,11 +137,10 @@ ok "Auth config written to $ENV_FILE"
 
 # ── deploy ────────────────────────────────────────────────────────────────────
 
-info "Building and deploying (this takes ~60s on first run)"
+info "Building and deploying (this takes a few minutes on first run)"
 cd "$BUILD_DIR"
-# Ensure cargo + uv are on PATH inside this subshell
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-./dev.py prod deploy
+run ./dev.py prod deploy
 
 # ── done ─────────────────────────────────────────────────────────────────────
 
