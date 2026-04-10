@@ -75,6 +75,20 @@ Multi-provider LLM support routes through either the Anthropic API or an exe.dev
 ./dev.py lima destroy  # tear down VM
 ```
 
+### Publishing a Release
+
+```bash
+./scripts/tag-release.sh v0.2.0   # validates clean tree, creates annotated tag, pushes
+```
+
+Pushing a `v*` tag triggers CI (`.github/workflows/release.yml`) which builds a static
+`x86_64-unknown-linux-musl` binary and publishes it as a GitHub Release asset. The stable
+download URL is:
+
+```
+https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x86_64-unknown-linux-musl
+```
+
 ## Environment Variables
 
 | Variable | Purpose | Default |

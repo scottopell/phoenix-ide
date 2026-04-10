@@ -43,3 +43,26 @@ For full details on each mode (ports, paths, log locations, LLM config), read th
 - **Lima VM (macOS):** read `skills/phoenix-deployment/LIMA.md`
 - **Native systemd (Linux):** read `skills/phoenix-deployment/SYSTEMD.md`
 - **Daemon (Linux, no systemd):** read `skills/phoenix-deployment/DAEMON.md`
+
+## Publishing a Release (GitHub)
+
+To publish a new versioned binary to GitHub Releases:
+
+```bash
+./scripts/tag-release.sh v0.2.0
+```
+
+This script:
+1. Validates the tag is in `vX.Y.Z` format
+2. Checks for a clean working tree
+3. Creates an annotated git tag and pushes it
+
+Pushing the tag triggers `.github/workflows/release.yml`, which:
+- Builds the UI (`npm ci && npm run build`)
+- Compiles a static `x86_64-unknown-linux-musl` binary
+- Creates a GitHub Release with the binary as an asset
+
+The stable download URL:
+```
+https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x86_64-unknown-linux-musl
+```
