@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-REPO_URL="git@github.com:scottopell/phoenix-ide.git"
+REPO_URL="https://github.com/scottopell/phoenix-ide.git"
 BUILD_DIR="$HOME/.phoenix-ide-build"
 PORT=8031
 
