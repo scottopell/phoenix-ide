@@ -65,9 +65,10 @@ if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
     need_cmd apt-get
     # Add NodeSource LTS repo if nodejs is missing
     if ! command -v node &>/dev/null; then
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - >/dev/null 2>&1
+        info "Adding NodeSource LTS repo"
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
     fi
-    sudo apt-get install -y "${MISSING_PKGS[@]}" >/dev/null 2>&1
+    sudo apt-get install -y "${MISSING_PKGS[@]}"
     ok "System packages installed"
 else
     ok "System packages present"
