@@ -210,7 +210,11 @@ impl ConvMode {
     pub fn task_title(&self) -> Option<&str> {
         match self {
             Self::Work { task_title, .. } => {
-                if task_title.is_empty() { None } else { Some(task_title) }
+                if task_title.is_empty() {
+                    None
+                } else {
+                    Some(task_title)
+                }
             }
             Self::Explore | Self::Direct => None,
         }

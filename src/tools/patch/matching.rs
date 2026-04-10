@@ -108,7 +108,7 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<EditSpec> {
 
 /// Find match using Unicode TR39 confusable skeleton mapping.
 ///
-/// Maps both content and old_text to their "skeleton" forms (visually
+/// Maps both content and `old_text` to their "skeleton" forms (visually
 /// confusable characters collapse to a common representation), then
 /// finds the match in skeleton space and maps the offset back to the
 /// original content's byte positions.

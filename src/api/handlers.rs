@@ -2814,7 +2814,12 @@ async fn list_conversation_tasks(
     let tasks_dir = cwd.join("tasks");
 
     // Build task_id -> conversation_slug map from active Work conversations
-    let all_convs = state.runtime.db().list_conversations().await.unwrap_or_default();
+    let all_convs = state
+        .runtime
+        .db()
+        .list_conversations()
+        .await
+        .unwrap_or_default();
     let task_to_slug: std::collections::HashMap<String, String> = all_convs
         .iter()
         .filter_map(|c| {
