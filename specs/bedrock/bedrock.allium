@@ -6,7 +6,8 @@
 -- Scope: Core conversation lifecycle state machine
 -- Includes: Conversation status transitions, mode system, tool execution,
 --           cancellation, error recovery, sub-agent lifecycle, task approval,
---           user questions, context continuation, terminal states
+--           user questions, context continuation, terminal states,
+--           lifecycle event announcements for downstream spec consumption
 -- Excludes:
 --   - Git operations (see projects spec)
 --   - Individual tool implementations (bash, patch, etc.)
@@ -1073,6 +1074,32 @@ rule TaskResolved {
     requires: conversation.mode = work
 
     ensures: conversation.status = terminal
+    ensures: ConversationBecameTerminal(conversation)
+}
+
+-- Lifecycle announcement: emitted whenever any conversation reaches a terminal
+-- state (context_exhausted, terminal, completed, failed).
+-- Downstream specs (terminal, metrics, etc.) subscribe to this rather than
+-- watching conversation.is_terminal directly, making the cross-spec contract
+-- explicit and navigable. See specs/terminal/terminal.allium for the canonical
+-- consumer. See tasks/08658 for the design rationale behind this choice.
+rule ConversationReachedTerminalState {
+    when: conversation: Conversation.is_terminal becomes true
+
+    ensures: ConversationBecameTerminal(conversation)
+
+    @guidance
+        -- This relay rule exists solely to convert the structural derived-value
+        -- transition into a named, subscribable lifecycle event.
+        -- All rules that set status to a terminal value (context_exhausted,
+        -- terminal, completed, failed) could alternatively each emit
+        -- ConversationBecameTerminal directly. The relay pattern is preferred
+        -- here because it is DRY: new terminal-state transitions added to bedrock
+        -- are automatically covered without remembering to add the emission.
+        -- The tradeoff: the relay rule fires on ANY terminal-state entry,
+        -- including sub-agent completed/failed states. Downstream consumers
+        -- should check conversation.is_sub_agent if they care only about
+        -- top-level conversations.
 }
 
 -- Absorb stale events in terminal states silently

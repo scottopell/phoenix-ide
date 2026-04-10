@@ -1,0 +1,501 @@
+-- allium: 3
+-- terminal.allium
+--
+-- Phoenix Terminal: Behavioural Specification
+--
+-- Scope: PTY-backed browser terminal per conversation
+-- Includes: Terminal session lifecycle, PTY spawn, WebSocket I/O relay,
+--           resize handling, vt100 screen parser, read_terminal agent tool,
+--           session teardown, conversation-terminal cascade,
+--           authentication identity precondition (session-scoped user)
+-- Excludes:
+--   - UI panel placement (deferred to implementation)
+--   - Scrollback persistence (ephemeral; tmux integration deferred)
+--   - Shell integration markers / OSC 133 (v2)
+--   - macOS PTY kqueue considerations (Linux target for v1)
+--   - Multiple terminals per conversation (exactly one)
+--   - PTY privilege escalation (API runs as same Unix user as shell)
+--   - WebSocket auth mechanism specifics (cookie vs header; see design.md)
+--
+-- Requirement traceability: REQ-TERM-001 through REQ-TERM-014
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- A user is identified by a valid API session. The same session mechanism
+-- used by all other API endpoints applies to the WebSocket upgrade request.
+-- The auth mechanism (cookie, bearer header) is an implementation detail
+-- specified in design.md. Allium governs the identity precondition: only
+-- a session-authenticated user may open or close a terminal.
+actor User {
+    identified_by: ApiSession
+}
+
+-- An LLM agent running within a conversation may read terminal contents.
+-- Agents do not open or close terminals.
+actor LlmAgent {
+    identified_by: bedrock/Conversation
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The kernel PTY subsystem: line discipline, SIGHUP chain, SIGWINCH delivery.
+-- This spec does not govern kernel internals, only what the API triggers.
+external entity KernelPty {
+}
+
+-- The browser terminal emulator. Sends/receives binary WebSocket frames.
+-- FitAddon computes cols/rows from the DOM on connect and on resize.
+external entity XtermJs {
+    cols: Integer
+    rows: Integer
+}
+
+-- The user's shell process. Holds the PTY slave fd as its controlling terminal.
+-- Has no awareness of WebSocket, xterm.js, or the API server.
+external entity ShellProcess {
+    pid: Integer
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value TerminalDimensions {
+    cols: Integer    -- must be > 0
+    rows: Integer    -- must be > 0
+}
+
+-- WebSocket binary frame (type-prefixed).
+-- 0x00 | <raw bytes>            PTY data (bidirectional)
+-- 0x01 | u16be cols | u16be rows  Resize (client → server only)
+value WsFrame {
+    kind: data | resize
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- (none beyond Terminal.status)
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Terminal {
+    -- The conversation this terminal is scoped to.
+    conversation: bedrock/Conversation
+
+    -- Lifecycle state.
+    status: absent | active
+
+    transitions status {
+        absent -> active
+        active -> absent
+        -- "absent" is both the initial and terminal state.
+        -- A new WebSocket connection on a conversation with status=absent
+        -- opens a fresh terminal. Closing returns to absent.
+    }
+
+    -- Fields present only while active (REQ-TERM-001, REQ-TERM-010).
+    master_fd:  OwnedFd            when status = active
+    child_pid:  Pid                when status = active
+    dimensions: TerminalDimensions when status = active
+    parser:     Vt100Parser        when status = active
+        -- parser.dimensions = terminal.dimensions at all times (ParserDimensionSync)
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    quiescence_debounce: Duration = 300.ms
+    -- After PTY output goes quiet for this duration, the parser state is
+    -- considered stable. Used as an optimisation hint for agent reads.
+
+    output_channel_bound: Integer = 4096
+    -- Maximum bytes buffered in the master-fd→WebSocket channel before backpressure.
+    -- Prevents fast producers (yes, large cat) from unboundedly queuing.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- REQ-TERM-001, REQ-TERM-002: Terminal opened, PTY spawned
+rule TerminalOpened {
+    when: UserOpensTerminal(conversation)
+
+    requires: not conversation.is_terminal
+    requires: Terminal(conversation).status = absent
+
+    ensures: terminal: Terminal.status = active
+    ensures: terminal.parser = Vt100Parser.initialized(dimensions: terminal.dimensions)
+    ensures: PtySpawned(terminal)
+
+    @guidance
+        -- Spawn sequence (run in spawn_blocking or before async handoff):
+        --   1. openpty() → master_fd + slave_fd
+        --   2. fork()
+        --      [child]:
+        --        setsid()                      new session, child is leader
+        --        ioctl(slave_fd, TIOCSCTTY, 0) slave becomes controlling tty
+        --        dup2(slave_fd, 0/1/2)         slave is stdin, stdout, stderr
+        --        close(slave_fd)               fd already dup'd
+        --        chdir(conversation.working_dir)  conversation working directory
+        --        -- working_dir corresponds to REQ-BED-010; same field used by projects.allium
+        --        execvp($SHELL, ["-i"])         with explicit env (REQ-TERM-002)
+        --      [parent]:
+        --        close(slave_fd)               parent must not hold slave open
+        --        store master_fd in TerminalHandle
+        --   3. Before entering normal I/O: wait for the first resize frame from
+        --      xterm.js FitAddon (REQ-TERM-005). The client sends it immediately
+        --      on connect; treat it as a required handshake, not optional input.
+        --      Apply via ResizeApplied before the shell produces its first prompt.
+        --   4. Spawn two async tasks:
+        --        Task A: loop { read(master_fd) → WS frame + parser.process() }
+        --                EIO → clean shutdown
+        --        Task B: loop { WS frame → write(master_fd) | ioctl(TIOCSWINSZ) }
+        --   5. Both tasks hold Arc<TerminalHandle>. Either exiting shuts down the other.
+}
+
+-- REQ-TERM-002: Explicit environment construction
+rule ShellEnvironmentConstructed {
+    when: PtySpawned(terminal)
+
+    ensures: ShellProcess.env = {
+        TERM:      "xterm-256color",
+        COLORTERM: "truecolor",
+        HOME:      user_home_dir(),
+        USER:      current_username(),
+        SHELL:     user_shell(),
+        PATH:      user_path(),
+        LANG:      "en_US.UTF-8",
+    }
+
+    @guidance
+        -- Do NOT inherit the API server's process environment.
+        -- The server env may contain secrets (API keys, tokens).
+        -- TERM=xterm-256color is the most critical variable:
+        -- wrong or missing causes readline degradation, broken arrow keys,
+        -- and misbehaviour in vim, htop, and similar programs.
+}
+
+-- REQ-TERM-003: Duplicate connection rejected
+rule DuplicateTerminalRejected {
+    when: UserOpensTerminal(conversation)
+
+    requires: Terminal(conversation).status = active
+
+    ensures: WebSocketUpgradeRejected(conversation, status: 409)
+
+    @guidance
+        -- Return HTTP 409 Conflict on the WebSocket upgrade request.
+        -- The UI must not offer to open a terminal when one is already active,
+        -- making this path unreachable in normal operation.
+}
+
+-- REQ-TERM-004, REQ-TERM-010: PTY output forwarded to WebSocket and parser
+rule PtyOutputForwarded {
+    when: BytesReadFromMaster(terminal, bytes)
+
+    requires: terminal.status = active
+
+    ensures: WebSocketBinaryFrameSent(terminal, prefix: 0x00, payload: bytes)
+    ensures: terminal.parser.process(bytes)
+        -- Same bytes, same order, no gaps. Both ensures fire in the same handler.
+
+    @guidance
+        -- The vt100 parser is a state machine. Dropped or reordered bytes corrupt
+        -- its state permanently for that session. The two ensures (WS send and
+        -- parser feed) must occur together with no interleaving path that skips either.
+        --
+        -- The internal master-fd→WebSocket channel is bounded to config.output_channel_bound
+        -- bytes. A slow WebSocket consumer causes backpressure that pauses reads from
+        -- master_fd, which is correct: the kernel buffers on the PTY side.
+        -- Do NOT drop bytes to relieve backpressure; the parser would become corrupt.
+}
+
+-- REQ-TERM-005: Initial resize applied before first prompt
+rule InitialResizeSent {
+    -- Triggered by the first resize frame the client sends on connect.
+    -- xterm.js FitAddon computes cols/rows from the DOM and sends this
+    -- as its first WebSocket message before any user input.
+    when: FirstResizeFrameReceived(terminal, dimensions)
+
+    requires: terminal.status = active
+
+    ensures: ResizeApplied(terminal, dimensions)
+
+    @guidance
+        -- The implementation holds off entering normal I/O loops until this
+        -- frame arrives. The client is contractually required to send it first.
+        -- "First" is defined as: no PTY output bytes have yet been forwarded
+        -- to the WebSocket. If the client sends a data frame before a resize
+        -- frame, treat the data frame normally and log a warning; the shell
+        -- will have started at its PTY default size (80×24).
+}
+
+-- REQ-TERM-006: Resize applied to PTY and parser
+rule ResizeApplied {
+    when: ResizeFrameReceived(terminal, dimensions)
+
+    requires: terminal.status = active
+    requires: dimensions.cols > 0
+    requires: dimensions.rows > 0
+
+    ensures: terminal.dimensions = dimensions
+    ensures: terminal.parser = terminal.parser.resized(dimensions)
+        -- Parser dimensions must always equal terminal dimensions (ParserDimensionSync)
+    ensures: IoctlTIOCSWINSZ(terminal.master_fd, dimensions)
+        -- Kernel delivers SIGWINCH to foreground process group automatically
+
+    @guidance
+        -- apply_resize() helper applies both the ioctl and parser.set_size() atomically
+        -- so the two never diverge between calls.
+}
+
+-- REQ-TERM-006: Invalid resize dimensions logged
+rule ResizeFrameRejected {
+    when: ResizeFrameReceived(terminal, dimensions)
+
+    requires: terminal.status = active
+    requires: dimensions.cols <= 0 or dimensions.rows <= 0
+
+    ensures: InvalidResizeDimensionsLogged(terminal, dimensions)
+        -- No state change; dimensions remain as before.
+        -- Log at tracing::warn level for debugging.
+}
+
+-- REQ-TERM-004: User input forwarded to PTY
+rule UserInputForwarded {
+    when: DataFrameReceived(terminal, bytes)
+
+    requires: terminal.status = active
+
+    ensures: BytesWrittenToMaster(terminal, bytes)
+        -- Type byte (0x00) stripped before write.
+
+    @guidance
+        -- Echo, line discipline processing, and special character dispatch
+        -- (Ctrl-C → SIGINT, Ctrl-Z → SIGTSTP, Ctrl-D → EOF) are all handled
+        -- by the kernel line discipline. This rule writes raw bytes only.
+}
+
+-- REQ-TERM-007, REQ-TERM-009: Shell exits (EIO)
+rule ShellExited {
+    when: EioOnMasterRead(terminal)
+
+    requires: terminal.status = active
+
+    ensures: ChildReaped(terminal.child_pid)
+        -- waitpid() called to prevent zombie processes
+    ensures: WebSocketClosed(terminal)
+    ensures: terminal.status = absent
+
+    @guidance
+        -- EIO is PTY EOF: the slave fd closed because the shell exited.
+        -- This is NOT an error condition. Log at tracing::debug, not error.
+        -- waitpid() belongs here (Task A) because Task A observes EIO first.
+}
+
+-- REQ-TERM-008: User closes terminal (WebSocket disconnect)
+rule UserClosedTerminal {
+    -- UserClosedTerminal is the event the surface provides (see UserTerminalAccess).
+    -- It covers both deliberate close (UI button) and WebSocket disconnect
+    -- (network drop, page refresh). From the system's perspective these are
+    -- identical: the WebSocket is gone, teardown begins.
+    when: UserClosedTerminal(terminal)
+
+    requires: terminal.status = active
+
+    ensures: MasterFdClosed(terminal)
+        -- Closing master_fd triggers kernel SIGHUP to shell's process group.
+        -- Shell receives SIGHUP and exits → slave fd closes → Task A reads EIO.
+        -- Task A then calls waitpid() to reap the child (ShellExited rule).
+    ensures: terminal.status = absent
+
+    @guidance
+        -- master_fd closure happens via Drop on TerminalHandle.
+        -- Do NOT call waitpid() here; let the reader task (Task A) observe EIO
+        -- and reap. Calling it in two places risks a race or double-reap.
+}
+
+-- REQ-TERM-011: Agent reads terminal screen
+rule TerminalScreenRead {
+    when: AgentCallsReadTerminal(conversation)
+
+    requires: Terminal(conversation).status = active
+
+    ensures: AgentReceivesScreenContents(Terminal(conversation).parser.screen().contents())
+
+    @guidance
+        -- Returns plain text from vt100::Parser::screen().contents().
+        -- Callers may read at any time; for best results read after PTY quiescence
+        -- (config.quiescence_debounce has elapsed with no new output) as that
+        -- reliably indicates a command has completed.
+}
+
+-- REQ-TERM-011: No terminal active for read request
+rule TerminalScreenReadAbsent {
+    when: AgentCallsReadTerminal(conversation)
+
+    requires: Terminal(conversation).status = absent
+
+    ensures: AgentReceivesError("no terminal is open for this conversation")
+}
+
+-- Optimisation hint: quiescence detection
+rule PtyQuiesced {
+    when: NoBytesReadFromMaster(terminal) for config.quiescence_debounce
+
+    requires: terminal.status = active
+
+    ensures: PtyIsQuiescent(terminal)
+        -- Signal available for agent polling optimisation.
+        -- Not required for correctness; callers may read terminal at any time.
+}
+
+-- REQ-TERM-012: Terminal torn down when conversation ends
+rule TerminalAbandonedWithConversation {
+    -- Subscribes to bedrock's ConversationBecameTerminal lifecycle announcement,
+    -- emitted whenever a conversation's is_terminal derived value becomes true
+    -- (status enters { context_exhausted, terminal, completed, failed }).
+    -- Using the named event rather than a cross-spec state-watch keeps the
+    -- cross-spec contract explicit and navigable. See tasks/08658 for rationale.
+    when: bedrock/ConversationBecameTerminal(conversation)
+
+    requires: Terminal(conversation).status = active
+
+    ensures: MasterFdClosed(terminal)
+        -- SIGHUP chain fires; shell exits; Task A observes EIO; waitpid() called.
+    ensures: terminal.status = absent
+
+    @guidance
+        -- Terminal sessions must not outlive their conversation.
+        -- Wire to bedrock's ConversationBecameTerminal event in the runtime executor.
+        -- Note: this fires for sub-agent conversations too (completed/failed).
+        -- Sub-agent conversations do not have terminals (OneTerminalPerConversation
+        -- only applies to user-facing conversations), so the requires guard
+        -- Terminal(conversation).status = active naturally excludes them.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-TERM-003
+invariant OneTerminalPerConversation {
+    for c in Conversations:
+        count(Terminal where conversation = c and status = active) <= 1
+}
+
+-- REQ-TERM-006, REQ-TERM-010
+invariant ParserDimensionSync {
+    for t in Terminals where t.status = active:
+        t.parser.dimensions = t.dimensions
+    -- Maintained by ResizeApplied firing apply_resize() which updates both
+    -- terminal.dimensions and parser.set_size() in the same call.
+}
+
+-- REQ-TERM-010
+invariant ParserFedEveryByte {
+    -- Every byte delivered to the WebSocket client has been processed by the
+    -- vt100 parser in the same order, with no gaps.
+    -- Structural guarantee: PtyOutputForwarded has both the WS send and
+    -- parser.process() in its ensures block, with no conditional path
+    -- that performs one without the other.
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface UserTerminalAccess {
+    facing user: User
+        -- User identity requires a valid ApiSession (REQ-TERM-013).
+        -- The WebSocket upgrade request must carry the same session credentials
+        -- as all other API endpoints. Unauthenticated upgrades are rejected
+        -- with HTTP 401 before any PTY is created.
+
+    context terminal: Terminal
+    context conversation: bedrock/Conversation
+
+    exposes:
+        terminal.status
+
+    provides:
+        UserOpensTerminal(conversation)
+            when Terminal(conversation).status = absent
+            and not conversation.is_terminal
+
+        UserClosedTerminal(terminal)
+            when terminal.status = active
+
+    @guarantee AuthenticatedSession
+        -- Every operation on this surface requires a valid API session.
+        -- The session is validated on the HTTP upgrade handshake, before
+        -- the WebSocket is accepted and before any PTY is created.
+        -- Mechanism: see design.md § WebSocket Authentication.
+
+surface AgentTerminalAccess {
+    facing agent: LlmAgent
+
+    context conversation: bedrock/Conversation
+    context terminal: Terminal
+
+    exposes:
+        terminal.status
+
+    provides:
+        AgentCallsReadTerminal(conversation)
+            -- Available regardless of terminal.status;
+            -- TerminalScreenReadAbsent handles the absent case gracefully.
+}
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred TmuxIntegration.named_sessions
+    -- Persistent named sessions; reconnect to existing session on WS open.
+    -- Future path for users who want scrollback or session persistence.
+    -- KISS: named sessions only. See KT doc for context.
+
+deferred ShellIntegration.osc133_markers
+    -- OSC 133 precmd/preexec hooks for structured command/output events.
+    -- Enables discrete { command, exit_code, cwd, output } events from the
+    -- byte stream without polling. v2 concern; vt100 scraping is sufficient for v1.
+
+deferred macOsKqueueSupport
+    -- PTY master fds have historically had kqueue quirks on macOS.
+    -- Linux is the v1 target platform. Test on macOS before enabling.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+-- No open questions remain.
+-- All decisions resolved during elicitation (see conversation dated April 2026):
+--   - Same Unix user: yes, no setuid needed
+--   - Max terminals per conversation: exactly 1 (409 on duplicate)
+--   - UI placement: deferred to implementation
+--   - vt100 scraping: v1, included in this spec
+--   - WebSocket auth: same session as rest of API (mechanism in design.md)
+--   - Output persistence: ephemeral; tmux integration deferred
+--   - Agent access: yes, read_terminal tool in v1
+--   - Cross-spec lifecycle trigger: bedrock/ConversationBecameTerminal (named
+--     chained event) preferred over cross-spec state-watch on is_terminal.
+--     Rationale and design discussion: tasks/08658.
+--
+-- Import path note: uses "../bedrock/bedrock.allium" (relative to terminal.allium).
+-- projects.allium uses "./bedrock.allium" (same directory). Both are correct
+-- relative paths; the terminal spec lives one level deeper than bedrock.
