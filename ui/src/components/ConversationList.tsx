@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getDisplayState } from '../api';
 import type { Conversation } from '../api';
@@ -20,6 +21,7 @@ interface ConversationListProps {
   onConversationClick?: (conv: Conversation) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
+  authChip?: ReactNode;
 }
 
 export function ConversationList({
@@ -35,6 +37,7 @@ export function ConversationList({
   onConversationClick,
   activeSlug,
   sidebarMode,
+  authChip,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -87,6 +90,7 @@ export function ConversationList({
                 {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
               </button>
             )}
+            {authChip}
             <button id="new-conv-btn" className="btn-primary" onClick={onNewConversation}>
               + New
             </button>

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, ExpansionError, type Conversation, type ImageData, type ModelInfo } from '../api';
+import { api, ExpansionError, type Conversation, type ImageData, type ModelInfo, type CredentialStatus } from '../api';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
@@ -12,6 +12,7 @@ import { ProseReader } from '../components/ProseReader';
 import { TaskApprovalReader } from '../components/TaskApprovalReader';
 import { QuestionPanel } from '../components/QuestionPanel';
 import { FirstTaskWelcome } from '../components/FirstTaskWelcome';
+import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { useMessageQueue, useConnection } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
@@ -72,6 +73,10 @@ export function ConversationPage() {
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
+
+  // Credential status
+  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
+  const [showAuthPanel, setShowAuthPanel] = useState(false);
 
   // Message queue management
   const { queuedMessages, enqueue, markSent, markFailed, dismiss } =
@@ -208,6 +213,23 @@ export function ConversationPage() {
     api.listModels()
       .then((resp) => setAvailableModels(resp.models))
       .catch((err) => console.warn('Failed to load models:', err));
+  }, []);
+
+  // Poll credential status every 5s
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const resp = await api.listModels();
+        if (resp.credential_status !== 'not_configured') {
+          setCredentialStatus(resp.credential_status);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => clearInterval(id);
   }, []);
 
   // Auto-open/close task approval overlay on state transitions
@@ -605,6 +627,20 @@ export function ConversationPage() {
             onSendMessage={(text) => handleSend(text, [])}
           />
         )}
+        {(credentialStatus === 'required' || credentialStatus === 'failed' || credentialStatus === 'running') && (
+          <div className="auth-expiry-banner" role="alert">
+            <span className="auth-expiry-text">
+              {credentialStatus === 'required' && 'LLM credential expired.'}
+              {credentialStatus === 'failed' && 'LLM authentication failed.'}
+              {credentialStatus === 'running' && 'Authenticating...'}
+            </span>
+            {(credentialStatus === 'required' || credentialStatus === 'failed') && (
+              <button className="auth-expiry-btn" onClick={() => setShowAuthPanel(true)}>
+                {credentialStatus === 'required' ? 'Authenticate' : 'Retry'}
+              </button>
+            )}
+          </div>
+        )}
         <InputArea
           ref={inputRef}
           conversationId={conversationId}
@@ -655,6 +691,20 @@ export function ConversationPage() {
         visible={showFirstTaskWelcome}
         onClose={() => setShowFirstTaskWelcome(false)}
       />
+
+      {showAuthPanel && (
+        <CredentialHelperPanel
+          onClose={async () => {
+            setShowAuthPanel(false);
+            try {
+              const resp = await api.listModels();
+              if (resp.credential_status !== 'not_configured') {
+                setCredentialStatus(resp.credential_status);
+              }
+            } catch { /* ignore */ }
+          }}
+        />
+      )}
 
       {/* Mobile file browser overlay */}
       <FileBrowserOverlay

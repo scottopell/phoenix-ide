@@ -91,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize LLM registry with model discovery
     let llm_config = LlmConfig::from_env();
+    let helper_state = llm_config.helper_state.clone();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
 
     if llm_registry.has_models() {
@@ -129,7 +130,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create application state
-    let state = AppState::new(db, llm_registry, platform, mcp_manager, password).await;
+    let state = AppState::new(
+        db,
+        llm_registry,
+        platform,
+        mcp_manager,
+        helper_state,
+        password,
+    )
+    .await;
 
     // Create router
     let cors = CorsLayer::new()

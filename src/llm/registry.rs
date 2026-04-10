@@ -193,7 +193,11 @@ impl CredentialSource for CommandCredential {
                 None
             }
             Ok(out) => {
-                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let token = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .rfind(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .to_string();
                 if token.is_empty() {
                     tracing::warn!(
                         command = %self.command,
@@ -315,6 +319,9 @@ pub struct LlmConfig {
     /// When true, send `api_key_helper` output as `Authorization: Bearer` instead of `x-api-key`.
     /// Set via `LLM_AUTH_HEADER=bearer`. Used for service gateways that expect JWT bearer auth.
     pub use_bearer_auth: bool,
+    /// Typed handle for the interactive credential helper. Set alongside `api_key_helper`
+    /// when `LLM_API_KEY_HELPER` is configured. `None` otherwise.
+    pub helper_state: Option<Arc<crate::llm::credential_helper::HelperState>>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -339,6 +346,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
             .field("use_bearer_auth", &self.use_bearer_auth)
+            .field("helper_state", &self.helper_state.is_some())
             .finish()
     }
 }
@@ -356,6 +364,7 @@ impl Clone for LlmConfig {
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
             use_bearer_auth: self.use_bearer_auth,
+            helper_state: self.helper_state.as_ref().map(Arc::clone),
         }
     }
 }
@@ -377,6 +386,7 @@ impl Default for LlmConfig {
             openai_base_url: None,
             custom_headers: Vec::new(),
             use_bearer_auth: false,
+            helper_state: None,
         }
     }
 }
@@ -408,19 +418,25 @@ impl LlmConfig {
             }
         };
 
-        let api_key_helper: Option<Arc<dyn CredentialSource>> = std::env::var("LLM_API_KEY_HELPER")
+        let (api_key_helper, helper_state): (
+            Option<Arc<dyn CredentialSource>>,
+            Option<Arc<crate::llm::credential_helper::HelperState>>,
+        ) = if let Some(command) = std::env::var("LLM_API_KEY_HELPER")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|command| {
-                let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
-                Arc::new(CommandCredential::new(
-                    command,
-                    Duration::from_millis(ttl_ms),
-                )) as Arc<dyn CredentialSource>
-            });
+        {
+            let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
+            let hs = crate::llm::credential_helper::HelperState::new(
+                command,
+                Duration::from_millis(ttl_ms),
+            );
+            (Some(Arc::clone(&hs) as Arc<dyn CredentialSource>), Some(hs))
+        } else {
+            (None, None)
+        };
 
         let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
@@ -457,6 +473,7 @@ impl LlmConfig {
             use_bearer_auth: std::env::var("LLM_AUTH_HEADER")
                 .ok()
                 .is_some_and(|v| v.eq_ignore_ascii_case("bearer")),
+            helper_state,
         }
     }
 }
@@ -655,6 +672,8 @@ impl ModelRegistry {
         } else if let Some(ref helper) = config.api_key_helper {
             // Direct auth mode — derive models URLs from base URL overrides
             let auth_token = helper.get().await;
+            // Helper not yet authenticated — skip discovery, fall back to hardcoded models
+            auth_token.as_ref()?;
             let headers = config.custom_headers.clone();
 
             Some((

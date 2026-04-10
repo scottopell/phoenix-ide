@@ -191,6 +191,8 @@ export interface ModelInfo {
 
 export type GatewayStatus = 'not_configured' | 'healthy' | 'unreachable';
 
+export type CredentialStatus = 'not_configured' | 'valid' | 'required' | 'running' | 'failed';
+
 export interface ModelsResponse {
   models: ModelInfo[];
   default: string;
@@ -198,6 +200,7 @@ export interface ModelsResponse {
   gateway_status: GatewayStatus;
   /** True when at least one LLM provider is configured */
   llm_configured: boolean;
+  credential_status: CredentialStatus;
 }
 
 /** A single file search result from the conversation-scoped file search API (REQ-IR-004) */

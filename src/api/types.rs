@@ -188,6 +188,22 @@ pub enum GatewayStatusApi {
     Unreachable,
 }
 
+/// Credential helper status surfaced to the frontend
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStatusApi {
+    /// No credential helper configured and no static API key set.
+    NotConfigured,
+    /// A valid credential is available (static key, env var, or cached helper result).
+    Valid,
+    /// Helper configured but no valid cached credential — user must authenticate.
+    Required,
+    /// Helper subprocess is currently executing.
+    Running,
+    /// Last helper run exited non-zero or produced no output.
+    Failed,
+}
+
 /// Response for model list
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
@@ -197,6 +213,8 @@ pub struct ModelsResponse {
     pub gateway_status: GatewayStatusApi,
     /// True when at least one LLM provider is configured (gateway or direct key)
     pub llm_configured: bool,
+    /// Credential helper status (only meaningful when helper is configured).
+    pub credential_status: CredentialStatusApi,
 }
 
 /// Response containing the current system prompt for a conversation

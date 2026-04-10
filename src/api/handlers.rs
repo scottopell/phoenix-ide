@@ -7,12 +7,13 @@ use super::sse::sse_stream;
 use super::types::{
     CancelResponse, ChatRequest, ChatResponse, CompleteTaskResponse, ConfirmCompleteRequest,
     ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse, ConversationResponse,
-    ConversationWithMessagesResponse, CreateConversationRequest, DirectoryEntry, ErrorResponse,
-    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    GatewayStatusApi, GitBranchesQuery, GitBranchesResponse, ListDirectoryResponse,
-    ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse, RenameRequest, SkillEntry,
-    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskApprovalResponse, TaskEntry,
-    TaskFeedbackRequest, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
+    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
+    FileSearchQuery, FileSearchResponse, GatewayStatusApi, GitBranchesQuery, GitBranchesResponse,
+    ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse,
+    RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SystemPromptResponse,
+    TaskApprovalResponse, TaskEntry, TaskFeedbackRequest, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
@@ -129,6 +130,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/projects", get(list_projects))
         // Model info (REQ-API-009)
         .route("/api/models", get(list_models))
+        // Interactive credential helper (REQ-CREDHELPER-003)
+        .route("/api/credential-helper/run", get(run_credential_helper))
         .route(
             "/api/conversations/:id/upgrade-model",
             post(upgrade_conversation_model),
@@ -2863,12 +2866,69 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     let llm_configured = state.llm_registry.has_models()
         || state.llm_registry.gateway_status != GatewayStatus::NotConfigured;
 
+    let credential_status = if let Some(ref hs) = state.helper_state {
+        use crate::llm::credential_helper::CredentialStatus;
+        match hs.credential_status().await {
+            CredentialStatus::Idle => CredentialStatusApi::Required,
+            CredentialStatus::Running => CredentialStatusApi::Running,
+            CredentialStatus::Valid => CredentialStatusApi::Valid,
+            CredentialStatus::Failed => CredentialStatusApi::Failed,
+        }
+    } else if llm_configured {
+        CredentialStatusApi::Valid
+    } else {
+        CredentialStatusApi::NotConfigured
+    };
+
     Json(ModelsResponse {
         models,
         default: state.llm_registry.default_model_id().to_string(),
         gateway_status,
         llm_configured,
+        credential_status,
     })
+}
+
+// ============================================================
+// Credential Helper
+// ============================================================
+
+async fn run_credential_helper(State(state): State<AppState>) -> impl IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    let Some(ref hs) = state.helper_state else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "No credential helper configured",
+        )
+            .into_response();
+    };
+
+    let event_stream = Arc::clone(hs).run_and_stream().await.map(|ev| {
+        let data = match &ev {
+            crate::llm::credential_helper::HelperEvent::Line(text) => {
+                serde_json::json!({ "type": "line", "text": text })
+            }
+            crate::llm::credential_helper::HelperEvent::Complete => {
+                serde_json::json!({ "type": "complete" })
+            }
+            crate::llm::credential_helper::HelperEvent::Error { exit_code, stderr } => {
+                serde_json::json!({ "type": "error", "exit_code": exit_code, "stderr": stderr })
+            }
+        };
+        Ok::<Event, Infallible>(Event::default().event("message").data(data.to_string()))
+    });
+
+    Sse::new(event_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 // ============================================================

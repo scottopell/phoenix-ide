@@ -28,6 +28,7 @@ pub struct AppState {
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
     pub mcp_manager: Arc<McpClientManager>,
+    pub helper_state: Option<Arc<crate::llm::credential_helper::HelperState>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
     pub password: Option<String>,
 }
@@ -39,6 +40,7 @@ impl AppState {
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
         mcp_manager: Arc<McpClientManager>,
+        helper_state: Option<Arc<crate::llm::credential_helper::HelperState>>,
         password: Option<String>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
@@ -54,6 +56,7 @@ impl AppState {
             db,
             platform,
             mcp_manager,
+            helper_state,
             password,
         }
     }

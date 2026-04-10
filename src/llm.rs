@@ -55,6 +55,7 @@
 //! occur, aiding diagnosis.
 
 mod anthropic;
+pub mod credential_helper;
 mod discovery;
 mod error;
 mod models;
@@ -66,6 +67,9 @@ mod service;
 pub(crate) mod sse;
 mod types;
 
+#[allow(unused_imports)]
+// CredentialStatus + HelperState: public API for credential helper consumers
+pub use credential_helper::{CredentialStatus, HelperState};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ModelSpec, Provider};

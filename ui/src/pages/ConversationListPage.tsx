@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import type { Conversation } from '../api';
+import type { Conversation, CredentialStatus } from '../api';
 import { cacheDB } from '../cache';
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
@@ -12,6 +12,7 @@ import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
+import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 
 export function ConversationListPage() {
   const navigate = useNavigate();
@@ -36,6 +37,10 @@ export function ConversationListPage() {
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+
+  // Credential helper state
+  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
+  const [showAuthPanel, setShowAuthPanel] = useState(false);
 
 
   // Listen for storage warnings
@@ -120,6 +125,21 @@ export function ConversationListPage() {
         }).catch(() => {/* silent */});
       }
     }, 5000);
+    return () => clearInterval(interval);
+  }, [isReady]);
+
+  // Poll credential helper status
+  useEffect(() => {
+    if (!isReady) return;
+
+    const fetchStatus = () => {
+      api.listModels().then(resp => {
+        setCredentialStatus(resp.credential_status);
+      }).catch(() => {/* silent */});
+    };
+
+    fetchStatus(); // immediate on mount
+    const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, [isReady]);
 
@@ -300,6 +320,23 @@ export function ConversationListPage() {
             <div className="view-header">
               <h2>Conversations</h2>
               <div className="view-header-actions">
+                {credentialStatus && credentialStatus !== 'not_configured' && (
+                  <button
+                    className={`auth-chip ${
+                      credentialStatus === 'valid' ? 'valid' :
+                      credentialStatus === 'running' ? 'running' :
+                      'required'
+                    }`}
+                    onClick={credentialStatus === 'required' || credentialStatus === 'failed'
+                      ? () => setShowAuthPanel(true)
+                      : undefined}
+                    disabled={credentialStatus === 'valid' || credentialStatus === 'running'}
+                  >
+                    {credentialStatus === 'valid' ? 'AUTH ✓' :
+                     credentialStatus === 'running' ? 'AUTH ...' :
+                     'AUTH ✗'}
+                  </button>
+                )}
                 <button className="btn-primary" disabled>+ New</button>
               </div>
             </div>
@@ -321,6 +358,23 @@ export function ConversationListPage() {
                 setRenameTarget(conv);
               }}
               onConversationClick={handleConversationClick}
+              authChip={credentialStatus && credentialStatus !== 'not_configured' ? (
+                <button
+                  className={`auth-chip ${
+                    credentialStatus === 'valid' ? 'valid' :
+                    credentialStatus === 'running' ? 'running' :
+                    'required'
+                  }`}
+                  onClick={credentialStatus === 'required' || credentialStatus === 'failed'
+                    ? () => setShowAuthPanel(true)
+                    : undefined}
+                  disabled={credentialStatus === 'valid' || credentialStatus === 'running'}
+                >
+                  {credentialStatus === 'valid' ? 'AUTH ✓' :
+                   credentialStatus === 'running' ? 'AUTH ...' :
+                   'AUTH ✗'}
+                </button>
+              ) : undefined}
             />
             <StorageStatus conversationCount={totalConversations} />
           </>
@@ -345,6 +399,12 @@ export function ConversationListPage() {
           setRenameError(undefined);
         }}
       />
+      {showAuthPanel && (
+        <CredentialHelperPanel onClose={() => {
+          setShowAuthPanel(false);
+          api.listModels().then(resp => setCredentialStatus(resp.credential_status)).catch(() => {});
+        }} />
+      )}
     </div>
   );
 }
