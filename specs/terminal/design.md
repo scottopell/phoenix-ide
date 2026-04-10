@@ -29,13 +29,12 @@ In axum, middleware runs before the WebSocket handler function is entered, so
 authentication failure returns a plain HTTP response without ever calling
 `ws.on_upgrade()`.
 
-**Current auth posture:** As of April 2026, the Phoenix IDE API has no
-user-facing authentication (task `08642-p2-ready--basic-password-auth` is filed
-but not yet implemented). The terminal endpoint shares this no-auth posture.
-REQ-TERM-013 will be fully satisfied when task 08642 lands; until then the
-endpoint is open to anyone who can reach the server, consistent with all other
-endpoints. Do not implement terminal-specific auth ahead of the general auth
-solution.
+**Auth mechanism:** Password authentication is implemented via `src/api/auth.rs`
+(task `08642-p2-done--basic-password-auth`). When `PHOENIX_PASSWORD` is set,
+all API requests require auth via `phoenix-auth` cookie or Bearer token, using
+constant-time comparison. When unset, auth is bypassed (backward compatible).
+The terminal WebSocket upgrade request goes through the same axum middleware
+layer — no terminal-specific auth needed. REQ-TERM-013 is satisfied.
 
 ## Active Terminal Registry and 409 Guard (REQ-TERM-003)
 
