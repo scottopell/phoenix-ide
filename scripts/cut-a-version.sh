@@ -44,7 +44,12 @@ info "Cutting version $SHA"
 # ── update build worktree ────────────────────────────────────────────────────
 
 info "Updating build worktree"
-if [[ -d "$BUILD_WORKTREE/.git" ]]; then
+if git -C "$ROOT" worktree list | grep -qF "$BUILD_WORKTREE"; then
+    # Registered worktree — just checkout the target commit
+    git -C "$BUILD_WORKTREE" checkout --force "$(git -C "$ROOT" rev-parse HEAD)"
+elif [[ -d "$BUILD_WORKTREE" ]]; then
+    # Directory exists but not registered (created by dev.py worktree add previously)
+    # dev.py manages this worktree; just checkout the right commit directly
     git -C "$BUILD_WORKTREE" checkout --force "$(git -C "$ROOT" rev-parse HEAD)"
 else
     git -C "$ROOT" worktree add --detach "$BUILD_WORKTREE" HEAD
