@@ -23,7 +23,7 @@ git -C "$ROOT" tag | grep -qx "$TAG" && die "Tag $TAG already exists locally."
 
 SHA=$(git -C "$ROOT" rev-parse --short HEAD)
 info "Tagging $SHA as $TAG"
-git -C "$ROOT" tag "$TAG"
+git -C "$ROOT" tag -a "$TAG" -m "$TAG"
 git -C "$ROOT" push origin "$TAG"
 ok "Pushed $TAG — GitHub Actions will build and publish the release."
 printf '\033[0;90m  https://github.com/scottopell/phoenix-ide/releases/tag/%s\033[0m\n' "$TAG"
