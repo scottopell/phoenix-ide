@@ -41,6 +41,7 @@ export function ConversationListPage() {
   // Credential helper state
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const autoAuthAttemptedRef = useRef(false);
 
 
   // Listen for storage warnings
@@ -142,6 +143,18 @@ export function ConversationListPage() {
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, [isReady]);
+
+  // Auto-open auth panel on first load when credential is required
+  useEffect(() => {
+    if (
+      credentialStatus === 'required' &&
+      !autoAuthAttemptedRef.current &&
+      !showAuthPanel
+    ) {
+      autoAuthAttemptedRef.current = true;
+      setShowAuthPanel(true);
+    }
+  }, [credentialStatus, showAuthPanel]);
 
   // Restore scroll position after data loads
   useEffect(() => {

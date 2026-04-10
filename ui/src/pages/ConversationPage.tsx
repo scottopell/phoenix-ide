@@ -77,6 +77,7 @@ export function ConversationPage() {
   // Credential status
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const autoAuthAttemptedRef = useRef(false);
 
   // Message queue management
   const { queuedMessages, enqueue, markSent, markFailed, dismiss } =
@@ -231,6 +232,18 @@ export function ConversationPage() {
     const id = setInterval(poll, 5000);
     return () => clearInterval(id);
   }, []);
+
+  // Auto-open auth panel on first load when credential is required
+  useEffect(() => {
+    if (
+      credentialStatus === 'required' &&
+      !autoAuthAttemptedRef.current &&
+      !showAuthPanel
+    ) {
+      autoAuthAttemptedRef.current = true;
+      setShowAuthPanel(true);
+    }
+  }, [credentialStatus, showAuthPanel]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {

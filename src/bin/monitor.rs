@@ -481,7 +481,7 @@ impl App {
             log_lines: Vec::new(),
             log_rx,
             last_refresh: Instant::now()
-                .checked_sub(Duration::from_secs(60))
+                .checked_sub(Duration::from_mins(1))
                 .unwrap_or_else(Instant::now),
             error: None,
             detail_scroll: 0,
@@ -1373,15 +1373,15 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
                     scroll_down(app);
                 }
             }
-            KeyCode::Enter => {
-                if app.detail_tab == DetailTab::SubAgents && !app.sub_agents.is_empty() {
-                    let id = app.sub_agents[app.sub_agent_cursor].id.clone();
-                    app.sub_detail_tab = SubDetailTab::State;
-                    app.sub_detail_scroll = 0;
-                    app.sub_detail_msg_scroll = 0;
-                    app.load_sub_agent_detail(&id);
-                    app.focus = Focus::SubAgentDetail;
-                }
+            KeyCode::Enter
+                if app.detail_tab == DetailTab::SubAgents && !app.sub_agents.is_empty() =>
+            {
+                let id = app.sub_agents[app.sub_agent_cursor].id.clone();
+                app.sub_detail_tab = SubDetailTab::State;
+                app.sub_detail_scroll = 0;
+                app.sub_detail_msg_scroll = 0;
+                app.load_sub_agent_detail(&id);
+                app.focus = Focus::SubAgentDetail;
             }
             KeyCode::Tab => {
                 let next = (app.detail_tab.index() + 1) % 3;
