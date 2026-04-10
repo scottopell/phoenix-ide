@@ -446,11 +446,12 @@ impl LlmConfig {
             .ok()
             .filter(|s| !s.is_empty());
 
-        // Parse newline-separated "key: value" pairs
+        // Parse newline-separated "key: value" pairs (supports real newlines and literal \n)
         let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
             .ok()
             .map(|raw| {
-                raw.lines()
+                raw.replace("\\n", "\n")
+                    .lines()
                     .filter_map(|line| {
                         let line = line.trim();
                         let (k, v) = line.split_once(':')?;
