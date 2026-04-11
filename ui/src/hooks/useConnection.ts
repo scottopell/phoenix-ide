@@ -219,6 +219,12 @@ export function useConnection({
             dispatchRef.current({ type: 'sse_agent_done' });
           });
 
+          // Terminal subsystem lifecycle event — wired up fully in Task 5.
+          // Registered here to prevent unrecognized-event console noise.
+          es.addEventListener('conversation_became_terminal', () => {
+            // no-op until terminal PTY teardown is implemented
+          });
+
           es.addEventListener('conversation_update', (e) => {
             try {
               const data = JSON.parse((e as MessageEvent).data) as { conversation?: Record<string, unknown> };

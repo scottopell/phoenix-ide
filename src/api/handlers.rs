@@ -25,6 +25,7 @@ use crate::runtime::executor::{run_git, TASK_APPROVAL_MUTEX};
 use crate::runtime::SseEvent;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
+use crate::terminal::terminal_ws_handler;
 use std::fmt::Write as _;
 
 use axum::{
@@ -72,6 +73,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id", get(get_conversation))
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
+        // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
+        .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
         // User actions (REQ-API-004)
         .route("/api/conversations/:id/chat", post(send_chat))
         .route("/api/conversations/:id/cancel", post(cancel_conversation))

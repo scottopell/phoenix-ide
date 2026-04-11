@@ -68,19 +68,19 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| REQ-TERM-001: PTY-backed terminal per conversation | ❌ Not Started | |
-| REQ-TERM-002: Explicit shell environment construction | ❌ Not Started | |
-| REQ-TERM-003: Exactly one terminal per conversation | ❌ Not Started | |
-| REQ-TERM-004: Binary WebSocket framing | ❌ Not Started | |
-| REQ-TERM-005: Initial resize before first prompt | ❌ Not Started | |
-| REQ-TERM-006: Resize propagated to PTY and parser | ❌ Not Started | |
-| REQ-TERM-007: EIO treated as clean termination | ❌ Not Started | |
-| REQ-TERM-008: Master fd closed on WebSocket disconnect | ❌ Not Started | |
-| REQ-TERM-009: Child process reaped after shell exit | ❌ Not Started | |
-| REQ-TERM-010: vt100 parser fed every byte in order | ❌ Not Started | |
-| REQ-TERM-011: `read_terminal` agent tool | ❌ Not Started | |
-| REQ-TERM-012: Terminal torn down with conversation | ❌ Not Started | |
-| REQ-TERM-013: WebSocket endpoint authentication | ❌ Not Started | |
-| REQ-TERM-014: Output channel backpressure | ❌ Not Started | |
+| REQ-TERM-001: PTY-backed terminal per conversation | ✅ Done | src/terminal/spawn.rs |
+| REQ-TERM-002: Explicit shell environment construction | ✅ Done | src/terminal/spawn.rs:build_env() |
+| REQ-TERM-003: Exactly one terminal per conversation | ✅ Done | src/terminal/session.rs:ActiveTerminals |
+| REQ-TERM-004: Binary WebSocket framing | ✅ Done | src/terminal/ws.rs |
+| REQ-TERM-005: Initial resize before first prompt | ✅ Done | src/terminal/ws.rs:wait_for_resize() |
+| REQ-TERM-006: Resize propagated to PTY and parser | ✅ Done | src/terminal/ws.rs:apply_resize() |
+| REQ-TERM-007: EIO treated as clean termination | ✅ Done | src/terminal/ws.rs:reader_task() |
+| REQ-TERM-008: Master fd closed on WebSocket disconnect | ✅ Done | src/terminal/session.rs:TerminalHandle::Drop |
+| REQ-TERM-009: Child process reaped after shell exit | ✅ Done | src/terminal/ws.rs:waitpid() |
+| REQ-TERM-010: vt100 parser fed every byte in order | ✅ Done | src/terminal/ws.rs:reader_task() |
+| REQ-TERM-011: `read_terminal` agent tool | ✅ Done | src/tools/read_terminal.rs |
+| REQ-TERM-012: Terminal torn down with conversation | ✅ Done | src/terminal/ws.rs:teardown watcher |
+| REQ-TERM-013: WebSocket endpoint authentication | ✅ Done | src/api/auth.rs middleware |
+| REQ-TERM-014: Output channel backpressure | ✅ Done | src/terminal/ws.rs:OUTPUT_BUF bounded reads |
 
 **Progress:** 0 of 14 complete

@@ -45,6 +45,8 @@ where
     browser_sessions: Arc<BrowserSessionManager>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
+    /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
+    terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: broadcast::Sender<SseEvent>,
@@ -91,6 +93,7 @@ where
         tool_executor: T,
         browser_sessions: Arc<BrowserSessionManager>,
         llm_registry: Arc<ModelRegistry>,
+        terminals: crate::terminal::ActiveTerminals,
         event_rx: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
         broadcast_tx: broadcast::Sender<SseEvent>,
@@ -109,6 +112,7 @@ where
             tool_executor: Arc::new(tool_executor),
             browser_sessions,
             llm_registry,
+            terminals,
             event_rx,
             event_tx,
             broadcast_tx,
@@ -183,6 +187,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
+                        self.emit_terminal_lifecycle_event();
                         return;
                     }
                 }
@@ -197,6 +202,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
+                        self.emit_terminal_lifecycle_event();
                         return;
                     }
                 }
@@ -215,6 +221,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
+                        self.emit_terminal_lifecycle_event();
                         return;
                     }
                 }
@@ -223,6 +230,15 @@ where
         }
 
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
+    }
+
+    /// Broadcast `ConversationBecameTerminal` to all SSE subscribers.
+    ///
+    /// Called once at each terminal exit point in the executor loop. Implements the
+    /// `ConversationReachedTerminalState` relay rule from bedrock.allium.
+    /// Send errors (no active receivers) are intentionally ignored.
+    fn emit_terminal_lifecycle_event(&self) {
+        let _ = self.broadcast_tx.send(SseEvent::ConversationBecameTerminal);
     }
 
     /// Process a typed effect outcome from a background task.
@@ -994,6 +1010,7 @@ where
                     self.context.working_dir.clone(),
                     self.browser_sessions.clone(),
                     self.llm_registry.clone(),
+                    self.terminals.clone(),
                 );
 
                 let conv_id = self.context.conversation_id.clone();

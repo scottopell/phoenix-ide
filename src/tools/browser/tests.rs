@@ -41,6 +41,7 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         std::env::temp_dir(),
         manager.clone(),
         Arc::new(crate::llm::ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
     );
     (ctx, manager)
 }

@@ -530,7 +530,10 @@ impl ConvState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            ConvState::Completed { .. } | ConvState::Failed { .. } | ConvState::Terminal
+            ConvState::Completed { .. }
+                | ConvState::Failed { .. }
+                | ConvState::ContextExhausted { .. }
+                | ConvState::Terminal
         )
     }
 

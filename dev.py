@@ -2,8 +2,13 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "taskmd @ git+https://github.com/scottopell/taskmd.git",
+#   "taskmd",
 # ]
+#
+# [tool.uv]
+# # Pre-built wheel lives in .taskmd-wheel/ (gitignored, one-time build per machine).
+# # Bootstrap: ./scripts/build-taskmd-wheel.sh
+# find-links = [".taskmd-wheel"]
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -27,6 +32,53 @@ UI_DIR = ROOT / "ui"
 PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
 VITE_PID_FILE = ROOT / ".vite.pid"
 LOG_FILE = ROOT / "phoenix.log"
+
+
+def _node_env() -> dict:
+    """Return an env dict with the correct Node.js binary prepended to PATH.
+
+    Reads the `.node-version` file at the repo root, then searches
+    `~/.local/share/node`, `~/node`, and `/usr/local` for a matching
+    venv-style installation.  Falls back to the ambient PATH if no match
+    is found (safe: the check will simply use whatever `node` is on PATH).
+    """
+    env = os.environ.copy()
+    node_version_file = ROOT / ".node-version"
+    if not node_version_file.exists():
+        return env
+    requested = node_version_file.read_text().strip()  # e.g. "22" or "22.14"
+    major = requested.split(".")[0]
+    candidates = [
+        Path.home() / "node",
+        Path.home() / ".local" / "share" / "node",
+        Path("/usr/local"),
+    ]
+    for base in candidates:
+        node_bin = base / "bin" / "node"
+        if node_bin.exists():
+            try:
+                import subprocess as _sp
+                ver_out = _sp.check_output([str(node_bin), "--version"],
+                                           text=True).strip()  # e.g. "v24.1.0"
+                found_major = ver_out.lstrip("v").split(".")[0]
+                # Accept the candidate if it meets or exceeds the requested major
+                if int(found_major) >= int(major):
+                    env["PATH"] = str(base / "bin") + ":" + env.get("PATH", "")
+                    return env
+            except Exception:
+                continue
+    return env
+
+
+_NODE_ENV: dict | None = None
+
+
+def node_env() -> dict:
+    """Cached result of _node_env()."""
+    global _NODE_ENV
+    if _NODE_ENV is None:
+        _NODE_ENV = _node_env()
+    return _NODE_ENV
 
 # Production paths
 PROD_SERVICE_NAME = "phoenix-ide"
@@ -295,7 +347,7 @@ def ensure_ui_deps():
     """Ensure UI dependencies are installed."""
     if not (UI_DIR / "node_modules").exists():
         print("Installing UI dependencies...")
-        subprocess.run(["npm", "install"], cwd=UI_DIR, check=True)
+        subprocess.run(["npm", "install"], cwd=UI_DIR, check=True, env=node_env())
 
 
 def build_rust(release: bool = True):
@@ -507,9 +559,11 @@ def cmd_check():
     def run_step(name, cmd, cwd=ROOT):
         t0 = time.monotonic()
         try:
+            # UI steps need the correct Node.js version on PATH
+            env = node_env() if Path(cwd) == UI_DIR else None
             proc = subprocess.run(
                 cmd, cwd=cwd, capture_output=True, text=True,
-                timeout=CHECK_TIMEOUT,
+                timeout=CHECK_TIMEOUT, env=env,
             )
             elapsed = time.monotonic() - t0
             output = (proc.stdout + proc.stderr).strip()
@@ -644,6 +698,14 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
 
     Returns True if all tasks pass, False otherwise.
     """
+    wheel_dir = ROOT / ".taskmd-wheel"
+    if not wheel_dir.exists():
+        print(
+            "\n✗ .taskmd-wheel/ not found. Run the one-time bootstrap first:\n"
+            "    ./scripts/build-taskmd-wheel.sh\n"
+            "Then retry. See README.md § Quick Start for details."
+        )
+        return False
     import taskmd
     tasks_dir = ROOT / "tasks"
     result = taskmd.validate(tasks_dir)

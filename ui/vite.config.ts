@@ -13,6 +13,7 @@ export default defineConfig({
       '/api': {
         target: `http://localhost:${apiPort}`,
         changeOrigin: true,
+        ws: true, // proxy WebSocket upgrades (needed for terminal endpoint)
       },
       '/preview': {
         target: `http://localhost:${apiPort}`,
