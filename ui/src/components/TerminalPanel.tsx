@@ -247,14 +247,31 @@ export function TerminalPanel({
     //
     // Intentionally NOT resetting `activity` here — let ws.onopen flip it
     // to 'idle' once the new handshake completes. Pre-clearing on mount
-    // produced a dim→undim flash when the effect re-ran spontaneously
-    // (HMR during dev, accidental clicks) without a real new session.
+    // produced a dim→undim flash when the effect re-ran spontaneously.
     integrationStatusRef.current = 'unknown';
     setIntegrationStatus('unknown');
     currentCommandRef.current = null;
     setCurrentCommand(null);
     setLastCompletedCommand(null);
     setReportedCwd(null);
+
+    // Defer allocation via setTimeout(0) so React 18 StrictMode's
+    // synchronous double-invoke in dev doesn't allocate → tear down →
+    // re-allocate an xterm + WebSocket in quick succession. That pattern
+    // surfaced as:
+    //   - "WebSocket closed before the connection is established" errors
+    //     from ws1 being closed mid-handshake
+    //   - xterm's internal refresh loop crashing on a disposed renderer
+    //     (TypeError: this._renderer.value.dimensions)
+    //   - A brief dim→undim flash in the HUD as ws1 fired onclose then
+    //     ws2 fired onopen ~50ms later
+    // With this deferral, effect run 1's cleanup cancels before the timer
+    // fires, so only run 2 actually allocates resources.
+    let cancelled = false;
+    let cleanupReal: (() => void) | null = null;
+
+    const initTimer = window.setTimeout(() => {
+      if (cancelled || !containerRef.current) return;
 
     // --- xterm.js setup ---
     const term = new Terminal({
@@ -469,35 +486,52 @@ export function TerminalPanel({
     };
     window.addEventListener('resize', handleResize);
 
+      // Stash real cleanup on the outer var so the effect's return can
+      // call it once allocation has completed.
+      cleanupReal = () => {
+        disposeOnData.dispose();
+        osc133Dispose.dispose();
+        osc7Dispose.dispose();
+        window.removeEventListener('resize', handleResize);
+        if (activityTimeoutRef.current !== null) {
+          window.clearTimeout(activityTimeoutRef.current);
+          activityTimeoutRef.current = null;
+        }
+        if (detectionTimeoutRef.current !== null) {
+          window.clearTimeout(detectionTimeoutRef.current);
+          detectionTimeoutRef.current = null;
+        }
+        // Unbind handlers BEFORE close() so the onclose for a WS that's
+        // still mid-handshake (or the onclose from a clean teardown) can't
+        // race with a fresh effect run and clobber its freshly-set state.
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        try {
+          ws.close();
+        } catch {
+          // ignore — close on an already-closed ws is a no-op
+        }
+        try {
+          term.dispose();
+        } catch {
+          // xterm.js has a race where internal rAF / refresh callbacks
+          // can fire on a partially-disposed renderer and throw
+          // "undefined is not an object (evaluating
+          // 'this._renderer.value.dimensions')". Swallow — we're tearing
+          // down anyway.
+        }
+        termRef.current = null;
+        fitAddonRef.current = null;
+        wsRef.current = null;
+      };
+    }, 0);
+
     return () => {
-      disposeOnData.dispose();
-      osc133Dispose.dispose();
-      osc7Dispose.dispose();
-      window.removeEventListener('resize', handleResize);
-      if (activityTimeoutRef.current !== null) {
-        window.clearTimeout(activityTimeoutRef.current);
-        activityTimeoutRef.current = null;
-      }
-      if (detectionTimeoutRef.current !== null) {
-        window.clearTimeout(detectionTimeoutRef.current);
-        detectionTimeoutRef.current = null;
-      }
-      // Unbind handlers BEFORE close() so a synthesized onclose during
-      // teardown doesn't race with the new effect run and clobber its
-      // freshly-set activity state. This was the "click-to-reconnect doesn't
-      // work" bug: ws.close() fired the old onclose handler, which set
-      // activity back to 'disconnected' while the new ws was still
-      // connecting — so even though the new connection succeeded, the UI
-      // stayed stuck in the dead state.
-      ws.onopen = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onmessage = null;
-      ws.close();
-      term.dispose();
-      termRef.current = null;
-      fitAddonRef.current = null;
-      wsRef.current = null;
+      cancelled = true;
+      window.clearTimeout(initTimer);
+      if (cleanupReal) cleanupReal();
     };
   }, [conversationId, setStatus, reconnectNonce]);
 
