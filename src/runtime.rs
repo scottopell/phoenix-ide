@@ -114,6 +114,10 @@ pub struct EnrichedConversation {
     pub base_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_title: Option<String>,
+    /// The server-user's `$SHELL` (REQ-TERM-002), used by the frontend to
+    /// tailor the OSC 133 enablement snippet (REQ-TERM-017).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.

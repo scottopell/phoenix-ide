@@ -748,6 +748,7 @@ export function ConversationPage() {
             collapsed={terminalPane.collapsed}
             onExpand={terminalPane.expandFromCollapsed}
             cwd={conversation.cwd}
+            shell={conversation.shell ?? undefined}
           />
         </>
       )}

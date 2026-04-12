@@ -258,6 +258,11 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
             .filter(|s| !s.is_empty())
             .map(String::from),
         task_title: conv.conv_mode.task_title().map(String::from),
+        // REQ-TERM-002 / REQ-TERM-017: surface the server-user's $SHELL so
+        // the frontend can tailor the OSC 133 enablement snippet. The PTY
+        // spawn path reads `$SHELL` from the same env, so this matches what
+        // the user's shell will actually be.
+        shell: std::env::var("SHELL").ok(),
         inner: conv.clone(),
     }
 }

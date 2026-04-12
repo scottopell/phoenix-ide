@@ -6932,6 +6932,193 @@ html * {
   }
 }
 
+/* Live dot wrapper — host for the absent-state hint tooltip */
+.terminal-live-dot-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.terminal-live-dot-wrap--hint {
+  cursor: help;
+}
+
+.terminal-hint-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  background: #2d2d2d;
+  border: 1px solid #444;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary, #e6edf3);
+  pointer-events: none;
+  animation: terminal-hint-tooltip-fade 150ms ease-out;
+}
+
+.terminal-hint-tooltip strong {
+  color: var(--accent-yellow, #d29922);
+  font-weight: 600;
+}
+
+.terminal-hint-tooltip-sub {
+  color: var(--text-muted, #888);
+  font-size: 10px;
+}
+
+@keyframes terminal-hint-tooltip-fade {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Rich HUD (OSC 133 detected) — inline spans inside .terminal-panel-prompt */
+.terminal-hud-cwd {
+  color: var(--accent-blue, #58a6ff);
+}
+.terminal-hud-sep {
+  color: var(--text-muted, #888);
+}
+.terminal-hud-cmd {
+  color: var(--text-primary, #e6edf3);
+}
+.terminal-hud-dur {
+  color: var(--text-muted, #888);
+}
+.terminal-hud-glyph {
+  font-weight: 600;
+}
+.terminal-hud-glyph--ok {
+  color: var(--accent-green, #3fb950);
+}
+.terminal-hud-glyph--err {
+  color: #f85149;
+}
+.terminal-hud-glyph--unknown {
+  color: var(--text-muted, #888);
+}
+
+/* Snippet modal */
+.terminal-snippet-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: terminal-snippet-fade 150ms ease-out;
+}
+
+@keyframes terminal-snippet-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.terminal-snippet-modal {
+  background: #1f1f1f;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  width: min(640px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.terminal-snippet-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #333;
+}
+
+.terminal-snippet-modal-title {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-primary, #e6edf3);
+}
+
+.terminal-snippet-modal-close {
+  background: none;
+  border: none;
+  color: var(--text-muted, #888);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  transition: color 150ms ease;
+}
+
+.terminal-snippet-modal-close:hover {
+  color: var(--text-primary, #e6edf3);
+}
+
+.terminal-snippet-modal-body {
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+}
+
+.terminal-snippet-modal-help {
+  font-size: 12px;
+  color: var(--text-muted, #aaa);
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+
+.terminal-snippet-modal-help code {
+  font-family: var(--font-mono);
+  background: #2a2a2a;
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--accent-yellow, #d29922);
+}
+
+.terminal-snippet-modal-pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: #141414;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 12px;
+  margin: 0 0 12px;
+  color: var(--text-primary, #e6edf3);
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.45;
+}
+
+.terminal-snippet-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.terminal-snippet-modal-copy {
+  background: var(--accent-blue, #2f6fb6);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.terminal-snippet-modal-copy:hover {
+  background: var(--accent-blue-hover, #3b82c4);
+}
+
 .terminal-panel-xterm {
   flex: 1 1 0;
   min-height: 0;
