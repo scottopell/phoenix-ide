@@ -1,7 +1,7 @@
 ---
 created: 2025-07-05
 priority: p2
-status: in-progress
+status: done
 artifact: src/api/assets.rs
 ---
 
