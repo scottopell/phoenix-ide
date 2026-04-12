@@ -6893,43 +6893,88 @@ html * {
   transition: background-color 150ms ease, box-shadow 150ms ease;
 }
 
-.terminal-live-dot--idle {
-  background: var(--accent-green, #3fb950);
-  box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.6);
-  animation: terminal-live-pulse-idle 2s ease-in-out infinite;
+/* Five semantic dot variants:
+ *   unknown    — dimmed grey, subtle pulse (still awaiting detection)
+ *   absent     — neutral grey, static (shell integration not detected)
+ *   idle-ok    — green static (detected, nothing running, last cmd ok or none)
+ *   running    — blue pulse (OSC 133;C received, no D yet)
+ *   failed     — red static (last command exited non-zero)
+ * Disconnected state is handled by a panel-level "dead" treatment below,
+ * not by the dot itself.
+ */
+.terminal-live-dot--unknown {
+  background: var(--text-muted, #6e7681);
+  opacity: 0.5;
+  animation: terminal-live-pulse-unknown 1.6s ease-in-out infinite;
 }
 
-.terminal-live-dot--running {
-  background: var(--accent-yellow, #d29922);
-  box-shadow: 0 0 0 0 rgba(210, 153, 34, 0.7);
-  animation: terminal-live-pulse-running 0.8s ease-in-out infinite;
-}
-
-.terminal-live-dot--disconnected {
-  background: #d14343;
+.terminal-live-dot--absent {
+  background: var(--text-muted, #6e7681);
+  opacity: 0.7;
   animation: none;
 }
 
-@keyframes terminal-live-pulse-idle {
-  0%, 100% {
-    box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.55);
-    opacity: 0.85;
-  }
-  50% {
-    box-shadow: 0 0 0 4px rgba(63, 185, 80, 0);
-    opacity: 1;
-  }
+.terminal-live-dot--idle-ok {
+  background: var(--accent-green, #3fb950);
+  animation: none;
+}
+
+.terminal-live-dot--running {
+  background: var(--accent-blue, #58a6ff);
+  box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.7);
+  animation: terminal-live-pulse-running 0.8s ease-in-out infinite;
+}
+
+.terminal-live-dot--failed {
+  background: var(--accent-red, #f85149);
+  animation: none;
+}
+
+@keyframes terminal-live-pulse-unknown {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 0.7; }
 }
 
 @keyframes terminal-live-pulse-running {
   0%, 100% {
-    box-shadow: 0 0 0 0 rgba(210, 153, 34, 0.7);
+    box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.7);
     opacity: 0.85;
   }
   50% {
-    box-shadow: 0 0 0 5px rgba(210, 153, 34, 0);
+    box-shadow: 0 0 0 5px rgba(88, 166, 255, 0);
     opacity: 1;
   }
+}
+
+/* Disconnected: entire terminal panel goes muted + clickable-to-reconnect */
+.terminal-panel--dead {
+  opacity: 0.6;
+  filter: grayscale(0.4);
+  cursor: pointer;
+}
+.terminal-panel--dead .terminal-panel-header {
+  background: rgba(209, 67, 67, 0.08);
+  border-top-color: var(--accent-red, #f85149);
+}
+.terminal-panel-prompt--dead {
+  color: var(--accent-red, #f85149);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.terminal-panel-prompt--dim {
+  color: var(--text-muted, #6e7681);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  opacity: 0.6;
+}
+.terminal-hud-cwd--dim {
+  color: var(--text-muted, #6e7681);
+  opacity: 0.85;
+}
+
+/* Collapse (down) chevron variant — shown in expanded state */
+.terminal-panel-chevron.terminal-panel-chevron--expanded {
+  transform: rotate(0deg);
 }
 
 /* Live dot wrapper — host for the absent-state hint tooltip */

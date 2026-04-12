@@ -267,18 +267,14 @@ export function ConversationPage() {
     }
   }, [atom.phase.type]);
 
-  // Ctrl+` toggles the terminal collapse state (ignored while typing in an
-  // input, textarea, contentEditable, or xterm).
+  // Ctrl+` toggles the terminal collapse state. Only blocked when focus is
+  // inside the xterm itself — in every other input (chat textarea, etc.)
+  // the shortcut should still work, matching how VS Code and iTerm2 behave.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!e.ctrlKey || e.key !== '`') return;
       const active = document.activeElement as HTMLElement | null;
-      if (active) {
-        const tag = active.tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-        if (active.isContentEditable) return;
-        if (active.closest('.terminal-panel-xterm')) return;
-      }
+      if (active?.closest('.terminal-panel-xterm')) return;
       e.preventDefault();
       if (terminalPane.collapsed) {
         terminalPane.expandFromCollapsed();
@@ -747,6 +743,7 @@ export function ConversationPage() {
             height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
             collapsed={terminalPane.collapsed}
             onExpand={terminalPane.expandFromCollapsed}
+            onCollapse={() => terminalPane.setCollapsed(true)}
             cwd={conversation.cwd}
             shell={conversation.shell ?? undefined}
           />

@@ -33,6 +33,8 @@ interface TerminalPanelProps {
   collapsed: boolean;
   /** Click on the header strip restores from collapsed */
   onExpand: () => void;
+  /** Click on the expanded-state close button collapses back to strip */
+  onCollapse: () => void;
   /** Fallback prompt text when xterm buffer has no content yet */
   cwd?: string;
   /** Server-user's $SHELL, used to tailor the absent-state hint snippet. */
@@ -84,12 +86,6 @@ function truncateLeft(s: string, max: number): string {
   return '…' + s.slice(s.length - (max - 1));
 }
 
-/** Format a cwd for fallback display — last 40 chars, replace $HOME with ~. */
-function formatCwd(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, '');
-  return truncateLeft(trimmed, 40) + ' ❯';
-}
-
 /** Format a cwd path for the rich HUD — no glyph, just the path. */
 function formatCwdPlain(cwd: string): string {
   const trimmed = cwd.replace(/\/+$/, '');
@@ -116,6 +112,7 @@ export function TerminalPanel({
   height,
   collapsed,
   onExpand,
+  onCollapse,
   cwd,
   shell,
 }: TerminalPanelProps) {
@@ -131,7 +128,6 @@ export function TerminalPanel({
   const [activity, setActivity] = useState<ActivityState>('disconnected');
   const unreadRef = useRef<number>(0);
   const [unreadDisplay, setUnreadDisplay] = useState<number>(0);
-  const [promptLine, setPromptLine] = useState<string>('');
   const activityTimeoutRef = useRef<number | null>(null);
 
   // REQ-TERM-015/016/018: shell integration state
@@ -153,6 +149,12 @@ export function TerminalPanel({
 
   const detectionTimeoutRef = useRef<number | null>(null);
 
+  // Reconnect counter: incrementing forces the mount effect to tear down the
+  // current xterm + WS and spawn a fresh one (backend spawns a new PTY since
+  // the previous is gone). Wired to the "click to reconnect" affordance in
+  // the disconnected-state UI.
+  const [reconnectNonce, setReconnectNonce] = useState(0);
+
   // 100ms ticker bumped only while currentCommand is non-null. Drives the
   // live duration display in the HUD without re-rendering on every tick when
   // nothing is running.
@@ -173,6 +175,16 @@ export function TerminalPanel({
   // shell state across collapse/expand cycles.
   useEffect(() => {
     if (!containerRef.current) return;
+
+    // Reset detection + command state on (re-)mount so a reconnect gets a
+    // fresh 5s detection window and clears any stale command from the
+    // previous PTY. Also cleared on conversationId change.
+    integrationStatusRef.current = 'unknown';
+    setIntegrationStatus('unknown');
+    currentCommandRef.current = null;
+    setCurrentCommand(null);
+    setLastCompletedCommand(null);
+    setReportedCwd(null);
 
     // --- xterm.js setup ---
     const term = new Terminal({
@@ -200,16 +212,6 @@ export function TerminalPanel({
     // message are inspected. The callbacks read state via refs, so they stay
     // correct across re-renders without needing to re-register.
     const handleOsc133 = (data: string): void => {
-      // Detection: any marker promotes unknown → detected. Locked thereafter
-      // (ShellIntegrationStatusMonotonic).
-      if (integrationStatusRef.current === 'unknown') {
-        integrationStatusRef.current = 'detected';
-        setIntegrationStatus('detected');
-        if (detectionTimeoutRef.current !== null) {
-          window.clearTimeout(detectionTimeoutRef.current);
-          detectionTimeoutRef.current = null;
-        }
-      }
       if (integrationStatusRef.current === 'absent') {
         // Detection settled to absent before this marker arrived. Lock holds.
         return;
@@ -220,17 +222,34 @@ export function TerminalPanel({
       const kind = semi === -1 ? data : data.slice(0, semi);
       const payload = semi === -1 ? '' : data.slice(semi + 1);
 
+      // REQ-TERM-015 (revised): detection promotes unknown → detected only
+      // on C. A and B alone are insufficient — p10k emits A/B from its
+      // prompt hooks but never C/D, and a HUD that says "detected" without
+      // being able to track commands would mislead.
+      if (kind === 'C' && integrationStatusRef.current === 'unknown') {
+        integrationStatusRef.current = 'detected';
+        setIntegrationStatus('detected');
+        if (detectionTimeoutRef.current !== null) {
+          window.clearTimeout(detectionTimeoutRef.current);
+          detectionTimeoutRef.current = null;
+        }
+      }
+
+      // A and B markers while unknown do nothing — we wait for a C.
+      if (integrationStatusRef.current === 'unknown') return;
+
       switch (kind) {
         case 'A':
-          // FTCS_PROMPT_START — clear last_completed_command
-          setLastCompletedCommand(null);
-          break;
         case 'B':
-          // FTCS_COMMAND_START — accepted, no state change (forward compat)
+          // No-op in the revised model. A marked the start of a new prompt
+          // (used to clear last_completed_command) but clearing now happens
+          // on the next C, which gives the ✓/✗ indicator a useful lifetime.
           break;
         case 'C': {
           // FTCS_COMMAND_EXECUTED — start a new command lifecycle.
-          // Overwrites any prior current_command (nested subshell case).
+          // Clears last_completed_command (was previously done on A but
+          // that fired ~50ms after D, making the success indicator invisible).
+          setLastCompletedCommand(null);
           const cmd: CommandExecution = {
             commandText: payload,
             startedAt: Date.now(),
@@ -245,7 +264,6 @@ export function TerminalPanel({
           // FTCS_COMMAND_FINISHED — finalise the current command, if any.
           const cur = currentCommandRef.current;
           if (!cur) {
-            // Spec: log at debug, no state change.
             // eslint-disable-next-line no-console
             console.debug(
               'OSC 133;D received with no current_command; ignoring',
@@ -271,8 +289,7 @@ export function TerminalPanel({
           break;
         }
         default:
-          // Unknown 133 sub-marker. Detection has already fired above; we
-          // just ignore the body. (Implementations sometimes use ;P, ;E, etc.)
+          // Unknown 133 sub-marker (;P, ;E, etc.). Ignore.
           break;
       }
     };
@@ -401,7 +418,11 @@ export function TerminalPanel({
       fitAddonRef.current = null;
       wsRef.current = null;
     };
-  }, [conversationId, setStatus]);
+  }, [conversationId, setStatus, reconnectNonce]);
+
+  const reconnect = useCallback(() => {
+    setReconnectNonce((n) => n + 1);
+  }, []);
 
   // Refit when the parent height changes (drag-resize).
   useEffect(() => {
@@ -440,58 +461,6 @@ export function TerminalPanel({
     return () => window.clearInterval(id);
   }, []);
 
-  // Sample the xterm buffer for the last non-blank line (~300ms).
-  // FALLBACK PATH ONLY — when integrationStatus === 'detected', the rich HUD
-  // draws from currentCommand / lastCompletedCommand instead and the prompt
-  // line text is unused. We still run the sampler in `unknown` so the HUD
-  // has something to show before detection settles.
-  useEffect(() => {
-    if (integrationStatus === 'detected') return;
-    const sample = () => {
-      const term = termRef.current;
-      if (!term) return;
-      const buf = term.buffer.active;
-      const startY = buf.cursorY + buf.baseY;
-      const lineText = (y: number): string => {
-        if (y < 0) return '';
-        const line = buf.getLine(y);
-        if (!line) return '';
-        return line.translateToString(true).trimEnd();
-      };
-      let found = '';
-      let foundY = -1;
-      for (let dy = 0; dy <= 5; dy++) {
-        const text = lineText(startY - dy);
-        if (text && text.trim().length > 0) {
-          found = text;
-          foundY = startY - dy;
-          break;
-        }
-      }
-      if (found && found.trim().length <= 10 && foundY > 0) {
-        for (let dy = 1; dy <= 3; dy++) {
-          const above = lineText(foundY - dy);
-          if (above && above.trim().length > found.trim().length) {
-            found = `${above} ${found.trim()}`;
-            break;
-          }
-        }
-      }
-      if (!found) {
-        if (cwd && cwd.length > 0) {
-          found = formatCwd(cwd);
-        } else {
-          found = '';
-        }
-      }
-      const truncated = truncateLeft(found, 60);
-      setPromptLine((prev) => (prev === truncated ? prev : truncated));
-    };
-    sample();
-    const id = window.setInterval(sample, 300);
-    return () => window.clearInterval(id);
-  }, [cwd, integrationStatus]);
-
   // Live duration ticker — runs only while a command is executing.
   useEffect(() => {
     if (!currentCommand) return;
@@ -522,26 +491,34 @@ export function TerminalPanel({
 
   // --- Rendering helpers ---
 
-  // Dot color: in detected mode, drive from current_command; in fallback,
-  // use the byte-activity heuristic. Disconnected always wins (WS dead).
-  const dotState: ActivityState =
-    activity === 'disconnected'
-      ? 'disconnected'
-      : integrationStatus === 'detected'
-        ? currentCommand !== null
-          ? 'running'
-          : 'idle'
-        : activity;
+  // Dot color / semantic state. Disconnected is handled by a panel-level
+  // "dead" treatment (see below); here we only compute the five normal dot
+  // variants. Order of priority: disconnected wins over everything.
+  const isDisconnected = activity === 'disconnected';
+  type DotVariant = 'unknown' | 'absent' | 'idle-ok' | 'running' | 'failed';
+  const dotVariant: DotVariant = (() => {
+    if (integrationStatus === 'unknown') return 'unknown';
+    if (integrationStatus === 'absent') return 'absent';
+    // detected
+    if (currentCommand !== null) return 'running';
+    if (lastCompletedCommand && (lastCompletedCommand.exitCode ?? 0) !== 0) {
+      return 'failed';
+    }
+    return 'idle-ok';
+  })();
 
-  const dotClass =
-    dotState === 'running'
-      ? 'terminal-live-dot terminal-live-dot--running'
-      : dotState === 'disconnected'
-        ? 'terminal-live-dot terminal-live-dot--disconnected'
-        : 'terminal-live-dot terminal-live-dot--idle';
+  const dotClass = `terminal-live-dot terminal-live-dot--${dotVariant}`;
 
-  const headerClickable = collapsed;
-  const handleHeaderClick = headerClickable ? onExpand : undefined;
+  // Header click semantics:
+  //   disconnected: click anywhere → reconnect (revive the PTY)
+  //   collapsed:    click anywhere → expand
+  //   expanded:     click on the header body does nothing (close button handles it)
+  const handleHeaderClick = isDisconnected
+    ? reconnect
+    : collapsed
+      ? onExpand
+      : undefined;
+  const headerClickable = isDisconnected || collapsed;
 
   // For the rich HUD: prefer reported_cwd, fall back to conversation cwd.
   const effectiveCwd = reportedCwd ?? cwd ?? '';
@@ -572,14 +549,34 @@ export function TerminalPanel({
     }
   };
 
-  // Render the collapsed-mode prompt area: rich HUD if detected, else
-  // sampler-driven text. Both branches are functionally identical re: layout
-  // (one flex line) so the existing CSS keeps working.
+  // Render the collapsed-mode prompt area. Five variants driven by
+  // integrationStatus + command lifecycle. No buffer sampler — it produced
+  // ugly fragments for two-line powerline prompts; cleaner to show the
+  // static cwd and rely on OSC 133 for live data when available.
   const renderCollapsedHud = () => {
-    if (integrationStatus !== 'detected') {
+    if (isDisconnected) {
+      return (
+        <span className="terminal-panel-prompt terminal-panel-prompt--dead">
+          Terminal disconnected — click to reconnect
+        </span>
+      );
+    }
+    if (integrationStatus === 'unknown') {
+      // Within the 5s detection window — show a calm placeholder, no sampler.
+      return (
+        <span className="terminal-panel-prompt terminal-panel-prompt--dim">
+          ❯_ Terminal
+        </span>
+      );
+    }
+    if (integrationStatus === 'absent') {
+      // Shell integration not detected. Show the static conversation cwd
+      // so the user has a useful anchor. Hover the dot for the hint.
       return (
         <span className="terminal-panel-prompt">
-          {promptLine || '❯_ Terminal'}
+          <span className="terminal-hud-cwd terminal-hud-cwd--dim">
+            {formatCwdPlain(cwd ?? '') || '❯_ Terminal'}
+          </span>
         </span>
       );
     }
@@ -640,8 +637,14 @@ export function TerminalPanel({
     );
   };
 
+  const panelClass = `terminal-panel${isDisconnected ? ' terminal-panel--dead' : ''}`;
+
   return (
-    <div className="terminal-panel" style={{ height: `${height}px` }}>
+    <div
+      className={panelClass}
+      style={{ height: `${height}px` }}
+      onClick={isDisconnected ? reconnect : undefined}
+    >
       <div
         className={`terminal-panel-header${collapsed ? ' terminal-panel-header--collapsed' : ''}`}
         onClick={handleHeaderClick}
@@ -665,7 +668,7 @@ export function TerminalPanel({
             </span>
           )}
         </span>
-        {collapsed ? (
+        {collapsed || isDisconnected ? (
           renderCollapsedHud()
         ) : (
           <span className="terminal-panel-prompt">❯_ Terminal</span>
@@ -676,17 +679,20 @@ export function TerminalPanel({
             +{unreadDisplay} {unreadDisplay === 1 ? 'line' : 'lines'}
           </span>
         )}
-        {collapsed && (
-          <span
-            className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--open'}`}
-            aria-hidden="true"
+        {!isDisconnected && (
+          <button
+            type="button"
+            className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--expanded'}`}
+            aria-label={collapsed ? 'Expand terminal' : 'Collapse terminal'}
+            title={collapsed ? 'Expand terminal' : 'Collapse terminal'}
             onClick={(e) => {
               e.stopPropagation();
-              onExpand();
+              if (collapsed) onExpand();
+              else onCollapse();
             }}
           >
-            ⌃
-          </span>
+            {collapsed ? '⌃' : '⌄'}
+          </button>
         )}
       </div>
       <div
