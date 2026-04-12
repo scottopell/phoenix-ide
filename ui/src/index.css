@@ -6848,7 +6848,10 @@ html * {
 .terminal-panel-status {
   font-size: 11px;
   color: var(--text-muted, #888);
-  flex-shrink: 0;
+  /* Allow the status div to shrink so the chevron can pin to the far right
+     regardless of how long the prompt text is. */
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .terminal-panel-unread {
@@ -6862,25 +6865,33 @@ html * {
   transition: color 150ms ease, background 150ms ease;
 }
 
+/* Collapse/expand button. Positioned at the LEFT of the header (before the
+ * status dot) so it's the first thing the user sees and a predictable hit
+ * target regardless of what the HUD is showing. Generous padding for easy
+ * mousing. */
 .terminal-panel-chevron {
-  font-size: 14px;
-  color: var(--text-muted, #888);
+  background: transparent;
+  border: 0;
+  padding: 4px 10px;
+  margin-right: 4px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-secondary, #8b949e);
   flex-shrink: 0;
-  width: 18px;
   text-align: center;
   line-height: 1;
   cursor: pointer;
-  transition: color 150ms ease, transform 150ms ease;
-  display: inline-block;
-  transform: rotate(180deg);
-}
-
-.terminal-panel-chevron--open {
-  transform: rotate(0deg);
+  transition: color 150ms ease, background 150ms ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  border-radius: 4px;
 }
 
 .terminal-panel-chevron:hover {
   color: var(--text-primary, #e6edf3);
+  background: var(--bg-tertiary, #21262d);
 }
 
 /* Live dot — CSS-only pulse */
@@ -6970,11 +6981,6 @@ html * {
 .terminal-hud-cwd--dim {
   color: var(--text-muted, #6e7681);
   opacity: 0.85;
-}
-
-/* Collapse (down) chevron variant — shown in expanded state */
-.terminal-panel-chevron.terminal-panel-chevron--expanded {
-  transform: rotate(0deg);
 }
 
 /* Live dot wrapper — host for the absent-state hint tooltip */
@@ -7162,6 +7168,53 @@ html * {
 
 .terminal-snippet-modal-copy:hover {
   background: var(--accent-blue-hover, #3b82c4);
+}
+
+.terminal-snippet-modal-assist {
+  background: var(--accent-green, #3fb950);
+  color: #0d1117;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 150ms ease, opacity 150ms ease;
+}
+
+.terminal-snippet-modal-assist:hover:not(:disabled) {
+  background: #4cc962;
+}
+
+.terminal-snippet-modal-assist:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Seed conversation breadcrumb (REQ-SEED-003) */
+.conversation-seed-breadcrumb {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-muted, #6e7681);
+  font-family: var(--font-mono);
+  border-bottom: 1px solid var(--border-primary, rgba(255, 255, 255, 0.06));
+  flex-shrink: 0;
+}
+
+.conversation-seed-breadcrumb a {
+  color: var(--text-muted, #6e7681);
+  text-decoration: none;
+  transition: color 150ms ease;
+}
+
+.conversation-seed-breadcrumb a:hover {
+  color: var(--text-primary, #e6edf3);
+  text-decoration: underline;
 }
 
 .terminal-panel-xterm {

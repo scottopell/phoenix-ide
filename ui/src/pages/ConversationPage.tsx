@@ -229,6 +229,36 @@ export function ConversationPage() {
       .catch((err) => console.warn('Failed to load models:', err));
   }, []);
 
+  // REQ-SEED-001: hydrate the input area from `seed-draft:<id>` localStorage
+  // when a seeded conversation first mounts, then clear the key so revisits
+  // don't re-hydrate it. We push the draft into InputArea via its imperative
+  // `setDraft` handle, which routes through `useDraft` so persistence picks
+  // up normally from there.
+  const seedHydratedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!conversationId) return;
+    if (seedHydratedRef.current === conversationId) return;
+    const key = `seed-draft:${conversationId}`;
+    let draft: string | null = null;
+    try {
+      draft = localStorage.getItem(key);
+    } catch {
+      // ignore
+    }
+    if (!draft) return;
+    seedHydratedRef.current = conversationId;
+    // Defer to the next tick so InputArea has mounted and inputRef is set.
+    const handle = window.setTimeout(() => {
+      inputRef.current?.setDraft(draft!);
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // ignore
+      }
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [conversationId]);
+
   // Poll credential status every 5s
   useEffect(() => {
     const poll = async () => {
@@ -436,6 +466,47 @@ export function ConversationPage() {
     }
   };
 
+  // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
+  // TerminalPanel builds the prompt text and hands it off; this owns the API
+  // call + navigation because it has conversationId, model, and router ctx.
+  //
+  // The seeded conversation is created with empty `text` — the backend
+  // skips the initial UserMessage dispatch when `seed_parent_id` is set and
+  // text is empty (handlers.rs). The new page hydrates its input area from
+  // `seed-draft:<id>` in localStorage so the user can review and hit Send.
+  const handleAssistShellSetup = useCallback(
+    async (promptText: string, seedLabel: string, homeDir: string) => {
+      if (!conversation?.id) return;
+      const messageId =
+        crypto.randomUUID?.() ??
+        `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      // Stash the seed draft BEFORE navigation so it's visible to the new
+      // page on first render (useDraft reads localStorage synchronously in
+      // its initializer).
+      const newConvPromise = api.createConversation(
+        homeDir,
+        '', // empty — server accepts empty text when seed_parent_id is set
+        messageId,
+        conversation.model ?? undefined,
+        [],
+        'direct',
+        null,
+        conversation.id,
+        seedLabel,
+      );
+      const newConv = await newConvPromise;
+      try {
+        localStorage.setItem(`seed-draft:${newConv.id}`, promptText);
+      } catch {
+        // ignore — non-fatal
+      }
+      if (newConv.slug) {
+        navigate(`/c/${newConv.slug}`);
+      }
+    },
+    [conversation, navigate],
+  );
+
   const handleApproveTask = async () => {
     if (!conversationId) return;
     try {
@@ -589,9 +660,31 @@ export function ConversationPage() {
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'context_exhausted';
 
+  // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list
+  // when this conversation was spawned from another via a seed action.
+  // If `seed_parent_slug` is present we link to it; if not (parent deleted),
+  // we render unlinked text.
+  const seedBreadcrumb = conversation.seed_parent_id ? (
+    <div className="conversation-seed-breadcrumb">
+      {conversation.seed_parent_slug ? (
+        <a href={`/c/${conversation.seed_parent_slug}`} onClick={(e) => {
+          e.preventDefault();
+          navigate(`/c/${conversation.seed_parent_slug}`);
+        }}>
+          {'\u2190'} from: {conversation.seed_label ?? conversation.seed_parent_slug}
+        </a>
+      ) : (
+        <span>
+          {'\u2190'} from: {conversation.seed_label ?? '(parent deleted)'}
+        </span>
+      )}
+    </div>
+  ) : null;
+
   return (
     <div id="app">
       <div className="conversation-column">
+      {seedBreadcrumb}
       <MessageList
         messages={atom.messages}
         queuedMessages={queuedMessages}
@@ -746,6 +839,8 @@ export function ConversationPage() {
             onCollapse={() => terminalPane.setCollapsed(true)}
             cwd={conversation.cwd}
             shell={conversation.shell ?? undefined}
+            homeDir={conversation.home_dir ?? undefined}
+            onAssistSetup={handleAssistShellSetup}
           />
         </>
       )}

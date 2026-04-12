@@ -22,6 +22,16 @@ export interface Conversation {
   /** Server-user's $SHELL (e.g. "/bin/zsh"); used to tailor the
    *  OSC 133 enablement snippet in the terminal HUD. REQ-TERM-017. */
   shell?: string | null;
+  /** Server-user's $HOME (e.g. "/Users/alice"); used to scope seeded
+   *  conversations for shell integration setup. REQ-SEED-*. */
+  home_dir?: string | null;
+  /** Seed parent conversation id (REQ-SEED-003). Decorative only. */
+  seed_parent_id?: string | null;
+  /** Seed label surfaced in the breadcrumb (REQ-SEED-004). */
+  seed_label?: string | null;
+  /** Slug of the seed parent, resolved server-side for the breadcrumb link.
+   *  `null` if the parent has been deleted; UI renders unlinked text. */
+  seed_parent_slug?: string | null;
 }
 
 export interface Project {
@@ -327,10 +337,18 @@ export const api = {
     images: ImageData[] = [],
     mode?: 'direct' | 'managed',
     baseBranch?: string | null,
+    seedParentId?: string | null,
+    seedLabel?: string | null,
   ): Promise<Conversation> {
     const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
     if (baseBranch) {
       body['base_branch'] = baseBranch;
+    }
+    if (seedParentId) {
+      body['seed_parent_id'] = seedParentId;
+    }
+    if (seedLabel) {
+      body['seed_label'] = seedLabel;
     }
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',

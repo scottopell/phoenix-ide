@@ -39,6 +39,16 @@ interface TerminalPanelProps {
   cwd?: string;
   /** Server-user's $SHELL, used to tailor the absent-state hint snippet. */
   shell?: string | undefined;
+  /** Server-user's $HOME, used by the "let Phoenix set this up for me"
+   *  button as the seeded conversation's working directory (REQ-TERM-020). */
+  homeDir?: string | undefined;
+  /**
+   * Called when the user clicks "Let Phoenix set this up for me" in the
+   * snippet modal. The parent owns navigation and the createConversation
+   * API call because it has the conversation id, model, and router context.
+   * TerminalPanel just builds the prompt and hands it off.
+   */
+  onAssistSetup?: (promptText: string, seedLabel: string, homeDir: string) => Promise<void> | void;
 }
 
 type ActivityState = 'idle' | 'running' | 'disconnected';
@@ -107,6 +117,59 @@ function formatDuration(ms: number): string {
   return `${seconds.toFixed(1)}s`;
 }
 
+/**
+ * REQ-TERM-020: build the initial prompt that the seeded conversation will
+ * hydrate into its input area. The prompt asks Phoenix to investigate the
+ * user's dotfiles setup, pick the right target file, and apply the OSC 133
+ * snippet safely without touching unrelated configuration.
+ *
+ * The prompt is pre-filled but NOT auto-submitted. The user reviews it and
+ * hits Send (REQ-SEED-001).
+ */
+function buildAssistPrompt(shellPath: string, snippet: ShellSnippet): string {
+  return `I want to enable OSC 133 shell integration in my shell so Phoenix IDE's terminal HUD can track my commands (running, exit codes, durations). My shell is ${shellPath}.
+
+Please:
+
+1. INVESTIGATE my dotfiles setup. Check:
+   - Whether ~/.zshrc (or equivalent for bash/fish) exists and whether it's a regular file or a symlink
+   - Framework markers: oh-my-zsh, prezto, zim, powerlevel10k, starship
+   - Dotfile managers: chezmoi (~/.local/share/chezmoi/), yadm (~/.yadm/ or ~/.config/yadm/), stow/dotbot/rcm (symlinked targets to a git repo), home-manager / NixOS (read-only generated configs)
+   - Existing "Phoenix terminal integration" marker comments (idempotency — if already installed, tell me and exit)
+
+2. DECIDE the right place to write the snippet:
+   - oh-my-zsh → create ~/.oh-my-zsh/custom/phoenix-integration.zsh (auto-sourced)
+   - fish → create ~/.config/fish/conf.d/phoenix-integration.fish
+   - chezmoi → use \`chezmoi source-path\` to find the managed source, edit it there, then \`chezmoi apply\`
+   - yadm → edit ~/.zshrc (or equivalent) directly; it's tracked in yadm's bare repo
+   - symlinked dotfiles → follow the symlink to the target file, edit the target
+   - plain → append to ~/.zshrc (or ~/.bashrc for bash)
+   - NixOS / home-manager → DO NOT EDIT. Tell me where to manually add the snippet in my home.nix.
+
+3. VERIFY BEFORE WRITE. Check if the snippet is already present (grep for "Phoenix terminal integration" or \`__phoenix_precmd\`). If so, confirm with me and exit without changes.
+
+4. APPLY the edit. Do not touch unrelated configuration.
+
+5. CONFIRM by reading the file back to verify the snippet landed correctly.
+
+6. TELL ME how to activate it (source the file, or restart my shell).
+
+7. GIT HYGIENE: if the edited file is tracked (yadm, chezmoi, a dotfiles repo), STAGE the change and SHOW git status but ASK before committing. Never auto-commit my dotfiles.
+
+Constraints:
+- Edit nothing outside my shell config
+- Do not install new tools
+- For exotic setups (home-manager, nushell, etc.) show me the snippet and explain the manual steps — do not attempt automation you cannot verify
+- Ask before committing anything to git
+
+The snippet to install (${snippet.shellName}):
+
+\`\`\`
+${snippet.snippet}
+\`\`\`
+`;
+}
+
 export function TerminalPanel({
   conversationId,
   height,
@@ -115,6 +178,8 @@ export function TerminalPanel({
   onCollapse,
   cwd,
   shell,
+  homeDir,
+  onAssistSetup,
 }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -179,6 +244,11 @@ export function TerminalPanel({
     // Reset detection + command state on (re-)mount so a reconnect gets a
     // fresh 5s detection window and clears any stale command from the
     // previous PTY. Also cleared on conversationId change.
+    //
+    // Intentionally NOT resetting `activity` here — let ws.onopen flip it
+    // to 'idle' once the new handshake completes. Pre-clearing on mount
+    // produced a dim→undim flash when the effect re-ran spontaneously
+    // (HMR during dev, accidental clicks) without a real new session.
     integrationStatusRef.current = 'unknown';
     setIntegrationStatus('unknown');
     currentCommandRef.current = null;
@@ -374,9 +444,9 @@ export function TerminalPanel({
       setActivity('disconnected');
     };
     ws.onclose = () => {
-      setStatus('Terminal closed');
+      setStatus('Shell exited');
       setActivity('disconnected');
-      term.write('\r\n\x1b[90m[Terminal disconnected]\x1b[0m\r\n');
+      term.write('\r\n\x1b[90m[Shell exited]\x1b[0m\r\n');
     };
 
     const disposeOnData = term.onData((text) => {
@@ -412,6 +482,17 @@ export function TerminalPanel({
         window.clearTimeout(detectionTimeoutRef.current);
         detectionTimeoutRef.current = null;
       }
+      // Unbind handlers BEFORE close() so a synthesized onclose during
+      // teardown doesn't race with the new effect run and clobber its
+      // freshly-set activity state. This was the "click-to-reconnect doesn't
+      // work" bug: ws.close() fired the old onclose handler, which set
+      // activity back to 'disconnected' while the new ws was still
+      // connecting — so even though the new connection succeeded, the UI
+      // stayed stuck in the dead state.
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
       ws.close();
       term.dispose();
       termRef.current = null;
@@ -549,6 +630,35 @@ export function TerminalPanel({
     }
   };
 
+  // REQ-TERM-020: build a detailed prompt for a seeded conversation that
+  // asks Phoenix to investigate the user's dotfiles setup and apply the
+  // integration snippet safely. The parent handles the API call + navigation.
+  const [assistInFlight, setAssistInFlight] = useState(false);
+  const canAssist =
+    snippet !== null &&
+    !!shell &&
+    !!homeDir &&
+    typeof onAssistSetup === 'function' &&
+    !assistInFlight;
+
+  const handleAssistSetup = async () => {
+    if (!snippet || !shell || !homeDir || !onAssistSetup) return;
+    const promptText = buildAssistPrompt(shell, snippet);
+    const seedLabel = `Shell integration setup (${snippet.shellName})`;
+    setAssistInFlight(true);
+    try {
+      await onAssistSetup(promptText, seedLabel, homeDir);
+      // Parent navigates; this component unmounts. No need to close the
+      // modal — it's disposed with the page.
+    } catch (err) {
+      // Surface nothing fancy — the button re-enables so the user can retry.
+      // Console is the only place the error goes; REQ-TERM-020 is best-effort.
+      // eslint-disable-next-line no-console
+      console.error('Assist setup failed:', err);
+      setAssistInFlight(false);
+    }
+  };
+
   // Render the collapsed-mode prompt area. Five variants driven by
   // integrationStatus + command lifecycle. No buffer sampler — it produced
   // ugly fragments for two-line powerline prompts; cleaner to show the
@@ -557,7 +667,7 @@ export function TerminalPanel({
     if (isDisconnected) {
       return (
         <span className="terminal-panel-prompt terminal-panel-prompt--dead">
-          Terminal disconnected — click to reconnect
+          Shell exited — click to start a new one
         </span>
       );
     }
@@ -650,6 +760,21 @@ export function TerminalPanel({
         onClick={handleHeaderClick}
         style={headerClickable ? { cursor: 'pointer' } : undefined}
       >
+        {!isDisconnected && (
+          <button
+            type="button"
+            className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--expanded'}`}
+            aria-label={collapsed ? 'Expand terminal' : 'Collapse terminal'}
+            title={collapsed ? 'Expand terminal' : 'Collapse terminal'}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (collapsed) onExpand();
+              else onCollapse();
+            }}
+          >
+            {collapsed ? '⌃' : '⌄'}
+          </button>
+        )}
         <span
           className={`terminal-live-dot-wrap${integrationStatus === 'absent' ? ' terminal-live-dot-wrap--hint' : ''}`}
           onMouseEnter={handleDotMouseEnter}
@@ -678,21 +803,6 @@ export function TerminalPanel({
           <span className="terminal-panel-unread">
             +{unreadDisplay} {unreadDisplay === 1 ? 'line' : 'lines'}
           </span>
-        )}
-        {!isDisconnected && (
-          <button
-            type="button"
-            className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--expanded'}`}
-            aria-label={collapsed ? 'Expand terminal' : 'Collapse terminal'}
-            title={collapsed ? 'Expand terminal' : 'Collapse terminal'}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (collapsed) onExpand();
-              else onCollapse();
-            }}
-          >
-            {collapsed ? '⌃' : '⌄'}
-          </button>
         )}
       </div>
       <div
@@ -741,6 +851,19 @@ export function TerminalPanel({
                       onClick={handleCopySnippet}
                     >
                       {copyAck ? 'Copied!' : 'Copy to clipboard'}
+                    </button>
+                    <button
+                      type="button"
+                      className="terminal-snippet-modal-assist"
+                      onClick={handleAssistSetup}
+                      disabled={!canAssist}
+                      title={
+                        canAssist
+                          ? 'Spin off a focused conversation that installs this snippet safely'
+                          : 'Shell or home directory unknown'
+                      }
+                    >
+                      {assistInFlight ? 'Starting…' : 'Let Phoenix set this up for me'}
                     </button>
                   </div>
                 </>
