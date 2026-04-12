@@ -12,6 +12,7 @@ mod runtime;
 pub mod skills;
 mod state_machine;
 mod system_prompt;
+mod terminal;
 mod title_generator;
 mod tools;
 

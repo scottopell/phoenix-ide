@@ -60,6 +60,8 @@ pub struct RuntimeManager {
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
+    /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
+    pub terminals: crate::terminal::ActiveTerminals,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
@@ -166,6 +168,9 @@ pub enum SseEvent {
         request_id: String,
     },
     AgentDone,
+    /// Emitted once when a conversation's `is_terminal()` first becomes true.
+    /// Consumed by the terminal subsystem to tear down any active PTY session.
+    ConversationBecameTerminal,
     /// Pushed when conversation metadata changes mid-session (e.g., cwd/mode after approval).
     /// Typed struct instead of `Value` — the executor knows exactly which fields changed.
     ConversationUpdate {
@@ -191,6 +196,7 @@ impl RuntimeManager {
             platform,
             browser_sessions: Arc::new(BrowserSessionManager::default()),
             mcp_manager,
+            terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
@@ -380,6 +386,7 @@ impl RuntimeManager {
             tool_executor,
             self.browser_sessions.clone(),
             self.llm_registry.clone(),
+            self.terminals.clone(),
             event_rx,
             event_tx.clone(),
             broadcast_tx.clone(),
@@ -584,6 +591,7 @@ impl RuntimeManager {
             tool_executor,
             self.browser_sessions.clone(),
             self.llm_registry.clone(),
+            self.terminals.clone(),
             event_rx,
             event_tx.clone(),
             broadcast_tx.clone(),

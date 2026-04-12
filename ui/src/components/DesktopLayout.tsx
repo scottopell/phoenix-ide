@@ -85,22 +85,25 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     [conversations, activeSlug],
   );
 
-  if (!isDesktop) {
-    return <FileExplorerProvider>{children}</FileExplorerProvider>;
-  }
-
+  // Always render a single stable tree so children never unmounts across the
+  // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
+  // panel via isDesktop — children stays in the same tree position throughout.
+  // See task 08664: previously the early-return on !isDesktop produced a
+  // different React tree, unmounting ConversationPage and resetting its state.
   return (
     <FileExplorerProvider>
-      <div className="desktop-layout">
-        <Sidebar
-          collapsed={sidebarCollapsed}
-          onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
-          conversations={conversations}
-          archivedConversations={archivedConversations}
-          activeSlug={activeSlug}
-          onConversationCreated={() => loadConversations(true)}
-        />
-        {activeSlug && (
+      <div className={isDesktop ? 'desktop-layout' : undefined}>
+        {isDesktop && (
+          <Sidebar
+            collapsed={sidebarCollapsed}
+            onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+            conversations={conversations}
+            archivedConversations={archivedConversations}
+            activeSlug={activeSlug}
+            onConversationCreated={() => loadConversations(true)}
+          />
+        )}
+        {isDesktop && activeSlug && (
           <FileExplorerPanel
             collapsed={fileExplorerCollapsed}
             onToggle={() => setFileExplorerCollapsed(!fileExplorerCollapsed)}
@@ -110,17 +113,20 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             branchName={activeConversation?.branch_name}
           />
         )}
-        <div className="desktop-main">
+        {/* children is always at this position — never remounts on breakpoint crossing */}
+        <div className={isDesktop ? 'desktop-main' : undefined}>
           {children}
         </div>
-        <CommandPalette conversations={conversations} />
+        {isDesktop && <CommandPalette conversations={conversations} />}
         {/* Debug: toast test triggers */}
-        <div className="toast-debug">
-          <button onClick={() => showSuccess('Operation completed', 3000)} title="Test success toast">ok</button>
-          <button onClick={() => showError('Something went wrong', 3000)} title="Test error toast">err</button>
-          <button onClick={() => showWarning('Approaching limit', 3000)} title="Test warning toast">warn</button>
-          <button onClick={() => showInfo('Processing...', 3000)} title="Test info toast">info</button>
-        </div>
+        {isDesktop && (
+          <div className="toast-debug">
+            <button onClick={() => showSuccess('Operation completed', 3000)} title="Test success toast">ok</button>
+            <button onClick={() => showError('Something went wrong', 3000)} title="Test error toast">err</button>
+            <button onClick={() => showWarning('Approaching limit', 3000)} title="Test warning toast">warn</button>
+            <button onClick={() => showInfo('Processing...', 3000)} title="Test info toast">info</button>
+          </div>
+        )}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
     </FileExplorerProvider>

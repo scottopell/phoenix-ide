@@ -86,6 +86,7 @@ mod tests {
             working_dir,
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
         )
     }
 

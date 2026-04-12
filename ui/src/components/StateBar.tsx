@@ -217,7 +217,7 @@ export function StateBar({
   const modeLabel = conversation?.conv_mode_label;
   const modeSuffix = isExplore ? ' (read-only)' : '';
   const modeClass = `statebar-mode statebar-mode--${mode}`;
-  const modelAbbrev = conversation ? abbreviateModel(conversation.model) : '';
+  const modelAbbrev = conversation ? abbreviateModel(conversation.model ?? '') : '';
   const projectName = conversation ? getProjectName(conversation) : null;
 
   // Model upgrade detection: check if a 1M variant exists for the current model

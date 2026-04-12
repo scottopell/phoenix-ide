@@ -12,6 +12,7 @@ pub mod patch;
 mod propose_task;
 mod read_file;
 mod read_image;
+mod read_terminal;
 mod search;
 mod skill;
 mod subagent;
@@ -29,6 +30,7 @@ pub use patch::PatchTool;
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
+pub use read_terminal::ReadTerminalTool;
 pub use search::SearchTool;
 pub use skill::SkillTool;
 pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
@@ -117,6 +119,9 @@ pub struct ToolContext {
 
     /// LLM registry for tools that need model access
     llm_registry: Arc<ModelRegistry>,
+
+    /// Active PTY terminal sessions — used by the `read_terminal` tool.
+    pub terminals: crate::terminal::ActiveTerminals,
 }
 
 impl ToolContext {
@@ -127,6 +132,7 @@ impl ToolContext {
         working_dir: PathBuf,
         browser_sessions: Arc<BrowserSessionManager>,
         llm_registry: Arc<ModelRegistry>,
+        terminals: crate::terminal::ActiveTerminals,
     ) -> Self {
         Self {
             cancel,
@@ -134,6 +140,7 @@ impl ToolContext {
             working_dir,
             browser_sessions,
             llm_registry,
+            terminals,
         }
     }
 
@@ -293,6 +300,7 @@ impl ToolRegistry {
             Arc::new(PatchTool::default()),
             Arc::new(KeywordSearchTool),
             Arc::new(ReadImageTool),
+            Arc::new(ReadTerminalTool),
             // Browser tools
             Arc::new(BrowserNavigateTool),
             Arc::new(BrowserEvalTool),

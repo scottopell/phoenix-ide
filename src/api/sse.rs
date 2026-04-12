@@ -105,6 +105,12 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 "type": "agent_done"
             }),
         ),
+        SseEvent::ConversationBecameTerminal => (
+            "conversation_became_terminal",
+            json!({
+                "type": "conversation_became_terminal"
+            }),
+        ),
         SseEvent::ConversationUpdate { update } => (
             "conversation_update",
             json!({

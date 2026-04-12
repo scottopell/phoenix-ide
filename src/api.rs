@@ -16,6 +16,7 @@ use crate::db::Database;
 use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
+use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
 use std::sync::Arc;
 
@@ -31,6 +32,8 @@ pub struct AppState {
     pub helper_state: Option<Arc<crate::llm::credential_helper::HelperState>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
     pub password: Option<String>,
+    /// Active PTY terminal sessions keyed by conversation ID (REQ-TERM-003).
+    pub terminals: ActiveTerminals,
 }
 
 impl AppState {
@@ -50,6 +53,7 @@ impl AppState {
             mcp_manager.clone(),
         ));
         runtime.start_sub_agent_handler().await;
+        let terminals = runtime.terminals.clone();
         Self {
             runtime,
             llm_registry,
@@ -58,6 +62,7 @@ impl AppState {
             mcp_manager,
             helper_state,
             password,
+            terminals,
         }
     }
 }

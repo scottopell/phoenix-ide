@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 01abf01c2fc03cec0affc254c09b5c8cdaecd7d053ba4eeb5b01ca402631194d # shrinks to dims = Dims { cols: 1, rows: 1 }, byte_sequences = [[32, 32, 0]]
+cc 41f6e9eba27596ddb583d4e53e463a798a482221a87ef04526f34d06a7f697d3 # shrinks to dims = Dims { cols: 1, rows: 1 }, byte_sequences = [[227, 128, 128]]
+cc b2b1a54c5bc87e3c1fa6f033029da4e6f67f7e795aae1f1d720213c7c132111a # shrinks to dims = Dims { cols: 1, rows: 196 }, byte_sequences = [[32, 32, 32, 32, 8, 127, 0, 227, 128, 128], [13, 0, 0, 0, 13, 0, 32]]

@@ -481,6 +481,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
             tools.clone(),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -587,6 +588,7 @@ mod tests {
             PathBuf::from("/tmp"),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
         )
     }
 
@@ -770,6 +772,7 @@ mod tests {
             tools,
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -884,6 +887,7 @@ mod tests {
             tools,
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -981,6 +985,7 @@ mod tests {
             tools,
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -1294,7 +1299,6 @@ mod tests {
         use crate::state_machine::state::{
             BashInput, BashMode, SubmitResultInput, ToolCall, ToolInput,
         };
-        use crate::state_machine::transition::TransitionError;
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
@@ -1412,6 +1416,7 @@ mod tests {
             tools,
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
             broadcast_tx,
@@ -1490,6 +1495,7 @@ mod tests {
             tools,
             Arc::new(BrowserSessionManager::default()),
             Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
             broadcast_tx,

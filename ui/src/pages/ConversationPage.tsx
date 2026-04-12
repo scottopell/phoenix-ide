@@ -22,6 +22,7 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom } from '../conversation';
+import { TerminalPanel } from '../components/TerminalPanel';
 
 export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -73,6 +74,8 @@ export function ConversationPage() {
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
+  // Terminal panel toggle — REQ-TERM-001
+  const [terminalOpen, setTerminalOpen] = useState(false);
 
   // Credential status
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
@@ -684,6 +687,24 @@ export function ConversationPage() {
         onTriggerContinuation={handleTriggerContinuation}
         onUpgradeModel={handleUpgradeModel}
       />
+
+      {/* Terminal toggle button — only for non-terminal-state conversations */}
+      {conversationId && convStateForChildren.type !== 'terminal' && convStateForChildren.type !== 'context_exhausted' && (
+        <div className="terminal-toggle-bar">
+          <button
+            className={`terminal-toggle-btn${terminalOpen ? ' active' : ''}`}
+            onClick={() => setTerminalOpen((o) => !o)}
+            title={terminalOpen ? 'Close terminal' : 'Open terminal'}
+          >
+            ❯_ Terminal
+          </button>
+        </div>
+      )}
+
+      {/* Terminal panel — below conversation chat (REQ-TERM-001) */}
+      {terminalOpen && conversationId && convStateForChildren.type !== 'terminal' && convStateForChildren.type !== 'context_exhausted' && (
+        <TerminalPanel conversationId={conversationId} />
+      )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
       {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
