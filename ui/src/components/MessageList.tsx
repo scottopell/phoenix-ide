@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { Message, ToolResultContent, ConversationState } from '../api'; // ConversationState used in MessageListProps
 import type { QueuedMessage } from '../hooks';
 import type { StreamingBuffer } from '../conversation/atom';
@@ -28,6 +28,11 @@ const SCROLL_THRESHOLD = 100;
 
 const SCROLL_KEY_PREFIX = 'phoenix:scroll:';
 const MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
+
+// Extracts the arguments portion of a skill trigger string, stripping the leading skill name.
+function extractSkillArgs(trigger: string, name: string): string {
+  return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
+}
 
 export function MessageList({ messages, queuedMessages, convState, onRetry, onOpenFile, systemPrompt, conversationId, streamingBuffer }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
@@ -151,20 +156,26 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
 
 
   // Build a map of tool_use_id -> tool result for pairing
-  const toolResults = new Map<string, Message>();
-  for (const msg of messages) {
-    const type = msg.message_type || msg.type;
-    if (type === 'tool') {
-      const content = msg.content as ToolResultContent;
-      const toolUseId = content?.tool_use_id;
-      if (toolUseId) {
-        toolResults.set(toolUseId, msg);
+  const toolResults = useMemo(() => {
+    const map = new Map<string, Message>();
+    for (const msg of messages) {
+      const type = msg.message_type || msg.type;
+      if (type === 'tool') {
+        const content = msg.content as ToolResultContent;
+        const toolUseId = content?.tool_use_id;
+        if (toolUseId) {
+          map.set(toolUseId, msg);
+        }
       }
     }
-  }
+    return map;
+  }, [messages]);
 
   // Get queued messages that are in "sending" state (not failed - those show in InputArea)
-  const sendingMessages = queuedMessages.filter(m => m.status === 'sending');
+  const sendingMessages = useMemo(
+    () => queuedMessages.filter(m => m.status === 'sending'),
+    [queuedMessages],
+  );
 
   return (
     <main id="main-area" ref={mainRef} onScroll={handleScroll}>
@@ -200,7 +211,7 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
                 } else if (type === 'skill') {
                   const skillContent = msg.content as { name?: string; trigger?: string };
                   const skillTrigger = skillContent.trigger || '';
-                  const triggerArgs = skillTrigger.replace(new RegExp(`^/?${skillContent.name || ''}\\s*`), '').trim();
+                  const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
                   return (
                     <div key={msg.sequence_id} className="message user" data-sequence-id={msg.sequence_id}>
                       <div className="message-header">

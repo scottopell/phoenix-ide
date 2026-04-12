@@ -97,6 +97,15 @@ export function Sidebar({
     }
   }, [renameTarget, onConversationCreated]);
 
+  const handleSetDeleteTarget = useCallback((conv: Conversation) => {
+    setDeleteTarget(conv);
+  }, []);
+
+  const handleSetRenameTarget = useCallback((conv: Conversation) => {
+    setRenameError(undefined);
+    setRenameTarget(conv);
+  }, []);
+
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
 
   if (collapsed) {
@@ -181,8 +190,8 @@ export function Sidebar({
           onNewConversation={handleNewClick}
           onArchive={handleArchive}
           onUnarchive={handleUnarchive}
-          onDelete={(conv) => setDeleteTarget(conv)}
-          onRename={(conv) => { setRenameError(undefined); setRenameTarget(conv); }}
+          onDelete={handleSetDeleteTarget}
+          onRename={handleSetRenameTarget}
           onConversationClick={handleConversationClick}
           activeSlug={activeSlug}
           sidebarMode

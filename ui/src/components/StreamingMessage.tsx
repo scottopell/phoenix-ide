@@ -6,6 +6,9 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { StreamingBuffer } from '../conversation/atom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 
+// Stable plugin array — avoids creating a new array reference on every render
+const REMARK_PLUGINS = [remarkGfm];
+
 interface StreamingMessageProps {
   buffer: StreamingBuffer | null;
 }
@@ -60,7 +63,7 @@ export function StreamingMessage({ buffer }: StreamingMessageProps) {
     <div className="streaming-message agent-message">
       <div className="streaming-message-content">
         {blocks.map((block, i) => (
-          <StreamingBlock key={i} block={block} />
+          <StreamingBlock key={`${block.type}-${i}`} block={block} />
         ))}
       </div>
       <span className="streaming-cursor" aria-hidden="true" />
@@ -72,7 +75,7 @@ function StreamingBlock({ block }: { block: StreamingBlock }) {
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
           {block.content}
         </ReactMarkdown>
       </div>

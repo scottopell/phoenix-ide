@@ -2,6 +2,7 @@ import {
   useRef,
   useEffect,
   useCallback,
+  useMemo,
   useState,
   forwardRef,
   useImperativeHandle,
@@ -319,7 +320,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const [acSelectedIndex, setAcSelectedIndex] = useState(0);
 
-  const filteredItems = fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label);
+  const filteredItems = useMemo(
+    () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
+    [acItems, activeTrigger?.query],
+  );
 
   useEffect(() => {
     setAcSelectedIndex(0);
@@ -377,17 +381,17 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Auto-resize
   // =========================================================================
 
-  const autoResize = () => {
+  const autoResize = useCallback(() => {
     const ta = textareaRef.current;
     if (ta) {
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
     }
-  };
+  }, []);
 
   useEffect(() => {
     autoResize();
-  }, [draft]);
+  }, [draft, autoResize]);
 
   // =========================================================================
   // Image handling
@@ -519,6 +523,31 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, []);
 
   // =========================================================================
+  // Textarea event handlers
+  // =========================================================================
+
+  const handleChange = useCallback((e: ChangeEvent<HTMLTextAreaElement>) => {
+    const newVal = e.target.value;
+    if (voiceBase !== null) {
+      setVoiceBase(newVal);
+      setVoiceInterim('');
+    } else {
+      setDraft(newVal);
+    }
+    handleTextChange(newVal);
+  }, [voiceBase, setVoiceBase, setVoiceInterim, setDraft, handleTextChange]);
+
+  const handleSelect = useCallback(() => {
+    // Re-detect trigger on cursor movement (arrow keys, click)
+    const ta = textareaRef.current;
+    if (ta) {
+      const currentVal = voiceBase !== null ? voiceBase : draft;
+      const trigger = detectTrigger(currentVal, ta.selectionStart);
+      setActiveTrigger(trigger);
+    }
+  }, [voiceBase, draft]);
+
+  // =========================================================================
   // Derived state
   // =========================================================================
 
@@ -646,27 +675,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
                 : voiceInterim)
             : draft}
-          onChange={(e) => {
-            const newVal = e.target.value;
-            if (voiceBase !== null) {
-              setVoiceBase(newVal);
-              setVoiceInterim('');
-            } else {
-              setDraft(newVal);
-            }
-            handleTextChange(newVal);
-          }}
+          onChange={handleChange}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          onSelect={() => {
-            // Re-detect trigger on cursor movement (arrow keys, click)
-            const ta = textareaRef.current;
-            if (ta) {
-              const currentVal = voiceBase !== null ? voiceBase : draft;
-              const trigger = detectTrigger(currentVal, ta.selectionStart);
-              setActiveTrigger(trigger);
-            }
-          }}
+          onSelect={handleSelect}
         />
         <div className="input-inline-actions">
           {!agentWorking && voiceSupported && (

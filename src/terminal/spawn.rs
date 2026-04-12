@@ -44,7 +44,7 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
 
             // Make slave fd the controlling terminal.
             // SAFETY: TIOCSCTTY on a valid slave fd; standard POSIX.
-            let ret = unsafe { libc::ioctl(slave_raw, libc::TIOCSCTTY.into(), 0) };
+            let ret = unsafe { libc::ioctl(slave_raw, libc::TIOCSCTTY, 0) };
             if ret != 0 {
                 eprintln!("TIOCSCTTY failed: {}", std::io::Error::last_os_error());
                 unsafe { libc::_exit(1) };
