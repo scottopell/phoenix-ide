@@ -282,6 +282,15 @@ pub struct Conversation {
     pub desired_base_branch: Option<String>,
     #[serde(default)]
     pub message_count: i64,
+    /// Seed parent for decorative UI breadcrumb (REQ-SEED-003). Distinct from
+    /// `parent_conversation_id` above (which is sub-agent parentage); this one
+    /// is set when a user-initiated conversation was spawned from another via
+    /// a "seed" action. Never traversed by runtime logic.
+    #[serde(default)]
+    pub seed_parent_id: Option<String>,
+    /// Seed label for decorative UI display (REQ-SEED-004).
+    #[serde(default)]
+    pub seed_label: Option<String>,
 }
 
 /// Derive a human-readable title from a kebab-case slug.

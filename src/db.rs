@@ -128,6 +128,16 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Seeded conversations: decorative parent link and label
+        // (REQ-SEED-003, REQ-SEED-004). Nullable, no foreign key — the link
+        // is advisory-only and if the parent is deleted the UI handles it.
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN seed_parent_id TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN seed_label TEXT")
+            .execute(&self.pool)
+            .await;
+
         Ok(())
     }
 
@@ -324,6 +334,8 @@ impl Database {
             None,
             &ConvMode::Explore,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -341,6 +353,8 @@ impl Database {
         project_id: Option<&str>,
         conv_mode: &ConvMode,
         desired_base_branch: Option<&str>,
+        seed_parent_id: Option<&str>,
+        seed_label: Option<&str>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -353,8 +367,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -368,6 +382,8 @@ impl Database {
             .bind(project_id)
             .bind(&conv_mode_json)
             .bind(desired_base_branch)
+            .bind(seed_parent_id)
+            .bind(seed_label)
             .execute(&self.pool)
             .await;
 
@@ -405,6 +421,8 @@ impl Database {
             conv_mode: conv_mode.clone(),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
+            seed_parent_id: seed_parent_id.map(String::from),
+            seed_label: seed_label.map(String::from),
         })
     }
 
@@ -414,6 +432,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.seed_parent_id, c.seed_label,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -433,6 +452,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.seed_parent_id, c.seed_label,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -452,6 +472,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.seed_parent_id, c.seed_label,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -470,6 +491,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.seed_parent_id, c.seed_label,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -574,6 +596,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.seed_parent_id, c.seed_label,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -984,6 +1007,13 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .try_get::<Option<String>, _>("desired_base_branch")
         .unwrap_or(None);
 
+    let seed_parent_id: Option<String> = row
+        .try_get::<Option<String>, _>("seed_parent_id")
+        .unwrap_or(None);
+    let seed_label: Option<String> = row
+        .try_get::<Option<String>, _>("seed_label")
+        .unwrap_or(None);
+
     Ok(Conversation {
         id: row.try_get("id")?,
         slug,
@@ -1003,6 +1033,8 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         conv_mode,
         desired_base_branch,
         message_count: row.try_get("message_count")?,
+        seed_parent_id,
+        seed_label,
     })
 }
 

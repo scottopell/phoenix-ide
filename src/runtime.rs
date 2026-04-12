@@ -118,6 +118,16 @@ pub struct EnrichedConversation {
     /// tailor the OSC 133 enablement snippet (REQ-TERM-017).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// The server-user's `$HOME` (REQ-SEED-*), used by the frontend to spawn
+    /// seeded conversations scoped to the user's home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_dir: Option<String>,
+    /// Slug of the seed parent conversation, resolved for the UI breadcrumb
+    /// (REQ-SEED-003). `None` if `inner.seed_parent_id` is `None` or the
+    /// parent has been deleted — the UI renders unlinked text in the latter
+    /// case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_parent_slug: Option<String>,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.
@@ -314,6 +324,8 @@ impl RuntimeManager {
                 None,                 // project_id
                 &sub_conv_mode,
                 None, // desired_base_branch
+                None, // seed_parent_id (sub-agents use `parent_conversation_id` above)
+                None, // seed_label
             )
             .await
         {

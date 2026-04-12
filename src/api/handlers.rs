@@ -243,6 +243,10 @@ fn commits_ahead(repo_root: &std::path::Path, base_branch: &str, task_branch: &s
 ///
 /// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
 /// Build an `EnrichedConversation` with derived display fields.
+///
+/// Note: `seed_parent_slug` is left as `None` here. Call sites that need to
+/// render the seed breadcrumb (single-conversation fetch, SSE init) should
+/// use [`enrich_conversation_with_seed`] instead to resolve the parent slug.
 fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::EnrichedConversation {
     crate::runtime::EnrichedConversation {
         conv_mode_label: conv.conv_mode.label().to_string(),
@@ -263,8 +267,32 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // spawn path reads `$SHELL` from the same env, so this matches what
         // the user's shell will actually be.
         shell: std::env::var("SHELL").ok(),
+        // REQ-SEED-*: surface $HOME so the UI can spawn a seeded conversation
+        // scoped to the user's home directory (e.g. for shell integration
+        // setup).
+        home_dir: std::env::var("HOME").ok(),
+        seed_parent_slug: None,
         inner: conv.clone(),
     }
+}
+
+/// Build an `EnrichedConversation` and resolve `seed_parent_slug` (REQ-SEED-003).
+///
+/// If the conversation has a seed parent and the parent still exists, the
+/// parent's slug is set so the UI can render a clickable breadcrumb. If the
+/// parent has been deleted the slug stays `None` and the UI renders unlinked
+/// text per REQ-SEED-003.
+async fn enrich_conversation_with_seed(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> crate::runtime::EnrichedConversation {
+    let mut enriched = enrich_conversation(conv);
+    if let Some(parent_id) = conv.seed_parent_id.as_deref() {
+        if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
+            enriched.seed_parent_slug = parent.slug;
+        }
+    }
+    enriched
 }
 
 /// Serialize a conversation to JSON with `display_state` included.
@@ -274,6 +302,22 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
 /// clients still receive it while the typed struct stays clean.
 fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
     let mut val = serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = val {
+        map.insert(
+            "display_state".to_string(),
+            Value::String(conv.state.display_state().as_str().to_string()),
+        );
+    }
+    val
+}
+
+/// Like [`conversation_to_json`] but also resolves `seed_parent_slug` via the
+/// database so the frontend can render the seed breadcrumb (REQ-SEED-003).
+/// Prefer this on single-conversation endpoints; the list endpoints stay
+/// synchronous because they don't render breadcrumbs.
+async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conversation) -> Value {
+    let enriched = enrich_conversation_with_seed(state, conv).await;
+    let mut val = serde_json::to_value(enriched).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
             "display_state".to_string(),
@@ -412,8 +456,11 @@ async fn create_conversation(
         return Err(AppError::BadRequest("Path is not a directory".to_string()));
     }
 
-    // Validate message text is not empty
-    if req.text.trim().is_empty() {
+    // REQ-SEED-001: seeded conversations may be created empty so the UI can
+    // hydrate the input area with a draft and let the user review before
+    // sending. For unseeded creates the text is still required.
+    let is_seeded = req.seed_parent_id.is_some() || req.seed_label.is_some();
+    if !is_seeded && req.text.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Message text cannot be empty".to_string(),
         ));
@@ -459,8 +506,22 @@ async fn create_conversation(
     // Generate ID
     let id = uuid::Uuid::new_v4().to_string();
 
-    // Try to generate a title using a cheap LLM model
-    let slug = if let Some(cheap_model) = state.runtime.model_registry().get_cheap_model() {
+    // Try to generate a title using a cheap LLM model.
+    //
+    // Seeded conversations with empty text skip LLM title generation — we
+    // derive the slug from `seed_label` (or fall back to a random slug)
+    // because the LLM hallucinates titles from empty input.
+    let seed_slug_source = if is_seeded && req.text.trim().is_empty() {
+        req.seed_label
+            .as_deref()
+            .map(slugify_label)
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let slug = if let Some(s) = seed_slug_source {
+        s
+    } else if let Some(cheap_model) = state.runtime.model_registry().get_cheap_model() {
         match crate::title_generator::generate_title(&req.text, cheap_model).await {
             Some(title) if !title.is_empty() => {
                 tracing::info!(title = %title, "Generated conversation title");
@@ -523,50 +584,58 @@ async fn create_conversation(
             project_id.as_deref(),
             &conv_mode,
             desired_base_branch,
+            req.seed_parent_id.as_deref(),
+            req.seed_label.as_deref(),
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
-    let working_dir_for_expand = std::path::PathBuf::from(&req.cwd);
-    let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
-        .map_err(|e| {
-            AppError::UnprocessableEntity(ExpansionErrorResponse {
-                error: e.to_string(),
-                error_type: e.error_type().to_string(),
-                reference: e.reference(),
+    // REQ-SEED-001: seeded conversations may be created with an empty
+    // `text` — the UI will hydrate the input area from localStorage and the
+    // user sends the first message manually. Skip expansion + initial event
+    // dispatch in that case.
+    if !(is_seeded && req.text.trim().is_empty()) {
+        // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
+        let working_dir_for_expand = std::path::PathBuf::from(&req.cwd);
+        let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
+            .map_err(|e| {
+                AppError::UnprocessableEntity(ExpansionErrorResponse {
+                    error: e.to_string(),
+                    error_type: e.error_type().to_string(),
+                    reference: e.reference(),
+                })
+            })?;
+
+        // Convert images
+        let images: Vec<ImageData> = req
+            .images
+            .into_iter()
+            .map(|img| ImageData {
+                data: img.data,
+                media_type: img.media_type,
             })
-        })?;
+            .collect();
 
-    // Convert images
-    let images: Vec<ImageData> = req
-        .images
-        .into_iter()
-        .map(|img| ImageData {
-            data: img.data,
-            media_type: img.media_type,
-        })
-        .collect();
+        // Only set llm_text when expansion actually changed the text (REQ-IR-001)
+        let initial_llm_text = (expanded_initial.llm_text != expanded_initial.display_text)
+            .then_some(expanded_initial.llm_text);
 
-    // Only set llm_text when expansion actually changed the text (REQ-IR-001)
-    let initial_llm_text = (expanded_initial.llm_text != expanded_initial.display_text)
-        .then_some(expanded_initial.llm_text);
+        // Send the initial message to the runtime
+        let event = Event::UserMessage {
+            text: expanded_initial.display_text,
+            llm_text: initial_llm_text,
+            images,
+            message_id: req.message_id,
+            user_agent: None,
+            skill_invocation: expanded_initial.skill_invocation,
+        };
 
-    // Send the initial message to the runtime
-    let event = Event::UserMessage {
-        text: expanded_initial.display_text,
-        llm_text: initial_llm_text,
-        images,
-        message_id: req.message_id,
-        user_agent: None,
-        skill_invocation: expanded_initial.skill_invocation,
-    };
-
-    state
-        .runtime
-        .send_event(&id, event)
-        .await
-        .map_err(|e| AppError::Internal(e.clone()))?;
+        state
+            .runtime
+            .send_event(&id, event)
+            .await
+            .map_err(|e| AppError::Internal(e.clone()))?;
+    }
 
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
@@ -611,7 +680,7 @@ async fn get_conversation(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json(&conversation),
+        conversation: conversation_to_json_with_seed(&state, &conversation).await,
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
@@ -972,7 +1041,7 @@ async fn stream_conversation(
 
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
-        conversation: Box::new(enrich_conversation(&conversation)),
+        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
         messages,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
@@ -2221,7 +2290,7 @@ async fn get_by_slug(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json(&conversation),
+        conversation: conversation_to_json_with_seed(&state, &conversation).await,
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
@@ -3062,6 +3131,24 @@ fn check_auto_stash_safe(
 // Slug Generation (REQ-API-002)
 // ============================================================
 
+/// Slugify a human-readable label (e.g. "Shell integration setup (zsh)") into
+/// a kebab-case slug (e.g. "shell-integration-setup-zsh"). Used for seeded
+/// conversation titles when the LLM title generator would receive empty text.
+fn slugify_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_dash = true;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
 fn generate_slug() -> String {
     let now = Local::now();
 
@@ -3226,7 +3313,7 @@ async fn get_shared_conversation(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json(&conversation),
+        conversation: conversation_to_json_with_seed(&state, &conversation).await,
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
@@ -3301,7 +3388,7 @@ async fn shared_sse_stream(
     };
 
     let init_event = SseEvent::Init {
-        conversation: Box::new(enrich_conversation(&conversation)),
+        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
         messages,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),

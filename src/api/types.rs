@@ -21,6 +21,14 @@ pub struct CreateConversationRequest {
     /// Desired base branch for Managed mode. If None, uses currently checked-out branch.
     #[serde(default)]
     pub base_branch: Option<String>,
+    /// Seed parent conversation id (REQ-SEED-003). Decorative link only; the
+    /// spawned conversation runs independently.
+    #[serde(default)]
+    pub seed_parent_id: Option<String>,
+    /// Seed label (REQ-SEED-004). Short human-readable context string shown in
+    /// the seeded conversation's breadcrumb.
+    #[serde(default)]
+    pub seed_label: Option<String>,
 }
 
 /// Request to upgrade a conversation's model

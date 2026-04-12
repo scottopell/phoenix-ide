@@ -379,3 +379,47 @@ communicate that the terminal has no PTY at all. A panel-level visual
 treatment plus an explicit reconnect affordance matches the user's mental
 model that the terminal is a thing that can be "off" or "on," and restores
 agency without requiring navigation away from the conversation.
+
+---
+
+### REQ-TERM-020: Shell Integration Setup Assist
+
+WHEN a terminal session has `shell_integration_status = absent`
+AND the user opens the shell integration modal (per REQ-TERM-017)
+THE SYSTEM SHALL offer the user an action that creates a seeded sub-
+conversation rooted in the user's home directory, pre-loaded with a
+prompt that directs Phoenix to investigate the user's dotfiles setup
+and apply the integration snippet on the user's behalf
+
+WHEN the user invokes the setup-assist action
+THE SYSTEM SHALL create a new conversation via the seeded-conversations
+primitive (per REQ-SEED-001 through REQ-SEED-004) with:
+- `cwd` = the server user's `$HOME`
+- `conv_mode` = `direct`
+- `parent_conversation_id` = the current conversation
+- `seed_label` = "Shell integration setup ({shell})"
+- a draft prompt tailored to the detected shell that instructs Phoenix
+  to detect the dotfiles management style (plain, oh-my-zsh, chezmoi,
+  yadm, symlinked git repo, home-manager, etc.), verify idempotency,
+  apply the snippet in the correct location, and confirm to the user
+AND SHALL NOT submit the draft automatically — the user reviews the
+prompt and decides whether to proceed
+
+WHEN the setup-assist action is offered
+THE SYSTEM SHALL also retain the manual "Copy to clipboard" action as
+the alternative path for users who prefer to handle the change
+themselves
+
+**Rationale:** Phoenix IS the agent that can do this work. Telling the
+user to manually copy-paste into their rc file is a concession to the
+era when IDEs were not LLM-powered. The seeded-conversations primitive
+makes it cheap to offer the automated path without special-casing
+terminal setup in the conversation engine. Keeping the manual option
+side-by-side preserves choice for users who don't want Phoenix
+touching their dotfiles.
+
+The agent-facing prompt needs to cover a wide variety of dotfile
+management styles because user setups vary enormously. The spawned
+conversation should investigate, not assume, and should punt gracefully
+on exotic setups (home-manager, nushell, etc.) rather than edit things
+it doesn't understand.

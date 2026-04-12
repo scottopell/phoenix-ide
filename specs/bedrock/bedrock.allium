@@ -92,6 +92,15 @@ entity Conversation {
     is_sub_agent: Boolean
     parent: Conversation?          -- set when is_sub_agent = true
 
+    -- Seed metadata (REQ-SEED-003, REQ-SEED-004)
+    -- Decorative only. `seed_parent` is a UI breadcrumb pointer to the
+    -- conversation the user spawned this one from via a "seed" action
+    -- (distinct from `parent` above, which is sub-agent parentage).
+    -- Never traversed by runtime logic; if the referenced conversation
+    -- is deleted, the UI renders the label as unlinked text.
+    seed_parent: Conversation?
+    seed_label:  String?
+
     -- Lifecycle status
     status: idle | llm_requesting | executing_tools
            | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
