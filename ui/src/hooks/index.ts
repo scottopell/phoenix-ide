@@ -6,6 +6,8 @@ export { useMessageQueue } from './useMessageQueue';
 export type { QueuedMessage, MessageStatus } from './useMessageQueue';
 export { useConnection } from './useConnection';
 export type { ConnectionState, ConnectionInfo } from './useConnection';
+export { useResizablePane } from './useResizablePane';
+export type { UseResizablePaneOptions, UseResizablePaneResult } from './useResizablePane';
 
 // Export state machine for testing
 export {

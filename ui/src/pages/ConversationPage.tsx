@@ -23,6 +23,10 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom } from '../conversation';
 import { TerminalPanel } from '../components/TerminalPanel';
+import { PaneDivider } from '../components/PaneDivider';
+import { useResizablePane } from '../hooks';
+
+const TERMINAL_COLLAPSED_PX = 32;
 
 export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -74,8 +78,14 @@ export function ConversationPage() {
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
-  // Terminal panel toggle — REQ-TERM-001
-  const [terminalOpen, setTerminalOpen] = useState(false);
+  // Terminal split-pane height — collapses to a 32px header strip
+  const terminalPane = useResizablePane({
+    key: 'terminal-height',
+    min: TERMINAL_COLLAPSED_PX,
+    max: () => Math.min(800, Math.floor(window.innerHeight * 0.75)),
+    defaultSize: 300,
+    collapseThreshold: 60,
+  });
 
   // Credential status
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
@@ -555,9 +565,14 @@ export function ConversationPage() {
   }
 
   const convStateForChildren = atom.phase;
+  const showTerminal =
+    !!conversationId &&
+    convStateForChildren.type !== 'terminal' &&
+    convStateForChildren.type !== 'context_exhausted';
 
   return (
     <div id="app">
+      <div className="conversation-column">
       <MessageList
         messages={atom.messages}
         queuedMessages={queuedMessages}
@@ -687,23 +702,29 @@ export function ConversationPage() {
         onTriggerContinuation={handleTriggerContinuation}
         onUpgradeModel={handleUpgradeModel}
       />
+      </div>
 
-      {/* Terminal toggle button — only for non-terminal-state conversations */}
-      {conversationId && convStateForChildren.type !== 'terminal' && convStateForChildren.type !== 'context_exhausted' && (
-        <div className="terminal-toggle-bar">
-          <button
-            className={`terminal-toggle-btn${terminalOpen ? ' active' : ''}`}
-            onClick={() => setTerminalOpen((o) => !o)}
-            title={terminalOpen ? 'Close terminal' : 'Open terminal'}
-          >
-            ❯_ Terminal
-          </button>
-        </div>
-      )}
-
-      {/* Terminal panel — below conversation chat (REQ-TERM-001) */}
-      {terminalOpen && conversationId && convStateForChildren.type !== 'terminal' && convStateForChildren.type !== 'context_exhausted' && (
-        <TerminalPanel conversationId={conversationId} />
+      {/* Terminal split-pane (REQ-TERM-001) — collapsed = 32px header strip */}
+      {showTerminal && (
+        <>
+          <PaneDivider
+            orientation="horizontal"
+            onPointerDown={(e) => terminalPane.startDrag(e, 'y', true)}
+            onDoubleClick={() => {
+              if (terminalPane.collapsed) {
+                terminalPane.expandFromCollapsed();
+              } else {
+                terminalPane.setCollapsed(true);
+              }
+            }}
+          />
+          <TerminalPanel
+            conversationId={conversationId!}
+            height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
+            collapsed={terminalPane.collapsed}
+            onExpand={terminalPane.expandFromCollapsed}
+          />
+        </>
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}

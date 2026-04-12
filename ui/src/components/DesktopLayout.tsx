@@ -3,11 +3,12 @@ import { useLocation } from 'react-router-dom';
 import { api } from '../api';
 import type { Conversation } from '../api';
 import { cacheDB } from '../cache';
-import { useLocalStorage } from '../hooks';
+import { useResizablePane } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
+import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
 
 interface DesktopLayoutProps {
@@ -16,12 +17,24 @@ interface DesktopLayoutProps {
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
   const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
-  const [sidebarCollapsed, setSidebarCollapsed] = useLocalStorage('sidebar-collapsed', false);
-  const [fileExplorerCollapsed, setFileExplorerCollapsed] = useLocalStorage('file-explorer-collapsed', false);
+  const sidebarPane = useResizablePane({
+    key: 'sidebar-width',
+    min: 160,
+    max: 500,
+    defaultSize: 280,
+    collapseThreshold: 120,
+  });
+  const fileExplorerPane = useResizablePane({
+    key: 'file-explorer-width',
+    min: 160,
+    max: 450,
+    defaultSize: 220,
+    collapseThreshold: 120,
+  });
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const location = useLocation();
-  const { toasts, dismissToast, showSuccess, showError, showWarning, showInfo } = useToast();
+  const { toasts, dismissToast, showSuccess } = useToast();
   const loadingRef = useRef(false);
 
   // Media query listener
@@ -95,22 +108,38 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       <div className={isDesktop ? 'desktop-layout' : undefined}>
         {isDesktop && (
           <Sidebar
-            collapsed={sidebarCollapsed}
-            onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+            collapsed={sidebarPane.collapsed}
+            onToggle={() => sidebarPane.setCollapsed(!sidebarPane.collapsed)}
             conversations={conversations}
             archivedConversations={archivedConversations}
             activeSlug={activeSlug}
             onConversationCreated={() => loadConversations(true)}
+            width={sidebarPane.collapsed ? undefined : sidebarPane.size}
+          />
+        )}
+        {isDesktop && (
+          <PaneDivider
+            orientation="vertical"
+            onPointerDown={(e) => sidebarPane.startDrag(e, 'x')}
+            onDoubleClick={() => sidebarPane.setCollapsed(!sidebarPane.collapsed)}
           />
         )}
         {isDesktop && activeSlug && (
           <FileExplorerPanel
-            collapsed={fileExplorerCollapsed}
-            onToggle={() => setFileExplorerCollapsed(!fileExplorerCollapsed)}
+            collapsed={fileExplorerPane.collapsed}
+            onToggle={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
             rootPath={activeConversation?.cwd || '/'}
             conversationId={activeConversation?.id}
             showToast={showSuccess}
             branchName={activeConversation?.branch_name}
+            width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
+          />
+        )}
+        {isDesktop && activeSlug && (
+          <PaneDivider
+            orientation="vertical"
+            onPointerDown={(e) => fileExplorerPane.startDrag(e, 'x')}
+            onDoubleClick={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
           />
         )}
         {/* children is always at this position — never remounts on breakpoint crossing */}
@@ -118,15 +147,6 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           {children}
         </div>
         {isDesktop && <CommandPalette conversations={conversations} />}
-        {/* Debug: toast test triggers */}
-        {isDesktop && (
-          <div className="toast-debug">
-            <button onClick={() => showSuccess('Operation completed', 3000)} title="Test success toast">ok</button>
-            <button onClick={() => showError('Something went wrong', 3000)} title="Test error toast">err</button>
-            <button onClick={() => showWarning('Approaching limit', 3000)} title="Test warning toast">warn</button>
-            <button onClick={() => showInfo('Processing...', 3000)} title="Test info toast">info</button>
-          </div>
-        )}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
     </FileExplorerProvider>

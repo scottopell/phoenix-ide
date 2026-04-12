@@ -4975,10 +4975,74 @@ html * {
   flex-direction: column;
 }
 
+/* Wrapper around the messages/input/state-bar stack so the terminal split-pane
+   can sit underneath without forcing the conversation column to overflow. */
+.conversation-column {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Pane dividers ─────────────────────────────────────────────────────── */
+
+.pane-divider {
+  flex-shrink: 0;
+  background: transparent;
+  position: relative;
+  z-index: 10;
+}
+
+.pane-divider--vertical {
+  width: 4px;
+  cursor: col-resize;
+}
+
+.pane-divider--horizontal {
+  height: 4px;
+  cursor: row-resize;
+}
+
+.pane-divider::after {
+  content: '';
+  position: absolute;
+  background: var(--border-color);
+  transition: background 0.15s;
+  pointer-events: none;
+}
+
+.pane-divider--vertical::after {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+}
+
+.pane-divider--horizontal::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-0.5px);
+}
+
+.pane-divider:hover::after {
+  background: var(--accent-blue, #58a6ff);
+}
+
+.pane-divider--dragging {
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.pane-divider--dragging::after {
+  background: var(--accent-blue, #58a6ff);
+}
+
 /* --- Expanded Sidebar --- */
 .sidebar-expanded {
-  width: 280px;
-  min-width: 280px;
+  /* width applied inline by useResizablePane */
   height: 100vh;
   height: 100dvh;
   display: flex;
@@ -4986,6 +5050,7 @@ html * {
   background: var(--bg-secondary);
   border-right: 1px solid var(--border-color);
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .sidebar-header {
@@ -5601,13 +5666,12 @@ html * {
 
 /* Panel - expanded */
 .fe-panel--expanded {
-  width: 220px;
+  /* width applied inline by useResizablePane */
   flex-shrink: 0;
   border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   background: var(--bg-primary);
-  transition: width 0.2s ease;
   overflow: hidden;
 }
 
@@ -6457,13 +6521,6 @@ html * {
   background: color-mix(in srgb, var(--accent-green, #22c55e) 85%, #000);
 }
 
-/* Narrower file explorer at tight viewports */
-@media (max-width: 1280px) {
-  .fe-panel--expanded {
-    width: 180px;
-  }
-}
-
 /* ============================================================
    Login Page (REQ-AUTH-003)
    ============================================================ */
@@ -6707,51 +6764,13 @@ html * {
 
 /* ── Terminal panel (REQ-TERM-001, Task 3) ───────────────────────────────── */
 
-.terminal-toggle-bar {
-  display: flex;
-  align-items: center;
-  padding: 4px 12px;
-  border-top: 1px solid var(--border-subtle, #333);
-  background: var(--bg-secondary, #1e1e1e);
-  flex-shrink: 0;
-}
-
-.terminal-toggle-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
-  font-family: var(--font-mono);
-  background: transparent;
-  border: 1px solid var(--border-subtle, #444);
-  border-radius: 4px;
-  color: var(--text-muted, #888);
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-  user-select: none;
-}
-
-.terminal-toggle-btn:hover {
-  color: var(--text-primary, #d4d4d4);
-  border-color: var(--border-default, #666);
-}
-
-.terminal-toggle-btn.active {
-  color: var(--accent-green, #4ec9b0);
-  border-color: var(--accent-green, #4ec9b0);
-  background: rgba(78, 201, 176, 0.08);
-}
-
 .terminal-panel {
   display: flex;
   flex-direction: column;
-  height: 40vh;
-  min-height: 200px;
-  max-height: 70vh;
-  border-top: 2px solid var(--accent-green, #4ec9b0);
+  /* height applied inline by useResizablePane */
   background: #1a1a1a;
   flex-shrink: 0;
+  overflow: hidden;
 }
 
 .terminal-panel-header {

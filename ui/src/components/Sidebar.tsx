@@ -13,6 +13,8 @@ interface SidebarProps {
   archivedConversations: Conversation[];
   activeSlug: string | null;
   onConversationCreated: () => void;
+  /** Width in px when expanded — driven by useResizablePane */
+  width?: number | undefined;
 }
 
 export function Sidebar({
@@ -22,6 +24,7 @@ export function Sidebar({
   archivedConversations,
   activeSlug,
   onConversationCreated,
+  width,
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -145,7 +148,10 @@ export function Sidebar({
   }
 
   return (
-    <aside className="sidebar sidebar-expanded">
+    <aside
+      className="sidebar sidebar-expanded"
+      style={width !== undefined ? { width: `${width}px`, minWidth: `${width}px` } : undefined}
+    >
       <div className="sidebar-header">
         <button className="sidebar-toggle-expanded" onClick={onToggle} title="Collapse sidebar">
           ◀

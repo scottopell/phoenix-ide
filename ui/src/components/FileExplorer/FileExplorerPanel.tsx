@@ -21,6 +21,8 @@ interface Props {
   showToast: (message: string, duration?: number) => void;
   /** Branch name of the current conversation (for extracting task ID in Work mode) */
   branchName?: string | null | undefined;
+  /** Width in px when expanded — driven by useResizablePane */
+  width?: number | undefined;
 }
 
 /** Extract task ID from a Work branch name like "task-08617-some-slug" */
@@ -30,7 +32,7 @@ function extractTaskId(branchName: string | null | undefined): string | undefine
   return match ? match[1] : undefined;
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, branchName }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, branchName, width }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
@@ -76,7 +78,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
       : null;
 
   return (
-    <aside className="fe-panel fe-panel--expanded">
+    <aside
+      className="fe-panel fe-panel--expanded"
+      style={width !== undefined ? { width: `${width}px` } : undefined}
+    >
       <div className="fe-header">
         <button className="fe-toggle" onClick={onToggle} title="Collapse">&#9666;</button>
         <span className="fe-title">Files</span>

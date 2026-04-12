@@ -16,6 +16,12 @@ import 'xterm/css/xterm.css';
 
 interface TerminalPanelProps {
   conversationId: string;
+  /** Total height in px (including header strip) */
+  height: number;
+  /** When true, only the header strip renders — no xterm */
+  collapsed: boolean;
+  /** Click on the header strip restores from collapsed */
+  onExpand: () => void;
 }
 
 /** Build the WebSocket URL for a conversation's terminal endpoint. */
@@ -41,7 +47,7 @@ function dataFrame(payload: Uint8Array): Uint8Array {
   return buf;
 }
 
-export function TerminalPanel({ conversationId }: TerminalPanelProps) {
+export function TerminalPanel({ conversationId, height, collapsed, onExpand }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -52,7 +58,11 @@ export function TerminalPanel({ conversationId }: TerminalPanelProps) {
     if (statusRef.current) statusRef.current.textContent = msg;
   }, []);
 
+  // Mount xterm only when the panel is expanded. The effect re-runs when
+  // `collapsed` flips so the terminal is fully torn down on collapse and
+  // re-initialised cleanly on expand (FitAddon refuses to fit a 0-height parent).
   useEffect(() => {
+    if (collapsed) return;
     if (!containerRef.current) return;
 
     // --- xterm.js setup ---
@@ -126,15 +136,41 @@ export function TerminalPanel({ conversationId }: TerminalPanelProps) {
       fitAddonRef.current = null;
       wsRef.current = null;
     };
-  }, [conversationId, setStatus]);
+  }, [conversationId, setStatus, collapsed]);
+
+  // Refit when the parent height changes (drag-resize) — same effect path as
+  // a window resize, but driven by the prop changing instead of a DOM event.
+  useEffect(() => {
+    if (collapsed) return;
+    const fit = fitAddonRef.current;
+    const term = termRef.current;
+    const ws = wsRef.current;
+    if (!fit || !term) return;
+    // Defer one frame so the parent <div> has its new height applied.
+    const id = requestAnimationFrame(() => {
+      try {
+        fit.fit();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(resizeFrame(term.cols, term.rows));
+        }
+      } catch {
+        // FitAddon throws if the container is 0×0; ignore — next height change retries.
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [height, collapsed]);
 
   return (
-    <div className="terminal-panel">
-      <div className="terminal-panel-header">
-        <span className="terminal-panel-title">Terminal</span>
+    <div className="terminal-panel" style={{ height: `${height}px` }}>
+      <div
+        className="terminal-panel-header"
+        onClick={collapsed ? onExpand : undefined}
+        style={collapsed ? { cursor: 'pointer' } : undefined}
+      >
+        <span className="terminal-panel-title">❯_ Terminal</span>
         <div ref={statusRef} className="terminal-panel-status" />
       </div>
-      <div ref={containerRef} className="terminal-panel-xterm" />
+      {!collapsed && <div ref={containerRef} className="terminal-panel-xterm" />}
     </div>
   );
 }
