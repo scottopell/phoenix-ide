@@ -255,16 +255,32 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand, cwd
       if (!term) return;
       const buf = term.buffer.active;
       const startY = buf.cursorY + buf.baseY;
-      let found = '';
-      for (let dy = 0; dy <= 5; dy++) {
-        const y = startY - dy;
-        if (y < 0) break;
+      const lineText = (y: number): string => {
+        if (y < 0) return '';
         const line = buf.getLine(y);
-        if (!line) continue;
-        const text = line.translateToString(true);
+        if (!line) return '';
+        return line.translateToString(true).trimEnd();
+      };
+      let found = '';
+      let foundY = -1;
+      for (let dy = 0; dy <= 5; dy++) {
+        const text = lineText(startY - dy);
         if (text && text.trim().length > 0) {
-          found = text.trimEnd();
+          found = text;
+          foundY = startY - dy;
           break;
+        }
+      }
+      // Two-line powerline prompts: if the found line is very short it's
+      // likely the continuation glyph (╰─ ❯). Walk up to 3 more rows for
+      // a longer content line above and join them so the cwd is visible.
+      if (found && found.trim().length <= 10 && foundY > 0) {
+        for (let dy = 1; dy <= 3; dy++) {
+          const above = lineText(foundY - dy);
+          if (above && above.trim().length > found.trim().length) {
+            found = `${above} ${found.trim()}`;
+            break;
+          }
         }
       }
       if (!found) {
