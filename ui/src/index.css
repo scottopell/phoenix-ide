@@ -6972,6 +6972,14 @@ html * {
   font-family: var(--font-mono);
   font-size: 12px;
 }
+/* CTA word ("click") inside the disconnected-state prompt — underlined,
+ * brighter, slight weight bump to draw the eye to the action. */
+.terminal-panel-prompt-cta {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-weight: 700;
+  color: var(--text-primary, #e6edf3);
+}
 .terminal-panel-prompt--dim {
   color: var(--text-muted, #6e7681);
   font-family: var(--font-mono);

@@ -726,7 +726,9 @@ export function TerminalPanel({
     if (isDisconnected) {
       return (
         <span className="terminal-panel-prompt terminal-panel-prompt--dead">
-          Shell exited — click to start a new one
+          Shell exited —{' '}
+          <strong className="terminal-panel-prompt-cta">click</strong>
+          {' '}to start a new one
         </span>
       );
     }
@@ -809,11 +811,7 @@ export function TerminalPanel({
   const panelClass = `terminal-panel${isDisconnected ? ' terminal-panel--dead' : ''}`;
 
   return (
-    <div
-      className={panelClass}
-      style={{ height: `${height}px` }}
-      onClick={isDisconnected ? reconnect : undefined}
-    >
+    <div className={panelClass} style={{ height: `${height}px` }}>
       <div
         className={`terminal-panel-header${collapsed ? ' terminal-panel-header--collapsed' : ''}`}
         onClick={handleHeaderClick}
