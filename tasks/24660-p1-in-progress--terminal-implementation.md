@@ -1,7 +1,7 @@
 ---
 created: 2026-04-10
 priority: p1
-status: in-progress
+status: done
 artifact: pending
 ---
 

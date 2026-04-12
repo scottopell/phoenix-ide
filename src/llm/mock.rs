@@ -46,8 +46,7 @@ impl Scenario {
                     None
                 }
             })
-            .map(|text| text.bytes().map(|b| b as usize).sum())
-            .unwrap_or(0);
+            .map_or(0, |text| text.bytes().map(|b| b as usize).sum());
 
         match hash % 7 {
             0 => Self::PlainText,
@@ -145,6 +144,7 @@ fn rand_u64() -> u64 {
     h.finish()
 }
 
+#[allow(clippy::too_many_lines)] // flat match over scenarios; splitting would add no value
 fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
     match scenario {
         Scenario::PlainText => (
@@ -179,8 +179,8 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
         }
 
         Scenario::ReadFileToolCall => {
-            let text = "I'll read the configuration file to understand the current setup."
-                .to_string();
+            let text =
+                "I'll read the configuration file to understand the current setup.".to_string();
             (
                 vec![
                     ContentBlock::Text { text: text.clone() },
@@ -226,8 +226,7 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
         }
 
         Scenario::MultiToolCall => {
-            let text =
-                "I'll check the project structure and recent changes.".to_string();
+            let text = "I'll check the project structure and recent changes.".to_string();
             (
                 vec![
                     ContentBlock::Text { text: text.clone() },
@@ -268,10 +267,7 @@ async fn stream_text(text: &str, chunk_tx: &broadcast::Sender<TokenChunk>) {
     while let Some(ch) = chars.next() {
         buf.push(ch);
         // Emit on whitespace boundaries or after newlines
-        let flush = ch.is_whitespace()
-            || ch == '\n'
-            || buf.len() > 15
-            || chars.peek().is_none();
+        let flush = ch.is_whitespace() || ch == '\n' || buf.len() > 15 || chars.peek().is_none();
 
         if flush && !buf.is_empty() {
             let _ = chunk_tx.send(TokenChunk::Text(buf.clone()));
@@ -332,6 +328,7 @@ impl LlmService for MockLlmService {
         })
     }
 
+    #[allow(clippy::unnecessary_literal_bound)] // trait signature requires &str, not &'static str
     fn model_id(&self) -> &str {
         "mock"
     }

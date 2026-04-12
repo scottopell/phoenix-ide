@@ -357,7 +357,6 @@ export function TerminalPanel({
           // FTCS_COMMAND_FINISHED — finalise the current command, if any.
           const cur = currentCommandRef.current;
           if (!cur) {
-            // eslint-disable-next-line no-console
             console.debug(
               'OSC 133;D received with no current_command; ignoring',
             );
@@ -391,7 +390,6 @@ export function TerminalPanel({
       // Payload format: file://hostname/absolute/path (percent-encoded)
       const m = data.match(/^file:\/\/[^/]*(\/.*)$/);
       if (!m) {
-        // eslint-disable-next-line no-console
         console.debug('OSC 7 parse failed:', data);
         return;
       }
@@ -399,7 +397,6 @@ export function TerminalPanel({
         const decoded = decodeURIComponent(m[1]!);
         setReportedCwd(decoded);
       } catch {
-        // eslint-disable-next-line no-console
         console.debug('OSC 7 percent-decode failed:', data);
       }
     };
@@ -712,7 +709,6 @@ export function TerminalPanel({
     } catch (err) {
       // Surface nothing fancy — the button re-enables so the user can retry.
       // Console is the only place the error goes; REQ-TERM-020 is best-effort.
-      // eslint-disable-next-line no-console
       console.error('Assist setup failed:', err);
       setAssistInFlight(false);
     }

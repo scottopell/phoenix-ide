@@ -54,7 +54,7 @@ __phoenix_precmd() {
   printf '\\e]7;file://%s%s\\e\\\\' "\${HOSTNAME}" "$PWD"
   __phoenix_prompt_start
 }
-PROMPT_COMMAND='__phoenix_precmd'\${PROMPT_COMMAND:+;\$PROMPT_COMMAND}
+PROMPT_COMMAND='__phoenix_precmd'\${PROMPT_COMMAND:+;$PROMPT_COMMAND}
 trap '__phoenix_preexec' DEBUG
 __phoenix_prompt_start`,
 };
