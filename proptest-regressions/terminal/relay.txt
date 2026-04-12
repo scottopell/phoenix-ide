@@ -6,3 +6,6 @@
 # everyone who runs the test benefits from these saved cases.
 cc 4943a32529be50fac2a8a516d9af0a7b187b61a5cbfdb74d1735c94e2142f0ea # shrinks to ops = [(true, 1, 1)]
 cc 803cf8ab6461d0112e060859b2bd766206def7513c026bac77bedee296a77e71 # shrinks to payload_len = 4, payload = [0, 1, 0, 1, 0]
+cc 20fccbb94156f07db431b365d96c6bceab44ca6a6611545eec3f90b30fd8559d # shrinks to chunks = [[1]]
+cc 24888de4ee3c61ce2e8bc304677ea2413e105eb0dad7c15fe0db9201c425389e # shrinks to chunks = [[27, 32]]
+cc 24888de4ee3c61ce2e8bc304677ea2413e105eb0dad7c15fe0db9201c425389e # shrinks to chunks = [[27, 32]]

@@ -89,6 +89,8 @@ async fn handle_socket(
         }
     };
 
+    let child_pid = handle.child_pid;
+
     // Final atomic check-and-insert: guards against the race where two connections
     // pass the pre-spawn check concurrently, then both try to register.
     let Some(arc_handle) = terminals.try_insert(conversation_id.clone(), handle) else {
@@ -96,18 +98,18 @@ async fn handle_socket(
         let _ = ws_sender
             .send(Message::Text("error: terminal already active".to_string()))
             .await;
+        // handle was consumed by try_insert and dropped (closing master_fd → SIGHUP),
+        // but we must still reap the child to avoid a zombie.
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = waitpid(child_pid, None);
+        })
+        .await;
         return;
     };
 
     tracing::info!(conv_id = %conversation_id, pid = %arc_handle.child_pid, "Terminal session started");
 
     let master_fd_raw = arc_handle.master_fd.as_raw_fd();
-
-    // Set non-blocking so PtyMasterIo (AsyncFd) works correctly.
-    if let Err(e) = set_nonblocking(master_fd_raw) {
-        tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: set_nonblocking failed");
-        return;
-    }
 
     // Wrap master_fd in PtyMasterIo (AsyncRead + AsyncWrite).
     // SAFETY: we take an owning copy of the raw fd here.  arc_handle keeps the
@@ -116,17 +118,22 @@ async fn handle_socket(
     // We cannot transfer ownership into PtyMasterIo because arc_handle.master_fd
     // needs to be dropped AFTER run_relay returns (to trigger SIGHUP via Drop).
     // Instead we duplicate the fd so PtyMasterIo owns its own file description.
-    let pty_fd = match nix::unistd::dup(master_fd_raw) {
-        Ok(raw) => unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) },
-        Err(e) => {
-            tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: dup(master_fd) failed");
-            return;
-        }
-    };
-    let pty_io = match PtyMasterIo::new(pty_fd) {
+    let pty_io = match (|| -> Result<PtyMasterIo, String> {
+        set_nonblocking(master_fd_raw).map_err(|e| format!("set_nonblocking: {e}"))?;
+        let pty_fd = nix::unistd::dup(master_fd_raw)
+            .map(|raw| unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) })
+            .map_err(|e| format!("dup: {e}"))?;
+        PtyMasterIo::new(pty_fd).map_err(|e| format!("AsyncFd: {e}"))
+    })() {
         Ok(io) => io,
-        Err(e) => {
-            tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: AsyncFd::new failed");
+        Err(reason) => {
+            tracing::error!(conv_id = %conversation_id, error = %reason, "Terminal: fd setup failed");
+            terminals.remove(&conversation_id);
+            drop(arc_handle);
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = waitpid(child_pid, None);
+            })
+            .await;
             return;
         }
     };
@@ -197,7 +204,6 @@ async fn handle_socket(
 
     tracing::debug!(conv_id = %conversation_id, ?exit, "Terminal relay exited");
 
-    let child_pid = arc_handle.child_pid;
     // Remove from registry then drop arc_handle → original master_fd closes →
     // SIGHUP → shell exits → EIO on the pty_io fd (already past run_relay).
     terminals.remove(&conversation_id);

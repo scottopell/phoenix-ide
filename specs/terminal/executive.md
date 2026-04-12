@@ -83,4 +83,4 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | REQ-TERM-013: WebSocket endpoint authentication | ✅ Done | src/api/auth.rs middleware |
 | REQ-TERM-014: Output channel backpressure | ✅ Done | src/terminal/ws.rs:OUTPUT_BUF bounded reads |
 
-**Progress:** 0 of 14 complete
+**Progress:** 14 of 14 complete

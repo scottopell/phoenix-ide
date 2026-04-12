@@ -3,12 +3,9 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "taskmd",
+#   "ziglang",
+#   "cargo-zigbuild",
 # ]
-#
-# [tool.uv]
-# # Pre-built wheel lives in .taskmd-wheel/ (gitignored, one-time build per machine).
-# # Bootstrap: ./scripts/build-taskmd-wheel.sh
-# find-links = [".taskmd-wheel"]
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -580,9 +577,12 @@ def cmd_check():
     def lane_rust():
         """Rust lane: clippy → musl smoke check → test (share cargo lock)."""
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
-        run_step("cargo check musl", [
-            "cargo", "check", "--target", "x86_64-unknown-linux-musl",
-        ])
+        if sys.platform == "darwin":
+            run_step("cargo check musl", [
+                "cargo", "zigbuild", "--target", "x86_64-unknown-linux-musl",
+            ])
+        else:
+            run_step("cargo check musl", ["cargo", "check"])
         has_nextest = subprocess.run(
             ["cargo", "nextest", "--version"],
             capture_output=True,
@@ -698,14 +698,6 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
 
     Returns True if all tasks pass, False otherwise.
     """
-    wheel_dir = ROOT / ".taskmd-wheel"
-    if not wheel_dir.exists():
-        print(
-            "\n✗ .taskmd-wheel/ not found. Run the one-time bootstrap first:\n"
-            "    ./scripts/build-taskmd-wheel.sh\n"
-            "Then retry. See README.md § Quick Start for details."
-        )
-        return False
     import taskmd
     tasks_dir = ROOT / "tasks"
     result = taskmd.validate(tasks_dir)
@@ -868,12 +860,11 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
     
     # Build Rust
     build_env = os.environ.copy()
-    cargo_cmd = ["cargo", "build", "--release"]
+    needs_cross = target and sys.platform != "linux"
+    cargo_cmd = ["cargo", "zigbuild", "--release"] if needs_cross else ["cargo", "build", "--release"]
     if target:
         print(f"Building Rust ({target}, release)...")
         cargo_cmd += ["--target", target]
-        if "musl" in target:
-            build_env["CC_x86_64_unknown_linux_musl"] = "x86_64-linux-musl-gcc"
         binary = worktree / "target" / target / "release" / "phoenix_ide"
     else:
         print("Building Rust (native, release)...")

@@ -160,10 +160,7 @@ proptest! {
 // ── Unit: ParserDimensionSync invariant ──────────────────────────────────────
 
 /// REQ-TERM-006 / ParserDimensionSync:
-/// After apply_resize, the parser's size must equal the requested Dims.
-///
-/// We test via vt100::Parser directly — the spec says parser.dimensions = terminal.dimensions
-/// after every ResizeApplied call, and `apply_resize` in ws.rs is the sole code path.
+/// After a resize, the parser's size must equal the requested Dims.
 #[test]
 fn parser_dimension_sync_after_resize() {
     let initial = Dims { cols: 80, rows: 24 };

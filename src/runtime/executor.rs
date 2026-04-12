@@ -234,8 +234,6 @@ where
 
     /// Broadcast `ConversationBecameTerminal` to all SSE subscribers.
     ///
-    /// Called once at each terminal exit point in the executor loop. Implements the
-    /// `ConversationReachedTerminalState` relay rule from bedrock.allium.
     /// Send errors (no active receivers) are intentionally ignored.
     fn emit_terminal_lifecycle_event(&self) {
         let _ = self.broadcast_tx.send(SseEvent::ConversationBecameTerminal);

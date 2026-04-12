@@ -107,7 +107,6 @@ impl Tool for ReadTerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::ActiveTerminals;
     use crate::tools::BrowserSessionManager;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;

@@ -1299,7 +1299,6 @@ mod tests {
         use crate::state_machine::state::{
             BashInput, BashMode, SubmitResultInput, ToolCall, ToolInput,
         };
-        use crate::state_machine::transition::TransitionError;
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 

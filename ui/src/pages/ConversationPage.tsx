@@ -689,7 +689,7 @@ export function ConversationPage() {
       />
 
       {/* Terminal toggle button — only for non-terminal-state conversations */}
-      {conversationId && convStateForChildren.type !== 'terminal' && (
+      {conversationId && convStateForChildren.type !== 'terminal' && convStateForChildren.type !== 'context_exhausted' && (
         <div className="terminal-toggle-bar">
           <button
             className={`terminal-toggle-btn${terminalOpen ? ' active' : ''}`}
@@ -702,7 +702,7 @@ export function ConversationPage() {
       )}
 
       {/* Terminal panel — below conversation chat (REQ-TERM-001) */}
-      {terminalOpen && conversationId && convStateForChildren.type !== 'terminal' && (
+      {terminalOpen && conversationId && convStateForChildren.type !== 'terminal' && convStateForChildren.type !== 'context_exhausted' && (
         <TerminalPanel conversationId={conversationId} />
       )}
 

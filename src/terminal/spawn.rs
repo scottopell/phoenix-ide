@@ -1,13 +1,9 @@
 //! PTY spawn path — REQ-TERM-001, REQ-TERM-002
-//!
-//! Sequence: openpty → fork → [child] setsid / TIOCSCTTY / dup2 / chdir / execvp
-//!                          → [parent] close(slave) / return `TerminalHandle`
-//!                          → [parent] close(slave) / return `TerminalHandle`
 
 use super::session::{Dims, TerminalHandle};
 use nix::{
     pty::openpty,
-    unistd::{close, dup2, execvpe, fork, setsid, ForkResult},
+    unistd::{close, dup2, execve, fork, setsid, ForkResult},
 };
 use std::{
     ffi::CString,
@@ -48,7 +44,7 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
 
             // Make slave fd the controlling terminal.
             // SAFETY: TIOCSCTTY on a valid slave fd; standard POSIX.
-            let ret = unsafe { libc::ioctl(slave_raw, libc::TIOCSCTTY, 0) };
+            let ret = unsafe { libc::ioctl(slave_raw, libc::TIOCSCTTY.into(), 0) };
             if ret != 0 {
                 eprintln!("TIOCSCTTY failed: {}", std::io::Error::last_os_error());
                 unsafe { libc::_exit(1) };
@@ -87,8 +83,8 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
                 .unwrap_or_else(|_| CString::new("/bin/bash").unwrap());
             let arg_i = CString::new("-i").unwrap();
 
-            let _ = execvpe(&shell_c, &[shell_c.clone(), arg_i], &env_cstrings);
-            eprintln!("execvpe {shell_path}: {}", std::io::Error::last_os_error());
+            let _ = execve(&shell_c, &[shell_c.clone(), arg_i], &env_cstrings);
+            eprintln!("execve {shell_path}: {}", std::io::Error::last_os_error());
             unsafe { libc::_exit(1) };
         }
 

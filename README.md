@@ -25,9 +25,6 @@ disclosure: essentials visible by default, details on demand.
 ## Quick Start
 
 ```bash
-# One-time setup: build the taskmd wheel (required for ./dev.py tasks validate)
-./scripts/build-taskmd-wheel.sh
-
 # Start everything (backend build + frontend dev server)
 ./dev.py up
 
@@ -37,12 +34,6 @@ disclosure: essentials visible by default, details on demand.
 ./dev.py status      # show running state
 ./dev.py check       # pre-commit checks (fmt, clippy, tests)
 ```
-
-> **Note:** `build-taskmd-wheel.sh` only needs to be run once after cloning. It
-> builds the `taskmd` Python package (a Rust/PyO3 wheel) and places it in
-> `.taskmd-wheel/` so `dev.py tasks validate` works without a maturin rebuild
-> on every invocation. If you skip it and see a maturin build error from
-> `dev.py check`, run the script and retry.
 
 ### Single-shot CLI
 

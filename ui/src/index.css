@@ -6671,6 +6671,7 @@ html * {
   color: var(--text-secondary);
   background: var(--bg-secondary);
   cursor: default;
+}
 
 /* ── Terminal panel (REQ-TERM-001, Task 3) ───────────────────────────────── */
 

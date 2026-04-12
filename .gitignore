@@ -11,7 +11,8 @@ certs/
 
 # UI
 ui/node_modules
-ui/dist
+ui/dist/*
+!ui/dist/.gitkeep
 static/dist/
 
 # Local config (machine-specific LLM credentials)
@@ -23,4 +24,3 @@ static/dist/
 .phoenix/
 dogfood-output
 scripts/install.sh
-.taskmd-wheel/
