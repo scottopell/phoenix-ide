@@ -63,6 +63,14 @@ external entity ShellProcess {
     pid: Integer
 }
 
+-- The shell or prompt framework (e.g. powerlevel10k, Starship, manual
+-- precmd/preexec hooks, fish 3.6+ built-in support) that emits OSC 133
+-- and OSC 7 markers on the PTY byte stream. Phoenix models only the
+-- contract at the byte-stream boundary; the provider's internals are
+-- opaque. (REQ-TERM-015 through REQ-TERM-018)
+external entity ShellIntegrationProvider {
+}
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
@@ -79,11 +87,27 @@ value WsFrame {
     kind: data | resize
 }
 
+-- A single command executed via the shell, tracked via OSC 133 markers.
+-- Populated at C, finalised at D. (REQ-TERM-016)
+value CommandExecution {
+    command_text: String       -- payload of OSC 133;C (may be empty)
+    started_at:   Timestamp    -- when C was processed
+    exit_code:    Integer?     -- from OSC 133;D payload; None when still executing or when D omits code
+    finished_at:  Timestamp?   -- when D was processed; None while still executing
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
--- (none beyond Terminal.status)
+-- Shell integration detection state for a terminal session.
+-- Transitions are one-shot: unknown → detected OR unknown → absent.
+-- See ShellIntegrationStatusMonotonic invariant.
+enum ShellIntegrationStatus {
+    unknown    -- initial, within detection window
+    detected   -- OSC 133 marker observed within window
+    absent     -- detection window elapsed without any marker
+}
 
 ------------------------------------------------------------
 -- Entities
@@ -110,6 +134,27 @@ entity Terminal {
     dimensions: TerminalDimensions when status = active
     parser:     Vt100Parser        when status = active
         -- parser.dimensions = terminal.dimensions at all times (ParserDimensionSync)
+
+    -- Shell integration fields (REQ-TERM-015 through REQ-TERM-018).
+    -- Initial value of shell_integration_status is `unknown`; it transitions
+    -- monotonically via ShellIntegrationDetected or ShellIntegrationDetectionTimedOut.
+    shell_integration_status: ShellIntegrationStatus when status = active
+
+    -- The currently executing command (if any). Set by CommandExecutionStarted,
+    -- cleared by CommandExecutionFinished. At most one at a time
+    -- (OneExecutingCommandAtATime).
+    current_command: CommandExecution?
+        when status = active and shell_integration_status = detected
+
+    -- The most recently completed command. Set by CommandExecutionFinished,
+    -- cleared by NewPromptClearsLastCompletedCommand on the next OSC 133;A.
+    -- Drives the transient ✓/✗ display in the HUD.
+    last_completed_command: CommandExecution?
+        when status = active and shell_integration_status = detected
+
+    -- Working directory reported via OSC 7. None means "never reported";
+    -- the HUD falls back to conversation.working_dir in that case.
+    reported_cwd: Path? when status = active
 }
 
 ------------------------------------------------------------
@@ -124,6 +169,11 @@ config {
     output_channel_bound: Integer = 4096
     -- Maximum bytes buffered in the master-fd→WebSocket channel before backpressure.
     -- Prevents fast producers (yes, large cat) from unboundedly queuing.
+
+    shell_integration_detection_window: Duration = 5.s
+    -- Bytes must contain at least one OSC 133 marker within this window from
+    -- terminal spawn or the session is locked at shell_integration_status = absent.
+    -- (REQ-TERM-015)
 }
 
 ------------------------------------------------------------
@@ -388,6 +438,138 @@ rule TerminalAbandonedWithConversation {
         -- Terminal(conversation).status = active naturally excludes them.
 }
 
+-- REQ-TERM-015: OSC 133 detection on first marker
+rule ShellIntegrationDetected {
+    when: Osc133MarkerReceived(terminal, _kind, _payload)
+
+    requires: terminal.status = active
+    requires: terminal.shell_integration_status = unknown
+
+    ensures: terminal.shell_integration_status = detected
+
+    @guidance
+        -- Any OSC 133 marker (A, B, C, or D) counts as detection evidence.
+        -- The first one wins. The marker that triggered detection is also
+        -- processed by its own lifecycle rule below in the same handler pass
+        -- (e.g. if the first marker is a C, CommandExecutionStarted also fires).
+        -- Implementation: xterm.js registerOscHandler(133, ...) is registered
+        -- at mount time; the callback inspects the handler count / a local
+        -- ref to track detection and cancels the detection timeout.
+}
+
+-- REQ-TERM-015: detection window elapses without any marker
+rule ShellIntegrationDetectionTimedOut {
+    when: TerminalElapsedSinceSpawn(terminal) = config.shell_integration_detection_window
+
+    requires: terminal.status = active
+    requires: terminal.shell_integration_status = unknown
+
+    ensures: terminal.shell_integration_status = absent
+
+    @guidance
+        -- Implementation: a single setTimeout (or tokio sleep, depending on
+        -- whether the detection state lives client-side or server-side) is
+        -- started when the xterm mounts and cancelled if
+        -- shell_integration_status transitions to `detected` first.
+        -- v1 puts this state in the frontend since xterm.js handles OSC parsing.
+}
+
+-- REQ-TERM-016: OSC 133;C → start a command execution
+rule CommandExecutionStarted {
+    when: Osc133MarkerReceived(terminal, 'C', command_text)
+
+    requires: terminal.status = active
+    requires: terminal.shell_integration_status = detected
+
+    ensures: terminal.current_command = CommandExecution(
+        command_text: command_text,
+        started_at:   now(),
+        exit_code:    None,
+        finished_at:  None,
+    )
+
+    @guidance
+        -- OSC 133;C payload is the user's typed command (text between B and C).
+        -- Shells that do not populate this payload emit an empty C; treat it as
+        -- an empty string, not null. If current_command was already non-None
+        -- when this fires (e.g. a subshell's C arrives while the outer command
+        -- still runs), overwrite — OneExecutingCommandAtATime holds at the
+        -- outer-terminal level only.
+}
+
+-- REQ-TERM-016: OSC 133;D → finish the current command
+rule CommandExecutionFinished {
+    when: Osc133MarkerReceived(terminal, 'D', exit_code_opt)
+
+    requires: terminal.status = active
+    requires: terminal.shell_integration_status = detected
+    requires: terminal.current_command != None
+
+    ensures: terminal.last_completed_command = CommandExecution(
+        command_text: terminal.current_command.command_text,
+        started_at:   terminal.current_command.started_at,
+        exit_code:    exit_code_opt,
+        finished_at:  now(),
+    )
+    ensures: terminal.current_command = None
+
+    @guidance
+        -- OSC 133;D may be emitted with or without an exit code:
+        --   D       → finished, exit code unknown (exit_code_opt = None)
+        --   D;0     → finished, success
+        --   D;N     → finished, failure with specific code N
+        -- All three are valid. Store None when absent; never fabricate 0.
+}
+
+-- REQ-TERM-016: OSC 133;D with no current_command → no-op
+rule CommandExecutionFinishedWithNoCurrent {
+    when: Osc133MarkerReceived(terminal, 'D', _exit_code_opt)
+
+    requires: terminal.status = active
+    requires: terminal.shell_integration_status = detected
+    requires: terminal.current_command = None
+
+    ensures: DebugLogged(terminal, "OSC 133;D received with no current_command; ignoring")
+
+    @guidance
+        -- Shells sometimes emit D on empty prompts or after signals (Ctrl-C on
+        -- a blank line). This is not an error. Logging at debug only avoids
+        -- noise in production but leaves a trail for diagnosis.
+}
+
+-- REQ-TERM-016: OSC 133;A → clear the last completed command
+rule NewPromptClearsLastCompletedCommand {
+    when: Osc133MarkerReceived(terminal, 'A')
+
+    requires: terminal.status = active
+    requires: terminal.shell_integration_status = detected
+
+    ensures: terminal.last_completed_command = None
+
+    @guidance
+        -- A signals the start of a new prompt. Clearing `last_completed_command`
+        -- here gives the HUD a clean "idle" state once the user lands at a fresh
+        -- prompt, rather than indefinitely showing the previous command's ✓/✗
+        -- indicator. This mirrors how most integrated terminals behave.
+}
+
+-- REQ-TERM-018: OSC 7 → update reported_cwd
+rule CwdReportedFromOsc7 {
+    when: Osc7CwdReceived(terminal, path)
+
+    requires: terminal.status = active
+
+    ensures: terminal.reported_cwd = path
+
+    @guidance
+        -- OSC 7 payload format: file://hostname/absolute/path
+        -- Parse: strip "file://", strip the optional host up to the first "/",
+        -- percent-decode the path component, accept as reported_cwd on success.
+        -- Log at debug and leave unchanged on parse failure. The rule fires
+        -- regardless of shell_integration_status because OSC 7 is independent
+        -- from OSC 133 (a shell might emit one without the other).
+}
+
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
@@ -413,6 +595,47 @@ invariant ParserFedEveryByte {
     -- Structural guarantee: PtyOutputForwarded has both the WS send and
     -- parser.process() in its ensures block, with no conditional path
     -- that performs one without the other.
+}
+
+-- REQ-TERM-015
+invariant ShellIntegrationStatusMonotonic {
+    -- Detection is one-shot per terminal session. Legal transitions for
+    -- shell_integration_status while terminal.status = active:
+    --
+    --   unknown -> detected   (via ShellIntegrationDetected)
+    --   unknown -> absent     (via ShellIntegrationDetectionTimedOut)
+    --
+    -- No other transitions. In particular, detected -> absent is NOT allowed
+    -- even if the shell stops emitting markers. The HUD simply stops updating
+    -- in that case. This keeps runtime state predictable and matches the
+    -- product decision to "lock at 5s" to avoid mid-session HUD mode flips.
+}
+
+-- REQ-TERM-016
+invariant OneExecutingCommandAtATime {
+    for t in Terminals where t.status = active and t.shell_integration_status = detected:
+        t.current_command != None implies (
+            "exactly one command in executing state on this terminal"
+        )
+    -- Nested subshell OSC 133 interleaving is out of scope for v1.
+    -- If a nested shell emits its own C while the outer command is still
+    -- executing, CommandExecutionStarted overwrites current_command (the
+    -- outer's lifecycle tracking is lost for that command).
+}
+
+-- REQ-TERM-016
+invariant CommandLifecycleFieldsCoherent {
+    for t in Terminals where t.shell_integration_status = detected:
+        t.current_command != None implies (
+            t.current_command.finished_at = None and
+            t.current_command.exit_code = None
+        )
+        t.last_completed_command != None implies (
+            t.last_completed_command.finished_at != None
+        )
+    -- An executing command has neither finished_at nor exit_code.
+    -- A completed command always has finished_at; exit_code may still be None
+    -- if OSC 133;D omitted the code.
 }
 
 ------------------------------------------------------------
@@ -461,6 +684,57 @@ surface AgentTerminalAccess {
             -- TerminalScreenReadAbsent handles the absent case gracefully.
 }
 
+-- REQ-TERM-015, REQ-TERM-016, REQ-TERM-018: OSC 133 + OSC 7 contract
+surface ShellIntegrationProtocol {
+    facing provider: ShellIntegrationProvider
+        -- The shell (or prompt framework) running inside the PTY.
+        -- Phoenix treats the provider as opaque — only the markers emitted
+        -- on the byte stream are part of the contract.
+
+    context terminal: Terminal
+
+    exposes:
+        terminal.shell_integration_status
+        terminal.current_command
+        terminal.last_completed_command
+        terminal.reported_cwd
+
+    expects:
+        Osc133MarkerReceived(terminal, 'A')
+            -- FTCS_PROMPT_START — shell is about to render a new prompt.
+            -- Clears last_completed_command.
+
+        Osc133MarkerReceived(terminal, 'B')
+            -- FTCS_COMMAND_START — prompt rendered, user input begins.
+            -- Accepted for forward compatibility; no lifecycle rule uses it.
+
+        Osc133MarkerReceived(terminal, 'C', command_text)
+            -- FTCS_COMMAND_EXECUTED — user pressed Enter; command begins.
+            -- Payload is the typed command text (may be empty string).
+
+        Osc133MarkerReceived(terminal, 'D', exit_code?)
+            -- FTCS_COMMAND_FINISHED — command completed.
+            -- Optional payload is the exit code. None means "finished,
+            -- exit code unknown"; do not substitute 0.
+
+        Osc7CwdReceived(terminal, path)
+            -- Current working directory report.
+            -- Payload format: file://hostname/absolute/path (percent-encoded).
+
+    @guarantee DetectionMonotonic
+        -- Per the ShellIntegrationStatusMonotonic invariant: once detection
+        -- settles to `detected` or `absent`, the provider cannot un-settle it
+        -- for the lifetime of the terminal session. If the shell stops
+        -- emitting markers mid-session, the HUD stops updating but status
+        -- remains `detected`.
+
+    @guarantee NoBackchannel
+        -- Phoenix never writes OSC 133 or OSC 7 sequences back to the
+        -- provider. The protocol is one-way: provider → Phoenix only.
+        -- v1 does not implement automatic injection of the hooks (see
+        -- ShellIntegrationAutoInjection in the Deferred section).
+}
+
 ------------------------------------------------------------
 -- Deferred
 ------------------------------------------------------------
@@ -470,10 +744,21 @@ deferred TmuxIntegration.named_sessions
     -- Future path for users who want scrollback or session persistence.
     -- KISS: named sessions only. See KT doc for context.
 
-deferred ShellIntegration.osc133_markers
-    -- OSC 133 precmd/preexec hooks for structured command/output events.
-    -- Enables discrete { command, exit_code, cwd, output } events from the
-    -- byte stream without polling. v2 concern; vt100 scraping is sufficient for v1.
+deferred ShellIntegrationAutoInjection
+    -- Phoenix could inject OSC 133 precmd/preexec hooks into the user's shell
+    -- by manipulating ZDOTDIR, --rcfile, or $BASH_ENV at spawn time. This
+    -- would make shell integration work without any user action.
+    --
+    -- Deferred because:
+    --   1. Conflicts with user's own rc file customisations are easy to
+    --      introduce and hard to debug.
+    --   2. Each shell needs its own injection approach.
+    --   3. The opt-in snippet (REQ-TERM-017) is simpler and gives users
+    --      control over what runs in their shell.
+    --
+    -- v1 ships detection + snippet-based opt-in (REQ-TERM-015 through -018).
+    -- Revisit auto-injection if evidence shows users want the zero-config
+    -- experience enough to accept the risk.
 
 deferred macOsKqueueSupport
     -- PTY master fds have historically had kqueue quirks on macOS.

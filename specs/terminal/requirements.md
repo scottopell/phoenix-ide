@@ -225,3 +225,117 @@ AND NOT drop bytes to relieve backpressure
 **Rationale:** The vt100 parser is a state machine — dropped bytes corrupt
 its state permanently for that session. Backpressure propagates to the kernel
 PTY buffer, which correctly slows the producing process rather than losing data.
+
+---
+
+### REQ-TERM-015: OSC 133 Shell Integration Detection
+
+WHEN a new terminal session is spawned
+THE SYSTEM SHALL begin a detection window of configurable duration (default 5 seconds)
+during which incoming PTY bytes are inspected for OSC 133 escape sequences
+
+WHEN an OSC 133 marker is observed within the detection window
+THE SYSTEM SHALL mark the terminal session as `shell_integration_status = detected`
+AND SHALL activate command lifecycle tracking for the remainder of the session
+
+WHEN the detection window elapses without observing any OSC 133 marker
+THE SYSTEM SHALL mark the terminal session as `shell_integration_status = absent`
+AND SHALL leave the detection state locked for the remainder of the session
+AND SHALL NOT re-attempt detection until a new terminal session is spawned
+
+**Rationale:** OSC 133 (FinalTerm shell integration) is the de-facto standard
+for structured prompt/command semantics in terminal emulators. Modern shells
+and prompt frameworks (powerlevel10k, Starship, fish 3.6+, iTerm2 shell
+integration) can emit these markers but do not by default. Detecting them
+per-session lets Phoenix provide a richer HUD when present and gracefully fall
+back to buffer scraping otherwise. The 5-second window accommodates slow shell
+startup (instant prompts, SSH login banners) without excessively delaying the
+absent-state UI affordances. Monotonic detection keeps runtime state simple and
+predictable: users don't see the HUD flip between modes mid-session.
+
+---
+
+### REQ-TERM-016: Shell Integration Command Lifecycle Tracking
+
+WHEN `shell_integration_status = detected` AND an OSC 133 `C` marker is received
+THE SYSTEM SHALL record the command text payload (may be empty)
+AND SHALL store an executing command as the terminal's `current_command`
+with `started_at` set to the current time
+
+WHEN `shell_integration_status = detected` AND an OSC 133 `D` marker is received
+AND `current_command` is present
+THE SYSTEM SHALL record the exit code from the `D` payload if present (may be absent)
+AND SHALL store the finished command as `last_completed_command`
+with `finished_at` set to the current time
+AND SHALL clear `current_command`
+
+WHEN `shell_integration_status = detected` AND an OSC 133 `D` marker is received
+AND no `current_command` is present
+THE SYSTEM SHALL treat the event as a no-op and log at debug level
+
+WHEN `shell_integration_status = detected` AND an OSC 133 `A` marker is received
+THE SYSTEM SHALL clear `last_completed_command`
+
+WHEN `shell_integration_status = detected` AND an OSC 133 `B` marker is received
+THE SYSTEM SHALL accept the marker without state change (reserved for forward compatibility)
+
+**Rationale:** The A/C/D subset of OSC 133 captures the essential command
+lifecycle: new prompt, execution begins, execution ends. The B marker
+(end-of-prompt / start-of-input) is not used because the HUD has no need to
+distinguish "prompt rendered" from "user typing." Accepting B without a rule
+keeps the spec forward-compatible. Clearing `last_completed_command` on A
+produces a clean idle state at each new interactive moment rather than
+indefinitely showing the previous command's result. Missing `current_command`
+on D is tolerated because shells can emit D on empty prompts or after signals.
+
+---
+
+### REQ-TERM-017: Shell Integration Absent Hint
+
+WHEN `shell_integration_status = absent` for the current terminal session
+THE SYSTEM SHALL display a passive hint indicator associated with the terminal's status dot
+AND SHALL offer the user a shell-specific enablement snippet on demand
+
+WHEN the user hovers the status dot in the absent state
+THE SYSTEM SHALL show a tooltip explaining that shell integration is not detected
+AND naming the detected shell (e.g. "zsh")
+
+WHEN the user clicks the status dot in the absent state
+THE SYSTEM SHALL display a modal containing a snippet tailored to the user's shell
+AND SHALL include a copy-to-clipboard affordance
+AND SHALL NOT show instructions for other shells
+
+WHEN the user's shell is `zsh`, `bash`, or `fish` (determined from `$SHELL` captured at spawn time per REQ-TERM-002)
+THE SYSTEM SHALL display the shell-specific snippet for that shell
+
+WHEN the user's shell is something else
+THE SYSTEM SHALL display a generic message indicating that shell integration is not supported out of the box for that shell
+
+**Rationale:** A passive tooltip on the terminal's status indicator surfaces
+the hint at the moment of engagement (hovering the dot) without intruding on
+the chat workflow or requiring a dismissable banner. Tailoring to the detected
+shell avoids overwhelming the user with options for shells they don't use and
+makes the copy-paste one step instead of two. The snippet bundles both OSC 133
+markers and OSC 7 cwd reporting into a single paste so users get both features
+at once.
+
+---
+
+### REQ-TERM-018: OSC 7 Working Directory Reporting
+
+WHEN an OSC 7 escape sequence is received from the PTY containing a `file://host/path` URL
+THE SYSTEM SHALL parse the path component (percent-decoded)
+AND SHALL update the terminal session's `reported_cwd` for HUD display
+
+WHEN no OSC 7 sequence has been observed for a terminal session
+THE SYSTEM SHALL fall back to the conversation's static working directory (REQ-BED-010) for HUD display
+
+WHEN an OSC 7 sequence is received with an unparseable payload
+THE SYSTEM SHALL log the parse failure at debug level
+AND SHALL leave `reported_cwd` unchanged
+
+**Rationale:** OSC 7 provides a reliable, shell-native way to track the current
+directory without parsing prompt text. It pairs naturally with OSC 133 (both
+are typically enabled by the same shell integration snippet) and ensures the
+HUD stays accurate when the user `cd`s inside the shell session, without the
+staleness of a static conversation-scoped cwd.
