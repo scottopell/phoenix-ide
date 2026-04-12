@@ -702,6 +702,12 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
+        // Mock provider needs no credentials
+        if spec.provider == Provider::Mock {
+            let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
+            return Some(Arc::new(LoggingService::new(service)));
+        }
+
         let auth = if let Some(ref helper) = config.api_key_helper {
             // api_key_helper takes highest priority — dynamic API key for all providers
             LlmAuth::new(Arc::clone(helper), AuthStyle::ApiKey)
@@ -730,6 +736,7 @@ impl ModelRegistry {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
                     LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
+                Provider::Mock => unreachable!("handled above"),
             }
         };
 
@@ -827,6 +834,7 @@ impl ModelRegistry {
         let candidates: &[&str] = match parent_provider {
             Some(Provider::Anthropic) => &["claude-haiku-4-5"],
             Some(Provider::OpenAI) => &["gpt-4o-mini", "gpt-5-mini"],
+            Some(Provider::Mock) => return "mock".to_string(),
             None => return parent_model_id.to_string(),
         };
 
@@ -845,14 +853,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_api_keys_no_models() {
+    fn test_no_api_keys_only_mock() {
         let config = LlmConfig::default();
         let registry = ModelRegistry::new(&config);
-        assert!(registry.available_models().is_empty());
+        // Mock model is always available (no credentials needed)
+        assert_eq!(registry.available_models(), vec!["mock".to_string()]);
     }
 
     #[test]
-    fn test_anthropic_key_only_anthropic_models() {
+    fn test_anthropic_key_only_anthropic_and_mock_models() {
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
             ..Default::default()
@@ -862,11 +871,11 @@ mod tests {
         let models = registry.available_models();
         assert!(!models.is_empty());
 
-        // All models should be Anthropic models
+        // All models should be Anthropic or mock
         for model_id in &models {
             assert!(
-                model_id.contains("claude"),
-                "Expected claude model, got {model_id}"
+                model_id.contains("claude") || model_id == "mock",
+                "Expected claude or mock model, got {model_id}"
             );
         }
     }

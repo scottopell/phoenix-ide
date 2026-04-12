@@ -58,6 +58,7 @@ mod anthropic;
 pub mod credential_helper;
 mod discovery;
 mod error;
+mod mock;
 mod models;
 mod openai;
 #[cfg(test)]

@@ -8,6 +8,7 @@
 pub enum Provider {
     Anthropic,
     OpenAI,
+    Mock,
 }
 
 impl Provider {
@@ -16,6 +17,7 @@ impl Provider {
         match self {
             Provider::Anthropic => "Anthropic",
             Provider::OpenAI => "OpenAI",
+            Provider::Mock => "Mock",
         }
     }
 
@@ -24,6 +26,7 @@ impl Provider {
         match self {
             Provider::Anthropic => "anthropic",
             Provider::OpenAI => "openai",
+            Provider::Mock => "mock",
         }
     }
 }
@@ -215,6 +218,17 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "GPT-5.2 Codex (latest code model)".into(),
             context_window: 200_000,
             recommended: true,
+            supports_tool_search: false,
+        },
+        // Mock model for frontend development without API keys
+        ModelSpec {
+            id: "mock".into(),
+            api_name: "mock".into(),
+            provider: Provider::Mock,
+            api_format: ApiFormat::Anthropic, // unused by mock, but needed for the struct
+            description: "Mock (lorem ipsum for UI dev)".into(),
+            context_window: 200_000,
+            recommended: false,
             supports_tool_search: false,
         },
     ]
