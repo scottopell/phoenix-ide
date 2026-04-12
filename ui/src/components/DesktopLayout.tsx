@@ -120,6 +120,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         {isDesktop && (
           <PaneDivider
             orientation="vertical"
+            title="Drag to resize • Drag past edge to collapse"
             onPointerDown={(e) => sidebarPane.startDrag(e, 'x')}
             onDoubleClick={() => sidebarPane.setCollapsed(!sidebarPane.collapsed)}
           />
@@ -138,6 +139,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         {isDesktop && activeSlug && (
           <PaneDivider
             orientation="vertical"
+            title="Drag to resize • Drag past edge to collapse"
             onPointerDown={(e) => fileExplorerPane.startDrag(e, 'x')}
             onDoubleClick={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
           />

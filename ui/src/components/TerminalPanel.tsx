@@ -9,7 +9,7 @@
  * REQ-TERM-004, REQ-TERM-005, REQ-TERM-006
  */
 
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
@@ -22,7 +22,11 @@ interface TerminalPanelProps {
   collapsed: boolean;
   /** Click on the header strip restores from collapsed */
   onExpand: () => void;
+  /** Fallback prompt text when xterm buffer has no content yet */
+  cwd?: string;
 }
+
+type ActivityState = 'idle' | 'running' | 'disconnected';
 
 /** Build the WebSocket URL for a conversation's terminal endpoint. */
 function terminalWsUrl(conversationId: string): string {
@@ -47,7 +51,20 @@ function dataFrame(payload: Uint8Array): Uint8Array {
   return buf;
 }
 
-export function TerminalPanel({ conversationId, height, collapsed, onExpand }: TerminalPanelProps) {
+/** Truncate from the LEFT, preserving the tail (cwd + prompt glyph). */
+function truncateLeft(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return '…' + s.slice(s.length - (max - 1));
+}
+
+/** Format a cwd for fallback display — last 40 chars, replace $HOME with ~. */
+function formatCwd(cwd: string): string {
+  // No reliable $HOME in the browser; just truncate from the left.
+  const trimmed = cwd.replace(/\/+$/, '');
+  return truncateLeft(trimmed, 40) + ' ❯';
+}
+
+export function TerminalPanel({ conversationId, height, collapsed, onExpand, cwd }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -57,6 +74,13 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
   // can check the current collapsed state without re-subscribing.
   const collapsedRef = useRef(collapsed);
   collapsedRef.current = collapsed;
+
+  // HUD state: activity / unread counter / sampled prompt line
+  const [activity, setActivity] = useState<ActivityState>('disconnected');
+  const unreadRef = useRef<number>(0);
+  const [unreadDisplay, setUnreadDisplay] = useState<number>(0);
+  const [promptLine, setPromptLine] = useState<string>('');
+  const activityTimeoutRef = useRef<number | null>(null);
 
   const setStatus = useCallback((msg: string) => {
     if (statusRef.current) statusRef.current.textContent = msg;
@@ -105,6 +129,7 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
       const { cols, rows } = term;
       ws.send(resizeFrame(cols, rows));
       setStatus('');
+      setActivity('idle');
     };
 
     ws.onmessage = (event: MessageEvent<ArrayBuffer>) => {
@@ -112,14 +137,36 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
       if (data.length === 0) return;
       if (data[0] === 0x00) {
         // PTY output → write to xterm.js
-        term.write(data.slice(1));
+        const payload = data.slice(1);
+        term.write(payload);
+        // Count newlines while collapsed for the unread counter
+        if (collapsedRef.current) {
+          let n = 0;
+          for (let i = 0; i < payload.length; i++) {
+            if (payload[i] === 0x0a) n++;
+          }
+          if (n > 0) unreadRef.current += n;
+        }
+        // Flip to running and schedule decay back to idle after 500ms
+        setActivity('running');
+        if (activityTimeoutRef.current !== null) {
+          window.clearTimeout(activityTimeoutRef.current);
+        }
+        activityTimeoutRef.current = window.setTimeout(() => {
+          setActivity('idle');
+          activityTimeoutRef.current = null;
+        }, 500);
       }
       // 0x01 (resize) is only sent server→client as a future extension; ignore for now.
     };
 
-    ws.onerror = () => setStatus('Connection error');
+    ws.onerror = () => {
+      setStatus('Connection error');
+      setActivity('disconnected');
+    };
     ws.onclose = () => {
       setStatus('Terminal closed');
+      setActivity('disconnected');
       term.write('\r\n\x1b[90m[Terminal disconnected]\x1b[0m\r\n');
     };
 
@@ -150,6 +197,10 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
     return () => {
       disposeOnData.dispose();
       window.removeEventListener('resize', handleResize);
+      if (activityTimeoutRef.current !== null) {
+        window.clearTimeout(activityTimeoutRef.current);
+        activityTimeoutRef.current = null;
+      }
       ws.close();
       term.dispose();
       termRef.current = null;
@@ -180,15 +231,96 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
     return () => cancelAnimationFrame(id);
   }, [height, collapsed]);
 
+  // Reset unread counter when collapse flips true → false
+  useEffect(() => {
+    if (!collapsed) {
+      unreadRef.current = 0;
+      setUnreadDisplay(0);
+    }
+  }, [collapsed]);
+
+  // Throttled flush of unread counter from ref to state (~200ms)
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const cur = unreadRef.current;
+      setUnreadDisplay((prev) => (prev === cur ? prev : cur));
+    }, 200);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Sample the xterm buffer for the last non-blank line (~300ms)
+  useEffect(() => {
+    const sample = () => {
+      const term = termRef.current;
+      if (!term) return;
+      const buf = term.buffer.active;
+      const startY = buf.cursorY + buf.baseY;
+      let found = '';
+      for (let dy = 0; dy <= 5; dy++) {
+        const y = startY - dy;
+        if (y < 0) break;
+        const line = buf.getLine(y);
+        if (!line) continue;
+        const text = line.translateToString(true);
+        if (text && text.trim().length > 0) {
+          found = text.trimEnd();
+          break;
+        }
+      }
+      if (!found) {
+        if (cwd && cwd.length > 0) {
+          found = formatCwd(cwd);
+        } else {
+          found = '';
+        }
+      }
+      const truncated = truncateLeft(found, 60);
+      setPromptLine((prev) => (prev === truncated ? prev : truncated));
+    };
+    sample();
+    const id = window.setInterval(sample, 300);
+    return () => window.clearInterval(id);
+  }, [cwd]);
+
+  const dotClass =
+    activity === 'running'
+      ? 'terminal-live-dot terminal-live-dot--running'
+      : activity === 'disconnected'
+        ? 'terminal-live-dot terminal-live-dot--disconnected'
+        : 'terminal-live-dot terminal-live-dot--idle';
+
+  const headerClickable = collapsed;
+  const handleHeaderClick = headerClickable ? onExpand : undefined;
+
   return (
     <div className="terminal-panel" style={{ height: `${height}px` }}>
       <div
-        className="terminal-panel-header"
-        onClick={collapsed ? onExpand : undefined}
-        style={collapsed ? { cursor: 'pointer' } : undefined}
+        className={`terminal-panel-header${collapsed ? ' terminal-panel-header--collapsed' : ''}`}
+        onClick={handleHeaderClick}
+        style={headerClickable ? { cursor: 'pointer' } : undefined}
       >
-        <span className="terminal-panel-title">❯_ Terminal</span>
+        <span className={dotClass} aria-hidden="true" />
+        <span className="terminal-panel-prompt">
+          {collapsed ? (promptLine || '❯_ Terminal') : '❯_ Terminal'}
+        </span>
         <div ref={statusRef} className="terminal-panel-status" />
+        {collapsed && unreadDisplay > 0 && (
+          <span className="terminal-panel-unread">
+            +{unreadDisplay} {unreadDisplay === 1 ? 'line' : 'lines'}
+          </span>
+        )}
+        {collapsed && (
+          <span
+            className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--open'}`}
+            aria-hidden="true"
+            onClick={(e) => {
+              e.stopPropagation();
+              onExpand();
+            }}
+          >
+            ⌃
+          </span>
+        )}
       </div>
       <div
         ref={containerRef}

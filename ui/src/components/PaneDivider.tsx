@@ -5,6 +5,8 @@ interface PaneDividerProps {
   /** Pointer-down handler — typically `(e) => startDrag(e, axis, invert)` from useResizablePane */
   onPointerDown: (e: React.PointerEvent) => void;
   onDoubleClick?: () => void;
+  /** Native tooltip text shown on hover */
+  title?: string;
 }
 
 /**
@@ -13,7 +15,7 @@ interface PaneDividerProps {
  * Vertical orientation = a vertical line between two side-by-side panes (col-resize).
  * Horizontal orientation = a horizontal line between two stacked panes (row-resize).
  */
-export function PaneDivider({ orientation, onPointerDown, onDoubleClick }: PaneDividerProps) {
+export function PaneDivider({ orientation, onPointerDown, onDoubleClick, title }: PaneDividerProps) {
   const [dragging, setDragging] = useState(false);
 
   const handlePointerDown = useCallback(
@@ -47,6 +49,9 @@ export function PaneDivider({ orientation, onPointerDown, onDoubleClick }: PaneD
       onDoubleClick={onDoubleClick}
       role="separator"
       aria-orientation={orientation}
-    />
+      title={title}
+    >
+      <span className="pane-divider-grip" aria-hidden="true" />
+    </div>
   );
 }

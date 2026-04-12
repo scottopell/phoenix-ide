@@ -267,6 +267,29 @@ export function ConversationPage() {
     }
   }, [atom.phase.type]);
 
+  // Ctrl+` toggles the terminal collapse state (ignored while typing in an
+  // input, textarea, contentEditable, or xterm).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.key !== '`') return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active) {
+        const tag = active.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        if (active.isContentEditable) return;
+        if (active.closest('.terminal-panel-xterm')) return;
+      }
+      e.preventDefault();
+      if (terminalPane.collapsed) {
+        terminalPane.expandFromCollapsed();
+      } else {
+        terminalPane.setCollapsed(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [terminalPane]);
+
   // Cache new messages as they arrive via SSE
   const cachedMsgCountRef = useRef(0);
   useEffect(() => {
@@ -709,6 +732,7 @@ export function ConversationPage() {
         <>
           <PaneDivider
             orientation="horizontal"
+            title="Drag to resize • Double-click to collapse/expand"
             onPointerDown={(e) => terminalPane.startDrag(e, 'y', true)}
             onDoubleClick={() => {
               if (terminalPane.collapsed) {
@@ -723,6 +747,7 @@ export function ConversationPage() {
             height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
             collapsed={terminalPane.collapsed}
             onExpand={terminalPane.expandFromCollapsed}
+            cwd={conversation.cwd}
           />
         </>
       )}
