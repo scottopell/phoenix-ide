@@ -209,7 +209,7 @@
   border: 1px solid var(--border-color);
   border-radius: 6px;
   padding: 12px;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-primary);
@@ -349,7 +349,7 @@
   min-height: 120px;
   background: transparent;
   border: none;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-primary);

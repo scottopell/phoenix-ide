@@ -59,7 +59,7 @@ export function TerminalPanel({ conversationId }: TerminalPanelProps) {
     const term = new Terminal({
       cursorBlink: true,
       theme: { background: '#1a1a1a', foreground: '#d4d4d4', cursor: '#d4d4d4' },
-      fontFamily: '"Cascadia Code", "JetBrains Mono", "Fira Code", monospace',
+      fontFamily: '"SauceCodePro NF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", monospace',
       fontSize: 13,
       scrollback: 1000,
     });

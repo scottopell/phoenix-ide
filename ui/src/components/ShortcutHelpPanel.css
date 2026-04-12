@@ -72,7 +72,7 @@
 }
 
 .shortcut-help-key {
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
