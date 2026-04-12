@@ -53,16 +53,21 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const statusRef = useRef<HTMLDivElement>(null);
+  // Stable ref so long-lived listeners (window resize, height-change effect)
+  // can check the current collapsed state without re-subscribing.
+  const collapsedRef = useRef(collapsed);
+  collapsedRef.current = collapsed;
 
   const setStatus = useCallback((msg: string) => {
     if (statusRef.current) statusRef.current.textContent = msg;
   }, []);
 
-  // Mount xterm only when the panel is expanded. The effect re-runs when
-  // `collapsed` flips so the terminal is fully torn down on collapse and
-  // re-initialised cleanly on expand (FitAddon refuses to fit a 0-height parent).
+  // Mount xterm once for the lifetime of the conversation. The xterm container
+  // is always rendered but hidden via `display: none` when the panel is
+  // collapsed, preserving the WebSocket, PTY, scrollback, and any running
+  // shell state across collapse/expand cycles. FitAddon is only invoked while
+  // the panel is expanded (it throws on 0-height parents).
   useEffect(() => {
-    if (collapsed) return;
     if (!containerRef.current) return;
 
     // --- xterm.js setup ---
@@ -76,7 +81,15 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(containerRef.current);
-    fitAddon.fit();
+    // Only fit immediately if the container is visible; otherwise the
+    // height-change effect will run fit() when the panel expands.
+    if (!collapsedRef.current) {
+      try {
+        fitAddon.fit();
+      } catch {
+        // ignore — deferred fit will retry
+      }
+    }
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
@@ -119,10 +132,17 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
     });
 
     // --- Resize handling (REQ-TERM-006) ---
+    // Skip fit() while collapsed — FitAddon throws on a `display: none` parent.
+    // The next expand triggers a fit via the height-change effect below.
     const handleResize = () => {
-      fitAddon.fit();
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(resizeFrame(term.cols, term.rows));
+      if (collapsedRef.current) return;
+      try {
+        fitAddon.fit();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(resizeFrame(term.cols, term.rows));
+        }
+      } catch {
+        // ignore — next resize will retry
       }
     };
     window.addEventListener('resize', handleResize);
@@ -136,7 +156,7 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
       fitAddonRef.current = null;
       wsRef.current = null;
     };
-  }, [conversationId, setStatus, collapsed]);
+  }, [conversationId, setStatus]);
 
   // Refit when the parent height changes (drag-resize) — same effect path as
   // a window resize, but driven by the prop changing instead of a DOM event.
@@ -170,7 +190,11 @@ export function TerminalPanel({ conversationId, height, collapsed, onExpand }: T
         <span className="terminal-panel-title">❯_ Terminal</span>
         <div ref={statusRef} className="terminal-panel-status" />
       </div>
-      {!collapsed && <div ref={containerRef} className="terminal-panel-xterm" />}
+      <div
+        ref={containerRef}
+        className="terminal-panel-xterm"
+        style={collapsed ? { display: 'none' } : undefined}
+      />
     </div>
   );
 }
