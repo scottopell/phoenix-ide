@@ -191,6 +191,12 @@ export function TerminalPanel({
 
   // Fallback (sampler) HUD state
   const [activity, setActivity] = useState<ActivityState>('disconnected');
+  // Ref mirror so long-lived callbacks (WS onmessage + activity timeout)
+  // can check the current activity without re-registering. Specifically
+  // prevents the byte-activity timeout from demoting a `disconnected`
+  // state back to `idle` after ws.onclose has fired.
+  const activityRef = useRef<ActivityState>('disconnected');
+  activityRef.current = activity;
   const unreadRef = useRef<number>(0);
   const [unreadDisplay, setUnreadDisplay] = useState<number>(0);
   const activityTimeoutRef = useRef<number | null>(null);
@@ -445,22 +451,41 @@ export function TerminalPanel({
         // Byte-activity heuristic — only used while integrationStatus is not
         // `detected`. When detected, the dot color is driven by the OSC 133
         // command lifecycle instead.
+        //
+        // Don't promote `disconnected` → `running`: once the session is
+        // dead, the byte-activity path stays dead. This can happen if a
+        // server-side shutdown message arrives as data just before the
+        // close handshake.
+        if (activityRef.current === 'disconnected') return;
         setActivity('running');
         if (activityTimeoutRef.current !== null) {
           window.clearTimeout(activityTimeoutRef.current);
         }
         activityTimeoutRef.current = window.setTimeout(() => {
-          setActivity('idle');
           activityTimeoutRef.current = null;
+          // Don't demote disconnected → idle. ws.onclose may have fired
+          // between this timer being scheduled and it firing, and the
+          // disconnected state needs to stick until explicit reconnect.
+          if (activityRef.current === 'disconnected') return;
+          setActivity('idle');
         }, 500);
       }
     };
 
+    const clearPendingActivityDecay = () => {
+      if (activityTimeoutRef.current !== null) {
+        window.clearTimeout(activityTimeoutRef.current);
+        activityTimeoutRef.current = null;
+      }
+    };
+
     ws.onerror = () => {
+      clearPendingActivityDecay();
       setStatus('Connection error');
       setActivity('disconnected');
     };
     ws.onclose = () => {
+      clearPendingActivityDecay();
       setStatus('Shell exited');
       setActivity('disconnected');
       term.write('\r\n\x1b[90m[Shell exited]\x1b[0m\r\n');
