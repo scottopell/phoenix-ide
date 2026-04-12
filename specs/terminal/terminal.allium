@@ -147,8 +147,8 @@ entity Terminal {
         when status = active and shell_integration_status = detected
 
     -- The most recently completed command. Set by CommandExecutionFinished,
-    -- cleared by NewPromptClearsLastCompletedCommand on the next OSC 133;A.
-    -- Drives the transient ✓/✗ display in the HUD.
+    -- cleared by CommandExecutionStarted on the next OSC 133;C. Drives the
+    -- transient ✓/✗ display in the HUD.
     last_completed_command: CommandExecution?
         when status = active and shell_integration_status = detected
 
@@ -438,9 +438,9 @@ rule TerminalAbandonedWithConversation {
         -- Terminal(conversation).status = active naturally excludes them.
 }
 
--- REQ-TERM-015: OSC 133 detection on first marker
+-- REQ-TERM-015 (revised): OSC 133 detection on first C marker
 rule ShellIntegrationDetected {
-    when: Osc133MarkerReceived(terminal, _kind, _payload)
+    when: Osc133MarkerReceived(terminal, 'C', _payload)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = unknown
@@ -448,13 +448,15 @@ rule ShellIntegrationDetected {
     ensures: terminal.shell_integration_status = detected
 
     @guidance
-        -- Any OSC 133 marker (A, B, C, or D) counts as detection evidence.
-        -- The first one wins. The marker that triggered detection is also
-        -- processed by its own lifecycle rule below in the same handler pass
-        -- (e.g. if the first marker is a C, CommandExecutionStarted also fires).
-        -- Implementation: xterm.js registerOscHandler(133, ...) is registered
-        -- at mount time; the callback inspects the handler count / a local
-        -- ref to track detection and cancels the detection timeout.
+        -- Detection fires specifically on C, not on any OSC 133 marker.
+        -- Rationale: prompt-boundary markers A and B (as emitted by
+        -- powerlevel10k's built-in shell integration) give us no actionable
+        -- data for the rich HUD. A "detected" status that cannot track
+        -- commands would mislead users. Conservative detection keeps the
+        -- HUD honest.
+        --
+        -- The C marker that triggers detection is also processed by
+        -- CommandExecutionStarted in the same handler pass.
 }
 
 -- REQ-TERM-015: detection window elapses without any marker
@@ -474,7 +476,7 @@ rule ShellIntegrationDetectionTimedOut {
         -- v1 puts this state in the frontend since xterm.js handles OSC parsing.
 }
 
--- REQ-TERM-016: OSC 133;C → start a command execution
+-- REQ-TERM-016 (revised): OSC 133;C → start a command execution
 rule CommandExecutionStarted {
     when: Osc133MarkerReceived(terminal, 'C', command_text)
 
@@ -487,6 +489,7 @@ rule CommandExecutionStarted {
         exit_code:    None,
         finished_at:  None,
     )
+    ensures: terminal.last_completed_command = None
 
     @guidance
         -- OSC 133;C payload is the user's typed command (text between B and C).
@@ -495,6 +498,12 @@ rule CommandExecutionStarted {
         -- when this fires (e.g. a subshell's C arrives while the outer command
         -- still runs), overwrite — OneExecutingCommandAtATime holds at the
         -- outer-terminal level only.
+        --
+        -- Clearing last_completed_command here (moved from the old
+        -- NewPromptClearsLastCompletedCommand rule) gives the ✓/✗ indicator
+        -- a useful visible lifetime: it persists from D until the user types
+        -- their next command and hits Enter. Clearing on A instead produced
+        -- ~50ms of visibility in shells that emit A back-to-back with D.
 }
 
 -- REQ-TERM-016: OSC 133;D → finish the current command
@@ -537,20 +546,25 @@ rule CommandExecutionFinishedWithNoCurrent {
         -- noise in production but leaves a trail for diagnosis.
 }
 
--- REQ-TERM-016: OSC 133;A → clear the last completed command
-rule NewPromptClearsLastCompletedCommand {
-    when: Osc133MarkerReceived(terminal, 'A')
+-- REQ-TERM-016: OSC 133;A and ;B are accepted as no-ops (forward compat)
+rule PromptBoundaryMarkerAccepted {
+    when: Osc133MarkerReceived(terminal, kind, _payload)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
+    requires: kind in ['A', 'B']
 
-    ensures: terminal.last_completed_command = None
+    ensures: nothing
+        -- Intentional no-op. A and B are preserved in the surface for
+        -- forward compatibility but do not trigger state changes under
+        -- the revised model where last_completed_command clears on C.
 
     @guidance
-        -- A signals the start of a new prompt. Clearing `last_completed_command`
-        -- here gives the HUD a clean "idle" state once the user lands at a fresh
-        -- prompt, rather than indefinitely showing the previous command's ✓/✗
-        -- indicator. This mirrors how most integrated terminals behave.
+        -- Historical: a previous version of this rule cleared
+        -- last_completed_command on A. That produced ~50ms of visible
+        -- lifetime for the ✓/✗ indicator in shells that emit A immediately
+        -- after D. Clearing on C instead gives the user the entire
+        -- "reading the result → typing the next command" window.
 }
 
 -- REQ-TERM-018: OSC 7 → update reported_cwd

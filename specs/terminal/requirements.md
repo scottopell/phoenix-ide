@@ -234,24 +234,36 @@ WHEN a new terminal session is spawned
 THE SYSTEM SHALL begin a detection window of configurable duration (default 5 seconds)
 during which incoming PTY bytes are inspected for OSC 133 escape sequences
 
-WHEN an OSC 133 marker is observed within the detection window
+WHEN an OSC 133 `C` marker is observed within the detection window
 THE SYSTEM SHALL mark the terminal session as `shell_integration_status = detected`
 AND SHALL activate command lifecycle tracking for the remainder of the session
 
-WHEN the detection window elapses without observing any OSC 133 marker
+WHEN only OSC 133 `A` and/or `B` markers are observed within the detection window (as with powerlevel10k's default integration)
+THE SYSTEM SHALL NOT promote to `detected` on those markers alone
+
+WHEN the detection window elapses without observing a `C` marker
 THE SYSTEM SHALL mark the terminal session as `shell_integration_status = absent`
 AND SHALL leave the detection state locked for the remainder of the session
 AND SHALL NOT re-attempt detection until a new terminal session is spawned
 
 **Rationale:** OSC 133 (FinalTerm shell integration) is the de-facto standard
-for structured prompt/command semantics in terminal emulators. Modern shells
-and prompt frameworks (powerlevel10k, Starship, fish 3.6+, iTerm2 shell
-integration) can emit these markers but do not by default. Detecting them
-per-session lets Phoenix provide a richer HUD when present and gracefully fall
-back to buffer scraping otherwise. The 5-second window accommodates slow shell
-startup (instant prompts, SSH login banners) without excessively delaying the
-absent-state UI affordances. Monotonic detection keeps runtime state simple and
-predictable: users don't see the HUD flip between modes mid-session.
+for structured prompt/command semantics in terminal emulators. Detection
+requires a `C` marker specifically because the purpose of the rich HUD is
+command lifecycle tracking — prompt boundaries (A, B) alone give us nothing
+actionable. powerlevel10k, a common prompt framework, emits only A/B via its
+built-in shell integration hook; users with p10k see `absent` until they
+supplement their configuration with preexec/precmd hooks that emit C/D.
+
+The 5-second window accommodates slow shell startup (instant prompts, SSH
+login banners, `nvm use` chains) without excessively delaying the absent-state
+UI affordances. Monotonic detection keeps runtime state simple and predictable:
+users don't see the HUD flip between modes mid-session.
+
+To maximise the chance that detection fires for users running prompt
+frameworks that gate shell integration on terminal identity, the PTY spawn
+env (REQ-TERM-002) includes `ITERM_SHELL_INTEGRATION_INSTALLED=Yes` and
+`TERM_PROGRAM=phoenix-ide`. The former specifically unlocks p10k's built-in
+OSC 133;A/B emission.
 
 ---
 
@@ -261,6 +273,7 @@ WHEN `shell_integration_status = detected` AND an OSC 133 `C` marker is received
 THE SYSTEM SHALL record the command text payload (may be empty)
 AND SHALL store an executing command as the terminal's `current_command`
 with `started_at` set to the current time
+AND SHALL clear any `last_completed_command` from the previous command
 
 WHEN `shell_integration_status = detected` AND an OSC 133 `D` marker is received
 AND `current_command` is present
@@ -273,20 +286,22 @@ WHEN `shell_integration_status = detected` AND an OSC 133 `D` marker is received
 AND no `current_command` is present
 THE SYSTEM SHALL treat the event as a no-op and log at debug level
 
-WHEN `shell_integration_status = detected` AND an OSC 133 `A` marker is received
-THE SYSTEM SHALL clear `last_completed_command`
-
-WHEN `shell_integration_status = detected` AND an OSC 133 `B` marker is received
+WHEN `shell_integration_status = detected` AND an OSC 133 `A` or `B` marker is received
 THE SYSTEM SHALL accept the marker without state change (reserved for forward compatibility)
 
-**Rationale:** The A/C/D subset of OSC 133 captures the essential command
-lifecycle: new prompt, execution begins, execution ends. The B marker
-(end-of-prompt / start-of-input) is not used because the HUD has no need to
-distinguish "prompt rendered" from "user typing." Accepting B without a rule
-keeps the spec forward-compatible. Clearing `last_completed_command` on A
-produces a clean idle state at each new interactive moment rather than
-indefinitely showing the previous command's result. Missing `current_command`
-on D is tolerated because shells can emit D on empty prompts or after signals.
+**Rationale:** The C/D subset of OSC 133 captures the essential command
+lifecycle: execution begins, execution ends. The A marker (prompt start)
+and B marker (end-of-prompt / start-of-input) are accepted for forward
+compatibility but do not trigger state changes.
+
+Clearing `last_completed_command` on the next `C` (rather than on the next
+`A`) gives the ✓/✗ indicator a useful visible lifetime. In shells that emit
+`A` on every prompt render, `A` fires approximately 50 ms after `D`, which
+makes clearing on `A` effectively invisible to the user. Clearing on `C`
+instead gives the user the entire "reading result → thinking → typing the
+next command" window to see the outcome of the previous command. Missing
+`current_command` on `D` is tolerated because shells can emit `D` on empty
+prompts or after signals.
 
 ---
 
@@ -339,3 +354,28 @@ directory without parsing prompt text. It pairs naturally with OSC 133 (both
 are typically enabled by the same shell integration snippet) and ensures the
 HUD stays accurate when the user `cd`s inside the shell session, without the
 staleness of a static conversation-scoped cwd.
+
+---
+
+### REQ-TERM-019: Disconnected-State Visual Treatment and Reconnect
+
+WHEN the WebSocket connection to a terminal session closes for any reason
+(server restart, shell exit, network error, explicit WS close)
+THE SYSTEM SHALL apply a visually distinct "dead" treatment to the terminal
+panel (e.g. reduced opacity, muted colour treatment)
+AND SHALL replace the prompt strip text with an explicit "disconnected"
+message that cues the user that the terminal is no longer running
+
+WHEN the user clicks anywhere on a disconnected terminal panel
+THE SYSTEM SHALL close any lingering WebSocket handle
+AND SHALL open a new WebSocket connection to the conversation's terminal
+endpoint, which triggers a fresh PTY spawn on the backend
+AND SHALL reset the shell_integration_status to `unknown`, restarting the
+5-second detection window for the new session
+
+**Rationale:** The disconnected state needs to be unambiguous. Using a dot
+colour alone (e.g. red) conflates with "last command failed" and fails to
+communicate that the terminal has no PTY at all. A panel-level visual
+treatment plus an explicit reconnect affordance matches the user's mental
+model that the terminal is a thing that can be "off" or "on," and restores
+agency without requiring navigation away from the conversation.

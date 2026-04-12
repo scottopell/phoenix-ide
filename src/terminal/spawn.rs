@@ -163,6 +163,14 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
         ("SHELL".into(), shell_path.to_owned()),
         ("PATH".into(), path),
         ("LANG".into(), "en_US.UTF-8".into()),
+        // Shell integration hints: tell prompts that OSC 133 is expected.
+        // powerlevel10k specifically gates its A/B emission on
+        // $ITERM_SHELL_INTEGRATION_INSTALLED=Yes; setting this makes p10k
+        // emit prompt markers without requiring a separate iTerm2 script.
+        // TERM_PROGRAM is set for forward compatibility with prompts that
+        // detect the host terminal by name rather than by env-var sniffing.
+        ("ITERM_SHELL_INTEGRATION_INSTALLED".into(), "Yes".into()),
+        ("TERM_PROGRAM".into(), "phoenix-ide".into()),
     ]
 }
 
