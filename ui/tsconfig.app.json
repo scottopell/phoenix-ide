@@ -4,9 +4,8 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
     "target": "ES2020",
     "useDefineForClassFields": true,
-    // ES2023 lib (for `toSorted` etc.) with ES2020 syntax target — modern
-    // browsers ship the runtime methods, Vite/esbuild can transpile down if
-    // the target ever gets tightened.
+    // ES2023 lib — requires a modern browser (Chrome 110+, Safari 16.4+,
+    // Firefox 115+). Internal tool: browser baseline is enforced, not polyfilled.
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "skipLibCheck": true,

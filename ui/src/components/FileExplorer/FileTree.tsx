@@ -9,7 +9,7 @@
  * REQ-FE-009: Active file highlight, loading indicators
  */
 
-import { memo, useState, useEffect, useCallback, useMemo } from 'react';
+import { memo, useState, useEffect, useCallback, useMemo, createContext, useContext } from 'react';
 import {
   ChevronRight,
   ChevronDown,
@@ -118,6 +118,25 @@ function computeDirLabel(rootPath: string): string {
 }
 
 // ============================================================================
+// Shared context for identity-unstable collections (not passed as props so
+// they don't defeat React.memo).
+// ============================================================================
+
+interface TreeCollections {
+  childItems: Map<string, FileItem[]>;
+  expandedPaths: Set<string>;
+  loadingPaths: Set<string>;
+  activeFile: string | null | undefined;
+}
+
+const TreeCollectionsCtx = createContext<TreeCollections>({
+  childItems: new Map(),
+  expandedPaths: new Set(),
+  loadingPaths: new Set(),
+  activeFile: null,
+});
+
+// ============================================================================
 // FileTreeItem — memoized per-node so only nodes with changed props re-render
 // ============================================================================
 
@@ -128,10 +147,6 @@ interface FileTreeItemProps {
   isLoadingChildren: boolean;
   isActive: boolean;
   visibleChildren: FileItem[];
-  childItems: Map<string, FileItem[]>;
-  expandedPaths: Set<string>;
-  loadingPaths: Set<string>;
-  activeFile: string | null | undefined;
   onItemClick: (item: FileItem) => void;
 }
 
@@ -142,12 +157,9 @@ const FileTreeItem = memo(function FileTreeItem({
   isLoadingChildren,
   isActive,
   visibleChildren,
-  childItems,
-  expandedPaths,
-  loadingPaths,
-  activeFile,
   onItemClick,
 }: FileTreeItemProps) {
+  const { childItems, expandedPaths, loadingPaths, activeFile } = useContext(TreeCollectionsCtx);
   const isDisabled = !item.is_directory && !item.is_text_file;
   const className = [
     'ft-item',
@@ -210,10 +222,6 @@ const FileTreeItem = memo(function FileTreeItem({
                   isLoadingChildren={childLoading}
                   isActive={childActive}
                   visibleChildren={childChildren}
-                  childItems={childItems}
-                  expandedPaths={expandedPaths}
-                  loadingPaths={loadingPaths}
-                  activeFile={activeFile}
                   onItemClick={onItemClick}
                 />
               );
@@ -359,6 +367,11 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   // Compact display: last two path segments or ~/dir
   const dirLabel = useMemo(() => computeDirLabel(rootPath), [rootPath]);
 
+  const treeCollections = useMemo<TreeCollections>(
+    () => ({ childItems, expandedPaths, loadingPaths, activeFile }),
+    [childItems, expandedPaths, loadingPaths, activeFile],
+  );
+
   if (loading) {
     return (
       <div className="ft-status">
@@ -386,30 +399,28 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   }
 
   return (
-    <div className="ft-root">
-      <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
-      {visibleItems.map(item => {
-        const isExpanded = expandedPaths.has(item.path);
-        const isLoadingChildren = loadingPaths.has(item.path);
-        const visibleChildren = (childItems.get(item.path) || []).filter(c => !c.name.startsWith('.'));
-        const isActive = activeFile === item.path;
-        return (
-          <FileTreeItem
-            key={item.path}
-            item={item}
-            depth={0}
-            isExpanded={isExpanded}
-            isLoadingChildren={isLoadingChildren}
-            isActive={isActive}
-            visibleChildren={visibleChildren}
-            childItems={childItems}
-            expandedPaths={expandedPaths}
-            loadingPaths={loadingPaths}
-            activeFile={activeFile}
-            onItemClick={handleItemClick}
-          />
-        );
-      })}
-    </div>
+    <TreeCollectionsCtx.Provider value={treeCollections}>
+      <div className="ft-root">
+        <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
+        {visibleItems.map(item => {
+          const isExpanded = expandedPaths.has(item.path);
+          const isLoadingChildren = loadingPaths.has(item.path);
+          const visibleChildren = (childItems.get(item.path) || []).filter(c => !c.name.startsWith('.'));
+          const isActive = activeFile === item.path;
+          return (
+            <FileTreeItem
+              key={item.path}
+              item={item}
+              depth={0}
+              isExpanded={isExpanded}
+              isLoadingChildren={isLoadingChildren}
+              isActive={isActive}
+              visibleChildren={visibleChildren}
+              onItemClick={handleItemClick}
+            />
+          );
+        })}
+      </div>
+    </TreeCollectionsCtx.Provider>
   );
 }

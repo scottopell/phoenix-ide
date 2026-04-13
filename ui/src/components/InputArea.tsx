@@ -117,6 +117,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const searchAbortRef = useRef<AbortController | null>(null);
   /** Debounce timer for search */
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Guard to prevent duplicate in-flight skill fetches */
+  const fetchingSkillsRef = useRef(false);
   /** Cached skill list for the current conversation (REQ-IR-005) */
   const [skillItems, setSkillItems] = useState<SkillEntry[]>([]);
   /** Argument hint ghost text shown after a skill is selected (REQ-IR-005) */
@@ -187,12 +189,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   /** Fetch and cache available skills for this conversation (once per session) */
   const fetchSkillItems = useCallback(async () => {
     if (!conversationId) return;
+    if (fetchingSkillsRef.current) return;
+    fetchingSkillsRef.current = true;
     try {
       const result = await api.listConversationSkills(conversationId);
       setSkillItems(result.skills);
     } catch (err) {
       console.warn('Skill list failed:', err);
       setSkillItems([]);
+    } finally {
+      fetchingSkillsRef.current = false;
     }
   }, [conversationId]);
 

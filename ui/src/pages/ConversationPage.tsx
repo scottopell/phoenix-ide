@@ -271,7 +271,7 @@ export function ConversationPage() {
   }, [conversationId]);
 
   // Credential polling is handled by the shared useModels() hook above.
-  // It adapts the interval based on credential health (30s when 'ok',
+  // It adapts the interval based on credential health (30s when 'valid',
   // 5s otherwise) so a healthy credential doesn't hot-poll every 5s.
 
   // Auto-open auth panel on first load when credential is required
