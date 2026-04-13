@@ -333,9 +333,6 @@ pub async fn complete_streaming(
     let mut builder = client.post(&base_url);
     builder = match auth.style {
         super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
-        super::AuthStyle::Bearer => builder
-            .header("Authorization", format!("Bearer {}", auth.credential))
-            .header("anthropic-beta", "oauth-2025-04-20"),
         super::AuthStyle::PlainBearer => {
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
@@ -427,9 +424,6 @@ pub async fn complete(
     let mut builder = client.post(&base_url);
     builder = match auth.style {
         super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
-        super::AuthStyle::Bearer => builder
-            .header("Authorization", format!("Bearer {}", auth.credential))
-            .header("anthropic-beta", "oauth-2025-04-20"),
         super::AuthStyle::PlainBearer => {
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }

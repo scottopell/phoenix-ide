@@ -36,26 +36,6 @@ impl EnvCredential {
     }
 }
 
-/// Reads a credential from a JSON file, traversing a dot-separated key path.
-///
-/// Example: path `["claudeAiOauth", "accessToken"]` extracts
-/// `json["claudeAiOauth"]["accessToken"]` as a string.
-/// Returns `None` silently if the file is absent or the path doesn't resolve.
-#[derive(Debug)]
-pub struct JsonFileCredential {
-    path: std::path::PathBuf,
-    key_path: Vec<String>,
-}
-
-impl JsonFileCredential {
-    pub fn new(path: impl Into<std::path::PathBuf>, key_path: Vec<String>) -> Self {
-        Self {
-            path: path.into(),
-            key_path,
-        }
-    }
-}
-
 /// A credential source that produces a string on demand.
 /// Implementations range from static strings to cached command execution.
 #[async_trait::async_trait]
@@ -101,25 +81,6 @@ impl CredentialSource for EnvCredential {
     }
     async fn invalidate(&self) -> bool {
         false // Re-reads env var each time — nothing to invalidate
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialSource for JsonFileCredential {
-    async fn get(&self) -> Option<String> {
-        let content = std::fs::read_to_string(&self.path).ok()?;
-        let mut value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| {
-                tracing::warn!(path = %self.path.display(), error = %e, "Failed to parse JSON credentials file");
-            })
-            .ok()?;
-        for key in &self.key_path {
-            value = value.get(key)?.clone();
-        }
-        value.as_str().map(std::string::ToString::to_string)
-    }
-    async fn invalidate(&self) -> bool {
-        false // Re-reads file each time — nothing to invalidate
     }
 }
 
@@ -233,9 +194,7 @@ impl CredentialSource for CommandCredential {
 pub enum AuthStyle {
     /// `x-api-key: <credential>` (standard API keys and gateway implicit auth)
     ApiKey,
-    /// `Authorization: Bearer <credential>` + `anthropic-beta` header (Claude OAuth)
-    Bearer,
-    /// `Authorization: Bearer <credential>` without `anthropic-beta`.
+    /// `Authorization: Bearer <credential>`.
     /// Used for service-to-service auth (e.g. Datadog AI Gateway with ddtool JWT).
     PlainBearer,
 }
@@ -254,9 +213,7 @@ impl LlmAuth {
     /// Resolve the credential for use in request headers.
     pub async fn resolve(&self) -> Result<ResolvedAuth, super::LlmError> {
         let credential = self.source.get().await.ok_or_else(|| {
-            super::LlmError::auth(
-                "Credential unavailable — check API key, LLM_API_KEY_HELPER, or `claude login`",
-            )
+            super::LlmError::auth("Credential unavailable — check API key or LLM_API_KEY_HELPER")
         })?;
         Ok(ResolvedAuth {
             credential,
@@ -302,10 +259,6 @@ pub struct LlmConfig {
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
-    /// Credential source for Anthropic OAuth Bearer auth. Takes precedence over
-    /// `anthropic_api_key` for Anthropic models in direct mode. Token is fetched
-    /// fresh on each request — no restart needed after `claude login`.
-    pub anthropic_oauth_token: Option<Arc<dyn CredentialSource>>,
     /// Shell command to run for obtaining an API key/token dynamically.
     pub api_key_helper: Option<Arc<dyn CredentialSource>>,
     /// Direct URL override for the Anthropic endpoint (overrides gateway routing).
@@ -337,10 +290,6 @@ impl std::fmt::Debug for LlmConfig {
             )
             .field("gateway", &self.gateway)
             .field("default_model", &self.default_model)
-            .field(
-                "anthropic_oauth_token",
-                &self.anthropic_oauth_token.is_some(),
-            )
             .field("api_key_helper", &self.api_key_helper)
             .field("anthropic_base_url", &self.anthropic_base_url)
             .field("openai_base_url", &self.openai_base_url)
@@ -358,7 +307,6 @@ impl Clone for LlmConfig {
             openai_api_key: self.openai_api_key.clone(),
             gateway: self.gateway.clone(),
             default_model: self.default_model.clone(),
-            anthropic_oauth_token: self.anthropic_oauth_token.as_ref().map(Arc::clone),
             api_key_helper: self.api_key_helper.as_ref().map(Arc::clone),
             anthropic_base_url: self.anthropic_base_url.clone(),
             openai_base_url: self.openai_base_url.clone(),
@@ -380,7 +328,6 @@ impl Default for LlmConfig {
             openai_api_key: None,
             gateway: None,
             default_model: None,
-            anthropic_oauth_token: None,
             api_key_helper: None,
             anthropic_base_url: None,
             openai_base_url: None,
@@ -393,31 +340,6 @@ impl Default for LlmConfig {
 
 impl LlmConfig {
     pub fn from_env() -> Self {
-        // Prefer ANTHROPIC_OAUTH_TOKEN env var (explicit override), then fall back to
-        // reading ~/.claude/.credentials.json directly (works in dev and in prod when
-        // the service user has read access via group membership + chmod g+r).
-        let anthropic_oauth_token: Option<Arc<dyn CredentialSource>> = if std::env::var(
-            "ANTHROPIC_OAUTH_TOKEN",
-        )
-        .is_ok_and(|t| !t.is_empty())
-        {
-            Some(Arc::new(EnvCredential::new("ANTHROPIC_OAUTH_TOKEN")))
-        } else {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let creds_path = std::path::Path::new(&home)
-                .join(".claude")
-                .join(".credentials.json");
-            if creds_path.exists() {
-                tracing::info!(path = %creds_path.display(), "Found Claude credentials file; will read OAuth token per request");
-                Some(Arc::new(JsonFileCredential::new(
-                    creds_path,
-                    vec!["claudeAiOauth".to_string(), "accessToken".to_string()],
-                )))
-            } else {
-                None
-            }
-        };
-
         let (api_key_helper, helper_state): (
             Option<Arc<dyn CredentialSource>>,
             Option<Arc<crate::llm::credential_helper::HelperState>>,
@@ -466,7 +388,6 @@ impl LlmConfig {
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
-            anthropic_oauth_token,
             api_key_helper,
             anthropic_base_url,
             openai_base_url,
@@ -721,16 +642,11 @@ impl ModelRegistry {
             // Direct mode: require real credentials per provider
             match spec.provider {
                 Provider::Anthropic => {
-                    // OAuth takes precedence over API key
-                    if let Some(source) = config.anthropic_oauth_token.as_ref() {
-                        LlmAuth::new(Arc::clone(source), AuthStyle::Bearer)
-                    } else {
-                        let key = config
-                            .anthropic_api_key
-                            .as_deref()
-                            .filter(|k| !k.is_empty())?;
-                        LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
-                    }
+                    let key = config
+                        .anthropic_api_key
+                        .as_deref()
+                        .filter(|k| !k.is_empty())?;
+                    LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
                 Provider::OpenAI => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
