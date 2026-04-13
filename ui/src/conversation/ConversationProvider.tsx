@@ -1,26 +1,17 @@
-import { useCallback, useMemo, useState } from 'react';
-import { conversationReducer, createInitialAtom } from './atom';
-import type { SSEAction } from './atom';
+import { useRef } from 'react';
+import { ConversationStore } from './ConversationStore';
 import { ConversationContext } from './ConversationContext';
 
 export function ConversationProvider({ children }: { children: React.ReactNode }) {
-  const [atoms, setAtoms] = useState(
-    () => new Map<string, ReturnType<typeof createInitialAtom>>()
-  );
-
-  const dispatch = useCallback((slug: string, action: SSEAction) => {
-    setAtoms((prev) => {
-      const current = prev.get(slug) ?? createInitialAtom();
-      const next = conversationReducer(current, action);
-      if (next === current) return prev; // No-op — avoid new Map allocation
-      return new Map(prev).set(slug, next);
-    });
-  }, []);
-
-  const value = useMemo(() => ({ atoms, dispatch }), [atoms, dispatch]);
+  // Single store instance for the app. Refs are fine here because the store is
+  // mutable externally and subscriptions run through `useSyncExternalStore`.
+  const storeRef = useRef<ConversationStore | null>(null);
+  if (storeRef.current === null) {
+    storeRef.current = new ConversationStore();
+  }
 
   return (
-    <ConversationContext.Provider value={value}>
+    <ConversationContext.Provider value={storeRef.current}>
       {children}
     </ConversationContext.Provider>
   );

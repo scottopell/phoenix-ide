@@ -94,13 +94,13 @@ export function parseLinks(text: string): LinkifySegment[] {
   }
 
   // Sort matches by index
-  matches.sort((a, b) => a.index - b.index);
+  const sortedMatches = matches.toSorted((a, b) => a.index - b.index);
 
   // Build results
   const results: LinkifySegment[] = [];
   let lastIndex = 0;
 
-  for (const m of matches) {
+  for (const m of sortedMatches) {
     // Add text before the match
     if (m.index > lastIndex) {
       results.push({

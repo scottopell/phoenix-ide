@@ -81,7 +81,7 @@ export function SettingsFields({
           ) : (
             // Show all models grouped by provider
             Object.entries(groupedModels)
-              .sort(([a], [b]) => a.localeCompare(b))
+              .toSorted(([a], [b]) => a.localeCompare(b))
               .map(([provider, providerModels]) => (
                 <optgroup key={provider} label={provider}>
                   {providerModels.map(m => (

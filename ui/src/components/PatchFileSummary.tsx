@@ -69,9 +69,7 @@ export function extractFileChanges(patchOutput: string): FileChanges[] {
   }
 
   // Sort by file path for consistent display
-  result.sort((a, b) => a.filePath.localeCompare(b.filePath));
-
-  return result;
+  return result.toSorted((a, b) => a.filePath.localeCompare(b.filePath));
 }
 
 /**

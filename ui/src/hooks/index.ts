@@ -8,6 +8,7 @@ export { useConnection } from './useConnection';
 export type { ConnectionState, ConnectionInfo } from './useConnection';
 export { useResizablePane } from './useResizablePane';
 export type { UseResizablePaneOptions, UseResizablePaneResult } from './useResizablePane';
+export { useModels } from './useModels';
 
 // Export state machine for testing
 export {

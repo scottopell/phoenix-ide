@@ -153,7 +153,7 @@ export function ConversationSettings({
             )}
             {branches
               .filter(b => b !== currentBranch)
-              .sort((a, b) => a.localeCompare(b))
+              .toSorted((a, b) => a.localeCompare(b))
               .map(b => (
                 <option key={b} value={b}>{b}</option>
               ))}

@@ -20,8 +20,9 @@ export function fuzzyMatch<T>(
     }
   }
 
-  scored.sort((a, b) => b.score - a.score);
-  return scored.map(s => s.item);
+  return scored
+    .toSorted((a, b) => b.score - a.score)
+    .map(s => s.item);
 }
 
 function computeScore(text: string, query: string): number {

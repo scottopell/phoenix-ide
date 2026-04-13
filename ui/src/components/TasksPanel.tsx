@@ -72,7 +72,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
   }
 
   // Sort groups by STATUS_ORDER
-  const sortedGroups = [...grouped.entries()].sort(
+  const sortedGroups = [...grouped.entries()].toSorted(
     ([a], [b]) => (STATUS_ORDER[a] ?? 99) - (STATUS_ORDER[b] ?? 99)
   );
 

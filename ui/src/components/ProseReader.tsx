@@ -12,9 +12,8 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter, createElement } from 'react-syntax-highlighter';
-import type { createElementProps } from 'react-syntax-highlighter';
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { SyntaxHighlighter, createElement, oneDark } from '../utils/syntaxHighlighter';
+import type { createElementProps } from '../utils/syntaxHighlighter';
 import { generateUUID } from '../utils/uuid';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {

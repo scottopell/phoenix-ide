@@ -9,7 +9,7 @@
  * REQ-FE-009: Active file highlight, loading indicators
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { memo, useState, useEffect, useCallback, useMemo, createContext, useContext } from 'react';
 import {
   ChevronRight,
   ChevronDown,
@@ -85,6 +85,158 @@ function saveExpansion(convId: string, expanded: Set<string>) {
   localStorage.setItem(expansionKey(convId), JSON.stringify([...expanded]));
 }
 
+/**
+ * Cheap fingerprint for a FileItem[]: concatenates name + modified_time per
+ * item. Two arrays with the same fingerprint are treated as equal for the
+ * purpose of the 10s auto-refresh loop — in that case we skip `setItems` so
+ * the whole tree doesn't re-render.
+ *
+ * This is a hash only in spirit; collisions are harmless because the worst
+ * outcome is one skipped re-render until the next tick.
+ */
+function fingerprintFiles(items: FileItem[]): string {
+  const parts: string[] = [];
+  for (const it of items) {
+    parts.push(it.name);
+    parts.push(String(it.modified_time ?? 0));
+    parts.push(it.is_directory ? 'd' : 'f');
+  }
+  return parts.join('|');
+}
+
+function computeDirLabel(rootPath: string): string {
+  const home = '/Users/';
+  if (rootPath.startsWith(home)) {
+    const rest = rootPath.slice(home.length);
+    const parts = rest.split('/').filter(Boolean);
+    if (parts.length <= 2) return '~/' + parts.join('/');
+    return '.../' + parts.slice(-2).join('/');
+  }
+  const parts = rootPath.split('/').filter(Boolean);
+  if (parts.length <= 2) return '/' + parts.join('/');
+  return '.../' + parts.slice(-2).join('/');
+}
+
+// ============================================================================
+// Shared context for identity-unstable collections (not passed as props so
+// they don't defeat React.memo).
+// ============================================================================
+
+interface TreeCollections {
+  childItems: Map<string, FileItem[]>;
+  expandedPaths: Set<string>;
+  loadingPaths: Set<string>;
+  activeFile: string | null | undefined;
+}
+
+const TreeCollectionsCtx = createContext<TreeCollections>({
+  childItems: new Map(),
+  expandedPaths: new Set(),
+  loadingPaths: new Set(),
+  activeFile: null,
+});
+
+// ============================================================================
+// FileTreeItem — memoized per-node so only nodes with changed props re-render
+// ============================================================================
+
+interface FileTreeItemProps {
+  item: FileItem;
+  depth: number;
+  isExpanded: boolean;
+  isLoadingChildren: boolean;
+  isActive: boolean;
+  visibleChildren: FileItem[];
+  onItemClick: (item: FileItem) => void;
+}
+
+const FileTreeItem = memo(function FileTreeItem({
+  item,
+  depth,
+  isExpanded,
+  isLoadingChildren,
+  isActive,
+  visibleChildren,
+  onItemClick,
+}: FileTreeItemProps) {
+  const { childItems, expandedPaths, loadingPaths, activeFile } = useContext(TreeCollectionsCtx);
+  const isDisabled = !item.is_directory && !item.is_text_file;
+  const className = [
+    'ft-item',
+    isDisabled && 'ft-item--disabled',
+    isActive && 'ft-item--active',
+    item.is_gitignored && 'ft-item--dimmed',
+  ].filter(Boolean).join(' ');
+
+  return (
+    <div>
+      <div
+        className={className}
+        style={{ paddingLeft: 12 + depth * 16 }}
+        onClick={() => !isDisabled && onItemClick(item)}
+        role="button"
+        tabIndex={isDisabled ? -1 : 0}
+        title={isDisabled ? 'Non-text file' : item.path}
+      >
+        {item.is_directory && (
+          <span className="ft-expand-icon">
+            {isLoadingChildren ? (
+              <Loader2 size={12} className="spinning" />
+            ) : isExpanded ? (
+              <ChevronDown size={12} />
+            ) : (
+              <ChevronRight size={12} />
+            )}
+          </span>
+        )}
+        {!item.is_directory && <span className="ft-indent-spacer" />}
+        {!item.is_directory && (
+          <span className="ft-dot" style={{ color: extensionColor(item.name) || 'var(--text-muted)' }}>
+            &#8226;
+          </span>
+        )}
+        <span className={`ft-name ${item.is_directory ? 'ft-name--folder' : ''}`}>{item.name}</span>
+      </div>
+      {item.is_directory && isExpanded && (
+        <div className="ft-children">
+          {isLoadingChildren && visibleChildren.length === 0 ? (
+            <div className="ft-loading" style={{ paddingLeft: 28 + depth * 16 }}>
+              <Loader2 size={14} className="spinning" /> Loading...
+            </div>
+          ) : visibleChildren.length === 0 ? (
+            <div className="ft-empty" style={{ paddingLeft: 28 + depth * 16 }}>
+              Empty
+            </div>
+          ) : (
+            visibleChildren.map((child) => {
+              const childExpanded = expandedPaths.has(child.path);
+              const childLoading = loadingPaths.has(child.path);
+              const childChildren = (childItems.get(child.path) || []).filter(c => !c.name.startsWith('.'));
+              const childActive = activeFile === child.path;
+              return (
+                <FileTreeItem
+                  key={child.path}
+                  item={child}
+                  depth={depth + 1}
+                  isExpanded={childExpanded}
+                  isLoadingChildren={childLoading}
+                  isActive={childActive}
+                  visibleChildren={childChildren}
+                  onItemClick={onItemClick}
+                />
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
+// ============================================================================
+// FileTree
+// ============================================================================
+
 export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, refreshKey }: FileTreeProps) {
   const [items, setItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -126,7 +278,9 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     return () => { cancelled = true; };
   }, [rootPath, refreshKey]);
 
-  // Auto-refresh every ~10s while page is visible
+  // Auto-refresh every ~10s while page is visible. Only `setItems` if the
+  // fingerprint changes — otherwise a tree of unchanged files would re-render
+  // the entire subtree every 10 seconds for no reason.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     function scheduleRefresh() {
@@ -135,7 +289,12 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
         if (document.visibilityState === 'visible') {
           try {
             const result = await listFiles(rootPath);
-            setItems(result);
+            setItems(prev => {
+              if (fingerprintFiles(prev) === fingerprintFiles(result)) {
+                return prev; // unchanged — skip re-render
+              }
+              return result;
+            });
           } catch { /* silent -- next tick will retry */ }
         }
         scheduleRefresh();
@@ -196,66 +355,22 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     }
   }, [toggleExpand, onFileSelect, rootPath]);
 
-  // Render a file/folder item
-  const renderItem = (item: FileItem, depth: number = 0) => {
-    const isExpanded = expandedPaths.has(item.path);
-    const isLoadingChildren = loadingPaths.has(item.path);
-    const children = (childItems.get(item.path) || []).filter(child => !child.name.startsWith('.'));
-    const isDisabled = !item.is_directory && !item.is_text_file;
-    const isActive = activeFile === item.path;
+  // Filter out dotfiles/directories at root level by default — memoized so the
+  // reference is stable as long as `items` is (which, with the fingerprint
+  // check above, now really means "stable unless the directory content
+  // actually changed").
+  const visibleItems = useMemo(
+    () => items.filter(item => !item.name.startsWith('.')),
+    [items]
+  );
 
-    return (
-      <div key={item.path}>
-        <div
-          className={[
-            'ft-item',
-            isDisabled && 'ft-item--disabled',
-            isActive && 'ft-item--active',
-            item.is_gitignored && 'ft-item--dimmed',
-          ].filter(Boolean).join(' ')}
-          style={{ paddingLeft: 12 + depth * 16 }}
-          onClick={() => !isDisabled && handleItemClick(item)}
-          role="button"
-          tabIndex={isDisabled ? -1 : 0}
-          title={isDisabled ? 'Non-text file' : item.path}
-        >
-          {item.is_directory && (
-            <span className="ft-expand-icon">
-              {isLoadingChildren ? (
-                <Loader2 size={12} className="spinning" />
-              ) : isExpanded ? (
-                <ChevronDown size={12} />
-              ) : (
-                <ChevronRight size={12} />
-              )}
-            </span>
-          )}
-          {!item.is_directory && <span className="ft-indent-spacer" />}
-          {!item.is_directory && (
-            <span className="ft-dot" style={{ color: extensionColor(item.name) || 'var(--text-muted)' }}>
-              &#8226;
-            </span>
-          )}
-          <span className={`ft-name ${item.is_directory ? 'ft-name--folder' : ''}`}>{item.name}</span>
-        </div>
-        {item.is_directory && isExpanded && (
-          <div className="ft-children">
-            {isLoadingChildren && children.length === 0 ? (
-              <div className="ft-loading" style={{ paddingLeft: 28 + depth * 16 }}>
-                <Loader2 size={14} className="spinning" /> Loading...
-              </div>
-            ) : children.length === 0 ? (
-              <div className="ft-empty" style={{ paddingLeft: 28 + depth * 16 }}>
-                Empty
-              </div>
-            ) : (
-              children.map(child => renderItem(child, depth + 1))
-            )}
-          </div>
-        )}
-      </div>
-    );
-  };
+  // Compact display: last two path segments or ~/dir
+  const dirLabel = useMemo(() => computeDirLabel(rootPath), [rootPath]);
+
+  const treeCollections = useMemo<TreeCollections>(
+    () => ({ childItems, expandedPaths, loadingPaths, activeFile }),
+    [childItems, expandedPaths, loadingPaths, activeFile],
+  );
 
   if (loading) {
     return (
@@ -283,27 +398,29 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     );
   }
 
-  // Filter out dotfiles/directories at root level by default
-  const visibleItems = items.filter(item => !item.name.startsWith('.'));
-
-  // Compact display: last two path segments or ~/dir
-  const dirLabel = (() => {
-    const home = '/Users/';
-    if (rootPath.startsWith(home)) {
-      const rest = rootPath.slice(home.length);
-      const parts = rest.split('/').filter(Boolean);
-      if (parts.length <= 2) return '~/' + parts.join('/');
-      return '.../' + parts.slice(-2).join('/');
-    }
-    const parts = rootPath.split('/').filter(Boolean);
-    if (parts.length <= 2) return '/' + parts.join('/');
-    return '.../' + parts.slice(-2).join('/');
-  })();
-
   return (
-    <div className="ft-root">
-      <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
-      {visibleItems.map(item => renderItem(item, 0))}
-    </div>
+    <TreeCollectionsCtx.Provider value={treeCollections}>
+      <div className="ft-root">
+        <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
+        {visibleItems.map(item => {
+          const isExpanded = expandedPaths.has(item.path);
+          const isLoadingChildren = loadingPaths.has(item.path);
+          const visibleChildren = (childItems.get(item.path) || []).filter(c => !c.name.startsWith('.'));
+          const isActive = activeFile === item.path;
+          return (
+            <FileTreeItem
+              key={item.path}
+              item={item}
+              depth={0}
+              isExpanded={isExpanded}
+              isLoadingChildren={isLoadingChildren}
+              isActive={isActive}
+              visibleChildren={visibleChildren}
+              onItemClick={handleItemClick}
+            />
+          );
+        })}
+      </div>
+    </TreeCollectionsCtx.Provider>
   );
 }
