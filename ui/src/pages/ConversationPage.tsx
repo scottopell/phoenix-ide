@@ -770,19 +770,19 @@ export function ConversationPage() {
             onSendMessage={(text) => handleSend(text, [])}
           />
         )}
-        {(credentialStatus === 'required' || credentialStatus === 'failed' || credentialStatus === 'running') && (
-          <div className="auth-expiry-banner" role="alert">
-            <span className="auth-expiry-text">
-              {credentialStatus === 'required' && 'LLM credential expired.'}
-              {credentialStatus === 'failed' && 'LLM authentication failed.'}
-              {credentialStatus === 'running' && 'Authenticating...'}
-            </span>
-            {(credentialStatus === 'required' || credentialStatus === 'failed') && (
-              <button className="auth-expiry-btn" onClick={() => setShowAuthPanel(true)}>
-                {credentialStatus === 'required' ? 'Authenticate' : 'Retry'}
-              </button>
-            )}
-          </div>
+        {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
+          <CredentialHelperPanel
+            active={showAuthPanel}
+            onDismiss={async () => {
+              setShowAuthPanel(false);
+              try {
+                const resp = await api.listModels();
+                if (resp.credential_status !== 'not_configured') {
+                  setCredentialStatus(resp.credential_status);
+                }
+              } catch { /* ignore */ }
+            }}
+          />
         )}
         <InputArea
           ref={inputRef}
@@ -865,19 +865,6 @@ export function ConversationPage() {
         onClose={() => setShowFirstTaskWelcome(false)}
       />
 
-      {showAuthPanel && (
-        <CredentialHelperPanel
-          onClose={async () => {
-            setShowAuthPanel(false);
-            try {
-              const resp = await api.listModels();
-              if (resp.credential_status !== 'not_configured') {
-                setCredentialStatus(resp.credential_status);
-              }
-            } catch { /* ignore */ }
-          }}
-        />
-      )}
 
       {/* Mobile file browser overlay */}
       <FileBrowserOverlay

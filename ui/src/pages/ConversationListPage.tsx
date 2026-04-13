@@ -412,11 +412,14 @@ export function ConversationListPage() {
           setRenameError(undefined);
         }}
       />
-      {showAuthPanel && (
-        <CredentialHelperPanel onClose={() => {
-          setShowAuthPanel(false);
-          api.listModels().then(resp => setCredentialStatus(resp.credential_status)).catch(() => {});
-        }} />
+      {showAuthPanel && credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
+        <CredentialHelperPanel
+          active={showAuthPanel}
+          onDismiss={() => {
+            setShowAuthPanel(false);
+            api.listModels().then(resp => setCredentialStatus(resp.credential_status)).catch(() => {});
+          }}
+        />
       )}
     </div>
   );

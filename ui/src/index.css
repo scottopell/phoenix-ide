@@ -6341,36 +6341,129 @@ html * {
   flex-shrink: 0;
 }
 
-.auth-expiry-banner {
+/* ── Auth strip (inline credential helper) ─────────────────────────────── */
+
+.auth-strip {
+  margin: 0 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.auth-strip.running {
+  border-color: color-mix(in srgb, var(--accent-yellow, #f59e0b) 30%, transparent);
+}
+
+.auth-strip.valid {
+  border-color: color-mix(in srgb, var(--success-color, #22c55e) 30%, transparent);
+}
+
+.auth-strip.error {
+  border-color: color-mix(in srgb, var(--error-color, #ef4444) 30%, transparent);
+}
+
+.auth-strip-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  margin: 0 12px;
-  font-size: 12px;
-  color: var(--accent-yellow, #f59e0b);
-  background: color-mix(in srgb, var(--accent-yellow, #f59e0b) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent-yellow, #f59e0b) 25%, transparent);
-  border-radius: 4px;
-}
-
-.auth-expiry-text {
-  flex: 1;
-}
-
-.auth-expiry-btn {
-  font-size: 11px;
-  color: var(--accent-yellow, #f59e0b);
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
   background: none;
-  border: 1px solid color-mix(in srgb, var(--accent-yellow, #f59e0b) 40%, transparent);
-  border-radius: 3px;
-  padding: 2px 8px;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: var(--font-mono);
   cursor: pointer;
+  text-align: left;
+}
+
+.auth-strip-header:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.auth-strip-indicator {
   flex-shrink: 0;
 }
 
-.auth-expiry-btn:hover {
-  background: color-mix(in srgb, var(--accent-yellow, #f59e0b) 12%, transparent);
+.auth-strip.running .auth-strip-indicator {
+  color: var(--accent-yellow, #f59e0b);
+}
+
+.auth-strip.valid .auth-strip-indicator {
+  color: var(--success-color, #22c55e);
+}
+
+.auth-strip.error .auth-strip-indicator {
+  color: var(--error-color, #ef4444);
+}
+
+.auth-strip-label {
+  flex: 1;
+}
+
+.auth-strip-chevron {
+  font-size: 10px;
+  opacity: 0.5;
+}
+
+.auth-strip-dismiss {
+  font-size: 11px;
+  color: var(--text-secondary);
+  opacity: 0.6;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.auth-strip-dismiss:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+.auth-strip-body {
+  padding: 0 10px 8px;
+  animation: auth-strip-expand 150ms ease;
+}
+
+@keyframes auth-strip-expand {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 300px; }
+}
+
+.auth-strip-output {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.auth-strip-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.auth-strip-error {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--error-color, #ef4444);
+  margin-top: 6px;
+}
+
+.auth-strip-stderr {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* --- Commit Message Modal --- */
@@ -6714,52 +6807,6 @@ html * {
   padding: 16px;
 }
 
-/* Credential helper auth panel */
-.credential-helper-panel {
-  max-width: 520px;
-}
-
-.credential-helper-status {
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 12px;
-}
-
-.credential-helper-output {
-  background: var(--bg-primary);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
-  max-height: 240px;
-  overflow-y: auto;
-  margin-bottom: 12px;
-}
-
-.credential-helper-line {
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
-.credential-helper-error {
-  background: rgba(239, 68, 68, 0.1);
-  border: 1px solid rgba(239, 68, 68, 0.3);
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-size: 13px;
-  color: var(--error-color, #ef4444);
-  margin-bottom: 12px;
-}
-
-.credential-helper-stderr {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  margin-top: 4px;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
 
 /* AUTH status chip */
 .auth-chip {
