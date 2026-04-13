@@ -352,6 +352,15 @@ None of these are blocking — they're spec hygiene tasks for the migration spri
 
 ---
 
+## Related Evaluation
+
+See `specs/terminal/alacritty-evaluation.md` (task 24676) for the alacritty_terminal
+evaluation conducted after this one.  Summary: alacritty_terminal has a similar
+tiny-terminal panic (wide-char OOB, not sixel) but is the **preferred long-term
+candidate** due to 10 new packages (+200 KB) vs wezterm's 116 new packages (+5 MB).
+
+---
+
 ## Appendix: Reproduction
 
 ```bash

@@ -770,3 +770,106 @@ mod wez_proptest {
         }
     }
 }
+
+// ── alacritty_terminal proptests (evaluation, task 24676) ─────────────────────
+//
+// Same stress scenarios as the vt100 and wezterm variants, run against
+// `AlacrittyParser`.  The wezterm variants are `#[ignore]`'d because they
+// panic; these should pass.
+//
+// Run with:  PROPTEST_CASES=10000 cargo test alac_prop
+
+#[cfg(test)]
+mod alac_proptest {
+    use proptest::prelude::*;
+
+    use super::{arb_terminal_op, arb_valid_dims, TerminalOp};
+    use crate::terminal::alacritty_parser::AlacrittyParser;
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 512,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// alacritty_terminal variant of `prop_parser_stress_tiny_terminals`.
+        ///
+        /// Tiny terminals (1×1 to 4×4) + long byte sequences + wide Unicode.
+        /// alacritty_terminal has no sixel/kitty image layer, so the class of
+        /// bug that panicked wezterm-term cannot arise here.
+        ///
+        /// **Known failure**: `alacritty_terminal v0.26.0` (tag v0.17.0 and
+        /// `master` v0.26.1-dev) panics on bytes `[0xE3, 0x80, 0x80]`
+        /// (U+3000 IDEOGRAPHIC SPACE, width=2) on a 1×1 terminal:
+        /// index-out-of-bounds in `grid.rs:439` (`cursor_cell` at col=1 in a
+        /// 1-column row).  Root cause: `write_at_cursor` for `WIDE_CHAR_SPACER`
+        /// advances cursor to col+1 without guarding against cols=1.  Same
+        /// class as vt100 patches 2–4.  Go/no-go **BLOCKER**.
+        ///
+        /// Marked `#[ignore]` so CI passes; run explicitly:
+        /// `PROPTEST_CASES=10000 cargo test alac_prop -- --ignored`
+        #[test]
+        #[ignore = "alacritty_terminal wide-char OOB bug (task 24676 blocker); run explicitly for evaluation"]
+        fn alac_prop_parser_stress_tiny_terminals(
+            cols in 1u16..=4u16,
+            rows in 1u16..=4u16,
+            byte_sequences in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..1024),
+                1..20
+            ),
+        ) {
+            let mut parser = AlacrittyParser::new(rows, cols);
+            for chunk in &byte_sequences {
+                parser.process(chunk);
+                let (r, c) = parser.size();
+                prop_assert_eq!(c, cols, "cols changed after processing bytes");
+                prop_assert_eq!(r, rows, "rows changed after processing bytes");
+            }
+        }
+
+        /// alacritty_terminal variant of `prop_parser_stress_resize_then_draw`.
+        ///
+        /// Arbitrary resize sequences interleaved with byte processing.
+        /// Verifies `ParserDimensionSync` holds and no panics occur.
+        ///
+        /// **Known failure**: same wide-char OOB as
+        /// `alac_prop_parser_stress_tiny_terminals`.  Go/no-go **BLOCKER**.
+        ///
+        /// Marked `#[ignore]` so CI passes; run explicitly:
+        /// `PROPTEST_CASES=10000 cargo test alac_prop -- --ignored`
+        #[test]
+        #[ignore = "alacritty_terminal wide-char OOB bug (task 24676 blocker); run explicitly for evaluation"]
+        fn alac_prop_parser_stress_resize_then_draw(
+            initial in arb_valid_dims(),
+            ops in proptest::collection::vec(arb_terminal_op(), 1..30),
+        ) {
+            let mut parser = AlacrittyParser::new(initial.rows, initial.cols);
+            let mut current_dims = initial;
+
+            for op in &ops {
+                match op {
+                    TerminalOp::Resize(dims) => {
+                        parser.set_size(dims.rows, dims.cols);
+                        current_dims = *dims;
+                    }
+                    TerminalOp::Draw(chunk) => {
+                        parser.process(chunk);
+                        let (r, c) = parser.size();
+                        prop_assert_eq!(
+                            c,
+                            current_dims.cols,
+                            "ParserDimensionSync: cols wrong after draw at {:?}",
+                            current_dims
+                        );
+                        prop_assert_eq!(
+                            r,
+                            current_dims.rows,
+                            "ParserDimensionSync: rows wrong after draw at {:?}",
+                            current_dims
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
