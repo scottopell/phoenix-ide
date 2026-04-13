@@ -77,7 +77,17 @@ impl AlacrittyParser {
             cols: cols as usize,
             rows: rows as usize,
         };
-        let term = Term::new(Config::default(), &size, VoidListener);
+        // scrolling_history: 0 — we only need the visible screen (same as
+        // vt100's scrollback=0). The default is 10000, which would allocate
+        // ~12 MB of Cell memory per session unnecessarily.
+        let term = Term::new(
+            Config {
+                scrolling_history: 0,
+                ..Config::default()
+            },
+            &size,
+            VoidListener,
+        );
         let parser = ansi::Processor::new();
         Self { term, parser }
     }
