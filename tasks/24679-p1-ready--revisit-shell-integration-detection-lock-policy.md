@@ -2,6 +2,7 @@
 created: 2026-04-13
 priority: p1
 status: ready
+artifact: specs/terminal/requirements.md, specs/terminal/terminal.allium, src/terminal/session.rs, src/terminal/ws.rs
 ---
 
 # Revisit shell integration detection lock-in policy

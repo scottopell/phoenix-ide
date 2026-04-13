@@ -101,9 +101,7 @@ impl Tool for TerminalCommandHistoryTool {
             return ToolOutput::error("no commands have completed in this terminal session yet");
         }
 
-        ToolOutput::success(
-            serde_json::Value::Array(records).to_string(),
-        )
+        ToolOutput::success(serde_json::Value::Array(records).to_string())
     }
 }
 

@@ -33,9 +33,7 @@ impl Tool for TerminalLastCommandTool {
 
     async fn run(&self, _input: Value, ctx: ToolContext) -> ToolOutput {
         let Some(handle) = ctx.terminals.get(&ctx.conversation_id) else {
-            return ToolOutput::error(
-                "no terminal is open for this conversation",
-            );
+            return ToolOutput::error("no terminal is open for this conversation");
         };
 
         let status = *handle
@@ -56,9 +54,7 @@ impl Tool for TerminalLastCommandTool {
         };
 
         let Some(rec) = record else {
-            return ToolOutput::error(
-                "no commands have completed in this terminal session yet",
-            );
+            return ToolOutput::error("no commands have completed in this terminal session yet");
         };
 
         let started_secs = rec

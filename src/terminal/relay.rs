@@ -671,7 +671,13 @@ mod tests {
         let applied = resizes_applied.lock().unwrap();
         assert_eq!(applied.len(), 2, "exactly two resize frames sent");
         assert_eq!(applied[0], Dims { cols: 40, rows: 10 });
-        assert_eq!(applied[1], Dims { cols: 120, rows: 30 });
+        assert_eq!(
+            applied[1],
+            Dims {
+                cols: 120,
+                rows: 30
+            }
+        );
     }
 
     // ========================================================================

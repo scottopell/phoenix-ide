@@ -33,10 +33,10 @@ fn arb_conv_id() -> impl Strategy<Value = String> {
 /// Build a minimal `TerminalHandle` for registry tests.
 /// Uses /dev/null as a stand-in fd since these tests never do PTY I/O.
 fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
-    use std::fs::OpenOptions;
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
     use crate::terminal::command_tracker::CommandTracker;
     use crate::terminal::session::ShellIntegrationStatus;
+    use std::fs::OpenOptions;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
 
     let f = OpenOptions::new()
         .read(true)
@@ -50,9 +50,9 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
     super::session::TerminalHandle {
         master_fd: owned_fd,
         child_pid: nix::unistd::Pid::from_raw(1), // init — never reaped in tests
-        tracker: std::sync::Arc::new(std::sync::Mutex::new(
-            CommandTracker::new("test-session".to_string()),
-        )),
+        tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
+            "test-session".to_string(),
+        ))),
         shell_integration_status: std::sync::Arc::new(std::sync::Mutex::new(
             ShellIntegrationStatus::Unknown,
         )),

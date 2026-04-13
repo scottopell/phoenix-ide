@@ -334,7 +334,10 @@ mod tests {
         let mut t = tracker();
         t.ingest(&full_command("ls", "", None));
         let rec = t.last_command().unwrap();
-        assert_eq!(rec.exit_code, None, "exit_code must be None when D omits code");
+        assert_eq!(
+            rec.exit_code, None,
+            "exit_code must be None when D omits code"
+        );
     }
 
     #[test]
@@ -357,13 +360,19 @@ mod tests {
     fn ring_buffer_evicts_oldest_at_capacity() {
         let mut t = tracker();
         for i in 0..6 {
-            t.ingest(&full_command(&format!("cmd{i}"), &format!("out{i}\n"), Some(i)));
+            t.ingest(&full_command(
+                &format!("cmd{i}"),
+                &format!("out{i}\n"),
+                Some(i),
+            ));
         }
         assert_eq!(t.record_count(), RING_CAPACITY);
         // cmd0 should be evicted; cmd1 is now oldest.
         let recent = t.recent_commands(5);
-        assert!(!recent.iter().any(|r| r.command_text == "cmd0"),
-            "oldest entry should be evicted");
+        assert!(
+            !recent.iter().any(|r| r.command_text == "cmd0"),
+            "oldest entry should be evicted"
+        );
     }
 
     #[test]
@@ -411,10 +420,7 @@ mod tests {
     #[test]
     fn ab_markers_are_noops() {
         let mut t = tracker();
-        let bytes = TerminalStream::new()
-            .osc133_a()
-            .osc133_b()
-            .build();
+        let bytes = TerminalStream::new().osc133_a().osc133_b().build();
         t.ingest(&bytes);
         assert_eq!(t.record_count(), 0, "A/B markers must not create records");
     }
@@ -446,7 +452,9 @@ mod tests {
             .osc133_d_st(Some(0))
             .build();
         t.ingest(&bytes);
-        let rec = t.last_command().expect("ST-terminated OSC must produce a record");
+        let rec = t
+            .last_command()
+            .expect("ST-terminated OSC must produce a record");
         assert_eq!(rec.command_text, "make");
         assert_eq!(rec.output, "built\n");
         assert_eq!(rec.exit_code, Some(0));
@@ -479,7 +487,9 @@ mod tests {
         for byte in &bytes {
             t.ingest(std::slice::from_ref(byte));
         }
-        let rec = t.last_command().expect("byte-by-byte delivery must produce a record");
+        let rec = t
+            .last_command()
+            .expect("byte-by-byte delivery must produce a record");
         assert_eq!(rec.command_text, "git status");
         assert_eq!(rec.output, "On branch main\n");
         assert_eq!(rec.exit_code, Some(0));
@@ -507,7 +517,10 @@ mod tests {
         t.ingest(&TerminalStream::new().osc133_c("cmd").build());
         t.ingest(raw);
         let rec = t.last_command().unwrap();
-        assert_eq!(rec.exit_code, None, "unparseable exit code must become None");
+        assert_eq!(
+            rec.exit_code, None,
+            "unparseable exit code must become None"
+        );
     }
 
     #[test]
@@ -517,8 +530,13 @@ mod tests {
         let bytes = b"\x1b]133;C\x07output here\x1b]133;D;0\x07";
         let mut t = tracker();
         t.ingest(bytes);
-        let rec = t.last_command().expect("C with no text param must still produce record");
-        assert_eq!(rec.command_text, "", "missing cmd param must yield empty string");
+        let rec = t
+            .last_command()
+            .expect("C with no text param must still produce record");
+        assert_eq!(
+            rec.command_text, "",
+            "missing cmd param must yield empty string"
+        );
         assert_eq!(rec.output, "output here");
     }
 
@@ -536,8 +554,8 @@ mod tests {
         // € is 3 bytes: 0xE2 0x82 0xAC. Place first byte at 4095 → straddles 4096.
         let padding_len = 4095; // bytes before €
         let padding = "a".repeat(padding_len); // all ASCII, 1 byte each
-        // Output buffer total: padding_len + 3 (€) + fill to exceed MAX_OUTPUT.
-        // We need len > 128*1024 to trigger truncation.
+                                               // Output buffer total: padding_len + 3 (€) + fill to exceed MAX_OUTPUT.
+                                               // We need len > 128*1024 to trigger truncation.
         let filler = "b".repeat(MAX_OUTPUT - padding_len); // pushes well past threshold
         let full_output = format!("{padding}€{filler}");
 
@@ -572,12 +590,12 @@ mod tests {
         let mut t = tracker();
         let bytes = TerminalStream::new()
             .osc133_c("cargo build")
-            .sgr(0)                  // reset
-            .csi("2K")               // erase line
-            .csi("1;32m")            // bold green
+            .sgr(0) // reset
+            .csi("2K") // erase line
+            .csi("1;32m") // bold green
             .text("Compiling foo\n")
             .sgr(0)
-            .csi("1A")               // cursor up — must not appear in output
+            .csi("1A") // cursor up — must not appear in output
             .text("   Finished\n")
             .osc133_d(Some(0))
             .build();
