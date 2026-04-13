@@ -3,8 +3,6 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "taskmd",
-#   "ziglang",
-#   "cargo-zigbuild",
 # ]
 # ///
 """Development tasks for phoenix-ide."""
@@ -579,7 +577,7 @@ def cmd_check():
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
             run_step("cargo check musl", [
-                "cargo", "zigbuild", "--target", "x86_64-unknown-linux-musl",
+                "cargo", "check", "--target", "x86_64-unknown-linux-musl",
             ])
         else:
             run_step("cargo check musl", ["cargo", "check"])
@@ -861,7 +859,9 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
     # Build Rust
     build_env = os.environ.copy()
     needs_cross = target and sys.platform != "linux"
-    cargo_cmd = ["cargo", "zigbuild", "--release"] if needs_cross else ["cargo", "build", "--release"]
+    if needs_cross:
+        raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
+    cargo_cmd = ["cargo", "build", "--release"]
     if target:
         print(f"Building Rust ({target}, release)...")
         cargo_cmd += ["--target", target]
