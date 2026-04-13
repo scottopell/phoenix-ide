@@ -133,6 +133,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             conversationId={activeConversation?.id}
             showToast={showSuccess}
             branchName={activeConversation?.branch_name}
+            parentConversation={activeConversation}
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
           />
         )}

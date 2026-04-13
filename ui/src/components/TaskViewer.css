@@ -131,3 +131,35 @@
 .task-viewer-conv-link:hover {
   opacity: 0.8;
 }
+
+/* "Start working" primary action sits at the right of the header */
+.task-viewer-start-work {
+  margin-left: auto;
+  background: var(--accent-blue, #58a6ff);
+  color: var(--bg-primary, #0d1117);
+  border: none;
+  padding: 4px 10px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 150ms ease, background 150ms ease;
+}
+
+.task-viewer-start-work:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.task-viewer-start-work:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.task-viewer-seed-error {
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  color: var(--text-error, #f85149);
+  font-size: 11px;
+  border-bottom: 1px solid var(--border-color);
+}

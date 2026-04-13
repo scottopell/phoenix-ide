@@ -282,6 +282,10 @@ pub struct TaskEntry {
     pub priority: String,
     pub status: String,
     pub slug: String,
+    /// Absolute path to the task file on disk. Used by the UI to fetch the task
+    /// body via the generic file read endpoint when seeding a "start working
+    /// on this task" conversation.
+    pub path: String,
     /// Slug of the conversation working on this task (if any active Work conversation owns it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_slug: Option<String>,

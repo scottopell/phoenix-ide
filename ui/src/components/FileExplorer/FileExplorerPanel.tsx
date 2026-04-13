@@ -11,7 +11,7 @@ import { SkillViewer } from '../SkillViewer';
 import { TasksPanel } from '../TasksPanel';
 import { TaskViewer } from '../TaskViewer';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import type { SkillEntry, TaskEntry } from '../../api';
+import type { SkillEntry, TaskEntry, Conversation } from '../../api';
 
 interface Props {
   collapsed: boolean;
@@ -21,6 +21,9 @@ interface Props {
   showToast: (message: string, duration?: number) => void;
   /** Branch name of the current conversation (for extracting task ID in Work mode) */
   branchName?: string | null | undefined;
+  /** Active conversation, used by TaskViewer to seed a "start working on this task"
+   *  sub-conversation (REQ-SEED-001 through -004). */
+  parentConversation?: Conversation | null;
   /** Width in px when expanded — driven by useResizablePane */
   width?: number | undefined;
 }
@@ -32,7 +35,7 @@ function extractTaskId(branchName: string | null | undefined): string | undefine
   return match ? match[1] : undefined;
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, branchName, width }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, branchName, parentConversation, width }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
@@ -74,7 +77,12 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const detailViewer = selectedSkill
     ? <SkillViewer skill={selectedSkill} onBack={() => setSelectedSkill(null)} />
     : selectedTask
-      ? <TaskViewer task={selectedTask} tasksDir={`${rootPath}/tasks`} onBack={() => setSelectedTask(null)} />
+      ? <TaskViewer
+          task={selectedTask}
+          tasksDir={`${rootPath}/tasks`}
+          parentConversation={parentConversation ?? null}
+          onBack={() => setSelectedTask(null)}
+        />
       : null;
 
   return (
