@@ -61,22 +61,33 @@ stale draft.
 
 WHEN a seeded conversation is created
 THE SYSTEM SHALL use the conversation mode specified by the caller
-(direct or worktree) without new detection logic
+(direct or managed) without new detection logic
 AND SHALL use the existing access and validation checks for the
 target directory that apply to unseeded conversation creation
+
+WHEN the caller passes `mode = "auto"`
+THE SYSTEM SHALL inspect the target cwd and resolve to `managed` if
+the cwd is inside a git repository, or `direct` otherwise
+AND SHALL surface the resolved mode in the conversation response so
+the UI can render consistently
+AND SHALL apply the same access and validation checks as an explicit
+mode choice (no new trust boundary)
 
 WHEN the target directory does not exist or is not accessible
 THE SYSTEM SHALL reject the seeding request with the same error path
 as unseeded creation
 AND SHALL NOT create a partial conversation
 
-**Rationale:** Callers know what mode they want. Shell integration
-wants `direct` in `$HOME`. A future tasks panel integration will want
-`worktree` in the project root. Auto-detecting mode from the cwd is
-tempting but risks doing the wrong thing for edge cases like bare-repo
-dotfiles in `$HOME`. KISS: let the caller pick. No new capability
-layer — seeded conversations inherit the same trust boundary as any
-other Phoenix conversation the user can create themselves.
+**Rationale:** Callers usually know what mode they want. Shell
+integration wants `direct` in `$HOME`. The tasks panel wants `managed`
+in the project root. For callers that genuinely don't know — or that
+want to mirror Phoenix's default new-conversation heuristic — `auto`
+delegates the choice to the backend, which uses the same git-repo
+detection that the regular new-conversation flow uses elsewhere. Auto
+is opt-in: explicit `direct` and `managed` continue to mean exactly
+what they say. No new capability layer — seeded conversations inherit
+the same trust boundary as any other Phoenix conversation the user
+can create themselves.
 
 ---
 
@@ -128,7 +139,6 @@ routing, lifecycle, or runtime behaviour.
 
 ## Non-Requirements (explicit out-of-scope for v1)
 
-- Auto-detection of conversation mode from cwd
 - Backend-persistent draft prompts (client-side localStorage is enough)
 - Any form of spawn-result notification or lifecycle coupling
 - Scoped capability restrictions on the spawned conversation

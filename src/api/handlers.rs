@@ -555,8 +555,23 @@ async fn create_conversation(
     };
 
     // Direct mode is the default. "managed" opts in to Explore/Work lifecycle (requires git).
-    let conv_mode = match req.mode.as_deref() {
-        Some("managed") => {
+    // "auto" delegates the choice to the backend: managed if cwd is in a git repo,
+    // direct otherwise (REQ-SEED-002).
+    let resolved_mode: &str = match req.mode.as_deref() {
+        Some("auto") => {
+            if project_id.is_some() {
+                tracing::info!(cwd = %req.cwd, "auto mode resolved to managed (git repo detected)");
+                "managed"
+            } else {
+                tracing::info!(cwd = %req.cwd, "auto mode resolved to direct (no git repo)");
+                "direct"
+            }
+        }
+        Some(other) => other,
+        None => "direct",
+    };
+    let conv_mode = match resolved_mode {
+        "managed" => {
             if project_id.is_none() {
                 return Err(AppError::BadRequest(
                     "Managed mode requires a git repository".to_string(),
@@ -566,7 +581,7 @@ async fn create_conversation(
         }
         _ => crate::db::ConvMode::Direct,
     };
-    let desired_base_branch = if matches!(req.mode.as_deref(), Some("managed")) {
+    let desired_base_branch = if resolved_mode == "managed" {
         req.base_branch.as_deref()
     } else {
         None
@@ -2918,6 +2933,7 @@ async fn list_conversation_tasks(
                 priority: t.priority,
                 status: t.status,
                 slug: t.slug,
+                path: t.path.to_string_lossy().into_owned(),
                 conversation_slug,
             }
         })

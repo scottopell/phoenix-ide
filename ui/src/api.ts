@@ -237,6 +237,8 @@ export interface TaskEntry {
   priority: string;
   status: string;
   slug: string;
+  /** Absolute path to the task file on disk. */
+  path: string;
   /** Slug of the conversation working on this task, if any. */
   conversation_slug?: string;
 }
@@ -335,7 +337,7 @@ export const api = {
     messageId: string,
     model?: string,
     images: ImageData[] = [],
-    mode?: 'direct' | 'managed',
+    mode?: 'direct' | 'managed' | 'auto',
     baseBranch?: string | null,
     seedParentId?: string | null,
     seedLabel?: string | null,
