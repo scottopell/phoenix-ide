@@ -5,13 +5,32 @@ use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
-use vt100::Parser;
+
+use super::alacritty_parser::AlacrittyParser;
 
 /// Dimensions of a terminal (columns × rows).
+///
+/// Invariant: `cols >= 2 && rows >= 1`. Use `try_new` to construct;
+/// the relay and WebSocket handler both enforce this at the boundary.
+/// See `ResizeFrameRejected` in `terminal.allium`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dims {
     pub cols: u16,
     pub rows: u16,
+}
+
+impl Dims {
+    /// Returns `Some(Dims)` iff `cols >= 2` and `rows >= 1`, else `None`.
+    ///
+    /// All construction sites must go through here so the invariant is
+    /// structurally enforced rather than replicated in prose comments.
+    pub fn try_new(cols: u16, rows: u16) -> Option<Self> {
+        if cols >= 2 && rows >= 1 {
+            Some(Self { cols, rows })
+        } else {
+            None
+        }
+    }
 }
 
 /// Signals quiescence (no output for 300ms) to waiting `read_terminal` callers.
@@ -28,8 +47,8 @@ pub struct TerminalHandle {
     pub master_fd: OwnedFd,
     /// Child shell PID.  Reaped by the reader task on EIO.
     pub child_pid: Pid,
-    /// vt100 parser — updated by the reader task on every byte (REQ-TERM-010).
-    pub parser: Arc<Mutex<Parser>>,
+    /// Terminal parser — updated by the reader task on every byte (REQ-TERM-010).
+    pub parser: Arc<Mutex<AlacrittyParser>>,
     /// Quiescence notification — incremented after 300ms silence.
     pub quiescence_tx: QuiescenceTx,
 }

@@ -1,5 +1,6 @@
 //! PTY spawn path — REQ-TERM-001, REQ-TERM-002
 
+use super::alacritty_parser::AlacrittyParser;
 use super::session::{Dims, TerminalHandle};
 use nix::{
     pty::openpty,
@@ -12,7 +13,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
-use vt100::Parser;
 
 /// Spawn a PTY-backed interactive shell in `cwd`.
 ///
@@ -97,13 +97,9 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
             // master_raw is now owned by the OwnedFd below.
             std::mem::forget(pty.slave);
 
-            // Initialize the vt100 parser at the same dimensions as the PTY
+            // Initialize the parser at the same dimensions as the PTY
             // (REQ-TERM-010: ParserDimensionSync invariant).
-            let parser = Parser::new(
-                initial_dims.rows,
-                initial_dims.cols,
-                0, // no scrollback — current screen only
-            );
+            let parser = AlacrittyParser::new(initial_dims.rows, initial_dims.cols);
 
             let (quiescence_tx, _) = watch::channel(0u64);
 

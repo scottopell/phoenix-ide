@@ -299,7 +299,7 @@ rule ResizeApplied {
     when: ResizeFrameReceived(terminal, dimensions)
 
     requires: terminal.status = active
-    requires: dimensions.cols > 0
+    requires: dimensions.cols >= 2
     requires: dimensions.rows > 0
 
     ensures: terminal.dimensions = dimensions
@@ -318,7 +318,10 @@ rule ResizeFrameRejected {
     when: ResizeFrameReceived(terminal, dimensions)
 
     requires: terminal.status = active
-    requires: dimensions.cols <= 0 or dimensions.rows <= 0
+    requires: dimensions.cols < 2 or dimensions.rows <= 0
+        -- cols >= 2 is required by AlacrittyParser (upstream wide-char OOB bug on cols=1;
+        -- see task 24676). cols=0 and cols=1 are both invalid. All construction sites
+        -- use Dims::try_new which encodes this structurally.
 
     ensures: InvalidResizeDimensionsLogged(terminal, dimensions)
         -- No state change; dimensions remain as before.

@@ -6,11 +6,14 @@
 //!
 //! See `specs/terminal/` for the full behavioral specification.
 
+pub mod alacritty_parser;
 #[cfg(test)]
 mod proptests;
 mod relay;
 mod session;
 mod spawn;
+#[cfg(test)]
+mod wezterm_parser;
 mod ws;
 
 pub use session::ActiveTerminals;

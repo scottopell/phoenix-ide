@@ -7,7 +7,7 @@
 //! ```text
 //! pty (AsyncRead + AsyncWrite)  ←→  run_relay  ←→  ws_incoming / ws_outgoing
 //!                                        │
-//!                                   vt100::Parser
+//!                                   AlacrittyParser
 //! ```
 //!
 //! Production: `pty = PtyMasterIo` (wraps the real PTY master fd via `AsyncFd`).
@@ -22,11 +22,11 @@ use std::{
     time::Duration,
 };
 
+use super::alacritty_parser::AlacrittyParser;
 use futures::SinkExt;
 use futures::StreamExt;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use vt100::Parser;
 
 use super::session::{Dims, QuiescenceTx};
 
@@ -169,7 +169,7 @@ const READ_BUF: usize = 4096;
 /// - `stop_rx`: external stop signal (conversation teardown, etc.).
 /// - `conv_id`: for log messages only.
 pub struct RelayConfig<F> {
-    pub parser: Arc<Mutex<Parser>>,
+    pub parser: Arc<Mutex<AlacrittyParser>>,
     pub quiescence_tx: QuiescenceTx,
     pub on_resize: F,
     pub stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -233,7 +233,7 @@ where
 async fn relay_reader<R, Out>(
     mut pty_read: R,
     mut ws_outgoing: Out,
-    parser: Arc<Mutex<Parser>>,
+    parser: Arc<Mutex<AlacrittyParser>>,
     quiescence_tx: QuiescenceTx,
     ws_closed: Arc<tokio::sync::Notify>,
     conv_id: &str,
@@ -297,7 +297,7 @@ where
 async fn relay_writer<W>(
     mut pty_write: W,
     mut ws_incoming: impl futures::Stream<Item = Vec<u8>> + Unpin,
-    parser: Arc<Mutex<Parser>>,
+    parser: Arc<Mutex<AlacrittyParser>>,
     on_resize: impl Fn(Dims),
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     ws_closed: Arc<tokio::sync::Notify>,
@@ -334,7 +334,7 @@ where
 /// Returns `false` if the connection should be terminated.
 async fn dispatch_incoming_frame<W>(
     pty_write: &mut W,
-    parser: &Arc<Mutex<Parser>>,
+    parser: &Arc<Mutex<AlacrittyParser>>,
     on_resize: &impl Fn(Dims),
     data: &[u8],
     conv_id: &str,
@@ -360,12 +360,11 @@ where
             }
             let cols = u16::from_be_bytes([data[1], data[2]]);
             let rows = u16::from_be_bytes([data[3], data[4]]);
-            if cols == 0 || rows == 0 {
+            let Some(dims) = Dims::try_new(cols, rows) else {
                 tracing::warn!(conv_id = %conv_id, cols, rows,
-                    "Terminal relay: ignoring resize frame with zero dimension");
+                    "Terminal relay: ignoring resize frame with invalid dimension (cols<2 or rows=0)");
                 return true;
-            }
-            let dims = Dims { cols, rows };
+            };
             // ParserDimensionSync: PTY ioctl and parser.set_size in same call.
             on_resize(dims);
             parser.lock().expect("parser lock").set_size(rows, cols);
@@ -387,8 +386,8 @@ mod tests {
     use futures::channel::mpsc;
     use tokio::sync::watch;
 
-    fn make_parser(rows: u16, cols: u16) -> Arc<Mutex<Parser>> {
-        Arc::new(Mutex::new(Parser::new(rows, cols, 0)))
+    fn make_parser(rows: u16, cols: u16) -> Arc<Mutex<AlacrittyParser>> {
+        Arc::new(Mutex::new(AlacrittyParser::new(rows, cols)))
     }
 
     fn default_stop() -> tokio::sync::watch::Receiver<bool> {
@@ -408,7 +407,7 @@ mod tests {
 
     /// Spec invariant `PtyOutputForwarded` (REQ-TERM-004, REQ-TERM-010):
     /// bytes read from the PTY must reach BOTH the WebSocket client AND the
-    /// vt100 parser — in the same handler, with no conditional path that skips
+    /// Terminal parser — in the same handler, with no conditional path that skips
     /// either.
     ///
     /// This is the core invariant the relay exists to maintain.
@@ -446,7 +445,7 @@ mod tests {
         assert_eq!(&frame[1..], b"hello terminal\r\n");
 
         // ParserFedEveryByte: the same bytes were processed by the parser.
-        let screen = parser.lock().unwrap().screen().contents();
+        let screen = parser.lock().unwrap().contents();
         assert!(
             screen.contains("hello terminal"),
             "parser screen must contain the PTY output; got: {screen:?}"
@@ -607,8 +606,8 @@ mod tests {
         fn prop_parser_dimension_sync_through_relay(
             ops in proptest::collection::vec(
                 prop_oneof![
-                    (1u16..=200u16, 1u16..=80u16)
-                        .prop_map(|(cols, rows)| (true, cols, rows)),  // resize
+                    (2u16..=200u16, 1u16..=80u16)
+                        .prop_map(|(cols, rows)| (true, cols, rows)),  // resize (cols>=2)
                     proptest::collection::vec(proptest::num::u8::ANY, 0..128)
                         .prop_map(|bytes| (false, bytes.len() as u16, 0u16)),  // data (cols=len, rows=0 as tag)
                 ],
@@ -664,7 +663,7 @@ mod tests {
 
                 // Shallow check: final parser size matches last resize.
                 if let Some(expected_dims) = last_resize {
-                    let (r, c) = parser.lock().unwrap().screen().size();
+                    let (r, c) = parser.lock().unwrap().size();
                     prop_assert_eq!(c, expected_dims.cols,
                         "ParserDimensionSync: final cols mismatch");
                     prop_assert_eq!(r, expected_dims.rows,
@@ -686,7 +685,7 @@ mod tests {
     // ========================================================================
     //
     // Sends a specific sequence: resize → data → resize → data → check.
-    // Verifies that after EACH resize, parser.screen().size() already matches
+    // Verifies that after EACH resize, parser.size() already matches
     // — not just at the end. Catches transient drift that proptest might miss.
 
     #[tokio::test]
@@ -744,7 +743,7 @@ mod tests {
         );
 
         // ParserDimensionSync: final parser size == last resize.
-        let (r, c) = parser.lock().unwrap().screen().size();
+        let (r, c) = parser.lock().unwrap().size();
         assert_eq!(c, 120, "cols must reflect last resize");
         assert_eq!(r, 30, "rows must reflect last resize");
     }
@@ -764,7 +763,7 @@ mod tests {
         // Design: ws_in contains only the resize frame. We DON'T write PTY data
         // because that would require shell_end to stay open (risking a race).
         // The property is: after relay processes the resize frame from ws_in,
-        // parser.screen().size() reflects those dimensions. ws_in ending causes
+        // parser.size() reflects those dimensions. ws_in ending causes
         // WsClosed exit, ensuring the resize is fully processed before we check.
         let (_shell_end, pty_end) = tokio::io::duplex(4096);
         // _shell_end kept alive: relay exits via ws_in ending (WsClosed), not EOF.
@@ -790,7 +789,7 @@ mod tests {
         .await;
 
         // Parser must be at the resized dimensions, not the initial 80×24.
-        let (r, c) = parser.lock().unwrap().screen().size();
+        let (r, c) = parser.lock().unwrap().size();
         assert_eq!(
             c, 200,
             "parser cols must be 200 after initial resize (REQ-TERM-005)"
@@ -827,7 +826,7 @@ mod tests {
                 let (ws_tx, _ws_rx) = ws_out_channel(32);
 
                 // Capture initial screen state before any frames.
-                let initial_screen = parser.lock().unwrap().screen().contents();
+                let initial_screen = parser.lock().unwrap().contents();
 
                 // Send one 0x00 input frame, then close the stream.
                 let frame = data_frame(&input_bytes);
@@ -848,7 +847,7 @@ mod tests {
                 ).await;
 
                 // B) Parser state must be unchanged — input did not leak into screen.
-                let final_screen = parser.lock().unwrap().screen().contents();
+                let final_screen = parser.lock().unwrap().contents();
                 prop_assert_eq!(
                     final_screen, initial_screen,
                     "input frame must not affect parser screen (bidirectional routing)"
@@ -939,7 +938,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let parser = make_parser(24, 80);
-                let initial_screen = parser.lock().unwrap().screen().contents();
+                let initial_screen = parser.lock().unwrap().contents();
 
                 let mut frame = vec![type_byte];
                 frame.extend_from_slice(&payload);
@@ -948,7 +947,7 @@ mod tests {
 
                 prop_assert!(result, "unknown frame type must not disconnect the session");
 
-                let final_screen = parser.lock().unwrap().screen().contents();
+                let final_screen = parser.lock().unwrap().contents();
                 prop_assert_eq!(final_screen, initial_screen,
                     "unknown frame must not affect parser state");
 
@@ -967,7 +966,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let parser = make_parser(24, 80);
-                let initial = parser.lock().unwrap().screen().size();
+                let initial = parser.lock().unwrap().size();
 
                 let mut frame = vec![0x01u8];
                 frame.extend_from_slice(&payload[..payload_len]);
@@ -975,7 +974,7 @@ mod tests {
                 let result = dispatch_frame_for_test(&parser, &frame, "test").await;
 
                 prop_assert!(result, "short resize frame must not disconnect");
-                let final_size = parser.lock().unwrap().screen().size();
+                let final_size = parser.lock().unwrap().size();
                 prop_assert_eq!(final_size, initial,
                     "short resize frame must not change parser dimensions");
 
@@ -990,7 +989,7 @@ mod tests {
 /// the frame signals a disconnect.
 #[cfg(test)]
 pub(crate) async fn dispatch_frame_for_test(
-    parser: &Arc<Mutex<Parser>>,
+    parser: &Arc<Mutex<AlacrittyParser>>,
     data: &[u8],
     conv_id: &str,
 ) -> bool {

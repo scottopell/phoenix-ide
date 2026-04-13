@@ -20,7 +20,9 @@ use crate::state_machine::state::ConvState;
 
 /// Generate arbitrary valid terminal dimensions (both > 0, fits in u16).
 fn arb_valid_dims() -> impl Strategy<Value = Dims> {
-    (1u16..=500u16, 1u16..=200u16).prop_map(|(cols, rows)| Dims { cols, rows })
+    // cols >= 2: enforced by relay (ResizeFrameRejected) and required by
+    // AlacrittyParser to avoid the upstream wide-char OOB bug (task 24676).
+    (2u16..=500u16, 1u16..=200u16).prop_map(|(cols, rows)| Dims { cols, rows })
 }
 
 /// Generate arbitrary conversation IDs (non-empty strings).
@@ -43,7 +45,7 @@ fn dummy_handle(dims: Dims) -> super::session::TerminalHandle {
     // SAFETY: we own the fd, transferring to OwnedFd.
     let owned_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) };
 
-    let parser = vt100::Parser::new(dims.rows, dims.cols, 0);
+    let parser = crate::terminal::alacritty_parser::AlacrittyParser::new(dims.rows, dims.cols);
     let (quiescence_tx, _) = tokio::sync::watch::channel(0u64);
 
     super::session::TerminalHandle {
@@ -164,10 +166,11 @@ proptest! {
 #[test]
 fn parser_dimension_sync_after_resize() {
     let initial = Dims { cols: 80, rows: 24 };
-    let mut parser = vt100::Parser::new(initial.rows, initial.cols, 0);
+    let mut parser =
+        crate::terminal::alacritty_parser::AlacrittyParser::new(initial.rows, initial.cols);
 
     // Initial dimensions match.
-    let (r, c) = parser.screen().size();
+    let (r, c) = parser.size();
     assert_eq!(c, initial.cols, "initial cols match");
     assert_eq!(r, initial.rows, "initial rows match");
 
@@ -178,7 +181,7 @@ fn parser_dimension_sync_after_resize() {
     };
     parser.set_size(new_dims.rows, new_dims.cols);
 
-    let (r2, c2) = parser.screen().size();
+    let (r2, c2) = parser.size();
     assert_eq!(c2, new_dims.cols, "cols after resize");
     assert_eq!(r2, new_dims.rows, "rows after resize");
 }
@@ -196,7 +199,7 @@ proptest! {
         initial in arb_valid_dims(),
         resizes in proptest::collection::vec(arb_valid_dims(), 0..20),
     ) {
-        let mut parser = vt100::Parser::new(initial.rows, initial.cols, 0);
+        let mut parser = crate::terminal::alacritty_parser::AlacrittyParser::new(initial.rows, initial.cols);
         let mut last_dims = initial;
 
         for dims in resizes {
@@ -206,7 +209,7 @@ proptest! {
             last_dims = dims;
 
             // ParserDimensionSync invariant.
-            let (r, c) = parser.screen().size();
+            let (r, c) = parser.size();
             prop_assert_eq!(c, last_dims.cols,
                 "ParserDimensionSync: cols mismatch after resize to {:?}", dims);
             prop_assert_eq!(r, last_dims.rows,
@@ -214,7 +217,7 @@ proptest! {
         }
 
         // Final check: size reflects the last resize.
-        let (r_final, c_final) = parser.screen().size();
+        let (r_final, c_final) = parser.size();
         prop_assert_eq!(c_final, last_dims.cols);
         prop_assert_eq!(r_final, last_dims.rows);
     }
@@ -236,14 +239,14 @@ proptest! {
             1..10
         ),
     ) {
-        let mut parser = vt100::Parser::new(dims.rows, dims.cols, 0);
+        let mut parser = crate::terminal::alacritty_parser::AlacrittyParser::new(dims.rows, dims.cols);
 
         for chunk in &byte_sequences {
             // Must not panic on any byte sequence (fixed in vendor/vt100 via saturating_sub).
             parser.process(chunk);
 
             // Dimensions must remain stable (no resize here).
-            let (r, c) = parser.screen().size();
+            let (r, c) = parser.size();
             prop_assert_eq!(c, dims.cols, "cols must not change from byte processing");
             prop_assert_eq!(r, dims.rows, "rows must not change from byte processing");
         }
@@ -376,13 +379,13 @@ proptest! {
         ..proptest::test_runner::Config::default()
     })]
 
-    /// Stress test for the patched vt100 vendor: tiny terminals (1×1 to 4×4)
-    /// combined with long byte sequences and frequent wide Unicode characters.
-    /// These dimensions were the original panic trigger. 512 cases gives good
-    /// coverage of the wide-char/scroll interaction space without slowing CI.
+    /// Stress test: tiny terminals (2×1 to 4×4) combined with long byte sequences
+    /// and frequent wide Unicode characters. Floor is 2 cols (the min enforced by
+    /// the relay) to avoid the upstream alacritty wide-char OOB bug (task 24676).
+    /// 512 cases gives good coverage without slowing CI.
     #[test]
     fn prop_parser_stress_tiny_terminals(
-        cols in 1u16..=4u16,
+        cols in 2u16..=4u16,
         rows in 1u16..=4u16,
         // Long sequences with many wide-char codepoints in the mix
         byte_sequences in proptest::collection::vec(
@@ -390,10 +393,10 @@ proptest! {
             1..20
         ),
     ) {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = crate::terminal::alacritty_parser::AlacrittyParser::new(rows, cols);
         for chunk in &byte_sequences {
             parser.process(chunk);
-            let (r, c) = parser.screen().size();
+            let (r, c) = parser.size();
             prop_assert_eq!(c, cols, "cols changed after processing bytes");
             prop_assert_eq!(r, rows, "rows changed after processing bytes");
         }
@@ -407,7 +410,7 @@ proptest! {
         initial in arb_valid_dims(),
         ops in proptest::collection::vec(arb_terminal_op(), 1..30),
     ) {
-        let mut parser = vt100::Parser::new(initial.rows, initial.cols, 0);
+        let mut parser = crate::terminal::alacritty_parser::AlacrittyParser::new(initial.rows, initial.cols);
         let mut current_dims = initial;
 
         for op in &ops {
@@ -418,7 +421,7 @@ proptest! {
                 }
                 TerminalOp::Draw(chunk) => {
                     parser.process(chunk);
-                    let (r, c) = parser.screen().size();
+                    let (r, c) = parser.size();
                     prop_assert_eq!(c, current_dims.cols,
                         "ParserDimensionSync: cols wrong after draw at {:?}", current_dims);
                     prop_assert_eq!(r, current_dims.rows,
@@ -430,81 +433,71 @@ proptest! {
 }
 
 // ── Unit: vt100 save/restore cursor clamps across shrinking resize ───────────
+// ── Unit: save/restore cursor clamps across shrinking resize ────────────────
 
-/// Regression for task 24668:
+/// Regression for task 24668 (originally a vt100 bug; alacritty handles
+/// this correctly without patching).
 ///
-/// The vendored vt100 crate's `restore_cursor` (driven by ESC 8 / DECRC)
-/// replayed the saved cursor position directly into `self.pos` without
-/// clamping against the current grid size. When a `save_cursor` on a large
-/// grid was followed by a `set_size` shrinking the grid and then a
-/// `restore_cursor`, the cursor landed outside the grid and the next draw
-/// panicked in `drawing_cell().unwrap()`.
-///
-/// This test exercises the exact API-level save → resize → restore → draw
-/// sequence with deterministic inputs so regressions can be caught without
-/// relying on the proptest random exploration.
+/// Save cursor at (9, 99) on a 10×100 grid, shrink to 3×5, restore. The
+/// saved position must be clamped to the new grid, and a subsequent draw
+/// must not panic.
 #[test]
-fn vt100_restore_cursor_clamps_after_shrinking_resize() {
-    let mut parser = vt100::Parser::new(10, 100, 0);
+fn restore_cursor_clamps_after_shrinking_resize() {
+    let mut parser = crate::terminal::alacritty_parser::AlacrittyParser::new(10, 100);
 
     // Move the cursor to (9, 99) on the 10x100 grid — last row, last col.
-    // Cursor position: `ESC [ row ; col H` is 1-indexed, so row=10, col=100.
     parser.process(b"\x1b[10;100H");
-    let pos = parser.screen().cursor_position();
+    let pos = parser.cursor_pos();
     assert_eq!(pos, (9, 99), "cursor not at bottom-right of 10x100 grid");
 
     // Save the cursor with DECSC (ESC 7).
     parser.process(b"\x1b7");
 
-    // Shrink the grid to 3x5. This should clamp the LIVE cursor, but
-    // leave the SAVED cursor stale at (9, 99).
+    // Shrink to 3x5. Live cursor must clamp.
     parser.set_size(3, 5);
-    let pos_after_resize = parser.screen().cursor_position();
+    let pos_after_resize = parser.cursor_pos();
     assert!(
         pos_after_resize.0 < 3 && pos_after_resize.1 < 5,
         "live cursor not clamped after resize, got {pos_after_resize:?}",
     );
 
-    // Restore with DECRC (ESC 8). Without the fix, self.pos becomes (9, 99)
-    // on a 3x5 grid.
+    // Restore with DECRC (ESC 8). Saved position must also be clamped.
     parser.process(b"\x1b8");
-    let pos_after_restore = parser.screen().cursor_position();
+    let pos_after_restore = parser.cursor_pos();
     assert!(
         pos_after_restore.0 < 3 && pos_after_restore.1 < 5,
-        "restore_cursor did not clamp saved position against current grid; \
-         got {pos_after_restore:?} on a 3x5 grid",
+        "restore_cursor did not clamp saved position; got {pos_after_restore:?} on a 3x5 grid",
     );
 
-    // A subsequent draw must not panic. Pre-fix, this panicked inside
-    // vt100::Screen::text at `drawing_cell(...).unwrap()`.
+    // Subsequent draw must not panic.
     parser.process(b"X");
 
-    // Sanity: grid stayed at 3x5 and the write landed somewhere valid.
-    let (rows, cols) = parser.screen().size();
+    let (rows, cols) = parser.size();
     assert_eq!((rows, cols), (3, 5));
 }
 
 // ── Unit: resize frame validation (ResizeFrameRejected rule) ─────────────────
+// ── Unit: resize frame validation (ResizeFrameRejected rule) ────────────────
 
 /// REQ-TERM-006 / ResizeFrameRejected:
-/// The spec requires cols > 0 && rows > 0 for a resize to be applied.
-/// Zero-dimension frames must be silently dropped.
+/// The relay requires cols >= 2 && rows >= 1 for a resize to be applied.
+/// Frames with cols < 2 or rows = 0 must be silently dropped.
 #[test]
-fn zero_cols_resize_frame_is_rejected() {
+fn small_cols_resize_frame_is_rejected() {
     use std::sync::{Arc, Mutex};
 
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+    let parser = Arc::new(Mutex::new(
+        crate::terminal::alacritty_parser::AlacrittyParser::new(24, 80),
+    ));
     let initial_dims = Dims { cols: 80, rows: 24 };
 
-    // Construct a 0x01 frame with cols=0
+    // Construct a 0x01 frame with cols=1 (below the minimum of 2)
     let data = {
         let mut v = vec![0x01u8];
-        v.extend_from_slice(&0u16.to_be_bytes()); // cols = 0
+        v.extend_from_slice(&1u16.to_be_bytes()); // cols = 1
         v.extend_from_slice(&24u16.to_be_bytes()); // rows = 24
         v
     };
-
-    // handle_binary_frame must return true (don't disconnect) and leave parser unchanged
 
     let result =
         tokio::runtime::Runtime::new()
@@ -514,23 +507,25 @@ fn zero_cols_resize_frame_is_rejected() {
                 &data,
                 "test-conv",
             ));
-    assert!(result, "zero-cols frame should not disconnect the session");
+    assert!(result, "cols=1 frame should not disconnect the session");
 
-    let (r, c) = parser.lock().unwrap().screen().size();
+    let (r, c) = parser.lock().unwrap().size();
     assert_eq!(
         c, initial_dims.cols,
-        "cols must be unchanged after zero-dim resize"
+        "cols must be unchanged after sub-minimum resize"
     );
     assert_eq!(
         r, initial_dims.rows,
-        "rows must be unchanged after zero-dim resize"
+        "rows must be unchanged after sub-minimum resize"
     );
 }
 
 #[test]
 fn zero_rows_resize_frame_is_rejected() {
     use std::sync::{Arc, Mutex};
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+    let parser = Arc::new(Mutex::new(
+        crate::terminal::alacritty_parser::AlacrittyParser::new(24, 80),
+    ));
 
     let data = {
         let mut v = vec![0x01u8];
@@ -549,7 +544,7 @@ fn zero_rows_resize_frame_is_rejected() {
             ));
     assert!(result);
 
-    let (r, c) = parser.lock().unwrap().screen().size();
+    let (r, c) = parser.lock().unwrap().size();
     assert_eq!(c, 80u16, "cols unchanged");
     assert_eq!(r, 24u16, "rows unchanged");
 }
@@ -558,17 +553,17 @@ proptest! {
     /// ResizeFrameRejected: for any frame with zero cols or rows, the parser
     /// dimensions must remain unchanged.
     #[test]
-    fn prop_zero_dimension_resize_rejected(
+    fn prop_small_dimension_resize_rejected(
         initial in arb_valid_dims(),
-        bad_cols in 0u16..=1u16,   // 0 is invalid, 1 is valid; test boundary
+        bad_cols in 0u16..=1u16,   // 0 and 1 are both below the cols>=2 minimum
         bad_rows in 0u16..=1u16,
     ) {
         use std::sync::{Arc, Mutex};
-        // Only test cases where at least one dimension is 0
-        prop_assume!(bad_cols == 0 || bad_rows == 0);
+        // Test cases where cols < 2 or rows < 1
+        prop_assume!(bad_cols < 2 || bad_rows == 0);
 
         let parser = Arc::new(Mutex::new(
-            vt100::Parser::new(initial.rows, initial.cols, 0)
+            crate::terminal::alacritty_parser::AlacrittyParser::new(initial.rows, initial.cols)
         ));
         let data = {
             let mut v = vec![0x01u8];
@@ -577,10 +572,11 @@ proptest! {
             v
         };
 
+        let _result = tokio::runtime::Runtime::new().unwrap().block_on(
+            super::relay::dispatch_frame_for_test(&parser, &data, "test")
+        );
 
-        let _result = tokio::runtime::Runtime::new().unwrap().block_on(super::relay::dispatch_frame_for_test(&parser, &data, "test"));
-
-        let (r, c) = parser.lock().unwrap().screen().size();
+        let (r, c) = parser.lock().unwrap().size();
         prop_assert_eq!(c, initial.cols, "cols must be unchanged after invalid resize");
         prop_assert_eq!(r, initial.rows, "rows must be unchanged after invalid resize");
     }
@@ -669,4 +665,188 @@ fn build_env_no_duplicate_keys() {
         original_len,
         "build_env must not produce duplicate keys"
     );
+}
+
+// ── wezterm-term proptests (evaluation, task 24673) ──────────────────────────
+//
+// These tests run the SAME stress scenarios as the vt100 variants above, but
+// against `WezParser` (see `wezterm_parser.rs`).  Identical shapes, identical
+// assertions.  Failures here indicate either a wezterm-term bug or an
+// incompatible edge case that would need fixing before migration.
+//
+// Run with:  PROPTEST_CASES=10000 cargo test wez_stress
+
+#[cfg(test)]
+mod wez_proptest {
+    use proptest::prelude::*;
+
+    use super::{arb_terminal_op, arb_valid_dims, TerminalOp};
+    use crate::terminal::wezterm_parser::WezParser;
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 512,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// wezterm-term variant of `prop_parser_stress_tiny_terminals`.
+        ///
+        /// Tiny terminals (1×1 to 4×4) combined with long byte sequences and
+        /// frequent wide-char codepoints.  This is the dimension range that
+        /// triggered all six vt100 patches.  If wezterm-term panics here,
+        /// it's a go/no-go blocker.
+        ///
+        /// **Known failure**: `tattoy-wezterm-term 0.1.0-fork.5` (and upstream
+        /// `wezterm/wezterm`) panics on bytes `[144, 113, 63, 128]` (DCS 'q' =
+        /// Sixel start) on a 1×1 terminal: divide-by-zero in
+        /// `terminalstate/image.rs:103` (`assign_image_to_cells`).  This is a
+        /// go/no-go **BLOCKER** for the migration.  See
+        /// `specs/terminal/wezterm-evaluation.md` for full analysis.
+        ///
+        /// Marked `#[ignore]` so CI passes; run explicitly:
+        /// `PROPTEST_CASES=10000 cargo test wez_prop -- --ignored`
+        #[test]
+        #[ignore = "wezterm-term divide-by-zero bug (task 24673 blocker); run explicitly for evaluation"]
+        fn wez_prop_parser_stress_tiny_terminals(
+            cols in 1u16..=4u16,
+            rows in 1u16..=4u16,
+            byte_sequences in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..1024),
+                1..20
+            ),
+        ) {
+            let mut parser = WezParser::new(rows, cols);
+            for chunk in &byte_sequences {
+                parser.process(chunk);
+                let (r, c) = parser.size();
+                prop_assert_eq!(c, cols, "cols changed after processing bytes");
+                prop_assert_eq!(r, rows, "rows changed after processing bytes");
+            }
+        }
+
+        /// wezterm-term variant of `prop_parser_stress_resize_then_draw`.
+        ///
+        /// Arbitrary resize sequences interleaved with byte processing.
+        /// Verifies `ParserDimensionSync` holds against wezterm-term and that
+        /// no panics occur across the resize+draw interaction.
+        ///
+        /// **Known failure**: same divide-by-zero as `wez_prop_parser_stress_tiny_terminals`.
+        /// Sixel/DCS sequence on a tiny terminal hits `assign_image_to_cells`
+        /// with `draw_width = 0`.  Go/no-go **BLOCKER**.
+        ///
+        /// Marked `#[ignore]` so CI passes; run explicitly:
+        /// `PROPTEST_CASES=10000 cargo test wez_prop -- --ignored`
+        #[test]
+        #[ignore = "wezterm-term divide-by-zero bug (task 24673 blocker); run explicitly for evaluation"]
+        fn wez_prop_parser_stress_resize_then_draw(
+            initial in arb_valid_dims(),
+            ops in proptest::collection::vec(arb_terminal_op(), 1..30),
+        ) {
+            let mut parser = WezParser::new(initial.rows, initial.cols);
+            let mut current_dims = initial;
+
+            for op in &ops {
+                match op {
+                    TerminalOp::Resize(dims) => {
+                        parser.set_size(dims.rows, dims.cols);
+                        current_dims = *dims;
+                    }
+                    TerminalOp::Draw(chunk) => {
+                        parser.process(chunk);
+                        let (r, c) = parser.size();
+                        prop_assert_eq!(c, current_dims.cols,
+                            "ParserDimensionSync: cols wrong after draw at {:?}",
+                            current_dims);
+                        prop_assert_eq!(r, current_dims.rows,
+                            "ParserDimensionSync: rows wrong after draw at {:?}",
+                            current_dims);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── alacritty_terminal proptests (evaluation, task 24676) ─────────────────────
+//
+// Same stress scenarios as the vt100 and wezterm variants, run against
+// `AlacrittyParser`.  The wezterm variants are `#[ignore]`'d because they
+// panic; these should pass.
+//
+// Run with:  PROPTEST_CASES=10000 cargo test alac_prop
+
+#[cfg(test)]
+mod alac_proptest {
+    use proptest::prelude::*;
+
+    use super::{arb_terminal_op, arb_valid_dims, TerminalOp};
+    use crate::terminal::alacritty_parser::AlacrittyParser;
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 512,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// alacritty_terminal: `prop_parser_stress_tiny_terminals` with cols >= 2.
+        ///
+        /// Tiny terminals (2 cols min to 4 cols) + long byte sequences + wide Unicode.
+        /// With the cols >= 2 relay invariant, the upstream wide-char OOB bug
+        /// (task 24676) cannot be triggered.
+        #[test]
+        fn alac_prop_parser_stress_tiny_terminals(
+            cols in 2u16..=4u16,
+            rows in 1u16..=4u16,
+            byte_sequences in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..1024),
+                1..20
+            ),
+        ) {
+            let mut parser = AlacrittyParser::new(rows, cols);
+            for chunk in &byte_sequences {
+                parser.process(chunk);
+                let (r, c) = parser.size();
+                prop_assert_eq!(c, cols, "cols changed after processing bytes");
+                prop_assert_eq!(r, rows, "rows changed after processing bytes");
+            }
+        }
+
+        /// alacritty_terminal: `prop_parser_stress_resize_then_draw`.
+        ///
+        /// Arbitrary resize sequences (cols >= 2 via arb_valid_dims) interleaved
+        /// with byte processing.  Verifies ParserDimensionSync holds.
+        #[test]
+        fn alac_prop_parser_stress_resize_then_draw(
+            initial in arb_valid_dims(),
+            ops in proptest::collection::vec(arb_terminal_op(), 1..30),
+        ) {
+            let mut parser = AlacrittyParser::new(initial.rows, initial.cols);
+            let mut current_dims = initial;
+
+            for op in &ops {
+                match op {
+                    TerminalOp::Resize(dims) => {
+                        parser.set_size(dims.rows, dims.cols);
+                        current_dims = *dims;
+                    }
+                    TerminalOp::Draw(chunk) => {
+                        parser.process(chunk);
+                        let (r, c) = parser.size();
+                        prop_assert_eq!(
+                            c,
+                            current_dims.cols,
+                            "ParserDimensionSync: cols wrong after draw at {:?}",
+                            current_dims
+                        );
+                        prop_assert_eq!(
+                            r,
+                            current_dims.rows,
+                            "ParserDimensionSync: rows wrong after draw at {:?}",
+                            current_dims
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

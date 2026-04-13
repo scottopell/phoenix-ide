@@ -1,0 +1,12 @@
+# Seeds for alacritty_terminal evaluation proptests (task 24676)
+# Both seeds trigger an index-out-of-bounds panic in alacritty_terminal v0.26.0:
+#   grid.rs:439: cursor_cell() at col=1 in a 1-column row
+# when a width-2 character (U+3000 IDEOGRAPHIC SPACE, bytes [0xE3, 0x80, 0x80])
+# is fed to a 1x1 terminal.
+#
+# Minimal reproducer: cols=1, rows=1, bytes=[0xE3, 0x80, 0x80]
+# Stack: handler::input → write_at_cursor (spacer) → cursor_cell → row[Column(1)] OOB
+#
+# Same class of bug as vt100 patches 2-4 (wide char on narrow terminal).
+# Present in alacritty_terminal 0.26.0 AND 0.26.1-dev (master, unfixed 2026-04-13).
+# Go/no-go BLOCKER for migration.

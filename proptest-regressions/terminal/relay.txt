@@ -9,3 +9,4 @@ cc 803cf8ab6461d0112e060859b2bd766206def7513c026bac77bedee296a77e71 # shrinks to
 cc 20fccbb94156f07db431b365d96c6bceab44ca6a6611545eec3f90b30fd8559d # shrinks to chunks = [[1]]
 cc 24888de4ee3c61ce2e8bc304677ea2413e105eb0dad7c15fe0db9201c425389e # shrinks to chunks = [[27, 32]]
 cc 24888de4ee3c61ce2e8bc304677ea2413e105eb0dad7c15fe0db9201c425389e # shrinks to chunks = [[27, 32]]
+cc 7fb659c13a19a8cb7b36d17a148c631c685de21f5210f8f06e2a951a42a9b162 # shrinks to ops = [(true, 1, 1)]

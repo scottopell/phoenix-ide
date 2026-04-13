@@ -1,0 +1,19 @@
+# Seeds for wezterm-term evaluation proptests (task 24673)
+# Both seeds trigger a divide-by-zero panic in tattoy-wezterm-term-0.1.0-fork.5
+# and upstream wezterm/wezterm (terminalstate/image.rs:103)
+# when a Sixel/DCS sequence (0x90 0x71 = DCS q) hits a terminal with cell_pixel_width=1.
+#
+# Minimal reproducer: cols=1, rows=1, bytes=[144, 113, 63, 128]
+# (0x90=DCS, 0x71='q'=sixel, 0x3F='?', 0x80=data)
+#
+# This matches the SAME class of bug that required 6 patches in vendor/vt100:
+# image/sixel arithmetic overflows/divides-by-zero on tiny terminals.
+
+cc c6a99947bec8b558f213faa3285d6118b67bf31d24e45bcd8c83a7072d66db9e
+
+# alacritty_terminal regression seed (task 24676)
+# bytes [0xE3, 0x80, 0x80] = U+3000 IDEOGRAPHIC SPACE (width=2) on a 1x1 terminal
+# triggers index-out-of-bounds in grid.rs:439 (cursor_cell, col=1 in 1-col row).
+# Root cause: write_at_cursor for WIDE_CHAR_SPACER at col+1 is not guarded
+# against cols=1. Same class as vt100 patches 2-4 (wide char on narrow terminal).
+# Present in alacritty_terminal v0.26.0 AND v0.26.1-dev (master, unfixed).
