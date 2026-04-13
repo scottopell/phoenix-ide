@@ -49,11 +49,25 @@ fn arb_nonempty_indent() -> impl Strategy<Value = String> {
 /// `str::matches()` skips overlapping matches, which can hide cases where
 /// a substring appears at multiple overlapping positions.
 fn count_overlapping(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
     let mut count = 0;
-    let mut start = 0;
-    while let Some(pos) = haystack[start..].find(needle) {
+    let mut cursor = haystack;
+    while let Some(pos) = cursor.find(needle) {
         count += 1;
-        start += pos + 1;
+        // Advance one char past the match start. `pos` is a char boundary
+        // (find() guarantees this); we then iterate `char_indices` from `pos`
+        // and take the second entry to land on the next boundary.
+        let next = cursor
+            .char_indices()
+            .skip_while(|(i, _)| *i <= pos)
+            .map(|(i, _)| i)
+            .next();
+        cursor = match next {
+            Some(i) => cursor.get(i..).unwrap_or(""),
+            None => "",
+        };
     }
     count
 }
@@ -67,7 +81,10 @@ fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    s[..end].to_string()
+    // `end` is guaranteed to be a char boundary by the loop above, so `get`
+    // returns Some. Using `get` instead of `[..end]` keeps clippy::string_slice
+    // happy without changing behavior.
+    s.get(..end).unwrap_or("").to_string()
 }
 
 /// Generate content with multi-byte UTF-8 characters
