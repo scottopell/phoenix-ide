@@ -12,11 +12,10 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { memo, useState, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { QueuedMessage } from '../hooks';
 
@@ -112,7 +111,9 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
 // User Message Components
 // ============================================================================
 
-export function UserMessage({ message }: { message: Message }) {
+export const UserMessage = memo(UserMessageImpl);
+
+function UserMessageImpl({ message }: { message: Message }) {
   const content = message.content as { text?: string; images?: { data: string; media_type: string }[]; is_meta?: boolean };
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
@@ -149,7 +150,9 @@ export function UserMessage({ message }: { message: Message }) {
   );
 }
 
-export function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
+export const QueuedUserMessage = memo(QueuedUserMessageImpl);
+
+function QueuedUserMessageImpl({ message, onRetry }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
   const isFailed = message.status === 'failed';
   const isSending = message.status === 'sending';
 
@@ -196,15 +199,15 @@ export function QueuedUserMessage({ message, onRetry }: { message: QueuedMessage
 // Agent Message Components
 // ============================================================================
 
-export function AgentMessage({
-  message,
-  toolResults,
-  onOpenFile,
-}: {
+interface AgentMessageProps {
   message: Message;
   toolResults: Map<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-}) {
+}
+
+export const AgentMessage = memo(AgentMessageImpl);
+
+function AgentMessageImpl({ message, toolResults, onOpenFile }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
 
@@ -359,7 +362,9 @@ function parseImageResult(text: string): { media_type: string; data: string } | 
   return null;
 }
 
-export function ToolUseBlock({ block, result, onOpenFile }: ToolUseBlockProps) {
+export const ToolUseBlock = memo(ToolUseBlockImpl);
+
+function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -643,7 +648,9 @@ function CompletedSubAgent({ result }: { result: SubAgentResult }) {
 
 type AwaitingSubAgentsState = Extract<ConversationState, { type: 'awaiting_sub_agents' }>;
 
-export function SubAgentStatus({ stateData }: { stateData: AwaitingSubAgentsState }) {
+export const SubAgentStatus = memo(SubAgentStatusImpl);
+
+function SubAgentStatusImpl({ stateData }: { stateData: AwaitingSubAgentsState }) {
   const pending: PendingSubAgent[] = stateData.pending;
   const completed: SubAgentResult[] = stateData.completed_results;
   const total = pending.length + completed.length;

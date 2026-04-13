@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, ExpansionError, type Conversation, type ImageData, type ModelInfo, type CredentialStatus } from '../api';
+import { api, ExpansionError, type Conversation, type ImageData } from '../api';
+import { refreshModels } from '../modelsPoller';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
@@ -8,12 +9,8 @@ import { InputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
-import { ProseReader } from '../components/ProseReader';
-import { TaskApprovalReader } from '../components/TaskApprovalReader';
 import { QuestionPanel } from '../components/QuestionPanel';
-import { FirstTaskWelcome } from '../components/FirstTaskWelcome';
-import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
-import { useMessageQueue, useConnection } from '../hooks';
+import { useMessageQueue, useConnection, useModels } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -22,9 +19,29 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom } from '../conversation';
-import { TerminalPanel } from '../components/TerminalPanel';
 import { PaneDivider } from '../components/PaneDivider';
 import { useResizablePane } from '../hooks';
+
+// Conditional overlays / heavy panels — code-split so the default render path
+// (chat view with no overlay open) doesn't pay their bundle cost.
+// - ProseReader, TaskApprovalReader: pull in react-syntax-highlighter
+// - TerminalPanel: pulls in xterm + addon (large)
+// - CredentialHelperPanel, FirstTaskWelcome: rarely mounted
+const ProseReader = lazy(() =>
+  import('../components/ProseReader').then((m) => ({ default: m.ProseReader })),
+);
+const TaskApprovalReader = lazy(() =>
+  import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
+);
+const FirstTaskWelcome = lazy(() =>
+  import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
+);
+const CredentialHelperPanel = lazy(() =>
+  import('../components/CredentialHelperPanel').then((m) => ({ default: m.CredentialHelperPanel })),
+);
+const TerminalPanel = lazy(() =>
+  import('../components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
+);
 
 const TERMINAL_COLLAPSED_PX = 32;
 
@@ -72,8 +89,8 @@ export function ConversationPage() {
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
 
-  // Available models (for upgrade detection)
-  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  // Shared models/credential poller — one request loop app-wide.
+  const { models: availableModels, credentialStatus } = useModels();
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
@@ -87,8 +104,7 @@ export function ConversationPage() {
     collapseThreshold: 60,
   });
 
-  // Credential status
-  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
+  // Credential status comes from useModels() above (shared poller).
   const [showAuthPanel, setShowAuthPanel] = useState(false);
   const autoAuthAttemptedRef = useRef(false);
 
@@ -222,12 +238,7 @@ export function ConversationPage() {
       .catch((err) => console.warn('Failed to load system prompt:', err));
   }, [conversationId, dispatch]);
 
-  // Fetch available models once (for upgrade detection in StateBar)
-  useEffect(() => {
-    api.listModels()
-      .then((resp) => setAvailableModels(resp.models))
-      .catch((err) => console.warn('Failed to load models:', err));
-  }, []);
+  // availableModels is populated by the shared useModels() poller above.
 
   // REQ-SEED-001: hydrate the input area from `seed-draft:<id>` localStorage
   // when a seeded conversation first mounts, then clear the key so revisits
@@ -259,22 +270,9 @@ export function ConversationPage() {
     return () => window.clearTimeout(handle);
   }, [conversationId]);
 
-  // Poll credential status every 5s
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        const resp = await api.listModels();
-        if (resp.credential_status !== 'not_configured') {
-          setCredentialStatus(resp.credential_status);
-        }
-      } catch {
-        // ignore
-      }
-    };
-    poll();
-    const id = setInterval(poll, 5000);
-    return () => clearInterval(id);
-  }, []);
+  // Credential polling is handled by the shared useModels() hook above.
+  // It adapts the interval based on credential health (30s when 'ok',
+  // 5s otherwise) so a healthy credential doesn't hot-poll every 5s.
 
   // Auto-open auth panel on first load when credential is required
   useEffect(() => {
@@ -422,7 +420,7 @@ export function ConversationPage() {
     }
   };
 
-  const handleRetry = (localId: string) => {
+  const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);
     if (!msg) return;
 
@@ -431,7 +429,7 @@ export function ConversationPage() {
     // the user may want to fix the issue that caused the failure).
     dismiss(localId);
     inputRef.current?.setDraft(msg.text);
-  };
+  }, [queuedMessages, dismiss]);
 
   const handleCancel = async () => {
     if (!conversationId || !isAgentWorking(atom.phase)) return;
@@ -603,6 +601,16 @@ export function ConversationPage() {
     [conversation?.cwd, isDesktop, fileExplorer]
   );
 
+  // REQ-SEED-003: click handler for the seed-parent breadcrumb link.
+  // Defined here (before any conditional early returns) so the hook order is
+  // stable across the !conversation / error branches below.
+  const seedParentSlugForCallback = conversation?.seed_parent_slug;
+  const handleSeedParentClick = useCallback((e: ReactMouseEvent) => {
+    if (!seedParentSlugForCallback) return;
+    e.preventDefault();
+    navigate(`/c/${seedParentSlugForCallback}`);
+  }, [seedParentSlugForCallback, navigate]);
+
   if (error) {
     return (
       <div id="app">
@@ -642,14 +650,16 @@ export function ConversationPage() {
     const prs = fileExplorer.proseReaderState;
     return (
       <div id="app">
-        <ProseReader
-          filePath={prs.path}
-          rootDir={prs.rootDir}
-          onClose={handleCloseProseReader}
-          onSendNotes={handleSendNotes}
-          patchContext={prs.patchContext ?? undefined}
-          inline
-        />
+        <Suspense fallback={null}>
+          <ProseReader
+            filePath={prs.path}
+            rootDir={prs.rootDir}
+            onClose={handleCloseProseReader}
+            onSendNotes={handleSendNotes}
+            patchContext={prs.patchContext ?? undefined}
+            inline
+          />
+        </Suspense>
       </div>
     );
   }
@@ -664,13 +674,13 @@ export function ConversationPage() {
   // when this conversation was spawned from another via a seed action.
   // If `seed_parent_slug` is present we link to it; if not (parent deleted),
   // we render unlinked text.
+  // NB: `seedParentSlug` and `handleSeedParentClick` are defined up near the
+  //     other `useCallback`s (before any conditional early returns) to keep
+  //     hooks in a stable order.
   const seedBreadcrumb = conversation.seed_parent_id ? (
     <div className="conversation-seed-breadcrumb">
       {conversation.seed_parent_slug ? (
-        <a href={`/c/${conversation.seed_parent_slug}`} onClick={(e) => {
-          e.preventDefault();
-          navigate(`/c/${conversation.seed_parent_slug}`);
-        }}>
+        <a href={`/c/${conversation.seed_parent_slug}`} onClick={handleSeedParentClick}>
           {'\u2190'} from: {conversation.seed_label ?? conversation.seed_parent_slug}
         </a>
       ) : (
@@ -693,9 +703,7 @@ export function ConversationPage() {
         onOpenFile={handleOpenFileFromPatch}
         conversationId={conversationId}
         streamingBuffer={atom.streamingBuffer}
-        {...(atom.systemPrompt !== undefined && atom.systemPrompt !== null && {
-          systemPrompt: atom.systemPrompt,
-        })}
+        systemPrompt={atom.systemPrompt ?? undefined}
       />
       {atom.uiError && (
         <div className="sse-error-toast" role="alert">
@@ -771,18 +779,15 @@ export function ConversationPage() {
           />
         )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
-          <CredentialHelperPanel
-            active={showAuthPanel}
-            onDismiss={async () => {
-              setShowAuthPanel(false);
-              try {
-                const resp = await api.listModels();
-                if (resp.credential_status !== 'not_configured') {
-                  setCredentialStatus(resp.credential_status);
-                }
-              } catch { /* ignore */ }
-            }}
-          />
+          <Suspense fallback={null}>
+            <CredentialHelperPanel
+              active={showAuthPanel}
+              onDismiss={() => {
+                setShowAuthPanel(false);
+                void refreshModels().catch(() => {});
+              }}
+            />
+          </Suspense>
         )}
         <InputArea
           ref={inputRef}
@@ -816,7 +821,8 @@ export function ConversationPage() {
       />
       </div>
 
-      {/* Terminal split-pane (REQ-TERM-001) — collapsed = 32px header strip */}
+      {/* Terminal split-pane (REQ-TERM-001) — collapsed = 32px header strip.
+          Lazy-loaded so xterm (~200KB) stays out of the main bundle. */}
       {showTerminal && (
         <>
           <PaneDivider
@@ -831,39 +837,47 @@ export function ConversationPage() {
               }
             }}
           />
-          <TerminalPanel
-            conversationId={conversationId!}
-            height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
-            collapsed={terminalPane.collapsed}
-            onExpand={terminalPane.expandFromCollapsed}
-            onCollapse={() => terminalPane.setCollapsed(true)}
-            cwd={conversation.cwd}
-            shell={conversation.shell ?? undefined}
-            homeDir={conversation.home_dir ?? undefined}
-            onAssistSetup={handleAssistShellSetup}
-          />
+          <Suspense fallback={null}>
+            <TerminalPanel
+              conversationId={conversationId!}
+              height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
+              collapsed={terminalPane.collapsed}
+              onExpand={terminalPane.expandFromCollapsed}
+              onCollapse={() => terminalPane.setCollapsed(true)}
+              cwd={conversation.cwd}
+              shell={conversation.shell ?? undefined}
+              homeDir={conversation.home_dir ?? undefined}
+              onAssistSetup={handleAssistShellSetup}
+            />
+          </Suspense>
         </>
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
       {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
-        <TaskApprovalReader
-          title={atom.phase.title}
-          priority={atom.phase.priority}
-          plan={atom.phase.plan}
-          onApprove={handleApproveTask}
-          onReject={handleRejectTask}
-          onSendFeedback={handleTaskFeedback}
-        />
+        <Suspense fallback={null}>
+          <TaskApprovalReader
+            title={atom.phase.title}
+            priority={atom.phase.priority}
+            plan={atom.phase.plan}
+            onApprove={handleApproveTask}
+            onReject={handleRejectTask}
+            onSendFeedback={handleTaskFeedback}
+          />
+        </Suspense>
       )}
 
       <Toast messages={toasts} onDismiss={dismissToast} />
 
       {/* First task welcome modal */}
-      <FirstTaskWelcome
-        visible={showFirstTaskWelcome}
-        onClose={() => setShowFirstTaskWelcome(false)}
-      />
+      {showFirstTaskWelcome && (
+        <Suspense fallback={null}>
+          <FirstTaskWelcome
+            visible={showFirstTaskWelcome}
+            onClose={() => setShowFirstTaskWelcome(false)}
+          />
+        </Suspense>
+      )}
 
 
       {/* Mobile file browser overlay */}
@@ -877,13 +891,15 @@ export function ConversationPage() {
 
       {/* Mobile prose reader overlay */}
       {!isDesktop && mobileProseFile && (
-        <ProseReader
-          filePath={mobileProseFile.path}
-          rootDir={mobileProseFile.rootDir}
-          onClose={handleCloseProseReader}
-          onSendNotes={handleSendNotes}
-          patchContext={mobileProseFile.patchContext ?? undefined}
-        />
+        <Suspense fallback={null}>
+          <ProseReader
+            filePath={mobileProseFile.path}
+            rootDir={mobileProseFile.rootDir}
+            onClose={handleCloseProseReader}
+            onSendNotes={handleSendNotes}
+            patchContext={mobileProseFile.patchContext ?? undefined}
+          />
+        </Suspense>
       )}
     </div>
   );

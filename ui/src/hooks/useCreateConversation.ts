@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
+import { getModels } from '../modelsPoller';
 import type { ImageData, ModelsResponse } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { processImageFiles } from '../utils/images';
@@ -48,10 +49,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
 
-  // Load models and environment info
-  // Load models and environment info (once on mount)
+  // Load models (via shared cache — dedupes with other callers that may be
+  // mounted concurrently) and environment info once on mount.
   useEffect(() => {
-    api.listModels().then(modelsData => {
+    getModels().then(modelsData => {
       setModels(modelsData);
       // Set default only if user has no saved preference
       setSelectedModel(prev => prev ?? modelsData.default);

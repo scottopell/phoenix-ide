@@ -96,9 +96,12 @@ export function useIOSKeyboardFix() {
     debugLog('Setting up listeners');
     lastVVHeight.current = vv.height;
 
-    // Listen for visualViewport resize
-    vv.addEventListener('resize', updateAppHeight);
-    vv.addEventListener('scroll', updateAppHeight);
+    // Listen for visualViewport resize.
+    // Both marked passive so the scroll handler never blocks the main thread's
+    // scroll commit — matches the `{ passive: true }` on the window scroll
+    // listener below.
+    vv.addEventListener('resize', updateAppHeight, { passive: true });
+    vv.addEventListener('scroll', updateAppHeight, { passive: true });
 
     // Also handle window scroll to keep it at 0 when keyboard is open
     const handleScroll = () => {

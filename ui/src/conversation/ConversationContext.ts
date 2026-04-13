@@ -1,9 +1,10 @@
 import { createContext } from 'react';
-import type { ConversationAtom, SSEAction } from './atom';
+import type { ConversationStore } from './ConversationStore';
 
-export interface ConversationContextValue {
-  atoms: Map<string, ConversationAtom>;
-  dispatch: (slug: string, action: SSEAction) => void;
-}
-
-export const ConversationContext = createContext<ConversationContextValue | null>(null);
+/**
+ * Context holds a reference to the external store, not React state. All
+ * subscriptions happen per-slug via `useSyncExternalStore` inside
+ * `useConversationAtom`, so context value itself never changes identity and
+ * does not trigger re-renders.
+ */
+export const ConversationContext = createContext<ConversationStore | null>(null);

@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import type { Conversation, CredentialStatus } from '../api';
+import { refreshModels } from '../modelsPoller';
+import type { Conversation } from '../api';
+import { useModels } from '../hooks';
 import { cacheDB } from '../cache';
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
@@ -38,8 +40,9 @@ export function ConversationListPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
 
-  // Credential helper state
-  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
+  // Credential helper state — sourced from the shared useModels() poller
+  // below so we share one request loop with any other mounted consumer.
+  const { credentialStatus } = useModels();
   const [showAuthPanel, setShowAuthPanel] = useState(false);
   const autoAuthAttemptedRef = useRef(false);
 
@@ -112,7 +115,10 @@ export function ConversationListPage() {
     }
   }, [isReady, loadConversations]);
 
-  // Periodic refresh for live state indicators (REQ-UI-012)
+  // Periodic refresh for live state indicators (REQ-UI-012).
+  // Consolidated into a single interval that fires both list fetches — the
+  // credential/models poll is owned by the shared useModels() hook above, so
+  // only one timer lives on this page now instead of two.
   useEffect(() => {
     if (!isReady) return;
     const interval = setInterval(() => {
@@ -126,21 +132,6 @@ export function ConversationListPage() {
         }).catch(() => {/* silent */});
       }
     }, 5000);
-    return () => clearInterval(interval);
-  }, [isReady]);
-
-  // Poll credential helper status
-  useEffect(() => {
-    if (!isReady) return;
-
-    const fetchStatus = () => {
-      api.listModels().then(resp => {
-        setCredentialStatus(resp.credential_status);
-      }).catch(() => {/* silent */});
-    };
-
-    fetchStatus(); // immediate on mount
-    const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, [isReady]);
 
@@ -417,7 +408,7 @@ export function ConversationListPage() {
           active={showAuthPanel}
           onDismiss={() => {
             setShowAuthPanel(false);
-            api.listModels().then(resp => setCredentialStatus(resp.credential_status)).catch(() => {});
+            void refreshModels().catch(() => {});
           }}
         />
       )}

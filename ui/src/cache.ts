@@ -105,12 +105,13 @@ export class CacheDB {
     return new Promise((resolve) => {
       const request = store.getAll();
       request.onsuccess = () => {
-        const conversations = request.result || [];
+        const conversations: Conversation[] = request.result || [];
         // Sort by updated_at descending (most recent first)
-        conversations.sort((a: Conversation, b: Conversation) => 
-          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+        resolve(
+          conversations.toSorted(
+            (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+          ),
         );
-        resolve(conversations);
       };
       request.onerror = () => resolve([]);
     });
@@ -203,10 +204,9 @@ export class CacheDB {
       const request = index.getAll(range);
       
       request.onsuccess = () => {
-        const messages = request.result || [];
+        const messages: Message[] = request.result || [];
         // Sort by sequence
-        messages.sort((a: Message, b: Message) => a.sequence_id - b.sequence_id);
-        resolve(messages);
+        resolve(messages.toSorted((a, b) => a.sequence_id - b.sequence_id));
       };
       
       request.onerror = () => resolve([]);

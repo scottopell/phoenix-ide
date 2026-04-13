@@ -1,16 +1,36 @@
-import { useState, useEffect, useCallback } from 'react';
+import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
-import { ConversationListPage } from './pages/ConversationListPage';
-import { ConversationPage } from './pages/ConversationPage';
-import { NewConversationPage } from './pages/NewConversationPage';
-import { LoginPage } from './pages/LoginPage';
-import { SharePage } from './pages/SharePage';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
 import { ConversationProvider } from './conversation';
 import { api } from './api';
 import './index.css';
+
+// Routes are code-split so the initial bundle only contains what the user
+// actually needs to view the current page. Heavy dependencies that live in
+// specific routes (react-syntax-highlighter, xterm, react-markdown) stay out
+// of the main chunk until that route mounts.
+const ConversationListPage = lazy(() =>
+  import('./pages/ConversationListPage').then((m) => ({ default: m.ConversationListPage })),
+);
+const ConversationPage = lazy(() =>
+  import('./pages/ConversationPage').then((m) => ({ default: m.ConversationPage })),
+);
+const NewConversationPage = lazy(() =>
+  import('./pages/NewConversationPage').then((m) => ({ default: m.NewConversationPage })),
+);
+const LoginPage = lazy(() =>
+  import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })),
+);
+const SharePage = lazy(() =>
+  import('./pages/SharePage').then((m) => ({ default: m.SharePage })),
+);
+
+/** Route loading fallback — blank div sized to the viewport to avoid CLS. */
+function RouteFallback() {
+  return <div style={{ minHeight: '100vh' }} />;
+}
 
 type AuthState =
   | { status: 'checking' }
@@ -30,20 +50,22 @@ function AppRoutes() {
 
   return (
     <>
-      <Routes>
-        {/* Share view: minimal layout, no sidebar, no auth required */}
-        <Route path="/s/:token" element={<SharePage />} />
-        {/* Main app routes: full layout with sidebar */}
-        <Route path="*" element={
-          <DesktopLayout>
-            <Routes>
-              <Route path="/" element={<ConversationListPage />} />
-              <Route path="/new" element={<NewConversationPage />} />
-              <Route path="/c/:slug" element={<ConversationPage />} />
-            </Routes>
-          </DesktopLayout>
-        } />
-      </Routes>
+      <Suspense fallback={<RouteFallback />}>
+        <Routes>
+          {/* Share view: minimal layout, no sidebar, no auth required */}
+          <Route path="/s/:token" element={<SharePage />} />
+          {/* Main app routes: full layout with sidebar */}
+          <Route path="*" element={
+            <DesktopLayout>
+              <Routes>
+                <Route path="/" element={<ConversationListPage />} />
+                <Route path="/new" element={<NewConversationPage />} />
+                <Route path="/c/:slug" element={<ConversationPage />} />
+              </Routes>
+            </DesktopLayout>
+          } />
+        </Routes>
+      </Suspense>
       <ShortcutHelpPanel visible={showHelp} onClose={() => setShowHelp(false)} />
     </>
   );
@@ -85,7 +107,11 @@ function App() {
   }
 
   if (authState.status === 'login_required') {
-    return <LoginPage onSuccess={handleLoginSuccess} />;
+    return (
+      <Suspense fallback={<RouteFallback />}>
+        <LoginPage onSuccess={handleLoginSuccess} />
+      </Suspense>
+    );
   }
 
   return (

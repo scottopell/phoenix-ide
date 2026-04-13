@@ -1,31 +1,40 @@
-import { useCallback, useContext, useMemo, type Dispatch } from 'react';
-import { createInitialAtom } from './atom';
+import { useCallback, useContext, useSyncExternalStore, type Dispatch } from 'react';
 import type { ConversationAtom, SSEAction } from './atom';
 import { ConversationContext } from './ConversationContext';
 import { isAgentWorking } from '../utils';
 
-function useConversationContext() {
-  const ctx = useContext(ConversationContext);
-  if (!ctx) throw new Error('useConversationAtom must be used within ConversationProvider');
-  return ctx;
+function useConversationStore() {
+  const store = useContext(ConversationContext);
+  if (!store) throw new Error('useConversationAtom must be used within ConversationProvider');
+  return store;
 }
 
-/** Returns [atom, dispatch] for the given conversation slug. */
+/**
+ * Returns [atom, dispatch] for the given conversation slug.
+ *
+ * Subscribes only to this slug's atom via the external store — updates to
+ * other conversation slugs do not cause this hook to re-render.
+ */
 export function useConversationAtom(slug: string): [ConversationAtom, Dispatch<SSEAction>] {
-  const ctx = useConversationContext();
+  const store = useConversationStore();
 
-  const atom = useMemo(
-    () => ctx.atoms.get(slug) ?? createInitialAtom(),
-    [ctx.atoms, slug]
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug),
+    [store, slug],
   );
 
-  const ctxDispatch = ctx.dispatch;
-  const boundDispatch = useCallback(
-    (action: SSEAction) => ctxDispatch(slug, action),
-    [ctxDispatch, slug]
+  const atom = useSyncExternalStore(subscribe, getSnapshot);
+
+  const dispatch = useCallback(
+    (action: SSEAction) => store.dispatch(slug, action),
+    [store, slug],
   );
 
-  return [atom, boundDispatch];
+  return [atom, dispatch];
 }
 
 /** Derived selectors to avoid passing the raw atom to child components. */

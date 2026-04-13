@@ -104,8 +104,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   /** Active trigger state — null when no trigger is open */
   const [activeTrigger, setActiveTrigger] = useState<TriggerState | null>(null);
-  /** Candidate items fetched from the server */
-  const [acItems, setAcItems] = useState<AutocompleteItem[]>([]);
+  /**
+   * File search results fetched from the server. Skill candidates are NOT
+   * stored here — they're derived during render from `skillItems`
+   * (see `acItems` useMemo below). This avoids the derived-state-in-effect
+   * anti-pattern.
+   */
+  const [fileAcItems, setFileAcItems] = useState<AutocompleteItem[]>([]);
   /** Inline error when an @ref or /skill fails to expand (REQ-IR-007) */
   const [expansionError, setExpansionError] = useState<string | null>(null);
   /** Ref to abort any in-flight search request */
@@ -116,6 +121,27 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [skillItems, setSkillItems] = useState<SkillEntry[]>([]);
   /** Argument hint ghost text shown after a skill is selected (REQ-IR-005) */
   const [skillArgumentHint, setSkillArgumentHint] = useState<string | null>(null);
+
+  /**
+   * Autocomplete items to display. Derived from the active trigger mode:
+   * skill triggers map `skillItems` at render time; file triggers use the
+   * results stored in `fileAcItems` by the debounced fetcher.
+   */
+  const acItems = useMemo<AutocompleteItem[]>(() => {
+    if (!activeTrigger) return [];
+    if (activeTrigger.mode === 'skill') {
+      return skillItems.map((s) => ({
+        id: s.name,
+        label: s.name,
+        subtitle: s.description,
+        metadata: s,
+      }));
+    }
+    if (activeTrigger.mode === 'expand' || activeTrigger.mode === 'path') {
+      return fileAcItems;
+    }
+    return [];
+  }, [activeTrigger, skillItems, fileAcItems]);
 
   // =========================================================================
   // File search (REQ-IR-004)
@@ -143,12 +169,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           ...(entry.is_text_file ? {} : { subtitle: 'binary' }),
           metadata: entry,
         }));
-        setAcItems(items);
+        setFileAcItems(items);
       } catch (err) {
         // Ignore abort errors
         if (err instanceof Error && err.name === 'AbortError') return;
         console.warn('File search failed:', err);
-        setAcItems([]);
+        setFileAcItems([]);
       }
     },
     [conversationId],
@@ -170,30 +196,26 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
   }, [conversationId]);
 
-  // Debounced fetch when trigger/query changes
+  // Fire side effects (fetch) on trigger change. No state derivation here —
+  // `acItems` is computed during render via useMemo above.
   useEffect(() => {
     if (!activeTrigger) {
-      setAcItems([]);
+      setFileAcItems([]);
       return;
     }
 
     if (activeTrigger.mode === 'skill') {
-      // Skills are fetched once (cached in skillItems); map to AutocompleteItems here
+      // Skills are fetched once and cached in skillItems. The derived list is
+      // materialized by the `acItems` useMemo during render, so this effect
+      // only needs to trigger the fetch when necessary.
       if (skillItems.length === 0) {
         void fetchSkillItems();
       }
-      const items: AutocompleteItem[] = skillItems.map((s) => ({
-        id: s.name,
-        label: s.name,
-        subtitle: s.description,
-        metadata: s,
-      }));
-      setAcItems(items);
       return;
     }
 
     if (activeTrigger.mode !== 'expand' && activeTrigger.mode !== 'path') {
-      setAcItems([]);
+      setFileAcItems([]);
       return;
     }
 
@@ -205,19 +227,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     return () => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     };
-  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems]);
-
-  // When skillItems updates after a fetch, refresh acItems if skill trigger is still active
-  useEffect(() => {
-    if (activeTrigger?.mode !== 'skill') return;
-    const items: AutocompleteItem[] = skillItems.map((s) => ({
-      id: s.name,
-      label: s.name,
-      subtitle: s.description,
-      metadata: s,
-    }));
-    setAcItems(items);
-  }, [skillItems, activeTrigger?.mode]);
+  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems.length]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -280,8 +290,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       }
 
       setActiveTrigger(null);
-      setAcItems([]);
-
+      // fileAcItems is cleared by the trigger-effect when activeTrigger → null.
       // Restore cursor position after React re-render
       requestAnimationFrame(() => {
         const ta = textareaRef.current;
@@ -296,7 +305,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const handleAcDismiss = useCallback(() => {
     setActiveTrigger(null);
-    setAcItems([]);
   }, []);
 
   // Clear argument hint when the user types past the skill name or clears input
@@ -453,7 +461,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
     // Close autocomplete and ghost text on send
     setActiveTrigger(null);
-    setAcItems([]);
     setSkillArgumentHint(null);
 
     // Clear draft and images eagerly — the message is already queued and

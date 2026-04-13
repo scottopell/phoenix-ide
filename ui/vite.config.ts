@@ -28,4 +28,9 @@ export default defineConfig({
     // as a hard failure in ./dev.py check (BUNDLE_LIMIT_KB = 1200).
     chunkSizeWarningLimit: 9999,
   },
+  // Pre-bundle lucide-react so the dev server doesn't re-scan every icon
+  // file on cold start (rule: bundle-barrel-imports).
+  optimizeDeps: {
+    include: ['lucide-react'],
+  },
 });

@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import type { Message, ToolResultContent, ConversationState } from '../api'; // ConversationState used in MessageListProps
+import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import type { Message, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import type { StreamingBuffer } from '../conversation/atom';
 import {
@@ -18,7 +18,7 @@ interface MessageListProps {
   convState: ConversationState;
   onRetry: (localId: string) => void;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-  systemPrompt?: string;
+  systemPrompt?: string | undefined;
   conversationId?: string | undefined;
   streamingBuffer?: StreamingBuffer | null;
 }
@@ -34,7 +34,104 @@ function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
 }
 
-export function MessageList({ messages, queuedMessages, convState, onRetry, onOpenFile, systemPrompt, conversationId, streamingBuffer }: MessageListProps) {
+interface MessageListBodyProps {
+  messages: Message[];
+  sendingMessages: QueuedMessage[];
+  toolResults: Map<string, Message>;
+  convState: ConversationState;
+  onRetry: (localId: string) => void;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+}
+
+/**
+ * Memoized subtree holding the .map over historical messages. Wrapping this
+ * in React.memo means token updates to `streamingBuffer` (which flow through
+ * the parent MessageList shell) DO NOT cause the historical messages to
+ * re-render — shallow prop compare skips the subtree entirely because
+ * `messages`, `toolResults`, etc. are reference-stable across token arrivals.
+ */
+const MessageListBody = memo(function MessageListBody({
+  messages,
+  sendingMessages,
+  toolResults,
+  convState,
+  onRetry,
+  onOpenFile,
+}: MessageListBodyProps) {
+  return (
+    <>
+      {messages.map((msg) => {
+        const type = msg.message_type || msg.type;
+        if (type === 'user') {
+          return <UserMessage key={msg.sequence_id} message={msg} />;
+        } else if (type === 'skill') {
+          const skillContent = msg.content as { name?: string; trigger?: string };
+          const skillTrigger = skillContent.trigger || '';
+          const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
+          return (
+            <div key={msg.sequence_id} className="message user" data-sequence-id={msg.sequence_id}>
+              <div className="message-header">
+                <span className="message-sender">You</span>
+                {msg.created_at && (
+                  <span className="message-time" title={new Date(msg.created_at).toLocaleString()}>
+                    {formatMessageTime(msg.created_at)}
+                  </span>
+                )}
+              </div>
+              <div className="message-content">
+                <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${skillContent.name || 'skill'}/SKILL.md and delivered to the agent`}>
+                  <span className="skill-label">skill: /{skillContent.name || 'skill'}</span>
+                  {triggerArgs && (
+                    <span className="skill-trigger">{triggerArgs}</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        } else if (type === 'agent') {
+          return (
+            <AgentMessage
+              key={msg.sequence_id}
+              message={msg}
+              toolResults={toolResults}
+              onOpenFile={onOpenFile}
+            />
+          );
+        }
+        if (type === 'system') {
+          const text = (msg.content as { text?: string })?.text;
+          if (text) {
+            return (
+              <div key={msg.sequence_id} className="system-message">
+                <span className="system-message-text">{text}</span>
+              </div>
+            );
+          }
+        }
+        // Skip tool messages - they're rendered inline with their tool_use
+        return null;
+      })}
+      {/* Render queued messages (sending state) */}
+      {sendingMessages.map((msg) => (
+        <QueuedUserMessage key={msg.localId} message={msg} onRetry={onRetry} />
+      ))}
+      {convState.type === 'awaiting_sub_agents' && (
+        <SubAgentStatus stateData={convState} />
+      )}
+    </>
+  );
+});
+
+export function MessageList({
+  messages,
+  queuedMessages,
+  convState,
+  onRetry,
+  onOpenFile,
+  systemPrompt,
+  conversationId,
+  streamingBuffer,
+}: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [showJumpToNewest, setShowJumpToNewest] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
@@ -177,6 +274,8 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
     [queuedMessages],
   );
 
+  const isEmpty = messages.length === 0 && sendingMessages.length === 0;
+
   return (
     <main id="main-area" ref={mainRef} onScroll={handleScroll}>
       <section id="chat-view" className="view active">
@@ -197,75 +296,25 @@ export function MessageList({ messages, queuedMessages, convState, onRetry, onOp
               )}
             </div>
           )}
-          {messages.length === 0 && sendingMessages.length === 0 ? (
+          {isEmpty ? (
             <div className="empty-state">
               <div className="empty-state-icon">✨</div>
               <p>Start a conversation</p>
             </div>
           ) : (
-            <>
-              {messages.map((msg) => {
-                const type = msg.message_type || msg.type;
-                if (type === 'user') {
-                  return <UserMessage key={msg.sequence_id} message={msg} />;
-                } else if (type === 'skill') {
-                  const skillContent = msg.content as { name?: string; trigger?: string };
-                  const skillTrigger = skillContent.trigger || '';
-                  const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
-                  return (
-                    <div key={msg.sequence_id} className="message user" data-sequence-id={msg.sequence_id}>
-                      <div className="message-header">
-                        <span className="message-sender">You</span>
-                        {msg.created_at && (
-                          <span className="message-time" title={new Date(msg.created_at).toLocaleString()}>
-                            {formatMessageTime(msg.created_at)}
-                          </span>
-                        )}
-                      </div>
-                      <div className="message-content">
-                        <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${skillContent.name || 'skill'}/SKILL.md and delivered to the agent`}>
-                          <span className="skill-label">skill: /{skillContent.name || 'skill'}</span>
-                          {triggerArgs && (
-                            <span className="skill-trigger">{triggerArgs}</span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                } else if (type === 'agent') {
-                  return (
-                    <AgentMessage
-                      key={msg.sequence_id}
-                      message={msg}
-                      toolResults={toolResults}
-                      onOpenFile={onOpenFile}
-                    />
-                  );
-                }
-                if (type === 'system') {
-                  const text = (msg.content as { text?: string })?.text;
-                  if (text) {
-                    return (
-                      <div key={msg.sequence_id} className="system-message">
-                        <span className="system-message-text">{text}</span>
-                      </div>
-                    );
-                  }
-                }
-                // Skip tool messages - they're rendered inline with their tool_use
-                return null;
-              })}
-              {/* Render queued messages (sending state) */}
-              {sendingMessages.map((msg) => (
-                <QueuedUserMessage key={msg.localId} message={msg} onRetry={onRetry} />
-              ))}
-              {convState.type === 'awaiting_sub_agents' && (
-                <SubAgentStatus stateData={convState} />
-              )}
-              {/* Streaming text — cleared atomically when sse_message arrives (REQ-UI-019) */}
-              <StreamingMessage buffer={streamingBuffer ?? null} />
-            </>
+            <MessageListBody
+              messages={messages}
+              sendingMessages={sendingMessages}
+              toolResults={toolResults}
+              convState={convState}
+              onRetry={onRetry}
+              onOpenFile={onOpenFile}
+            />
           )}
+          {/* Streaming text — cleared atomically when sse_message arrives (REQ-UI-019).
+              Lives OUTSIDE <MessageListBody> so token updates only re-render this element,
+              not the historical message list. */}
+          <StreamingMessage buffer={streamingBuffer ?? null} />
         </div>
       </section>
       {showJumpToNewest && (
