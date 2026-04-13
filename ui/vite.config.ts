@@ -1,12 +1,24 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import { writeFileSync } from 'fs';
+import { resolve } from 'path';
+
+// Restore .gitkeep after vite wipes dist/ so fresh worktrees compile.
+function gitkeep(): Plugin {
+  return {
+    name: 'gitkeep',
+    closeBundle() {
+      writeFileSync(resolve(__dirname, 'dist/.gitkeep'), '');
+    },
+  };
+}
 
 // API port can be overridden via VITE_API_PORT env var
 const apiPort = process.env.VITE_API_PORT || '8000';
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), gitkeep()],
   server: {
     allowedHosts: true,
     proxy: {
