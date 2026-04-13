@@ -175,7 +175,7 @@ PTY master fds are pollable on Linux and work with tokio's reactor.
 ```
 WebSocket connection accepted
   ├── Spawn PTY + shell (sync, in spawn_blocking or before async handoff)
-  ├── Task A: loop { read(master_fd) → WebSocket binary frame + vt100 parser }
+  ├── Task A: loop { read(master_fd) → WebSocket binary frame + command_tracker.ingest(&bytes) }
   │     EIO → clean shutdown (not error)
   └── Task B: loop { WebSocket frame → write(master_fd) OR ioctl(TIOCSWINSZ) }
 ```
@@ -207,7 +207,7 @@ Send immediately on WebSocket open, before the shell produces its first prompt:
 ```rust
 // After WS upgrade, before entering the read loop:
 let dims = wait_for_initial_resize_frame(&mut ws).await?;
-apply_resize(&master_fd, &mut parser, dims);
+apply_resize(&master_fd, dims);
 ```
 
 xterm.js FitAddon computes cols/rows from the DOM and sends a resize frame as its
@@ -216,7 +216,7 @@ first message on connect.
 ### Resize Application
 
 ```rust
-fn apply_resize(master_fd: &OwnedFd, parser: &mut vt100::Parser, dims: Dims) {
+fn apply_resize(master_fd: &OwnedFd, dims: Dims) {
     let ws = libc::winsize {
         ws_col: dims.cols as u16,
         ws_row: dims.rows as u16,
@@ -224,46 +224,85 @@ fn apply_resize(master_fd: &OwnedFd, parser: &mut vt100::Parser, dims: Dims) {
         ws_ypixel: 0,
     };
     unsafe { libc::ioctl(master_fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
-    parser.set_size(dims.rows, dims.cols); // keep parser in sync
     // Kernel delivers SIGWINCH to foreground process group automatically
 }
 ```
 
-## vt100 Parser / Scraping Layer (REQ-TERM-010, REQ-TERM-011)
+## Command Tracker (REQ-TERM-010, REQ-TERM-021)
 
-A `vt100::Parser` instance runs server-side alongside the output path:
+A `CommandTracker` runs server-side, fed every byte from the PTY output path.
+It implements `vte::Perform` to capture structured command records via OSC 133
+C/D markers.
 
-```rust
-// Task A: same bytes going to WebSocket also feed the parser
-let bytes = read_master_fd(&master_fd).await?;
-ws_sender.send(binary_frame(0x00, &bytes)).await?;
-parser.process(&bytes);  // in-order, no gaps
-```
-
-**Critical invariants:**
-- Parser initialized with the same `(rows, cols)` as the terminal.
-- Resized on every `TIOCSWINSZ` call (same `apply_resize` function).
-- Every byte sent to WebSocket also goes to parser, in order, with no gaps.
-  The parser is a state machine — dropped or reordered bytes corrupt its state
-  permanently for that session.
-
-### Quiescence Debounce
-
-For agent reads, PTY quiescence (output stream quiet for 300ms) is a reliable
-signal that a command has completed. The `read_terminal` tool may be called at any
-time; callers should prefer reading after quiescence for meaningful output.
-
-### `read_terminal` Tool
-
-The tool fetches the current screen state from the parser:
+### CommandRecord
 
 ```rust
-// read_terminal tool run():
-let text = parser.screen().contents();
-ToolOutput::success(text)
+struct CommandRecord {
+    command_text: String,       // OSC 133;C payload (may be empty)
+    output:       String,       // captured text, ANSI stripped; may include disk path if truncated
+    exit_code:    Option<i32>,  // from OSC 133;D; None if D omits code
+    started_at:   Timestamp,    // when C was processed
+    duration_ms:  u64,          // milliseconds from C to D
+}
 ```
 
-The tool returns an error if no terminal is active for the conversation.
+### How CommandTracker implements vte::Perform
+
+`vte` parses the byte stream and calls the `Perform` trait methods for each decoded
+element. `CommandTracker` uses only three:
+
+- `print(char)`: appends the character to the current output buffer when capturing
+  (i.e. between a C and D marker). `vte` calls `print` only for printable characters
+  — escape sequences never reach it. ANSI stripping is therefore structural, not
+  a post-processing step.
+- `execute(byte)`: appends a newline (`\n`) to the buffer when the byte is `0x0a`
+  (LF) and capturing is active; all other control bytes are ignored.
+- `osc_dispatch(params, bell_terminated)`: intercepts OSC 133 sequences. On a `C`
+  marker, starts a new capture (stores command_text, records started_at, resets the
+  output buffer). On a `D` marker, finalises the capture (computes duration_ms,
+  records exit_code, applies truncation if needed, pushes to the ring buffer). `A`
+  and `B` markers are accepted and ignored.
+
+Everything else (`hook`, `put`, `unhook`, `csi_dispatch`, `esc_dispatch`) is a
+no-op — `CommandTracker` has no grid, no cursor, and no resize state.
+
+### Ring Buffer
+
+```rust
+struct CommandTracker {
+    records:         VecDeque<CommandRecord>, // capacity 5
+    current_capture: Option<CaptureState>,
+    session_id:      SessionId,
+    seq:             u64,
+}
+```
+
+`VecDeque` with a fixed capacity of 5. When a 6th record would be pushed,
+`pop_front` is called first to evict the oldest entry.
+
+### Output Truncation
+
+The 128KB threshold matches the bash tool's `MAX_OUTPUT_LENGTH` constant. When
+`current_capture.output.len()` exceeds 128KB at finalisation:
+
+1. Write the full output bytes to `~/.phoenix-ide/terminal-output/<session-id>/<seq>.txt`.
+2. Store a truncated preview (first 4KB) with the disk path appended in the record's
+   `output` field, in the same format as the bash tool's `truncate_output` helper.
+3. Increment `seq` after each record so disk files are uniquely named.
+
+### Placement in TerminalHandle
+
+```rust
+struct TerminalHandle {
+    master_fd:       OwnedFd,
+    child_pid:       Pid,
+    command_tracker: Arc<Mutex<CommandTracker>>,
+}
+```
+
+`command_tracker` is behind `Arc<Mutex<_>>` so both Task A (which calls
+`command_tracker.ingest(&bytes)`) and the tool handlers (which read from the ring
+buffer) can access it without shared mutable state.
 
 ## Session Teardown
 
@@ -292,7 +331,7 @@ via the same master fd close → SIGHUP chain.
 | Purpose | Crate | Status | Notes |
 |---|---|---|---|
 | PTY syscalls | `nix` | ✅ In Cargo.toml | Add `pty` to features: `features = ["signal", "process", "pty"]` |
-| vt100 parsing | `vt100` | ❌ Not present | Add to Cargo.toml |
+| OSC 133 parsing and output capture | `vte` | ❌ Not present | Add to Cargo.toml; implement `Perform` trait on `CommandTracker` |
 | WebSocket | `axum` | ⚠️ Feature missing | Add `"ws"` to axum features: `features = ["macros", "ws"]` |
 | Async runtime | `tokio` | ✅ In Cargo.toml | No changes needed |
 
@@ -312,7 +351,6 @@ stack concrete and understandable.
 ### Sizing
 - **Initial size race**: xterm.js sends resize as its first frame; wait for it before
   the shell produces output.
-- **vt100 parser out of sync**: call `parser.set_size()` on every `TIOCSWINSZ`.
 
 ### WebSocket
 - **Binary frames only**: text frames corrupt arbitrary PTY bytes.

@@ -1104,8 +1104,7 @@ mod tests {
         for tool in tools {
             assert!(
                 tool.get("defer_loading").is_none(),
-                "defer_loading should be omitted when tool search is disabled: {}",
-                tool
+                "defer_loading should be omitted when tool search is disabled: {tool}"
             );
         }
 

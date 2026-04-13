@@ -566,7 +566,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Write a skill under `{base}/{skills_subdir}/{skill_dir_name}/SKILL.md`.
-    /// `skills_subdir` should be one of SKILL_DIRS (e.g. ".claude/skills").
+    /// `skills_subdir` should be one of `SKILL_DIRS` (e.g. ".claude/skills").
     fn write_skill(
         base: &Path,
         skills_subdir: &str,

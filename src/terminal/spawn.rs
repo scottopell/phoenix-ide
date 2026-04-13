@@ -1,7 +1,7 @@
 //! PTY spawn path — REQ-TERM-001, REQ-TERM-002
 
-use super::alacritty_parser::AlacrittyParser;
-use super::session::{Dims, TerminalHandle};
+use super::command_tracker::CommandTracker;
+use super::session::{Dims, ShellIntegrationStatus, TerminalHandle};
 use nix::{
     pty::openpty,
     unistd::{close, dup2, execve, fork, setsid, ForkResult},
@@ -12,7 +12,6 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-use tokio::sync::watch;
 
 /// Spawn a PTY-backed interactive shell in `cwd`.
 ///
@@ -98,22 +97,21 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
             // master_raw is now owned by the OwnedFd below.
             std::mem::forget(pty.slave);
 
-            // Initialize the parser at the same dimensions as the PTY
-            // (REQ-TERM-010: ParserDimensionSync invariant).
-            let parser = AlacrittyParser::new(initial_dims.rows, initial_dims.cols);
-
-            let (quiescence_tx, _) = watch::channel(0u64);
-
             // SAFETY: master_raw is a valid fd; we take ownership here.
             let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };
             // Forget the openpty OwnedFd to avoid double-close.
             std::mem::forget(pty.master);
 
+            // Use conversation_id placeholder; ws.rs updates tracker session when
+            // the handle is registered. The conversation_id is not available at spawn
+            // time, so we use the child PID as a unique session identifier.
+            let session_id = child.to_string();
+
             Ok(TerminalHandle {
                 master_fd,
                 child_pid: child,
-                parser: Arc::new(Mutex::new(parser)),
-                quiescence_tx,
+                tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
+                shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
             })
         }
     }

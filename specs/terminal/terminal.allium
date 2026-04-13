@@ -5,19 +5,19 @@
 --
 -- Scope: PTY-backed browser terminal per conversation
 -- Includes: Terminal session lifecycle, PTY spawn, WebSocket I/O relay,
---           resize handling, vt100 screen parser, read_terminal agent tool,
---           session teardown, conversation-terminal cascade,
+--           resize handling, command tracker, terminal_last_command,
+--           terminal_command_history, session teardown,
+--           conversation-terminal cascade,
 --           authentication identity precondition (session-scoped user)
 -- Excludes:
 --   - UI panel placement (deferred to implementation)
 --   - Scrollback persistence (ephemeral; tmux integration deferred)
---   - Shell integration markers / OSC 133 (v2)
 --   - macOS PTY kqueue considerations (Linux target for v1)
 --   - Multiple terminals per conversation (exactly one)
 --   - PTY privilege escalation (API runs as same Unix user as shell)
 --   - WebSocket auth mechanism specifics (cookie vs header; see design.md)
 --
--- Requirement traceability: REQ-TERM-001 through REQ-TERM-014
+-- Requirement traceability: REQ-TERM-001 through REQ-TERM-014, REQ-TERM-021 through REQ-TERM-023
 -- Dependencies: specs/bedrock/bedrock.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -88,12 +88,13 @@ value WsFrame {
 }
 
 -- A single command executed via the shell, tracked via OSC 133 markers.
--- Populated at C, finalised at D. (REQ-TERM-016)
-value CommandExecution {
+-- Populated at C, finalised at D. (REQ-TERM-016, REQ-TERM-021)
+value CommandRecord {
     command_text: String       -- payload of OSC 133;C (may be empty)
+    output:       String       -- text captured between C and D; ANSI stripped; may include disk path when truncated
     started_at:   Timestamp    -- when C was processed
-    exit_code:    Integer?     -- from OSC 133;D payload; None when still executing or when D omits code
-    finished_at:  Timestamp?   -- when D was processed; None while still executing
+    duration_ms:  Integer      -- milliseconds from C to D
+    exit_code:    Integer?     -- from OSC 133;D payload; None when D omits code — do not substitute 0
 }
 
 ------------------------------------------------------------
@@ -132,24 +133,34 @@ entity Terminal {
     master_fd:  OwnedFd            when status = active
     child_pid:  Pid                when status = active
     dimensions: TerminalDimensions when status = active
-    parser:     Vt100Parser        when status = active
-        -- parser.dimensions = terminal.dimensions at all times (ParserDimensionSync)
 
     -- Shell integration fields (REQ-TERM-015 through REQ-TERM-018).
     -- Initial value of shell_integration_status is `unknown`; it transitions
     -- monotonically via ShellIntegrationDetected or ShellIntegrationDetectionTimedOut.
     shell_integration_status: ShellIntegrationStatus when status = active
 
+    -- Ring buffer of completed command records. Capacity 5; oldest evicted on overflow.
+    -- Empty when shell_integration_status != detected. (REQ-TERM-021)
+    command_records: RingBuffer(CommandRecord, capacity=5)
+        when status = active and shell_integration_status = detected
+
     -- The currently executing command (if any). Set by CommandExecutionStarted,
     -- cleared by CommandExecutionFinished. At most one at a time
     -- (OneExecutingCommandAtATime).
-    current_command: CommandExecution?
+    current_command: CommandRecord?
+        when status = active and shell_integration_status = detected
+
+    -- Output accumulation buffer: printable characters appended by CommandTracker
+    -- between a C and D marker. Cleared on CommandExecutionStarted, finalised on
+    -- CommandExecutionFinished. Lives inside CommandTracker; exposed here as a
+    -- conceptual entity field for the ensures clauses in those rules.
+    output_buffer: String
         when status = active and shell_integration_status = detected
 
     -- The most recently completed command. Set by CommandExecutionFinished,
     -- cleared by CommandExecutionStarted on the next OSC 133;C. Drives the
     -- transient ✓/✗ display in the HUD.
-    last_completed_command: CommandExecution?
+    last_completed_command: CommandRecord?
         when status = active and shell_integration_status = detected
 
     -- Working directory reported via OSC 7. None means "never reported";
@@ -162,18 +173,22 @@ entity Terminal {
 ------------------------------------------------------------
 
 config {
-    quiescence_debounce: Duration = 300.ms
-    -- After PTY output goes quiet for this duration, the parser state is
-    -- considered stable. Used as an optimisation hint for agent reads.
-
     output_channel_bound: Integer = 4096
     -- Maximum bytes buffered in the master-fd→WebSocket channel before backpressure.
     -- Prevents fast producers (yes, large cat) from unboundedly queuing.
 
     shell_integration_detection_window: Duration = 5.s
-    -- Bytes must contain at least one OSC 133 marker within this window from
+    -- Bytes must contain at least one OSC 133 C marker within this window from
     -- terminal spawn or the session is locked at shell_integration_status = absent.
     -- (REQ-TERM-015)
+
+    command_record_ring_capacity: Integer = 5
+    -- Maximum CommandRecord entries retained per terminal session.
+    -- When a 6th command completes, the oldest record is evicted. (REQ-TERM-021)
+
+    command_output_truncation_threshold: Integer = 131072
+    -- 128KB. Output exceeding this is written to disk; a truncated preview + path
+    -- is stored in CommandRecord.output. Matches bash tool MAX_OUTPUT_LENGTH. (REQ-TERM-021)
 }
 
 ------------------------------------------------------------
@@ -188,7 +203,6 @@ rule TerminalOpened {
     requires: Terminal(conversation).status = absent
 
     ensures: terminal: Terminal.status = active
-    ensures: terminal.parser = Vt100Parser.initialized(dimensions: terminal.dimensions)
     ensures: PtySpawned(terminal)
 
     @guidance
@@ -211,7 +225,7 @@ rule TerminalOpened {
         --      on connect; treat it as a required handshake, not optional input.
         --      Apply via ResizeApplied before the shell produces its first prompt.
         --   4. Spawn two async tasks:
-        --        Task A: loop { read(master_fd) → WS frame + parser.process() }
+        --        Task A: loop { read(master_fd) → WS frame + command_tracker.ingest(bytes) }
         --                EIO → clean shutdown
         --        Task B: loop { WS frame → write(master_fd) | ioctl(TIOCSWINSZ) }
         --   5. Both tasks hold Arc<TerminalHandle>. Either exiting shuts down the other.
@@ -253,25 +267,26 @@ rule DuplicateTerminalRejected {
         -- making this path unreachable in normal operation.
 }
 
--- REQ-TERM-004, REQ-TERM-010: PTY output forwarded to WebSocket and parser
+-- REQ-TERM-004, REQ-TERM-010: PTY output forwarded to WebSocket and command tracker
 rule PtyOutputForwarded {
     when: BytesReadFromMaster(terminal, bytes)
 
     requires: terminal.status = active
 
     ensures: WebSocketBinaryFrameSent(terminal, prefix: 0x00, payload: bytes)
-    ensures: terminal.parser.process(bytes)
+    ensures: terminal.command_tracker.ingest(bytes)
         -- Same bytes, same order, no gaps. Both ensures fire in the same handler.
 
     @guidance
-        -- The vt100 parser is a state machine. Dropped or reordered bytes corrupt
-        -- its state permanently for that session. The two ensures (WS send and
-        -- parser feed) must occur together with no interleaving path that skips either.
+        -- The CommandTracker is a state machine over OSC 133 boundaries. Dropped or
+        -- reordered bytes can corrupt C/D pairing, producing garbled output records
+        -- or missed commands. The two ensures (WS send and tracker ingest) must occur
+        -- together with no interleaving path that skips either.
         --
         -- The internal master-fd→WebSocket channel is bounded to config.output_channel_bound
         -- bytes. A slow WebSocket consumer causes backpressure that pauses reads from
         -- master_fd, which is correct: the kernel buffers on the PTY side.
-        -- Do NOT drop bytes to relieve backpressure; the parser would become corrupt.
+        -- Do NOT drop bytes to relieve backpressure; the tracker would miss boundaries.
 }
 
 -- REQ-TERM-005: Initial resize applied before first prompt
@@ -294,7 +309,7 @@ rule InitialResizeSent {
         -- will have started at its PTY default size (80×24).
 }
 
--- REQ-TERM-006: Resize applied to PTY and parser
+-- REQ-TERM-006: Resize applied to PTY
 rule ResizeApplied {
     when: ResizeFrameReceived(terminal, dimensions)
 
@@ -303,14 +318,12 @@ rule ResizeApplied {
     requires: dimensions.rows > 0
 
     ensures: terminal.dimensions = dimensions
-    ensures: terminal.parser = terminal.parser.resized(dimensions)
-        -- Parser dimensions must always equal terminal dimensions (ParserDimensionSync)
     ensures: IoctlTIOCSWINSZ(terminal.master_fd, dimensions)
         -- Kernel delivers SIGWINCH to foreground process group automatically
 
     @guidance
-        -- apply_resize() helper applies both the ioctl and parser.set_size() atomically
-        -- so the two never diverge between calls.
+        -- apply_resize() applies only the ioctl. The CommandTracker has no
+        -- concept of screen dimensions; no tracker update is needed.
 }
 
 -- REQ-TERM-006: Invalid resize dimensions logged
@@ -319,9 +332,8 @@ rule ResizeFrameRejected {
 
     requires: terminal.status = active
     requires: dimensions.cols < 2 or dimensions.rows <= 0
-        -- cols >= 2 is required by AlacrittyParser (upstream wide-char OOB bug on cols=1;
-        -- see task 24676). cols=0 and cols=1 are both invalid. All construction sites
-        -- use Dims::try_new which encodes this structurally.
+        -- cols >= 2: cols=0 and cols=1 are both invalid for PTY operations.
+        -- All construction sites use Dims::try_new which encodes this structurally.
 
     ensures: InvalidResizeDimensionsLogged(terminal, dimensions)
         -- No state change; dimensions remain as before.
@@ -382,39 +394,81 @@ rule UserClosedTerminal {
         -- and reap. Calling it in two places risks a race or double-reap.
 }
 
--- REQ-TERM-011: Agent reads terminal screen
-rule TerminalScreenRead {
-    when: AgentCallsReadTerminal(conversation)
+-- REQ-TERM-022: Agent reads most recent command record (success)
+rule AgentCallsTerminalLastCommand {
+    when: AgentCallsTerminalLastCommand(conversation)
 
     requires: Terminal(conversation).status = active
+    requires: terminal.shell_integration_status = detected
+    requires: terminal.command_records not empty
 
-    ensures: AgentReceivesScreenContents(Terminal(conversation).parser.screen().contents())
+    ensures: AgentReceivesCommandRecord(terminal.command_records.last())
 
     @guidance
-        -- Returns plain text from vt100::Parser::screen().contents().
-        -- Callers may read at any time; for best results read after PTY quiescence
-        -- (config.quiescence_debounce has elapsed with no new output) as that
-        -- reliably indicates a command has completed.
+        -- Returns the most recently completed CommandRecord from the ring buffer.
+        -- The record includes command_text, output, exit_code, started_at,
+        -- and duration_ms. If output was truncated, the output field contains
+        -- a preview + disk path (see REQ-TERM-021 / CommandExecutionFinished).
 }
 
--- REQ-TERM-011: No terminal active for read request
-rule TerminalScreenReadAbsent {
-    when: AgentCallsReadTerminal(conversation)
+-- REQ-TERM-022: Shell integration absent — terminal_last_command returns error
+rule AgentCallsTerminalLastCommandAbsent {
+    when: AgentCallsTerminalLastCommand(conversation)
 
-    requires: Terminal(conversation).status = absent
+    requires: Terminal(conversation).status = active
+    requires: terminal.shell_integration_status != detected
 
-    ensures: AgentReceivesError("no terminal is open for this conversation")
+    ensures: AgentReceivesError("shell integration is not active for this terminal — install the shell integration snippet to enable command tracking")
 }
 
--- Optimisation hint: quiescence detection
-rule PtyQuiesced {
-    when: NoBytesReadFromMaster(terminal) for config.quiescence_debounce
+-- REQ-TERM-022: Ring buffer empty — terminal_last_command returns error
+rule AgentCallsTerminalLastCommandEmpty {
+    when: AgentCallsTerminalLastCommand(conversation)
 
-    requires: terminal.status = active
+    requires: Terminal(conversation).status = active
+    requires: terminal.shell_integration_status = detected
+    requires: terminal.command_records is empty
 
-    ensures: PtyIsQuiescent(terminal)
-        -- Signal available for agent polling optimisation.
-        -- Not required for correctness; callers may read terminal at any time.
+    ensures: AgentReceivesError("no commands have completed in this terminal session yet")
+}
+
+-- REQ-TERM-023: Agent reads command history (success)
+rule AgentCallsTerminalCommandHistory {
+    when: AgentCallsTerminalCommandHistory(conversation, count)
+
+    requires: Terminal(conversation).status = active
+    requires: terminal.shell_integration_status = detected
+    requires: terminal.command_records not empty
+    requires: count >= 1 and count <= 5
+
+    ensures: AgentReceivesCommandRecords(terminal.command_records.last(count))
+        -- Returns up to `count` records newest-first. Default count = 3 when omitted.
+
+    @guidance
+        -- count defaults to 3 when not supplied by the caller; max is 5 (ring capacity).
+        -- Records are returned newest-first (most recent command at index 0).
+        -- If fewer than count records exist, return all available records.
+}
+
+-- REQ-TERM-023: Shell integration absent — terminal_command_history returns error
+rule AgentCallsTerminalCommandHistoryAbsent {
+    when: AgentCallsTerminalCommandHistory(conversation, count)
+
+    requires: Terminal(conversation).status = active
+    requires: terminal.shell_integration_status != detected
+
+    ensures: AgentReceivesError("shell integration is not active for this terminal — install the shell integration snippet to enable command tracking")
+}
+
+-- REQ-TERM-023: Ring buffer empty — terminal_command_history returns error
+rule AgentCallsTerminalCommandHistoryEmpty {
+    when: AgentCallsTerminalCommandHistory(conversation, count)
+
+    requires: Terminal(conversation).status = active
+    requires: terminal.shell_integration_status = detected
+    requires: terminal.command_records is empty
+
+    ensures: AgentReceivesError("no commands have completed in this terminal session yet")
 }
 
 -- REQ-TERM-012: Terminal torn down when conversation ends
@@ -486,12 +540,14 @@ rule CommandExecutionStarted {
     requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
 
-    ensures: terminal.current_command = CommandExecution(
+    ensures: terminal.current_command = CommandRecord(
         command_text: command_text,
+        output:       "",
         started_at:   now(),
+        duration_ms:  0,
         exit_code:    None,
-        finished_at:  None,
     )
+    ensures: terminal.output_buffer = ""
     ensures: terminal.last_completed_command = None
 
     @guidance
@@ -509,7 +565,7 @@ rule CommandExecutionStarted {
         -- ~50ms of visibility in shells that emit A back-to-back with D.
 }
 
--- REQ-TERM-016: OSC 133;D → finish the current command
+-- REQ-TERM-016, REQ-TERM-021: OSC 133;D → finish the current command
 rule CommandExecutionFinished {
     when: Osc133MarkerReceived(terminal, 'D', exit_code_opt)
 
@@ -517,12 +573,14 @@ rule CommandExecutionFinished {
     requires: terminal.shell_integration_status = detected
     requires: terminal.current_command != None
 
-    ensures: terminal.last_completed_command = CommandExecution(
+    ensures: terminal.last_completed_command = CommandRecord(
         command_text: terminal.current_command.command_text,
+        output:       finalize(terminal.output_buffer),
         started_at:   terminal.current_command.started_at,
+        duration_ms:  elapsed_ms(terminal.current_command.started_at, now()),
         exit_code:    exit_code_opt,
-        finished_at:  now(),
     )
+    ensures: terminal.command_records.push(terminal.last_completed_command)
     ensures: terminal.current_command = None
 
     @guidance
@@ -531,6 +589,14 @@ rule CommandExecutionFinished {
         --   D;0     → finished, success
         --   D;N     → finished, failure with specific code N
         -- All three are valid. Store None when absent; never fabricate 0.
+        --
+        -- finalize(output_buffer): if len > 128KB, write full bytes to
+        -- ~/.phoenix-ide/terminal-output/<session-id>/<seq>.txt and store a
+        -- truncated preview with the path appended. This matches the bash tool's
+        -- MAX_OUTPUT_LENGTH constant and truncate_output format.
+        --
+        -- command_records.push() evicts the oldest record if capacity (5) is
+        -- exceeded before inserting the new one.
 }
 
 -- REQ-TERM-016: OSC 133;D with no current_command → no-op
@@ -597,21 +663,21 @@ invariant OneTerminalPerConversation {
         count(Terminal where conversation = c and status = active) <= 1
 }
 
--- REQ-TERM-006, REQ-TERM-010
-invariant ParserDimensionSync {
-    for t in Terminals where t.status = active:
-        t.parser.dimensions = t.dimensions
-    -- Maintained by ResizeApplied firing apply_resize() which updates both
-    -- terminal.dimensions and parser.set_size() in the same call.
+-- REQ-TERM-010
+invariant CommandTrackerFedEveryByte {
+    -- Every byte delivered to the WebSocket client has also been ingested by the
+    -- CommandTracker in the same order, with no gaps.
+    -- Structural guarantee: PtyOutputForwarded has both the WS send and
+    -- command_tracker.ingest() in its ensures block, with no conditional path
+    -- that performs one without the other.
 }
 
--- REQ-TERM-010
-invariant ParserFedEveryByte {
-    -- Every byte delivered to the WebSocket client has been processed by the
-    -- vt100 parser in the same order, with no gaps.
-    -- Structural guarantee: PtyOutputForwarded has both the WS send and
-    -- parser.process() in its ensures block, with no conditional path
-    -- that performs one without the other.
+-- REQ-TERM-021
+invariant CommandRecordRingBufferBound {
+    for t in Terminals where t.status = active and t.shell_integration_status = detected:
+        count(t.command_records) <= 5
+    -- Maintained by CommandExecutionFinished calling pop_front before push
+    -- when the buffer is at capacity.
 }
 
 -- REQ-TERM-015
@@ -644,15 +710,17 @@ invariant OneExecutingCommandAtATime {
 invariant CommandLifecycleFieldsCoherent {
     for t in Terminals where t.shell_integration_status = detected:
         t.current_command != None implies (
-            t.current_command.finished_at = None and
+            t.current_command.duration_ms = 0 and
             t.current_command.exit_code = None
         )
         t.last_completed_command != None implies (
-            t.last_completed_command.finished_at != None
+            t.last_completed_command.duration_ms >= 0
         )
-    -- An executing command has neither finished_at nor exit_code.
-    -- A completed command always has finished_at; exit_code may still be None
-    -- if OSC 133;D omitted the code.
+    -- An in-progress command has duration_ms=0 and no exit_code.
+    -- A completed command has duration_ms >= 0; sub-millisecond commands produce
+    -- duration_ms=0 due to as_millis() truncation. Presence in the ring buffer
+    -- is the completeness sentinel, not a positive duration. exit_code may still
+    -- be None if OSC 133;D omitted the code.
 }
 
 ------------------------------------------------------------
@@ -694,11 +762,19 @@ surface AgentTerminalAccess {
 
     exposes:
         terminal.status
+        terminal.shell_integration_status
+        terminal.command_records
 
     provides:
-        AgentCallsReadTerminal(conversation)
-            -- Available regardless of terminal.status;
-            -- TerminalScreenReadAbsent handles the absent case gracefully.
+        AgentCallsTerminalLastCommand(conversation)
+            -- Returns the most recent CommandRecord, or an error if shell
+            -- integration is absent or no commands have completed yet.
+            -- (REQ-TERM-022)
+
+        AgentCallsTerminalCommandHistory(conversation, count)
+            -- Returns up to `count` recent CommandRecords newest-first.
+            -- count defaults to 3, max 5. Same error conditions as above.
+            -- (REQ-TERM-023)
 }
 
 -- REQ-TERM-015, REQ-TERM-016, REQ-TERM-018: OSC 133 + OSC 7 contract
@@ -761,6 +837,15 @@ deferred TmuxIntegration.named_sessions
     -- Future path for users who want scrollback or session persistence.
     -- KISS: named sessions only. See KT doc for context.
 
+deferred ShellIntegrationAbsentFallback
+    -- If evidence shows users need read-screen capability when shell integration
+    -- is absent, a minimal grid scraper (vt100/alacritty_terminal) could be
+    -- added as a fallback. Explicitly out of scope for this version: the
+    -- command-record model (REQ-TERM-021 through REQ-TERM-023) requires
+    -- shell integration; absent integration returns an error, not degraded output.
+    -- Revisit if user feedback indicates the error is blocking enough workflows
+    -- to justify the complexity of maintaining a grid scraper in parallel.
+
 deferred ShellIntegrationAutoInjection
     -- Phoenix could inject OSC 133 precmd/preexec hooks into the user's shell
     -- by manipulating ZDOTDIR, --rcfile, or $BASH_ENV at spawn time. This
@@ -790,10 +875,18 @@ deferred macOsKqueueSupport
 --   - Same Unix user: yes, no setuid needed
 --   - Max terminals per conversation: exactly 1 (409 on duplicate)
 --   - UI placement: deferred to implementation
---   - vt100 scraping: v1, included in this spec
+--   - Agent tool model: command-record model (REQ-TERM-021 through REQ-TERM-023),
+--     replacing the grid-scrape v1 approach. Decisions resolved April 2026:
+--       * read_terminal removed; absent shell integration → error (no fallback)
+--       * Ring buffer capacity: 5
+--       * Truncation threshold: 128KB (matching bash tool MAX_OUTPUT_LENGTH)
+--       * Truncated output written to disk at
+--         ~/.phoenix-ide/terminal-output/<session-id>/<seq>.txt
+--       * Parser: vte crate directly (not alacritty_terminal); implements Perform
+--       * No grid, no cursor tracking, no resize tracking in CommandTracker
+--       * OSC 133 A/B remain no-ops
 --   - WebSocket auth: same session as rest of API (mechanism in design.md)
 --   - Output persistence: ephemeral; tmux integration deferred
---   - Agent access: yes, read_terminal tool in v1
 --   - Cross-spec lifecycle trigger: bedrock/ConversationBecameTerminal (named
 --     chained event) preferred over cross-spec state-watch on is_terminal.
 --     Rationale and design discussion: tasks/08658.

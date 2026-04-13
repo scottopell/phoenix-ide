@@ -6,17 +6,22 @@
 //!
 //! See `specs/terminal/` for the full behavioral specification.
 
+// AlacrittyParser is retained for the evaluation proptests (alac_proptest module)
+// and as a reference implementation. It is no longer used in production paths.
+#[cfg(test)]
 pub mod alacritty_parser;
+pub mod command_tracker;
 #[cfg(test)]
 mod proptests;
 mod relay;
 mod session;
 mod spawn;
 #[cfg(test)]
+pub(crate) mod test_helpers;
+#[cfg(test)]
 mod wezterm_parser;
 mod ws;
 
 pub use session::ActiveTerminals;
-#[allow(unused_imports)]
-pub use session::TerminalHandle; // Used by Task 5 teardown and read_terminal tool
+pub use session::ShellIntegrationStatus;
 pub use ws::terminal_ws_handler;

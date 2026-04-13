@@ -12,10 +12,11 @@ pub mod patch;
 mod propose_task;
 mod read_file;
 mod read_image;
-mod read_terminal;
 mod search;
 mod skill;
 mod subagent;
+mod terminal_command_history;
+mod terminal_last_command;
 mod think;
 
 pub use ask_user_question::AskUserQuestionTool;
@@ -30,10 +31,11 @@ pub use patch::PatchTool;
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
-pub use read_terminal::ReadTerminalTool;
 pub use search::SearchTool;
 pub use skill::SkillTool;
 pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
+pub use terminal_command_history::TerminalCommandHistoryTool;
+pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
 
 use async_trait::async_trait;
@@ -300,7 +302,8 @@ impl ToolRegistry {
             Arc::new(PatchTool::default()),
             Arc::new(KeywordSearchTool),
             Arc::new(ReadImageTool),
-            Arc::new(ReadTerminalTool),
+            Arc::new(TerminalLastCommandTool),
+            Arc::new(TerminalCommandHistoryTool),
             // Browser tools
             Arc::new(BrowserNavigateTool),
             Arc::new(BrowserEvalTool),

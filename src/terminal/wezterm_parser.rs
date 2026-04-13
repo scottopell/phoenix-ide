@@ -1,4 +1,4 @@
-//! Proof-of-concept adapter: wezterm-term as a drop-in for vt100::Parser.
+//! Proof-of-concept adapter: wezterm-term as a drop-in for `vt100::Parser`.
 //!
 //! This module is **evaluation only** — it is never called from production code.
 //! It exists to prove API parity and run the stress proptests against
@@ -110,6 +110,7 @@ impl WezParser {
     }
 
     /// Equivalent of `parser.screen().size() -> (rows, cols)`.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn size(&self) -> (u16, u16) {
         let s = self.terminal.screen();
         (s.physical_rows as u16, s.physical_cols as u16)
@@ -122,6 +123,7 @@ impl WezParser {
     /// We replicate that contract here.
     pub fn contents(&self) -> String {
         let screen = self.terminal.screen();
+        #[allow(clippy::cast_possible_wrap)]
         let phys_range = screen.phys_range(&(0..screen.physical_rows as VisibleRowIndex));
         let lines = screen.lines_in_phys_range(phys_range);
         let mut result: String = lines
@@ -137,6 +139,7 @@ impl WezParser {
     }
 
     /// Equivalent of `parser.screen().cursor_position() -> (row, col)`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn cursor_pos(&self) -> (u16, u16) {
         let c = self.terminal.cursor_pos();
         (c.y as u16, c.x as u16)
@@ -175,7 +178,7 @@ mod tests {
         let mut p = WezParser::new(24, 80);
         p.process(b"Hello, world!\r\n");
         let c = p.contents();
-        assert!(c.contains("Hello, world!"), "contents: {:?}", c);
+        assert!(c.contains("Hello, world!"), "contents: {c:?}");
     }
 
     #[test]
@@ -227,14 +230,12 @@ mod tests {
         // Row must always be < rows
         assert!(
             after_resize.0 < 3,
-            "live cursor row not clamped after resize: {:?}",
-            after_resize
+            "live cursor row not clamped after resize: {after_resize:?}",
         );
         // Col may equal physical_cols (deferred wrap) — that's valid in wezterm-term
         assert!(
             after_resize.1 <= 5,
-            "live cursor col exceeds physical_cols after resize: {:?}",
-            after_resize
+            "live cursor col exceeds physical_cols after resize: {after_resize:?}",
         );
 
         // Restore saved cursor (DECRC / ESC 8)
@@ -243,14 +244,12 @@ mod tests {
         // Row must be < rows
         assert!(
             after_restore.0 < 3,
-            "restored cursor row exceeds rows: {:?}",
-            after_restore
+            "restored cursor row exceeds rows: {after_restore:?}",
         );
         // Col <= physical_cols (deferred-wrap at physical_cols is allowed)
         assert!(
             after_restore.1 <= 5,
-            "restored cursor col exceeds physical_cols: {:?}",
-            after_restore
+            "restored cursor col exceeds physical_cols: {after_restore:?}",
         );
 
         // Critical: subsequent draw must not panic (this was the original crash in vt100)

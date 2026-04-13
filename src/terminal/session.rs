@@ -4,9 +4,24 @@ use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
 
-use super::alacritty_parser::AlacrittyParser;
+use super::command_tracker::CommandTracker;
+
+/// Shell integration detection state (REQ-TERM-015).
+///
+/// Transitions are one-shot per session: `Unknown` → `Detected` OR `Unknown` → `Absent`.
+/// See `ShellIntegrationStatusMonotonic` invariant in `terminal.allium`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegrationStatus {
+    /// Initial state — within the detection window.
+    Unknown,
+    /// OSC 133;C marker observed within the detection window.
+    Detected,
+    /// Detection window elapsed without a C marker (REQ-TERM-015).
+    /// Set by the frontend 5-second timeout; transitions are one-shot.
+    #[allow(dead_code)]
+    Absent,
+}
 
 /// Dimensions of a terminal (columns × rows).
 ///
@@ -33,11 +48,6 @@ impl Dims {
     }
 }
 
-/// Signals quiescence (no output for 300ms) to waiting `read_terminal` callers.
-pub type QuiescenceTx = watch::Sender<u64>;
-#[allow(dead_code)] // Used by read_terminal tool (Task 6)
-pub type QuiescenceRx = watch::Receiver<u64>;
-
 /// Owns the PTY master fd and child process.
 ///
 /// `Drop` closes `master_fd`, which causes the kernel to deliver `SIGHUP`
@@ -47,10 +57,10 @@ pub struct TerminalHandle {
     pub master_fd: OwnedFd,
     /// Child shell PID.  Reaped by the reader task on EIO.
     pub child_pid: Pid,
-    /// Terminal parser — updated by the reader task on every byte (REQ-TERM-010).
-    pub parser: Arc<Mutex<AlacrittyParser>>,
-    /// Quiescence notification — incremented after 300ms silence.
-    pub quiescence_tx: QuiescenceTx,
+    /// Command tracker — fed with every PTY output byte (REQ-TERM-010, REQ-TERM-021).
+    pub tracker: Arc<Mutex<CommandTracker>>,
+    /// Shell integration detection state.
+    pub shell_integration_status: Arc<Mutex<ShellIntegrationStatus>>,
 }
 
 impl std::fmt::Debug for TerminalHandle {
@@ -107,7 +117,6 @@ impl ActiveTerminals {
     }
 
     /// Look up an active terminal.
-    #[allow(dead_code)] // Used by read_terminal tool (Task 6)
     pub fn get(&self, conversation_id: &str) -> Option<Arc<TerminalHandle>> {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.get(conversation_id).cloned()

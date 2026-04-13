@@ -2533,8 +2533,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(TransitionError::AwaitingUserResponse)),
-            "Should reject user messages with AwaitingUserResponse error, got {:?}",
-            result
+            "Should reject user messages with AwaitingUserResponse error, got {result:?}"
         );
     }
 }

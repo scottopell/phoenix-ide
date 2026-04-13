@@ -4,9 +4,9 @@
 //!   byte 0 = 0x00 → PTY data (bidirectional)
 //!   byte 0 = 0x01 → resize: u16be cols, u16be rows (client → server only)
 //!
-//! The relay logic (byte forwarding, parser feeding, quiescence detection) lives
-//! in `relay.rs` as `run_relay`.  This module handles only the axum/WebSocket
-//! wiring: auth, 409 guard, PTY spawn, frame type filtering, and process lifecycle.
+//! The relay logic (byte forwarding, command tracking) lives in `relay.rs` as
+//! `run_relay`.  This module handles only the axum/WebSocket wiring: auth, 409
+//! guard, PTY spawn, frame type filtering, and process lifecycle.
 
 use super::relay::{run_relay, PtyMasterIo, RelayConfig};
 use super::session::{ActiveTerminals, Dims};
@@ -180,9 +180,7 @@ async fn handle_socket(
         .boxed();
 
     // The resize callback: calls TIOCSWINSZ on the real PTY master fd.
-    // Note: relay.rs also calls parser.set_size(), maintaining ParserDimensionSync.
-    let quiescence_tx = arc_handle.quiescence_tx.clone();
-    let parser = Arc::clone(&arc_handle.parser);
+    let tracker = Arc::clone(&arc_handle.tracker);
     let on_resize = move |dims: Dims| {
         set_winsize_raw(master_fd_raw, dims)
             .unwrap_or_else(|e| tracing::warn!(error = %e, "Terminal: TIOCSWINSZ failed"));
@@ -193,8 +191,7 @@ async fn handle_socket(
         ws_out,
         ws_in,
         RelayConfig {
-            parser,
-            quiescence_tx,
+            tracker,
             on_resize,
             stop_rx,
             conv_id: conversation_id.clone(),

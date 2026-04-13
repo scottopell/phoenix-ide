@@ -552,7 +552,7 @@ fn arb_mcp_tool_use() -> impl Strategy<Value = ContentBlock> {
         })
 }
 
-/// Any ContentBlock variant
+/// Any `ContentBlock` variant
 fn arb_content_block() -> impl Strategy<Value = ContentBlock> {
     prop_oneof![
         3 => arb_text_block(),

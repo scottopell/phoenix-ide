@@ -105,15 +105,15 @@ the first prompt to render incorrectly and wrap at the wrong column.
 
 ---
 
-### REQ-TERM-006: Resize Propagated to PTY and Parser
+### REQ-TERM-006: Resize Propagated to PTY
 
 WHEN the client sends a resize frame (type `0x01`)
 THE SYSTEM SHALL apply the new dimensions to the PTY via `ioctl(TIOCSWINSZ)`
-AND update the server-side vt100 parser to the same dimensions
 AND the kernel SHALL deliver `SIGWINCH` to the shell's foreground process group automatically
 
-**Rationale:** The vt100 parser must stay in sync with the actual terminal dimensions.
-A parser out of sync produces corrupted screen reads for the agent tool.
+**Rationale:** The PTY must reflect the actual terminal dimensions so that the shell
+and any running programs (vim, htop, etc.) can wrap and render correctly. Resize is
+PTY-only; the CommandTracker (REQ-TERM-010) has no concept of screen dimensions.
 
 ---
 
@@ -158,33 +158,93 @@ API server exits. Long-lived servers with many terminal sessions accumulate zomb
 
 ---
 
-### REQ-TERM-010: vt100 Parser Fed Every Byte In Order
+### REQ-TERM-010: Command Tracker Fed Every Byte In Order
 
 WHEN bytes are read from the PTY master fd
 THE SYSTEM SHALL send those bytes to the WebSocket client
-AND feed the same bytes to the server-side vt100 parser
+AND feed the same bytes to the server-side CommandTracker
 AND these two operations SHALL occur in the same handler with no gaps or reordering
 
-WHEN the terminal is resized (REQ-TERM-006)
-THE SYSTEM SHALL resize the vt100 parser to the new dimensions
-
-**Rationale:** The vt100 parser is a state machine. Dropped or reordered bytes
-corrupt its internal state permanently for that session. The parser's screen
-contents are the source of truth for the agent tool (REQ-TERM-011).
+**Rationale:** The CommandTracker is a state machine over OSC 133 C/D boundaries.
+Dropped or reordered bytes can corrupt C/D pairing, producing garbled output records
+or missed commands for that session.
 
 ---
 
-### REQ-TERM-011: `read_terminal` Agent Tool
+### REQ-TERM-021: Command Record Store
 
-WHEN an LLM agent calls the `read_terminal` tool for a conversation
+WHEN a terminal session is active AND `shell_integration_status = detected`
+THE SYSTEM SHALL maintain a ring buffer of at most 5 `CommandRecord` entries for
+that session
+
+Each `CommandRecord` SHALL contain:
+- `command_text`: the text payload from OSC 133;C (may be empty string)
+- `output`: text captured between the C and D markers; only printable characters and
+  newlines, with ANSI escape sequences discarded
+- `exit_code`: integer from the OSC 133;D payload; `None` if D omits it — do NOT
+  substitute 0
+- `started_at`: timestamp when the C marker was processed
+- `duration_ms`: milliseconds elapsed from C to D
+
+WHEN `shell_integration_status != detected`
+THE SYSTEM SHALL keep the ring buffer always empty
+
+WHEN a 6th command completes
+THE SYSTEM SHALL evict the oldest record from the ring buffer
+
+WHEN the captured output for a command exceeds 128KB
+THE SYSTEM SHALL write the full output bytes to disk at
+`~/.phoenix-ide/terminal-output/<session-id>/<seq>.txt`
+AND store a truncated preview with the disk path appended in the record's `output` field
+
+**Rationale:** Structured command records give agent tools precise access to recent
+command output without requiring a screen-scrape of the full terminal buffer. The
+128KB threshold matches the bash tool's `MAX_OUTPUT_LENGTH` constant. Writing large
+output to disk avoids unbounded memory growth while still making the full output
+accessible.
+
+---
+
+### REQ-TERM-022: `terminal_last_command` Agent Tool
+
+WHEN an LLM agent calls `terminal_last_command` for a conversation
 AND a terminal is active for that conversation
-THE SYSTEM SHALL return the current vt100 parser screen contents as plain text
+AND `shell_integration_status = detected`
+AND the ring buffer is non-empty
+THE SYSTEM SHALL return the most recent `CommandRecord` as structured data
 
-WHEN no terminal is active for that conversation
-THE SYSTEM SHALL return an error indicating no terminal is open
+WHEN `shell_integration_status != detected`
+THE SYSTEM SHALL return an error:
+`"shell integration is not active for this terminal — install the shell integration snippet to enable command tracking"`
 
-**Rationale:** Enables agent workflows that inspect command output, check build
-results, or verify the state of a running program without a human round-trip.
+WHEN `shell_integration_status = detected` AND the ring buffer is empty (no command
+has completed this session)
+THE SYSTEM SHALL return an error:
+`"no commands have completed in this terminal session yet"`
+
+**Rationale:** Gives agents a direct, zero-ambiguity view of the most recently
+completed command and its output without requiring screen coordinate arithmetic or
+quiescence heuristics.
+
+---
+
+### REQ-TERM-023: `terminal_command_history` Agent Tool
+
+WHEN an LLM agent calls `terminal_command_history` for a conversation
+AND a terminal is active for that conversation
+AND `shell_integration_status = detected`
+AND the ring buffer is non-empty
+THE SYSTEM SHALL return the last `count` `CommandRecord` entries newest-first,
+where `count` is an integer parameter (default 3, max 5)
+
+WHEN `shell_integration_status != detected`
+THE SYSTEM SHALL return the same error as REQ-TERM-022
+
+WHEN `shell_integration_status = detected` AND the ring buffer is empty
+THE SYSTEM SHALL return the same error as REQ-TERM-022
+
+**Rationale:** Lets agents inspect a short history of commands when the most recent
+result alone is insufficient. Cap of 5 matches the ring buffer capacity.
 
 ---
 
@@ -222,9 +282,10 @@ exceeds its configured bound
 THE SYSTEM SHALL pause reads from the PTY master fd
 AND NOT drop bytes to relieve backpressure
 
-**Rationale:** The vt100 parser is a state machine — dropped bytes corrupt
-its state permanently for that session. Backpressure propagates to the kernel
-PTY buffer, which correctly slows the producing process rather than losing data.
+**Rationale:** The CommandTracker is a state machine — dropped bytes corrupt
+C/D boundary pairing permanently for that session. Backpressure propagates to
+the kernel PTY buffer, which correctly slows the producing process rather than
+losing data.
 
 ---
 

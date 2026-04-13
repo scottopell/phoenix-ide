@@ -57,6 +57,8 @@ libc = "0.2"
 
 # Terminal emulation (for relay loop and read_terminal agent tool)
 alacritty_terminal = { git = "https://github.com/alacritty/alacritty", tag = "v0.17.0", package = "alacritty_terminal", default-features = false }
+# OSC 133 parsing for CommandTracker (REQ-TERM-021)
+vte = "0.15"
 
 # Gitignore-aware directory walking (for file search)
 ignore = "0.4"
