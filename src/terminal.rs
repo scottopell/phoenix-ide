@@ -11,6 +11,8 @@ mod proptests;
 mod relay;
 mod session;
 mod spawn;
+#[cfg(test)]
+mod wezterm_parser;
 mod ws;
 
 pub use session::ActiveTerminals;

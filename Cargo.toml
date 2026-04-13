@@ -80,6 +80,9 @@ unicode-security = "0.1.2"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# wezterm-term evaluation (task 24673). Gated to dev-deps — not shipped in production.
+# Remove once the go/no-go decision is made and either migrated or rejected.
+tattoy-wezterm-term = "0.1.0-fork.5"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

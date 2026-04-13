@@ -670,3 +670,103 @@ fn build_env_no_duplicate_keys() {
         "build_env must not produce duplicate keys"
     );
 }
+
+// ── wezterm-term proptests (evaluation, task 24673) ──────────────────────────
+//
+// These tests run the SAME stress scenarios as the vt100 variants above, but
+// against `WezParser` (see `wezterm_parser.rs`).  Identical shapes, identical
+// assertions.  Failures here indicate either a wezterm-term bug or an
+// incompatible edge case that would need fixing before migration.
+//
+// Run with:  PROPTEST_CASES=10000 cargo test wez_stress
+
+#[cfg(test)]
+mod wez_proptest {
+    use proptest::prelude::*;
+
+    use super::{arb_terminal_op, arb_valid_dims, TerminalOp};
+    use crate::terminal::wezterm_parser::WezParser;
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 512,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// wezterm-term variant of `prop_parser_stress_tiny_terminals`.
+        ///
+        /// Tiny terminals (1×1 to 4×4) combined with long byte sequences and
+        /// frequent wide-char codepoints.  This is the dimension range that
+        /// triggered all six vt100 patches.  If wezterm-term panics here,
+        /// it's a go/no-go blocker.
+        ///
+        /// **Known failure**: `tattoy-wezterm-term 0.1.0-fork.5` (and upstream
+        /// `wezterm/wezterm`) panics on bytes `[144, 113, 63, 128]` (DCS 'q' =
+        /// Sixel start) on a 1×1 terminal: divide-by-zero in
+        /// `terminalstate/image.rs:103` (`assign_image_to_cells`).  This is a
+        /// go/no-go **BLOCKER** for the migration.  See
+        /// `specs/terminal/wezterm-evaluation.md` for full analysis.
+        ///
+        /// Marked `#[ignore]` so CI passes; run explicitly:
+        /// `PROPTEST_CASES=10000 cargo test wez_prop -- --ignored`
+        #[test]
+        #[ignore = "wezterm-term divide-by-zero bug (task 24673 blocker); run explicitly for evaluation"]
+        fn wez_prop_parser_stress_tiny_terminals(
+            cols in 1u16..=4u16,
+            rows in 1u16..=4u16,
+            byte_sequences in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..1024),
+                1..20
+            ),
+        ) {
+            let mut parser = WezParser::new(rows, cols);
+            for chunk in &byte_sequences {
+                parser.process(chunk);
+                let (r, c) = parser.size();
+                prop_assert_eq!(c, cols, "cols changed after processing bytes");
+                prop_assert_eq!(r, rows, "rows changed after processing bytes");
+            }
+        }
+
+        /// wezterm-term variant of `prop_parser_stress_resize_then_draw`.
+        ///
+        /// Arbitrary resize sequences interleaved with byte processing.
+        /// Verifies `ParserDimensionSync` holds against wezterm-term and that
+        /// no panics occur across the resize+draw interaction.
+        ///
+        /// **Known failure**: same divide-by-zero as `wez_prop_parser_stress_tiny_terminals`.
+        /// Sixel/DCS sequence on a tiny terminal hits `assign_image_to_cells`
+        /// with `draw_width = 0`.  Go/no-go **BLOCKER**.
+        ///
+        /// Marked `#[ignore]` so CI passes; run explicitly:
+        /// `PROPTEST_CASES=10000 cargo test wez_prop -- --ignored`
+        #[test]
+        #[ignore = "wezterm-term divide-by-zero bug (task 24673 blocker); run explicitly for evaluation"]
+        fn wez_prop_parser_stress_resize_then_draw(
+            initial in arb_valid_dims(),
+            ops in proptest::collection::vec(arb_terminal_op(), 1..30),
+        ) {
+            let mut parser = WezParser::new(initial.rows, initial.cols);
+            let mut current_dims = initial;
+
+            for op in &ops {
+                match op {
+                    TerminalOp::Resize(dims) => {
+                        parser.set_size(dims.rows, dims.cols);
+                        current_dims = *dims;
+                    }
+                    TerminalOp::Draw(chunk) => {
+                        parser.process(chunk);
+                        let (r, c) = parser.size();
+                        prop_assert_eq!(c, current_dims.cols,
+                            "ParserDimensionSync: cols wrong after draw at {:?}",
+                            current_dims);
+                        prop_assert_eq!(r, current_dims.rows,
+                            "ParserDimensionSync: rows wrong after draw at {:?}",
+                            current_dims);
+                    }
+                }
+            }
+        }
+    }
+}

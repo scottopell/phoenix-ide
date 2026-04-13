@@ -1,0 +1,12 @@
+# Seeds for wezterm-term evaluation proptests (task 24673)
+# Both seeds trigger a divide-by-zero panic in tattoy-wezterm-term-0.1.0-fork.5
+# and upstream wezterm/wezterm (terminalstate/image.rs:103)
+# when a Sixel/DCS sequence (0x90 0x71 = DCS q) hits a terminal with cell_pixel_width=1.
+#
+# Minimal reproducer: cols=1, rows=1, bytes=[144, 113, 63, 128]
+# (0x90=DCS, 0x71='q'=sixel, 0x3F='?', 0x80=data)
+#
+# This matches the SAME class of bug that required 6 patches in vendor/vt100:
+# image/sixel arithmetic overflows/divides-by-zero on tiny terminals.
+
+cc c6a99947bec8b558f213faa3285d6118b67bf31d24e45bcd8c83a7072d66db9e
