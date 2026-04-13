@@ -6,8 +6,7 @@
 //!
 //! See `specs/terminal/` for the full behavioral specification.
 
-#[cfg(test)]
-mod alacritty_parser;
+pub mod alacritty_parser;
 #[cfg(test)]
 mod proptests;
 mod relay;

@@ -8,3 +8,5 @@ cc 01abf01c2fc03cec0affc254c09b5c8cdaecd7d053ba4eeb5b01ca402631194d # shrinks to
 cc 41f6e9eba27596ddb583d4e53e463a798a482221a87ef04526f34d06a7f697d3 # shrinks to dims = Dims { cols: 1, rows: 1 }, byte_sequences = [[227, 128, 128]]
 cc b2b1a54c5bc87e3c1fa6f033029da4e6f67f7e795aae1f1d720213c7c132111a # shrinks to dims = Dims { cols: 1, rows: 196 }, byte_sequences = [[32, 32, 32, 32, 8, 127, 0, 227, 128, 128], [13, 0, 0, 0, 13, 0, 32]]
 cc a7331e24b59e23f71ac9086005dd0a4139a870dbe84fc851f9f0db7a552c8d9e # task 24668 — shrinks to resize+draw underflow with initial 1x1, Resize(230,9), 4x Draw, Resize(210,8), Draw
+cc 60ffd6d3cfb0b5868c79632058baddb59c947265c3acecdb2c5233dc777c4db3 # shrinks to cols = 1, rows = 1, byte_sequences = [[144, 113], [63, 128]]
+cc c6a99947bec8b558f213faa3285d6118b67bf31d24e45bcd8c83a7072d66db9e # shrinks to initial = Dims { cols: 1, rows: 1 }, ops = [Draw([144, 113, 63, 128])]

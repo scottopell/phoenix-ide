@@ -1,6 +1,6 @@
 //! `read_terminal` tool — REQ-TERM-011
 //!
-//! Returns the current vt100 screen contents of the conversation's active terminal.
+//! Returns the current terminal screen contents of the conversation's active terminal.
 //! Optionally waits for output quiescence (300 ms of silence) before reading,
 //! which gives more meaningful results after running a command.
 
@@ -36,7 +36,7 @@ impl Tool for ReadTerminalTool {
 
     fn description(&self) -> String {
         "Read the current contents of the terminal screen for this conversation. \
-         Returns the visible text exactly as it appears in the terminal (vt100 screen buffer). \
+         Returns the visible text exactly as it appears in the terminal (screen buffer). \
          \n\nWhen `wait_for_quiescence` is true (default), the tool waits up to 5 s for the \
          output stream to go quiet for 300 ms before returning — this is the right setting \
          after running a command, because it waits for the command to finish producing output. \
@@ -93,7 +93,7 @@ impl Tool for ReadTerminalTool {
 
         let screen_contents = {
             let parser = handle.parser.lock().expect("parser lock");
-            parser.screen().contents()
+            parser.contents()
         };
 
         if screen_contents.trim().is_empty() {

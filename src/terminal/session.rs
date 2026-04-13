@@ -5,9 +5,13 @@ use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
-use vt100::Parser;
+
+use super::alacritty_parser::AlacrittyParser;
 
 /// Dimensions of a terminal (columns × rows).
+///
+/// Invariant: `cols >= 2` (enforced by relay; see `ResizeFrameRejected` rule
+/// and `alacritty_parser` module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dims {
     pub cols: u16,
@@ -28,8 +32,8 @@ pub struct TerminalHandle {
     pub master_fd: OwnedFd,
     /// Child shell PID.  Reaped by the reader task on EIO.
     pub child_pid: Pid,
-    /// vt100 parser — updated by the reader task on every byte (REQ-TERM-010).
-    pub parser: Arc<Mutex<Parser>>,
+    /// Terminal parser — updated by the reader task on every byte (REQ-TERM-010).
+    pub parser: Arc<Mutex<AlacrittyParser>>,
     /// Quiescence notification — incremented after 300ms silence.
     pub quiescence_tx: QuiescenceTx,
 }

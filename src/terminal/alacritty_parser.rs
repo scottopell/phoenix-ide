@@ -1,38 +1,31 @@
-//! Proof-of-concept adapter: alacritty_terminal as a drop-in for vt100::Parser.
+//! Terminal parser — wraps `alacritty_terminal` and `vte::ansi::Processor`
+//! to expose the same six-method API surface Phoenix uses.
 //!
-//! This module is **evaluation only** — never called from production code.
-//! It proves API parity and runs the stress proptests against alacritty_terminal.
-//! See `specs/terminal/alacritty-evaluation.md` for full findings.
+//! Replaces the vendored `vt100 0.15.2` crate (task 24678). See
+//! `specs/terminal/alacritty-evaluation.md` for the full evaluation.
 //!
-//! ## API surface covered
+//! ## cols >= 2 invariant
 //!
-//! | vt100 call                          | alacritty_terminal equivalent                    |
-//! |-------------------------------------|--------------------------------------------------|
-//! | `Parser::new(rows, cols, 0)`        | `AlacrittyParser::new(rows, cols)`               |
-//! | `parser.process(&bytes)`            | `AlacrittyParser::process(&bytes)`               |
-//! | `parser.set_size(rows, cols)`       | `AlacrittyParser::set_size(rows, cols)`          |
-//! | `parser.screen().size()`            | `AlacrittyParser::size() -> (rows, cols)`        |
-//! | `parser.screen().contents()`        | `AlacrittyParser::contents() -> String`          |
-//! | `parser.screen().cursor_position()` | `AlacrittyParser::cursor_pos() -> (row, col)`    |
+//! `alacritty_terminal` panics when a width-2 Unicode character is fed to a
+//! 1-column terminal (upstream bug; task 24676).  The relay layer enforces
+//! `cols >= 2` at resize time (`ResizeFrameRejected` rule), so this code
+//! path is unreachable in production.
 //!
-//! ## Key structural difference from vt100 / wezterm-term
+//! ## API surface
 //!
-//! alacritty_terminal separates the *parser* (`vte::ansi::Processor`) from the
-//! *terminal state* (`Term<T>`).  vt100 and wezterm-term bundle both into one
-//! struct.  This adapter wraps both in a single `AlacrittyParser` so callers
-//! see the same one-struct API.
+//! | vt100 call                          | `alacritty_terminal` equivalent                 |
+//! |-------------------------------------|-----------------------------------------------|
+//! | `Parser::new(rows, cols, 0)`        | `AlacrittyParser::new(rows, cols)`            |
+//! | `parser.process(&bytes)`            | `AlacrittyParser::process(&bytes)`            |
+//! | `parser.set_size(rows, cols)`       | `AlacrittyParser::set_size(rows, cols)`       |
+//! | `parser.screen().size()`            | `AlacrittyParser::size() -> (rows, cols)`     |
+//! | `parser.screen().contents()`        | `AlacrittyParser::contents() -> String`       |
+//! | `parser.screen().cursor_position()` | `AlacrittyParser::cursor_pos() -> (row, col)` |
 //!
-//! ## Gaps
+//! ## Structural note
 //!
-//! - OSC 133 (FinalTerm semantic prompts) is **not handled** by alacritty_terminal.
-//!   OSC 133 sequences fall through to `unhandled()` — a debug log, no callback.
-//!   Exit codes (D marker) are not accessible.  See evaluation doc section 4.
-//!
-//! - `Term<VoidListener>` is used; alacritty events (title changes, bell, etc.)
-//!   are silently dropped.  That is correct for headless parser use.
-
-#![cfg(test)]
-#![allow(dead_code)]
+//! `alacritty_terminal` separates parser (`vte::ansi::Processor`) and state
+//! (`Term<T>`).  `AlacrittyParser` wraps both so callers see one struct.
 
 use alacritty_terminal::{
     event::VoidListener,
@@ -45,8 +38,8 @@ use alacritty_terminal::{
 
 // ── Dimensions shim ───────────────────────────────────────────────────────────
 
-/// Minimal `Dimensions` implementation for constructing and resizing `Term`.
-/// `TermSize` in alacritty_terminal is `#[cfg(test)]`-only; we define our own.
+/// `TermSize` is `#[cfg(test)]`-only in `alacritty_terminal`, so we provide
+/// our own.
 struct TermSize {
     cols: usize,
     rows: usize,
@@ -56,20 +49,21 @@ impl Dimensions for TermSize {
     fn total_lines(&self) -> usize {
         self.rows
     }
+
     fn screen_lines(&self) -> usize {
         self.rows
     }
+
     fn columns(&self) -> usize {
         self.cols
     }
 }
 
-// ── Adapter ──────────────────────────────────────────────────────────────────────
+// ── Parser ────────────────────────────────────────────────────────────────────
 
-/// Drop-in replacement for the vt100 `Parser` API surface used by Phoenix.
+/// Terminal parser — drop-in replacement for `vt100::Parser`.
 ///
-/// Wraps `alacritty_terminal::Term<VoidListener>` and an `ansi::Processor`,
-/// exposing exactly the 6 methods Phoenix calls.  No production code is touched.
+/// Wraps `alacritty_terminal::Term<VoidListener>` and an `ansi::Processor`.
 pub struct AlacrittyParser {
     term: Term<VoidListener>,
     parser: ansi::Processor,
@@ -77,6 +71,7 @@ pub struct AlacrittyParser {
 
 impl AlacrittyParser {
     /// Equivalent of `vt100::Parser::new(rows, cols, 0)`.
+    /// Precondition: `cols >= 2` (enforced by relay; see module doc).
     pub fn new(rows: u16, cols: u16) -> Self {
         let size = TermSize {
             cols: cols as usize,
@@ -87,40 +82,42 @@ impl AlacrittyParser {
         Self { term, parser }
     }
 
-    /// Equivalent of `parser.process(&bytes)`. May not panic on any input.
+    /// Equivalent of `parser.process(&bytes)`. Never panics given `cols >= 2`.
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
     }
 
     /// Equivalent of `parser.set_size(rows, cols)`.
+    /// Precondition: `cols >= 2` (relay rejects cols < 2 before calling this).
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        let size = TermSize {
+        self.term.resize(TermSize {
             cols: cols as usize,
             rows: rows as usize,
-        };
-        self.term.resize(size);
+        });
     }
 
     /// Equivalent of `parser.screen().size() -> (rows, cols)`.
+    #[allow(dead_code)] // Used by relay tests and terminal HUD
     pub fn size(&self) -> (u16, u16) {
+        #[allow(clippy::cast_possible_truncation)]
         (self.term.screen_lines() as u16, self.term.columns() as u16)
     }
 
     /// Equivalent of `parser.screen().contents() -> String`.
     ///
-    /// vt100's `contents()` joins visible rows with `\n`, trimming trailing
-    /// whitespace on each line and stripping trailing newlines from the result.
-    /// We replicate that contract here via `bounds_to_string`.
+    /// Mirrors vt100 contract: lines joined with `\n`, trailing whitespace
+    /// trimmed per line, trailing newlines stripped from result.
     pub fn contents(&self) -> String {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         if rows == 0 || cols == 0 {
             return String::new();
         }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let end_line = Line(rows as i32 - 1);
         let start = Point::new(Line(0), Column(0));
-        let end = Point::new(Line(rows as i32 - 1), Column(cols - 1));
+        let end = Point::new(end_line, Column(cols - 1));
         let raw = self.term.bounds_to_string(start, end);
-        // Mirror vt100: trim trailing whitespace per line, strip trailing newlines.
         let trimmed: String = raw
             .split('\n')
             .map(|l| l.trim_end().to_string())
@@ -130,16 +127,19 @@ impl AlacrittyParser {
     }
 
     /// Equivalent of `parser.screen().cursor_position() -> (row, col)`.
+    /// Always satisfies `row < rows` and `col < cols` (no deferred-wrap).
+    #[allow(dead_code)] // Used by terminal HUD; not yet wired in production
     pub fn cursor_pos(&self) -> (u16, u16) {
         let pt = self.term.grid().cursor.point;
-        // Line is i32 (negative = scrollback). Viewport rows are 0..screen_lines.
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let row = pt.line.0.max(0) as u16;
+        #[allow(clippy::cast_possible_truncation)]
         let col = pt.column.0 as u16;
         (row, col)
     }
 }
 
-// ── Unit tests: API parity ────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -168,12 +168,11 @@ mod tests {
 
     #[test]
     fn alac_process_does_not_panic_on_wezterm_trigger_bytes() {
-        // The byte sequence [0x90, 0x71, 0x3F, 0x80] that triggered a
-        // divide-by-zero in wezterm-term's sixel handler (task 24673 blocker).
-        // alacritty_terminal has no sixel handler, so this should be a no-op.
-        let mut p = AlacrittyParser::new(1, 1);
+        // [0x90, 0x71, 0x3F, 0x80]: Sixel/DCS sequence — divide-by-zero in
+        // wezterm-term (task 24673 blocker). alacritty has no sixel path.
+        let mut p = AlacrittyParser::new(2, 2);
         p.process(&[0x90, 0x71, 0x3F, 0x80]);
-        assert_eq!(p.size(), (1, 1));
+        assert_eq!(p.size(), (2, 2));
     }
 
     #[test]
@@ -196,44 +195,44 @@ mod tests {
     #[test]
     fn alac_resize_cursor_clamped() {
         // Mirrors the vt100 regression from task 24668.
-        // Save cursor at (9, 99) on 10x100, shrink to 3x5, restore.
         let mut p = AlacrittyParser::new(10, 100);
-        p.process(b"\x1b[10;100H"); // move to bottom-right
-        let pos = p.cursor_pos();
-        assert_eq!(pos, (9, 99), "cursor not at bottom-right");
+        p.process(b"\x1b[10;100H");
+        assert_eq!(p.cursor_pos(), (9, 99));
 
-        p.process(b"\x1b7"); // DECSC save
-        p.set_size(3, 5); // shrink
-
+        p.process(b"\x1b7");
+        p.set_size(3, 5);
         let after_resize = p.cursor_pos();
-        assert!(
-            after_resize.0 < 3 && after_resize.1 <= 5,
-            "cursor not clamped after resize: {after_resize:?}"
-        );
+        assert!(after_resize.0 < 3 && after_resize.1 <= 5);
 
-        p.process(b"\x1b8"); // DECRC restore
+        p.process(b"\x1b8");
         let after_restore = p.cursor_pos();
-        // alacritty clamps to < cols strictly (no deferred-wrap at col == cols)
         assert!(
             after_restore.0 < 3 && after_restore.1 < 5,
             "restored cursor not clamped: {after_restore:?}"
         );
 
-        // Subsequent draw must not panic
         p.process(b"X");
         assert_eq!(p.size(), (3, 5));
     }
 
     #[test]
     fn alac_osc133_sequences_do_not_panic() {
-        // OSC 133 A/B/C/D sequences must be silently ignored (not crash).
         let mut p = AlacrittyParser::new(24, 80);
-        // A = prompt start, B = prompt end, C = command start, D;0 = exit code 0
         p.process(b"\x1b]133;A\x07");
         p.process(b"\x1b]133;B\x07");
         p.process(b"\x1b]133;C\x07");
         p.process(b"\x1b]133;D;0\x07");
-        // No panic = pass. Content is unaffected by OSC 133 sequences.
         assert_eq!(p.size(), (24, 80));
+    }
+
+    /// min-cols-2 invariant: verify that wide Unicode on the minimum (cols=2)
+    /// terminal does NOT panic. This is the regression guard for the upstream
+    /// alacritty bug (task 24676) that panics at cols=1.
+    #[test]
+    fn alac_wide_char_at_min_cols_does_not_panic() {
+        let mut p = AlacrittyParser::new(4, 2);
+        // U+3000 IDEOGRAPHIC SPACE (width=2) — the blocker byte sequence
+        p.process(&[0xE3, 0x80, 0x80]);
+        assert_eq!(p.size(), (4, 2));
     }
 }
