@@ -114,6 +114,14 @@ impl Grid {
     pub fn restore_cursor(&mut self) {
         self.pos = self.saved_pos;
         self.origin_mode = self.saved_origin_mode;
+        // The saved cursor position may be stale: the grid can have been
+        // resized smaller between save_cursor and restore_cursor, making
+        // self.saved_pos point outside the current grid. Clamp against the
+        // current size so subsequent draws don't panic in drawing_cell().
+        // (Task 24668: prop_parser_stress_resize_then_draw panic on a
+        // shrunken grid after DECRC restored a stale cursor.)
+        self.row_clamp();
+        self.col_clamp();
     }
 
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {

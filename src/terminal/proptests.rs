@@ -429,6 +429,61 @@ proptest! {
     }
 }
 
+// ── Unit: vt100 save/restore cursor clamps across shrinking resize ───────────
+
+/// Regression for task 24668:
+///
+/// The vendored vt100 crate's `restore_cursor` (driven by ESC 8 / DECRC)
+/// replayed the saved cursor position directly into `self.pos` without
+/// clamping against the current grid size. When a `save_cursor` on a large
+/// grid was followed by a `set_size` shrinking the grid and then a
+/// `restore_cursor`, the cursor landed outside the grid and the next draw
+/// panicked in `drawing_cell().unwrap()`.
+///
+/// This test exercises the exact API-level save → resize → restore → draw
+/// sequence with deterministic inputs so regressions can be caught without
+/// relying on the proptest random exploration.
+#[test]
+fn vt100_restore_cursor_clamps_after_shrinking_resize() {
+    let mut parser = vt100::Parser::new(10, 100, 0);
+
+    // Move the cursor to (9, 99) on the 10x100 grid — last row, last col.
+    // Cursor position: `ESC [ row ; col H` is 1-indexed, so row=10, col=100.
+    parser.process(b"\x1b[10;100H");
+    let pos = parser.screen().cursor_position();
+    assert_eq!(pos, (9, 99), "cursor not at bottom-right of 10x100 grid");
+
+    // Save the cursor with DECSC (ESC 7).
+    parser.process(b"\x1b7");
+
+    // Shrink the grid to 3x5. This should clamp the LIVE cursor, but
+    // leave the SAVED cursor stale at (9, 99).
+    parser.set_size(3, 5);
+    let pos_after_resize = parser.screen().cursor_position();
+    assert!(
+        pos_after_resize.0 < 3 && pos_after_resize.1 < 5,
+        "live cursor not clamped after resize, got {pos_after_resize:?}",
+    );
+
+    // Restore with DECRC (ESC 8). Without the fix, self.pos becomes (9, 99)
+    // on a 3x5 grid.
+    parser.process(b"\x1b8");
+    let pos_after_restore = parser.screen().cursor_position();
+    assert!(
+        pos_after_restore.0 < 3 && pos_after_restore.1 < 5,
+        "restore_cursor did not clamp saved position against current grid; \
+         got {pos_after_restore:?} on a 3x5 grid",
+    );
+
+    // A subsequent draw must not panic. Pre-fix, this panicked inside
+    // vt100::Screen::text at `drawing_cell(...).unwrap()`.
+    parser.process(b"X");
+
+    // Sanity: grid stayed at 3x5 and the write landed somewhere valid.
+    let (rows, cols) = parser.screen().size();
+    assert_eq!((rows, cols), (3, 5));
+}
+
 // ── Unit: resize frame validation (ResizeFrameRejected rule) ─────────────────
 
 /// REQ-TERM-006 / ResizeFrameRejected:
