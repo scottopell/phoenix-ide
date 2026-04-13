@@ -360,12 +360,11 @@ where
             }
             let cols = u16::from_be_bytes([data[1], data[2]]);
             let rows = u16::from_be_bytes([data[3], data[4]]);
-            if cols < 2 || rows == 0 {
+            let Some(dims) = Dims::try_new(cols, rows) else {
                 tracing::warn!(conv_id = %conv_id, cols, rows,
                     "Terminal relay: ignoring resize frame with invalid dimension (cols<2 or rows=0)");
                 return true;
-            }
-            let dims = Dims { cols, rows };
+            };
             // ParserDimensionSync: PTY ioctl and parser.set_size in same call.
             on_resize(dims);
             parser.lock().expect("parser lock").set_size(rows, cols);

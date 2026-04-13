@@ -4,16 +4,9 @@
 //! Replaces the vendored `vt100 0.15.2` crate (task 24678). See
 //! `specs/terminal/alacritty-evaluation.md` for the full evaluation.
 //!
-//! ## cols >= 2 invariant
-//!
-//! `alacritty_terminal` panics when a width-2 Unicode character is fed to a
-//! 1-column terminal (upstream bug; task 24676).  The relay layer enforces
-//! `cols >= 2` at resize time (`ResizeFrameRejected` rule), so this code
-//! path is unreachable in production.
-//!
 //! ## API surface
 //!
-//! | vt100 call                          | `alacritty_terminal` equivalent                 |
+//! | vt100 call                          | `alacritty_terminal` equivalent               |
 //! |-------------------------------------|-----------------------------------------------|
 //! | `Parser::new(rows, cols, 0)`        | `AlacrittyParser::new(rows, cols)`            |
 //! | `parser.process(&bytes)`            | `AlacrittyParser::process(&bytes)`            |
@@ -71,7 +64,6 @@ pub struct AlacrittyParser {
 
 impl AlacrittyParser {
     /// Equivalent of `vt100::Parser::new(rows, cols, 0)`.
-    /// Precondition: `cols >= 2` (enforced by relay; see module doc).
     pub fn new(rows: u16, cols: u16) -> Self {
         let size = TermSize {
             cols: cols as usize,
@@ -92,13 +84,12 @@ impl AlacrittyParser {
         Self { term, parser }
     }
 
-    /// Equivalent of `parser.process(&bytes)`. Never panics given `cols >= 2`.
+    /// Equivalent of `parser.process(&bytes)`.
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
     }
 
     /// Equivalent of `parser.set_size(rows, cols)`.
-    /// Precondition: `cols >= 2` (relay rejects cols < 2 before calling this).
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         self.term.resize(TermSize {
             cols: cols as usize,
@@ -212,7 +203,10 @@ mod tests {
         p.process(b"\x1b7");
         p.set_size(3, 5);
         let after_resize = p.cursor_pos();
-        assert!(after_resize.0 < 3 && after_resize.1 <= 5);
+        assert!(
+            after_resize.0 < 3 && after_resize.1 < 5,
+            "live cursor not clamped after resize to 3x5: {after_resize:?}"
+        );
 
         p.process(b"\x1b8");
         let after_restore = p.cursor_pos();

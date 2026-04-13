@@ -225,8 +225,8 @@ async fn wait_for_resize(ws: &mut futures::stream::SplitStream<WebSocket>) -> Op
                     let cols = u16::from_be_bytes([data[1], data[2]]);
                     let rows = u16::from_be_bytes([data[3], data[4]]);
                     // Reject zero-dimension initial resize (ResizeFrameRejected rule).
-                    if cols > 0 && rows > 0 {
-                        return Some(Dims { cols, rows });
+                    if let Some(dims) = Dims::try_new(cols, rows) {
+                        return Some(dims);
                     }
                 }
             }
