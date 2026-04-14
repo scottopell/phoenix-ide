@@ -48,10 +48,6 @@ impl Tool for SkillTool {
         })
     }
 
-    fn defer_loading(&self) -> bool {
-        true
-    }
-
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let skill_name = input
             .get("skill_name")

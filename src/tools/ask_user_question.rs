@@ -28,11 +28,6 @@ impl Tool for AskUserQuestionTool {
             .to_string()
     }
 
-    /// REQ-AUQ-008: Rarely used, defer full schema to reduce prompt size.
-    fn defer_loading(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
