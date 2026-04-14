@@ -1,11 +1,35 @@
 ---
 created: 2026-04-14
 priority: p2
-status: ready
+status: done
 artifact: src/tools.rs
 ---
 
 # `read_file` missing from Direct / Work tool registry
+
+## Resolution
+
+Refactored `ToolRegistry` to compose constructors from named base sets
+(`read_only_tools`, `write_tools`, `browser_tools`, `parent_terminal_tools`,
+`parent_coordination_tools`, `sub_agent_terminal_tools`) instead of having
+each constructor own its own `Vec<Arc<dyn Tool>>`. The drift was a
+maintenance hazard: the same tool needed to be added to N independent
+lists with no compile-time enforcement that they stayed in sync.
+
+`ReadFileTool` is now in `read_only_tools()` and reaches every constructor
+via composition. Adding a new read-only tool happens in exactly one place.
+
+Two new tests in `src/tools.rs` enforce the matrix at test time:
+
+- `registry_mode_matrix_read_only_tools_everywhere` — every constructor
+  must include the read-only set
+- `registry_mode_matrix_capability_boundaries` — each mode's capability
+  set is asserted explicitly (Direct has `bash` + `spawn_agents` but no
+  `propose_task`, sub-agent Explore has `submit_result` but no `spawn`,
+  etc.)
+
+Forgetting to add a tool to a specific constructor now fails one of these
+tests instead of surfacing as a runtime "Unknown tool" error.
 
 ## Problem
 
