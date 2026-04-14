@@ -52,7 +52,16 @@ impl TransitionResult {
     }
 }
 
-/// Errors that can occur during transition
+/// Errors that can occur during transition.
+///
+/// Every variant is either payload-free or carries structured data. In
+/// particular `InvalidTransition` carries `&'static str` discriminators
+/// sourced from [`ConvState::variant_name`] / [`Event::variant_name`]
+/// instead of a `format!("{state:?}/{event:?}")` dump — task 24682
+/// follow-up. This means `Display`-formatting a `TransitionError`
+/// anywhere in the codebase produces output that is always safe to
+/// show to humans, never leaks the internal `Debug` shape of
+/// `ConvState` or `Event`, and never embeds payload data.
 #[derive(Debug, Error)]
 pub enum TransitionError {
     #[error("Agent is busy, cannot accept message (cancel current operation first)")]
@@ -67,8 +76,17 @@ pub enum TransitionError {
     AwaitingUserResponse,
     #[error("Conversation has reached terminal state (completed or abandoned)")]
     ConversationTerminal,
-    #[error("Invalid transition: {0}")]
-    InvalidTransition(String),
+    #[error("Invalid transition: no arm for state={state} event={event}")]
+    InvalidTransition {
+        /// Variant name of the `ConvState` that didn't have a matching
+        /// transition arm, e.g. `"Idle"`. Populated via
+        /// [`ConvState::variant_name`]. Never contains payload data.
+        state: &'static str,
+        /// Variant name of the `Event` we were trying to apply, e.g.
+        /// `"UserCancel"`. Populated via [`Event::variant_name`].
+        /// Never contains payload data.
+        event: &'static str,
+    },
 }
 
 /// Pure transition function
@@ -1418,9 +1436,15 @@ pub fn transition(
         // ============================================================
         // Invalid Transitions
         // ============================================================
-        (state, event) => Err(TransitionError::InvalidTransition(format!(
-            "No transition from {state:?} with event {event:?}"
-        ))),
+        //
+        // No `format!("{state:?}/{event:?}")` — the catch-all carries
+        // structured discriminators so `Display`-ing a `TransitionError`
+        // anywhere downstream produces safe output. See the doc on
+        // `TransitionError::InvalidTransition`.
+        (state, event) => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }),
     }
 }
 

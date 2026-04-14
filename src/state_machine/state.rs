@@ -537,6 +537,31 @@ impl ConvState {
         )
     }
 
+    /// Stable, payload-free name of this variant. Used by structured
+    /// error types (e.g. `TransitionError::InvalidTransition`) and
+    /// tracing so they can carry a state discriminator without the
+    /// `Debug` format of the variant's payloads — task 24682 follow-up.
+    /// This is the single source of truth; do not inline another
+    /// `match self { ... => "Name" }` elsewhere.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ConvState::Idle => "Idle",
+            ConvState::LlmRequesting { .. } => "LlmRequesting",
+            ConvState::ToolExecuting { .. } => "ToolExecuting",
+            ConvState::CancellingTool { .. } => "CancellingTool",
+            ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
+            ConvState::CancellingSubAgents { .. } => "CancellingSubAgents",
+            ConvState::Completed { .. } => "Completed",
+            ConvState::Failed { .. } => "Failed",
+            ConvState::Error { .. } => "Error",
+            ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
+            ConvState::ContextExhausted { .. } => "ContextExhausted",
+            ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
+            ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
+            ConvState::Terminal => "Terminal",
+        }
+    }
+
     /// Structural terminal-state check for the executor loop.
     ///
     /// Returns `StepResult::Terminal` for states that cannot produce further transitions,

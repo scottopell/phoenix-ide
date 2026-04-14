@@ -153,11 +153,15 @@ pub fn from_transition_error(err: &TransitionError) -> UserFacingError {
             "This conversation has been completed or abandoned. Start a new one to \
              continue.",
         ),
-        // The default failure mode for unhandled (state, event) pairs in
-        // the state machine. The `String` payload contains a Debug-format
-        // dump of internal types — never expose it to the UI. The
-        // *internal* error should still be logged at the call site.
-        TransitionError::InvalidTransition(_) => UserFacingError::internal(),
+        // Catch-all for (state, event) pairs the state machine doesn't
+        // have an arm for. The variant payload is now structured
+        // (`&'static str` discriminators, never `Debug`-formatted payloads
+        // — see the doc on `TransitionError::InvalidTransition`) so the
+        // call site is free to log the full error at `warn`/`debug` for
+        // operators. We still surface only a generic `internal()` to end
+        // users because "invalid transition" means something *we* got
+        // wrong: it's not useful for the user to debug themselves.
+        TransitionError::InvalidTransition { .. } => UserFacingError::internal(),
     }
 }
 
@@ -167,14 +171,32 @@ mod tests {
 
     #[test]
     fn internal_variant_does_not_expose_debug_format() {
-        let err = TransitionError::InvalidTransition(
-            "No transition from Idle with event UserCancel { reason: None }".to_string(),
-        );
+        let err = TransitionError::InvalidTransition {
+            state: "Idle",
+            event: "UserCancel",
+        };
         let user = from_transition_error(&err);
+        // User-facing text is the generic "Unexpected error" + helpful
+        // fallback copy. Neither the state discriminator nor the event
+        // discriminator leaks through, and there are no braces from a
+        // Rust Debug dump.
         assert!(!user.flat_message().contains("UserCancel"));
         assert!(!user.flat_message().contains("Idle"));
         assert!(!user.flat_message().contains("{"));
         assert_eq!(user.kind, UserFacingErrorKind::Internal);
+
+        // But the error's own Display format — used for logs and
+        // operator-facing error paths — DOES surface the discriminators,
+        // because they're now structured &'static str fields. Verify
+        // the safe-for-humans-to-read shape of the Display output too,
+        // so we catch any regression that accidentally embeds payload
+        // data in the error message.
+        let display = err.to_string();
+        assert!(display.contains("state=Idle"), "display: {display}");
+        assert!(display.contains("event=UserCancel"), "display: {display}");
+        // And crucially, no stray Debug formatting in the operator path
+        // either. Payloads like `{ reason: None }` must not appear.
+        assert!(!display.contains('{'), "display: {display}");
     }
 
     #[test]

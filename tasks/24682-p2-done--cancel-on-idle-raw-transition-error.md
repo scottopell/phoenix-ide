@@ -9,8 +9,9 @@ artifact: src/api/handlers.rs
 
 ## Resolution
 
-Two complementary fixes — one at the API boundary, one at the SSE
-boundary, so neither path can leak `Debug` strings to users.
+**Three** complementary fixes — one at the API boundary, one at the SSE
+boundary, and one at the source in `TransitionError` itself — so no
+path can leak `Debug` strings to users.
 
 ### 1. `cancel_conversation` handler is a no-op on idle/terminal
 
@@ -61,12 +62,50 @@ construct typed payloads:
 - The redundant double-broadcast at the outer event loop was removed —
   `process_event` already broadcasts at the source.
 
+### 3. `TransitionError::InvalidTransition` carries structured discriminators
+
+The `UserFacingError` shim above closed the SSE leak, but the underlying
+payload was still `InvalidTransition(String)` holding
+`format!("No transition from {state:?} with event {event:?}")`. Any
+future code path that Display-formatted the error somewhere
+user-visible would reintroduce the same leak. That's a loose thread in
+AGENTS.md terms — the type system should refuse the Debug dump
+structurally, not rely on every downstream consumer to remember to
+route through the shim.
+
+Fix:
+
+- `TransitionError::InvalidTransition` now carries two
+  `&'static str` fields (`state`, `event`) sourced from
+  `ConvState::variant_name` and `Event::variant_name`. Its
+  `thiserror`-generated `Display` impl produces
+  `"Invalid transition: no arm for state=Idle event=UserCancel"` —
+  safe to show anywhere.
+- `ConvState::variant_name` and `Event::variant_name` are the single
+  source of truth for variant discriminators. The inline `state_name`
+  helper in `executor.rs::apply_transition_result` was deleted in
+  favour of the method, and two `std::mem::discriminant(..)` tracing
+  calls were upgraded to use `variant_name()` for readable log output.
+- The construction site at `transition.rs:1421` now passes
+  `state.variant_name()` and `event.variant_name()` instead of
+  `format!("{state:?} ... {event:?}")`. No Debug format survives.
+
+After the refactor, the `TransitionError` type itself refuses to carry
+payload data — the only way to populate `InvalidTransition` is with
+static strings that have been manually picked from a finite set.
+Adding a new `ConvState` or `Event` variant fails to compile the
+corresponding `variant_name` match arm, so drift isn't possible.
+
 ### Tests
 
-- `internal_variant_does_not_expose_debug_format` — proves
-  `from_transition_error(&TransitionError::InvalidTransition(...))`
-  produces a payload that does NOT contain `"UserCancel"`, `"Idle"`, or
-  any `{`. The mapping is genuinely lossy in the safe direction.
+- `internal_variant_does_not_expose_debug_format` — now proves BOTH
+  sides:
+  - User-facing: `from_transition_error(&InvalidTransition {..})` maps
+    to `internal()`, which contains neither `"UserCancel"`, `"Idle"`,
+    nor `{`.
+  - Operator-facing: `err.to_string()` (via `thiserror` Display)
+    produces `"state=Idle event=UserCancel"` without any payload dump
+    and without any stray braces.
 - `agent_busy_is_retryable`, `context_exhausted_is_fatal` — sanity
   checks on the variant kinds.
 

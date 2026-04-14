@@ -302,7 +302,7 @@ where
             Err(invalid) => {
                 tracing::warn!(
                     reason = %invalid.reason,
-                    state = ?std::mem::discriminant(&self.state),
+                    state = self.state.variant_name(),
                     "Rejected invalid outcome — state unchanged"
                 );
                 return Err(invalid.reason);
@@ -370,7 +370,11 @@ where
                     // payload via SSE, never the raw `Debug` formatting.
                     // The full `TransitionError` is logged separately so
                     // operators can still diagnose it.
-                    tracing::warn!(error = ?e, state = ?std::mem::discriminant(&self.state), "Transition rejected");
+                    tracing::warn!(
+                        error = %e,
+                        state = self.state.variant_name(),
+                        "Transition rejected"
+                    );
                     let _ = self.broadcast_tx.send(SseEvent::Error {
                         error: crate::runtime::user_facing_error::from_transition_error(&e),
                     });
@@ -402,27 +406,11 @@ where
         // Log notable state transitions at INFO. "Notable" means transitions that cross
         // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
         // terminal states) are logged at DEBUG to keep steady-state noise low.
+        // Variant names come from `ConvState::variant_name` so the set of
+        // names is maintained in exactly one place.
         {
-            fn state_name(s: &ConvState) -> &'static str {
-                match s {
-                    ConvState::Idle => "Idle",
-                    ConvState::LlmRequesting { .. } => "LlmRequesting",
-                    ConvState::ToolExecuting { .. } => "ToolExecuting",
-                    ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
-                    ConvState::CancellingSubAgents { .. } => "CancellingSubAgents",
-                    ConvState::CancellingTool { .. } => "CancellingTool",
-                    ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
-                    ConvState::Completed { .. } => "Completed",
-                    ConvState::Failed { .. } => "Failed",
-                    ConvState::Error { .. } => "Error",
-                    ConvState::ContextExhausted { .. } => "ContextExhausted",
-                    ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
-                    ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
-                    ConvState::Terminal => "Terminal",
-                }
-            }
-            let from = state_name(&old_state);
-            let to = state_name(&self.state);
+            let from = old_state.variant_name();
+            let to = self.state.variant_name();
             if from != to {
                 let notable = matches!(
                     &self.state,

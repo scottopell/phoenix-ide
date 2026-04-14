@@ -117,3 +117,30 @@ pub enum Event {
         repo_root: String,
     },
 }
+
+impl Event {
+    /// Stable, payload-free name of this event variant. Used by structured
+    /// error types (e.g. `TransitionError::InvalidTransition`) and tracing
+    /// so they can carry a discriminator without the `Debug` format of the
+    /// variant's payloads — task 24682 follow-up. Single source of truth.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Event::UserMessage { .. } => "UserMessage",
+            Event::UserCancel { .. } => "UserCancel",
+            Event::LlmResponse { .. } => "LlmResponse",
+            Event::LlmError { .. } => "LlmError",
+            Event::RetryTimeout { .. } => "RetryTimeout",
+            Event::ToolComplete { .. } => "ToolComplete",
+            Event::ToolAborted { .. } => "ToolAborted",
+            Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
+            Event::SubAgentResult { .. } => "SubAgentResult",
+            Event::ContinuationResponse { .. } => "ContinuationResponse",
+            Event::ContinuationFailed { .. } => "ContinuationFailed",
+            Event::UserTriggerContinuation => "UserTriggerContinuation",
+            Event::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+            Event::UserQuestionResponse { .. } => "UserQuestionResponse",
+            Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
+            Event::TaskResolved { .. } => "TaskResolved",
+        }
+    }
+}
