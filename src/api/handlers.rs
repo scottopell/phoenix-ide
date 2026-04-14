@@ -1219,7 +1219,7 @@ async fn cancel_conversation(
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
         tracing::debug!(
             conv_id = %id,
-            state = ?std::mem::discriminant(&conversation.state),
+            state = conversation.state.variant_name(),
             "cancel no-op: conversation has nothing in flight"
         );
         return Ok(Json(CancelResponse {

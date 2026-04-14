@@ -601,14 +601,21 @@ where
     /// happened, then sends `Event::UserCancel` so the state machine
     /// transitions `LlmRequesting → Idle` via the normal abort path. The
     /// next user message will reset the counter and resume normal operation.
-    async fn halt_parent_cycle_cap(&mut self, cap: u32) {
+    ///
+    /// `attempted` is the attempt number that tripped the guard — strictly
+    /// `cap + 1` for the first trip of a turn, but the signature makes the
+    /// off-by-one explicit to operators reading logs or the system message:
+    /// "attempt #{attempted} exceeds cap of {cap}" reads unambiguously,
+    /// while a bare "limit reached ({cap})" invites confusion about whether
+    /// the counter shown elsewhere (`cap + 1`) is a bug.
+    async fn halt_parent_cycle_cap(&mut self, cap: u32, attempted: u32) {
         let msg_id = uuid::Uuid::new_v4().to_string();
         let text = format!(
-            "Tool-use iteration limit reached ({cap} consecutive LLM calls without a user \
-             message). Halted to prevent a runaway agent loop. Send another message to continue \
-             — the counter resets on every user turn. If this keeps happening, check recent \
-             tool results for a stuck call. Override via the PHOENIX_PARENT_TOOL_CYCLE_CAP env \
-             var (0 disables)."
+            "Tool-use iteration limit reached: attempted LLM call #{attempted} exceeds the cap \
+             of {cap} consecutive calls without a user message. Halted to prevent a runaway \
+             agent loop. Send another message to continue — the counter resets on every user \
+             turn. If this keeps happening, check recent tool results for a stuck call. \
+             Override via the PHOENIX_PARENT_TOOL_CYCLE_CAP env var (0 disables)."
         );
         let content = crate::db::MessageContent::system(text);
 
@@ -890,13 +897,14 @@ where
                     self.parent_tool_cycle_count += 1;
                     if self.parent_tool_cycle_count > self.parent_tool_cycle_cap {
                         let cap = self.parent_tool_cycle_cap;
+                        let attempted = self.parent_tool_cycle_count;
                         tracing::warn!(
                             conv_id = %self.context.conversation_id,
-                            count = self.parent_tool_cycle_count,
+                            attempted,
                             cap,
-                            "Parent conversation hit tool-use cycle cap; halting"
+                            "parent conversation attempted to exceed tool-use cycle cap; halting"
                         );
-                        self.halt_parent_cycle_cap(cap).await;
+                        self.halt_parent_cycle_cap(cap, attempted).await;
                         return Ok(None);
                     }
                 }

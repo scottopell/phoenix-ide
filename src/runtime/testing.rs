@@ -1604,14 +1604,20 @@ mod tests {
         );
     }
 
-    /// Regression test for task 24680: a parent conversation whose LLM keeps
-    /// calling an unknown tool must be capped, not loop forever.
+    /// Regression test for task 24680: a parent conversation whose LLM
+    /// keeps issuing tool calls without ever producing a final answer must
+    /// be capped, not loop forever.
     ///
-    /// Simulates a stuck provider: every LLM response calls a tool named
-    /// `unknown_tool`, the tool executor reports "Unknown tool", and the
-    /// next LLM turn repeats the same thing. With no cap this would fill
-    /// the DB; with `parent_tool_cycle_cap = 3` the runtime halts after 3
-    /// LLM calls, persists a system message, and returns to Idle so the
+    /// Simulates a stuck provider: every LLM response calls the valid
+    /// `bash` tool, the mock tool executor reports success, and the next
+    /// LLM turn repeats the same call instead of emitting `end_turn`. The
+    /// "valid tool + success" shape is a strictly stronger test than an
+    /// "unknown tool" loop — it proves the cap halts *correct* tool usage
+    /// that simply never terminates, not just pathological error cases.
+    ///
+    /// With no cap this would fill the DB; with `parent_tool_cycle_cap = 3`
+    /// the runtime halts after 3 completed LLM calls (the 4th attempt trips
+    /// the guard), persists a system message, and returns to Idle so the
     /// user can send a follow-up.
     #[tokio::test]
     async fn test_parent_tool_cycle_cap_halts_runaway_loop() {
@@ -1795,7 +1801,15 @@ mod tests {
             // or it hits a terminal state. We don't join it — the runtime
             // holds its own internal event_tx clone, so dropping our test
             // clone isn't enough to make it exit, and waiting here would
-            // hang the test. Letting it leak is fine at test scope.
+            // hang the test. Letting it leak is fine at test scope because
+            // `#[tokio::test]` gives each test function its own tokio
+            // runtime and aborts all spawned tasks when that runtime drops
+            // at the end of the test — the leaked runtimes never survive
+            // into other tests.
+            //
+            // The design gap (runtime has no graceful-shutdown path) is
+            // tracked as task 24685. Once that lands, this test can join
+            // the handle instead of fire-and-forgetting it.
             tokio::spawn(async move { runtime.run().await });
 
             event_tx
