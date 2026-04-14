@@ -393,7 +393,7 @@ pub fn build_system_prompt_with_home(
     let skills = discover_skills_with_home(working_dir, home_override);
     if !skills.is_empty() {
         prompt.push_str("\n\n<available_skills>\n");
-        prompt.push_str("The following skills are available. To use a skill, read its SKILL.md file using bash (e.g. `cat /path/to/SKILL.md`) to load full instructions.\n");
+        prompt.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
         for skill in &skills {
             let path = skill.path.display();
             let _ = writeln!(

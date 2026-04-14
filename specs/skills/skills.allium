@@ -1,0 +1,389 @@
+-- allium: 3
+-- specs/skills/skills.allium
+--
+-- Scope: Skill system — discovery, invocation, argument substitution, delivery
+-- Includes: Skill entity, discovery walk-up, slash invocation, LLM tool invocation,
+--           frontmatter stripping, argument substitution, system prompt catalog
+-- Excludes: Frontend autocomplete (see inline-references.allium)
+--           context-mode: fork (open question below)
+--           REQ-SK-002 delivery convergence (open question below)
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A skill is a filesystem resource: a directory containing SKILL.md.
+-- The system reads skills but never writes them.
+external entity Skill {
+    name: String            -- from frontmatter; the identifier used in /name invocation
+    description: String     -- from frontmatter; shown in catalog and autocomplete
+    body: String            -- SKILL.md content with frontmatter stripped
+    path: Path              -- absolute path to the SKILL.md file itself
+    base_dir: Path          -- absolute path to the skill's containing directory (path.parent())
+    argument_hint: String?  -- from frontmatter; shown in autocomplete after /name
+    source: String          -- scanning location: ".claude/skills" | ".agents/skills"
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value SkillInvocation {
+    name: String
+    body: String       -- base_dir line prepended, arguments substituted into skill body
+    skill_dir: String  -- absolute path to skill directory (for companion file access)
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Relative paths scanned at each directory level during discovery.
+    -- Order matters: first match for a given name wins within a level.
+    skill_scan_dirs: List<String> = [".claude/skills", ".agents/skills"]
+}
+
+------------------------------------------------------------
+-- Rules: Discovery
+------------------------------------------------------------
+
+rule DiscoverSkillCatalog {
+    when: CatalogRequested(working_dir)
+
+    ensures: catalog = collect_skills(working_dir)
+    -- collect_skills: black box returning List<Skill>, sorted by name, fully deduplicated
+
+    @guidance
+        -- Collection order (determines name-collision winner):
+        --   1. Walk from working_dir to root; at each level scan skill_scan_dirs.
+        --      working_dir is visited first so the most specific skill wins.
+        --   2. Scan immediate children of working_dir (projects-directory case).
+        --   3. Scan $HOME/skill_scan_dirs if $HOME was not visited in the walk.
+        --
+        -- Dedup: all three checks applied inline as each skill is discovered
+        -- (not in separate passes). A skill is skipped if any of these match:
+        --   a. Canonical path: same inode as an already-collected skill (symlinks).
+        --   b. Content hash: same SKILL.md content as an already-collected skill.
+        --   c. Name: same name as an already-collected skill (first = closer to CWD wins).
+        --
+        -- Result is sorted by name for deterministic output.
+        -- Implementation: discover_skills_with_home() in src/system_prompt.rs.
+}
+
+rule CollectNamespacedSubSkills {
+    when: SkillDirectoryScanned(skill_dir, parent_name)
+
+    let sub_dir = sub_skills_dir(skill_dir)
+    -- sub_skills_dir: black box resolving skill_dir/skills/ as a Path
+
+    requires: directory_exists(sub_dir)
+    -- directory_exists: black box
+
+    ensures: for sub in skill_subdirectories(sub_dir) where has_skill_md(sub):
+        SkillDirectoryScanned(sub, parent_name + ":" + frontmatter_name(sub))
+    -- Chained trigger: recurse so sub-skills produce further SkillDirectoryScanned events.
+    -- skill_subdirectories: black box returning immediate child directories of sub_dir
+    -- has_skill_md: black box checking that a directory contains SKILL.md
+    -- frontmatter_name: black box reading the `name:` field from directory/SKILL.md
+
+    @guidance
+        -- Example: .claude/skills/allium/skills/distill/SKILL.md
+        --   parent_name: "allium"
+        --   frontmatter_name result: "distill"
+        --   registered name: "allium:distill"
+        -- Recursion continues: allium:distill could itself contain a skills/
+        -- subdirectory producing allium:distill:grandchild.
+        -- Implementation: collect_skills_from_dir() in src/system_prompt.rs.
+}
+
+------------------------------------------------------------
+-- Rules: Invocation — User Slash Command
+------------------------------------------------------------
+
+-- When a user sends a message containing /skill-name, the skill body replaces
+-- the entire llm_text. The original message is kept as display_text.
+-- The slash token may appear anywhere in the message (preceded by whitespace
+-- or at position 0) — mid-sentence invocation is intentional.
+--
+-- SPEC CHANGE — $ARGUMENTS semantics: This rule specifies target behaviour.
+-- The current implementation passes the full raw text as arguments (including
+-- the /skill-name token itself). The after-token semantics defined here are
+-- not yet implemented; the fix is tracked against this rule.
+
+rule UserInvokesSkill {
+    when: UserSendsMessage(text)
+
+    let token = first_slash_token(text)
+    -- first_slash_token: black box returning the first "/" + word sequence that
+    -- is preceded by whitespace or at position 0; null if none exists
+
+    requires: exists token
+
+    let skill = find_skill(collect_skills(working_dir), token.name)
+    -- find_skill: black box looking up a skill by exact name in a List<Skill>
+
+    requires: exists skill
+
+    let arguments = text_after_token(text, token)
+    -- text_after_token: black box returning the substring of text beginning
+    -- immediately after the end of the matched /skill-name token, leading
+    -- whitespace trimmed. Returns empty string if token is the last word.
+    -- Pre-slash context (e.g. "use " in "use /build --release") is NOT included.
+
+    ensures: MessageContent.created(
+        display_text: text,
+        llm_text: expand_skill(skill, arguments),
+        kind: Skill
+    )
+
+    @guidance
+        -- Only the first matched skill token is acted on; subsequent slash tokens
+        -- in the same message are treated as literal text.
+        --
+        -- Non-argument skills (no $ARGUMENTS placeholder in body) are the common
+        -- case. Arguments do not appear in the delivered body unless the skill
+        -- body uses $ARGUMENTS or the append fallback fires.
+        --
+        -- Implementation: expand() in src/message_expander.rs.
+        -- Current code passes full raw text as arguments (including /skill-name).
+        -- Target: arguments = text_after_token(text, token).
+}
+
+rule SkillTokenNotMatched {
+    when: UserSendsMessage(text)
+
+    let token = first_slash_token(text)
+
+    requires: exists token
+
+    let skill = find_skill(collect_skills(working_dir), token.name)
+
+    requires: not exists skill
+
+    ensures: MessageContent.created(
+        display_text: text,
+        llm_text: text,
+        kind: User
+    )
+    -- No skill matched; message passes through unchanged. No error emitted.
+    -- Common case: "/usr/bin/ls" produces token.name = "usr" (first path component
+    -- only), which does not match any skill name. URLs and prose using slash also
+    -- fall through here.
+}
+
+rule NoSlashToken {
+    when: UserSendsMessage(text)
+
+    let token = first_slash_token(text)
+
+    requires: not exists token
+
+    ensures: MessageContent.created(
+        display_text: text,
+        llm_text: text,
+        kind: User
+    )
+}
+
+------------------------------------------------------------
+-- Rules: Invocation — LLM Tool Call
+------------------------------------------------------------
+
+-- When the LLM calls the `skill` tool, the skill body is returned as a tool
+-- result. This delivers at lower authority than the user slash path (which
+-- delivers as a user-role message). A tool result is appropriate for an LLM
+-- autonomously invoking a skill mid-task, where the skill body is informational
+-- ("here are the instructions I found") rather than a user directive.
+--
+-- The design relationship between this path and REQ-SK-002 (which prescribes
+-- user-role delivery for all paths) is unresolved. See open questions below.
+
+rule LlmCallsSkillTool {
+    when: LlmToolCall(tool: "skill", skill_name: String, args: String, working_dir: Path)
+
+    let skill = find_skill(collect_skills(working_dir), skill_name)
+
+    requires: exists skill
+
+    ensures: ToolResult.created(
+        content: expand_skill(skill, args),
+        success: true
+    )
+
+    @guidance
+        -- skill_name must exactly match a discovered name including any namespace
+        -- prefix (e.g. "allium:distill", not just "distill").
+        -- Implementation: SkillTool::run() in src/tools/skill.rs.
+}
+
+rule LlmCallsSkillToolNotFound {
+    when: LlmToolCall(tool: "skill", skill_name: String, args: String, working_dir: Path)
+
+    let skill = find_skill(collect_skills(working_dir), skill_name)
+
+    requires: not exists skill
+
+    let available = skill_names_joined(collect_skills(working_dir))
+    -- skill_names_joined: black box returning comma-separated skill names
+
+    ensures: ToolResult.created(
+        content: "Skill '" + skill_name + "' not found. Available: " + available,
+        success: false
+    )
+}
+
+------------------------------------------------------------
+-- Rules: Skill Expansion (shared between both invocation paths)
+------------------------------------------------------------
+
+rule ExpandSkill {
+    when: SkillExpansionRequested(skill, arguments)
+
+    let header = "Base directory for this skill: " + path_to_string(skill.base_dir)
+    -- path_to_string: black box converting Path to its string representation
+
+    let body = substitute_arguments(skill.body, arguments)
+
+    ensures: SkillInvocation.created(
+        name: skill.name,
+        body: header + "\n\n" + body,
+        skill_dir: path_to_string(skill.base_dir)
+    )
+
+    @guidance
+        -- Both invocation paths call the same invoke_skill() function; the
+        -- difference is only how the resulting SkillInvocation is wrapped
+        -- (MessageContent::Skill vs ToolOutput::success).
+        -- Implementation: invoke_skill() in src/skills.rs.
+}
+
+------------------------------------------------------------
+-- Rules: Argument Substitution
+------------------------------------------------------------
+
+-- Non-argument skills (no $ARGUMENTS in body) are the common case.
+-- Argument support was added for parity with external conventions; most
+-- skills are invoked without arguments.
+
+rule SubstituteArguments {
+    when: SubstituteArgumentsRequested(body, arguments)
+
+    -- No arguments provided: body delivered unchanged (common case).
+    ensures: body
+        if is_empty(arguments)
+    -- is_empty: black box on String
+
+    -- Body uses $ARGUMENTS: substitute positional placeholders first, then the
+    -- full argument string. Positional substitution must precede bare $ARGUMENTS
+    -- replacement to prevent the bare form from corrupting $ARGUMENTS[N] patterns.
+    -- NOTE: $N shorthand ($1, $2) is substituted via this branch but only fires
+    -- when the body also contains the bare $ARGUMENTS marker. A body with only
+    -- $1/$2 and no $ARGUMENTS falls through to the append branch below.
+    ensures: replace_full(replace_positional(body, arguments), arguments)
+        if not is_empty(arguments) and contains(body, "$ARGUMENTS")
+    -- replace_positional: black box substituting $ARGUMENTS[N] and $N (1-based)
+    --   with the Nth whitespace-delimited argument token
+    -- replace_full: black box replacing $ARGUMENTS with the full argument string
+    -- contains: black box on String
+
+    -- No placeholder but arguments provided: append so the LLM still receives
+    -- the arguments even though the skill author didn't anticipate them.
+    ensures: body + "\nARGUMENTS: " + arguments
+        if not is_empty(arguments) and not contains(body, "$ARGUMENTS")
+
+    @guidance
+        -- Substitution with no arguments is identity: substitute_arguments(body, "")
+        -- always returns body unchanged, regardless of whether $ARGUMENTS appears.
+        -- Implementation: substitute_arguments() in src/skills.rs.
+}
+
+------------------------------------------------------------
+-- Rules: Frontmatter Stripping
+------------------------------------------------------------
+
+rule StripFrontmatter {
+    when: SkillFileRead(path, content)
+
+    let trimmed = trim_start(content)
+    -- trim_start: black box removing leading whitespace/newlines from content
+    -- Applied before the delimiter check: SKILL.md files with leading blank
+    -- lines are handled correctly.
+
+    requires: starts_with(trimmed, "---\n")
+    -- starts_with: black box on String
+
+    let body = after_frontmatter(trimmed)
+    -- after_frontmatter: black box stripping from the opening "---\n" through the
+    -- closing "\n---" delimiter and any immediately following newlines, returning
+    -- only the body. If no closing delimiter is found, returns content unchanged.
+
+    ensures: skill.body = body
+
+    @guidance
+        -- Files without a leading "---\n" (after trimming) are delivered as-is;
+        -- this rule's requires guard excludes them.
+        -- Implementation: strip_frontmatter() in src/skills.rs.
+}
+
+-- Supported frontmatter fields (parsed during discovery, not at invocation time):
+--   name:          required String — skill identifier used for /name invocation
+--   description:   required String — one-line description for catalog and autocomplete
+--   argument-hint: optional String — hint shown in autocomplete UI after /name
+
+------------------------------------------------------------
+-- Rules: System Prompt Catalog
+------------------------------------------------------------
+
+rule InjectSkillCatalog {
+    when: SystemPromptBuilt(working_dir)
+
+    let catalog = collect_skills(working_dir)
+
+    requires: catalog.count > 0
+
+    let entries = skill_catalog_lines(catalog)
+    -- skill_catalog_lines: black box formatting each skill as:
+    --   "- **name** — description (`/path/to/SKILL.md`)"
+    -- Uses skill.path (the SKILL.md file path), not skill.base_dir.
+
+    ensures: system_prompt.contains(
+        "<available_skills>\n" +
+        "Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). " +
+        "Do not cat SKILL.md files directly.\n" +
+        entries +
+        "\n</available_skills>"
+    )
+
+    @guidance
+        -- Full skill bodies are NOT included — the catalog is a lightweight index.
+        -- argument_hint is omitted from the catalog (it is for UI autocomplete only).
+        -- Implementation: build_system_prompt_with_home() in src/system_prompt.rs.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Frontmatter delimiters are never present at the start of a delivered skill body.
+invariant FrontmatterStrippedFromBody {
+    for skill in Skills:
+        not starts_with(skill.body, "---\n")
+}
+
+-- Skill names are unique across all skills visible in a given working directory.
+-- Dedup during discovery ensures no two distinct files reach the catalog with
+-- the same name.
+invariant SkillNamesUnique {
+    for a in Skills:
+        for b in Skills where b != a:
+            a.name != b.name
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "context-mode: fork — a planned frontmatter field that would cause skill invocation to run in an isolated context (similar to a sub-agent) rather than injecting into the current conversation. Semantics, lifecycle, and delivery format are unresolved. Not implementing yet."
+
+open question "REQ-SK-002 delivery convergence — the spEARS spec requires both the slash path and the LLM tool path to deliver skill content as a user-role message. Current implementation diverges: slash path delivers as MessageContent::Skill (user role), tool path delivers as ToolOutput (tool result). The code author tracked this as REQ-SK-005 / TODO in src/tools/skill.rs. Design decision pending: converge to user-role for both paths, or accept tool-result delivery for LLM-autonomous invocation as intentional?"
