@@ -190,7 +190,12 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
         let skills = discover_skills(working_dir);
         if skills.iter().any(|s| s.name == skill_ref.token) {
-            match crate::skills::invoke_skill(&skill_ref.token, text, &skills) {
+            // Safety: `skill_ref.span.end` is produced by the tokenizer from
+            // `char_indices()` on `text`, so it is always a valid UTF-8
+            // boundary.
+            #[allow(clippy::string_slice)]
+            let arguments = text[skill_ref.span.end..].trim_start();
+            match crate::skills::invoke_skill(&skill_ref.token, arguments, &skills) {
                 Ok(invocation) => {
                     return Ok(ExpandedMessage {
                         display_text: text.to_string(),
@@ -554,8 +559,8 @@ mod tests {
         let result = expand("/writing-style", tmp.path()).unwrap();
         assert_eq!(result.display_text, "/writing-style");
         assert!(result.llm_text.contains("Write in a formal tone."));
-        // Full message is passed as arguments
-        assert!(result.llm_text.contains("ARGUMENTS: /writing-style"));
+        // No text after the token — arguments is empty, so append fallback does not fire
+        assert!(!result.llm_text.contains("ARGUMENTS:"));
         // Skill invocation is populated
         let invocation = result.skill_invocation.as_ref().unwrap();
         assert_eq!(invocation.name, "writing-style");
@@ -575,10 +580,10 @@ mod tests {
 
         let result = expand("/review src/main.rs", tmp.path()).unwrap();
         assert_eq!(result.display_text, "/review src/main.rs");
-        // $ARGUMENTS is replaced with the full original message
+        // $ARGUMENTS is replaced with only the text after the skill token
         assert!(result
             .llm_text
-            .contains("Please review /review src/main.rs carefully."));
+            .contains("Please review src/main.rs carefully."));
         let invocation = result.skill_invocation.as_ref().unwrap();
         assert_eq!(invocation.name, "review");
     }
@@ -597,8 +602,8 @@ mod tests {
         let result = expand("/deploy staging", tmp.path()).unwrap();
         assert_eq!(result.display_text, "/deploy staging");
         assert!(result.llm_text.contains("Run the deployment steps."));
-        // Full message appended as ARGUMENTS
-        assert!(result.llm_text.contains("ARGUMENTS: /deploy staging"));
+        // Only the text after the skill token is appended as ARGUMENTS
+        assert!(result.llm_text.contains("ARGUMENTS: staging"));
     }
 
     #[test]
@@ -615,7 +620,7 @@ mod tests {
         let result = expand("use /build to compile", tmp.path()).unwrap();
         assert_eq!(result.display_text, "use /build to compile");
         assert!(result.llm_text.contains("Run the build steps."));
-        assert!(result.llm_text.contains("ARGUMENTS: use /build to compile"));
+        assert!(result.llm_text.contains("ARGUMENTS: to compile"));
     }
 
     #[test]
@@ -633,7 +638,7 @@ mod tests {
         assert_eq!(result.display_text, "use /review to check this PR");
         assert!(result
             .llm_text
-            .contains("Please review use /review to check this PR carefully."));
+            .contains("Please review to check this PR carefully."));
     }
 
     #[test]
