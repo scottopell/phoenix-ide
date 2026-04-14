@@ -1,11 +1,74 @@
 ---
 created: 2026-04-14
 priority: p3
-status: ready
+status: done
 artifact: ui/src/index.css
 ---
 
 # Terminal panel hardcodes dark colors, ignores `data-theme="light"`
+
+## Resolution
+
+Followed the recommended "follow theme" path so the terminal feels
+consistent with the rest of the UI instead of being a permanent dark
+island.
+
+### CSS variables (`ui/src/index.css`)
+
+Added `--terminal-bg`, `--terminal-header-bg`, `--terminal-border`,
+`--terminal-fg`, `--terminal-cursor` to both `[data-theme="dark"]` and
+`[data-theme="light"]`. The dark values match the previous hardcoded
+hexes (`#1a1a1a`, `#252525`, `#333`); the light values use the existing
+GitHub-light palette tones (`#f6f8fa`, `#eaeef2`, `#d0d7de`, `#1f2328`)
+for consistency with the chat / sidebar / file tree.
+
+`.terminal-panel` and `.terminal-panel-header` were updated to read the
+new variables instead of literal hexes.
+
+### xterm.js theme integration (`ui/src/components/TerminalPanel.tsx`)
+
+xterm.js renders to its own canvas, so CSS doesn't reach
+`.xterm-viewport`. The fix:
+
+1. New helper `readXtermTheme()` reads `--terminal-bg/--terminal-fg/
+   --terminal-cursor` from `:root` and returns an `ITheme`.
+2. `new Terminal({ ... })` now uses `theme: readXtermTheme()` instead of
+   the previous `{ background: '#1a1a1a', ... }` literal.
+3. New `useEffect([theme])` (where `theme` is from `useTheme()`) reapplies
+   the theme to the live `term.options.theme` whenever the app theme
+   changes. This means the terminal will switch live without tearing
+   down the PTY once a theme toggle button is wired up to the
+   `useTheme().toggleTheme()` API. Today the only path is reload, which
+   already worked via the construction-time read.
+
+### Verification
+
+DOM-level inspection in light mode:
+
+```
+panel_bg     = rgb(246, 248, 250)   ← #f6f8fa, the new --terminal-bg
+viewport_bg  = rgb(246, 248, 250)   ← xterm.js canvas, matches
+css_var      = #f6f8fa
+```
+
+After `localStorage.setItem('phoenix-theme','dark'); reload`:
+
+```
+panel_bg     = rgb(26, 26, 26)
+viewport_bg  = rgb(26, 26, 26)
+css_var      = #1a1a1a
+```
+
+Screenshot at `tasks/screenshots/17-terminal-light-mode.png` shows the
+terminal blending into the light layout instead of the previous dark
+strip.
+
+### Out of scope
+
+A user-facing theme toggle button. `ThemeToggle.tsx` exists but isn't
+mounted anywhere — that's a separate UI wiring task. The
+infrastructure to live-switch themes is now in place; only the trigger
+is missing.
 
 ## Problem
 
