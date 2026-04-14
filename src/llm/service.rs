@@ -15,7 +15,6 @@ pub struct LlmServiceImpl {
     pub anthropic_base_url: Option<String>,
     pub openai_base_url: Option<String>,
     pub custom_headers: Vec<(String, String)>,
-    pub use_bearer_auth: bool,
 }
 
 impl LlmServiceImpl {
@@ -26,7 +25,6 @@ impl LlmServiceImpl {
         anthropic_base_url: Option<String>,
         openai_base_url: Option<String>,
         custom_headers: Vec<(String, String)>,
-        use_bearer_auth: bool,
     ) -> Self {
         Self {
             spec,
@@ -35,7 +33,6 @@ impl LlmServiceImpl {
             anthropic_base_url,
             openai_base_url,
             custom_headers,
-            use_bearer_auth,
         }
     }
 }
@@ -176,13 +173,9 @@ impl LlmServiceImpl {
         }
     }
 
-    /// Resolve auth, promoting `ApiKey` to `PlainBearer` when `use_bearer_auth` is set.
+    /// Resolve auth credential for this request.
     async fn resolve_auth(&self) -> Result<super::ResolvedAuth, super::LlmError> {
-        let mut resolved = self.auth.resolve().await?;
-        if self.use_bearer_auth && matches!(resolved.style, super::AuthStyle::ApiKey) {
-            resolved.style = super::AuthStyle::PlainBearer;
-        }
-        Ok(resolved)
+        self.auth.resolve().await
     }
 
     /// Resolve a plain credential string for `OpenAI` calls.

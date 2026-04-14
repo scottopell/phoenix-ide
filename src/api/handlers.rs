@@ -2960,7 +2960,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     let llm_configured = state.llm_registry.has_models()
         || state.llm_registry.gateway_status != GatewayStatus::NotConfigured;
 
-    let credential_status = if let Some(ref hs) = state.helper_state {
+    let credential_status = if let Some(ref hs) = state.credential_helper {
         use crate::llm::credential_helper::CredentialStatus;
         match hs.credential_status().await {
             CredentialStatus::Idle => CredentialStatusApi::Required,
@@ -2993,7 +2993,7 @@ async fn run_credential_helper(State(state): State<AppState>) -> impl IntoRespon
     use std::convert::Infallible;
     use std::sync::Arc;
 
-    let Some(ref hs) = state.helper_state else {
+    let Some(ref hs) = state.credential_helper else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             "No credential helper configured",

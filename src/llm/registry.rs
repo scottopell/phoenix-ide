@@ -8,8 +8,7 @@ use super::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex as TokioMutex;
+use std::time::Duration;
 
 /// Gateway reachability status determined at startup
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,20 +19,6 @@ pub enum GatewayStatus {
     Healthy,
     /// Gateway configured but unreachable or returned an error during startup probe
     Unreachable,
-}
-
-/// Reads a credential from an environment variable on each call.
-#[derive(Debug)]
-pub struct EnvCredential {
-    var_name: String,
-}
-
-impl EnvCredential {
-    pub fn new(var_name: impl Into<String>) -> Self {
-        Self {
-            var_name: var_name.into(),
-        }
-    }
 }
 
 /// A credential source that produces a string on demand.
@@ -71,121 +56,6 @@ impl CredentialSource for StaticCredential {
     }
     async fn invalidate(&self) -> bool {
         false // Static credentials can't be invalidated — retry won't help
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialSource for EnvCredential {
-    async fn get(&self) -> Option<String> {
-        std::env::var(&self.var_name).ok().filter(|t| !t.is_empty())
-    }
-    async fn invalidate(&self) -> bool {
-        false // Re-reads env var each time — nothing to invalidate
-    }
-}
-
-/// Runs a shell command to obtain an API key/token on demand, caching the
-/// result for `ttl` duration.
-pub struct CommandCredential {
-    command: String,
-    ttl: Duration,
-    cache: TokioMutex<Option<(String, Instant)>>,
-}
-
-impl CommandCredential {
-    pub fn new(command: impl Into<String>, ttl: Duration) -> Self {
-        Self {
-            command: command.into(),
-            ttl,
-            cache: TokioMutex::new(None),
-        }
-    }
-}
-
-impl std::fmt::Debug for CommandCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CommandCredential")
-            .field("command", &"[redacted]")
-            .field("ttl", &self.ttl)
-            .field("cache", &"<locked>")
-            .finish()
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialSource for CommandCredential {
-    async fn get(&self) -> Option<String> {
-        let guard = self.cache.lock().await;
-
-        // Return cached token if still valid
-        if let Some((ref tok, ref at)) = *guard {
-            if at.elapsed() < self.ttl {
-                return Some(tok.clone());
-            }
-        }
-
-        // Cache miss or expired — release lock during execution
-        drop(guard);
-
-        let output = tokio::process::Command::new("sh")
-            .args(["-c", &self.command])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await;
-
-        match output {
-            Err(e) => {
-                tracing::warn!(
-                    command = %self.command,
-                    error = %e,
-                    "LLM_API_KEY_HELPER command failed to spawn"
-                );
-                None
-            }
-            Ok(out) if !out.status.success() => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!(
-                    command = %self.command,
-                    exit_code = ?out.status.code(),
-                    stderr = %stderr.trim(),
-                    "LLM_API_KEY_HELPER command exited with non-zero status"
-                );
-                None
-            }
-            Ok(out) => {
-                let token = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .rfind(|l| !l.trim().is_empty())
-                    .unwrap_or("")
-                    .to_string();
-                if token.is_empty() {
-                    tracing::warn!(
-                        command = %self.command,
-                        "LLM_API_KEY_HELPER command produced empty output"
-                    );
-                    return None;
-                }
-                tracing::debug!(
-                    command = %self.command,
-                    ttl_ms = self.ttl.as_millis(),
-                    "LLM_API_KEY_HELPER token refreshed"
-                );
-                let mut guard = self.cache.lock().await;
-                *guard = Some((token.clone(), Instant::now()));
-                Some(token)
-            }
-        }
-    }
-
-    async fn invalidate(&self) -> bool {
-        let mut guard = self.cache.lock().await;
-        if guard.is_some() {
-            *guard = None;
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -274,7 +144,7 @@ pub struct LlmConfig {
     pub use_bearer_auth: bool,
     /// Typed handle for the interactive credential helper. Set alongside `api_key_helper`
     /// when `LLM_API_KEY_HELPER` is configured. `None` otherwise.
-    pub helper_state: Option<Arc<crate::llm::credential_helper::HelperState>>,
+    pub credential_helper: Option<Arc<crate::llm::credential_helper::CredentialHelper>>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -295,7 +165,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
             .field("use_bearer_auth", &self.use_bearer_auth)
-            .field("helper_state", &self.helper_state.is_some())
+            .field("credential_helper", &self.credential_helper.is_some())
             .finish()
     }
 }
@@ -312,7 +182,7 @@ impl Clone for LlmConfig {
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
             use_bearer_auth: self.use_bearer_auth,
-            helper_state: self.helper_state.as_ref().map(Arc::clone),
+            credential_helper: self.credential_helper.as_ref().map(Arc::clone),
         }
     }
 }
@@ -333,16 +203,16 @@ impl Default for LlmConfig {
             openai_base_url: None,
             custom_headers: Vec::new(),
             use_bearer_auth: false,
-            helper_state: None,
+            credential_helper: None,
         }
     }
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
-        let (api_key_helper, helper_state): (
+        let (api_key_helper, credential_helper): (
             Option<Arc<dyn CredentialSource>>,
-            Option<Arc<crate::llm::credential_helper::HelperState>>,
+            Option<Arc<crate::llm::credential_helper::CredentialHelper>>,
         ) = if let Some(command) = std::env::var("LLM_API_KEY_HELPER")
             .ok()
             .filter(|s| !s.is_empty())
@@ -351,7 +221,7 @@ impl LlmConfig {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
-            let hs = crate::llm::credential_helper::HelperState::new(
+            let hs = crate::llm::credential_helper::CredentialHelper::new(
                 command,
                 Duration::from_millis(ttl_ms),
             );
@@ -395,7 +265,7 @@ impl LlmConfig {
             use_bearer_auth: std::env::var("LLM_AUTH_HEADER")
                 .ok()
                 .is_some_and(|v| v.eq_ignore_ascii_case("bearer")),
-            helper_state,
+            credential_helper,
         }
     }
 }
@@ -629,9 +499,15 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(service)));
         }
 
+        let default_style = if config.use_bearer_auth {
+            AuthStyle::PlainBearer
+        } else {
+            AuthStyle::ApiKey
+        };
+
         let auth = if let Some(ref helper) = config.api_key_helper {
             // api_key_helper takes highest priority — dynamic API key for all providers
-            LlmAuth::new(Arc::clone(helper), AuthStyle::ApiKey)
+            LlmAuth::new(Arc::clone(helper), default_style)
         } else if config.gateway.is_some() {
             // Gateway mode: sentinel value; gateway handles real authentication
             LlmAuth::new(
@@ -663,7 +539,6 @@ impl ModelRegistry {
             config.anthropic_base_url.clone(),
             config.openai_base_url.clone(),
             config.custom_headers.clone(),
-            config.use_bearer_auth,
         ));
         Some(Arc::new(LoggingService::new(service)))
     }
@@ -847,35 +722,6 @@ mod tests {
         let registry = ModelRegistry::new(&config);
 
         assert_eq!(registry.default_model_id(), "claude-opus-4-5");
-    }
-
-    #[tokio::test]
-    async fn test_command_credential_caches() {
-        let cred = CommandCredential::new("echo cached-token", Duration::from_hours(1));
-        let t1 = cred.get().await;
-        let t2 = cred.get().await;
-        assert_eq!(t1, Some("cached-token".to_string()));
-        assert_eq!(t2, Some("cached-token".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_command_credential_invalidate() {
-        let cred = CommandCredential::new("echo fresh", Duration::from_hours(1));
-        assert!(cred.get().await.is_some());
-        cred.invalidate().await;
-        assert!(cred.get().await.is_some()); // re-runs command
-    }
-
-    #[tokio::test]
-    async fn test_command_credential_failed_command() {
-        let cred = CommandCredential::new("exit 1", Duration::from_hours(1));
-        assert!(cred.get().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_command_credential_empty_output() {
-        let cred = CommandCredential::new("true", Duration::from_hours(1));
-        assert!(cred.get().await.is_none());
     }
 
     #[tokio::test]

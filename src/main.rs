@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize LLM registry with model discovery
     let llm_config = LlmConfig::from_env();
-    let helper_state = llm_config.helper_state.clone();
+    let credential_helper = llm_config.credential_helper.clone();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
 
     if llm_registry.has_models() {
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         llm_registry,
         platform,
         mcp_manager,
-        helper_state,
+        credential_helper,
         password,
     )
     .await;

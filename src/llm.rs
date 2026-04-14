@@ -69,8 +69,8 @@ pub(crate) mod sse;
 mod types;
 
 #[allow(unused_imports)]
-// CredentialStatus + HelperState: public API for credential helper consumers
-pub use credential_helper::{CredentialStatus, HelperState};
+// CredentialStatus + CredentialHelper: public API for credential helper consumers
+pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
 pub use models::{all_models, ModelSpec, Provider};

@@ -1,6 +1,6 @@
 //! Interactive credential helper lifecycle management.
 //!
-//! `HelperState` manages the full lifecycle of a shell-based credential helper:
+//! `CredentialHelper` manages the full lifecycle of a shell-based credential helper:
 //! idle → running → valid/failed, with SSE fan-out to multiple concurrent subscribers.
 
 use crate::llm::registry::CredentialSource;
@@ -51,15 +51,24 @@ pub enum CredentialStatus {
 }
 
 /// Manages the lifecycle of an interactive shell credential helper.
-pub struct HelperState {
+/// Duration to wait for a non-interactive helper to return before giving up.
+/// If the helper needs OIDC interaction, it will hang past this timeout and
+/// the UI credential panel takes over.
+const AUTO_TRIGGER_TIMEOUT: Duration = Duration::from_secs(3);
+
+pub struct CredentialHelper {
     command: String,
     ttl: Duration,
     inner: TokioMutex<HelperInner>,
+    /// Signalled when the helper task transitions out of Running (to Valid or Failed).
+    settled: tokio::sync::Notify,
+    /// Weak self-reference for auto-triggering from `get()`.
+    self_ref: std::sync::OnceLock<std::sync::Weak<Self>>,
 }
 
-impl std::fmt::Debug for HelperState {
+impl std::fmt::Debug for CredentialHelper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HelperState")
+        f.debug_struct("CredentialHelper")
             .field("command", &"[redacted]")
             .field("ttl", &self.ttl)
             .finish_non_exhaustive()
@@ -67,13 +76,17 @@ impl std::fmt::Debug for HelperState {
 }
 
 #[allow(dead_code)] // credential_status and expire_if_needed used by Phase 2 models handler
-impl HelperState {
+impl CredentialHelper {
     pub fn new(command: String, ttl: Duration) -> Arc<Self> {
-        Arc::new(Self {
+        let this = Arc::new(Self {
             command,
             ttl,
             inner: TokioMutex::new(HelperInner::Idle),
-        })
+            settled: tokio::sync::Notify::new(),
+            self_ref: std::sync::OnceLock::new(),
+        });
+        let _ = this.self_ref.set(Arc::downgrade(&this));
+        this
     }
 
     /// Return the current observable status. Transitions Valid→Idle if TTL has expired.
@@ -284,6 +297,7 @@ impl HelperState {
                     },
                 );
                 drop(inner);
+                this.settled.notify_waiters();
                 for sub in subs {
                     let _ = sub.send(HelperEvent::Complete).await;
                 }
@@ -296,6 +310,7 @@ impl HelperState {
                     },
                 );
                 drop(inner);
+                this.settled.notify_waiters();
                 for sub in subs {
                     let _ = sub
                         .send(HelperEvent::Error {
@@ -323,23 +338,69 @@ impl HelperState {
 }
 
 #[async_trait::async_trait]
-impl CredentialSource for HelperState {
+impl CredentialSource for CredentialHelper {
     async fn get(&self) -> Option<String> {
-        let mut inner = self.inner.lock().await;
-        match &*inner {
-            HelperInner::Valid {
-                credential,
-                expires_at,
-            } => {
-                if Instant::now() < *expires_at {
-                    Some(credential.clone())
-                } else {
+        // Fast path: return cached credential if still valid.
+        {
+            let mut inner = self.inner.lock().await;
+            match &*inner {
+                HelperInner::Valid {
+                    credential,
+                    expires_at,
+                } => {
+                    if Instant::now() < *expires_at {
+                        return Some(credential.clone());
+                    }
+                    // Expired — fall through to auto-trigger.
                     *inner = HelperInner::Idle;
-                    None
+                }
+                HelperInner::Running { .. } => {
+                    // Already running (e.g. triggered by UI panel) — wait briefly for result.
+                    drop(inner);
+                    if tokio::time::timeout(AUTO_TRIGGER_TIMEOUT, self.settled.notified())
+                        .await
+                        .is_ok()
+                    {
+                        let inner = self.inner.lock().await;
+                        if let HelperInner::Valid { credential, .. } = &*inner {
+                            return Some(credential.clone());
+                        }
+                    }
+                    return None;
+                }
+                HelperInner::Idle | HelperInner::Failed { .. } => {}
+            }
+        }
+
+        // Auto-trigger: spawn the helper and wait up to AUTO_TRIGGER_TIMEOUT.
+        // If the helper returns quickly (cached token), the LLM request succeeds
+        // without UI interaction. If it hangs (OIDC), timeout fires and the UI
+        // credential panel takes over.
+        if let Some(weak) = self.self_ref.get() {
+            if let Some(arc_self) = weak.upgrade() {
+                let mut inner = self.inner.lock().await;
+                if matches!(&*inner, HelperInner::Idle | HelperInner::Failed { .. }) {
+                    *inner = HelperInner::Running {
+                        lines_so_far: vec![],
+                        subscribers: vec![],
+                    };
+                    drop(inner);
+                    Self::spawn_helper_task(arc_self);
+
+                    if tokio::time::timeout(AUTO_TRIGGER_TIMEOUT, self.settled.notified())
+                        .await
+                        .is_ok()
+                    {
+                        let inner = self.inner.lock().await;
+                        if let HelperInner::Valid { credential, .. } = &*inner {
+                            return Some(credential.clone());
+                        }
+                    }
                 }
             }
-            _ => None,
         }
+
+        None
     }
 
     async fn invalidate(&self) -> bool {
