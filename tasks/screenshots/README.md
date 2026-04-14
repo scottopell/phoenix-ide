@@ -21,7 +21,8 @@ cross-checking the UI-focused tasks in `tasks/*-ready--*.md`.
 | 12 | `12-fresh-conversation.png` | Fresh conversation right after sending "hello". Note the red banner: `Invalid transition: No transition from Idle with event UserCancel { reason: None }` — appeared when `POST /cancel` was issued after the mock had already replied and state had returned to idle. See task `24682`. |
 | 13 | `13-tasks-section-expanded.png` | The collapsible **Tasks** section under the file explorer expanded — READY (29), BLOCKED (3), BRAINSTORMING (5), DONE (209), WONT-DO (7). |
 | 14 | `14-task-file-opened.png` | A task file (`08605 auto-scroll-on-new-messages`) opened in the prose reader pane. The reader column is extremely narrow — this is the split-pane mentioned in task 08654. |
-| 15 | `15-light-mode.png` | Light theme forced via `data-theme="light"` on `<html>`. **Partial coverage**: chat area, file tree and main input switch to light, but the left conversation-list sidebar, the **FILES** header, the tool-tab row, and the terminal stay dark. |
+| 15 | `15-light-mode.png` | Light theme forced via `data-theme="light"` on `<html>` **before** task 24681 landed. Chat area, file tree and main input are light, but the terminal strip at the bottom stays hardcoded dark (`#1a1a1a`). The low-contrast light gray vs white on the sidebar initially misled me into thinking multiple panels were broken; a DOM-level computed-style walk proved the terminal was the only opaque dark element. |
+| 17 | `17-terminal-light-mode.png` | Same view **after** task 24681. Terminal panel, header, and xterm.js viewport all inherit the light palette via CSS variables (`--terminal-bg`, `--terminal-header-bg`) and a `useEffect([theme])` that reapplies the xterm `theme` option. Paired with shot 15 as a before/after. |
 
 ## UI observations that line up with ready tasks
 
