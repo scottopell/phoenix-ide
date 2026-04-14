@@ -1,11 +1,65 @@
 ---
 created: 2026-04-14
 priority: p1
-status: ready
+status: done
 artifact: src/runtime/executor.rs, ui/src/conversation/atom.ts
 ---
 
 # Streaming message appears to "repeatedly deliver itself" (real-provider)
+
+## Resolution
+
+Backend (root cause) and client (defense in depth) both addressed.
+
+### Backend: happens-before barrier
+
+In `src/runtime/executor.rs`, the LLM task now stores the token forwarder's
+`JoinHandle` and, after `complete_streaming` returns:
+
+1. Drops `chunk_tx` explicitly so the forwarder sees `Err(Closed)`
+2. `await`s `forwarder_handle` so the forwarder drains every buffered
+   `TokenChunk` and broadcasts them as `SseEvent::Token`
+3. Only then sends the LLM outcome on `llm_tx`
+
+This guarantees every `SseEvent::Token` lands on the per-conversation
+broadcast channel before the main executor loop can receive the outcome
+and broadcast `SseEvent::Message`. The race is now structurally
+impossible.
+
+### Backend regression test
+
+`test_streaming_tokens_ordered_before_message` uses a new
+`StreamingMockLlmClient` that emits 500 tokens then returns. It runs 30
+back-to-back iterations on a 4-worker tokio runtime and asserts that for
+every iteration, the LAST `SseEvent::Token` index is strictly less than
+the FIRST agent `SseEvent::Message` index on the broadcast channel.
+
+I verified the test catches the race: with the `forwarder_handle.await`
+removed, the test fails 3/3 runs in a row. With the fix in place, it
+passes 100% across the 30 iterations.
+
+### Client: defensive guards
+
+In `ui/src/conversation/atom.ts`:
+
+1. **`sse_token` phase guard** — only accumulate a streaming buffer when
+   `phase.type === 'llm_requesting'`. Late tokens that arrive after the
+   phase has moved away (a regression of the backend race, or any future
+   reconnect-replay edge case) are dropped instead of spawning a phantom
+   buffer.
+2. **`sse_init` dedup merge** — on reconnect (`?after=N`), filter
+   incoming messages by both `sequence_id > atom.lastSequenceId` AND
+   `!existingIds.has(message_id)` before concatenating. Matches the
+   bulletproofing already present in `sse_message`.
+
+New unit tests in `ui/src/conversation/atom.test.ts`:
+
+- `drops tokens when phase is idle`
+- `drops tokens when phase is tool_executing`
+- `drops overlapping messages by sequence_id on reconnect merge`
+- `drops overlapping messages by message_id on reconnect merge`
+
+All 39 atom tests pass.
 
 ## User-reported symptom
 

@@ -70,6 +70,67 @@ impl LlmClient for MockLlmClient {
 }
 
 // ============================================================================
+// Streaming Mock LLM Client
+// ============================================================================
+
+/// Mock streaming LLM client used by the task 24683 regression test.
+///
+/// Emits a burst of `TokenChunk::Text` events on `complete_streaming` and
+/// then returns a single text `LlmResponse`. Combined with the executor's
+/// `forwarder_handle.await` barrier, every `SseEvent::Token` should arrive
+/// on the outer broadcast channel *before* the resulting `SseEvent::Message`.
+#[allow(dead_code)]
+pub struct StreamingMockLlmClient {
+    model_id: String,
+    token_count: usize,
+    final_text: String,
+}
+
+#[allow(dead_code)]
+impl StreamingMockLlmClient {
+    pub fn new(token_count: usize, final_text: impl Into<String>) -> Self {
+        Self {
+            model_id: "streaming-mock".to_string(),
+            token_count,
+            final_text: final_text.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for StreamingMockLlmClient {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        // Not used — complete_streaming is the intended path.
+        Err(LlmError::network(
+            "StreamingMockLlmClient only supports complete_streaming",
+        ))
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        // Emit the burst. Each send is a fire-and-forget into the broadcast
+        // channel; the forwarder task reads and re-broadcasts as
+        // `SseEvent::Token`. The count is deliberately large so the forwarder
+        // provably has pending work when `complete_streaming` returns.
+        for i in 0..self.token_count {
+            let _ = chunk_tx.send(crate::llm::TokenChunk::Text(format!("chunk{i} ")));
+        }
+        Ok(LlmResponse {
+            content: vec![crate::llm::ContentBlock::text(self.final_text.clone())],
+            end_turn: true,
+            usage: crate::llm::Usage::default(),
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+// ============================================================================
 // Mock Tool Executor
 // ============================================================================
 
@@ -1541,5 +1602,271 @@ mod tests {
             messages.len() >= 3,
             "Should have user message, tool result, and agent response"
         );
+    }
+
+    /// Regression test for task 24680: a parent conversation whose LLM keeps
+    /// calling an unknown tool must be capped, not loop forever.
+    ///
+    /// Simulates a stuck provider: every LLM response calls a tool named
+    /// `unknown_tool`, the tool executor reports "Unknown tool", and the
+    /// next LLM turn repeats the same thing. With no cap this would fill
+    /// the DB; with `parent_tool_cycle_cap = 3` the runtime halts after 3
+    /// LLM calls, persists a system message, and returns to Idle so the
+    /// user can send a follow-up.
+    #[tokio::test]
+    async fn test_parent_tool_cycle_cap_halts_runaway_loop() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::{broadcast, mpsc};
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        // Queue enough responses to outrun the cap. The cap is 3, so the
+        // 4th RequestLlm should trip it. Queue 10 for headroom.
+        for _ in 0..10 {
+            llm.queue_response(LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "tool-x",
+                    "bash",
+                    serde_json::json!({ "command": "echo loop" }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+            });
+        }
+
+        // Every call reports success — this models the shape of the 24679 bug
+        // (tool exists and runs cleanly, LLM just never stops calling it).
+        let tools = Arc::new(MockToolExecutor::new().with_tool("bash", ToolOutput::success("ok")));
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new(
+            "cap-test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+        );
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(256);
+
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm.clone(),
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        )
+        .with_parent_tool_cycle_cap(3);
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // Send an initial user message. The LLM then tool-loops forever
+        // against the cap.
+        event_tx
+            .send(Event::UserMessage {
+                text: "Start looping".to_string(),
+                llm_text: None,
+                images: vec![],
+                message_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+
+        // Wait for AgentDone, which fires when the runtime halts back to Idle.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut agent_done = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(SseEvent::AgentDone)) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                agent_done = true;
+                break;
+            }
+        }
+        assert!(
+            agent_done,
+            "Runtime should have emitted AgentDone after hitting the cap"
+        );
+
+        // The DB should contain the user message + system cap message +
+        // a bounded number of agent/tool rows — NOT an unbounded loop.
+        // Exact row count depends on how many cycles squeezed in before the
+        // cancel lands; the cap is 3, so the upper bound is ~3 agent + 3 tool
+        // messages plus bookkeeping. We assert "small" rather than an exact
+        // number to stay robust against scheduling.
+        let messages = storage.get_messages("cap-test-conv").await.unwrap();
+        assert!(
+            messages.len() < 20,
+            "DB should contain a bounded set of messages, got {}",
+            messages.len()
+        );
+
+        // The system cap message must be present and mention the cap.
+        let has_cap_message = messages.iter().any(|m| {
+            matches!(m.message_type, MessageType::System)
+                && match &m.content {
+                    MessageContent::System(s) => s.text.contains("Tool-use iteration limit"),
+                    _ => false,
+                }
+        });
+        assert!(
+            has_cap_message,
+            "Expected a system message explaining the cap, got: {:#?}",
+            messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression test for task 24683: every `SseEvent::Token` for a given
+    /// LLM turn must land on the broadcast channel before the corresponding
+    /// `SseEvent::Message`.
+    ///
+    /// Before the fix: the executor's main task sent the LLM outcome as soon
+    /// as `complete_streaming` returned, but the token-forwarder ran in its
+    /// own `tokio::spawn`. With enough tokens buffered in the inner broadcast
+    /// channel, the forwarder could still be draining when the outer
+    /// broadcast channel had already seen `SseEvent::Message` — producing
+    /// phantom streaming content in the client ("same message stuck
+    /// repeatedly delivering itself").
+    ///
+    /// After the fix: the LLM task `drop`s the chunk sender and `awaits` the
+    /// forwarder's `JoinHandle` before sending the outcome, guaranteeing the
+    /// order we assert below.
+    ///
+    /// Uses the multi-thread runtime because on `current_thread` the race is
+    /// not reachable: tasks spawned on the same thread are polled FIFO and
+    /// the forwarder always drains before the main loop runs. Multi-thread
+    /// allows genuine parallel scheduling between the forwarder and the
+    /// outcome-routing / main-loop tasks, which is what real production
+    /// looks like.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_streaming_tokens_ordered_before_message() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::{broadcast, mpsc};
+
+        // The race is inherently scheduler-dependent. Without the fix, a
+        // single iteration catches the bug ~1 in 5 runs on a 4-worker
+        // runtime — not reliable enough for CI. We run many independent
+        // iterations back-to-back; with the fix all succeed, without it at
+        // least one fails with overwhelming probability.
+        const ITERATIONS: usize = 30;
+
+        for iteration in 0..ITERATIONS {
+            // 500 tokens is overkill but makes it vanishingly unlikely that
+            // the forwarder finishes synchronously inside its spawn before
+            // the LLM task progresses.
+            let llm = Arc::new(StreamingMockLlmClient::new(500, "final text"));
+            let tools = Arc::new(MockToolExecutor::new());
+            let storage = Arc::new(InMemoryStorage::new());
+            let context = ConvContext::new(
+                format!("ordering-test-{iteration}"),
+                PathBuf::from("/tmp"),
+                "streaming-mock",
+                200_000,
+            );
+            let (event_tx, event_rx) = mpsc::channel(32);
+            let (broadcast_tx, mut broadcast_rx) = broadcast::channel(4096);
+
+            let runtime = ConversationRuntime::new(
+                context,
+                ConvState::Idle,
+                storage.clone(),
+                llm,
+                tools,
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx.clone(),
+                broadcast_tx,
+            );
+
+            // Runtime runs until its outcome_rx/event_rx both become empty
+            // or it hits a terminal state. We don't join it — the runtime
+            // holds its own internal event_tx clone, so dropping our test
+            // clone isn't enough to make it exit, and waiting here would
+            // hang the test. Letting it leak is fine at test scope.
+            tokio::spawn(async move { runtime.run().await });
+
+            event_tx
+                .send(Event::UserMessage {
+                    text: "stream please".to_string(),
+                    llm_text: None,
+                    images: vec![],
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                })
+                .await
+                .unwrap();
+
+            // Collect events until AgentDone or timeout.
+            let mut last_token_idx: Option<usize> = None;
+            let mut first_agent_msg_idx: Option<usize> = None;
+            let mut seen_agent_done = false;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut idx = 0usize;
+            while tokio::time::Instant::now() < deadline && !seen_agent_done {
+                match tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv()).await {
+                    Ok(Ok(evt)) => {
+                        match &evt {
+                            SseEvent::Token { .. } => {
+                                last_token_idx = Some(idx);
+                            }
+                            SseEvent::Message { message } => {
+                                if matches!(message.message_type, MessageType::Agent)
+                                    && first_agent_msg_idx.is_none()
+                                {
+                                    first_agent_msg_idx = Some(idx);
+                                }
+                            }
+                            SseEvent::AgentDone => {
+                                seen_agent_done = true;
+                            }
+                            _ => {}
+                        }
+                        idx += 1;
+                    }
+                    Ok(Err(_)) | Err(_) => { /* keep polling until deadline */ }
+                }
+            }
+
+            drop(event_tx);
+
+            assert!(
+                seen_agent_done,
+                "iteration {iteration}: runtime should emit AgentDone"
+            );
+            let last_token = last_token_idx.unwrap_or_else(|| {
+                panic!(
+                    "iteration {iteration}: streaming mock emitted 500 tokens; at least one \
+                     SseEvent::Token expected"
+                )
+            });
+            let first_agent_msg = first_agent_msg_idx.unwrap_or_else(|| {
+                panic!(
+                    "iteration {iteration}: streaming mock should produce an Agent \
+                     SseEvent::Message"
+                )
+            });
+
+            assert!(
+                last_token < first_agent_msg,
+                "task 24683 regression (iteration {iteration}): last Token event (index \
+                 {last_token}) arrived AT OR AFTER the Agent Message event (index \
+                 {first_agent_msg}). The token forwarder's JoinHandle is no longer being \
+                 awaited before the LLM outcome is sent, so trailing tokens can race past \
+                 the Message — producing phantom streaming buffers in the client."
+            );
+        }
     }
 }

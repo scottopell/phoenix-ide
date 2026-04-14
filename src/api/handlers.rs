@@ -1202,13 +1202,42 @@ async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<CancelResponse>, AppError> {
+    // Task 24682: guard against cancelling a conversation that's already
+    // idle or in a terminal state. Before this guard, the state machine
+    // would reject `UserCancel` from `Idle` with an `InvalidTransition`
+    // error, which then leaked as a raw `Debug`-formatted toast in the UI.
+    // Doing nothing is the right answer — there's nothing to cancel —
+    // and the response's `no_op: true` lets callers distinguish this
+    // from the "we stopped something in flight" case.
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
+        tracing::debug!(
+            conv_id = %id,
+            state = ?std::mem::discriminant(&conversation.state),
+            "cancel no-op: conversation has nothing in flight"
+        );
+        return Ok(Json(CancelResponse {
+            ok: true,
+            no_op: true,
+        }));
+    }
+
     state
         .runtime
         .send_event(&id, Event::UserCancel { reason: None })
         .await
         .map_err(AppError::BadRequest)?;
 
-    Ok(Json(CancelResponse { ok: true }))
+    Ok(Json(CancelResponse {
+        ok: true,
+        no_op: false,
+    }))
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).

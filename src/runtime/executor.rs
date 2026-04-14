@@ -29,6 +29,30 @@ use tokio_util::sync::CancellationToken;
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
+/// Default cap on consecutive LLM requests within a single parent-conversation
+/// user turn. Distinct from sub-agent `max_turns`: this resets on every
+/// `Event::UserMessage`, so a long conversation is never penalised — only a
+/// runaway `tool_use` burst within one turn. Overridable via the
+/// `PHOENIX_PARENT_TOOL_CYCLE_CAP` env var; set to `0` to disable.
+const DEFAULT_PARENT_TOOL_CYCLE_CAP: u32 = 100;
+
+/// Resolve the parent-conversation tool-use cycle cap from the environment,
+/// falling back to [`DEFAULT_PARENT_TOOL_CYCLE_CAP`]. A malformed value logs
+/// a warning and uses the default. Called once per runtime at construction.
+fn parent_tool_cycle_cap_from_env() -> u32 {
+    let Ok(raw) = std::env::var("PHOENIX_PARENT_TOOL_CYCLE_CAP") else {
+        return DEFAULT_PARENT_TOOL_CYCLE_CAP;
+    };
+    raw.parse::<u32>().unwrap_or_else(|_| {
+        tracing::warn!(
+            raw = %raw,
+            default = DEFAULT_PARENT_TOOL_CYCLE_CAP,
+            "PHOENIX_PARENT_TOOL_CYCLE_CAP is not a non-negative integer; using default"
+        );
+        DEFAULT_PARENT_TOOL_CYCLE_CAP
+    })
+}
+
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
@@ -71,6 +95,18 @@ where
     llm_turn_count: u32,
     /// Whether this sub-agent has been given its grace turn (one extra LLM turn to call `submit_result`)
     grace_turn_granted: bool,
+    /// LLM request counter for parent conversations. Resets on every
+    /// `Event::UserMessage`, so a long conversation with many turns is fine;
+    /// only runaway tool-use bursts within a single user turn trip the cap.
+    /// Guards against tasks 24679 + 24680 (a provider that keeps asking for
+    /// a missing tool can otherwise loop until the DB runs out of space).
+    parent_tool_cycle_count: u32,
+    /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
+    /// a system message. `0` disables the cap. Read once at construction
+    /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
+    /// [`DEFAULT_PARENT_TOOL_CYCLE_CAP`] as the fallback. Tests that want
+    /// to exercise the cap deterministically use [`Self::with_parent_tool_cycle_cap`].
+    parent_tool_cycle_cap: u32,
     /// Typed outcome channel — background tasks send `EffectOutcome` here.
     /// Each task gets a typed `oneshot::Sender<T>` that constrains what it can send,
     /// then the forwarder wraps the result in `EffectOutcome` for this channel.
@@ -126,9 +162,19 @@ where
             active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
+            parent_tool_cycle_count: 0,
+            parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             outcome_tx,
             outcome_rx,
         }
+    }
+
+    /// Override the parent tool-use cycle cap. Test-only: production code
+    /// relies on the env-var default set in [`Self::new`].
+    #[cfg(test)]
+    pub fn with_parent_tool_cycle_cap(mut self, cap: u32) -> Self {
+        self.parent_tool_cycle_cap = cap;
+        self
     }
 
     /// Set the parent event channel (for sub-agents)
@@ -157,8 +203,11 @@ where
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
             if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
                 tracing::error!(error = %e, "Failed to resume LLM request");
+                // Internal error: log full detail, ship a generic message.
                 let _ = self.broadcast_tx.send(SseEvent::Error {
-                    message: format!("Failed to resume: {e}"),
+                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                        "resume the LLM request",
+                    ),
                 });
             }
         }
@@ -175,10 +224,10 @@ where
             tokio::select! {
                 Some(event) = self.event_rx.recv() => {
                     if let Err(e) = self.process_event(event).await {
+                        // process_event already broadcast a typed
+                        // SseEvent::Error at the source if appropriate
+                        // (task 24682). No double-broadcast here.
                         tracing::error!(error = %e, "Error handling event");
-                        let _ = self.broadcast_tx.send(SseEvent::Error {
-                            message: e.clone(),
-                        });
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -276,6 +325,12 @@ where
     }
 
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        // A fresh user turn always resets the parent tool-cycle counter
+        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
+        if matches!(event, Event::UserMessage { .. }) {
+            self.parent_tool_cycle_count = 0;
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {
@@ -307,9 +362,13 @@ where
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
-                    // Transition errors are user-facing (e.g., "agent is busy")
+                    // Task 24682: surface a humanised, kind-aware error
+                    // payload via SSE, never the raw `Debug` formatting.
+                    // The full `TransitionError` is logged separately so
+                    // operators can still diagnose it.
+                    tracing::warn!(error = ?e, state = ?std::mem::discriminant(&self.state), "Transition rejected");
                     let _ = self.broadcast_tx.send(SseEvent::Error {
-                        message: e.to_string(),
+                        error: crate::runtime::user_facing_error::from_transition_error(&e),
                     });
                     return Err(e.to_string());
                 }
@@ -539,6 +598,46 @@ where
             .event_tx
             .send(Event::GraceTurnExhausted {
                 result: partial_result,
+            })
+            .await;
+    }
+
+    /// Halt a parent conversation that has exceeded its tool-use cycle cap
+    /// (task 24680). Persists a user-visible system message explaining what
+    /// happened, then sends `Event::UserCancel` so the state machine
+    /// transitions `LlmRequesting → Idle` via the normal abort path. The
+    /// next user message will reset the counter and resume normal operation.
+    async fn halt_parent_cycle_cap(&mut self, cap: u32) {
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let text = format!(
+            "Tool-use iteration limit reached ({cap} consecutive LLM calls without a user \
+             message). Halted to prevent a runaway agent loop. Send another message to continue \
+             — the counter resets on every user turn. If this keeps happening, check recent \
+             tool results for a stuck call. Override via the PHOENIX_PARENT_TOOL_CYCLE_CAP env \
+             var (0 disables)."
+        );
+        let content = crate::db::MessageContent::system(text);
+
+        match self
+            .storage
+            .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+            .await
+        {
+            Ok(msg) => {
+                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist parent cycle cap system message"
+                );
+            }
+        }
+
+        let _ = self
+            .event_tx
+            .send(Event::UserCancel {
+                reason: Some(format!("parent_tool_cycle_cap_exceeded ({cap})")),
             })
             .await;
     }
@@ -789,6 +888,25 @@ where
             }
 
             Effect::RequestLlm => {
+                // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
+                // have their own lifetime cap below (REQ-PROJ-008); this branch
+                // only fires for parent conversations. The counter is reset at
+                // the top of `process_event` on every `Event::UserMessage`.
+                if !self.context.is_sub_agent && self.parent_tool_cycle_cap > 0 {
+                    self.parent_tool_cycle_count += 1;
+                    if self.parent_tool_cycle_count > self.parent_tool_cycle_cap {
+                        let cap = self.parent_tool_cycle_cap;
+                        tracing::warn!(
+                            conv_id = %self.context.conversation_id,
+                            count = self.parent_tool_cycle_count,
+                            cap,
+                            "Parent conversation hit tool-use cycle cap; halting"
+                        );
+                        self.halt_parent_cycle_cap(cap).await;
+                        return Ok(None);
+                    }
+                }
+
                 // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
                 // finite turn budget. Grace turn mechanism gives the model one extra LLM
                 // turn to call submit_result before hard-stopping.
@@ -862,16 +980,28 @@ where
                 let is_sub_agent = self.context.is_sub_agent;
                 let mode_context = self.context.mode_context.clone();
 
-                // Token streaming channel (REQ-BED-025)
-                // Broadcast so the forwarding task can subscribe before the LLM task starts.
+                // Token streaming channel (REQ-BED-025).
+                //
+                // Broadcast so the forwarding task can subscribe before the LLM
+                // task starts emitting chunks. The forwarder bridges this
+                // per-request broadcast to `self.broadcast_tx` (the per-
+                // conversation SSE broadcast) as `SseEvent::Token`.
+                //
+                // Task 24683: the LLM task owns the forwarder's `JoinHandle`
+                // and awaits it after the LLM call finishes. That forces a
+                // happens-before barrier so every `SseEvent::Token` has been
+                // sent to `self.broadcast_tx` before the main executor loop
+                // is ever told the call is done (and therefore before it
+                // broadcasts `SseEvent::Message`). Without this barrier a
+                // trailing Token could land on the SSE channel after its
+                // Message, producing a phantom streaming buffer on the
+                // client (the "repeated message" bug).
                 let (chunk_tx, chunk_rx) = broadcast::channel::<crate::llm::TokenChunk>(256);
                 let request_id = uuid::Uuid::new_v4().to_string();
 
-                // Spawn token forwarding task BEFORE the LLM task to avoid missing early tokens.
-                // Reads TokenChunk::Text events and forwards them as SseEvent::Token.
                 let broadcast_tx_for_tokens = self.broadcast_tx.clone();
                 let request_id_for_fwd = request_id.clone();
-                tokio::spawn(async move {
+                let forwarder_handle = tokio::spawn(async move {
                     let mut rx = chunk_rx;
                     loop {
                         match rx.recv().await {
@@ -935,8 +1065,6 @@ where
                     };
 
                     // Use streaming — chunk_tx forwards text tokens to SSE clients.
-                    // Dropping chunk_tx here (after await) closes the channel and
-                    // terminates the forwarding task.
                     let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await
                     {
                         Ok(response) => {
@@ -969,8 +1097,25 @@ where
                         }
                         Err(e) => llm_error_to_outcome(e),
                     };
-                    // chunk_tx dropped here — closes broadcast, forwarding task exits
-                    // Send typed outcome through oneshot channel
+
+                    // Happens-before barrier for task 24683: close the chunk
+                    // broadcast and wait for the forwarder to drain any
+                    // trailing tokens before the outcome (and therefore the
+                    // eventual `SseEvent::Message`) is allowed to proceed.
+                    //
+                    //   1. Drop `chunk_tx` explicitly. Relying on the end of
+                    //      the closure isn't enough — we need the forwarder
+                    //      to see `Err(Closed)` *before* the `.await` below.
+                    //   2. Await the forwarder's `JoinHandle`. This suspends
+                    //      this task until every buffered `TokenChunk` has
+                    //      been broadcast as `SseEvent::Token`.
+                    //   3. Only then send the outcome that will cause the
+                    //      main executor loop to broadcast `SseEvent::Message`.
+                    drop(chunk_tx);
+                    if let Err(e) = forwarder_handle.await {
+                        tracing::warn!(error = ?e, "token forwarder task joined with error");
+                    }
+
                     let _ = llm_tx.send(llm_outcome);
                 });
                 self.llm_task_handle = Some(handle);
@@ -1797,8 +1942,17 @@ where
 
                 // Broadcast an error so the UI knows, but don't propagate — the
                 // conversation stays in AwaitingTaskApproval for retry.
+                // Task 24682: use the typed UserFacingError. `e` is the
+                // approval-pipeline error (Display-formatted, no Debug leak)
+                // so it's safe to inline as the human detail.
                 let _ = self.broadcast_tx.send(SseEvent::Error {
-                    message: format!("Task approval failed: {e}"),
+                    error: crate::runtime::user_facing_error::UserFacingError::retryable(
+                        "Task approval failed",
+                        format!(
+                            "Phoenix could not finalise the task: {e}. The conversation \
+                             stays in approval state — try approving again or abandon."
+                        ),
+                    ),
                 });
 
                 Ok(())

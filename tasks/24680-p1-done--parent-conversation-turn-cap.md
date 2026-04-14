@@ -1,11 +1,36 @@
 ---
 created: 2026-04-14
 priority: p1
-status: ready
+status: done
 artifact: src/runtime/executor.rs
 ---
 
 # Parent conversations have no tool_use iteration cap
+
+## Resolution
+
+Added a separate `parent_tool_cycle_count` counter on `ConversationRuntime`
+(distinct from sub-agent `llm_turn_count`, which has different semantics —
+sub-agents have a hard lifetime cap, parents have a per-turn cap that
+resets on every user message).
+
+- New constant `DEFAULT_PARENT_TOOL_CYCLE_CAP = 100`
+- New field `parent_tool_cycle_cap: u32` on `ConversationRuntime`, sourced
+  from `PHOENIX_PARENT_TOOL_CYCLE_CAP` at construction (set to `0` to
+  disable). Test override via `with_parent_tool_cycle_cap(cap)`.
+- Reset in `process_event` when the incoming event is `Event::UserMessage`
+- Increment + check in `Effect::RequestLlm` for non-sub-agent runtimes
+- On cap hit: `halt_parent_cycle_cap` persists a system message
+  explaining what happened and dispatches `Event::UserCancel` so the
+  state machine transitions cleanly back to `Idle` via the existing
+  abort path. The user can then send a follow-up message — the counter
+  resets on that next turn.
+
+Regression test `test_parent_tool_cycle_cap_halts_runaway_loop` proves
+that with `cap=3`, a mock LLM that always emits a `bash` tool_use stops
+the runtime within a bounded number of rows (vs. the ~800 rows the bug
+was producing), and that a system message containing "Tool-use iteration
+limit" is persisted for the user.
 
 ## Problem
 

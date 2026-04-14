@@ -1,11 +1,74 @@
 ---
 created: 2026-04-14
 priority: p2
-status: ready
+status: done
 artifact: src/api/handlers.rs
 ---
 
 # `POST /cancel` on an idle conversation surfaces raw Rust Debug error
+
+## Resolution
+
+Two complementary fixes — one at the API boundary, one at the SSE
+boundary, so neither path can leak `Debug` strings to users.
+
+### 1. `cancel_conversation` handler is a no-op on idle/terminal
+
+`src/api/handlers.rs::cancel_conversation` now reads the conversation's
+state from the DB before dispatching `Event::UserCancel`. If the state
+is `Idle` or any terminal variant, it returns `{"ok": true, "no_op":
+true}` immediately without touching the runtime. No SSE event, no state
+machine round-trip.
+
+`CancelResponse` was extended with a new `no_op: bool` field
+(`#[serde(skip_serializing_if = "std::ops::Not::not")]` so the existing
+`{"ok": true}` shape is preserved when the cancel actually did something).
+
+Verified live against a running Phoenix:
+
+```
+$ curl -X POST http://localhost:8033/api/conversations/<idle>/cancel
+{"ok":true,"no_op":true}
+```
+
+### 2. Typed `UserFacingError` at the SSE boundary
+
+New module `src/runtime/user_facing_error.rs` defines a
+`UserFacingError` struct with constrained construction:
+
+- `internal()` — generic "Unexpected error" + "check the logs"
+- `retryable(title, detail)`
+- `fatal(title, detail)`
+- `with_action(action)` — generic internal failure tagged with an action
+- `from_transition_error(&TransitionError)` — exhaustive match over every
+  variant, mapping each to a humanised payload. `InvalidTransition`
+  always maps to `internal()` so its `Debug` payload cannot reach the
+  user. The match has no wildcard arm, so adding a new `TransitionError`
+  variant fails the build instead of falling through to a generic
+  message.
+
+`SseEvent::Error` now carries `UserFacingError` instead of `String`. The
+SSE serialization layer emits both the legacy `message` field (so
+existing UI banners keep working) and a typed `error` field for future
+kind-aware UI affordances.
+
+All four `SseEvent::Error` send sites in `executor.rs` were updated to
+construct typed payloads:
+
+- Resume failure → `UserFacingError::with_action("resume the LLM request")`
+- Transition error → `from_transition_error(&e)`
+- Task approval failure → `UserFacingError::retryable("Task approval failed", ...)`
+- The redundant double-broadcast at the outer event loop was removed —
+  `process_event` already broadcasts at the source.
+
+### Tests
+
+- `internal_variant_does_not_expose_debug_format` — proves
+  `from_transition_error(&TransitionError::InvalidTransition(...))`
+  produces a payload that does NOT contain `"UserCancel"`, `"Idle"`, or
+  any `{`. The mapping is genuinely lossy in the safe direction.
+- `agent_busy_is_retryable`, `context_exhausted_is_fatal` — sanity
+  checks on the variant kinds.
 
 ## Summary
 

@@ -117,6 +117,51 @@ describe('conversationReducer', () => {
       expect(next.breadcrumbs).toHaveLength(1);
       expect(next.breadcrumbs[0]!.type).toBe('llm');
     });
+
+    // Task 24683 defensive dedup: even if the server unexpectedly re-sends
+    // messages the client already has, the client must not display them
+    // twice. `sse_message` already dedups by message_id and sequence_id;
+    // this proves `sse_init`'s merge path matches that discipline.
+    it('drops overlapping messages by sequence_id on reconnect merge', () => {
+      const existing = makeMessage(3);
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 3,
+        messages: [existing],
+      };
+      // Server sends [3, 4] even though client already has 3 (off-by-one
+      // or server bug). The client must keep exactly one copy of 3.
+      const payload = makeInitPayload({
+        messages: [makeMessage(3), makeMessage(4)],
+        lastSequenceId: 4,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(2);
+      expect(next.messages.map((m) => m.sequence_id)).toEqual([3, 4]);
+    });
+
+    it('drops overlapping messages by message_id on reconnect merge', () => {
+      // Same story but the server reassigned sequence_id (hypothetical).
+      // message_id is the stable identifier and must win.
+      const existing: Message = { ...makeMessage(3), message_id: 'stable-id' };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 3,
+        messages: [existing],
+      };
+      const duplicated: Message = { ...makeMessage(4), message_id: 'stable-id' };
+      const payload = makeInitPayload({
+        messages: [duplicated],
+        lastSequenceId: 4,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(1);
+      expect(next.messages[0]!.message_id).toBe('stable-id');
+    });
   });
 
   describe('sse_message', () => {
@@ -409,8 +454,16 @@ describe('conversationReducer', () => {
   });
 
   describe('sse_token', () => {
+    // Tokens are only accepted while phase === 'llm_requesting' (task 24683).
+    // All tests in this block set that phase first to mirror how the real
+    // SSE stream looks: tokens only arrive during an in-flight LLM call.
+    const llmRequestingAtom = (): ConversationAtom => ({
+      ...createInitialAtom(),
+      phase: { type: 'llm_requesting', attempt: 1 },
+    });
+
     it('accumulates tokens in streaming buffer', () => {
-      const atom = createInitialAtom();
+      const atom = llmRequestingAtom();
 
       const s1 = dispatch(atom, { type: 'sse_token', delta: 'Hello', sequence: 1 });
       const s2 = dispatch(s1, { type: 'sse_token', delta: ' world', sequence: 2 });
@@ -420,7 +473,7 @@ describe('conversationReducer', () => {
 
     it('is a no-op for duplicate or out-of-order sequence', () => {
       const atom: ConversationAtom = {
-        ...createInitialAtom(),
+        ...llmRequestingAtom(),
         streamingBuffer: { text: 'Hello', lastSequence: 5, startedAt: Date.now() },
       };
 
@@ -432,13 +485,46 @@ describe('conversationReducer', () => {
     it('preserves startedAt across token accumulation', () => {
       const startedAt = Date.now() - 1000;
       const atom: ConversationAtom = {
-        ...createInitialAtom(),
+        ...llmRequestingAtom(),
         streamingBuffer: { text: 'Hello', lastSequence: 1, startedAt },
       };
 
       const next = dispatch(atom, { type: 'sse_token', delta: '!', sequence: 2 });
 
       expect(next.streamingBuffer?.startedAt).toBe(startedAt);
+    });
+
+    // Task 24683 regression: tokens arriving after the phase has left
+    // `llm_requesting` must be dropped. Otherwise a late token from a
+    // previous turn creates a phantom streaming buffer below the
+    // already-persisted assistant message — the client-facing half of the
+    // "message repeats itself" bug.
+    it('drops tokens when phase is idle', () => {
+      const atom = createInitialAtom(); // default phase: idle
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        delta: 'ghost',
+        sequence: 1,
+      });
+      expect(next).toBe(atom);
+      expect(next.streamingBuffer).toBeNull();
+    });
+
+    it('drops tokens when phase is tool_executing', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: {
+          type: 'tool_executing',
+          current_tool: { id: 'tool-1', input: { _tool: 'bash' } },
+          remaining_tools: [],
+        },
+      };
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        delta: 'ghost',
+        sequence: 1,
+      });
+      expect(next).toBe(atom);
     });
   });
 
