@@ -34,7 +34,11 @@ const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 /// `Event::UserMessage`, so a long conversation is never penalised — only a
 /// runaway `tool_use` burst within one turn. Overridable via the
 /// `PHOENIX_PARENT_TOOL_CYCLE_CAP` env var; set to `0` to disable.
-const DEFAULT_PARENT_TOOL_CYCLE_CAP: u32 = 100;
+///
+/// Set deliberately high — this is a backup safety-net, not a budget.
+/// A well-behaved agent + real user is expected to stay far below it;
+/// hitting this cap means something is stuck or looping.
+const DEFAULT_PARENT_TOOL_CYCLE_CAP: u32 = 1000;
 
 /// Resolve the parent-conversation tool-use cycle cap from the environment,
 /// falling back to [`DEFAULT_PARENT_TOOL_CYCLE_CAP`]. A malformed value logs

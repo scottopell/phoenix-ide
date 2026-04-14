@@ -14,7 +14,10 @@ Added a separate `parent_tool_cycle_count` counter on `ConversationRuntime`
 sub-agents have a hard lifetime cap, parents have a per-turn cap that
 resets on every user message).
 
-- New constant `DEFAULT_PARENT_TOOL_CYCLE_CAP = 100`
+- New constant `DEFAULT_PARENT_TOOL_CYCLE_CAP = 1000`. Deliberately
+  high: this is a backup safety-net, not a budget. A well-behaved
+  agent should stay far below it; hitting the cap means something is
+  stuck or looping.
 - New field `parent_tool_cycle_cap: u32` on `ConversationRuntime`, sourced
   from `PHOENIX_PARENT_TOOL_CYCLE_CAP` at construction (set to `0` to
   disable). Test override via `with_parent_tool_cycle_cap(cap)`.
