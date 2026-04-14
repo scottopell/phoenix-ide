@@ -129,8 +129,9 @@ pub struct LlmConfig {
     pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
-    /// Shell command to run for obtaining an API key/token dynamically.
-    pub api_key_helper: Option<Arc<dyn CredentialSource>>,
+    /// Interactive credential helper. Implements `CredentialSource` for LLM auth
+    /// and streams interactive output (OIDC flows) to the UI panel.
+    pub credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
     /// Direct URL override for the Anthropic endpoint (overrides gateway routing).
     pub anthropic_base_url: Option<String>,
     /// Direct URL override for the `OpenAI` endpoint (overrides gateway routing).
@@ -139,12 +140,9 @@ pub struct LlmConfig {
     /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
     /// based on which provider is being called.
     pub custom_headers: Vec<(String, String)>,
-    /// When true, send `api_key_helper` output as `Authorization: Bearer` instead of `x-api-key`.
-    /// Set via `LLM_AUTH_HEADER=bearer`. Used for service gateways that expect JWT bearer auth.
-    pub use_bearer_auth: bool,
-    /// Typed handle for the interactive credential helper. Set alongside `api_key_helper`
-    /// when `LLM_API_KEY_HELPER` is configured. `None` otherwise.
-    pub credential_helper: Option<Arc<crate::llm::credential_helper::CredentialHelper>>,
+    /// How credential helper output should be sent in HTTP headers.
+    /// Parsed from `LLM_AUTH_HEADER` env var at startup.
+    pub auth_style: AuthStyle,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -160,12 +158,11 @@ impl std::fmt::Debug for LlmConfig {
             )
             .field("gateway", &self.gateway)
             .field("default_model", &self.default_model)
-            .field("api_key_helper", &self.api_key_helper)
+            .field("credential_helper", &self.credential_helper.is_some())
             .field("anthropic_base_url", &self.anthropic_base_url)
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
-            .field("use_bearer_auth", &self.use_bearer_auth)
-            .field("credential_helper", &self.credential_helper.is_some())
+            .field("auth_style", &self.auth_style)
             .finish()
     }
 }
@@ -177,20 +174,15 @@ impl Clone for LlmConfig {
             openai_api_key: self.openai_api_key.clone(),
             gateway: self.gateway.clone(),
             default_model: self.default_model.clone(),
-            api_key_helper: self.api_key_helper.as_ref().map(Arc::clone),
+            credential_helper: self.credential_helper.as_ref().map(Arc::clone),
             anthropic_base_url: self.anthropic_base_url.clone(),
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
-            use_bearer_auth: self.use_bearer_auth,
-            credential_helper: self.credential_helper.as_ref().map(Arc::clone),
+            auth_style: self.auth_style,
         }
     }
 }
 
-// Default is derived via the `#[derive(Default)]` approach won't work for
-// `Arc<dyn Trait>`, but `Option<Arc<dyn Trait>>` defaults to `None` just fine.
-// Clippy pedantic suggests deriving, but trait objects prevent it. Suppress.
-#[allow(clippy::derivable_impls)]
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -198,37 +190,27 @@ impl Default for LlmConfig {
             openai_api_key: None,
             gateway: None,
             default_model: None,
-            api_key_helper: None,
+            credential_helper: None,
             anthropic_base_url: None,
             openai_base_url: None,
             custom_headers: Vec::new(),
-            use_bearer_auth: false,
-            credential_helper: None,
+            auth_style: AuthStyle::ApiKey,
         }
     }
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
-        let (api_key_helper, credential_helper): (
-            Option<Arc<dyn CredentialSource>>,
-            Option<Arc<crate::llm::credential_helper::CredentialHelper>>,
-        ) = if let Some(command) = std::env::var("LLM_API_KEY_HELPER")
+        let credential_helper = std::env::var("LLM_API_KEY_HELPER")
             .ok()
             .filter(|s| !s.is_empty())
-        {
-            let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
-            let hs = crate::llm::credential_helper::CredentialHelper::new(
-                command,
-                Duration::from_millis(ttl_ms),
-            );
-            (Some(Arc::clone(&hs) as Arc<dyn CredentialSource>), Some(hs))
-        } else {
-            (None, None)
-        };
+            .map(|command| {
+                let ttl_ms = std::env::var("LLM_API_KEY_HELPER_TTL_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
+                crate::llm::CredentialHelper::new(command, Duration::from_millis(ttl_ms))
+            });
 
         let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
@@ -258,14 +240,18 @@ impl LlmConfig {
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
-            api_key_helper,
+            credential_helper,
             anthropic_base_url,
             openai_base_url,
             custom_headers,
-            use_bearer_auth: std::env::var("LLM_AUTH_HEADER")
+            auth_style: if std::env::var("LLM_AUTH_HEADER")
                 .ok()
-                .is_some_and(|v| v.eq_ignore_ascii_case("bearer")),
-            credential_helper,
+                .is_some_and(|v| v.eq_ignore_ascii_case("bearer"))
+            {
+                AuthStyle::PlainBearer
+            } else {
+                AuthStyle::ApiKey
+            },
         }
     }
 }
@@ -350,7 +336,7 @@ impl ModelRegistry {
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
     }
 
-    /// Create registry with model discovery from gateway or `api_key_helper`.
+    /// Create registry with model discovery from gateway or `credential_helper`.
     ///
     /// Discovery validates which hardcoded models are available on the gateway.
     /// Unknown/dynamic models from the gateway are silently ignored.
@@ -380,7 +366,7 @@ impl ModelRegistry {
                 return Self::new_with_status(config, GatewayStatus::Unreachable);
             }
         } else {
-            tracing::info!("Discovering models via api_key_helper auth");
+            tracing::info!("Discovering models via credential_helper auth");
         }
 
         // Try to discover models
@@ -447,7 +433,7 @@ impl ModelRegistry {
     /// Build a `DiscoveryConfig` from the available LLM config settings.
     ///
     /// Returns `Some((config, is_gateway_mode))` when discovery is possible,
-    /// or `None` when no gateway or `api_key_helper` is configured.
+    /// or `None` when no gateway or `credential_helper` is configured.
     async fn build_discovery_config(config: &LlmConfig) -> Option<(DiscoveryConfig, bool)> {
         if let Some(ref gw) = config.gateway {
             // Legacy gateway mode — construct URLs from gateway base
@@ -461,7 +447,7 @@ impl ModelRegistry {
                 },
                 true,
             ))
-        } else if let Some(ref helper) = config.api_key_helper {
+        } else if let Some(ref helper) = config.credential_helper {
             // Direct auth mode — derive models URLs from base URL overrides
             let auth_token = helper.get().await;
             // Helper not yet authenticated — skip discovery, fall back to hardcoded models
@@ -499,15 +485,12 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(service)));
         }
 
-        let default_style = if config.use_bearer_auth {
-            AuthStyle::PlainBearer
-        } else {
-            AuthStyle::ApiKey
-        };
-
-        let auth = if let Some(ref helper) = config.api_key_helper {
-            // api_key_helper takes highest priority — dynamic API key for all providers
-            LlmAuth::new(Arc::clone(helper), default_style)
+        let auth = if let Some(ref helper) = config.credential_helper {
+            // credential_helper takes highest priority — dynamic credential for all providers
+            LlmAuth::new(
+                Arc::clone(helper) as Arc<dyn CredentialSource>,
+                config.auth_style,
+            )
         } else if config.gateway.is_some() {
             // Gateway mode: sentinel value; gateway handles real authentication
             LlmAuth::new(
@@ -731,10 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn test_api_key_helper_enables_all_models() {
-        // When api_key_helper is set, all models become available
+    fn test_credential_helper_enables_all_models() {
+        // When credential_helper is set, all models become available
         let config = LlmConfig {
-            api_key_helper: Some(Arc::new(StaticCredential::new("test-token"))),
+            credential_helper: Some(crate::llm::CredentialHelper::new(
+                "echo test-token".to_string(),
+                Duration::from_hours(1),
+            )),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);

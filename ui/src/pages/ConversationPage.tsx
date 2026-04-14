@@ -10,7 +10,7 @@ import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { QuestionPanel } from '../components/QuestionPanel';
-import { useMessageQueue, useConnection, useModels } from '../hooks';
+import { useMessageQueue, useConnection, useModels, useAutoAuth } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -104,9 +104,8 @@ export function ConversationPage() {
     collapseThreshold: 60,
   });
 
-  // Credential status comes from useModels() above (shared poller).
-  const [showAuthPanel, setShowAuthPanel] = useState(false);
-  const autoAuthAttemptedRef = useRef(false);
+  // Credential helper auto-open — shared hook consolidates the pattern.
+  const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
   // Message queue management
   const { queuedMessages, enqueue, markSent, markFailed, dismiss } =
@@ -269,22 +268,6 @@ export function ConversationPage() {
     }, 0);
     return () => window.clearTimeout(handle);
   }, [conversationId]);
-
-  // Credential polling is handled by the shared useModels() hook above.
-  // It adapts the interval based on credential health (30s when 'valid',
-  // 5s otherwise) so a healthy credential doesn't hot-poll every 5s.
-
-  // Auto-open auth panel when credential needs attention (required or already running)
-  useEffect(() => {
-    if (
-      (credentialStatus === 'required' || credentialStatus === 'running' || credentialStatus === 'failed') &&
-      !autoAuthAttemptedRef.current &&
-      !showAuthPanel
-    ) {
-      autoAuthAttemptedRef.current = true;
-      setShowAuthPanel(true);
-    }
-  }, [credentialStatus, showAuthPanel]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {

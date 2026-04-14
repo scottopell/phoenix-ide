@@ -33,15 +33,15 @@ enum HelperInner {
         credential: String,
         expires_at: Instant,
     },
-    #[allow(dead_code)] // fields read via Debug; used by Phase 2 status API
     Failed {
+        #[allow(dead_code)] // written on failure, read via Debug
         exit_code: Option<i32>,
+        #[allow(dead_code)] // written on failure, read via Debug
         stderr: String,
     },
 }
 
 /// Observable status of the helper, suitable for API responses.
-#[allow(dead_code)] // Used by Phase 2 models API handler
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialStatus {
     Idle,
@@ -75,7 +75,6 @@ impl std::fmt::Debug for CredentialHelper {
     }
 }
 
-#[allow(dead_code)] // credential_status and expire_if_needed used by Phase 2 models handler
 impl CredentialHelper {
     pub fn new(command: String, ttl: Duration) -> Arc<Self> {
         let this = Arc::new(Self {

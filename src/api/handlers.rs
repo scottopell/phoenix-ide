@@ -2961,7 +2961,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
         || state.llm_registry.gateway_status != GatewayStatus::NotConfigured;
 
     let credential_status = if let Some(ref hs) = state.credential_helper {
-        use crate::llm::credential_helper::CredentialStatus;
+        use crate::llm::CredentialStatus;
         match hs.credential_status().await {
             CredentialStatus::Idle => CredentialStatusApi::Required,
             CredentialStatus::Running => CredentialStatusApi::Running,

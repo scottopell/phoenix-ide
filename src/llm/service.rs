@@ -123,7 +123,7 @@ impl LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIResponses => {
-                let key = self.resolve_openai_key().await?;
+                let key = self.auth.resolve().await?.credential;
                 openai::complete(
                     &self.spec,
                     &key,
@@ -158,7 +158,7 @@ impl LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIResponses => {
-                let key = self.resolve_openai_key().await?;
+                let key = self.auth.resolve().await?.credential;
                 openai::complete_streaming(
                     &self.spec,
                     &key,
@@ -176,10 +176,5 @@ impl LlmServiceImpl {
     /// Resolve auth credential for this request.
     async fn resolve_auth(&self) -> Result<super::ResolvedAuth, super::LlmError> {
         self.auth.resolve().await
-    }
-
-    /// Resolve a plain credential string for `OpenAI` calls.
-    async fn resolve_openai_key(&self) -> Result<String, super::LlmError> {
-        Ok(self.auth.resolve().await?.credential)
     }
 }

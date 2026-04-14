@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 interface CredentialHelperPanelProps {
   /** When true, connects to the SSE endpoint and runs the helper */
@@ -78,10 +78,6 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
     }
   }, [lines]);
 
-  const handleDismiss = useCallback(() => {
-    onDismiss();
-  }, [onDismiss]);
-
   if (!active && stripState === 'connecting') {
     return null;
   }
@@ -108,8 +104,8 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
             className="auth-strip-dismiss"
             role="button"
             tabIndex={0}
-            onClick={(e) => { e.stopPropagation(); handleDismiss(); }}
-            onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handleDismiss(); } }}
+            onClick={(e) => { e.stopPropagation(); onDismiss(); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onDismiss(); } }}
           >
             dismiss
           </span>

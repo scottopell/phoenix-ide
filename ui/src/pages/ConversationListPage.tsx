@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels } from '../modelsPoller';
 import type { Conversation } from '../api';
-import { useModels } from '../hooks';
+import { useModels, useAutoAuth } from '../hooks';
 import { cacheDB } from '../cache';
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
@@ -40,11 +40,8 @@ export function ConversationListPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
 
-  // Credential helper state — sourced from the shared useModels() poller
-  // below so we share one request loop with any other mounted consumer.
   const { credentialStatus } = useModels();
-  const [showAuthPanel, setShowAuthPanel] = useState(false);
-  const autoAuthAttemptedRef = useRef(false);
+  const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
 
   // Listen for storage warnings
@@ -134,18 +131,6 @@ export function ConversationListPage() {
     }, 5000);
     return () => clearInterval(interval);
   }, [isReady]);
-
-  // Auto-open auth panel on first load when credential is required
-  useEffect(() => {
-    if (
-      credentialStatus === 'required' &&
-      !autoAuthAttemptedRef.current &&
-      !showAuthPanel
-    ) {
-      autoAuthAttemptedRef.current = true;
-      setShowAuthPanel(true);
-    }
-  }, [credentialStatus, showAuthPanel]);
 
   // Restore scroll position after data loads
   useEffect(() => {
@@ -300,6 +285,24 @@ export function ConversationListPage() {
 
   const totalConversations = conversations.length + archivedConversations.length;
 
+  const authChip = credentialStatus && credentialStatus !== 'not_configured' ? (
+    <button
+      className={`auth-chip ${
+        credentialStatus === 'valid' ? 'valid' :
+        credentialStatus === 'running' ? 'running' :
+        'required'
+      }`}
+      onClick={credentialStatus === 'required' || credentialStatus === 'failed'
+        ? () => setShowAuthPanel(true)
+        : undefined}
+      disabled={credentialStatus === 'valid' || credentialStatus === 'running'}
+    >
+      {credentialStatus === 'valid' ? 'AUTH \u2713' :
+       credentialStatus === 'running' ? 'AUTH ...' :
+       'AUTH \u2717'}
+    </button>
+  ) : undefined;
+
   return (
     <div id="app" className="list-page">
       <Toast messages={toasts} onDismiss={dismissToast} />
@@ -324,23 +327,7 @@ export function ConversationListPage() {
             <div className="view-header">
               <h2>Conversations</h2>
               <div className="view-header-actions">
-                {credentialStatus && credentialStatus !== 'not_configured' && (
-                  <button
-                    className={`auth-chip ${
-                      credentialStatus === 'valid' ? 'valid' :
-                      credentialStatus === 'running' ? 'running' :
-                      'required'
-                    }`}
-                    onClick={credentialStatus === 'required' || credentialStatus === 'failed'
-                      ? () => setShowAuthPanel(true)
-                      : undefined}
-                    disabled={credentialStatus === 'valid' || credentialStatus === 'running'}
-                  >
-                    {credentialStatus === 'valid' ? 'AUTH ✓' :
-                     credentialStatus === 'running' ? 'AUTH ...' :
-                     'AUTH ✗'}
-                  </button>
-                )}
+                {authChip}
                 <button className="btn-primary" disabled>+ New</button>
               </div>
             </div>
@@ -362,23 +349,7 @@ export function ConversationListPage() {
                 setRenameTarget(conv);
               }}
               onConversationClick={handleConversationClick}
-              authChip={credentialStatus && credentialStatus !== 'not_configured' ? (
-                <button
-                  className={`auth-chip ${
-                    credentialStatus === 'valid' ? 'valid' :
-                    credentialStatus === 'running' ? 'running' :
-                    'required'
-                  }`}
-                  onClick={credentialStatus === 'required' || credentialStatus === 'failed'
-                    ? () => setShowAuthPanel(true)
-                    : undefined}
-                  disabled={credentialStatus === 'valid' || credentialStatus === 'running'}
-                >
-                  {credentialStatus === 'valid' ? 'AUTH ✓' :
-                   credentialStatus === 'running' ? 'AUTH ...' :
-                   'AUTH ✗'}
-                </button>
-              ) : undefined}
+              authChip={authChip}
             />
             <StorageStatus conversationCount={totalConversations} />
           </>
