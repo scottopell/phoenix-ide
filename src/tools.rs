@@ -122,7 +122,8 @@ pub struct ToolContext {
     /// LLM registry for tools that need model access
     llm_registry: Arc<ModelRegistry>,
 
-    /// Active PTY terminal sessions — used by the `read_terminal` tool.
+    /// Active PTY terminal sessions — used by the terminal-command tools
+    /// (`terminal_last_command`, `terminal_command_history`).
     pub terminals: crate::terminal::ActiveTerminals,
 }
 
@@ -200,37 +201,102 @@ pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
 }
 
+// =============================================================================
+// Named base tool sets — composed by the registry constructors below.
+//
+// Rationale: before this refactor the ToolRegistry constructors each assembled
+// their own Vec of tools. `read_file` was present in `explore_no_sandbox()` and
+// `for_subagent_explore()` but absent from `new_with_options()`, which powers
+// both Direct and Work modes. The drift was only catchable at runtime via
+// "Unknown tool: read_file" from the LLM.
+//
+// The sets here are the single source of truth. Each mode-specific constructor
+// is a straight-line composition of these sets, so adding a new read-only tool
+// happens in exactly one place and every mode picks it up. Drift is caught by
+// `registry_mode_matrix` in the tests module.
+// =============================================================================
+
+/// Read-only information tools available in every mode.
+/// Reading files, searching, thinking, reading images — nothing that mutates
+/// on-disk or remote state.
+fn read_only_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(ThinkTool),
+        Arc::new(ReadFileTool),
+        Arc::new(SearchTool),
+        Arc::new(KeywordSearchTool),
+        Arc::new(ReadImageTool),
+    ]
+}
+
+/// Shell and file-mutating tools.
+/// Present in Direct, Work, sandboxed Explore, and Work sub-agents. Absent
+/// from Explore-no-sandbox and Explore sub-agents (which only read).
+fn write_tools() -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(BashTool), Arc::new(PatchTool::default())]
+}
+
+/// Headless-browser tools. Available in every conversation mode.
+fn browser_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(BrowserNavigateTool),
+        Arc::new(BrowserEvalTool),
+        Arc::new(BrowserTakeScreenshotTool),
+        Arc::new(BrowserRecentConsoleLogsTool),
+        Arc::new(BrowserClearConsoleLogsTool),
+        Arc::new(BrowserResizeTool),
+        Arc::new(BrowserWaitForSelectorTool),
+        Arc::new(BrowserClickTool),
+        Arc::new(BrowserTypeTool),
+        Arc::new(BrowserKeyPressTool),
+    ]
+}
+
+/// Coordination tools only available to parent conversations — sub-agents are
+/// not allowed to spawn more sub-agents, ask the user, or invoke skills
+/// (REQ-PROJ-008, REQ-AUQ-006).
+fn parent_coordination_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(SpawnAgentsTool),
+        Arc::new(AskUserQuestionTool),
+        Arc::new(SkillTool),
+    ]
+}
+
+/// Sub-agent terminal tools — how a sub-agent reports its result or error
+/// back to the parent. Only available to sub-agents.
+fn sub_agent_terminal_tools() -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(SubmitResultTool), Arc::new(SubmitErrorTool)]
+}
+
+/// Terminal-integration tools present only in parent Direct/Work modes
+/// (sub-agents don't own a PTY).
+///
+/// Historical note: until `99c5df1` these were the single `ReadTerminalTool`
+/// (which returned the tail of the xterm buffer). That was replaced by a
+/// two-tool command-record model backed by OSC 133 shell-integration
+/// markers. Both tools live here because they share the same scope:
+/// read-only access to the parent conversation's PTY.
+fn parent_terminal_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(TerminalLastCommandTool),
+        Arc::new(TerminalCommandHistoryTool),
+    ]
+}
+
 impl ToolRegistry {
     /// Create tool registry for Explore mode WITHOUT sandbox.
     /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no patch.
     pub fn explore_no_sandbox() -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ThinkTool),
-            Arc::new(ReadFileTool),
-            Arc::new(SearchTool),
-            Arc::new(KeywordSearchTool),
-            Arc::new(ReadImageTool),
-            Arc::new(ProposeTaskTool),
-            Arc::new(AskUserQuestionTool),
-            Arc::new(SkillTool),
-            Arc::new(SpawnAgentsTool),
-            // Browser tools
-            Arc::new(BrowserNavigateTool),
-            Arc::new(BrowserEvalTool),
-            Arc::new(BrowserTakeScreenshotTool),
-            Arc::new(BrowserRecentConsoleLogsTool),
-            Arc::new(BrowserClearConsoleLogsTool),
-            Arc::new(BrowserResizeTool),
-            Arc::new(BrowserWaitForSelectorTool),
-            Arc::new(BrowserClickTool),
-            Arc::new(BrowserTypeTool),
-            Arc::new(BrowserKeyPressTool),
-        ];
+        let mut tools = read_only_tools();
+        tools.extend(browser_tools());
+        tools.extend(parent_coordination_tools());
+        tools.push(Arc::new(ProposeTaskTool));
         Self { tools }
     }
 
     /// Create tool registry for Explore mode WITH sandbox.
-    /// REQ-PROJ-013: All tools available, bash sandboxed read-only.
+    /// REQ-PROJ-013: Full tool suite, bash sandboxed read-only at runtime.
     /// Adds `propose_task` (Explore-only gateway to Work mode).
     pub fn explore_with_sandbox() -> Self {
         let mut registry = Self::new_with_options(false);
@@ -251,32 +317,15 @@ impl ToolRegistry {
     }
 
     /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
-    /// Read-only tools + `submit_result`/`submit_error`. No patch, no spawn, no `ask_user`, no skill, no `propose_task`.
+    /// Read-only tools + bash + `submit_result`/`submit_error`. No patch, no
+    /// spawn, no `ask_user`, no skill, no `propose_task`.
     // TODO: read-only bash enforcement not yet implemented --
     // uses regular bash. See REQ-BASH-008 for the planned sandbox approach.
     pub fn for_subagent_explore() -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ThinkTool),
-            Arc::new(BashTool),
-            Arc::new(ReadFileTool),
-            Arc::new(SearchTool),
-            Arc::new(KeywordSearchTool),
-            Arc::new(ReadImageTool),
-            // Browser tools
-            Arc::new(BrowserNavigateTool),
-            Arc::new(BrowserEvalTool),
-            Arc::new(BrowserTakeScreenshotTool),
-            Arc::new(BrowserRecentConsoleLogsTool),
-            Arc::new(BrowserClearConsoleLogsTool),
-            Arc::new(BrowserResizeTool),
-            Arc::new(BrowserWaitForSelectorTool),
-            Arc::new(BrowserClickTool),
-            Arc::new(BrowserTypeTool),
-            Arc::new(BrowserKeyPressTool),
-            // Sub-agent terminal tools
-            Arc::new(SubmitResultTool),
-            Arc::new(SubmitErrorTool),
-        ];
+        let mut tools = read_only_tools();
+        tools.push(Arc::new(BashTool));
+        tools.extend(browser_tools());
+        tools.extend(sub_agent_terminal_tools());
         Self { tools }
     }
 
@@ -296,36 +345,18 @@ impl ToolRegistry {
 
     /// Create tool registry with options
     fn new_with_options(is_sub_agent: bool) -> Self {
-        let mut tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ThinkTool),
-            Arc::new(BashTool),
-            Arc::new(PatchTool::default()),
-            Arc::new(KeywordSearchTool),
-            Arc::new(ReadImageTool),
-            Arc::new(TerminalLastCommandTool),
-            Arc::new(TerminalCommandHistoryTool),
-            // Browser tools
-            Arc::new(BrowserNavigateTool),
-            Arc::new(BrowserEvalTool),
-            Arc::new(BrowserTakeScreenshotTool),
-            Arc::new(BrowserRecentConsoleLogsTool),
-            Arc::new(BrowserClearConsoleLogsTool),
-            Arc::new(BrowserResizeTool),
-            Arc::new(BrowserWaitForSelectorTool),
-            Arc::new(BrowserClickTool),
-            Arc::new(BrowserTypeTool),
-            Arc::new(BrowserKeyPressTool),
-        ];
+        let mut tools = read_only_tools();
+        tools.extend(write_tools());
+        tools.extend(browser_tools());
 
         if is_sub_agent {
             // Sub-agents get completion tools, no spawning, no ask_user_question (REQ-AUQ-006)
-            tools.push(Arc::new(SubmitResultTool));
-            tools.push(Arc::new(SubmitErrorTool));
+            tools.extend(sub_agent_terminal_tools());
         } else {
-            // Parent conversations can spawn sub-agents, ask user questions, and invoke skills
-            tools.push(Arc::new(SpawnAgentsTool));
-            tools.push(Arc::new(AskUserQuestionTool));
-            tools.push(Arc::new(SkillTool));
+            // Parent conversations can read the terminal, spawn sub-agents,
+            // ask user questions, and invoke skills.
+            tools.extend(parent_terminal_tools());
+            tools.extend(parent_coordination_tools());
         }
 
         Self { tools }
@@ -392,32 +423,152 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn names(registry: &ToolRegistry) -> BTreeSet<String> {
+        registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect()
+    }
 
     #[test]
     fn test_browser_tools_registered() {
-        let registry = ToolRegistry::standard();
-        let defs = registry.definitions();
-        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        let names = names(&ToolRegistry::standard());
+        for expected in [
+            "browser_navigate",
+            "browser_eval",
+            "browser_take_screenshot",
+            "browser_recent_console_logs",
+            "browser_clear_console_logs",
+            "browser_resize",
+        ] {
+            assert!(names.contains(expected), "Missing {expected}");
+        }
+    }
 
-        assert!(
-            names.contains(&"browser_navigate"),
-            "Missing browser_navigate"
-        );
-        assert!(names.contains(&"browser_eval"), "Missing browser_eval");
-        assert!(
-            names.contains(&"browser_take_screenshot"),
-            "Missing browser_take_screenshot"
-        );
-        assert!(
-            names.contains(&"browser_recent_console_logs"),
-            "Missing browser_recent_console_logs"
-        );
-        assert!(
-            names.contains(&"browser_clear_console_logs"),
-            "Missing browser_clear_console_logs"
-        );
-        assert!(names.contains(&"browser_resize"), "Missing browser_resize");
-        // browser_inject/remove_react_devtools removed — hook is auto-injected
-        // by BrowserSession::launch_and_init()
+    /// Read-only tools (`read_file`, `search`, `keyword_search`, `read_image`,
+    /// `think`) must be present in every registry. Drift here caused the
+    /// original "Unknown tool: read_file" infinite loop in Direct mode — the
+    /// mock provider emitted a `read_file` call that the registry didn't
+    /// recognise, which fed back into the LLM unbounded.
+    ///
+    /// This test is the guardrail. Adding a new read-only tool to
+    /// `read_only_tools()` in tools.rs will automatically propagate it to
+    /// every mode and keep this test passing; forgetting to add it to a
+    /// specific constructor will fail this test.
+    #[test]
+    fn registry_mode_matrix_read_only_tools_everywhere() {
+        let read_only_expected: BTreeSet<&str> = [
+            "think",
+            "read_file",
+            "search",
+            "keyword_search",
+            "read_image",
+        ]
+        .into_iter()
+        .collect();
+
+        let registries: Vec<(&str, ToolRegistry)> = vec![
+            ("direct", ToolRegistry::direct()),
+            ("explore_no_sandbox", ToolRegistry::explore_no_sandbox()),
+            ("explore_with_sandbox", ToolRegistry::explore_with_sandbox()),
+            ("subagent_explore", ToolRegistry::for_subagent_explore()),
+            ("subagent_work", ToolRegistry::for_subagent_work()),
+        ];
+
+        for (label, registry) in &registries {
+            let present = names(registry);
+            for tool in &read_only_expected {
+                assert!(
+                    present.contains(*tool),
+                    "{label} registry is missing read-only tool `{tool}`"
+                );
+            }
+        }
+    }
+
+    /// Per-mode capability matrix. If a constructor starts handing out the
+    /// wrong capability set — e.g. giving sub-agents `spawn_agents`, or
+    /// Explore-no-sandbox a `bash` — this test fails loudly instead of
+    /// surfacing as a runtime transition error.
+    ///
+    /// Note on terminal tools: `terminal_last_command` and
+    /// `terminal_command_history` replaced the older single
+    /// `read_terminal` tool (commit `99c5df1`). They're the parent-mode
+    /// terminal capability now and must only appear in Direct/Work —
+    /// never in Explore (sandboxed or not) or in sub-agents.
+    #[test]
+    fn registry_mode_matrix_capability_boundaries() {
+        const PARENT_TERMINAL_TOOLS: &[&str] =
+            &["terminal_last_command", "terminal_command_history"];
+
+        // Direct: full suite, no propose_task, no sub-agent submission tools.
+        let direct = names(&ToolRegistry::direct());
+        assert!(direct.contains("bash"));
+        assert!(direct.contains("patch"));
+        for tool in PARENT_TERMINAL_TOOLS {
+            assert!(direct.contains(*tool), "Direct missing {tool}");
+        }
+        assert!(direct.contains("spawn_agents"));
+        assert!(direct.contains("ask_user_question"));
+        assert!(!direct.contains("propose_task"));
+        assert!(!direct.contains("submit_result"));
+        assert!(!direct.contains("submit_error"));
+
+        // Explore (sandbox): full suite + propose_task.
+        let work = names(&ToolRegistry::explore_with_sandbox());
+        assert!(work.contains("bash"));
+        assert!(work.contains("patch"));
+        assert!(work.contains("propose_task"));
+        for tool in PARENT_TERMINAL_TOOLS {
+            assert!(work.contains(*tool), "Work missing {tool}");
+        }
+
+        // Explore (no sandbox): read-only + propose_task, no bash/patch,
+        // no terminal (the agent only sees what's in the repo here).
+        let explore = names(&ToolRegistry::explore_no_sandbox());
+        assert!(explore.contains("propose_task"));
+        assert!(explore.contains("ask_user_question"));
+        assert!(!explore.contains("bash"));
+        assert!(!explore.contains("patch"));
+        for tool in PARENT_TERMINAL_TOOLS {
+            assert!(
+                !explore.contains(*tool),
+                "Explore-no-sandbox should not have {tool}"
+            );
+        }
+
+        // Sub-agent Explore: read-only + bash + submit. No patch, no spawn,
+        // no ask_user, no propose_task, no parent-terminal tools.
+        let sub_explore = names(&ToolRegistry::for_subagent_explore());
+        assert!(sub_explore.contains("bash"));
+        assert!(sub_explore.contains("submit_result"));
+        assert!(sub_explore.contains("submit_error"));
+        assert!(!sub_explore.contains("patch"));
+        assert!(!sub_explore.contains("spawn_agents"));
+        assert!(!sub_explore.contains("ask_user_question"));
+        assert!(!sub_explore.contains("propose_task"));
+        for tool in PARENT_TERMINAL_TOOLS {
+            assert!(
+                !sub_explore.contains(*tool),
+                "Sub-agent should not have parent terminal tool {tool}"
+            );
+        }
+
+        // Sub-agent Work: Explore + patch.
+        let sub_work = names(&ToolRegistry::for_subagent_work());
+        assert!(sub_work.contains("bash"));
+        assert!(sub_work.contains("patch"));
+        assert!(sub_work.contains("submit_result"));
+        assert!(!sub_work.contains("spawn_agents"));
+        assert!(!sub_work.contains("propose_task"));
+        for tool in PARENT_TERMINAL_TOOLS {
+            assert!(
+                !sub_work.contains(*tool),
+                "Sub-agent should not have parent terminal tool {tool}"
+            );
+        }
     }
 }

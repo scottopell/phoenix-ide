@@ -16,7 +16,7 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
-import { Terminal } from 'xterm';
+import { Terminal, type ITheme } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import 'xterm/css/xterm.css';
 import {
@@ -24,6 +24,26 @@ import {
   shellDisplayName,
   type ShellSnippet,
 } from '../shellIntegrationSnippets';
+import { useTheme } from '../hooks/useTheme';
+
+/**
+ * Read the current xterm-relevant CSS variables from `:root[data-theme=...]`.
+ * Pulls the values the chrome already uses (--terminal-bg, --terminal-fg,
+ * --terminal-cursor) so xterm.js's drawing surface matches the theme rather
+ * than diverging via a hardcoded colour pair (task 24681).
+ */
+function readXtermTheme(): ITheme {
+  const styles = getComputedStyle(document.documentElement);
+  const get = (name: string, fallback: string): string => {
+    const v = styles.getPropertyValue(name).trim();
+    return v.length > 0 ? v : fallback;
+  };
+  return {
+    background: get('--terminal-bg', '#1a1a1a'),
+    foreground: get('--terminal-fg', '#d4d4d4'),
+    cursor: get('--terminal-cursor', '#d4d4d4'),
+  };
+}
 
 interface TerminalPanelProps {
   conversationId: string;
@@ -280,9 +300,12 @@ export function TerminalPanel({
       if (cancelled || !containerRef.current) return;
 
     // --- xterm.js setup ---
+    // Theme is sourced from the same CSS variables the rest of the UI uses
+    // (task 24681). On theme change the `useTheme()` effect below reapplies
+    // them live without tearing down the PTY.
     const term = new Terminal({
       cursorBlink: true,
-      theme: { background: '#1a1a1a', foreground: '#d4d4d4', cursor: '#d4d4d4' },
+      theme: readXtermTheme(),
       fontFamily: '"SauceCodePro NF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", monospace',
       fontSize: 13,
       scrollback: 1000,
@@ -560,6 +583,19 @@ export function TerminalPanel({
   const reconnect = useCallback(() => {
     setReconnectNonce((n) => n + 1);
   }, []);
+
+  // Reapply the xterm theme when the app theme changes (task 24681).
+  // xterm.js's `options.theme` is a getter/setter pair; assigning a fresh
+  // ITheme triggers an internal redraw without needing to tear down the
+  // PTY or remount the terminal. The colours come from the same CSS
+  // variables the chrome reads in index.css, so the whole panel switches
+  // atomically.
+  const { theme } = useTheme();
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = readXtermTheme();
+  }, [theme]);
 
   // Refit when the parent height changes (drag-resize).
   useEffect(() => {

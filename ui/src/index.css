@@ -63,6 +63,15 @@
   --accent-red: #f85149;
   --accent-purple: #a371f7;
   --code-bg: #161b22;
+
+  /* Terminal panel chrome — task 24681. xterm.js itself is themed via
+     its `theme:` option in TerminalPanel.tsx, which reads these same
+     variables at construction. */
+  --terminal-bg: #1a1a1a;
+  --terminal-header-bg: #252525;
+  --terminal-border: #333333;
+  --terminal-fg: #e6edf3;
+  --terminal-cursor: #e6edf3;
 }
 
 /* Light theme */
@@ -80,6 +89,15 @@
   --accent-red: #cf222e;
   --accent-purple: #8250df;
   --code-bg: #f6f8fa;
+
+  /* Terminal panel chrome — task 24681. Light-mode terminal still uses
+     a slightly darker shade than the chat for visual separation, but
+     stays in the light palette so the whole UI feels consistent. */
+  --terminal-bg: #f6f8fa;
+  --terminal-header-bg: #eaeef2;
+  --terminal-border: #d0d7de;
+  --terminal-fg: #1f2328;
+  --terminal-cursor: #1f2328;
 }
 
 html {
@@ -6844,7 +6862,7 @@ html * {
   display: flex;
   flex-direction: column;
   /* height applied inline by useResizablePane */
-  background: #1a1a1a;
+  background: var(--terminal-bg);
   flex-shrink: 0;
   overflow: hidden;
 }
@@ -6854,8 +6872,8 @@ html * {
   align-items: center;
   gap: 10px;
   padding: 4px 12px;
-  background: #252525;
-  border-bottom: 1px solid #333;
+  background: var(--terminal-header-bg);
+  border-bottom: 1px solid var(--terminal-border);
   flex-shrink: 0;
   height: 32px;
   box-sizing: border-box;

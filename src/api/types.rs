@@ -94,10 +94,19 @@ pub struct ChatResponse {
     pub queued: bool,
 }
 
-/// Response for cancel action
+/// Response for cancel action.
+///
+/// `ok` is always true; `no_op` is `true` when the conversation was already
+/// idle or terminal (nothing to cancel). Callers that need to distinguish
+/// "cancelled in-flight work" from "already idle" should check `no_op`.
+/// Task 24682: this replaces the earlier behaviour where cancelling an
+/// idle conversation would dispatch `UserCancel`, fail the state
+/// transition, and broadcast a raw `InvalidTransition` error via SSE.
 #[derive(Debug, Serialize)]
 pub struct CancelResponse {
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_op: bool,
 }
 
 /// Response for lifecycle actions

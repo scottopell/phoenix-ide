@@ -118,11 +118,16 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 "conversation": update
             }),
         ),
-        SseEvent::Error { message } => (
+        SseEvent::Error { error } => (
+            // Task 24682: emit both `message` (for the existing UI banner
+            // that reads a flat string) and `error` (the typed payload) so
+            // future UI code can render kind-aware affordances without a
+            // breaking schema change.
             "error",
             json!({
                 "type": "error",
-                "message": message
+                "message": error.flat_message(),
+                "error": error,
             }),
         ),
     };

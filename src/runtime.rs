@@ -12,6 +12,7 @@
 pub(crate) mod executor;
 mod recovery;
 pub mod traits;
+pub mod user_facing_error;
 
 #[cfg(test)]
 pub mod testing;
@@ -190,8 +191,12 @@ pub enum SseEvent {
     ConversationUpdate {
         update: ConversationMetadataUpdate,
     },
+    /// User-facing error for the SSE `error` channel. Carries a typed
+    /// payload (task 24682) so internal `Debug`-format strings cannot
+    /// accidentally leak — every construction goes through
+    /// `runtime::user_facing_error`.
     Error {
-        message: String,
+        error: user_facing_error::UserFacingError,
     },
 }
 

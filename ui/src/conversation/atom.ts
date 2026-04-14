@@ -159,10 +159,27 @@ export function conversationReducer(
     case 'sse_init': {
       const p = action.payload;
 
-      // When reconnecting with ?after=N, the server returns only delta messages (sequence_id > N).
-      // Merge with existing to preserve full history. On fresh connect (lastSequenceId=0), replace.
-      const mergedMessages =
-        atom.lastSequenceId > 0 ? [...atom.messages, ...p.messages] : p.messages;
+      // When reconnecting with ?after=N, the server returns only delta messages
+      // (sequence_id > N). Merge with existing to preserve full history. On
+      // fresh connect (lastSequenceId=0), replace.
+      //
+      // Defensive dedup (task 24683): filter incoming messages by
+      // sequence_id AND message_id before concatenating. The server contract
+      // is "deltas only", but the client must not rely on that — any
+      // accidental overlap (backend off-by-one, retry, or regression) would
+      // otherwise surface as visibly duplicated messages in the chat, fixable
+      // only by a full reload. `sse_message` already dedups; `sse_init` must
+      // match that discipline.
+      let mergedMessages: Message[];
+      if (atom.lastSequenceId > 0) {
+        const existingIds = new Set(atom.messages.map((m) => m.message_id));
+        const delta = p.messages.filter(
+          (m) => m.sequence_id > atom.lastSequenceId && !existingIds.has(m.message_id)
+        );
+        mergedMessages = [...atom.messages, ...delta];
+      } else {
+        mergedMessages = p.messages;
+      }
 
       // Apply in-progress phase breadcrumb if the server breadcrumbs don't include it
       const currentCrumb = breadcrumbFromPhase(p.phase, p.lastSequenceId);
@@ -298,6 +315,16 @@ export function conversationReducer(
     }
 
     case 'sse_token': {
+      // Phase guard (task 24683): only accumulate a streaming buffer while
+      // the conversation is actually waiting on an LLM response. Tokens that
+      // arrive after the phase has left `llm_requesting` — because of a
+      // scheduler race, a reconnect replay, or late drainage from a prior
+      // turn — would otherwise spawn a "ghost" streaming message below the
+      // already-persisted assistant message, which is the client-facing
+      // half of the "message repeats itself" bug.
+      if (atom.phase.type !== 'llm_requesting') {
+        return atom;
+      }
       if (
         atom.streamingBuffer &&
         atom.streamingBuffer.lastSequence >= action.sequence
