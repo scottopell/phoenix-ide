@@ -135,7 +135,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/models", get(list_models))
         // Interactive credential helper (REQ-CREDHELPER-003)
         .route("/api/credential-helper/run", get(run_credential_helper))
-        .route("/api/credential-helper/invalidate", post(invalidate_credential))
+        .route(
+            "/api/credential-helper/invalidate",
+            post(invalidate_credential),
+        )
         .route(
             "/api/conversations/:id/upgrade-model",
             post(upgrade_conversation_model),
@@ -3028,7 +3031,7 @@ async fn run_credential_helper(State(state): State<AppState>) -> impl IntoRespon
 async fn invalidate_credential(State(state): State<AppState>) -> impl IntoResponse {
     use crate::llm::CredentialSource;
 
-    let Some(ref hs) = state.helper_state else {
+    let Some(ref hs) = state.credential_helper else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             "No credential helper configured",
@@ -3037,7 +3040,11 @@ async fn invalidate_credential(State(state): State<AppState>) -> impl IntoRespon
     };
 
     let was_valid = hs.invalidate().await;
-    let status = if was_valid { "invalidated" } else { "already_idle" };
+    let status = if was_valid {
+        "invalidated"
+    } else {
+        "already_idle"
+    };
     tracing::info!(was_valid, "Credential manually invalidated via API");
     axum::Json(serde_json::json!({ "status": status })).into_response()
 }
