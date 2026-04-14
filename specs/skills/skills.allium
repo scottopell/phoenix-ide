@@ -191,13 +191,11 @@ rule NoSlashToken {
 ------------------------------------------------------------
 
 -- When the LLM calls the `skill` tool, the skill body is returned as a tool
--- result. This delivers at lower authority than the user slash path (which
--- delivers as a user-role message). A tool result is appropriate for an LLM
--- autonomously invoking a skill mid-task, where the skill body is informational
--- ("here are the instructions I found") rather than a user directive.
---
--- The design relationship between this path and REQ-SK-002 (which prescribes
--- user-role delivery for all paths) is unresolved. See open questions below.
+-- result. This is intentional: a user typing /skill-name is issuing a directive
+-- (user-role is correct); the LLM calling the skill tool is autonomously fetching
+-- instructions mid-task (tool result is correct — the model asked and received).
+-- REQ-SK-002 captures this split. REQ-SK-005 ensures the expanded body content
+-- is identical across both paths regardless of delivery wrapper.
 
 rule LlmCallsSkillTool {
     when: LlmToolCall(tool: "skill", skill_name: String, args: String, working_dir: Path)
@@ -386,4 +384,5 @@ invariant SkillNamesUnique {
 
 open question "context-mode: fork — a planned frontmatter field that would cause skill invocation to run in an isolated context (similar to a sub-agent) rather than injecting into the current conversation. Semantics, lifecycle, and delivery format are unresolved. Not implementing yet."
 
-open question "REQ-SK-002 delivery convergence — the spEARS spec requires both the slash path and the LLM tool path to deliver skill content as a user-role message. Current implementation diverges: slash path delivers as MessageContent::Skill (user role), tool path delivers as ToolOutput (tool result). The code author tracked this as REQ-SK-005 / TODO in src/tools/skill.rs. Design decision pending: converge to user-role for both paths, or accept tool-result delivery for LLM-autonomous invocation as intentional?"
+-- REQ-SK-002 delivery split: resolved. User slash path → user-role message.
+-- LLM tool path → tool result. Both are intentional; see rule comment above.

@@ -28,25 +28,26 @@ the model with key-value pairs it can't act on.
 
 ---
 
-### REQ-SK-002: Deliver Skills as Authoritative User Messages
+### REQ-SK-002: Delivery Format Matches Invocation Semantics
 
-WHEN a skill is invoked by any path (user `/skill` prefix, LLM Skill tool,
-or any future invocation mechanism)
+WHEN a user invokes a skill via `/skill-name`
 THE SYSTEM SHALL deliver the skill content as a user-role message marked as
 system-generated (not typed by the user)
 
-THE SYSTEM SHALL NOT deliver skill content as a tool result, system prompt
-injection, or unstructured text dump
+WHEN the LLM invokes a skill via the Skill tool
+THE SYSTEM SHALL deliver the skill content as a tool result
 
-**Rationale:** User-role messages carry high authority with the LLM -- the
-model treats them as direct instructions from the person it's helping. Tool
-results are informational ("here's what happened") and carry lower weight.
-Skill instructions are directives ("do this"), not information, so they belong
-in the user role. Marking them as system-generated distinguishes them from
-actual user input in conversation history.
+THE SYSTEM SHALL NOT deliver skill content as a system prompt injection or
+unstructured text dump
 
-**Dependencies:** Both the user-facing `/skill` path (REQ-IR-002) and the LLM
-Skill tool must converge to this same delivery format.
+**Rationale:** The delivery format reflects who is issuing the instruction.
+A user typing `/skill-name` is giving a directive — user-role message is the
+right representation because the skill body replaces the user's message and
+carries the same authority. The LLM calling the Skill tool is autonomously
+fetching instructions mid-task — tool result is the right representation
+because the model is asking "what should I do?" and receiving an answer, not
+being commanded by the user. The distinction is semantically meaningful and
+maps cleanly to how LLMs weight different message roles.
 
 ---
 
@@ -94,23 +95,18 @@ THE SYSTEM SHALL deliver the skill body unmodified
 
 ---
 
-### REQ-SK-005: Unified Invocation
+### REQ-SK-005: Shared Expansion Logic
 
-WHEN a user types `/skill-name` in a message (at any position)
-THE SYSTEM SHALL invoke the skill through the same delivery mechanism as
-REQ-SK-002
+WHEN a skill is invoked by any path
+THE SYSTEM SHALL use the same underlying expansion function: frontmatter
+stripped, base directory prepended, arguments substituted
 
-WHEN the LLM calls the Skill tool with a skill name
-THE SYSTEM SHALL invoke the skill through the same delivery mechanism as
-REQ-SK-002
+THE SYSTEM SHALL NOT have separate expansion logic per invocation path
 
-THE SYSTEM SHALL NOT have separate code paths that produce different LLM
-representations for the same skill invoked by different triggers
-
-**Rationale:** A skill's behavior should be identical regardless of who
-triggered it. Two code paths producing different representations (one as raw
-text, one as a tool result) creates divergent behavior that's hard to reason
-about and test.
+**Rationale:** The content produced by skill expansion must be identical
+regardless of trigger. Separate expansion logic would diverge. The delivery
+wrapper (user-role message vs. tool result) differs by design per REQ-SK-002,
+but the expanded body must not.
 
 ---
 

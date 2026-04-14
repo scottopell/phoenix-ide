@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 
 /// Tool that lets the LLM invoke a discovered skill by name.
 ///
-/// TODO(REQ-SK-005): For full convergence with the user `/skill` path, this
-/// tool should produce a `MessageContent::Skill` (injected via state machine
-/// interception, like `ask_user_question`) rather than a plain `ToolOutput`.
-/// Currently the *content* is identical thanks to shared `invoke_skill()`, but
-/// the delivery mechanism differs (tool result vs. user message).
+/// Delivers the skill body as a tool result (not a user-role message).
+/// This is intentional: the LLM calling this tool mid-task is fetching
+/// instructions autonomously; tool result is the correct delivery weight.
+/// The user `/skill` slash path delivers as a user-role message because
+/// the user is issuing a directive. See REQ-SK-002 in specs/skills/.
 pub struct SkillTool;
 
 #[async_trait]
