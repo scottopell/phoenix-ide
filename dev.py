@@ -850,11 +850,16 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
     ui_dir = worktree / "ui"
     
     # Build UI
+    npm_env = node_env()
     print("Installing UI dependencies...")
-    subprocess.run(["npm", "ci"], cwd=ui_dir, check=True, capture_output=True)
-    
+    result = subprocess.run(["npm", "ci"], cwd=ui_dir, capture_output=True, text=True, env=npm_env)
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, file=sys.stderr, end="")
+        raise SystemExit(f"npm ci failed (exit {result.returncode})")
+
     print("Building UI...")
-    subprocess.run(["npm", "run", "build"], cwd=ui_dir, check=True)
+    subprocess.run(["npm", "run", "build"], cwd=ui_dir, check=True, env=npm_env)
     
     # Build Rust
     build_env = os.environ.copy()
@@ -2113,4 +2118,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        cmd = " ".join(str(a) for a in e.cmd)
+        print(f"ERROR: command failed (exit {e.returncode}): {cmd}", file=sys.stderr)
+        if e.stderr:
+            stderr = e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace")
+            print(stderr, file=sys.stderr, end="")
+        sys.exit(e.returncode)
