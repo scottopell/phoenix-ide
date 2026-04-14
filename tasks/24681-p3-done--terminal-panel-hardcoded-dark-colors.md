@@ -59,9 +59,12 @@ viewport_bg  = rgb(26, 26, 26)
 css_var      = #1a1a1a
 ```
 
-Screenshot at `tasks/screenshots/17-terminal-light-mode.png` shows the
-terminal blending into the light layout instead of the previous dark
-strip.
+Manual light-mode verification: the terminal panel background,
+header, and xterm.js viewport all inherit the light palette via
+CSS variables (`--terminal-bg`, `--terminal-header-bg`) and a
+`useEffect([theme])` that reapplies the xterm `theme` option. No
+more opaque `#1a1a1a` strip at the bottom of the page in light
+mode.
 
 ### Out of scope
 

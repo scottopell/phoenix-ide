@@ -202,11 +202,12 @@ type system prevents direct Debug leakage. (Matches AGENTS.md's
 
 ## Notes
 
-- The screenshot `tasks/screenshots/12-fresh-conversation.png` shows
-  this banner. An earlier version of `tasks/screenshots/README.md`
-  misquoted it as *"No transitions from this state with event 'send'
-  [state: Ready]"*; the actual text has been captured here from the
-  live DOM and is the authoritative version.
+- The authoritative banner text above was captured from the live
+  DOM via `agent-browser eval` on the red toast element at repro
+  time. Earlier ad-hoc notes from the UI review had transcribed it
+  as *"No transitions from this state with event 'send' [state:
+  Ready]"* — that was a misquote; the text shown in this task is
+  what the user actually sees.
 - Related but distinct: task `08517-p3-done` investigated cancellation
   state transitions at the state-machine level. This bug is about the
   *edge-of-race* path (cancel races with natural state transition to
