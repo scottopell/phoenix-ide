@@ -274,10 +274,10 @@ export function ConversationPage() {
   // It adapts the interval based on credential health (30s when 'valid',
   // 5s otherwise) so a healthy credential doesn't hot-poll every 5s.
 
-  // Auto-open auth panel on first load when credential is required
+  // Auto-open auth panel when credential needs attention (required or already running)
   useEffect(() => {
     if (
-      credentialStatus === 'required' &&
+      (credentialStatus === 'required' || credentialStatus === 'running' || credentialStatus === 'failed') &&
       !autoAuthAttemptedRef.current &&
       !showAuthPanel
     ) {

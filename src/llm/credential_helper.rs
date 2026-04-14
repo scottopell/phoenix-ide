@@ -204,15 +204,48 @@ impl HelperState {
             let stdout = child.stdout.take().expect("stdout piped");
             let stderr_handle = child.stderr.take().expect("stderr piped");
 
-            let mut lines = BufReader::new(stdout).lines();
+            // Stream stderr lines as HelperEvent::Line (instruction/progress output).
+            // Many credential helpers (e.g. ddtool) write interactive instructions
+            // (OIDC device URLs, codes) to stderr and reserve stdout for the token.
+            let this_for_stderr = Arc::clone(&this);
+            let stderr_task = tokio::spawn(async move {
+                let mut stderr_lines = BufReader::new(stderr_handle).lines();
+                let mut collected = Vec::<String>::new();
+                while let Ok(Some(line)) = stderr_lines.next_line().await {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    collected.push(line.clone());
+                    let subs = {
+                        let mut inner = this_for_stderr.inner.lock().await;
+                        if let HelperInner::Running {
+                            lines_so_far,
+                            subscribers,
+                        } = &mut *inner
+                        {
+                            lines_so_far.push(line.clone());
+                            subscribers.clone()
+                        } else {
+                            vec![]
+                        }
+                    };
+                    for sub in subs {
+                        let _ = sub.send(HelperEvent::Line(line.clone())).await;
+                    }
+                }
+                collected.join("\n")
+            });
+
+            // Read stdout lines — the last non-empty line is the credential.
+            let mut stdout_lines = BufReader::new(stdout).lines();
             let mut pending: Option<String> = None;
 
-            while let Ok(Some(line)) = lines.next_line().await {
+            while let Ok(Some(line)) = stdout_lines.next_line().await {
                 if line.trim().is_empty() {
                     continue;
                 }
                 if let Some(prev) = pending.replace(line.clone()) {
-                    // prev is a non-final instruction line — broadcast it
+                    // prev is a non-final stdout instruction line — broadcast it
                     let subs = {
                         let mut inner = this.inner.lock().await;
                         if let HelperInner::Running {
@@ -232,14 +265,8 @@ impl HelperState {
                 }
             }
 
-            // Collect stderr
-            let mut stderr_bytes = Vec::new();
-            {
-                use tokio::io::AsyncReadExt;
-                let mut stderr_reader = BufReader::new(stderr_handle);
-                let _ = stderr_reader.read_to_end(&mut stderr_bytes).await;
-            }
-            let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
+            // Wait for stderr task and collect output for error reporting.
+            let stderr_str = stderr_task.await.unwrap_or_default();
 
             let status = child.wait().await;
             let exit_code = status.ok().and_then(|s| s.code());
