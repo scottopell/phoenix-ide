@@ -65,13 +65,15 @@ cross-checking the UI-focused tasks in `tasks/*-ready--*.md`.
   idle, then `POST /cancel` — the API returns `{ok:true}` but the SSE
   path emits the raw Rust Debug rendering.
 
-- **Mock runaway → backend, not UI (tasks 24679 + 24680).** The 797→829
+- **Mock runaway → backend, not UI (tasks 24684 + 24680).** The 797→829
   message conversation I hit was a real backend loop, not a UI duplication
   bug. SQLite had 414 distinct agent rows + 414 distinct tool rows, each
   with unique `mock_toolu_*` ids. Root causes: (a) `read_file` missing
-  from the Direct-mode tool registry (24679), (b) no iteration cap on
-  parent-conversation tool_use loops (24680). User-reported streaming
-  duplication is a separate issue being investigated.
+  from the Direct-mode tool registry (24684, renumbered from 24679 during
+  rebase to avoid colliding with main's shell-integration task),
+  (b) no iteration cap on parent-conversation tool_use loops (24680).
+  User-reported streaming duplication is a separate issue being
+  investigated.
 
 ## How I reproduced this
 

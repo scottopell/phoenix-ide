@@ -61,7 +61,9 @@ until either the conversation is cancelled or the process is killed.
 
 The in-tree `mock` provider's `ReadFileToolCall` scenario asks for a
 tool (`read_file`) that the Direct-mode registry doesn't expose (see
-task 24679). A single "hello" message produced **414 agent + 414 tool
+task 24684, filed in this same branch; renumbered from 24679 during
+rebase to avoid colliding with main's shell-integration task that
+also used 24679). A single "hello" message produced **414 agent + 414 tool
 rows (+ 1 user) = 829 rows** in roughly one minute before it was
 cancelled. Each agent message was a fresh row with a distinct
 `mock_toolu_*` id; this is a real backend loop, not a UI dupe.
@@ -73,7 +75,7 @@ agent text snippets: {"I'll read the configuration file ...": 414}
 tool result snippets: {"Unknown tool: read_file": 414}
 ```
 
-In the mock's case fixing task 24679 removes *this particular* loop,
+In the mock's case fixing task 24684 removes *this particular* loop,
 but the underlying issue remains: a real Anthropic / OpenAI / Fireworks
 provider that gets stuck (e.g. context window starvation, flaky tool
 schema, hallucinated tool name) will do the same thing with no
@@ -111,7 +113,8 @@ backstop.
 
 ## Related
 
-- Task 24679 — the concrete trigger this bug fires on
+- Task 24684 — the concrete trigger this bug fires on (renumbered
+  from 24679 during rebase; collided with main's shell-integration task)
 - REQ-PROJ-008 / REQ-BED-026 — existing sub-agent max_turns contract
 - Task 08513 (done) — context exhaustion UI, reference for the error
   system message pattern

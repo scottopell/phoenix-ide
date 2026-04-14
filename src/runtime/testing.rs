@@ -1635,8 +1635,10 @@ mod tests {
             });
         }
 
-        // Every call reports success — this models the shape of the 24679 bug
+        // Every call reports success — this models the shape of the 24684 bug
         // (tool exists and runs cleanly, LLM just never stops calling it).
+        // Note: 24684 was originally 24679 in git history; renumbered during
+        // rebase to avoid collision with main's shell-integration task.
         let tools = Arc::new(MockToolExecutor::new().with_tool("bash", ToolOutput::success("ok")));
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new(

@@ -102,8 +102,10 @@ where
     /// LLM request counter for parent conversations. Resets on every
     /// `Event::UserMessage`, so a long conversation with many turns is fine;
     /// only runaway tool-use bursts within a single user turn trip the cap.
-    /// Guards against tasks 24679 + 24680 (a provider that keeps asking for
+    /// Guards against tasks 24684 + 24680 (a provider that keeps asking for
     /// a missing tool can otherwise loop until the DB runs out of space).
+    /// Task 24684 was originally numbered 24679 in commit history — see
+    /// the task file for the rebase-time renumbering note.
     parent_tool_cycle_count: u32,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction

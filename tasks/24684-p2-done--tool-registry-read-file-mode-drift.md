@@ -7,6 +7,14 @@ artifact: src/tools.rs
 
 # `read_file` missing from Direct / Work tool registry
 
+> **Renumbered from 24679 → 24684 during rebase.** This task was
+> originally filed and fixed under id 24679 before rebasing onto main.
+> Main had already used 24679 for the shell-integration lock-policy
+> task (created 2026-04-13, one day earlier). Git commit messages and
+> a handful of in-code comments still reference the original `24679`
+> for historical accuracy — this file is the authoritative task
+> record.
+
 ## Resolution
 
 Refactored `ToolRegistry` to compose constructors from named base sets
