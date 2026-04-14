@@ -18,7 +18,7 @@ cross-checking the UI-focused tasks in `tasks/*-ready--*.md`.
 | 08 | `08-project-view.png` | `phoenix-ide` project filter selected. |
 | 09 | `09-archived-view.png` | Archived conversations view. Conversation card shows title / mode pill / "just now" / message count. |
 | 11 | `11-home-configured.png` | Home form fully configured (`/home/user/phoenix-ide`, mock model, Direct mode). |
-| 12 | `12-fresh-conversation.png` | Fresh conversation right after sending "hello". Note the red banner: `Invalid Execution: No transitions from this state with event 'send' [state: Ready]` — appeared after a quick cancel/resend race. |
+| 12 | `12-fresh-conversation.png` | Fresh conversation right after sending "hello". Note the red banner: `Invalid transition: No transition from Idle with event UserCancel { reason: None }` — appeared when `POST /cancel` was issued after the mock had already replied and state had returned to idle. See task `24682`. |
 | 13 | `13-tasks-section-expanded.png` | The collapsible **Tasks** section under the file explorer expanded — READY (29), BLOCKED (3), BRAINSTORMING (5), DONE (209), WONT-DO (7). |
 | 14 | `14-task-file-opened.png` | A task file (`08605 auto-scroll-on-new-messages`) opened in the prose reader pane. The reader column is extremely narrow — this is the split-pane mentioned in task 08654. |
 | 15 | `15-light-mode.png` | Light theme forced via `data-theme="light"` on `<html>`. **Partial coverage**: chat area, file tree and main input switch to light, but the left conversation-list sidebar, the **FILES** header, the tool-tab row, and the terminal stay dark. |
@@ -51,27 +51,27 @@ cross-checking the UI-focused tasks in `tasks/*-ready--*.md`.
   width (~220px), making markdown almost unreadable. This is the task's
   core complaint.
 
-- **Light-mode incomplete (`08505`-adjacent; fresh observation).** Shot 15
-  shows that `data-theme="light"` only flips parts of the UI. Conversation
-  list sidebar, files column, tool-tab bar and terminal keep hard-coded
-  dark colors instead of CSS variables. Not in any existing `ready` task
-  that I saw — potentially worth filing if not tracked elsewhere.
+- **Terminal panel hardcoded dark (task 24681).** Shot 15 initially
+  looked like multiple panels stayed dark in light mode. After computing
+  backgrounds on every element in the DOM, only `.terminal-panel` and
+  `.xterm-viewport` are actually opaque dark (`#1a1a1a`). Everything
+  else is light-theme-correct. The sidebar / file tree shading I thought
+  was a bug was actually `#f6f8fa` vs `#ffffff` at thumbnail scale.
 
-- **State-machine race (`08517`-adjacent; fresh observation).** Shot 12's
-  red banner (`Invalid Execution: No transitions from this state with
-  event 'send' [state: Ready]`) appeared after `POST /cancel` landed
-  simultaneously with a new `send`. Task 08517 is about cancellation
-  transitions — the repro in that task should probably include this
-  client-visible error string.
+- **Cancel-on-idle raw Debug error (task 24682).** Shot 12's red banner
+  reads `"Invalid transition: No transition from Idle with event UserCancel
+  { reason: None }"` (authoritative text pulled from the live DOM via
+  `agent-browser eval`). Repro: send a message to mock, let it settle to
+  idle, then `POST /cancel` — the API returns `{ok:true}` but the SSE
+  path emits the raw Rust Debug rendering.
 
-- **Mock infinite loop (fresh observation, likely pre-existing).** Once a
-  message is sent with the `mock` provider, the assistant keeps emitting
-  tool_use blocks indefinitely (hit 797 → 829 messages in under a
-  minute) until `/api/conversations/:id/cancel` is called. This is not
-  exclusively a UI issue, but it makes manual UI testing on `./dev.py up`
-  dangerous — a single "hello" produces an unusable, frozen conversation.
-  Didn't find a ready task tracking this; may want to bound the mock
-  stream.
+- **Mock runaway → backend, not UI (tasks 24679 + 24680).** The 797→829
+  message conversation I hit was a real backend loop, not a UI duplication
+  bug. SQLite had 414 distinct agent rows + 414 distinct tool rows, each
+  with unique `mock_toolu_*` ids. Root causes: (a) `read_file` missing
+  from the Direct-mode tool registry (24679), (b) no iteration cap on
+  parent-conversation tool_use loops (24680). User-reported streaming
+  duplication is a separate issue being investigated.
 
 ## How I reproduced this
 
