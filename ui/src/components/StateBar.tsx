@@ -164,6 +164,7 @@ export function StateBar({
           case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
           case 'awaiting_sub_agents': case 'awaiting_continuation':
           case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
+          case 'awaiting_recovery':
             dotClass += ' working';
             stateText = getStateDescription(convState);
             break;

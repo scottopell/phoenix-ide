@@ -87,6 +87,7 @@ export type ConversationState =
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'error'; message: string }
+  | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
 /** Derive the coarse display category from a conversation's state type.

@@ -737,7 +737,32 @@ export function ConversationPage() {
           </button>
         </div>
       )}
-      {convStateForChildren.type === 'error' ? (
+      {convStateForChildren.type === 'awaiting_recovery' ? (
+        <>
+        {credentialStatus && (
+          <Suspense fallback={null}>
+            <CredentialHelperPanel
+              active={true}
+              onDismiss={() => void refreshModels().catch(() => {})}
+            />
+          </Suspense>
+        )}
+        <InputArea
+          ref={inputRef}
+          conversationId={conversationId}
+          convState={convStateForChildren}
+          images={images}
+          setImages={setImages}
+          isOffline={isOffline}
+          queuedMessages={queuedMessages}
+          convModeLabel={conversation.conv_mode_label}
+          onSend={handleSend}
+          onCancel={handleCancel}
+          onRetry={handleRetry}
+          onDismissError={dismiss}
+        />
+        </>
+      ) : convStateForChildren.type === 'error' ? (
         <ErrorBanner
           message={convStateForChildren.message}
           onRetry={() => handleSend('continue', [])}

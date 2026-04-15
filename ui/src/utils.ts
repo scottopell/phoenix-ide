@@ -58,6 +58,7 @@ export function isAgentWorking(state: ConversationState): boolean {
     case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
+    case 'awaiting_recovery':
       return true;
     default: state satisfies never; return false;
   }
@@ -71,6 +72,7 @@ export function isCancellingState(state: ConversationState): boolean {
     case 'awaiting_task_approval': case 'awaiting_user_response':
     case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
+    case 'awaiting_recovery':
       return false;
     default: state satisfies never; return false;
   }
@@ -109,6 +111,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'awaiting response';
     case 'error':
       return 'error';
+    case 'awaiting_recovery':
+      return 'authenticating...';
     case 'context_exhausted':
       return 'context full';
     default: state satisfies never; return '';
@@ -162,6 +166,12 @@ export function parseConversationState(raw: unknown): ConversationState {
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
     case 'error':
       return { type: 'error', message: (obj['message'] as string) ?? 'Unknown error' };
+    case 'awaiting_recovery':
+      return {
+        type: 'awaiting_recovery',
+        message: (obj['message'] as string) ?? '',
+        recovery_kind: (obj['recovery_kind'] as string) ?? 'credential',
+      };
     default:
       console.warn(`Unknown conversation state type: ${String(type)}`);
       return { type: 'error', message: `Unknown state: ${String(type)}` };
