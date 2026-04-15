@@ -195,27 +195,18 @@ export function ConversationSettings({
               ref={inputRef}
               type="text"
               className="settings-input branch-combobox-input"
-              placeholder={comboOpen || !selectedName ? 'Search branches...' : undefined}
+              placeholder={comboOpen ? 'Search branches...' : undefined}
               value={comboOpen ? branchSearch : selectedName}
               readOnly={!comboOpen}
               onFocus={() => setComboOpen(true)}
               onChange={(e) => setBranchSearch?.(e.target.value)}
             />
-            {!comboOpen && selectedName && (
-              <span
-                className="branch-combobox-value"
-                onClick={() => { setComboOpen(true); inputRef.current?.focus(); }}
-              >
-                {selectedName}
-                {(() => {
-                  const entry = displayBranches.find(b => b.name === selectedName);
-                  if (entry?.behind_remote && entry.behind_remote > 0) {
-                    return <span className="branch-behind-badge">{entry.behind_remote} behind</span>;
-                  }
-                  return null;
-                })()}
-              </span>
-            )}
+            {!comboOpen && (() => {
+              const entry = displayBranches.find(b => b.name === selectedName);
+              return entry?.behind_remote && entry.behind_remote > 0
+                ? <span className="branch-combobox-badge">{entry.behind_remote} behind</span>
+                : null;
+            })()}
             {branchSearchLoading && <span className="branch-combobox-loading">...</span>}
             {comboOpen && (
               <div className="branch-combobox-dropdown">
