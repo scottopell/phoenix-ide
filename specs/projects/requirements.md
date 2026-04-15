@@ -404,26 +404,25 @@ non-project behaviors.
 
 ### REQ-PROJ-017: Base Branch Tracking in Work Mode
 
-WHEN a conversation transitions from Explore to Work mode (task approval)
-THE SYSTEM SHALL record the currently checked-out branch as `base_branch` in the
-  `ConvMode::Work` data
+WHEN a conversation transitions to Work mode (via task approval or Branch mode selection)
+THE SYSTEM SHALL record the base branch in the conversation's Work mode data
 
-THE `ConvMode::Work` struct SHALL contain:
-- `worktree_path: PathBuf` — path to the conversation's worktree
-- `branch: String` — the task branch name
-- `task_id: String` — the task identifier
-- `base_branch: String` — the branch that was checked out at approval time
+THE Work mode data SHALL contain:
+- `worktree_path: PathBuf` -- path to the conversation's worktree
+- `branch: String` -- the task branch name (Managed) or existing branch (Branch mode)
+- `task_id: String?` -- the task identifier (absent for Branch mode)
+- `base_branch: String` -- the branch the worktree was created from
 
-WHEN the Complete action runs (REQ-PROJ-009)
-THE SYSTEM SHALL merge into `base_branch` (not hardcoded to main)
+WHEN the "Mark as merged" action runs (REQ-PROJ-026/027)
+THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
 
 WHEN the Abandon action runs (REQ-PROJ-010)
-THE SYSTEM SHALL commit the task file status update on `base_branch`
+THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
 
 **Rationale:** Not all projects use `main` as their integration branch. A user may be
-working on a shared feature branch and want task work merged there. Recording the
-base branch at approval time supports this workflow without requiring the user to
-specify a merge target at completion time.
+working on a shared feature branch. Recording the base branch at worktree creation
+time supports this workflow. Branch mode uses the branch itself as both the branch
+name and the base branch.
 
 ---
 

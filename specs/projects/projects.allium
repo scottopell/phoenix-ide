@@ -240,7 +240,7 @@ rule BranchConflictDetected {
 
     requires: exists active_worktree_on_branch(conversation.project, branch_name)
 
-    -- Four cases:
+    -- Three conflict cases (case D -- terminal conversation -- is excluded):
     -- (A) Active conversation with worktree -> prompt redirect
     -- (B) Orphaned worktree (no conversation) -> prompt delete + fresh start
     -- (C) Stale conversation (no worktree) -> redirect to conversation
@@ -500,8 +500,29 @@ rule TaskRejectionNoGitOps {
 }
 
 -- ===========================================================
--- 4. MARK AS MERGED (REQ-PROJ-026, REQ-PROJ-027)
+-- 4. PUSH AND TERMINAL ACTIONS (REQ-PROJ-026, REQ-PROJ-027)
 -- ===========================================================
+
+-- REQ-PROJ-026/027: Agent pushes branch to origin (not a state transition)
+rule PushBranch {
+    when: AgentPushesCommits(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+
+    requires: conversation.status = idle
+    requires: conversation.mode = work
+
+    -- Push does NOT change mode or status. Conversation stays in Work.
+    ensures: conversation.mode = work
+    ensures: conversation.status = idle
+
+    @guidance
+        -- Push is a bash command the agent runs (`git push origin <branch>`).
+        -- It is not a Phoenix UI action or state machine event.
+        -- This rule exists to document that push has no lifecycle side effects.
+        -- Push failures surface as tool output (auth, branch protection, etc.)
+        -- and the agent handles them like any other command failure.
+}
 
 -- REQ-PROJ-026/027: User marks conversation as merged
 rule MarkAsMerged {
@@ -578,6 +599,31 @@ rule ConfirmAbandon {
 }
 
 -- ===========================================================
+-- 5b. EXPLORE WORKTREE CLEANUP (REQ-PROJ-028)
+-- ===========================================================
+
+-- REQ-PROJ-028: Managed Explore conversation reaches terminal without
+-- entering Work mode. Clean up the worktree and temp branch.
+rule ExploreWorktreeCleanupOnTerminal {
+    when: bedrock/ConversationBecameTerminal(conversation)
+
+    requires: conversation.mode = explore
+    requires: exists Worktree{conversation: conversation}
+
+    let worktree = Worktree{conversation: conversation}
+
+    ensures: not exists worktree
+    ensures: BranchDeleted(worktree.branch_name)
+
+    @guidance
+        -- Fires when an Explore conversation with a worktree reaches
+        -- terminal state (user abandoned without ever approving a task).
+        -- The temp branch (task-pending-*) and worktree are cleaned up.
+        -- Complements ServerRestartWorktreeReconciliation, which catches
+        -- the crash case. This rule handles the normal-operation case.
+}
+
+-- ===========================================================
 -- 6. COMMITS-BEHIND POLLING (REQ-PROJ-011, REQ-PROJ-023)
 -- ===========================================================
 
@@ -587,6 +633,8 @@ rule CommitsBehindPoll {
 
     requires: conversation.mode = work
     requires: conversation.has_connected_clients
+    -- Skip for Branch mode: base_branch == branch_name, comparison is always 0.
+    requires: Worktree{conversation: conversation}.kind = managed
 
     let worktree = Worktree{conversation: conversation}
 

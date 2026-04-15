@@ -200,7 +200,8 @@ entity Conversation {
     -- Mode transition graph (REQ-BED-027)
     -- ----------------------------------------------------------------
     transitions mode {
-        explore -> work
+        explore -> work             -- Managed: approval upgrades permissions
+        direct -> work              -- Branch: skip Explore, straight to Work (REQ-PROJ-024)
         terminal: direct, work
     }
 
@@ -255,11 +256,11 @@ entity Conversation {
     failure_error: String when status = failed
     failure_error_class: ErrorClass? when status = failed
 
-    -- Work mode fields (REQ-BED-027)
-    branch_name: String when mode = work
-    worktree_path: String when mode = work
-    base_branch: String when mode = work
-    task_id: String when mode = work
+    -- Work/Explore mode fields (REQ-BED-027, REQ-PROJ-024, REQ-PROJ-028)
+    branch_name: String when mode in { explore, work }
+    worktree_path: String when mode in { explore, work }
+    base_branch: String when mode in { explore, work }
+    task_id: String? when mode = work       -- absent for Branch mode (REQ-PROJ-024)
 
     -- ----------------------------------------------------------------
     -- Relationships
