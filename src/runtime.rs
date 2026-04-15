@@ -594,8 +594,8 @@ impl RuntimeManager {
                     // Full tool suite for Direct mode
                     ToolRegistry::direct()
                 }
-                ConvMode::Work { .. } => {
-                    // Full tool suite for Work mode (same as Direct)
+                ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                    // Full tool suite for Work/Branch mode (same as Direct)
                     ToolRegistry::direct()
                 }
             };
@@ -801,6 +801,15 @@ fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             worktree_path,
             ..
         } => ModeContext::Work {
+            branch_name: branch_name.clone(),
+            base_branch: base_branch.clone(),
+            worktree_path: worktree_path.clone(),
+        },
+        ConvMode::Branch {
+            branch_name,
+            base_branch,
+            worktree_path,
+        } => ModeContext::Branch {
             branch_name: branch_name.clone(),
             base_branch: base_branch.clone(),
             worktree_path: worktree_path.clone(),

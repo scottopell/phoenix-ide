@@ -7,11 +7,7 @@
 //! Generated via /allium:propagate from the Allium spec. Each property
 //! traces to a specific invariant or rule in the spec.
 
-// NOTE: These tests describe the TARGET state after Branch mode is implemented.
-// They will not compile until ConvMode::Branch exists. Uncomment when implementing
-// REQ-PROJ-024 through REQ-PROJ-029.
-//
-// To enable: add `mod project_proptests;` to state_machine.rs (behind #[cfg(test)])
+// Enabled: `mod project_proptests;` in state_machine.rs (behind #[cfg(test)])
 
 #[cfg(test)]
 mod tests {
@@ -41,21 +37,20 @@ mod tests {
             )
     }
 
-    // Uncomment when ConvMode::Branch exists:
-    // fn arb_branch_mode() -> impl Strategy<Value = ConvMode> {
-    //     (
-    //         "[a-z]{5,15}",           // branch_name
-    //         "/tmp/[a-z]{8}",         // worktree_path
-    //         "[a-z]{3,8}",            // base_branch
-    //     )
-    //         .prop_map(|(branch_name, worktree_path, base_branch)| {
-    //             ConvMode::Branch {
-    //                 branch_name,
-    //                 worktree_path,
-    //                 base_branch,
-    //             }
-    //         })
-    // }
+    fn arb_branch_mode() -> impl Strategy<Value = ConvMode> {
+        (
+            "[a-z]{5,15}",   // branch_name
+            "/tmp/[a-z]{8}", // worktree_path
+            "[a-z]{3,8}",    // base_branch
+        )
+            .prop_map(
+                |(branch_name, worktree_path, base_branch)| ConvMode::Branch {
+                    branch_name,
+                    worktree_path,
+                    base_branch,
+                },
+            )
+    }
 
     // ========================================================================
     // Invariant: Mode IS the discriminator (no WorktreeKind needed)
@@ -107,40 +102,38 @@ mod tests {
         }
     }
 
-    // Uncomment when ConvMode::Branch exists:
-    //
-    // proptest! {
-    //     /// Branch mode never carries a task_id.
-    //     /// This is the structural complement of prop_work_mode_always_has_task_id.
-    //     /// Together they prove the modes are structurally distinguishable.
-    //     ///
-    //     /// Traces to: BranchModeHasNoTaskFile invariant
-    //     #[test]
-    //     fn prop_branch_mode_never_has_task_id(mode in arb_branch_mode()) {
-    //         // The type system enforces this -- ConvMode::Branch has no task_id field.
-    //         // This test exists to document the invariant and catch regressions if
-    //         // someone adds a task_id field to Branch.
-    //         match &mode {
-    //             ConvMode::Branch { .. } => {
-    //                 // Compile-time: no task_id field accessible here.
-    //                 // If this test compiles, the invariant holds.
-    //             }
-    //             _ => prop_assert!(false, "Expected Branch mode"),
-    //         }
-    //     }
-    //
-    //     /// Branch mode always carries a non-empty branch_name.
-    //     #[test]
-    //     fn prop_branch_mode_always_has_branch_name(mode in arb_branch_mode()) {
-    //         match &mode {
-    //             ConvMode::Branch { branch_name, .. } => {
-    //                 prop_assert!(!branch_name.is_empty(),
-    //                     "Branch mode must always have a non-empty branch_name");
-    //             }
-    //             _ => prop_assert!(false, "Expected Branch mode"),
-    //         }
-    //     }
-    // }
+    proptest! {
+        /// Branch mode never carries a task_id.
+        /// This is the structural complement of prop_work_mode_always_has_task_id.
+        /// Together they prove the modes are structurally distinguishable.
+        ///
+        /// Traces to: BranchModeHasNoTaskFile invariant
+        #[test]
+        fn prop_branch_mode_never_has_task_id(mode in arb_branch_mode()) {
+            // The type system enforces this -- ConvMode::Branch has no task_id field.
+            // This test exists to document the invariant and catch regressions if
+            // someone adds a task_id field to Branch.
+            match &mode {
+                ConvMode::Branch { .. } => {
+                    // Compile-time: no task_id field accessible here.
+                    // If this test compiles, the invariant holds.
+                }
+                _ => prop_assert!(false, "Expected Branch mode"),
+            }
+        }
+
+        /// Branch mode always carries a non-empty branch_name.
+        #[test]
+        fn prop_branch_mode_always_has_branch_name(mode in arb_branch_mode()) {
+            match &mode {
+                ConvMode::Branch { branch_name, .. } => {
+                    prop_assert!(!branch_name.is_empty(),
+                        "Branch mode must always have a non-empty branch_name");
+                }
+                _ => prop_assert!(false, "Expected Branch mode"),
+            }
+        }
+    }
 
     // ========================================================================
     // Invariant: Serde roundtrip preserves mode discrimination
@@ -163,19 +156,18 @@ mod tests {
                 "Work mode must survive serde roundtrip");
         }
 
-        // Uncomment when ConvMode::Branch exists:
-        // /// Branch mode survives JSON roundtrip without gaining a task_id.
-        // #[test]
-        // fn prop_branch_mode_serde_roundtrip(mode in arb_branch_mode()) {
-        //     let json = serde_json::to_string(&mode).unwrap();
-        //     let deserialized: ConvMode = serde_json::from_str(&json).unwrap();
-        //     prop_assert_eq!(&mode, &deserialized,
-        //         "Branch mode must survive serde roundtrip");
-        //     // Verify no task_id leaked in:
-        //     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        //     prop_assert!(value.get("task_id").is_none(),
-        //         "Branch mode JSON must not contain task_id");
-        // }
+        /// Branch mode survives JSON roundtrip without gaining a task_id.
+        #[test]
+        fn prop_branch_mode_serde_roundtrip(mode in arb_branch_mode()) {
+            let json = serde_json::to_string(&mode).unwrap();
+            let deserialized: ConvMode = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(&mode, &deserialized,
+                "Branch mode must survive serde roundtrip");
+            // Verify no task_id leaked in:
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            prop_assert!(value.get("task_id").is_none(),
+                "Branch mode JSON must not contain task_id");
+        }
     }
 
     // ========================================================================
@@ -198,8 +190,8 @@ mod tests {
     fn is_valid_mode_transition(from: &ConvMode, to: &ConvMode) -> bool {
         matches!(
             (from, to),
-            (ConvMode::Explore, ConvMode::Work { .. }) // Uncomment when ConvMode::Branch exists:
-                                                       // | (ConvMode::Direct, ConvMode::Branch { .. })
+            (ConvMode::Explore, ConvMode::Work { .. })
+                | (ConvMode::Direct, ConvMode::Branch { .. })
         )
     }
 

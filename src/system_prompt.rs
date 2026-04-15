@@ -37,6 +37,12 @@ pub enum ModeContext {
     },
     /// Direct mode: full tool access, no lifecycle ceremony.
     Direct,
+    /// Branch mode: work directly on an existing branch. No task file.
+    Branch {
+        branch_name: String,
+        base_branch: String,
+        worktree_path: String,
+    },
 }
 
 /// A discovered guidance file with its path and content
@@ -360,6 +366,7 @@ pub fn build_system_prompt(
 ///
 /// When `home_override` is `Some`, that path is used instead of `$HOME` for
 /// the explicit home-directory skill scan. See [`discover_skills_with_home`].
+#[allow(clippy::too_many_lines)] // One match arm per ModeContext variant; splitting hurts readability
 pub fn build_system_prompt_with_home(
     working_dir: &Path,
     is_sub_agent: bool,
@@ -463,6 +470,24 @@ pub fn build_system_prompt_with_home(
                     "\n\nYou have full tool access. You are working directly in this directory \
                      with no plan/approve workflow or branch isolation. Changes happen on the \
                      current branch.",
+                );
+            }
+            ModeContext::Branch {
+                branch_name,
+                base_branch,
+                worktree_path,
+            } => {
+                let _ = write!(
+                    prompt,
+                    "\n\nYou are in Branch mode on existing branch {branch_name}, \
+                     targeting {base_branch}.\n\
+                     Your working directory is {worktree_path}. All file edits and \
+                     bash commands MUST stay inside this worktree. Do NOT modify \
+                     files in the main checkout or repo root.\n\
+                     You are working directly on an existing branch -- there is no \
+                     task file. Commit your changes directly to {branch_name}.\n\n\
+                     When the work is complete, let the user know. They will handle \
+                     merging or pushing when ready."
                 );
             }
         }

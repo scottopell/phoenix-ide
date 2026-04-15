@@ -1013,6 +1013,11 @@ async fn stream_conversation(
             branch_name,
             base_branch,
             ..
+        }
+        | ConvMode::Branch {
+            branch_name,
+            base_branch,
+            ..
         } if !base_branch.is_empty() && !branch_name.is_empty() => {
             // Resolve repo root from project
             let repo_root = if let Some(ref project_id) = conversation.project_id {

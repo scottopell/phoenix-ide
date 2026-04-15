@@ -215,16 +215,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Reconcile Work conversations whose worktree has been deleted or whose
+/// Reconcile Work/Branch conversations whose worktree has been deleted or whose
 /// `worktree_path` is empty (legacy rows predating M3).
 ///
-/// For each affected conversation: revert mode to Explore, reset cwd to the
-/// project root, and run `git worktree prune` to clean stale worktree bookkeeping.
+/// For each affected conversation: revert mode (Work -> Explore, Branch -> Direct),
+/// reset cwd to the project root, and run `git worktree prune` to clean stale
+/// worktree bookkeeping.
 async fn reconcile_worktrees(db: &Database) {
     let work_convs = match db.get_work_conversations().await {
         Ok(convs) => convs,
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to query Work conversations for reconciliation");
+            tracing::warn!(error = %e, "Failed to query Work/Branch conversations for reconciliation");
             return;
         }
     };
@@ -251,18 +252,26 @@ async fn reconcile_worktrees(db: &Database) {
         } else {
             "worktree directory missing"
         };
+
+        // Branch mode reverts to Direct (no Explore phase to fall back to).
+        // Work mode reverts to Explore (Managed workflow fallback).
+        let is_branch = matches!(conv.conv_mode, db::ConvMode::Branch { .. });
+        let revert_label = if is_branch { "Direct" } else { "Explore" };
+        let revert_mode = if is_branch {
+            db::ConvMode::Direct
+        } else {
+            db::ConvMode::Explore
+        };
+
         tracing::warn!(
             conv_id = %conv.id,
             worktree_path = wt_path,
             reason,
-            "Reverting Work conversation to Explore"
+            revert_to = revert_label,
+            "Reverting worktree conversation"
         );
 
-        // Revert to Explore mode
-        if let Err(e) = db
-            .update_conversation_mode(&conv.id, &db::ConvMode::Explore)
-            .await
-        {
+        if let Err(e) = db.update_conversation_mode(&conv.id, &revert_mode).await {
             tracing::error!(conv_id = %conv.id, error = %e, "Failed to revert conv_mode");
             continue;
         }

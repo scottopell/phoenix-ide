@@ -161,6 +161,19 @@ pub enum ConvMode {
         #[serde(default)]
         task_title: String,
     },
+    /// Branch mode: work directly on an existing branch (e.g., fix a PR).
+    /// No task file, no Explore phase. Full tool access.
+    /// REQ-PROJ-024
+    Branch {
+        /// The existing branch name (e.g., "q-branch-observer")
+        branch_name: String,
+        /// Absolute path to the git worktree
+        #[serde(default)]
+        worktree_path: String,
+        /// The branch this worktree was created from (same as `branch_name` for Branch mode)
+        #[serde(default)]
+        base_branch: String,
+    },
 }
 
 impl ConvMode {
@@ -170,43 +183,46 @@ impl ConvMode {
             Self::Explore => "Explore",
             Self::Direct => "Direct",
             Self::Work { .. } => "Work",
+            Self::Branch { .. } => "Branch",
         }
     }
 
-    /// The branch name if in Work mode, None otherwise.
+    /// The branch name if in Work or Branch mode, None otherwise.
     pub fn branch_name(&self) -> Option<&str> {
         match self {
-            Self::Work { branch_name, .. } => Some(branch_name),
+            Self::Work { branch_name, .. } | Self::Branch { branch_name, .. } => Some(branch_name),
             Self::Explore | Self::Direct => None,
         }
     }
 
-    /// The worktree path if in Work mode, None otherwise.
+    /// The worktree path if in Work or Branch mode, None otherwise.
     pub fn worktree_path(&self) -> Option<&str> {
         match self {
-            Self::Work { worktree_path, .. } => Some(worktree_path),
+            Self::Work { worktree_path, .. } | Self::Branch { worktree_path, .. } => {
+                Some(worktree_path)
+            }
             Self::Explore | Self::Direct => None,
         }
     }
 
-    /// The base branch if in Work mode, None otherwise.
+    /// The base branch if in Work or Branch mode, None otherwise.
     pub fn base_branch(&self) -> Option<&str> {
         match self {
-            Self::Work { base_branch, .. } => Some(base_branch),
+            Self::Work { base_branch, .. } | Self::Branch { base_branch, .. } => Some(base_branch),
             Self::Explore | Self::Direct => None,
         }
     }
 
-    /// The task ID if in Work mode, None otherwise.
+    /// The task ID if in Work mode, None otherwise. Branch mode has no task.
     #[allow(dead_code)] // Used by M4 Complete/Abandon flows (task 0604)
     pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::Work { task_id, .. } => Some(task_id),
-            Self::Explore | Self::Direct => None,
+            Self::Explore | Self::Direct | Self::Branch { .. } => None,
         }
     }
 
-    /// The task title if in Work mode, None otherwise.
+    /// The task title if in Work mode, None otherwise. Branch mode has no task.
     pub fn task_title(&self) -> Option<&str> {
         match self {
             Self::Work { task_title, .. } => {
@@ -216,7 +232,7 @@ impl ConvMode {
                     Some(task_title)
                 }
             }
-            Self::Explore | Self::Direct => None,
+            Self::Explore | Self::Direct | Self::Branch { .. } => None,
         }
     }
 }
@@ -795,6 +811,21 @@ mod conv_mode_tests {
         let json = r#"{"mode":"Explore"}"#;
         let parsed: ConvMode = serde_json::from_str(json).unwrap();
         assert_eq!(parsed, ConvMode::Explore);
+    }
+
+    #[test]
+    fn test_branch_serialization() {
+        let mode = ConvMode::Branch {
+            branch_name: "fix-login".to_string(),
+            worktree_path: "/tmp/wt".to_string(),
+            base_branch: "main".to_string(),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: ConvMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, mode);
+        // Verify no task_id in JSON
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("task_id").is_none());
     }
 }
 

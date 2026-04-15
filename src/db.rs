@@ -590,7 +590,7 @@ impl Database {
         Ok(())
     }
 
-    /// Get all non-archived Work conversations (for startup worktree reconciliation).
+    /// Get all non-archived Work/Branch conversations (for startup worktree reconciliation).
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
@@ -600,7 +600,7 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
-               AND json_extract(c.conv_mode, '$.mode') = 'Work'",
+               AND json_extract(c.conv_mode, '$.mode') IN ('Work', 'Branch')",
         )
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
