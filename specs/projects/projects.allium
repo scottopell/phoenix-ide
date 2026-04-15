@@ -18,8 +18,8 @@
 --   - Auto-stash mechanics (implementation detail)
 --   - Diff snapshot capture (implementation detail of abandon)
 --
--- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-023
--- (1 descoped: REQ-PROJ-015)
+-- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
+-- (2 descoped: REQ-PROJ-009, REQ-PROJ-015)
 
 use "./bedrock.allium" as bedrock
 
@@ -60,6 +60,11 @@ value WorktreePath {
 enum TaskFileStatus { in_progress | done | wont_do }
 
 enum TaskResolutionOutcome { completed | abandoned }
+
+-- Distinguishes worktree lifecycle rules.
+-- Managed: Phoenix created the branch, task file exists, branch deleted on terminal.
+-- Branch: user's existing branch, no task file, branch kept on terminal.
+enum WorktreeKind { managed | branch }
 
 -- A branch entry as presented to the user in the branch picker.
 value BranchEntry {
@@ -103,7 +108,7 @@ entity Project {
     work_conversations: conversations where mode = work
 }
 
--- A task file in the tasks/ directory, committed to main.
+-- A task file in the tasks/ directory, committed on the task branch.
 entity TaskFile {
     project: Project
     task_id: String                -- NNNN format (date-based sequential)
@@ -128,15 +133,16 @@ entity TaskFile {
     }
 }
 
--- A git worktree for an isolated Work conversation.
--- Exists only while the conversation is in Work mode.
+-- A git worktree for an isolated conversation.
+-- Exists while the conversation is in Explore (managed) or Work mode.
 entity Worktree {
     conversation: bedrock/Conversation
     project: Project
     path: WorktreePath
-    branch_name: String            -- task-{NNNN}-{slug}
-    base_branch: String            -- recorded at approval time
-    task_file: TaskFile
+    branch_name: String            -- task-{NNNN}-{slug} (managed) or existing branch (branch mode)
+    base_branch: String            -- recorded at creation time
+    kind: WorktreeKind
+    task_file: TaskFile?           -- present only for managed worktrees
 
     -- Derived
     is_clean: git_status_clean(path)
@@ -191,6 +197,101 @@ rule ManagedModeSelected {
     requires: is_git_repository(conversation.working_dir)
 
     ensures: conversation.mode = explore
+}
+
+-- REQ-PROJ-024/029: User selects Branch mode for git repo
+rule BranchModeSelected {
+    when: UserSelectsBranch(conversation, branch_name)
+
+    requires: is_git_repository(conversation.working_dir)
+    requires: branch_name is not empty
+
+    -- REQ-PROJ-025: check for existing worktree/conversation on this branch
+    requires: not exists active_worktree_on_branch(conversation.project, branch_name)
+        or BranchConflictResolved(conversation, branch_name)
+
+    -- Single-branch fetch (REQ-PROJ-022)
+    ensures: BestEffortFetch(conversation.project.repo, branch_name)
+
+    -- Create worktree on the existing branch (no new branch)
+    ensures: Worktree.created(
+        conversation: conversation,
+        project: conversation.project,
+        path: WorktreePath { absolute_path: worktree_path(conversation) },
+        branch_name: branch_name,
+        base_branch: branch_name,
+        kind: branch,
+        task_file: absent
+    )
+    ensures: conversation.mode = work
+
+    @guidance
+        -- Unlike Managed mode, Branch mode skips Explore entirely.
+        -- The worktree checks out the existing branch (not a new branch).
+        -- `git worktree add <path> <branch>` (no -b flag).
+        -- The conversation starts in Work mode with full tool access.
+        -- No task file is created. The agent's first message is delivered
+        -- immediately after worktree creation.
+}
+
+-- REQ-PROJ-025: Branch conflict detection
+rule BranchConflictDetected {
+    when: UserSelectsBranch(conversation, branch_name)
+
+    requires: exists active_worktree_on_branch(conversation.project, branch_name)
+
+    -- Four cases:
+    -- (A) Active conversation with worktree -> prompt redirect
+    -- (B) Orphaned worktree (no conversation) -> prompt delete + fresh start
+    -- (C) Stale conversation (no worktree) -> redirect to conversation
+    -- All cases must be resolved before BranchModeSelected can proceed.
+
+    ensures: BranchConflictPrompt(conversation, branch_name,
+        existing_conversation: find_conversation_for_branch(branch_name),
+        orphaned_worktree: find_orphaned_worktree(branch_name)
+    )
+
+    @guidance
+        -- The prompt is shown in the /new page before conversation creation.
+        -- "This branch is open in another conversation. Continue there?"
+        -- For orphaned worktrees: "An orphaned worktree exists. Delete and
+        --   start fresh?"
+        -- For stale conversations: redirect to the existing conversation.
+        -- Terminal conversations are excluded from conflict detection.
+}
+
+-- REQ-PROJ-028: Managed mode creates worktree on first message
+rule ManagedWorktreeOnFirstMessage {
+    when: UserSendsFirstMessage(conversation)
+
+    requires: conversation.mode = explore
+    requires: not exists Worktree{conversation: conversation}
+
+    let base_branch = conversation.desired_base_branch
+        or conversation.project.repo.current_branch
+    let branch_name = "task-pending-" + conversation.id[0..8]
+
+    -- Single-branch fetch (REQ-PROJ-022)
+    ensures: BestEffortFetch(conversation.project.repo, base_branch)
+
+    ensures: Worktree.created(
+        conversation: conversation,
+        project: conversation.project,
+        path: WorktreePath { absolute_path: worktree_path(conversation) },
+        branch_name: branch_name,
+        base_branch: base_branch,
+        kind: managed,
+        task_file: absent
+    )
+    -- conversation stays in Explore mode, agent reads from worktree
+
+    @guidance
+        -- The worktree is created from the selected base branch so the
+        -- agent explores the right code (not the main checkout).
+        -- A temporary branch name is used until task approval assigns
+        -- the real task-{NNNN}-{slug} name.
+        -- `git worktree add -b <temp-branch> <path> <base_branch>`
+        -- The agent has read-only tools in this worktree.
 }
 
 -- REQ-PROJ-016/018: Non-git or Direct mode has no project features
@@ -326,25 +427,26 @@ rule MaterializeBranch {
 -- No git operations during propose/feedback loop. Plan exists only in memory.
 -- Tool availability (Explore only, no sub-agents) enforced by bedrock.
 
--- REQ-PROJ-004/006: User approves task — git operations execute
+-- REQ-PROJ-004/006/028: User approves task — permission upgrade + task file
 rule TaskApprovalExecuted {
     when: bedrock/UserApprovesTask(conversation, decision)
 
-    -- Bedrock handles the state transition (AwaitingTaskApproval → LlmRequesting).
+    -- Bedrock handles the state transition (AwaitingTaskApproval -> LlmRequesting).
     -- This rule specifies the git side effects.
+    -- REQ-PROJ-028: worktree already exists from ManagedWorktreeOnFirstMessage.
+    -- Approval is a permission upgrade (Explore -> Work), not worktree creation.
 
+    let worktree = Worktree{conversation: conversation}
     let project = conversation.project
     let proposal = conversation.proposal
     let task_id = next_task_id(project)
     let slug = derive_slug(proposal.title)
-    -- base_branch resolved via MaterializeBranch (REQ-PROJ-022):
-    -- single-branch fetch, then local ref (fast-forwarded or newly created).
-    let base_branch = conversation.resolved_base
-        or conversation.desired_base_branch
-        or project.repo.current_branch
     let branch_name = "task-" + task_id + "-" + slug
-    let worktree_path = project.repo.root_path + "/" + config.worktree_base_dir + "/" + conversation.id
 
+    -- Rename the temporary branch to the final task branch name
+    ensures: worktree.branch_name = branch_name
+
+    -- Create and commit task file on the task branch (not main)
     ensures: TaskFile.created(
         project: project,
         task_id: task_id,
@@ -354,51 +456,30 @@ rule TaskApprovalExecuted {
         status: in_progress,
         created_at: now
     )
-    ensures: TaskFileCommitted(project, task_id)
-    ensures: Worktree.created(
-        conversation: conversation,
-        project: project,
-        path: WorktreePath { absolute_path: worktree_path },
-        branch_name: branch_name,
-        base_branch: base_branch,
-        task_file: TaskFile{task_id: task_id}
-    )
-    -- Mode transition to Work with all fields
+    ensures: worktree.task_file = TaskFile{task_id: task_id}
+    ensures: TaskFileCommittedOnBranch(worktree, task_id)
+
+    -- Mode transition to Work
     ensures: conversation.branch_name = branch_name
-    ensures: conversation.worktree_path = worktree_path
-    ensures: conversation.base_branch = base_branch
     ensures: conversation.task_id = task_id
 
     @guidance
         -- All operations run under a global mutex to prevent concurrent
         -- approvals from getting the same task number.
         --
-        -- Sequence (two paths based on whether desired base is current HEAD):
+        -- Sequence:
+        --   1. Assign task ID (date-based sequential via taskmd-core)
+        --   2. Rename branch: `git branch -m <temp-name> <task-branch>`
+        --   3. Write task file to tasks/ in the worktree
+        --   4. Stage and commit on the task branch (not main)
+        --   5. Transition Explore -> Work (permission upgrade)
         --
-        -- Path A (on base branch, or no desired_base_branch):
-        --   1. Detect base_branch (desired_base_branch or current HEAD)
-        --   2. Create tasks/ directory if first task for this project
-        --   3. Assign task ID (date-based sequential via taskmd-core)
-        --   4. Write task file to tasks/ (in-progress status)
-        --   5. Ensure .gitignore contains `.phoenix/`
-        --   6. Stage task file, commit to base_branch
-        --   7. Branch collision check
-        --   8. Create branch (git branch), then worktree (git worktree add)
-        --
-        -- Path B (desired base differs from current HEAD):
-        --   1. MaterializeBranch: fetch origin/<base>, fast-forward or
-        --      create tracking branch (REQ-PROJ-022)
-        --   2. Assign task ID
-        --   3. Create worktree + branch in one step:
-        --      `git worktree add -b <branch> <path> <base_branch>`
-        --   4. Write task file and .gitignore in the WORKTREE
-        --   5. Commit in the worktree (not the main checkout)
-        --   Main checkout is not modified in Path B.
+        -- The worktree and base_branch were set by
+        -- ManagedWorktreeOnFirstMessage. No new worktree is created here.
         --
         -- Rollback:
-        --   Path A: commit failure -> git reset HEAD, remove file
-        --           worktree failure -> git branch -D
-        --   Path B: worktree failure -> git branch -D (no main checkout changes to revert)
+        --   Task file write failure: remove file, reset
+        --   Branch rename failure: keep temp name, log warning
 }
 
 -- REQ-PROJ-004: User provides feedback — no git operations
@@ -419,148 +500,79 @@ rule TaskRejectionNoGitOps {
 }
 
 -- ===========================================================
--- 4. TASK COMPLETION (REQ-PROJ-009, REQ-PROJ-017)
+-- 4. MARK AS MERGED (REQ-PROJ-026, REQ-PROJ-027)
 -- ===========================================================
 
--- REQ-PROJ-009: Pre-checks before completion
-rule CompleteTaskPrechecks {
-    when: UserInitiatesComplete(conversation)
+-- REQ-PROJ-026/027: User marks conversation as merged
+rule MarkAsMerged {
+    when: UserMarksAsMerged(conversation)
 
     let worktree = Worktree{conversation: conversation}
 
     requires: conversation.status = idle
     requires: conversation.mode = work
-    requires: worktree.is_clean
-    requires:
-        git_main_clean(worktree.project.repo)
-        or auto_stash_safe(worktree.project.repo, worktree.base_branch)
-    requires: not git_has_conflicts(worktree, worktree.base_branch)
 
-    ensures: CompletionPrechecksPass(conversation, worktree)
-
-    @guidance
-        -- If worktree is dirty: agent must commit or stash.
-        -- If main is dirty AND auto_stash was requested: check whether
-        --   dirty files overlap with the merge. If no overlap, report
-        --   can_auto_stash=true so ConfirmComplete can stash/pop.
-        --   If overlap, fail with actionable error.
-        -- If main is dirty AND auto_stash not requested: fail with
-        --   actionable error.
-        -- If merge conflicts: agent must resolve first.
-        -- Pre-check failures are actionable (user stays in Work mode).
-}
-
--- REQ-PROJ-009: User confirms completion
-rule ConfirmComplete {
-    when: UserConfirmsComplete(conversation, commit_message, auto_stash)
-
-    let worktree = Worktree{conversation: conversation}
-    let task_file = worktree.task_file
-
-    requires: conversation.status = idle
-    requires: conversation.mode = work
-
-    -- Git operations (under mutex)
-    ensures: SquashMerged(worktree, commit_message)
-    ensures: task_file.status = done
     ensures: not exists worktree
+    ensures:
+        if worktree.kind = managed:
+            -- Phoenix created this branch; delete it
+            BranchDeleted(worktree.branch_name)
+        -- Branch mode: keep the branch (it's the user's PR branch)
+
     ensures: bedrock/TaskResolved(
         conversation,
-        system_message: "Task completed. Squash merged to " + worktree.base_branch
+        system_message: "Marked as merged. Worktree deleted."
     )
 
     @guidance
-        -- All operations run in a single blocking task under the global
-        -- TASK_APPROVAL_MUTEX.
-        --
         -- Sequence:
-        --   1. Auto-stash: if main checkout is dirty and auto_stash=true,
-        --      run `git stash push --include-untracked -m "phoenix: ..."`.
-        --      If dirty and auto_stash=false, return conflict error.
-        --   2. `git checkout {base_branch}`
-        --      On failure: pop stash (if stashed), return error.
-        --   3. `git merge --squash {branch_name}`
-        --      On failure: `git reset --hard HEAD`, pop stash, return error.
-        --   4. Task file rename: use taskmd rename_status to update
-        --      frontmatter and rename file from in-progress to done.
-        --      Stage both old and new paths with `git add`.
-        --      Non-fatal if fails — merge still proceeds.
-        --      ORDERING: must run after stash+merge so filesystem reads
-        --      see merged state, not stashed files.
-        --   5. Check `git diff --cached --quiet`. If nothing staged
-        --      (task-file-only branch with no code changes), skip commit.
-        --   6. `git commit -m {commit_message}`
-        --      On failure: `git reset --hard HEAD`, pop stash, return error.
-        --   7. `git rev-parse --short HEAD` for system message.
-        --   8. `git worktree remove {path} --force`
-        --      On failure (non-fatal): `rm -rf` + `git worktree prune`.
-        --   9. `git branch -D {branch_name}` (non-fatal if fails).
-        --  10. Pop auto-stash if stashed in step 1.
-        --      If pop fails: return warning (stash preserved, user
-        --      must `git stash pop` manually).
-        --  11. Send TaskResolved event.
+        --   1. `git worktree remove {path} --force`
+        --      On failure: `rm -rf` + `git worktree prune`
+        --   2. If managed: `git branch -D {branch}` (non-fatal)
+        --      If branch: no branch deletion
+        --   3. Send TaskResolved event
 }
 
 -- ===========================================================
--- 5. TASK ABANDONMENT (REQ-PROJ-010)
+-- 5. ABANDONMENT (REQ-PROJ-010, REQ-PROJ-026)
 -- ===========================================================
 
--- REQ-PROJ-010: User confirms abandonment
+-- REQ-PROJ-010/026: User confirms abandonment
 rule ConfirmAbandon {
     when: UserConfirmsAbandon(conversation)
 
     let worktree = Worktree{conversation: conversation}
-    let task_file = worktree.task_file
 
     requires: conversation.status = idle
     requires: conversation.mode = work
 
-    -- Worktree and branch deleted (no merge).
-    -- The critical postcondition is worktree deletion; task file
-    -- update is best-effort bookkeeping. The endpoint returns
-    -- success once the worktree is gone, regardless of whether
-    -- task file operations succeed.
     ensures: not exists worktree
-    ensures: task_file.status = wont_do         -- best-effort
+    ensures:
+        if worktree.kind = managed:
+            -- Phoenix created this branch; delete it
+            BranchDeleted(worktree.branch_name)
+        -- Branch mode: keep the branch (it's the user's PR branch)
+
     ensures: bedrock/TaskResolved(
         conversation,
-        system_message: "Task abandoned. Worktree and branch deleted."
+        system_message:
+            if worktree.kind = managed:
+                "Task abandoned. Worktree and branch deleted."
+            else:
+                "Conversation abandoned. Worktree deleted, branch kept."
     )
 
     @guidance
-        -- Design decision: abandon always succeeds from the user's
-        -- perspective. The worktree is the critical resource; its
-        -- deletion is the gate. Task file bookkeeping (step 4) is
-        -- entirely non-fatal — failures are logged but the endpoint
-        -- still returns success and TaskResolved still fires.
-        --
-        -- The only post-deletion error path is if the state machine
-        -- event dispatch itself fails (send_event for TaskResolved),
-        -- which indicates runtime corruption, not a git problem.
+        -- Abandon always succeeds from the user's perspective.
+        -- The worktree is the critical resource; its deletion is the gate.
         --
         -- Sequence:
-        --   1. Capture diff snapshot (blocking, before worktree deletion):
-        --      a. `git log --oneline {base_branch}..HEAD` (commit log)
-        --      b. `git add -N .` (stage untracked for diff visibility)
-        --      c. `git diff HEAD` (uncommitted changes)
-        --      d. Truncate to 100 KiB if larger
-        --      e. Non-fatal: if capture fails, skip snapshot
-        --   2. Persist snapshot as system message in database
-        --      (non-fatal, broadcast via SSE after state transition)
-        --   3. Delete worktree and branch (NO MUTEX):
-        --      a. `git worktree remove {path} --force`
-        --         On failure: `rm -rf` + `git worktree prune`
-        --      b. `git branch -D {branch}` (non-fatal if fails)
-        --   4. Task file update (UNDER MUTEX, all non-fatal):
-        --      a. `git status --porcelain` on main checkout.
-        --         If dirty, skip task file update entirely.
-        --      b. `git checkout {base_branch}`
-        --      c. Update frontmatter status in file content (fs write)
-        --      d. `git mv tasks/{old_filename} tasks/{new_filename}`
-        --         (renames from in-progress to wont-do)
-        --      e. `git commit -m "task {id}: mark wont-do"`
-        --         On failure: `git reset HEAD`
-        --   5. Send TaskResolved event to state machine
+        --   1. Capture diff snapshot (non-fatal, before worktree deletion)
+        --   2. `git worktree remove {path} --force`
+        --      On failure: `rm -rf` + `git worktree prune`
+        --   3. If managed: `git branch -D {branch}` (non-fatal)
+        --      If branch: no branch deletion
+        --   4. Send TaskResolved event
         --
         -- All uncommitted work in the worktree is permanently lost.
 }
@@ -666,7 +678,9 @@ rule ExploreSubAgentDirectory {
 rule ServerRestartWorktreeReconciliation {
     when: bedrock/ServerRestarted(conversation)
 
+    -- REQ-PROJ-028: Explore conversations with worktrees also need reconciliation
     requires: conversation.mode = work
+        or (conversation.mode = explore and conversation.worktree_path != "")
 
     -- Detection: worktree is orphaned if any of these hold
     let orphaned =
@@ -736,10 +750,23 @@ invariant OneWorktreePerConversation {
 -- from desired_base_branch or current HEAD, then stored in ConvMode::Work.
 -- No rule updates it after approval.)
 
--- Task file exists on base_branch after approval
-invariant TaskFileExistsAfterApproval {
-    for w in Worktrees:
-        exists w.task_file
+-- Task file exists after approval (managed worktrees only)
+invariant TaskFileExistsForManagedWorktrees {
+    for w in Worktrees where w.kind = managed:
+        w.conversation.mode = work implies exists w.task_file
+}
+
+-- REQ-PROJ-024: Branch mode worktrees never have task files
+invariant BranchModeHasNoTaskFile {
+    for w in Worktrees where w.kind = branch:
+        w.task_file = absent
+}
+
+-- REQ-PROJ-025: No two active worktrees on the same branch
+invariant OneBranchOneActiveWorktree {
+    for a in Worktrees:
+        for b in Worktrees:
+            a != b implies a.branch_name != b.branch_name
 }
 
 -- Task file status consistency with conversation lifecycle
@@ -772,19 +799,13 @@ surface ProjectManagement {
     exposes:
         worktree.branch_name
         worktree.base_branch
+        worktree.kind
         worktree.is_clean
-        worktree.task_file.status
+        worktree.task_file.status when worktree.kind = managed
 
     provides:
-        UserInitiatesComplete(conversation)
-            when worktree.is_clean
-        UserConfirmsComplete(conversation, commit_message)
+        UserMarksAsMerged(conversation)
         UserConfirmsAbandon(conversation)
-
-    @guarantee MutexSerialisation
-        -- Git operations that modify the main checkout (merge, task file
-        -- update) are serialised under a per-project mutex. The mutex
-        -- is held only during checkout+merge+commit, not during LLM calls.
 
     @guarantee NonFatalBookkeeping
         -- Task file status updates are best-effort. If they fail,
