@@ -46,9 +46,13 @@ interface ConversationSettingsProps {
 function branchLabel(b: GitBranchEntry, currentBranch?: string | null): string {
   let label = b.name;
   if (b.name === currentBranch) label += ' (current)';
-  else if (!b.local && b.remote) label += ' (remote)';
-  if (b.behind_remote && b.behind_remote > 0) label += ` \u2022 ${b.behind_remote} behind origin`;
+  if (b.behind_remote && b.behind_remote > 0) label += ` \u2022 ${b.behind_remote} behind`;
   return label;
+}
+
+function branchTag(b: GitBranchEntry): { text: string; className: string } | null {
+  if (b.local && !b.remote) return { text: 'local only', className: 'branch-tag branch-tag--local' };
+  return null;
 }
 
 export function ConversationSettings({
@@ -214,6 +218,7 @@ export function ConversationSettings({
             {branchSearchLoading && <span className="branch-combobox-loading">...</span>}
             {comboOpen && (
               <div className="branch-combobox-dropdown">
+                <div className="branch-combobox-hint">Fetches latest from origin when task starts</div>
                 {defaultBranch && !branchSearch && (
                   <div
                     className={`branch-combobox-item branch-combobox-item--default ${selectedName === defaultBranch ? 'branch-combobox-item--selected' : ''}`}
@@ -224,16 +229,19 @@ export function ConversationSettings({
                 )}
                 {displayBranches
                   .filter(b => !branchSearch || b.name !== defaultBranch)
-                  .map(b => (
-                    <div
-                      key={b.name}
-                      className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
-                      onClick={() => selectBranch(b.name)}
-                    >
-                      <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
-                      {!b.local && b.remote && <span className="branch-tag branch-tag--remote">remote</span>}
-                    </div>
-                  ))}
+                  .map(b => {
+                    const tag = branchTag(b);
+                    return (
+                      <div
+                        key={b.name}
+                        className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
+                        onClick={() => selectBranch(b.name)}
+                      >
+                        <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
+                        {tag && <span className={tag.className}>{tag.text}</span>}
+                      </div>
+                    );
+                  })}
                 {displayBranches.length === 0 && branchSearch && !branchSearchLoading && (
                   <div className="branch-combobox-empty">No matching branches</div>
                 )}

@@ -2516,19 +2516,41 @@ fn search_remote_branches(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let branches: Vec<GitBranchEntry> = refs
+    let mut branches: Vec<GitBranchEntry> = refs
         .into_iter()
         .filter(|name| name.to_lowercase().contains(&query_lower))
         .map(|name| {
             let local = local_set.contains(&name);
+            // Compute behind_remote for branches that exist locally.
+            let behind_remote = if local {
+                let remote_ref = format!("origin/{name}");
+                let range = format!("{name}..{remote_ref}");
+                run_git(cwd, &["rev-list", "--count", &range])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&n| n > 0)
+            } else {
+                None
+            };
             GitBranchEntry {
                 local,
                 remote: true,
-                behind_remote: None,
+                behind_remote,
                 name,
             }
         })
         .collect();
+
+    // Sort: prefix matches first, then substring. Within each group,
+    // local branches first (you've used them), then alphabetical.
+    branches.sort_by(|a, b| {
+        let a_prefix = a.name.to_lowercase().starts_with(&query_lower);
+        let b_prefix = b.name.to_lowercase().starts_with(&query_lower);
+        b_prefix
+            .cmp(&a_prefix)
+            .then(b.local.cmp(&a.local))
+            .then(a.name.cmp(&b.name))
+    });
 
     let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_default()
