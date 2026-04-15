@@ -195,8 +195,9 @@ export function ConversationSettings({
               ref={inputRef}
               type="text"
               className="settings-input branch-combobox-input"
-              placeholder={selectedName || 'Search branches...'}
-              value={comboOpen ? branchSearch : ''}
+              placeholder={comboOpen || !selectedName ? 'Search branches...' : undefined}
+              value={comboOpen ? branchSearch : selectedName}
+              readOnly={!comboOpen}
               onFocus={() => setComboOpen(true)}
               onChange={(e) => setBranchSearch?.(e.target.value)}
             />

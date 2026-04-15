@@ -2541,13 +2541,16 @@ fn search_remote_branches(
         })
         .collect();
 
-    // Sort: prefix matches first, then substring. Within each group,
-    // local branches first (you've used them), then alphabetical.
+    // Sort: exact match first, then prefix matches, then substring.
+    // Within each tier, local branches first (you've used them), then alphabetical.
     branches.sort_by(|a, b| {
+        let a_exact = a.name.to_lowercase() == query_lower;
+        let b_exact = b.name.to_lowercase() == query_lower;
         let a_prefix = a.name.to_lowercase().starts_with(&query_lower);
         let b_prefix = b.name.to_lowercase().starts_with(&query_lower);
-        b_prefix
-            .cmp(&a_prefix)
+        b_exact
+            .cmp(&a_exact)
+            .then(b_prefix.cmp(&a_prefix))
             .then(b.local.cmp(&a.local))
             .then(a.name.cmp(&b.name))
     });
