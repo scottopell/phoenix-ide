@@ -17,7 +17,7 @@ use std::path::PathBuf;
 // Test Helpers
 // ============================================================================
 
-fn test_context() -> ConvContext {
+pub(crate) fn test_context() -> ConvContext {
     ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
 }
 
@@ -78,7 +78,7 @@ fn arb_tool_result() -> impl Strategy<Value = ToolResult> {
     })
 }
 
-fn arb_error_kind() -> impl Strategy<Value = ErrorKind> {
+pub(crate) fn arb_error_kind() -> impl Strategy<Value = ErrorKind> {
     prop_oneof![
         Just(ErrorKind::Network),
         Just(ErrorKind::RateLimit),
@@ -237,7 +237,17 @@ fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
         })
 }
 
-fn arb_state() -> impl Strategy<Value = ConvState> {
+fn arb_awaiting_recovery_state() -> impl Strategy<Value = ConvState> {
+    ("[a-zA-Z ]{1,30}", arb_error_kind()).prop_map(|(message, error_kind)| {
+        ConvState::AwaitingRecovery {
+            message,
+            error_kind,
+            recovery_kind: super::state::RecoveryKind::Credential,
+        }
+    })
+}
+
+pub(crate) fn arb_state() -> impl Strategy<Value = ConvState> {
     prop_oneof![
         arb_idle_state(),
         arb_llm_requesting_state(),
@@ -249,6 +259,7 @@ fn arb_state() -> impl Strategy<Value = ConvState> {
         arb_awaiting_task_approval_state(),
         arb_awaiting_user_response_state(),
         arb_terminal_state(),
+        arb_awaiting_recovery_state(),
     ]
 }
 
@@ -344,7 +355,7 @@ fn arb_grace_turn_exhausted_event() -> impl Strategy<Value = Event> {
         .prop_map(|result| Event::GraceTurnExhausted { result })
 }
 
-fn arb_event() -> impl Strategy<Value = Event> {
+pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
     prop_oneof![
         arb_user_message_event(),
         arb_llm_response_event(),

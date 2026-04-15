@@ -563,7 +563,8 @@ pub fn transition(
 
         // AwaitingRecovery + CredentialBecameAvailable -> retry LLM request
         (ConvState::AwaitingRecovery { .. }, Event::CredentialBecameAvailable) => Ok(
-            TransitionResult::new(ConvState::LlmRequesting { attempt: 0 })
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistState)
                 .with_effect(Effect::RequestLlm),
         ),
 

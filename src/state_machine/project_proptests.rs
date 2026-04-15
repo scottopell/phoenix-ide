@@ -24,21 +24,21 @@ mod tests {
 
     fn arb_work_mode() -> impl Strategy<Value = ConvMode> {
         (
-            "[a-z]{5,10}",           // branch_name
-            "/tmp/[a-z]{8}",         // worktree_path
-            "[a-z]{3,8}",            // base_branch
-            "[A-Z]{2}[0-9]{3,4}",   // task_id
-            "[a-zA-Z ]{5,30}",       // task_title
+            "[a-z]{5,10}",        // branch_name
+            "/tmp/[a-z]{8}",      // worktree_path
+            "[a-z]{3,8}",         // base_branch
+            "[A-Z]{2}[0-9]{3,4}", // task_id
+            "[a-zA-Z ]{5,30}",    // task_title
         )
-            .prop_map(|(branch_name, worktree_path, base_branch, task_id, task_title)| {
-                ConvMode::Work {
+            .prop_map(
+                |(branch_name, worktree_path, base_branch, task_id, task_title)| ConvMode::Work {
                     branch_name,
                     worktree_path,
                     base_branch,
                     task_id,
                     task_title,
-                }
-            })
+                },
+            )
     }
 
     // Uncomment when ConvMode::Branch exists:
@@ -198,9 +198,8 @@ mod tests {
     fn is_valid_mode_transition(from: &ConvMode, to: &ConvMode) -> bool {
         matches!(
             (from, to),
-            (ConvMode::Explore, ConvMode::Work { .. })
-            // Uncomment when ConvMode::Branch exists:
-            // | (ConvMode::Direct, ConvMode::Branch { .. })
+            (ConvMode::Explore, ConvMode::Work { .. }) // Uncomment when ConvMode::Branch exists:
+                                                       // | (ConvMode::Direct, ConvMode::Branch { .. })
         )
     }
 
@@ -295,4 +294,189 @@ mod tests {
 
     // These are integration tests (require git/filesystem), not proptests.
     // Documented here for traceability; implemented in integration test suite.
+}
+
+// ============================================================================
+// State machine property tests
+// ============================================================================
+
+#[cfg(test)]
+mod state_machine_props {
+    use crate::db::ErrorKind;
+    use crate::state_machine::effect::Effect;
+    use crate::state_machine::event::Event;
+    use crate::state_machine::proptests::{arb_error_kind, arb_event, arb_state, test_context};
+    use crate::state_machine::state::{ConvContext, ConvState};
+    use crate::state_machine::transition::{transition, TransitionError};
+    use proptest::prelude::*;
+    use std::path::PathBuf;
+
+    // ====================================================================
+    // Generators for terminal states
+    // ====================================================================
+
+    fn arb_completed_state() -> impl Strategy<Value = ConvState> {
+        "[a-zA-Z0-9 ]{1,50}".prop_map(|result| ConvState::Completed { result })
+    }
+
+    fn arb_failed_state() -> impl Strategy<Value = ConvState> {
+        ("[a-zA-Z ]{1,30}", arb_error_kind())
+            .prop_map(|(error, error_kind)| ConvState::Failed { error, error_kind })
+    }
+
+    fn arb_context_exhausted_state() -> impl Strategy<Value = ConvState> {
+        "[a-zA-Z0-9 ]{0,100}".prop_map(|summary| ConvState::ContextExhausted { summary })
+    }
+
+    fn arb_any_terminal_state() -> impl Strategy<Value = ConvState> {
+        prop_oneof![
+            arb_completed_state(),
+            arb_failed_state(),
+            arb_context_exhausted_state(),
+            Just(ConvState::Terminal),
+        ]
+    }
+
+    fn subagent_context() -> ConvContext {
+        ConvContext::sub_agent("test-sub", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    // ====================================================================
+    // Property 1: Terminal state absorption
+    //
+    // Once a conversation reaches a terminal state, no event can change
+    // the state variant. Events either return Err (rejected) or Ok with
+    // the same variant.
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn prop_terminal_state_absorption(
+            state in arb_any_terminal_state(),
+            events in proptest::collection::vec(arb_event(), 20..30),
+        ) {
+            let ctx = test_context();
+            let variant = state.variant_name();
+
+            for event in events {
+                match transition(&state, &ctx, event) {
+                    Ok(result) => {
+                        prop_assert_eq!(
+                            result.new_state.variant_name(),
+                            variant,
+                            "Terminal state {} changed variant to {}",
+                            variant,
+                            result.new_state.variant_name(),
+                        );
+                    }
+                    Err(_) => { /* Rejection is fine */ }
+                }
+            }
+        }
+    }
+
+    // ====================================================================
+    // Property 2: Sub-agent NotifyParent conservation
+    //
+    // Any transition where context.is_sub_agent == true that reaches
+    // Completed or Failed must include Effect::NotifyParent.
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn prop_subagent_notify_parent_on_terminal(
+            state in arb_state(),
+            event in arb_event(),
+        ) {
+            let ctx = subagent_context();
+            if let Ok(result) = transition(&state, &ctx, event) {
+                let reached_terminal = matches!(
+                    result.new_state,
+                    ConvState::Completed { .. } | ConvState::Failed { .. }
+                );
+                if reached_terminal {
+                    prop_assert!(
+                        result.effects.iter().any(|e| matches!(e, Effect::NotifyParent { .. })),
+                        "Sub-agent reached {:?} without NotifyParent effect. Effects: {:?}",
+                        result.new_state.variant_name(),
+                        result.effects,
+                    );
+                }
+            }
+        }
+    }
+
+    // ====================================================================
+    // Property 3: Effect ordering -- PersistState before I/O effects
+    //
+    // If a transition produces both PersistState and RequestLlm (or
+    // ExecuteTool), PersistState must appear first. This ensures the
+    // state is durable before the side-effect fires.
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn prop_persist_state_before_io_effects(
+            state in arb_state(),
+            event in arb_event(),
+        ) {
+            if let Ok(result) = transition(&state, &test_context(), event) {
+                let persist_pos = result.effects.iter().position(|e| matches!(e, Effect::PersistState));
+                let request_llm_pos = result.effects.iter().position(|e| matches!(e, Effect::RequestLlm));
+                let execute_tool_pos = result.effects.iter().position(|e| matches!(e, Effect::ExecuteTool { .. }));
+
+                if let (Some(p), Some(r)) = (persist_pos, request_llm_pos) {
+                    prop_assert!(
+                        p < r,
+                        "PersistState (pos {}) must come before RequestLlm (pos {}). Effects: {:?}",
+                        p, r, result.effects,
+                    );
+                }
+
+                if let (Some(p), Some(e)) = (persist_pos, execute_tool_pos) {
+                    prop_assert!(
+                        p < e,
+                        "PersistState (pos {}) must come before ExecuteTool (pos {}). Effects: {:?}",
+                        p, e, result.effects,
+                    );
+                }
+            }
+        }
+    }
+
+    // ====================================================================
+    // Property 4: TaskResolved only from Idle
+    //
+    // Non-Idle, non-Terminal states must not successfully transition to
+    // Terminal via TaskResolved.
+    // ====================================================================
+
+    fn arb_non_idle_non_terminal_state() -> impl Strategy<Value = ConvState> {
+        arb_state().prop_filter("must be non-Idle and non-Terminal", |s| {
+            !matches!(s, ConvState::Idle | ConvState::Terminal)
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn prop_task_resolved_only_from_idle(
+            state in arb_non_idle_non_terminal_state(),
+        ) {
+            let event = Event::TaskResolved {
+                system_message: "completed".to_string(),
+                repo_root: "/tmp".to_string(),
+            };
+            let result = transition(&state, &test_context(), event);
+            match result {
+                Err(_) => { /* Rejected -- correct */ }
+                Ok(tr) => {
+                    prop_assert!(
+                        !matches!(tr.new_state, ConvState::Terminal),
+                        "TaskResolved from {} should not reach Terminal, but did",
+                        state.variant_name(),
+                    );
+                }
+            }
+        }
+    }
 }
