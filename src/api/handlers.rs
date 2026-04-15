@@ -96,6 +96,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Task abandon (REQ-PROJ-010)
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
+        // Mark as merged (REQ-PROJ-026)
+        .route("/api/conversations/:id/mark-merged", post(mark_merged))
         // Lifecycle (REQ-API-006)
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route(
@@ -2321,14 +2323,15 @@ fn check_task_file_status(worktree_path: &std::path::Path, task_id: &str) -> boo
     }
 }
 
-/// Abandon a Work-mode task: delete worktree/branch, mark task file wont-do, go Terminal.
+/// Abandon a Work or Branch conversation: delete worktree, optionally delete branch,
+/// capture diff snapshot, transition to Terminal.
 /// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
 #[allow(clippy::too_many_lines)]
 async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    // 1. Validate conversation exists, is Work mode, Idle state, project-scoped
+    // 1. Validate conversation exists, is Work or Branch mode, Idle state, project-scoped
     let conv = state
         .runtime
         .db()
@@ -2342,7 +2345,8 @@ async fn abandon_task(
         ));
     }
 
-    let (branch_name, worktree_path, base_branch, task_id) = match &conv.conv_mode {
+    // Accept both Work and Branch mode
+    let (branch_name, worktree_path, base_branch, task_id, is_work_mode) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
@@ -2354,10 +2358,23 @@ async fn abandon_task(
             worktree_path.clone(),
             base_branch.clone(),
             task_id.clone(),
+            true,
+        ),
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            base_branch,
+            ..
+        } => (
+            branch_name.clone(),
+            worktree_path.clone(),
+            base_branch.clone(),
+            String::new(), // Branch mode has no task
+            false,
         ),
         _ => {
             return Err(AppError::BadRequest(
-                "Conversation is not in Work mode".to_string(),
+                "Conversation must be in Work or Branch mode to abandon".to_string(),
             ));
         }
     };
@@ -2458,13 +2475,13 @@ async fn abandon_task(
         None
     };
 
-    // 2c. Delete worktree/branch + best-effort task file update (blocking)
-    // If desired_base_branch was set, the task file was committed in the worktree
-    // (not the main checkout), so skip the checkout + rename on main.
-    let was_off_head = conv.desired_base_branch.is_some();
+    // 2c. Delete worktree + conditionally delete branch (blocking)
+    // Work mode: delete worktree AND branch (Phoenix-created), skip task file update
+    //   (the branch is being deleted, so any task file committed there goes with it).
+    // Branch mode: delete worktree only, keep user's branch, no task file.
     let repo_root_clone = repo_root.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        // Phase 1: worktree cleanup (BEFORE mutex -- these don't touch the main checkout)
+        // Worktree cleanup
         let worktree_dir = PathBuf::from(&worktree_path);
         if let Err(e) = run_git(
             &repo_root_clone,
@@ -2479,111 +2496,29 @@ async fn abandon_task(
             let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
         }
 
-        if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
-            tracing::warn!(
-                error = %e,
-                branch = %branch_name,
-                "Failed to delete branch (non-fatal)"
-            );
-        }
-
-        // Phase 2: best-effort task file update (UNDER mutex)
-        // This is bookkeeping -- nothing here should block the abandon.
-        // Skip entirely for off-HEAD conversations: the task file was committed
-        // in the worktree (now deleted), not on the main checkout.
-        if was_off_head {
-            tracing::info!(
-                task_id = %task_id,
-                "Off-HEAD conversation -- skipping task file rename (file was in worktree)"
-            );
-            return Ok(());
-        }
-
-        let _guard = TASK_APPROVAL_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Check main checkout is clean enough to do git operations
-        let main_clean = match run_git(&repo_root_clone, &["status", "--porcelain"]) {
-            Ok(status) => status.is_empty(),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to check main checkout status");
-                false
-            }
-        };
-
-        if main_clean {
-            // Checkout base branch so task file rename happens on the right branch
-            if let Err(e) = run_git(&repo_root_clone, &["checkout", &base_branch]) {
+        // Work mode: delete the managed branch.
+        // Branch mode: keep the user's branch.
+        if is_work_mode {
+            if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
                 tracing::warn!(
                     error = %e,
-                    branch = %base_branch,
-                    "Failed to checkout base branch -- skipping task file update"
+                    branch = %branch_name,
+                    "Failed to delete branch (non-fatal)"
                 );
-            } else {
-                // Scan tasks/ for matching task file and rename to wont-do
-                let tasks_dir = repo_root_clone.join("tasks");
-                match taskmd_core::tasks::find_task_by_id(&tasks_dir, &task_id) {
-                    Some(task) => {
-                        let old_filename = task
-                            .path
-                            .file_name()
-                            .expect("task path has filename")
-                            .to_string_lossy()
-                            .to_string();
-                        let new_filename = taskmd_core::filename::format_filename(
-                            &task.id,
-                            &task.priority,
-                            "wont-do",
-                            &task.slug,
-                        );
-
-                        // Update frontmatter status in-place before renaming
-                        if let Ok(content) = std::fs::read_to_string(&task.path) {
-                            let updated =
-                                taskmd_core::tasks::update_status_in_content(&content, "wont-do");
-                            if let Err(e) = std::fs::write(&task.path, updated) {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Failed to update task frontmatter (non-fatal)"
-                                );
-                            }
-                        }
-
-                        // Use git mv so the rename is tracked
-                        let old_path = format!("tasks/{old_filename}");
-                        let new_path = format!("tasks/{new_filename}");
-
-                        if let Err(e) = run_git(&repo_root_clone, &["mv", &old_path, &new_path]) {
-                            tracing::warn!(
-                                error = %e,
-                                old = %old_path,
-                                new = %new_path,
-                                "Failed to git mv task file (non-fatal)"
-                            );
-                        } else if let Err(e) = run_git(
-                            &repo_root_clone,
-                            &["commit", "-m", &format!("task {task_id}: mark wont-do")],
-                        ) {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to commit task file rename (non-fatal)"
-                            );
-                            let _ = run_git(&repo_root_clone, &["reset", "HEAD"]);
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            task_id = task_id,
-                            "No task file found for task number (may have been manually deleted)"
-                        );
-                    }
-                }
             }
         } else {
-            tracing::warn!(
+            tracing::info!(
+                branch = %branch_name,
+                "Branch mode abandon: keeping user's branch"
+            );
+        }
+
+        // Skip task file update entirely. For Work mode the branch (and its task file)
+        // is deleted above. For Branch mode there is no task file.
+        if !task_id.is_empty() {
+            tracing::info!(
                 task_id = %task_id,
-                "Main checkout has uncommitted changes -- skipping task file update"
+                "Skipping task file update -- branch deleted, task file goes with it"
             );
         }
 
@@ -2603,12 +2538,149 @@ async fn abandon_task(
 
     // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
     let repo_root_str = repo_root.display().to_string();
+    let mode_label = if is_work_mode { "Work" } else { "Branch" };
+    let system_message = if is_work_mode {
+        "Task abandoned. Worktree and branch deleted.".to_string()
+    } else {
+        "Abandoned. Worktree removed, branch kept.".to_string()
+    };
+    tracing::info!(
+        conversation_id = %id,
+        mode = mode_label,
+        "Abandon complete"
+    );
     state
         .runtime
         .send_event(
             &id,
             Event::TaskResolved {
-                system_message: "Task abandoned. Worktree and branch deleted.".to_string(),
+                system_message,
+                repo_root: repo_root_str,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Mark as Merged (REQ-PROJ-026)
+// ============================================================
+
+/// Mark a Work or Branch conversation as merged: delete worktree, optionally delete branch,
+/// transition to Terminal. The user has already merged/PR'd the branch externally.
+async fn mark_merged(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // 1. Validate conversation exists, is Work or Branch mode, Idle state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to mark as merged".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.clone(), worktree_path.clone(), true),
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.clone(), worktree_path.clone(), false),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation must be in Work or Branch mode to mark as merged".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+    let repo_root_str = repo_root.display().to_string();
+
+    // 2. Delete worktree + conditionally delete branch (blocking)
+    let repo_root_clone = repo_root.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // Remove worktree
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(
+            &repo_root_clone,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal), trying filesystem fallback"
+            );
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
+        }
+
+        // Work mode (Managed): delete the task branch — it was created by Phoenix.
+        // Branch mode: keep the branch — it's the user's PR branch.
+        if is_work_mode {
+            if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
+                tracing::warn!(
+                    error = %e,
+                    branch = %branch_name,
+                    "Failed to delete managed branch (non-fatal)"
+                );
+            }
+        } else {
+            tracing::info!(
+                branch = %branch_name,
+                "Branch mode: keeping user's branch after mark-merged"
+            );
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+
+    // 3. Route through state machine -> Terminal
+    let mode_label = if is_work_mode { "Work" } else { "Branch" };
+    let system_message = format!(
+        "Marked as merged. Worktree removed{}.",
+        if is_work_mode {
+            ", task branch deleted"
+        } else {
+            ""
+        }
+    );
+    tracing::info!(
+        conversation_id = %id,
+        mode = mode_label,
+        "Mark-merged complete"
+    );
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskResolved {
+                system_message,
                 repo_root: repo_root_str,
             },
         )

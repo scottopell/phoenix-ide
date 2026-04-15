@@ -584,6 +584,12 @@ export const api = {
     return resp.json();
   },
 
+  async markMerged(conversationId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/mark-merged`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to mark as merged'); }
+    return resp.json();
+  },
+
   async approveTask(convId: string): Promise<{ success: boolean; first_task?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/approve-task`, { method: 'POST' });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to approve task'); }
