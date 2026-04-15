@@ -51,11 +51,6 @@ pub enum CredentialStatus {
 }
 
 /// Manages the lifecycle of an interactive shell credential helper.
-/// Duration to wait for a non-interactive helper to return before giving up.
-/// If the helper needs OIDC interaction, it will hang past this timeout and
-/// the UI credential panel takes over.
-const AUTO_TRIGGER_TIMEOUT: Duration = Duration::from_secs(3);
-
 pub struct CredentialHelper {
     command: String,
     ttl: Duration,
@@ -338,8 +333,10 @@ impl CredentialHelper {
 
 #[async_trait::async_trait]
 impl CredentialSource for CredentialHelper {
+    /// Returns the cached credential if valid, or `None` immediately.
+    /// Auto-triggers the helper subprocess if idle/failed (fire-and-forget).
+    /// Never blocks -- the state machine handles waiting via `AwaitingRecovery`.
     async fn get(&self) -> Option<String> {
-        // Fast path: return cached credential if still valid.
         {
             let mut inner = self.inner.lock().await;
             match &*inner {
@@ -350,31 +347,18 @@ impl CredentialSource for CredentialHelper {
                     if Instant::now() < *expires_at {
                         return Some(credential.clone());
                     }
-                    // Expired — fall through to auto-trigger.
                     *inner = HelperInner::Idle;
+                    // Fall through to auto-trigger.
                 }
                 HelperInner::Running { .. } => {
-                    // Already running (e.g. triggered by UI panel) — wait briefly for result.
-                    drop(inner);
-                    if tokio::time::timeout(AUTO_TRIGGER_TIMEOUT, self.settled.notified())
-                        .await
-                        .is_ok()
-                    {
-                        let inner = self.inner.lock().await;
-                        if let HelperInner::Valid { credential, .. } = &*inner {
-                            return Some(credential.clone());
-                        }
-                    }
+                    // Already running -- return None, caller checks is_recovering().
                     return None;
                 }
                 HelperInner::Idle | HelperInner::Failed { .. } => {}
             }
         }
 
-        // Auto-trigger: spawn the helper and wait up to AUTO_TRIGGER_TIMEOUT.
-        // If the helper returns quickly (cached token), the LLM request succeeds
-        // without UI interaction. If it hangs (OIDC), timeout fires and the UI
-        // credential panel takes over.
+        // Auto-trigger: spawn the helper (fire-and-forget, no waiting).
         if let Some(weak) = self.self_ref.get() {
             if let Some(arc_self) = weak.upgrade() {
                 let mut inner = self.inner.lock().await;
@@ -385,21 +369,16 @@ impl CredentialSource for CredentialHelper {
                     };
                     drop(inner);
                     Self::spawn_helper_task(arc_self);
-
-                    if tokio::time::timeout(AUTO_TRIGGER_TIMEOUT, self.settled.notified())
-                        .await
-                        .is_ok()
-                    {
-                        let inner = self.inner.lock().await;
-                        if let HelperInner::Valid { credential, .. } = &*inner {
-                            return Some(credential.clone());
-                        }
-                    }
                 }
             }
         }
 
         None
+    }
+
+    /// Returns true when the helper subprocess is actively running.
+    async fn is_recovering(&self) -> bool {
+        matches!(&*self.inner.lock().await, HelperInner::Running { .. })
     }
 
     async fn invalidate(&self) -> bool {

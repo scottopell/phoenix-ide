@@ -25,8 +25,16 @@ pub enum GatewayStatus {
 /// Implementations range from static strings to cached command execution.
 #[async_trait::async_trait]
 pub trait CredentialSource: Send + Sync + std::fmt::Debug {
-    /// Fetch the current credential, possibly re-executing or re-reading.
+    /// Fetch the current credential if available. Returns immediately (non-blocking).
+    /// Returns `None` if the credential is not yet available (helper still running,
+    /// no credential configured, etc.).
     async fn get(&self) -> Option<String>;
+    /// Whether a recovery mechanism is actively running to obtain the credential.
+    /// When `get()` returns `None` and this returns `true`, the caller should wait
+    /// rather than treat it as a terminal failure.
+    async fn is_recovering(&self) -> bool {
+        false
+    }
     /// Invalidate any cached value (e.g. after a 401).
     /// Returns `true` if there was a cached value to invalidate (i.e. a retry is worthwhile).
     async fn invalidate(&self) -> bool;
@@ -82,13 +90,16 @@ impl LlmAuth {
 
     /// Resolve the credential for use in request headers.
     pub async fn resolve(&self) -> Result<ResolvedAuth, super::LlmError> {
-        let credential = self.source.get().await.ok_or_else(|| {
-            super::LlmError::auth("Credential unavailable — check API key or LLM_API_KEY_HELPER")
-        })?;
-        Ok(ResolvedAuth {
-            credential,
-            style: self.style,
-        })
+        if let Some(credential) = self.source.get().await {
+            return Ok(ResolvedAuth {
+                credential,
+                style: self.style,
+            });
+        }
+        let mut err =
+            super::LlmError::auth("Credential unavailable — check API key or LLM_API_KEY_HELPER");
+        err.recovery_in_progress = self.source.is_recovering().await;
+        Err(err)
     }
 
     /// Invalidate any cached credential (e.g. after a 401).

@@ -18,7 +18,7 @@
 --   - Token streaming mechanics
 --   - System prompt construction
 --
--- Requirement traceability: REQ-BED-001 through REQ-BED-029
+-- Requirement traceability: REQ-BED-001 through REQ-BED-030
 -- (3 deprecated: REQ-BED-014, REQ-BED-015, REQ-BED-016)
 
 ------------------------------------------------------------
@@ -81,6 +81,10 @@ enum ErrorClass { retryable | non_retryable }
 
 enum SubAgentOutcome { success | failure | timed_out }
 
+-- Active recovery mechanism in flight. Used by AwaitingRecovery state
+-- to determine what the conversation is waiting for.
+enum RecoveryKind { credential }
+
 enum TaskApprovalDecision { approved | rejected | feedback_provided }
 
 ------------------------------------------------------------
@@ -104,9 +108,9 @@ entity Conversation {
     -- Lifecycle status
     status: idle | llm_requesting | executing_tools
            | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
-           | error | awaiting_continuation | awaiting_task_approval
-           | awaiting_user_response | context_exhausted | terminal
-           | completed | failed
+           | error | awaiting_recovery | awaiting_continuation
+           | awaiting_task_approval | awaiting_user_response
+           | context_exhausted | terminal | completed | failed
 
     -- Mode (orthogonal to status, persists across status transitions)
     mode: explore | direct | work
@@ -155,6 +159,12 @@ entity Conversation {
         -- Error recovery (REQ-BED-006)
         -- (error -> llm_requesting declared above)
 
+        -- Active recovery (REQ-BED-030)
+        llm_requesting -> awaiting_recovery
+        awaiting_recovery -> llm_requesting
+        awaiting_recovery -> error
+        awaiting_recovery -> idle
+
         -- Context continuation (REQ-BED-019)
         idle -> awaiting_continuation
         awaiting_continuation -> context_exhausted
@@ -177,6 +187,7 @@ entity Conversation {
         awaiting_continuation -> failed
         awaiting_task_approval -> failed
         awaiting_user_response -> failed
+        awaiting_recovery -> failed
         error -> failed
 
         -- Task resolution (REQ-BED-029)
@@ -226,9 +237,12 @@ entity Conversation {
     -- Continuation tracking (REQ-BED-019)
     rejected_tool_calls: List<ToolCall> when status = awaiting_continuation
 
-    -- Error info (REQ-BED-006)
-    error_message: String when status = error
+    -- Error info (REQ-BED-006, REQ-BED-030)
+    error_message: String when status in { error, awaiting_recovery }
     error_class: ErrorClass when status = error
+
+    -- Active recovery (REQ-BED-030)
+    recovery_kind: RecoveryKind when status = awaiting_recovery
 
     -- Context exhaustion (REQ-BED-021)
     continuation_summary: String when status = context_exhausted
@@ -258,7 +272,7 @@ entity Conversation {
     -- ----------------------------------------------------------------
     is_busy: status in { llm_requesting, executing_tools,
                          awaiting_sub_agents, cancelling_tool,
-                         cancelling_sub_agents }
+                         cancelling_sub_agents, awaiting_recovery }
     is_terminal: status in { context_exhausted, terminal, completed, failed }
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
@@ -287,6 +301,11 @@ entity Conversation {
     }
     invariant FailedIsSubAgentOnly {
         status = failed implies is_sub_agent
+    }
+
+    -- REQ-BED-030: Sub-agents fail fast on auth errors, never wait for recovery
+    invariant NoRecoveryForSubAgents {
+        is_sub_agent implies status != awaiting_recovery
     }
 }
 
@@ -848,6 +867,100 @@ rule RetryTimeoutFires {
 }
 
 -- ===========================================================
+-- 5b. ACTIVE RECOVERY (REQ-BED-030)
+-- ===========================================================
+
+-- REQ-BED-030: Auth error with credential helper running → await recovery
+-- instead of transitioning to error. The helper is actively solving the
+-- problem; going to error would unmount the UI that shows auth instructions.
+rule AuthErrorWithActiveRecovery {
+    when: LlmErrors(conversation, message, error_class, attempt)
+
+    requires: conversation.status = llm_requesting
+    requires: not conversation.is_sub_agent
+    requires: error_class = non_retryable
+    requires: error_kind = auth
+    requires: CredentialHelperIsRunning
+
+    ensures: conversation.status = awaiting_recovery
+    ensures: conversation.recovery_kind = credential
+    ensures: conversation.error_message = message
+
+    @guidance
+        -- This rule MUST be checked before LlmErrorNonRecoverable.
+        -- Both match on (llm_requesting, non_retryable), but this one
+        -- has two additional preconditions: error_kind is auth AND the
+        -- credential helper is running. A ContentFilter or InvalidRequest
+        -- error should go to Error even if a helper happens to be running.
+        --
+        -- In the code, error_kind maps to ErrorKind::Auth. The
+        -- credential_helper_running flag is enriched on the LlmOutcome
+        -- by the executor (keeps the transition function pure).
+        --
+        -- The conversation stays in awaiting_recovery until one of:
+        --   1. CredentialBecameAvailable fires -> retry (RecoverySucceeded)
+        --   2. CredentialHelperFailed fires -> error (RecoveryFailed)
+        --   3. User cancels -> idle (CancelDuringRecovery)
+}
+
+-- Cross-spec event: credential helper succeeded while a conversation
+-- was waiting for recovery. Retry the LLM request.
+rule RecoverySucceeded {
+    when: CredentialBecameAvailable
+
+    requires: conversation.status = awaiting_recovery
+    requires: conversation.recovery_kind = credential
+
+    ensures: conversation.status = llm_requesting
+    ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- CredentialBecameAvailable is emitted by the credential-helper spec's
+        -- HelperSucceeded rule. It is a broadcast event: ALL conversations
+        -- in awaiting_recovery with recovery_kind=credential should retry.
+        --
+        -- The executor re-dispatches the same LLM request that originally
+        -- failed. The credential helper now has a valid cached credential,
+        -- so resolve() will succeed on this attempt.
+}
+
+-- Cross-spec event: credential helper failed or timed out while a
+-- conversation was waiting for recovery. Fall through to error.
+rule RecoveryFailed {
+    when: CredentialHelperTerminatedWithoutCredential
+
+    requires: conversation.status = awaiting_recovery
+    requires: conversation.recovery_kind = credential
+
+    ensures: conversation.status = error
+    -- error_message was already set by AuthErrorWithActiveRecovery
+
+    @guidance
+        -- CredentialHelperTerminatedWithoutCredential is emitted by the
+        -- credential-helper spec's HelperFailed rule. This is a broadcast
+        -- event: ALL conversations in awaiting_recovery with
+        -- recovery_kind=credential transition to error.
+        --
+        -- The error_message was already set by AuthErrorWithActiveRecovery
+        -- and persists through the state change. The conversation is now
+        -- genuinely terminal (no recovery mechanism in flight).
+}
+
+-- User cancels during recovery → idle (same as cancel during other waits)
+rule CancelDuringRecovery {
+    when: UserCancels(conversation)
+
+    requires: conversation.status = awaiting_recovery
+
+    ensures: conversation.status = idle
+
+    @guidance
+        -- User can always escape awaiting_recovery by cancelling.
+        -- The credential helper continues running (it's a global resource,
+        -- not conversation-scoped), but this conversation stops waiting.
+}
+
+-- ===========================================================
 -- 6. SUB-AGENT LIFECYCLE (REQ-BED-008, 009, 018, 024, 026)
 -- ===========================================================
 
@@ -1243,7 +1356,8 @@ surface UserConversation {
         conversation.context_warning
         conversation.proposal when conversation.status = awaiting_task_approval
         conversation.pending_questions when conversation.status = awaiting_user_response
-        conversation.error_message when conversation.status = error
+        conversation.error_message when conversation.status in { error, awaiting_recovery }
+        conversation.recovery_kind when conversation.status = awaiting_recovery
         conversation.continuation_summary when conversation.status = context_exhausted
 
     provides:

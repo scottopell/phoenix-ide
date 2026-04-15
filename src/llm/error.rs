@@ -8,6 +8,10 @@ use thiserror::Error;
 pub struct LlmError {
     pub kind: LlmErrorKind,
     pub message: String,
+    /// When true, a recovery mechanism (e.g. credential helper) is actively
+    /// running and may resolve this error. The state machine should wait
+    /// rather than treat it as terminal.
+    pub recovery_in_progress: bool,
 }
 
 impl LlmError {
@@ -15,6 +19,7 @@ impl LlmError {
         Self {
             kind,
             message: message.into(),
+            recovery_in_progress: false,
         }
     }
 
