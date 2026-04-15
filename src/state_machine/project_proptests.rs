@@ -302,12 +302,11 @@ mod tests {
 
 #[cfg(test)]
 mod state_machine_props {
-    use crate::db::ErrorKind;
     use crate::state_machine::effect::Effect;
     use crate::state_machine::event::Event;
     use crate::state_machine::proptests::{arb_error_kind, arb_event, arb_state, test_context};
     use crate::state_machine::state::{ConvContext, ConvState};
-    use crate::state_machine::transition::{transition, TransitionError};
+    use crate::state_machine::transition::transition;
     use proptest::prelude::*;
     use std::path::PathBuf;
 
@@ -359,17 +358,14 @@ mod state_machine_props {
             let variant = state.variant_name();
 
             for event in events {
-                match transition(&state, &ctx, event) {
-                    Ok(result) => {
-                        prop_assert_eq!(
-                            result.new_state.variant_name(),
-                            variant,
-                            "Terminal state {} changed variant to {}",
-                            variant,
-                            result.new_state.variant_name(),
-                        );
-                    }
-                    Err(_) => { /* Rejection is fine */ }
+                if let Ok(result) = transition(&state, &ctx, event) {
+                    prop_assert_eq!(
+                        result.new_state.variant_name(),
+                        variant,
+                        "Terminal state {} changed variant to {}",
+                        variant,
+                        result.new_state.variant_name(),
+                    );
                 }
             }
         }
@@ -476,6 +472,457 @@ mod state_machine_props {
                         state.variant_name(),
                     );
                 }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// State-coherent random walk property tests
+// ============================================================================
+
+#[cfg(test)]
+mod random_walk {
+    use crate::db::{ErrorKind, ToolResult};
+    use crate::llm::{ContentBlock, Usage};
+    use crate::state_machine::effect::Effect;
+    use crate::state_machine::event::Event;
+    use crate::state_machine::proptests::{effects_are_valid, is_valid_state, test_context};
+    use crate::state_machine::state::{
+        ConvContext, ConvState, SubAgentOutcome, TaskApprovalOutcome, ToolCall, ToolInput,
+    };
+    use crate::state_machine::transition::transition;
+    use proptest::prelude::*;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // ====================================================================
+    // State-aware event generator
+    // ====================================================================
+
+    fn random_string(rng: &mut impl Rng, len: usize) -> String {
+        (0..len)
+            .map(|_| (b'a' + rng.gen_range(0..26)) as char)
+            .collect()
+    }
+
+    fn random_id(rng: &mut impl Rng) -> String {
+        random_string(rng, 8)
+    }
+
+    fn random_tool_call(rng: &mut impl Rng) -> ToolCall {
+        let id = random_id(rng);
+        ToolCall::new(
+            id,
+            ToolInput::Think(crate::state_machine::state::ThinkInput {
+                thoughts: random_string(rng, 10),
+            }),
+        )
+    }
+
+    fn random_error_kind(rng: &mut impl Rng) -> ErrorKind {
+        match rng.gen_range(0..6) {
+            0 => ErrorKind::Network,
+            1 => ErrorKind::RateLimit,
+            2 => ErrorKind::ServerError,
+            3 => ErrorKind::Auth,
+            4 => ErrorKind::InvalidRequest,
+            _ => ErrorKind::ContentFilter,
+        }
+    }
+
+    /// Generate an event that the transition function will accept for the current state.
+    /// This reads the transition match arms to produce events that won't hit the catch-all.
+    #[allow(clippy::too_many_lines)]
+    fn generate_valid_event(state: &ConvState, rng: &mut impl Rng) -> Event {
+        match state {
+            ConvState::Idle => match rng.gen_range(0..3) {
+                0 => Event::UserMessage {
+                    text: random_string(rng, 10),
+                    llm_text: None,
+                    images: vec![],
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                1 => Event::TaskResolved {
+                    system_message: random_string(rng, 15),
+                    repo_root: "/tmp".to_string(),
+                },
+                _ => Event::UserTriggerContinuation,
+            },
+
+            ConvState::LlmRequesting { attempt } => {
+                match rng.gen_range(0..4) {
+                    0 => {
+                        // LlmResponse: text-only or with tool calls
+                        let num_tools = rng.gen_range(0..3);
+                        let mut tool_calls: Vec<ToolCall> = Vec::new();
+                        let mut content = vec![ContentBlock::text("response")];
+                        for _ in 0..num_tools {
+                            let tc = random_tool_call(rng);
+                            content.push(ContentBlock::ToolUse {
+                                id: tc.id.clone(),
+                                name: tc.name().to_string(),
+                                input: serde_json::json!({}),
+                            });
+                            tool_calls.push(tc);
+                        }
+                        Event::LlmResponse {
+                            content,
+                            tool_calls,
+                            end_turn: true,
+                            usage: Usage::default(),
+                        }
+                    }
+                    1 => {
+                        // LlmError with random retryable/non-retryable
+                        let error_kind = random_error_kind(rng);
+                        let recovery = rng.gen_bool(0.2) && matches!(error_kind, ErrorKind::Auth);
+                        Event::LlmError {
+                            message: random_string(rng, 15),
+                            error_kind,
+                            attempt: *attempt,
+                            recovery_in_progress: recovery,
+                        }
+                    }
+                    2 => Event::UserCancel { reason: None },
+                    _ => {
+                        // RetryTimeout matching the current attempt
+                        Event::RetryTimeout { attempt: *attempt }
+                    }
+                }
+            }
+
+            ConvState::ToolExecuting { current_tool, .. } => {
+                match rng.gen_range(0..2) {
+                    0 => {
+                        // ToolComplete with matching ID
+                        Event::ToolComplete {
+                            tool_use_id: current_tool.id.clone(),
+                            result: ToolResult::success(
+                                current_tool.id.clone(),
+                                random_string(rng, 20),
+                            ),
+                        }
+                    }
+                    _ => Event::UserCancel { reason: None },
+                }
+            }
+
+            ConvState::CancellingTool {
+                tool_use_id,
+                pending_sub_agents,
+                ..
+            } => {
+                // Also consider SubAgentResult if there are pending sub-agents
+                let options = if pending_sub_agents.is_empty() { 2 } else { 3 };
+                match rng.gen_range(0..options) {
+                    0 => Event::ToolAborted {
+                        tool_use_id: tool_use_id.clone(),
+                    },
+                    1 => Event::ToolComplete {
+                        tool_use_id: tool_use_id.clone(),
+                        result: ToolResult::success(tool_use_id.clone(), random_string(rng, 10)),
+                    },
+                    _ => {
+                        // SubAgentResult for a pending agent
+                        let agent = &pending_sub_agents[rng.gen_range(0..pending_sub_agents.len())];
+                        Event::SubAgentResult {
+                            agent_id: agent.agent_id.clone(),
+                            outcome: SubAgentOutcome::Success {
+                                result: random_string(rng, 10),
+                            },
+                        }
+                    }
+                }
+            }
+
+            ConvState::AwaitingSubAgents { pending, .. } => {
+                if pending.is_empty() {
+                    // Shouldn't happen, but be defensive
+                    return Event::UserCancel { reason: None };
+                }
+                match rng.gen_range(0..2) {
+                    0 => {
+                        let agent = &pending[rng.gen_range(0..pending.len())];
+                        let outcome = if rng.gen_bool(0.7) {
+                            SubAgentOutcome::Success {
+                                result: random_string(rng, 15),
+                            }
+                        } else {
+                            SubAgentOutcome::Failure {
+                                error: random_string(rng, 15),
+                                error_kind: ErrorKind::SubAgentError,
+                            }
+                        };
+                        Event::SubAgentResult {
+                            agent_id: agent.agent_id.clone(),
+                            outcome,
+                        }
+                    }
+                    _ => Event::UserCancel { reason: None },
+                }
+            }
+
+            ConvState::CancellingSubAgents { pending, .. } => {
+                if pending.is_empty() {
+                    // Shouldn't happen, but defensive
+                    return Event::UserCancel { reason: None };
+                }
+                let agent = &pending[rng.gen_range(0..pending.len())];
+                Event::SubAgentResult {
+                    agent_id: agent.agent_id.clone(),
+                    outcome: SubAgentOutcome::Failure {
+                        error: "cancelled".to_string(),
+                        error_kind: ErrorKind::Cancelled,
+                    },
+                }
+            }
+
+            ConvState::Error { .. } => Event::UserMessage {
+                text: random_string(rng, 10),
+                llm_text: None,
+                images: vec![],
+                message_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+
+            ConvState::AwaitingRecovery { .. } => match rng.gen_range(0..3) {
+                0 => Event::CredentialBecameAvailable,
+                1 => Event::CredentialHelperFailed {
+                    message: random_string(rng, 15),
+                },
+                _ => Event::UserCancel { reason: None },
+            },
+
+            ConvState::AwaitingContinuation { attempt, .. } => match rng.gen_range(0..4) {
+                0 => Event::ContinuationResponse {
+                    summary: random_string(rng, 30),
+                },
+                1 => Event::ContinuationFailed {
+                    error: random_string(rng, 15),
+                },
+                2 => {
+                    let error_kind = random_error_kind(rng);
+                    Event::LlmError {
+                        message: random_string(rng, 15),
+                        error_kind,
+                        attempt: *attempt,
+                        recovery_in_progress: false,
+                    }
+                }
+                _ => Event::UserCancel { reason: None },
+            },
+
+            ConvState::AwaitingTaskApproval { .. } => match rng.gen_range(0..4) {
+                0 => Event::TaskApprovalResponse {
+                    outcome: TaskApprovalOutcome::Approved,
+                },
+                1 => Event::TaskApprovalResponse {
+                    outcome: TaskApprovalOutcome::Rejected,
+                },
+                2 => Event::TaskApprovalResponse {
+                    outcome: TaskApprovalOutcome::FeedbackProvided {
+                        annotations: random_string(rng, 20),
+                    },
+                },
+                _ => Event::UserCancel { reason: None },
+            },
+
+            ConvState::AwaitingUserResponse { questions, .. } => {
+                match rng.gen_range(0..2) {
+                    0 => {
+                        // Build answers matching the questions
+                        let answers: HashMap<String, String> = questions
+                            .iter()
+                            .map(|q| {
+                                let answer = if q.options.is_empty() {
+                                    random_string(rng, 5)
+                                } else {
+                                    q.options[rng.gen_range(0..q.options.len())].label.clone()
+                                };
+                                (q.question.clone(), answer)
+                            })
+                            .collect();
+                        Event::UserQuestionResponse {
+                            answers,
+                            annotations: None,
+                        }
+                    }
+                    _ => Event::UserCancel { reason: None },
+                }
+            }
+
+            // Terminal states -- events are absorbed, generate anything
+            ConvState::ContextExhausted { .. }
+            | ConvState::Terminal
+            | ConvState::Completed { .. }
+            | ConvState::Failed { .. } => Event::UserCancel { reason: None },
+        }
+    }
+
+    // ====================================================================
+    // Invariant checker
+    // ====================================================================
+
+    fn check_invariants(
+        old_state: &ConvState,
+        new_state: &ConvState,
+        effects: &[Effect],
+        context: &ConvContext,
+    ) {
+        // 1. Terminal absorption: if old_state was terminal, new_state must be same variant
+        if old_state.is_terminal() {
+            assert_eq!(
+                old_state.variant_name(),
+                new_state.variant_name(),
+                "Terminal state {} changed to {}",
+                old_state.variant_name(),
+                new_state.variant_name()
+            );
+        }
+
+        // 2. PersistState on variant change
+        //    Exception: ResolveTask effect handles its own persistence atomically
+        //    alongside mode and cwd updates (execute_resolve_task).
+        if old_state.variant_name() != new_state.variant_name() {
+            let has_persist = effects.iter().any(|e| matches!(e, Effect::PersistState));
+            let has_resolve_task = effects
+                .iter()
+                .any(|e| matches!(e, Effect::ResolveTask { .. }));
+            assert!(
+                has_persist || has_resolve_task,
+                "State changed from {} to {} without PersistState or ResolveTask. Effects: {:?}",
+                old_state.variant_name(),
+                new_state.variant_name(),
+                effects,
+            );
+        }
+
+        // 3. Effect ordering: PersistState before RequestLlm, PersistState before ExecuteTool
+        let persist_pos = effects
+            .iter()
+            .position(|e| matches!(e, Effect::PersistState));
+        let request_llm_pos = effects.iter().position(|e| matches!(e, Effect::RequestLlm));
+        let execute_tool_pos = effects
+            .iter()
+            .position(|e| matches!(e, Effect::ExecuteTool { .. }));
+
+        if let (Some(p), Some(r)) = (persist_pos, request_llm_pos) {
+            assert!(
+                p < r,
+                "PersistState (pos {p}) must come before RequestLlm (pos {r}). Effects: {effects:?}",
+            );
+        }
+        if let (Some(p), Some(e)) = (persist_pos, execute_tool_pos) {
+            assert!(
+                p < e,
+                "PersistState (pos {p}) must come before ExecuteTool (pos {e}). Effects: {effects:?}",
+            );
+        }
+
+        // 4. Sub-agent NotifyParent on terminal
+        if context.is_sub_agent
+            && matches!(
+                new_state,
+                ConvState::Completed { .. } | ConvState::Failed { .. }
+            )
+        {
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::NotifyParent { .. })),
+                "Sub-agent reached {} without NotifyParent. Effects: {:?}",
+                new_state.variant_name(),
+                effects,
+            );
+        }
+
+        // 5. Valid state (attempt range, no duplicate tool IDs)
+        assert!(
+            is_valid_state(new_state),
+            "Invalid state after transition: {new_state:?}",
+        );
+
+        // 6. Effects are valid for the new state
+        assert!(
+            effects_are_valid(effects, new_state),
+            "Invalid effects for state {new_state:?}: {effects:?}",
+        );
+
+        // 7. Tool count conservation in ToolExecuting
+        // (current + remaining + completed should be consistent across transitions)
+        // We check that ToolExecuting always has a non-empty current_tool
+        if let ConvState::ToolExecuting { current_tool, .. } = new_state {
+            assert!(
+                !current_tool.id.is_empty(),
+                "ToolExecuting has empty current_tool.id"
+            );
+        }
+    }
+
+    // ====================================================================
+    // The walks
+    // ====================================================================
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Random walk from Idle through the state machine.
+        /// Each step generates an event valid for the current state,
+        /// applies it, and checks invariants.
+        #[test]
+        fn prop_coherent_random_walk(seed in 0u64..u64::MAX) {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let ctx = test_context();
+            let mut state = ConvState::Idle;
+
+            for _step in 0..200 {
+                if state.is_terminal() {
+                    break;
+                }
+
+                let event = generate_valid_event(&state, &mut rng);
+                if let Ok(result) = transition(&state, &ctx, event) {
+                    check_invariants(&state, &result.new_state, &result.effects, &ctx);
+                    state = result.new_state;
+                }
+                // Err: generator might occasionally produce invalid events
+                // (e.g., RetryTimeout with wrong attempt, sub-agent-only paths).
+            }
+        }
+
+        /// Same walk but with is_sub_agent context.
+        /// Sub-agents hit Completed/Failed instead of Error on LLM failures,
+        /// and UserCancel produces Failed + NotifyParent.
+        #[test]
+        fn prop_coherent_random_walk_subagent(seed in 0u64..u64::MAX) {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let ctx = ConvContext::sub_agent(
+                "test-sub-walk",
+                PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+            );
+            let mut state = ConvState::Idle;
+
+            for _step in 0..200 {
+                if state.is_terminal() {
+                    break;
+                }
+
+                let event = generate_valid_event(&state, &mut rng);
+                if let Ok(result) = transition(&state, &ctx, event) {
+                    check_invariants(&state, &result.new_state, &result.effects, &ctx);
+                    state = result.new_state;
+                }
+                // Err: sub-agent context rejects some events that parent accepts
+                // (e.g., UserTriggerContinuation from Idle, TaskResolved).
             }
         }
     }

@@ -24,7 +24,7 @@ pub(crate) fn test_context() -> ConvContext {
 /// Build an `AssistantMessage` with `ToolUse` content blocks for the given tool IDs.
 /// Used in tests that construct `ToolExecuting`/`CancellingTool` states directly,
 /// where `CheckpointData::tool_round()` enforces `tool_use` count == `tool_result` count.
-fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage {
+pub(crate) fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage {
     let content_blocks: Vec<ContentBlock> = tool_ids
         .iter()
         .map(|id| ContentBlock::ToolUse {
@@ -373,7 +373,7 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
 // State Validity Checkers
 // ============================================================================
 
-fn is_valid_state(state: &ConvState) -> bool {
+pub(crate) fn is_valid_state(state: &ConvState) -> bool {
     match state {
         ConvState::ToolExecuting {
             current_tool,
@@ -394,7 +394,7 @@ fn is_valid_state(state: &ConvState) -> bool {
     }
 }
 
-fn effects_are_valid(effects: &[Effect], new_state: &ConvState) -> bool {
+pub(crate) fn effects_are_valid(effects: &[Effect], new_state: &ConvState) -> bool {
     // Check that ExecuteTool effects only appear in appropriate states
     let has_execute = effects
         .iter()
