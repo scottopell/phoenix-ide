@@ -2516,12 +2516,13 @@ fn search_remote_branches(
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Start with remote refs that match the query.
+    let remote_set: std::collections::HashSet<&str> = refs.iter().map(String::as_str).collect();
     let mut branches: Vec<GitBranchEntry> = refs
-        .into_iter()
+        .iter()
         .filter(|name| name.to_lowercase().contains(&query_lower))
         .map(|name| {
-            let local = local_set.contains(&name);
-            // Compute behind_remote for branches that exist locally.
+            let local = local_set.contains(name.as_str());
             let behind_remote = if local {
                 let remote_ref = format!("origin/{name}");
                 let range = format!("{name}..{remote_ref}");
@@ -2536,10 +2537,36 @@ fn search_remote_branches(
                 local,
                 remote: true,
                 behind_remote,
-                name,
+                name: name.clone(),
             }
         })
         .collect();
+
+    // Include local branches that match the query but aren't in ls-remote.
+    // This catches branches like "main" that may not appear in --heads output.
+    for local_name in &local_set {
+        if local_name.to_lowercase().contains(&query_lower)
+            && !remote_set.contains(local_name.as_str())
+        {
+            let remote_ref = format!("origin/{local_name}");
+            let has_remote = run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok();
+            let behind_remote = if has_remote {
+                let range = format!("{local_name}..{remote_ref}");
+                run_git(cwd, &["rev-list", "--count", &range])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&n| n > 0)
+            } else {
+                None
+            };
+            branches.push(GitBranchEntry {
+                local: true,
+                remote: has_remote,
+                behind_remote,
+                name: local_name.clone(),
+            });
+        }
+    }
 
     // Sort: exact match first, then prefix matches, then substring.
     // Within each tier, local branches first (you've used them), then alphabetical.
