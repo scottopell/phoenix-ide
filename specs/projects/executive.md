@@ -39,13 +39,13 @@ commits-behind indicator shows base branch advancement in the StateBar.
 | **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_plan tool |
-| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Task 08602 (M2). TaskApprovalReader + prose feedback |
+| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | 🔄 Needs Update | Approval becomes permission upgrade in existing worktree (REQ-PROJ-028) |
 | **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
-| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | Task 08602 (M2). taskmd-core integration |
+| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | 🔄 Needs Update | Task file committed on branch, not main (REQ-PROJ-027) |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | 🔄 Partial | Sub-agents work but missing: mode parameter (explore/work), model override, one-writer constraint, MCP access |
-| **REQ-PROJ-009:** Complete a Task (Squash Merge) | ✅ Complete | Task 08604 (M4). Auto-stash support added |
-| **REQ-PROJ-010:** Abandon a Task (Destructive Discard) | ✅ Complete | Task 08604 (M4). Worktree+branch deleted, task wont-do |
+| **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Deprecated | Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
+| **REQ-PROJ-010:** Abandon a Conversation | 🔄 Needs Update | Branch mode keeps branch on abandon; Managed deletes it |
 | **REQ-PROJ-011:** Passive Commits-Behind Indicator | ✅ Complete | Task 08604 (M4). StateBar badge |
 | **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
@@ -59,12 +59,18 @@ commits-behind indicator shows base branch advancement in the StateBar.
 | **REQ-PROJ-021:** Remote Branch Search (On-Demand) | 🔧 In Progress | `git ls-remote` with caching, substring search |
 | **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | 🔧 In Progress | Auto-fetch selected branch at worktree creation |
 | **REQ-PROJ-023:** Remote-Aware Commits-Behind Polling | 🔧 In Progress | Single-branch fetch in poller |
+| **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ❌ Not Started | New mode: worktree on existing branch, no task file, no Explore |
+| **REQ-PROJ-025:** One Active Work Conversation Per Branch | ❌ Not Started | Redirect/prompt when branch already has active conversation |
+| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | ❌ Not Started | Push is not terminal; "Mark as merged" is the terminal action |
+| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ❌ Not Started | Replaces squash-merge with push; task file on branch, not main |
+| **REQ-PROJ-028:** Managed Mode Worktree from First Message | ❌ Not Started | Agent explores the selected branch, not the main checkout |
+| **REQ-PROJ-029:** Branch Mode in the Mode Picker | ❌ Not Started | Three modes: Direct, Managed, Branch |
 
-**Progress:** 15 of 21 complete (1 descoped, 1 partial, 4 in progress)
+**Progress:** 12 of 27 complete (2 descoped, 1 partial, 4 in progress, 3 needs update, 6 not started)
 
 ## Remaining Work
 
-REQ-PROJ-008 (Work Sub-Agents) is the only incomplete requirement. Needed:
+REQ-PROJ-008 (Work Sub-Agents) is the only incomplete pre-024 requirement. Needed:
 
 1. **Agent mode parameter** on spawn_agents: `mode: "explore" | "work"`. Explore gets
    read-only tools + cheaper model. Work gets full tools + parent model.

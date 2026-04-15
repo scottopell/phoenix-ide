@@ -110,11 +110,9 @@ AND the agent MAY revise the plan and call `propose_plan` again
 WHEN user approves the task
 THE SYSTEM SHALL assign the next sequential task ID for the project
 AND write a task file to `tasks/` in taskmd format
-AND commit the task file to main using `git add <task-file> && git commit --only <task-file>`
-AND record the current checked-out branch as `base_branch` in the conversation mode
-AND create a worktree at `.phoenix/worktrees/{conv-id}` with a new branch `task-{NNNN}-{slug}`
-  using `git worktree add .phoenix/worktrees/{conv-id} -b task-{NNNN}-{slug}`
-AND transition the conversation to Work mode (storing base_branch, worktree_path, branch, task_id)
+AND commit the task file on the task branch in the existing worktree (REQ-PROJ-028)
+AND transition the conversation from Explore to Work mode within the same worktree
+  (storing base_branch, worktree_path, branch, task_id)
 AND resume agent execution with "Task approved. You are on branch task-{NNNN}-{slug}."
 
 WHEN user discards the task
@@ -122,10 +120,11 @@ THE SYSTEM SHALL return the conversation to Explore mode
 AND return a rejection result to the agent
 AND NOT perform any git operations (no file was written, nothing to clean up)
 
-**Rationale:** All git operations are deferred to the approval moment. The feedback
-loop is entirely in-memory: no files written, no commits, no branches until the user
-explicitly approves. Discarding a task is free — there is nothing to undo. The prose
-reader renders from the plan content carried in the state, not from a file on disk.
+**Rationale:** The Explore -> Work transition is a permission upgrade within an
+existing worktree (REQ-PROJ-028). The task file is committed on the task branch
+(never main -- REQ-PROJ-027) at approval time. Discarding a task is cheap: the
+worktree and branch already exist but no task file was written. The prose reader
+renders from the plan content carried in the state, not from a file on disk.
 
 ---
 
@@ -156,22 +155,20 @@ AND include frontmatter with: task ID, priority, status, branch name, conversati
   and creation date
 AND include a Plan section containing the agent's proposed approach as approved
 AND include a Progress section (initially empty, updated by the agent via patch tool)
-AND commit the file to the main branch
+AND commit the file on the task branch (never on main or the base branch)
 
 Task files are only created on approval. During the propose/feedback loop, the plan
-exists only in the AwaitingTaskApproval state — no file on disk, no git commit.
+exists only in the AwaitingTaskApproval state -- no file on disk, no git commit.
+Branch mode conversations (REQ-PROJ-024) do not create task files.
 
 WHEN the agent updates a task file during Work mode (via patch tool)
 THE SYSTEM SHALL allow edits to the task file on the task branch like any other file
-AND the updates SHALL merge to main with the rest of the code changes (M4)
+AND the updates SHALL be pushed with the rest of the code changes (REQ-PROJ-027)
 
-WHEN any conversation in Explore mode reads the `tasks/` directory
-THE SYSTEM SHALL show all task files including those for in-progress work conversations
-
-**Rationale:** Task files on main give every conversation — whether Explore or Work —
-project-wide situational awareness. An agent in Explore mode can see what tasks are
-in-progress, planned, or done without any special API. The git history of task files
-is a human-readable audit trail of all work attempted on the project.
+**Rationale:** Task files live on the task branch alongside the code changes, keeping
+the branch self-contained. This avoids committing to main (which may be protected)
+and eliminates the two-path commit logic. The task file merges to main when the PR
+is merged through the user's normal workflow.
 
 ---
 
@@ -219,69 +216,33 @@ one-Work-sub-agent constraint maintains a single writer per worktree at all time
 
 ### REQ-PROJ-009: Complete a Task (Squash Merge)
 
-WHEN the user initiates the Complete action on an idle Work conversation
-THE SYSTEM SHALL run pre-checks before proceeding:
-- Verify no uncommitted changes exist in the worktree (fail with actionable error if dirty)
-- Verify the main checkout has no uncommitted changes (fail with actionable error if dirty)
-- Verify no merge conflicts exist between the task branch and base_branch (fail with actionable error if conflicts)
-
-WHEN pre-checks pass
-THE SYSTEM SHALL generate a semantic commit message by sending `git diff base_branch...HEAD`
-  to the LLM with instructions to produce a concise, concept-focused commit message
-AND present the generated commit message in an editable confirmation dialog
-
-WHILE the commit message confirmation dialog is open
-THE SYSTEM SHALL register a browser navigation guard to warn the user before leaving the page
-
-WHEN the user confirms the commit message (possibly after editing)
-THE SYSTEM SHALL squash merge the task branch into base_branch:
-  `git checkout base_branch && git merge --squash task_branch && git commit -m "{message}"`
-AND delete the worktree: `git worktree remove {path} --force`
-AND delete the task branch: `git branch -D {branch}`
-AND transition the conversation to Terminal state
-
-WHEN the task file status is not `done` at Complete time
-THE SYSTEM SHALL display a non-blocking nudge suggesting the user ask the agent to
-  update the task file before completing
-AND SHALL NOT block the Complete action
-
-WHEN pre-checks fail
-THE SYSTEM SHALL display a specific, actionable error message
-AND SHALL NOT proceed with the merge
-AND the conversation SHALL remain in Work mode (user can ask the agent to fix the issue)
-
-**Rationale:** Completion is user-initiated, not agent-initiated. The user has been
-reviewing work live during the conversation and does not need a separate diff review
-gate. Squash merge produces a clean single commit on the base branch. The conversation
-goes to Terminal (not back to Explore) because the task is done -- the user creates a
-new Explore conversation if they need to continue working on the project. Pre-checks
-prevent silent data loss (dirty tree) and broken merges (conflicts).
+**DEPRECATED:** Superseded by REQ-PROJ-027 (push branch, user merges via PR).
+Squash-merge bypasses code review and branch protection rules. The push-branch
+model aligns with how teams actually ship code. Retained for historical context.
 
 ---
 
-### REQ-PROJ-010: Abandon a Task (Destructive Discard)
+### REQ-PROJ-010: Abandon a Conversation
 
 WHEN the user initiates the Abandon action on an idle Work conversation
-THE SYSTEM SHALL present a confirmation dialog warning that all work will be
-  permanently deleted (worktree and branch)
+THE SYSTEM SHALL present a confirmation dialog warning that the worktree will be deleted
 
-WHEN the user confirms abandonment
-THE SYSTEM SHALL verify the main checkout has no uncommitted changes (fail with actionable error if dirty)
-AND delete the worktree: `git worktree remove {path} --force`
-AND delete the task branch: `git branch -D {branch}`
-AND update the task file status to `wont-do` on base_branch:
-  `git checkout base_branch && taskmd rename {task_file} --status wont-do && git add tasks/ && git commit -m "task {NNNN}: mark wont-do"`
+WHEN the user confirms abandonment of a Managed mode conversation
+THE SYSTEM SHALL delete the worktree AND delete the task branch
+AND transition the conversation to Terminal state
+
+WHEN the user confirms abandonment of a Branch mode conversation
+THE SYSTEM SHALL delete the worktree AND keep the branch
 AND transition the conversation to Terminal state
 
 WHEN the user cancels the confirmation dialog
 THE SYSTEM SHALL take no action
 AND the conversation SHALL remain in Work mode
 
-**Rationale:** Abandon is a destructive, irreversible operation -- the worktree and
-branch are deleted, discarding all code changes. The task file is updated to `wont-do`
-(a valid taskmd status) on the base branch as a historical record of what was attempted.
-The conversation goes to Terminal because the task is over. Confirmation dialog is
-mandatory to prevent accidental data loss.
+**Rationale:** Abandon deletes the worktree to free disk space. For Managed mode,
+the task branch is also deleted because Phoenix created it -- it's a Phoenix artifact.
+For Branch mode, the branch is kept because it belongs to the user's PR, not to
+Phoenix. The confirmation dialog prevents accidental worktree deletion.
 
 ---
 
@@ -613,4 +574,171 @@ THE SYSTEM SHALL compare the task branch against the local base branch ref
 fetch before comparison ensures the behind/ahead counts reflect remote state,
 not just the local snapshot from the last full fetch. The cost is one lightweight
 network call per minute for one branch, not a full repo fetch.
+
+---
+
+### REQ-PROJ-024: Branch Mode -- Work Directly on an Existing Branch
+
+WHEN the user creates a conversation for a git repository AND selects "Branch" mode
+AND selects an existing branch
+THE SYSTEM SHALL create a worktree checked out to that branch (no new branch created)
+AND initialize the conversation directly in Work mode (no Explore phase)
+AND give the agent full tool access in the worktree
+AND deliver the user's first message to the agent immediately
+
+WHEN the user selects "Branch" mode for a non-git directory
+THE SYSTEM SHALL reject the request (Branch mode requires a git repository)
+
+WHEN the user selects "Branch" mode without selecting a branch
+THE SYSTEM SHALL reject the request (Branch mode requires an explicit branch selection)
+
+THE SYSTEM SHALL NOT create a task file for Branch mode conversations
+THE SYSTEM SHALL NOT create a new branch -- the worktree checks out the existing branch
+
+**Rationale:** Branch mode serves the "fix my PR" workflow: the user has existing
+work on a branch and needs to iterate on it. The Explore phase is overhead when
+the user already knows the branch and the task. No task file because the branch
+pre-exists and the user manages its lifecycle through their normal PR workflow.
+No new branch because the point is to commit directly to the existing branch --
+the worktree provides isolation from the main checkout without the indirection
+of a task branch.
+
+---
+
+### REQ-PROJ-025: One Active Work Conversation Per Branch
+
+WHEN the user selects a branch in Branch mode AND a non-terminal conversation
+already has an active worktree on that branch
+THE SYSTEM SHALL prompt the user: "This branch is open in another conversation.
+Continue there?"
+AND offer a link to navigate to the existing conversation
+
+WHEN the user selects a branch AND an orphaned worktree exists for that branch
+(worktree on disk but no matching non-terminal conversation)
+THE SYSTEM SHALL prompt: "An orphaned worktree exists for this branch.
+Delete it and start fresh?"
+AND on confirmation, delete the orphaned worktree and create a new one
+
+WHEN the user selects a branch AND a stale conversation exists (conversation
+references this branch but no worktree on disk)
+THE SYSTEM SHALL redirect the user to the existing conversation
+AND the existing conversation SHALL offer the standard Abandon action
+  (abandoning frees the branch for a fresh start)
+
+THE SYSTEM SHALL NOT redirect to terminal (abandoned, completed, merged)
+conversations -- only to active or idle ones
+
+**Rationale:** Git worktrees hold an exclusive lock on a branch -- two worktrees
+cannot check out the same branch. Rather than surfacing this as a git error,
+Phoenix makes the constraint visible at branch selection time. The one-per-branch
+rule prevents conflicting edits and encourages reusing conversations for
+iterative work on the same branch.
+
+---
+
+### REQ-PROJ-026: Branch Mode Lifecycle -- Push, Mark Merged, Abandon
+
+WHILE a conversation is in Branch mode Work state
+THE SYSTEM SHALL allow the agent to commit and push to the branch when instructed
+AND the conversation SHALL remain in Work mode after pushing (push is not terminal)
+
+WHEN the user initiates "Mark as merged" on a Branch mode conversation
+THE SYSTEM SHALL delete the worktree (keep the branch -- it is not ours to delete)
+AND transition the conversation to terminal state
+
+WHEN the user initiates "Abandon" on a Branch mode conversation
+THE SYSTEM SHALL delete the worktree (keep the branch)
+AND transition the conversation to terminal state
+
+THE SYSTEM SHALL NOT offer "Complete (squash-merge)" for Branch mode conversations
+
+**Rationale:** Branch mode conversations track the PR lifecycle, not the task
+lifecycle. Push is a milestone, not an endpoint -- the PR may need reviews, CI
+fixes, and follow-up pushes before merge. "Mark as merged" is the user-initiated
+terminal action when the PR is merged through their normal workflow. Abandon
+means "I'm done with this conversation" but doesn't touch the branch. In both
+cases the branch survives because it belongs to the user's PR, not to Phoenix.
+
+---
+
+### REQ-PROJ-027: Simplified Managed Mode Completion -- Push Branch
+
+WHEN the user initiates completion of a Managed mode conversation
+THE SYSTEM SHALL push the task branch to origin
+AND the conversation SHALL remain in Work mode after pushing
+
+WHEN the user initiates "Mark as merged" on a Managed mode conversation
+THE SYSTEM SHALL delete the worktree AND delete the task branch
+AND transition the conversation to terminal state
+
+WHEN the user initiates "Abandon" on a Managed mode conversation
+THE SYSTEM SHALL delete the worktree AND delete the task branch
+AND transition the conversation to terminal state
+
+THE SYSTEM SHALL NOT squash-merge to the base branch
+THE SYSTEM SHALL commit the task file on the task branch (never on main/base)
+
+**Rationale:** Many repositories protect their main branch and require PR-based
+merges. Squash-merging in Phoenix bypasses code review and branch protection
+rules. Pushing the task branch and letting the user merge via PR is simpler,
+works with protected branches, and aligns with how teams actually ship code.
+The task file lives on the task branch alongside the code changes, keeping the
+task branch self-contained. On "Mark as merged," Phoenix cleans up both the
+worktree and the task branch (since Phoenix created it). On abandon, same
+cleanup -- the task branch was a Phoenix artifact that the user is discarding.
+
+---
+
+### REQ-PROJ-028: Managed Mode -- Worktree from First Message
+
+WHEN the user selects Managed mode AND sends their first message
+THE SYSTEM SHALL create the worktree and task branch immediately
+AND initialize the conversation in Explore mode within the worktree
+AND the agent SHALL read from the worktree (not the main checkout)
+
+WHEN the agent calls `propose_plan` in a Managed conversation with a worktree
+THE SYSTEM SHALL intercept the call (same as REQ-PROJ-003)
+AND on approval, transition the conversation from Explore to Work mode
+AND the agent SHALL begin writing in the same worktree (no second worktree created)
+
+WHEN a Managed conversation with a worktree reaches Terminal state without
+ever entering Work mode (user never approved a task)
+THE SYSTEM SHALL delete the worktree and task branch during cleanup
+AND worktree reconciliation on server restart SHALL detect Explore conversations
+  with worktrees (not only Work conversations)
+
+**Rationale:** The Explore phase should read from the selected branch's code,
+not whatever the main checkout happens to be (which may be dirty, detached, or
+on a different branch). Creating the worktree at conversation start ensures the
+agent explores the right code. The Explore -> Work transition becomes a permission
+change (read-only to read-write) within the same worktree, not a workspace change.
+The cleanup clause ensures worktrees from abandoned Explore conversations don't
+accumulate on disk.
+
+---
+
+### REQ-PROJ-029: Branch Mode in the Mode Picker
+
+WHEN the directory is a git repository
+THE SYSTEM SHALL show three mode options: Direct, Managed, and Branch
+AND Branch mode SHALL require selecting an existing branch
+
+WHEN the user selects Branch mode
+THE SYSTEM SHALL show the branch picker (same as Managed mode)
+AND the branch picker SHALL use the same search and discovery mechanisms
+(REQ-PROJ-020 through REQ-PROJ-023)
+
+WHEN the user selects Managed mode
+THE SYSTEM SHALL show the branch picker for selecting a base branch
+AND the label SHALL indicate "Base branch" (starting point for new work)
+
+WHEN the user selects Branch mode
+THE SYSTEM SHALL show the branch picker for selecting an existing branch
+AND the label SHALL indicate "Branch" (the branch to work on directly)
+
+**Rationale:** The mode picker is the decision point where the user declares
+their intent: "no git" (Direct), "start new work" (Managed), or "work on
+existing branch" (Branch). The branch picker is reused across Managed and
+Branch modes with different labeling to communicate the different semantics:
+"base branch" (starting point) vs "branch" (destination).
 
