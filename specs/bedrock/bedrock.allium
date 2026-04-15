@@ -256,17 +256,16 @@ entity Conversation {
     failure_error: String when status = failed
     failure_error_class: ErrorClass? when status = failed
 
-    -- Managed mode fields (REQ-BED-027, REQ-PROJ-028)
-    -- Present in both Explore (worktree created at first message) and Work.
-    branch_name: String when mode in { explore, work }
-    worktree_path: String when mode in { explore, work }
-    base_branch: String when mode in { explore, work }
-    task_id: String when mode = work        -- always present in Work (Managed)
+    -- Worktree fields -- shared across all modes that have worktrees.
+    -- The structural distinction between Work and Branch is task_id presence,
+    -- not different field names for the same concept.
+    branch_name: String when mode in { explore, work, branch }
+    worktree_path: String when mode in { explore, work, branch }
+    base_branch: String when mode in { explore, work, branch }
 
-    -- Branch mode fields (REQ-PROJ-024)
-    -- Separate from Work: no task_id, no base_branch (branch IS the target).
-    branch_mode_branch: String when mode = branch
-    branch_mode_worktree_path: String when mode = branch
+    -- Work-only: task_id is the structural discriminator.
+    -- Present in Work (Managed), absent in Branch and Explore.
+    task_id: String when mode = work
 
     -- ----------------------------------------------------------------
     -- Relationships

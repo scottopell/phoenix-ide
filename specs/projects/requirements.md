@@ -404,14 +404,18 @@ non-project behaviors.
 
 ### REQ-PROJ-017: Base Branch Tracking in Work Mode
 
-WHEN a conversation transitions to Work mode (via task approval or Branch mode selection)
-THE SYSTEM SHALL record the base branch in the conversation's Work mode data
+WHEN a conversation transitions to Work or Branch mode
+THE SYSTEM SHALL record the base branch in the conversation's mode data
 
-THE Work mode data SHALL contain:
+THE shared worktree fields (present in Explore, Work, and Branch modes) SHALL be:
 - `worktree_path: PathBuf` -- path to the conversation's worktree
-- `branch: String` -- the task branch name (Managed) or existing branch (Branch mode)
-- `task_id: String?` -- the task identifier (absent for Branch mode)
+- `branch_name: String` -- the task branch (Work) or existing branch (Branch)
 - `base_branch: String` -- the branch the worktree was created from
+
+THE Work mode SHALL additionally contain:
+- `task_id: String` -- always present, the structural discriminator vs Branch mode
+
+THE Branch mode SHALL NOT contain `task_id`
 
 WHEN the "Mark as merged" action runs (REQ-PROJ-026/027)
 THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)

@@ -281,7 +281,6 @@ rule ManagedWorktreeOnFirstMessage {
         path: WorktreePath { absolute_path: worktree_path(conversation) },
         branch_name: branch_name,
         base_branch: base_branch,
-        kind: managed,
         task_file: absent
     )
     -- conversation stays in Explore mode, agent reads from worktree
@@ -631,10 +630,9 @@ rule ExploreWorktreeCleanupOnTerminal {
 rule CommitsBehindPoll {
     when: PollerFires(conversation, interval: 60 seconds)
 
-    requires: conversation.mode = work
-    requires: conversation.has_connected_clients
     -- Skip for Branch mode: base_branch == branch_name, comparison is always 0.
     requires: conversation.mode = work
+    requires: conversation.has_connected_clients
 
     let worktree = Worktree{conversation: conversation}
 
