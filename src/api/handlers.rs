@@ -628,19 +628,44 @@ async fn create_conversation(
                 return Err(AppError::BadRequest(msg));
             }
         }
-    } else {
-        let mode = match resolved_mode {
-            "managed" => {
-                if project_id.is_none() {
-                    return Err(AppError::BadRequest(
-                        "Managed mode requires a git repository".to_string(),
-                    ));
+    } else if resolved_mode == "managed" {
+        if project_id.is_none() {
+            return Err(AppError::BadRequest(
+                "Managed mode requires a git repository".to_string(),
+            ));
+        }
+
+        // REQ-PROJ-028: If a base_branch is specified, create the worktree immediately
+        // so the agent explores the selected branch's code, not the main checkout.
+        if let Some(ref base_branch) = req.base_branch {
+            let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
+                AppError::BadRequest("Could not determine git repository root".to_string())
+            })?;
+            let conv_id = id.clone();
+            let branch = base_branch.clone();
+            let repo = repo_root.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                create_managed_explore_worktree_blocking(&repo, &conv_id, &branch)
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+
+            match result {
+                Ok(worktree_path) => (crate::db::ConvMode::Explore, worktree_path),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to create early worktree for Managed mode, falling back to repo root"
+                    );
+                    (crate::db::ConvMode::Explore, req.cwd.clone())
                 }
-                crate::db::ConvMode::Explore
             }
-            _ => crate::db::ConvMode::Direct,
-        };
-        (mode, req.cwd.clone())
+        } else {
+            (crate::db::ConvMode::Explore, req.cwd.clone())
+        }
+    } else {
+        (crate::db::ConvMode::Direct, req.cwd.clone())
     };
 
     let desired_base_branch = if resolved_mode == "managed" {
@@ -893,6 +918,115 @@ fn find_active_branch_conversation_slug(
             c.conv_mode.branch_name().is_some_and(|b| b == branch_name) && !c.state.is_terminal()
         })
         .and_then(|c| c.slug.clone())
+}
+
+// ============================================================
+// Managed Mode Early Worktree (REQ-PROJ-028)
+// ============================================================
+
+/// Create a worktree at conversation start for Managed mode so the agent
+/// explores the selected base branch, not the main checkout.
+///
+/// Creates a temporary branch `task-pending-{conv_id_prefix}` from the
+/// base branch. At approval time, `execute_approve_task_blocking` detects
+/// the existing worktree and renames the branch.
+fn create_managed_explore_worktree_blocking(
+    repo_root: &str,
+    conv_id: &str,
+    base_branch: &str,
+) -> Result<String, String> {
+    let cwd = std::path::Path::new(repo_root);
+
+    // Single-branch fetch (best-effort, REQ-PROJ-022 reuse)
+    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+    if let Err(e) = run_git(cwd, &["fetch", "origin", &refspec]) {
+        tracing::debug!(
+            branch = %base_branch,
+            error = %e,
+            "Single-branch fetch failed (non-fatal, using local ref)"
+        );
+    }
+
+    // Materialize local ref if remote-only
+    let has_local = run_git(cwd, &["rev-parse", "--verify", base_branch]).is_ok();
+    let remote_ref = format!("origin/{base_branch}");
+    let has_remote = run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok();
+
+    if has_local && has_remote {
+        let local_sha = run_git(cwd, &["rev-parse", base_branch]).unwrap_or_default();
+        let remote_sha = run_git(cwd, &["rev-parse", &remote_ref]).unwrap_or_default();
+        if local_sha.trim() != remote_sha.trim()
+            && run_git(
+                cwd,
+                &["merge-base", "--is-ancestor", base_branch, &remote_ref],
+            )
+            .is_ok()
+        {
+            let current_head =
+                run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+            if current_head.trim() != base_branch {
+                let _ = run_git(
+                    cwd,
+                    &[
+                        "update-ref",
+                        &format!("refs/heads/{base_branch}"),
+                        remote_sha.trim(),
+                    ],
+                );
+                tracing::info!(branch = %base_branch, "Fast-forwarded local branch to remote tip");
+            }
+        }
+    } else if !has_local && has_remote {
+        run_git(cwd, &["branch", "--track", base_branch, &remote_ref]).map_err(|e| {
+            format!("Failed to create local branch '{base_branch}' from {remote_ref}: {e}")
+        })?;
+        tracing::info!(branch = %base_branch, "Created local tracking branch from remote");
+    } else if !has_local && !has_remote {
+        return Err(format!(
+            "Branch '{base_branch}' not found locally or at origin"
+        ));
+    }
+
+    // Create .phoenix/worktrees/ directory
+    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
+    std::fs::create_dir_all(&phoenix_dir)
+        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
+
+    let worktree_path = phoenix_dir.join(conv_id);
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    // Temporary branch name: task-pending-{first 8 chars of conv_id}
+    let id_prefix: String = conv_id.chars().take(8).collect();
+    let temp_branch = format!("task-pending-{id_prefix}");
+
+    // Create worktree with temporary branch from the base branch
+    run_git(
+        cwd,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &temp_branch,
+            &worktree_path_str,
+            base_branch,
+        ],
+    )
+    .map_err(|e| format!("Failed to create early worktree from '{base_branch}': {e}"))?;
+
+    // Ensure .phoenix/ is in .gitignore at the repo root
+    if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
+        tracing::warn!(error = %e, "Failed to update .gitignore (non-fatal)");
+    }
+
+    tracing::info!(
+        conv_id = %conv_id,
+        base_branch = %base_branch,
+        temp_branch = %temp_branch,
+        worktree = %worktree_path_str,
+        "Created early Managed-mode worktree (REQ-PROJ-028)"
+    );
+
+    Ok(worktree_path_str)
 }
 
 // ============================================================
