@@ -12,6 +12,8 @@ pub(crate) mod transition;
 
 #[cfg(test)]
 mod proptests;
+#[cfg(test)]
+mod project_proptests;
 
 pub use effect::Effect;
 pub use event::Event;
