@@ -387,13 +387,33 @@ impl ConflictErrorResponse {
 #[derive(Debug, Deserialize)]
 pub struct GitBranchesQuery {
     pub cwd: String,
+    /// When present, searches remote refs via `git ls-remote` (substring match).
+    /// When absent, returns local branches sorted by recency.
+    pub search: Option<String>,
+}
+
+/// A single branch entry with local/remote provenance.
+#[derive(Debug, Serialize)]
+pub struct GitBranchEntry {
+    pub name: String,
+    /// true if this branch exists locally
+    pub local: bool,
+    /// true if a remote-tracking ref exists (e.g. `origin/<name>`)
+    pub remote: bool,
+    /// How many commits the local ref is behind the remote tracking ref.
+    /// Only set when both local and remote exist and they diverge. 0 = up-to-date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind_remote: Option<u32>,
 }
 
 /// Response for git branch listing
 #[derive(Debug, Serialize)]
 pub struct GitBranchesResponse {
-    pub branches: Vec<String>,
+    pub branches: Vec<GitBranchEntry>,
     pub current: String,
+    /// The remote's default branch (e.g. "main"), if detectable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
 }
 
 /// Error response

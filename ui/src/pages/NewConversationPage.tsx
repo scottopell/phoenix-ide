@@ -107,6 +107,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             currentBranch={conv.currentBranch}
             baseBranch={conv.baseBranch}
             setBaseBranch={conv.setBaseBranch}
+            defaultBranch={conv.defaultBranch}
+            branchSearch={conv.branchSearch}
+            setBranchSearch={conv.setBranchSearch}
+            branchSearchLoading={conv.branchSearchLoading}
           />
 
           {/* Main input */}
@@ -181,6 +185,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             currentBranch={conv.currentBranch}
             baseBranch={conv.baseBranch}
             setBaseBranch={conv.setBaseBranch}
+            defaultBranch={conv.defaultBranch}
+            branchSearch={conv.branchSearch}
+            setBranchSearch={conv.setBranchSearch}
+            branchSearchLoading={conv.branchSearchLoading}
           />
         </div>
       </main>

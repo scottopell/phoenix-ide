@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { getModels } from '../modelsPoller';
-import type { ImageData, ModelsResponse } from '../api';
+import type { GitBranchEntry, ImageData, ModelsResponse } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -41,9 +41,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
   const [mode, setMode] = useState<'direct' | 'managed'>('direct');
-  const [branches, setBranches] = useState<string[]>([]);
+  const [branches, setBranches] = useState<GitBranchEntry[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
+  const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
+  const [branchSearch, setBranchSearch] = useState('');
+  const [branchSearchLoading, setBranchSearchLoading] = useState(false);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -72,12 +75,14 @@ export function useCreateConversation(navigate: (path: string) => void) {
   // Reset to Direct when directory is not a git repo (Managed requires git)
   useEffect(() => { if (isGitDir === false) setMode('direct'); }, [isGitDir]);
 
-  // Fetch branches when git dir is confirmed and mode is managed
+  // Fetch local branches when git dir is confirmed and mode is managed (instant, no network)
   useEffect(() => {
     if (!isGitDir || mode !== 'managed') {
       setBranches([]);
       setCurrentBranch(null);
       setBaseBranch(null);
+      setDefaultBranch(null);
+      setBranchSearch('');
       return;
     }
     const trimmedCwd = cwd.trim();
@@ -88,17 +93,45 @@ export function useCreateConversation(navigate: (path: string) => void) {
       if (cancelled) return;
       setBranches(resp.branches);
       setCurrentBranch(resp.current);
+      setDefaultBranch(resp.default_branch ?? null);
       setBaseBranch(null);
     }).catch(err => {
       if (cancelled) return;
       console.warn('Failed to fetch git branches:', err);
       setBranches([]);
       setCurrentBranch(null);
+      setDefaultBranch(null);
       setBaseBranch(null);
     });
 
     return () => { cancelled = true; };
   }, [isGitDir, mode, cwd]);
+
+  // Debounced remote search when user types in the branch picker
+  useEffect(() => {
+    if (!isGitDir || mode !== 'managed' || !branchSearch.trim()) return;
+    const trimmedCwd = cwd.trim();
+    if (!trimmedCwd) return;
+
+    setBranchSearchLoading(true);
+    const timer = setTimeout(() => {
+      let cancelled = false;
+      api.listGitBranches(trimmedCwd, branchSearch.trim()).then(resp => {
+        if (cancelled) return;
+        setBranches(resp.branches);
+        setBranchSearchLoading(false);
+      }).catch(err => {
+        if (cancelled) return;
+        console.warn('Branch search failed:', err);
+        setBranchSearchLoading(false);
+      });
+      // Stash the cancel fn for cleanup -- the timer already fired,
+      // but the fetch might still be in flight.
+      return () => { cancelled = true; };
+    }, 300);
+
+    return () => { clearTimeout(timer); setBranchSearchLoading(false); };
+  }, [isGitDir, mode, cwd, branchSearch]);
 
   const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
 
@@ -200,6 +233,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
     currentBranch,
     baseBranch,
     setBaseBranch,
+    defaultBranch,
+    branchSearch,
+    setBranchSearch,
+    branchSearchLoading,
     recentDirs,
     addImages,
     removeImage,

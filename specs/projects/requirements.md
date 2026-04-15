@@ -513,3 +513,104 @@ conversations prevents indefinite list growth from completed or abandoned tasks.
 Mode and project filters let the user focus on what matters: "show me my active
 Work conversations for this project."
 
+---
+
+### REQ-PROJ-020: Branch Discovery (Local, No Network)
+
+WHEN the user opens the branch picker in Managed mode
+THE SYSTEM SHALL list local branches sorted by most-recent commit date (descending)
+AND detect the remote's default branch via cached symbolic ref (no network call)
+
+WHEN a local branch has a remote tracking ref (e.g. `origin/<name>`)
+THE SYSTEM SHALL compare the local ref against the remote tracking ref
+AND display how many commits the local branch is behind the remote tracking ref
+AND this comparison SHALL use only local data (no fetch)
+
+WHEN the remote default branch is detectable
+THE SYSTEM SHALL include it in the response even if it is not checked out locally
+
+THE SYSTEM SHALL NOT run `git fetch` or any network operation during the no-query
+  branch listing path
+
+**Rationale:** The no-query path must be instant regardless of repo size or network
+conditions. Local branches sorted by recency surface the branches the user is
+actively working on, pushing stale branches down. Behind-remote counts use the
+local remote-tracking ref (last fetch), which may be stale but provides a useful
+signal at zero cost. The staleness is resolved at materialization time
+(REQ-PROJ-022), not at listing time. The user can also search (REQ-PROJ-021)
+to get fresh remote data.
+
+---
+
+### REQ-PROJ-021: Remote Branch Search (Network, On-Demand)
+
+WHEN the user types a search query in the branch picker
+THE SYSTEM SHALL run `git ls-remote --heads --tags origin` to list remote refs
+AND filter the results server-side by case-insensitive substring match on the query
+AND return matching branches and version-like tags
+
+THE SYSTEM SHALL cache `git ls-remote` results keyed by repository path
+AND the cache TTL SHALL be at least 5 minutes
+AND subsequent searches within the TTL SHALL filter the cached result (no network)
+
+WHEN the search returns results
+THE SYSTEM SHALL distinguish remote-only branches from branches that also exist locally
+
+THE SYSTEM SHALL NOT download git objects during search (`ls-remote` transfers only
+  ref names and SHAs)
+
+**Rationale:** `git ls-remote` lists refs without downloading pack data, making it
+fast even on large repositories. Caching the full ref list means rapid successive
+keystrokes (typeahead) filter locally after the first network call. The 5-minute
+TTL balances freshness against network cost. Substring matching handles the common
+patterns: full branch name paste, prefix search (`sopell/`), and keyword search.
+
+---
+
+### REQ-PROJ-022: Branch Materialization (Single-Branch Fetch)
+
+WHEN a Managed conversation's task is approved (worktree creation begins)
+THE SYSTEM SHALL run `git fetch origin <base_branch>` (single-branch) before
+  creating the worktree, regardless of whether the branch is local or remote-only
+AND this fetch SHALL be best-effort (network failure is non-fatal, logged at debug)
+
+WHEN the fetch succeeds AND the branch exists locally
+THE SYSTEM SHALL fast-forward the local ref to match the remote tip
+  (if fast-forward is not possible, the local ref is left as-is and a warning is logged)
+AND use the updated local ref as the worktree base
+
+WHEN the fetch succeeds AND the branch exists only as a remote ref
+THE SYSTEM SHALL create a local tracking branch from the fetched remote ref
+AND use that local branch as the base for worktree creation
+
+WHEN the fetch fails (network unavailable)
+THE SYSTEM SHALL fall back to the local ref if one exists
+AND fail with a clear error if no local ref exists
+
+THE SYSTEM SHALL NOT run `git fetch` without a refspec (no blanket fetch)
+
+**Rationale:** Always fetching the selected branch at materialization time ensures
+the worktree starts from the latest remote tip. This is a single targeted network
+call at a moment where the user already expects a brief wait (worktree creation
+involves git operations). It eliminates the "stale local branch" problem without
+requiring the user to confirm an update -- the answer is always "yes, give me the
+latest." Listing remains instant (REQ-PROJ-020); the network cost moves to the
+commit point where it has the highest value.
+
+---
+
+### REQ-PROJ-023: Remote-Aware Commits-Behind Polling
+
+WHEN the commits-behind poller fires for a Work conversation (REQ-PROJ-011)
+THE SYSTEM SHALL run `git fetch origin <base_branch>` (single-branch) before
+  comparing commit counts
+AND this fetch SHALL be best-effort (failures are non-fatal, logged at debug)
+
+THE SYSTEM SHALL compare the task branch against the local base branch ref
+  (which is now updated by the single-branch fetch)
+
+**Rationale:** The poller already runs every 60 seconds. Adding a single-branch
+fetch before comparison ensures the behind/ahead counts reflect remote state,
+not just the local snapshot from the last full fetch. The cost is one lightweight
+network call per minute for one branch, not a full repo fetch.
+

@@ -9,11 +9,11 @@ use super::types::{
     ConfirmCompleteResponse, ConflictErrorResponse, ConversationListResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
-    FileSearchQuery, FileSearchResponse, GatewayStatusApi, GitBranchesQuery, GitBranchesResponse,
-    ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse,
-    RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SystemPromptResponse,
-    TaskApprovalResponse, TaskEntry, TaskFeedbackRequest, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    FileSearchQuery, FileSearchResponse, GatewayStatusApi, GitBranchEntry, GitBranchesQuery,
+    GitBranchesResponse, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SystemPromptResponse, TaskApprovalResponse, TaskEntry, TaskFeedbackRequest, TasksResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
@@ -1081,6 +1081,19 @@ async fn stream_conversation(
             let mut last_ahead = initial_commits_ahead;
             loop {
                 tokio::time::sleep(std::time::Duration::from_mins(1)).await;
+
+                // REQ-PROJ-023: single-branch fetch for the base branch only.
+                let fetch_root = repo_root.clone();
+                let fetch_branch = base_branch.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let refspec = format!(
+                        "refs/heads/{fetch_branch}:refs/remotes/origin/{fetch_branch}"
+                    );
+                    if let Err(e) = run_git(&fetch_root, &["fetch", "origin", &refspec]) {
+                        tracing::debug!(error = %e, "periodic single-branch fetch failed (non-fatal)");
+                    }
+                })
+                .await;
 
                 let root1 = repo_root.clone();
                 let base1 = base_branch.clone();
@@ -2406,20 +2419,182 @@ async fn list_git_branches(
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
 
-    let output = run_git(&cwd, &["branch", "--list", "--format=%(refname:short)"])
-        .map_err(|e| AppError::Internal(format!("Failed to list branches: {e}")))?;
-    let branches: Vec<String> = output
+    let search = params.search.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(query) = search {
+            search_remote_branches(&cwd, &query)
+        } else {
+            list_local_branches(&cwd)
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
+/// REQ-PROJ-020: Local branches sorted by recency, no network.
+fn list_local_branches(cwd: &std::path::Path) -> Result<GitBranchesResponse, AppError> {
+    // Local branches sorted by most recent commit (descending).
+    let local_output = run_git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/heads/",
+            "--format=%(refname:short)",
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("Failed to list branches: {e}")))?;
+
+    let local_names: Vec<String> = local_output
         .lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    let current = run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+    // Build entries with behind-remote counts for tracked branches.
+    let branches: Vec<GitBranchEntry> = local_names
+        .into_iter()
+        .map(|name| {
+            let remote_ref = format!("origin/{name}");
+            let has_remote = run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok();
+
+            let behind_remote = if has_remote {
+                let range = format!("{name}..{remote_ref}");
+                run_git(cwd, &["rev-list", "--count", &range])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&n| n > 0)
+            } else {
+                None
+            };
+
+            GitBranchEntry {
+                local: true,
+                remote: has_remote,
+                behind_remote,
+                name,
+            }
+        })
+        .collect();
+
+    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map_err(|e| AppError::Internal(format!("Failed to get current branch: {e}")))?
         .trim()
         .to_string();
 
-    Ok(Json(GitBranchesResponse { branches, current }))
+    // Detect remote default branch from cached symbolic ref (no network).
+    let default_branch = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("refs/remotes/origin/")
+                .map(String::from)
+        });
+
+    Ok(GitBranchesResponse {
+        branches,
+        current,
+        default_branch,
+    })
+}
+
+/// REQ-PROJ-021: Remote branch search via cached `git ls-remote`.
+fn search_remote_branches(
+    cwd: &std::path::Path,
+    query: &str,
+) -> Result<GitBranchesResponse, AppError> {
+    let refs = ls_remote_cached(cwd)?;
+    let query_lower = query.to_lowercase();
+
+    // Local branch set for cross-referencing.
+    let local_output =
+        run_git(cwd, &["branch", "--list", "--format=%(refname:short)"]).unwrap_or_default();
+    let local_set: std::collections::HashSet<String> = local_output
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let branches: Vec<GitBranchEntry> = refs
+        .into_iter()
+        .filter(|name| name.to_lowercase().contains(&query_lower))
+        .map(|name| {
+            let local = local_set.contains(&name);
+            GitBranchEntry {
+                local,
+                remote: true,
+                behind_remote: None,
+                name,
+            }
+        })
+        .collect();
+
+    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    Ok(GitBranchesResponse {
+        branches,
+        current,
+        default_branch: None,
+    })
+}
+
+/// Cached `git ls-remote` results. Key: canonical repo path. Value: (refs, timestamp).
+type LsRemoteCacheMap = std::collections::HashMap<PathBuf, (Vec<String>, std::time::Instant)>;
+static LS_REMOTE_CACHE: std::sync::LazyLock<std::sync::Mutex<LsRemoteCacheMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(LsRemoteCacheMap::new()));
+
+/// Cache TTL for ls-remote results.
+const LS_REMOTE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Returns cached remote ref names, refreshing if expired or missing.
+fn ls_remote_cached(cwd: &std::path::Path) -> Result<Vec<String>, AppError> {
+    let repo_root = run_git(cwd, &["rev-parse", "--show-toplevel"])
+        .map_or_else(|_| cwd.to_path_buf(), |s| PathBuf::from(s.trim()));
+
+    // Check cache.
+    {
+        let cache = LS_REMOTE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((refs, ts)) = cache.get(&repo_root) {
+            if ts.elapsed() < LS_REMOTE_CACHE_TTL {
+                return Ok(refs.clone());
+            }
+        }
+    }
+
+    // Cache miss or expired: run ls-remote.
+    let output = run_git(cwd, &["ls-remote", "--heads", "--tags", "origin"])
+        .map_err(|e| AppError::Internal(format!("git ls-remote failed: {e}")))?;
+
+    let refs: Vec<String> = output
+        .lines()
+        .filter_map(|line| {
+            let refname = line.split_whitespace().nth(1)?;
+            // Skip dereferenced tag refs (e.g. refs/tags/v1.0^{})
+            if refname.ends_with("^{}") {
+                return None;
+            }
+            refname
+                .strip_prefix("refs/heads/")
+                .or_else(|| refname.strip_prefix("refs/tags/"))
+                .map(String::from)
+        })
+        .collect();
+
+    // Update cache.
+    {
+        let mut cache = LS_REMOTE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert(repo_root, (refs.clone(), std::time::Instant::now()));
+    }
+
+    Ok(refs)
 }
 
 async fn list_directory(

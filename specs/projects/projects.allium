@@ -4,20 +4,21 @@
 -- Phoenix Project Lifecycle: Behavioural Specification
 --
 -- Scope: Git-backed project lifecycle around bedrock conversations
--- Includes: Project detection, mode selection, task approval git operations,
---           worktree lifecycle, task file lifecycle, complete flow, abandon flow,
+-- Includes: Project detection, mode selection, branch discovery,
+--           task approval git operations, worktree lifecycle,
+--           task file lifecycle, complete flow, abandon flow,
 --           write scoping, sub-agent worktree inheritance,
 --           server restart worktree reconciliation
 -- Excludes:
 --   - Conversation state machine (see bedrock.allium)
 --   - LLM commit message generation (implementation detail)
 --   - Platform capability detection (infrastructure)
---   - UI elements (confirmation dialogs, project switcher, badges)
+--   - UI layout (confirmation dialogs, project switcher, badges)
 --   - .gitignore management (infrastructure)
 --   - Auto-stash mechanics (implementation detail)
 --   - Diff snapshot capture (implementation detail of abandon)
 --
--- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-019
+-- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-023
 -- (1 descoped: REQ-PROJ-015)
 
 use "./bedrock.allium" as bedrock
@@ -31,6 +32,15 @@ use "./bedrock.allium" as bedrock
 external entity GitRepository {
     root_path: String
     current_branch: String
+    -- Cached symbolic ref: refs/remotes/origin/HEAD → short name.
+    -- Set by git clone, updated by git fetch. May be absent.
+    remote_default_branch: String?
+}
+
+-- The remote "origin". ls-remote queries target this.
+external entity GitRemote {
+    repo: GitRepository
+    name: String = "origin"
 }
 
 ------------------------------------------------------------
@@ -50,6 +60,30 @@ value WorktreePath {
 enum TaskFileStatus { in_progress | done | wont_do }
 
 enum TaskResolutionOutcome { completed | abandoned }
+
+-- A branch entry as presented to the user in the branch picker.
+value BranchEntry {
+    name: String
+    local: Boolean                   -- exists as a local ref
+    remote: Boolean                  -- exists as a remote tracking ref
+    behind_remote: Natural?          -- commits local is behind origin (local compare, no network)
+}
+
+-- Cached output of `git ls-remote` for a repository.
+value LsRemoteCache {
+    repo_path: String
+    refs: List<RemoteRef>
+    fetched_at: Timestamp
+    ttl: Duration = 5 minutes
+}
+
+value RemoteRef {
+    name: String                     -- short name (e.g. "main", "sopell/feature-x", "v2.1.0")
+    kind: RefKind
+    sha: String
+}
+
+enum RefKind { branch | tag }
 
 ------------------------------------------------------------
 -- Entities
@@ -164,7 +198,128 @@ rule ManagedModeSelected {
 -- Enforced by tool registry configuration, not by rules.
 
 -- ===========================================================
--- 2. TASK APPROVAL — GIT OPERATIONS (REQ-PROJ-003, 004, 006, 012)
+-- 2. BRANCH DISCOVERY (REQ-PROJ-020, 021, 022)
+-- ===========================================================
+
+-- REQ-PROJ-020: Local branch listing (no network)
+rule ListLocalBranches {
+    when: UserOpensBranchPicker(project)
+
+    -- No search query provided. Instant, local-only.
+    requires: no search query
+
+    let repo = project.repo
+    let local_branches = git_for_each_ref(repo, "refs/heads/",
+        sort: "-committerdate")
+
+    ensures: for each branch in local_branches:
+        BranchEntry {
+            name: branch.short_name,
+            local: true,
+            remote: exists git_ref(repo, "refs/remotes/origin/" + branch.short_name),
+            behind_remote:
+                if exists git_ref(repo, "refs/remotes/origin/" + branch.short_name):
+                    commits_between(branch.sha, remote_tracking_sha)
+                else:
+                    absent
+        }
+
+    ensures: if repo.remote_default_branch is present:
+        response.default_branch = repo.remote_default_branch
+
+    @guidance
+        -- `git for-each-ref --sort=-committerdate refs/heads/` returns
+        -- branches ordered by last commit. All local operations, no network.
+        --
+        -- behind_remote is computed via:
+        --   `git rev-list --count <local>..<remote-tracking>`
+        -- Both refs are local; this is a graph walk, not a fetch.
+        --
+        -- remote_default_branch detected via:
+        --   `git symbolic-ref refs/remotes/origin/HEAD`
+        -- Stripped to short name. Absent if symref is missing (never fetched,
+        -- or remote has no HEAD). No fallback guessing.
+}
+
+-- REQ-PROJ-021: Remote branch search (network, on-demand)
+rule SearchRemoteBranches {
+    when: UserSearchesBranches(project, query)
+
+    requires: query is not empty
+
+    let cache = LsRemoteCache.for(project.repo.root_path)
+
+    ensures:
+        if cache is absent or cache.expired:
+            cache = LsRemoteCache {
+                repo_path: project.repo.root_path,
+                refs: git_ls_remote(project.repo, "--heads", "--tags", "origin"),
+                fetched_at: now,
+                ttl: 5 minutes
+            }
+
+    ensures: response.branches = cache.refs
+        .where(ref => ref.name.contains_case_insensitive(query))
+        .map(ref => BranchEntry {
+            name: ref.name,
+            local: exists git_ref(project.repo, "refs/heads/" + ref.name),
+            remote: true,
+            behind_remote: absent   -- not computed for search results
+        })
+
+    @guidance
+        -- `git ls-remote --heads --tags origin` lists all remote refs.
+        -- Transfers only ref names and SHAs, no pack data.
+        --
+        -- Cache is keyed on repo_path. TTL is 5 minutes.
+        -- Subsequent searches within TTL filter the cached list.
+        --
+        -- Tags are included in results but only version-like tags
+        -- (matching `v\d` or semver patterns) are useful in practice.
+        -- Filtering is substring, not glob, for typeahead UX.
+}
+
+-- REQ-PROJ-022: Branch materialization (single-branch fetch at worktree creation)
+rule MaterializeBranch {
+    when: TaskApprovalStarted(conversation, base_branch_name)
+
+    let repo = conversation.project.repo
+
+    -- Always attempt a single-branch fetch, regardless of local/remote status.
+    -- This is the moment where staleness is resolved.
+    ensures: BestEffortFetch(repo, base_branch_name)
+
+    ensures:
+        if exists git_ref(repo, "refs/heads/" + base_branch_name):
+            -- Local branch exists. If fetch succeeded, fast-forward to remote tip.
+            FastForwardIfPossible(repo, base_branch_name)
+            conversation.resolved_base = base_branch_name
+        else if exists git_ref(repo, "refs/remotes/origin/" + base_branch_name):
+            -- Remote-only. Create local tracking branch.
+            CreateTrackingBranch(repo, base_branch_name, "origin/" + base_branch_name)
+            conversation.resolved_base = base_branch_name
+        else:
+            -- Neither local nor remote. Fail.
+            error("Branch '" + base_branch_name + "' not found locally or at origin")
+
+    @guidance
+        -- `git fetch origin <branch>` downloads objects for one branch only.
+        -- Sub-second even on large repos.
+        --
+        -- Best-effort: if fetch fails (offline, auth, etc.), fall back to
+        -- local ref. If no local ref exists and fetch failed, error out.
+        --
+        -- Fast-forward: `git fetch origin <branch>:<branch>` updates the
+        -- local ref atomically if it's a fast-forward. If not (diverged),
+        -- leave the local ref as-is and log a warning. The user chose this
+        -- branch; forcing a reset would lose local commits.
+        --
+        -- Tracking branch: `git branch --track <name> origin/<name>`.
+        -- Ensures merge-back and behind/ahead polling work on local refs.
+}
+
+-- ===========================================================
+-- 3. TASK APPROVAL -- GIT OPERATIONS (REQ-PROJ-003, 004, 006, 012)
 -- ===========================================================
 
 -- REQ-PROJ-003/012: propose_plan tool intercepted by bedrock.
@@ -182,7 +337,11 @@ rule TaskApprovalExecuted {
     let proposal = conversation.proposal
     let task_id = next_task_id(project)
     let slug = derive_slug(proposal.title)
-    let base_branch = conversation.desired_base_branch or project.repo.current_branch
+    -- base_branch resolved via MaterializeBranch (REQ-PROJ-022):
+    -- single-branch fetch, then local ref (fast-forwarded or newly created).
+    let base_branch = conversation.resolved_base
+        or conversation.desired_base_branch
+        or project.repo.current_branch
     let branch_name = "task-" + task_id + "-" + slug
     let worktree_path = project.repo.root_path + "/" + config.worktree_base_dir + "/" + conversation.id
 
@@ -227,7 +386,8 @@ rule TaskApprovalExecuted {
         --   8. Create branch (git branch), then worktree (git worktree add)
         --
         -- Path B (desired base differs from current HEAD):
-        --   1. Validate desired_base_branch exists (rev-parse --verify)
+        --   1. MaterializeBranch: fetch origin/<base>, fast-forward or
+        --      create tracking branch (REQ-PROJ-022)
         --   2. Assign task ID
         --   3. Create worktree + branch in one step:
         --      `git worktree add -b <branch> <path> <base_branch>`
@@ -259,7 +419,7 @@ rule TaskRejectionNoGitOps {
 }
 
 -- ===========================================================
--- 3. TASK COMPLETION (REQ-PROJ-009, REQ-PROJ-017)
+-- 4. TASK COMPLETION (REQ-PROJ-009, REQ-PROJ-017)
 -- ===========================================================
 
 -- REQ-PROJ-009: Pre-checks before completion
@@ -342,7 +502,7 @@ rule ConfirmComplete {
 }
 
 -- ===========================================================
--- 4. TASK ABANDONMENT (REQ-PROJ-010)
+-- 5. TASK ABANDONMENT (REQ-PROJ-010)
 -- ===========================================================
 
 -- REQ-PROJ-010: User confirms abandonment
@@ -406,7 +566,42 @@ rule ConfirmAbandon {
 }
 
 -- ===========================================================
--- 5. WRITE SCOPING (REQ-PROJ-007)
+-- 6. COMMITS-BEHIND POLLING (REQ-PROJ-011, REQ-PROJ-023)
+-- ===========================================================
+
+-- REQ-PROJ-023: Remote-aware commits-behind polling
+rule CommitsBehindPoll {
+    when: PollerFires(conversation, interval: 60 seconds)
+
+    requires: conversation.mode = work
+    requires: conversation.has_connected_clients
+
+    let worktree = Worktree{conversation: conversation}
+
+    -- Single-branch fetch before comparison (best-effort)
+    ensures: BestEffortFetch(worktree.project.repo, worktree.base_branch)
+
+    ensures: conversation.commits_behind =
+        commits_between(worktree.branch_name, worktree.base_branch)
+    ensures: conversation.commits_ahead =
+        commits_between(worktree.base_branch, worktree.branch_name)
+
+    -- Emit SSE only when values change
+    ensures:
+        if values_changed:
+            SseEmit(conversation, commits_behind, commits_ahead)
+
+    @guidance
+        -- `git fetch origin <base_branch>` before rev-list comparison.
+        -- Single-branch fetch: sub-second, even on large repos.
+        -- Failure is non-fatal; comparison proceeds against local refs.
+        --
+        -- Poller exits when broadcast channel has no receivers
+        -- (client disconnected).
+}
+
+-- ===========================================================
+-- 7. WRITE SCOPING (REQ-PROJ-007)
 -- ===========================================================
 
 -- REQ-PROJ-007: Writes scoped to worktree
@@ -421,7 +616,7 @@ rule WriteBlockedOutsideWorktree {
 }
 
 -- ===========================================================
--- 6. SUB-AGENT WORKTREE INHERITANCE (REQ-PROJ-008)
+-- 8. SUB-AGENT WORKTREE INHERITANCE (REQ-PROJ-008)
 -- ===========================================================
 
 -- REQ-PROJ-008: Work sub-agent inherits parent worktree
@@ -457,7 +652,7 @@ rule ExploreSubAgentDirectory {
 }
 
 -- ===========================================================
--- 7. WORKTREE RECONCILIATION ON SERVER RESTART
+-- 9. WORKTREE RECONCILIATION ON SERVER RESTART
 -- ===========================================================
 
 -- Worktree reconciliation on server restart.
@@ -554,6 +749,14 @@ invariant TaskFileStatusMatchesLifecycle {
             t.project.work_conversations.any(c => c.task_id = t.task_id)
 }
 
+-- REQ-PROJ-020/022: No blanket fetches
+-- Every `git fetch` call must include a refspec targeting a single branch.
+-- `git fetch --prune` (all refs) is prohibited.
+invariant NoBlanketFetch {
+    for all git_fetch_invocations:
+        refspec is not empty
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
@@ -588,5 +791,33 @@ surface ProjectManagement {
         -- the completion/abandonment still proceeds. Failures are logged.
 }
 
+surface BranchPicker {
+    facing user: bedrock/User
+
+    context project: Project
+
+    exposes:
+        ListLocalBranches(project)         -- instant, no network
+        SearchRemoteBranches(project, query) -- on-demand, cached ls-remote
+        project.repo.remote_default_branch
+
+    provides:
+        UserOpensBranchPicker(project)
+        UserSearchesBranches(project, query)
+
+    @guarantee ListingIsInstant
+        -- The no-query branch listing path never touches the network.
+        -- It returns local branches sorted by recency with staleness
+        -- signals based on cached remote-tracking refs.
+
+    @guarantee SearchIsCached
+        -- `git ls-remote` results are cached for at least 5 minutes.
+        -- Rapid successive keystrokes filter the cache, not the network.
+
+    @guarantee MaterializationIsTargeted
+        -- When a branch is selected and the task is approved, only that
+        -- branch is fetched. No blanket `git fetch` or `git fetch --prune`.
+}
+
 -- No open questions. All requirements are either modeled or explicitly
--- excluded by scope (UI, platform detection, descoped registry).
+-- excluded by scope (UI layout, platform detection, descoped registry).

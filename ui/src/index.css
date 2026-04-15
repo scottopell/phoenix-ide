@@ -4353,9 +4353,114 @@ html * {
   margin-top: 8px;
 }
 
-.branch-selector .settings-select {
+.branch-combobox {
+  position: relative;
+}
+
+.branch-combobox-input {
+  width: 100%;
   font-size: 12px;
   padding: 6px 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  outline: none;
+}
+
+.branch-combobox-input:focus {
+  border-color: var(--accent-color);
+}
+
+.branch-combobox-value {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.branch-combobox-loading {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.branch-combobox-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  z-index: 100;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.branch-combobox-item {
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.branch-combobox-item:hover {
+  background: var(--bg-hover);
+}
+
+.branch-combobox-item--selected {
+  background: var(--bg-hover);
+}
+
+.branch-combobox-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch-combobox-empty {
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.branch-tag {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg-tertiary, rgba(255, 255, 255, 0.08));
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.branch-tag--remote {
+  background: rgba(59, 130, 246, 0.15);
+  color: rgb(96, 165, 250);
+}
+
+.branch-behind-badge {
+  font-size: 10px;
+  color: rgb(251, 191, 36);
+  flex-shrink: 0;
 }
 
 /* Expanded settings inside card */

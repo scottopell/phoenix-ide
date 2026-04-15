@@ -290,9 +290,17 @@ export interface McpReloadResult {
   unchanged: string[];
 }
 
+export interface GitBranchEntry {
+  name: string;
+  local: boolean;
+  remote: boolean;
+  behind_remote?: number;
+}
+
 export interface GitBranchesResponse {
-  branches: string[];
+  branches: GitBranchEntry[];
   current: string;
+  default_branch?: string;
 }
 
 export interface AuthStatus {
@@ -409,8 +417,10 @@ export const api = {
     return resp.json();
   },
 
-  async listGitBranches(cwd: string): Promise<GitBranchesResponse> {
-    const resp = await fetch(`/api/git/branches?cwd=${encodeURIComponent(cwd)}`);
+  async listGitBranches(cwd: string, search?: string): Promise<GitBranchesResponse> {
+    let url = `/api/git/branches?cwd=${encodeURIComponent(cwd)}`;
+    if (search) url += `&search=${encodeURIComponent(search)}`;
+    const resp = await fetch(url);
     if (!resp.ok) throw new Error('Failed to list git branches');
     return resp.json();
   },

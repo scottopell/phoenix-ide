@@ -1,8 +1,8 @@
-import { useId } from 'react';
+import { useId, useRef, useState, useEffect, useCallback } from 'react';
 import { LlmStatusBanner } from './LlmStatusBanner';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
-import type { ModelsResponse } from '../api';
+import type { GitBranchEntry, ModelsResponse } from '../api';
 
 interface ConversationSettingsProps {
   cwd: string;
@@ -26,13 +26,29 @@ interface ConversationSettingsProps {
   /** Callback to change mode */
   setMode?: (m: 'direct' | 'managed') => void;
   /** Available git branches for the current directory */
-  branches?: string[];
+  branches?: GitBranchEntry[];
   /** Currently checked-out branch */
   currentBranch?: string | null;
   /** User-selected base branch (null means use current) */
   baseBranch?: string | null;
   /** Callback to change base branch selection */
   setBaseBranch?: (b: string | null) => void;
+  /** Remote default branch name (e.g. "main") */
+  defaultBranch?: string | null;
+  /** Current search query for remote branch search */
+  branchSearch?: string;
+  /** Callback to update branch search query */
+  setBranchSearch?: (q: string) => void;
+  /** Whether a remote branch search is in progress */
+  branchSearchLoading?: boolean;
+}
+
+function branchLabel(b: GitBranchEntry, currentBranch?: string | null): string {
+  let label = b.name;
+  if (b.name === currentBranch) label += ' (current)';
+  else if (!b.local && b.remote) label += ' (remote)';
+  if (b.behind_remote && b.behind_remote > 0) label += ` \u2022 ${b.behind_remote} behind origin`;
+  return label;
 }
 
 export function ConversationSettings({
@@ -55,8 +71,40 @@ export function ConversationSettings({
   currentBranch,
   baseBranch,
   setBaseBranch,
+  defaultBranch,
+  branchSearch = '',
+  setBranchSearch,
+  branchSearchLoading,
 }: ConversationSettingsProps) {
   const radioGroupName = useId();
+  const [comboOpen, setComboOpen] = useState(false);
+  const comboRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Close dropdown on outside click.
+  useEffect(() => {
+    if (!comboOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (comboRef.current && !comboRef.current.contains(e.target as Node)) {
+        setComboOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [comboOpen]);
+
+  const selectBranch = useCallback((name: string) => {
+    setBaseBranch?.(name === currentBranch ? null : name);
+    setBranchSearch?.('');
+    setComboOpen(false);
+  }, [currentBranch, setBaseBranch, setBranchSearch]);
+
+  const selectedName = baseBranch ?? currentBranch ?? '';
+
+  // Build display list: current branch first, then the rest in order received
+  // (already sorted by recency from backend for local, or relevance for search).
+  const displayBranches = branches ?? [];
+
   return (
     <>
       <LlmStatusBanner models={models} />
@@ -135,30 +183,64 @@ export function ConversationSettings({
         </div>
       )}
 
-      {isGitDir && mode === 'managed' && branches && branches.length > 0 && (
-        <label className="settings-field branch-selector">
+      {isGitDir && mode === 'managed' && (
+        <div className="settings-field branch-selector" ref={comboRef}>
           <span className="settings-field-label">Branch</span>
-          <select
-            className="settings-select"
-            value={baseBranch ?? currentBranch ?? ''}
-            onChange={(e) => {
-              const val = e.target.value;
-              setBaseBranch?.(val === currentBranch ? null : val);
-            }}
-          >
-            {currentBranch && (
-              <option value={currentBranch}>
-                {currentBranch} (current)
-              </option>
+          <div className="branch-combobox">
+            <input
+              ref={inputRef}
+              type="text"
+              className="settings-input branch-combobox-input"
+              placeholder={selectedName || 'Search branches...'}
+              value={comboOpen ? branchSearch : ''}
+              onFocus={() => setComboOpen(true)}
+              onChange={(e) => setBranchSearch?.(e.target.value)}
+            />
+            {!comboOpen && selectedName && (
+              <span
+                className="branch-combobox-value"
+                onClick={() => { setComboOpen(true); inputRef.current?.focus(); }}
+              >
+                {selectedName}
+                {(() => {
+                  const entry = displayBranches.find(b => b.name === selectedName);
+                  if (entry?.behind_remote && entry.behind_remote > 0) {
+                    return <span className="branch-behind-badge">{entry.behind_remote} behind</span>;
+                  }
+                  return null;
+                })()}
+              </span>
             )}
-            {branches
-              .filter(b => b !== currentBranch)
-              .toSorted((a, b) => a.localeCompare(b))
-              .map(b => (
-                <option key={b} value={b}>{b}</option>
-              ))}
-          </select>
-        </label>
+            {branchSearchLoading && <span className="branch-combobox-loading">...</span>}
+            {comboOpen && (
+              <div className="branch-combobox-dropdown">
+                {defaultBranch && !branchSearch && (
+                  <div
+                    className={`branch-combobox-item branch-combobox-item--default ${selectedName === defaultBranch ? 'branch-combobox-item--selected' : ''}`}
+                    onClick={() => selectBranch(defaultBranch)}
+                  >
+                    {defaultBranch} <span className="branch-tag">default</span>
+                  </div>
+                )}
+                {displayBranches
+                  .filter(b => !branchSearch || b.name !== defaultBranch)
+                  .map(b => (
+                    <div
+                      key={b.name}
+                      className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
+                      onClick={() => selectBranch(b.name)}
+                    >
+                      <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
+                      {!b.local && b.remote && <span className="branch-tag branch-tag--remote">remote</span>}
+                    </div>
+                  ))}
+                {displayBranches.length === 0 && branchSearch && !branchSearchLoading && (
+                  <div className="branch-combobox-empty">No matching branches</div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </>
   );
