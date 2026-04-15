@@ -2458,7 +2458,7 @@ fn execute_approve_task_blocking(
 
 /// Ensure .gitignore in the given directory contains `.phoenix/`.
 /// Creates .gitignore if it doesn't exist. Stages the change if modified.
-fn ensure_gitignore_has_phoenix(dir: &std::path::Path) -> Result<(), String> {
+pub(crate) fn ensure_gitignore_has_phoenix(dir: &std::path::Path) -> Result<(), String> {
     use std::io::Write as _;
 
     let gitignore_path = dir.join(".gitignore");

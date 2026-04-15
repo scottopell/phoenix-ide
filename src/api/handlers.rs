@@ -21,7 +21,7 @@ use crate::llm::{
     ContentBlock, GatewayStatus, LlmMessage, LlmRequest, MessageRole,
     SystemContent as LlmSystemContent,
 };
-use crate::runtime::executor::{run_git, TASK_APPROVAL_MUTEX};
+use crate::runtime::executor::{ensure_gitignore_has_phoenix, run_git, TASK_APPROVAL_MUTEX};
 use crate::runtime::SseEvent;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
@@ -561,6 +561,7 @@ async fn create_conversation(
     // Direct mode is the default. "managed" opts in to Explore/Work lifecycle (requires git).
     // "auto" delegates the choice to the backend: managed if cwd is in a git repo,
     // direct otherwise (REQ-SEED-002).
+    // "branch" checks out an existing branch in a worktree (REQ-PROJ-024).
     let resolved_mode: &str = match req.mode.as_deref() {
         Some("auto") => {
             if project_id.is_some() {
@@ -574,17 +575,74 @@ async fn create_conversation(
         Some(other) => other,
         None => "direct",
     };
-    let conv_mode = match resolved_mode {
-        "managed" => {
-            if project_id.is_none() {
-                return Err(AppError::BadRequest(
-                    "Managed mode requires a git repository".to_string(),
-                ));
-            }
-            crate::db::ConvMode::Explore
+
+    // Branch mode: create worktree on existing branch (REQ-PROJ-024)
+    let (conv_mode, effective_cwd) = if resolved_mode == "branch" {
+        let branch_name = req.base_branch.as_deref().ok_or_else(|| {
+            AppError::BadRequest(
+                "Branch mode requires base_branch (the branch name to check out)".to_string(),
+            )
+        })?;
+        if project_id.is_none() {
+            return Err(AppError::BadRequest(
+                "Branch mode requires a git repository".to_string(),
+            ));
         }
-        _ => crate::db::ConvMode::Direct,
+        let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
+            AppError::BadRequest("Could not determine git repository root".to_string())
+        })?;
+
+        let conv_id = id.clone();
+        let branch = branch_name.to_string();
+        let repo = repo_root.clone();
+        let db = state.db.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            create_branch_worktree_blocking(&repo, &conv_id, &branch, &db)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+
+        match result {
+            Ok(info) => {
+                let mode = crate::db::ConvMode::Branch {
+                    branch_name: info.branch_name.clone(),
+                    worktree_path: info.worktree_path.clone(),
+                    base_branch: info.base_branch,
+                };
+                (mode, info.worktree_path)
+            }
+            Err(BranchWorktreeError::Conflict { slug }) => {
+                return Err(AppError::Conflict(ConflictErrorResponse::new(
+                    format!(
+                        "Branch already has an active conversation: {slug}. \
+                         Navigate to that conversation or abandon it first."
+                    ),
+                    "branch_already_active",
+                )));
+            }
+            Err(BranchWorktreeError::Git(msg)) => {
+                return Err(AppError::Internal(msg));
+            }
+            Err(BranchWorktreeError::BadRequest(msg)) => {
+                return Err(AppError::BadRequest(msg));
+            }
+        }
+    } else {
+        let mode = match resolved_mode {
+            "managed" => {
+                if project_id.is_none() {
+                    return Err(AppError::BadRequest(
+                        "Managed mode requires a git repository".to_string(),
+                    ));
+                }
+                crate::db::ConvMode::Explore
+            }
+            _ => crate::db::ConvMode::Direct,
+        };
+        (mode, req.cwd.clone())
     };
+
     let desired_base_branch = if resolved_mode == "managed" {
         req.base_branch.as_deref()
     } else {
@@ -596,7 +654,7 @@ async fn create_conversation(
         .create_conversation_with_project(
             &id,
             &slug,
-            &req.cwd,
+            &effective_cwd,
             true,                 // user_initiated
             None,                 // no parent
             req.model.as_deref(), // selected model
@@ -615,7 +673,7 @@ async fn create_conversation(
     // dispatch in that case.
     if !(is_seeded && req.text.trim().is_empty()) {
         // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
-        let working_dir_for_expand = std::path::PathBuf::from(&req.cwd);
+        let working_dir_for_expand = std::path::PathBuf::from(&effective_cwd);
         let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
             .map_err(|e| {
                 AppError::UnprocessableEntity(ExpansionErrorResponse {
@@ -659,6 +717,182 @@ async fn create_conversation(
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
     }))
+}
+
+// ============================================================
+// Branch Mode Worktree Creation (REQ-PROJ-024)
+// ============================================================
+
+struct BranchWorktreeInfo {
+    branch_name: String,
+    worktree_path: String,
+    base_branch: String,
+}
+
+enum BranchWorktreeError {
+    Conflict { slug: String },
+    Git(String),
+    BadRequest(String),
+}
+
+/// Create a git worktree for an existing branch. Runs on a blocking thread.
+///
+/// 1. Single-branch fetch (best-effort, REQ-PROJ-022 reuse)
+/// 2. Materialize local ref if remote-only
+/// 3. Create `.phoenix/worktrees/<conv_id>` worktree
+/// 4. Ensure `.phoenix/` is in `.gitignore`
+#[allow(clippy::too_many_lines)] // Sequential git flow; splitting hurts readability
+fn create_branch_worktree_blocking(
+    repo_root: &str,
+    conv_id: &str,
+    branch_name: &str,
+    db: &crate::db::Database,
+) -> Result<BranchWorktreeInfo, BranchWorktreeError> {
+    let cwd = std::path::Path::new(repo_root);
+
+    // Validate git repo
+    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        return Err(BranchWorktreeError::BadRequest(
+            "Directory is not a git repository".to_string(),
+        ));
+    }
+
+    // Determine current branch for base_branch metadata
+    let current_branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|_| "HEAD".to_string())
+        .trim()
+        .to_string();
+    let default_branch = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("refs/remotes/origin/")
+                .map(String::from)
+        })
+        .unwrap_or_else(|| current_branch.clone());
+
+    // REQ-PROJ-022: single-branch fetch to get the latest remote tip.
+    let refspec = format!("refs/heads/{branch_name}:refs/remotes/origin/{branch_name}");
+    if let Err(e) = run_git(cwd, &["fetch", "origin", &refspec]) {
+        tracing::debug!(
+            branch = %branch_name,
+            error = %e,
+            "Single-branch fetch failed (non-fatal, using local ref)"
+        );
+    }
+
+    // Materialize branch: ensure a local ref exists.
+    let has_local = run_git(cwd, &["rev-parse", "--verify", branch_name]).is_ok();
+    let remote_ref = format!("origin/{branch_name}");
+    let has_remote = run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok();
+
+    if has_local && has_remote {
+        // Fast-forward local to remote tip if possible.
+        let local_sha = run_git(cwd, &["rev-parse", branch_name]).unwrap_or_default();
+        let remote_sha = run_git(cwd, &["rev-parse", &remote_ref]).unwrap_or_default();
+        if local_sha.trim() != remote_sha.trim()
+            && run_git(
+                cwd,
+                &["merge-base", "--is-ancestor", branch_name, &remote_ref],
+            )
+            .is_ok()
+        {
+            let current_head =
+                run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+            if current_head.trim() != branch_name {
+                let _ = run_git(
+                    cwd,
+                    &[
+                        "update-ref",
+                        &format!("refs/heads/{branch_name}"),
+                        remote_sha.trim(),
+                    ],
+                );
+                tracing::info!(branch = %branch_name, "Fast-forwarded local branch to remote tip");
+            }
+        }
+    } else if !has_local && has_remote {
+        // Remote-only: create local tracking branch.
+        run_git(cwd, &["branch", "--track", branch_name, &remote_ref]).map_err(|e| {
+            BranchWorktreeError::Git(format!(
+                "Failed to create local branch '{branch_name}' from {remote_ref}: {e}"
+            ))
+        })?;
+        tracing::info!(
+            branch = %branch_name,
+            "Created local tracking branch from remote"
+        );
+    } else if !has_local && !has_remote {
+        return Err(BranchWorktreeError::BadRequest(format!(
+            "Branch '{branch_name}' not found locally or at origin"
+        )));
+    }
+
+    // Create .phoenix/worktrees/ directory
+    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
+    std::fs::create_dir_all(&phoenix_dir).map_err(|e| {
+        BranchWorktreeError::Git(format!("Failed to create .phoenix/worktrees/: {e}"))
+    })?;
+
+    let worktree_path = phoenix_dir.join(conv_id);
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    // Create worktree (existing branch, no -b flag)
+    match run_git(cwd, &["worktree", "add", &worktree_path_str, branch_name]) {
+        Ok(_) => {}
+        Err(e) if e.contains("already checked out") => {
+            // REQ-PROJ-025: branch conflict detection.
+            // Query the database for an active conversation on this branch.
+            let slug = find_active_branch_conversation_slug(db, branch_name);
+            if let Some(slug) = slug {
+                return Err(BranchWorktreeError::Conflict { slug });
+            }
+            // No matching conversation found -- orphaned checkout. Report the git error.
+            return Err(BranchWorktreeError::Git(format!(
+                "Branch '{branch_name}' is already checked out in another worktree. \
+                 Use `git worktree list` to inspect. Error: {e}"
+            )));
+        }
+        Err(e) => {
+            return Err(BranchWorktreeError::Git(format!(
+                "Failed to create worktree for branch '{branch_name}': {e}"
+            )));
+        }
+    }
+
+    // Ensure .phoenix/ is in .gitignore at the repo root
+    if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
+        tracing::warn!(error = %e, "Failed to update .gitignore (non-fatal)");
+    }
+
+    tracing::info!(
+        branch = %branch_name,
+        worktree = %worktree_path_str,
+        "Created Branch-mode worktree (REQ-PROJ-024)"
+    );
+
+    Ok(BranchWorktreeInfo {
+        branch_name: branch_name.to_string(),
+        worktree_path: worktree_path_str,
+        base_branch: default_branch,
+    })
+}
+
+/// Look up the slug of a non-terminal conversation that owns this branch.
+/// Runs synchronously (called from a blocking thread).
+fn find_active_branch_conversation_slug(
+    db: &crate::db::Database,
+    branch_name: &str,
+) -> Option<String> {
+    // Use a blocking runtime handle to query the async DB.
+    let rt = tokio::runtime::Handle::try_current().ok()?;
+    let convs = rt.block_on(db.get_work_conversations()).ok()?;
+    convs
+        .iter()
+        .find(|c| {
+            c.conv_mode.branch_name().is_some_and(|b| b == branch_name) && !c.state.is_terminal()
+        })
+        .and_then(|c| c.slug.clone())
 }
 
 // ============================================================
