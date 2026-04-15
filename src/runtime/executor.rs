@@ -1749,6 +1749,7 @@ where
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
                             attempt: 0,
+                            recovery_in_progress: e.recovery_in_progress,
                         })
                         .await;
                 }
@@ -2463,6 +2464,7 @@ fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
         LlmErrorKind::ContextWindowExceeded => LlmOutcome::TokenBudgetExceeded,
         LlmErrorKind::Auth => LlmOutcome::AuthError {
             message: error.message,
+            recovery_in_progress: error.recovery_in_progress,
         },
         LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
             message: error.message,

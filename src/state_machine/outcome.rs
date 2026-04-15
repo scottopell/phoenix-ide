@@ -37,8 +37,12 @@ pub enum LlmOutcome {
     NetworkError { message: String },
     /// Token budget exceeded
     TokenBudgetExceeded,
-    /// Authentication error (401/403) — non-retryable
-    AuthError { message: String },
+    /// Authentication error (401/403) — non-retryable.
+    /// `recovery_in_progress` is true when a credential helper is actively running.
+    AuthError {
+        message: String,
+        recovery_in_progress: bool,
+    },
     /// Request rejected (400, content filter, etc.) — non-retryable
     RequestRejected { message: String },
     /// Request was cancelled (abort signal received)

@@ -14,7 +14,7 @@
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolOutcome};
 use super::state::{
-    AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, SubAgentResult,
+    AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, RecoveryKind, SubAgentResult,
     TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
@@ -490,6 +490,32 @@ pub fn transition(
             }))
         }
 
+        // REQ-BED-030: Auth error with recovery in progress -> AwaitingRecovery
+        // Must be checked before the catch-all Error arm below.
+        (
+            ConvState::LlmRequesting { .. },
+            Event::LlmError {
+                message,
+                error_kind,
+                recovery_in_progress: true,
+                ..
+            },
+        ) if matches!(error_kind, ErrorKind::Auth) && !context.is_sub_agent => {
+            Ok(TransitionResult::new(ConvState::AwaitingRecovery {
+                message: message.clone(),
+                error_kind: error_kind.clone(),
+                recovery_kind: RecoveryKind::Credential,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change(
+                "awaiting_recovery",
+                json!({
+                    "message": message,
+                    "recovery_kind": "credential"
+                }),
+            )))
+        }
+
         // LlmRequesting + LlmError (non-retryable or exhausted) -> Error
         (
             ConvState::LlmRequesting { attempt },
@@ -529,6 +555,41 @@ pub fn transition(
                 TransitionResult::new(ConvState::LlmRequesting { attempt: *attempt })
                     .with_effect(Effect::RequestLlm),
             )
+        }
+
+        // ============================================================
+        // Active Recovery (REQ-BED-030)
+        // ============================================================
+
+        // AwaitingRecovery + CredentialBecameAvailable -> retry LLM request
+        (ConvState::AwaitingRecovery { .. }, Event::CredentialBecameAvailable) => Ok(
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 0 })
+                .with_effect(Effect::RequestLlm),
+        ),
+
+        // AwaitingRecovery + CredentialHelperFailed -> Error (genuinely terminal)
+        (
+            ConvState::AwaitingRecovery {
+                message,
+                error_kind,
+                ..
+            },
+            Event::CredentialHelperFailed { .. },
+        ) => Ok(TransitionResult::new(ConvState::Error {
+            message: message.clone(),
+            error_kind: error_kind.clone(),
+        })
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change(
+            "error",
+            json!({ "message": message }),
+        ))),
+
+        // AwaitingRecovery + UserCancel -> Idle
+        (ConvState::AwaitingRecovery { .. }, Event::UserCancel { .. }) => {
+            Ok(TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change("idle", json!({}))))
         }
 
         // ============================================================
@@ -1501,6 +1562,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 message: "Rate limited".to_string(),
                 error_kind: ErrorKind::RateLimit,
                 attempt,
+                recovery_in_progress: false,
             }
         }
         LlmOutcome::ServerError { status, body } => {
@@ -1509,6 +1571,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 message: format!("Server error {status}: {body}"),
                 error_kind: ErrorKind::ServerError,
                 attempt,
+                recovery_in_progress: false,
             }
         }
         LlmOutcome::NetworkError { message } => {
@@ -1517,6 +1580,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 message,
                 error_kind: ErrorKind::Network,
                 attempt,
+                recovery_in_progress: false,
             }
         }
         LlmOutcome::TokenBudgetExceeded => {
@@ -1525,14 +1589,19 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 message: "Token budget exceeded".to_string(),
                 error_kind: ErrorKind::ContextExhausted,
                 attempt,
+                recovery_in_progress: false,
             }
         }
-        LlmOutcome::AuthError { message } => {
+        LlmOutcome::AuthError {
+            message,
+            recovery_in_progress,
+        } => {
             let attempt = current_attempt(state);
             Event::LlmError {
                 message,
                 error_kind: ErrorKind::Auth,
                 attempt,
+                recovery_in_progress,
             }
         }
         LlmOutcome::RequestRejected { message } => {
@@ -1541,6 +1610,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 message,
                 error_kind: ErrorKind::InvalidRequest,
                 attempt,
+                recovery_in_progress: false,
             }
         }
         LlmOutcome::Cancelled => {
@@ -1549,6 +1619,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 message: "Request cancelled".to_string(),
                 error_kind: ErrorKind::Cancelled,
                 attempt,
+                recovery_in_progress: false,
             }
         }
     }
@@ -2211,6 +2282,7 @@ mod tests {
                 message: "Request timeout".to_string(),
                 error_kind: ErrorKind::Network, // retryable
                 attempt: 3,
+                recovery_in_progress: false,
             },
         )
         .unwrap();
@@ -2256,6 +2328,7 @@ mod tests {
                 message: "Invalid API key".to_string(),
                 error_kind: ErrorKind::Auth, // non-retryable
                 attempt: 1,
+                recovery_in_progress: false,
             },
         )
         .unwrap();
@@ -2288,6 +2361,7 @@ mod tests {
                 message: "Request timeout".to_string(),
                 error_kind: ErrorKind::Network,
                 attempt: 3,
+                recovery_in_progress: false,
             },
         )
         .unwrap();

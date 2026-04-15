@@ -45,6 +45,10 @@ pub enum Event {
         error_kind: ErrorKind,
         #[allow(dead_code)] // Reserved for retry tracking
         attempt: u32,
+        /// When true, a recovery mechanism (e.g. credential helper) is actively
+        /// running and may resolve this error. The transition function uses this
+        /// to choose `AwaitingRecovery` vs `Error` (REQ-BED-030).
+        recovery_in_progress: bool,
     },
     RetryTimeout {
         attempt: u32,
@@ -107,6 +111,18 @@ pub enum Event {
         result: Option<String>,
     },
 
+    // Recovery events (REQ-BED-030)
+    /// Credential helper succeeded — conversations in `AwaitingRecovery` should retry.
+    #[allow(dead_code)]
+    // Constructed by executor in Phase 2 (credential helper settlement wiring)
+    CredentialBecameAvailable,
+    /// Credential helper failed — conversations in `AwaitingRecovery` transition to `Error`.
+    #[allow(dead_code)]
+    // Constructed by executor in Phase 2 (credential helper settlement wiring)
+    CredentialHelperFailed {
+        message: String,
+    },
+
     // Task resolution events (REQ-BED-029)
     /// Task completed or abandoned — transitions conversation to Terminal.
     /// Sent by the API handler after git operations succeed.
@@ -140,6 +156,8 @@ impl Event {
             Event::TaskApprovalResponse { .. } => "TaskApprovalResponse",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
+            Event::CredentialBecameAvailable => "CredentialBecameAvailable",
+            Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
             Event::TaskResolved { .. } => "TaskResolved",
         }
     }

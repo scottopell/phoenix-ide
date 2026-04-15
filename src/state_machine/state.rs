@@ -343,6 +343,14 @@ impl AssistantMessage {
 // Conversation State
 // ============================================================================
 
+/// Active recovery mechanism in flight (REQ-BED-030).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryKind {
+    /// Credential helper subprocess is running (OIDC flow in progress).
+    Credential,
+}
+
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -424,6 +432,15 @@ pub enum ConvState {
     Error {
         message: String,
         error_kind: ErrorKind,
+    },
+
+    /// Recovery mechanism active — waiting for external resolution (REQ-BED-030).
+    /// Distinct from `Error`: something is in flight to fix the problem.
+    /// Transitions to `LlmRequesting` on success, `Error` on failure, `Idle` on cancel.
+    AwaitingRecovery {
+        message: String,
+        error_kind: ErrorKind,
+        recovery_kind: RecoveryKind,
     },
 
     /// Awaiting continuation summary from LLM (tool-less request in flight)
@@ -554,6 +571,7 @@ impl ConvState {
             ConvState::Completed { .. } => "Completed",
             ConvState::Failed { .. } => "Failed",
             ConvState::Error { .. } => "Error",
+            ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
             ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
             ConvState::ContextExhausted { .. } => "ContextExhausted",
             ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
@@ -587,6 +605,7 @@ impl ConvState {
             | ConvState::AwaitingSubAgents { .. }
             | ConvState::CancellingSubAgents { .. }
             | ConvState::Error { .. }
+            | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. } => StepResult::Continue,
@@ -611,6 +630,7 @@ impl ConvState {
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
             | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. } => DisplayState::Working,
         }
     }
