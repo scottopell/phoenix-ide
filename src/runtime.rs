@@ -70,6 +70,8 @@ pub struct RuntimeManager {
     /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
+    /// Credential helper for recovery settlement (REQ-BED-030).
+    credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
 }
 
 /// Handle to interact with a running conversation
@@ -206,6 +208,7 @@ impl RuntimeManager {
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
+        credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
@@ -221,6 +224,7 @@ impl RuntimeManager {
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
+            credential_helper,
         }
     }
 
@@ -413,7 +417,8 @@ impl RuntimeManager {
             broadcast_tx.clone(),
         )
         .with_parent(parent_event_tx.clone())
-        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone());
+        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+        .with_credential_helper(self.credential_helper.clone());
 
         // 7. Store handle
         self.runtimes.write().await.insert(
@@ -617,7 +622,8 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcast_tx.clone(),
         )
-        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone());
+        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+        .with_credential_helper(self.credential_helper.clone());
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs

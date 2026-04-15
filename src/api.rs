@@ -51,6 +51,7 @@ impl AppState {
             llm_registry.clone(),
             platform,
             mcp_manager.clone(),
+            credential_helper.clone(),
         ));
         runtime.start_sub_agent_handler().await;
         let terminals = runtime.terminals.clone();

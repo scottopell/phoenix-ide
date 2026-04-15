@@ -118,6 +118,9 @@ where
     /// then the forwarder wraps the result in `EffectOutcome` for this channel.
     outcome_tx: mpsc::Sender<EffectOutcome>,
     outcome_rx: mpsc::Receiver<EffectOutcome>,
+    /// Credential helper for recovery settlement (REQ-BED-030).
+    /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
+    credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -172,7 +175,17 @@ where
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             outcome_tx,
             outcome_rx,
+            credential_helper: None,
         }
+    }
+
+    /// Set the credential helper for recovery settlement (REQ-BED-030).
+    pub fn with_credential_helper(
+        mut self,
+        helper: Option<Arc<crate::llm::CredentialHelper>>,
+    ) -> Self {
+        self.credential_helper = helper;
+        self
     }
 
     /// Override the parent tool-use cycle cap. Test-only: production code
@@ -200,6 +213,7 @@ where
         self
     }
 
+    #[allow(clippy::too_many_lines)] // Sequential event loop; splitting hurts readability
     pub async fn run(mut self) {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
@@ -209,7 +223,6 @@ where
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
             if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
                 tracing::error!(error = %e, "Failed to resume LLM request");
-                // Internal error: log full detail, ship a generic message.
                 let _ = self.broadcast_tx.send(SseEvent::Error {
                     error: crate::runtime::user_facing_error::UserFacingError::with_action(
                         "resume the LLM request",
@@ -218,14 +231,41 @@ where
             }
         }
 
+        // REQ-BED-030: crash recovery for AwaitingRecovery.
+        // If the credential helper is still running, the select loop will pick it up.
+        // If it already settled, handle it immediately.
+        if matches!(self.state, ConvState::AwaitingRecovery { .. }) {
+            if let Some(ref helper) = self.credential_helper {
+                let status = helper.credential_status().await;
+                if !matches!(
+                    status,
+                    crate::llm::credential_helper::CredentialStatus::Running
+                ) {
+                    self.handle_credential_settlement().await;
+                }
+            } else {
+                // No credential helper available after restart — fall through to error.
+                if let Err(e) = self
+                    .process_event(Event::CredentialHelperFailed {
+                        message: "Credential helper not available after restart".to_string(),
+                    })
+                    .await
+                {
+                    tracing::error!(error = %e, "Error handling post-restart credential recovery");
+                }
+            }
+        }
+
         // Process events and outcomes in a loop - no recursion
-        // Three input sources:
+        // Four input sources:
         //   event_rx    — user events + legacy executor events (continuation, sub-agent results)
         //   outcome_rx  — typed effect outcomes (LLM, tool, persist, retry)
         //   deadline    — sub-agent timeout (REQ-SA-006, FM-6 prevention)
+        //   recovery    — credential helper settlement (REQ-BED-030)
         loop {
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.sub_agent_deadline;
+            let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
                 Some(event) = self.event_rx.recv() => {
@@ -280,11 +320,53 @@ where
                         return;
                     }
                 }
+                // REQ-BED-030: credential helper settled while awaiting recovery
+                () = async {
+                    match &self.credential_helper {
+                        Some(helper) => helper.wait_for_settlement().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if awaiting_recovery && self.credential_helper.is_some() => {
+                    self.handle_credential_settlement().await;
+                    if let StepResult::Terminal(outcome) = self.state.step_result() {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        self.emit_terminal_lifecycle_event();
+                        return;
+                    }
+                }
                 else => break,
             }
         }
 
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
+    }
+
+    /// REQ-BED-030: credential helper settled while in `AwaitingRecovery`.
+    /// Check the helper's new status and inject the appropriate event.
+    async fn handle_credential_settlement(&mut self) {
+        let Some(ref helper) = self.credential_helper else {
+            return;
+        };
+        let status = helper.credential_status().await;
+        let event = if status == crate::llm::credential_helper::CredentialStatus::Valid {
+            tracing::info!("Credential helper succeeded, retrying LLM request");
+            Event::CredentialBecameAvailable
+        } else {
+            tracing::info!(
+                ?status,
+                "Credential helper settled without valid credential"
+            );
+            Event::CredentialHelperFailed {
+                message: "Credential helper did not produce a valid credential".to_string(),
+            }
+        };
+        if let Err(e) = self.process_event(event).await {
+            tracing::error!(error = %e, "Error handling credential settlement event");
+        }
     }
 
     /// Broadcast `ConversationBecameTerminal` to all SSE subscribers.
