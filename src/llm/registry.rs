@@ -96,9 +96,14 @@ impl LlmAuth {
                 style: self.style,
             });
         }
-        let mut err =
-            super::LlmError::auth("Credential unavailable — check API key or LLM_API_KEY_HELPER");
-        err.recovery_in_progress = self.source.is_recovering().await;
+        let recovering = self.source.is_recovering().await;
+        let message = if recovering {
+            "Waiting for authentication — complete the sign-in flow to continue"
+        } else {
+            "Credential unavailable — check API key or LLM_API_KEY_HELPER"
+        };
+        let mut err = super::LlmError::auth(message);
+        err.recovery_in_progress = recovering;
         Err(err)
     }
 

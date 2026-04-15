@@ -361,7 +361,7 @@ where
                 "Credential helper settled without valid credential"
             );
             Event::CredentialHelperFailed {
-                message: "Credential helper did not produce a valid credential".to_string(),
+                message: "Authentication failed — click Retry to try again".to_string(),
             }
         };
         if let Err(e) = self.process_event(event).await {

@@ -569,12 +569,8 @@ pub fn transition(
 
         // AwaitingRecovery + CredentialHelperFailed -> Error (genuinely terminal)
         (
-            ConvState::AwaitingRecovery {
-                message,
-                error_kind,
-                ..
-            },
-            Event::CredentialHelperFailed { .. },
+            ConvState::AwaitingRecovery { error_kind, .. },
+            Event::CredentialHelperFailed { message },
         ) => Ok(TransitionResult::new(ConvState::Error {
             message: message.clone(),
             error_kind: error_kind.clone(),

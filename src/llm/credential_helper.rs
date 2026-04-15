@@ -86,11 +86,14 @@ impl CredentialHelper {
     /// Wait until the helper transitions out of Running (to Valid or Failed).
     /// Returns immediately if not currently Running.
     pub async fn wait_for_settlement(&self) {
-        // Check if already settled before awaiting.
+        // Register the notification future BEFORE checking the lock.
+        // If we checked first then registered, a settlement between
+        // the check and the registration would be lost (TOCTOU).
+        let notified = self.settled.notified();
         if !matches!(&*self.inner.lock().await, HelperInner::Running { .. }) {
             return;
         }
-        self.settled.notified().await;
+        notified.await;
     }
 
     /// Return the current observable status. Transitions Valid→Idle if TTL has expired.
