@@ -6551,8 +6551,8 @@ html * {
 }
 
 @keyframes auth-strip-expand {
-  from { opacity: 0; max-height: 0; }
-  to { opacity: 1; max-height: 300px; }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .auth-strip-output {
@@ -6563,7 +6563,7 @@ html * {
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.5;
-  max-height: 180px;
+  max-height: 300px;
   overflow-y: auto;
 }
 
