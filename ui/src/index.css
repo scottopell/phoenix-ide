@@ -6474,6 +6474,7 @@ html * {
   overflow: hidden;
   border: 1px solid var(--border-color);
   background: var(--bg-secondary);
+  flex-shrink: 0;
 }
 
 .auth-strip.running {
