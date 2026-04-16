@@ -22,19 +22,27 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
   const [errorInfo, setErrorInfo] = useState<ErrorInfo | null>(null);
   const [expanded, setExpanded] = useState(true);
   const [retryDisplay, setRetryDisplay] = useState(0);
+  // Bumping this triggers the effect to reconnect. The retry button and
+  // auto-retry timer both use this instead of calling a loose function.
+  const [connectEpoch, setConnectEpoch] = useState(0);
   const outputRef = useRef<HTMLDivElement>(null);
   const doneRef = useRef(false);
   const retryCountRef = useRef(0);
-  const esRef = useRef<EventSource | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const connect = () => {
-    if (esRef.current) {
-      esRef.current.close();
+  useEffect(() => {
+    if (!active) {
+      setLines([]);
+      setStripState('connecting');
+      setErrorInfo(null);
+      setExpanded(true);
+      doneRef.current = false;
+      retryCountRef.current = 0;
+      setRetryDisplay(0);
+      return;
     }
 
     const es = new EventSource('/api/credential-helper/run');
-    esRef.current = es;
     doneRef.current = false;
 
     es.addEventListener('message', (event) => {
@@ -59,7 +67,7 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
             setLines([]);
             setStripState('retrying');
             retryTimerRef.current = setTimeout(() => {
-              connect();
+              setConnectEpoch(e => e + 1);
             }, 2000);
           } else {
             setStripState('error');
@@ -80,7 +88,7 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
           setLines([]);
           setStripState('retrying');
           retryTimerRef.current = setTimeout(() => {
-            connect();
+            setConnectEpoch(e => e + 1);
           }, 2000);
         } else {
           setStripState('error');
@@ -90,42 +98,15 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
         es.close();
       }
     };
-  };
-
-  useEffect(() => {
-    if (!active) {
-      // Reset when deactivated
-      if (esRef.current) {
-        esRef.current.close();
-        esRef.current = null;
-      }
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
-      setLines([]);
-      setStripState('connecting');
-      setErrorInfo(null);
-      setExpanded(true);
-      doneRef.current = false;
-      retryCountRef.current = 0;
-      setRetryDisplay(0);
-      return;
-    }
-
-    connect();
 
     return () => {
-      if (esRef.current) {
-        esRef.current.close();
-        esRef.current = null;
-      }
+      es.close();
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
     };
-  }, [active]);
+  }, [active, connectEpoch]);
 
   // Auto-scroll output
   useEffect(() => {
@@ -196,7 +177,7 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
                   setLines([]);
                   setErrorInfo(null);
                   setStripState('connecting');
-                  connect();
+                  setConnectEpoch(e => e + 1);
                 }}
               >
                 Retry

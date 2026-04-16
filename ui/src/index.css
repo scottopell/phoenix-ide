@@ -6591,6 +6591,21 @@ html * {
   word-break: break-all;
 }
 
+.auth-strip-retry {
+  margin-top: 8px;
+  padding: 4px 12px;
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.auth-strip-retry:hover {
+  background: var(--bg-hover);
+}
+
 /* --- Commit Message Modal --- */
 
 .commit-modal-overlay {
