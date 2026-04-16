@@ -239,7 +239,7 @@ export function ConversationSettings({
                   </div>
                 )}
                 {displayBranches
-                  .filter(b => !branchSearch || b.name !== defaultBranch)
+                  .filter(b => branchSearch || b.name !== defaultBranch)
                   .map(b => {
                     const tag = branchTag(b);
                     return (
