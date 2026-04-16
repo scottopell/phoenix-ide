@@ -22,9 +22,9 @@ interface ConversationSettingsProps {
   /** Error message to display */
   error?: string | null;
   /** Selected conversation mode */
-  mode?: 'direct' | 'managed';
+  mode?: 'direct' | 'managed' | 'branch';
   /** Callback to change mode */
-  setMode?: (m: 'direct' | 'managed') => void;
+  setMode?: (m: 'direct' | 'managed' | 'branch') => void;
   /** Available git branches for the current directory */
   branches?: GitBranchEntry[];
   /** Currently checked-out branch */
@@ -179,7 +179,26 @@ export function ConversationSettings({
               <span className="mode-option-content">
                 <strong>Managed <span className="beta-badge">BETA</span></strong>
                 <span className="mode-option-desc">
-                  Read-only exploration first. Proposes a task plan for your approval, then works on an isolated worktree.
+                  Explore first, then propose a plan. Works on a new task branch.
+                </span>
+              </span>
+            </label>
+          )}
+          {isGitDir && (
+            <label
+              className={`mode-option ${mode === 'branch' ? 'mode-option--active' : ''}`}
+              onClick={() => setMode?.('branch')}
+            >
+              <input
+                type="radio"
+                name={radioGroupName}
+                checked={mode === 'branch'}
+                onChange={() => setMode?.('branch')}
+              />
+              <span className="mode-option-content">
+                <strong>Branch <span className="beta-badge">BETA</span></strong>
+                <span className="mode-option-desc">
+                  Work directly on an existing branch. For PR fixes and iteration.
                 </span>
               </span>
             </label>
@@ -187,9 +206,9 @@ export function ConversationSettings({
         </div>
       )}
 
-      {isGitDir && mode === 'managed' && (
+      {isGitDir && (mode === 'managed' || mode === 'branch') && (
         <div className="settings-field branch-selector" ref={comboRef}>
-          <span className="settings-field-label">Branch</span>
+          <span className="settings-field-label">{mode === 'branch' ? 'Branch' : 'Base branch'}</span>
           <div className="branch-combobox">
             <input
               ref={inputRef}

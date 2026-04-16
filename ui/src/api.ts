@@ -346,7 +346,7 @@ export const api = {
     messageId: string,
     model?: string,
     images: ImageData[] = [],
-    mode?: 'direct' | 'managed' | 'auto',
+    mode?: 'direct' | 'managed' | 'branch' | 'auto',
     baseBranch?: string | null,
     seedParentId?: string | null,
     seedLabel?: string | null,

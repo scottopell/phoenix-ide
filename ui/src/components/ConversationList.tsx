@@ -141,6 +141,7 @@ export function ConversationList({
                       conv.conv_mode_label.toLowerCase() === 'explore' ? 'Managed mode (read-only exploration)' :
                       conv.conv_mode_label.toLowerCase() === 'work' ? 'Managed mode (task branch)' :
                       conv.conv_mode_label.toLowerCase() === 'direct' ? 'Full access (Direct mode)' :
+                      conv.conv_mode_label.toLowerCase() === 'branch' ? 'Branch mode (existing branch)' :
                       conv.conv_mode_label
                     }>{conv.conv_mode_label}</span>
                   )}

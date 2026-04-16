@@ -40,7 +40,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [creating, setCreating] = useState(false);
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
-  const [mode, setMode] = useState<'direct' | 'managed'>('direct');
+  const [mode, setMode] = useState<'direct' | 'managed' | 'branch'>('direct');
   const [branches, setBranches] = useState<GitBranchEntry[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
@@ -72,12 +72,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  // Reset to Direct when directory is not a git repo (Managed requires git)
+  // Reset to Direct when directory is not a git repo (Managed/Branch require git)
   useEffect(() => { if (isGitDir === false) setMode('direct'); }, [isGitDir]);
 
-  // Fetch local branches when git dir is confirmed and mode is managed (instant, no network)
+  // Fetch local branches when git dir is confirmed and mode needs branches (instant, no network)
   useEffect(() => {
-    if (!isGitDir || mode !== 'managed') {
+    if (!isGitDir || (mode !== 'managed' && mode !== 'branch')) {
       setBranches([]);
       setCurrentBranch(null);
       setBaseBranch(null);
@@ -109,7 +109,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   // Debounced remote search when user types in the branch picker
   useEffect(() => {
-    if (!isGitDir || mode !== 'managed' || !branchSearch.trim()) return;
+    if (!isGitDir || (mode !== 'managed' && mode !== 'branch') || !branchSearch.trim()) return;
     const trimmedCwd = cwd.trim();
     if (!trimmedCwd) return;
 
@@ -197,7 +197,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       const trimmedCwd = cwd.trim();
       const conv = await api.createConversation(
         trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode,
-        mode === 'managed' ? baseBranch : null,
+        (mode === 'managed' || mode === 'branch') ? baseBranch : null,
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());

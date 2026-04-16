@@ -215,6 +215,7 @@ export function StateBar({
   const mode = conversation?.conv_mode_label?.toLowerCase();
   const isWork = mode === 'work';
   const isExplore = mode === 'explore';
+  const isBranchMode = mode === 'branch';
   const modeLabel = conversation?.conv_mode_label;
   const modeSuffix = isExplore ? ' (read-only)' : '';
   const modeClass = `statebar-mode statebar-mode--${mode}`;
@@ -266,6 +267,7 @@ export function StateBar({
                   <span className={modeClass} title={
                     isExplore ? 'Read-only mode (git project)' :
                     isWork ? 'Write mode (task branch)' :
+                    isBranchMode ? 'Branch mode (existing branch)' :
                     'Full access (no git workflow)'
                   }>
                     {modeLabel}{modeSuffix}
