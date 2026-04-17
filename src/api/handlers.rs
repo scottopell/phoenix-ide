@@ -864,30 +864,33 @@ fn create_branch_worktree_blocking(
     let worktree_path = phoenix_dir.join(conv_id);
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
-    // Create worktree (existing branch, no -b flag)
-    match run_git(cwd, &["worktree", "add", &worktree_path_str, branch_name]) {
-        Ok(_) => {}
-        Err(e) if e.contains("already checked out") => {
-            // REQ-PROJ-025: branch conflict detection.
-            // Query the database for an active conversation on this branch.
-            let slug = find_active_branch_conversation_slug(db, branch_name);
-            if let Some(slug) = slug {
-                return Err(BranchWorktreeError::Conflict { slug });
-            }
-            // No matching Phoenix conversation -- branch is checked out in the
-            // main working tree or an external worktree.
-            return Err(BranchWorktreeError::Git(format!(
-                "Branch '{branch_name}' is already checked out in your main working tree. \
-                 Git doesn't allow a branch to be checked out in two places at once. \
-                 Switch to a different branch in your main checkout first, or use \
-                 Direct mode to work there directly."
-            )));
+    // REQ-PROJ-025: check if branch is already checked out BEFORE attempting worktree add.
+    // Parse `git worktree list --porcelain` for structured conflict detection instead of
+    // relying on error message strings from `git worktree add`.
+    if let Some(existing_path) = find_branch_in_worktree_list(cwd, branch_name) {
+        // Branch is checked out somewhere. Check if it's a Phoenix conversation.
+        let slug = find_active_branch_conversation_slug(db, branch_name);
+        if let Some(slug) = slug {
+            return Err(BranchWorktreeError::Conflict { slug });
         }
-        Err(e) => {
-            return Err(BranchWorktreeError::Git(format!(
-                "Failed to create worktree for branch '{branch_name}': {e}"
-            )));
-        }
+        // Not a Phoenix conversation -- checked out in main worktree or external.
+        let location = if existing_path == cwd.to_string_lossy() {
+            "your main working tree".to_string()
+        } else {
+            format!("a worktree at {existing_path}")
+        };
+        return Err(BranchWorktreeError::Git(format!(
+            "Branch '{branch_name}' is already checked out in {location}. \
+             Git doesn't allow a branch to be checked out in two places at once. \
+             Switch to a different branch there first, or use Direct mode."
+        )));
+    }
+
+    // No conflict -- create the worktree.
+    if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, branch_name]) {
+        return Err(BranchWorktreeError::Git(format!(
+            "Failed to create worktree for branch '{branch_name}': {e}"
+        )));
     }
 
     // Ensure .phoenix/ is in .gitignore at the repo root
@@ -906,6 +909,28 @@ fn create_branch_worktree_blocking(
         worktree_path: worktree_path_str,
         base_branch: default_branch,
     })
+}
+
+/// Check if a branch is already checked out in any worktree.
+/// Returns the worktree path if found, None if the branch is free.
+/// Uses `git worktree list --porcelain` for structured, reliable detection.
+fn find_branch_in_worktree_list(cwd: &std::path::Path, branch_name: &str) -> Option<String> {
+    let output = run_git(cwd, &["worktree", "list", "--porcelain"]).ok()?;
+    let target_ref = format!("refs/heads/{branch_name}");
+
+    let mut current_path: Option<String> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(path.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if branch == target_ref {
+                return current_path;
+            }
+        } else if line.is_empty() {
+            current_path = None;
+        }
+    }
+    None
 }
 
 /// Look up the slug of a non-terminal conversation that owns this branch.
