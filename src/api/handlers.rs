@@ -260,12 +260,12 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         worktree_path: conv
             .conv_mode
             .worktree_path()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.starts_with("__LEGACY"))
             .map(String::from),
         base_branch: conv
             .conv_mode
             .base_branch()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.starts_with("__LEGACY"))
             .map(String::from),
         task_title: conv.conv_mode.task_title().map(String::from),
         // REQ-TERM-002 / REQ-TERM-017: surface the server-user's $SHELL so
@@ -608,9 +608,12 @@ async fn create_conversation(
         match result {
             Ok(info) => {
                 let mode = crate::db::ConvMode::Branch {
-                    branch_name: info.branch_name.clone(),
-                    worktree_path: info.worktree_path.clone(),
-                    base_branch: info.base_branch,
+                    branch_name: crate::db::NonEmptyString::new(info.branch_name.clone())
+                        .expect("branch_name from worktree creation must be non-empty"),
+                    worktree_path: crate::db::NonEmptyString::new(info.worktree_path.clone())
+                        .expect("worktree_path from worktree creation must be non-empty"),
+                    base_branch: crate::db::NonEmptyString::new(info.base_branch)
+                        .expect("base_branch from worktree creation must be non-empty"),
                 };
                 (mode, info.worktree_path)
             }
@@ -1416,7 +1419,9 @@ async fn stream_conversation(
             branch_name,
             base_branch,
             ..
-        } if !base_branch.is_empty() && !branch_name.is_empty() => {
+        } if !base_branch.as_str().starts_with("__LEGACY")
+            && !branch_name.as_str().starts_with("__LEGACY") =>
+        {
             // Resolve repo root from project
             let repo_root = if let Some(ref project_id) = conversation.project_id {
                 state
@@ -1428,7 +1433,7 @@ async fn stream_conversation(
             } else {
                 None
             };
-            repo_root.map(|root| (root, base_branch.clone(), branch_name.clone()))
+            repo_root.map(|root| (root, base_branch.to_string(), branch_name.to_string()))
         }
         _ => None,
     };
@@ -1923,10 +1928,10 @@ async fn complete_task(
             task_id,
             ..
         } => (
-            branch_name.clone(),
-            worktree_path.clone(),
-            base_branch.clone(),
-            task_id.clone(),
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            task_id.to_string(),
         ),
         _ => {
             return Err(AppError::BadRequest(
@@ -2124,10 +2129,10 @@ async fn confirm_complete(
             task_id,
             ..
         } => (
-            branch_name.clone(),
-            worktree_path.clone(),
-            base_branch.clone(),
-            task_id.clone(),
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            task_id.to_string(),
         ),
         _ => {
             return Err(AppError::BadRequest(
@@ -2382,10 +2387,10 @@ async fn abandon_task(
             task_id,
             ..
         } => (
-            branch_name.clone(),
-            worktree_path.clone(),
-            base_branch.clone(),
-            task_id.clone(),
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            task_id.to_string(),
             true,
         ),
         ConvMode::Branch {
@@ -2394,9 +2399,9 @@ async fn abandon_task(
             base_branch,
             ..
         } => (
-            branch_name.clone(),
-            worktree_path.clone(),
-            base_branch.clone(),
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            base_branch.to_string(),
             String::new(), // Branch mode has no task
             false,
         ),
@@ -2621,12 +2626,12 @@ async fn mark_merged(
             branch_name,
             worktree_path,
             ..
-        } => (branch_name.clone(), worktree_path.clone(), true),
+        } => (branch_name.to_string(), worktree_path.to_string(), true),
         ConvMode::Branch {
             branch_name,
             worktree_path,
             ..
-        } => (branch_name.clone(), worktree_path.clone(), false),
+        } => (branch_name.to_string(), worktree_path.to_string(), false),
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation must be in Work or Branch mode to mark as merged".to_string(),

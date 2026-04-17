@@ -84,6 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(path = %db_path, "Opening database");
     let db = Database::open(&db_path).await?;
 
+    // Run pending data migrations before anything reads conversation data
+    db::run_pending_migrations(db.pool()).await?;
+
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
 
@@ -237,18 +240,21 @@ async fn reconcile_worktrees(db: &Database) {
         let wt_path = conv.conv_mode.worktree_path().unwrap_or("");
         let base_branch = conv.conv_mode.base_branch().unwrap_or("");
 
-        // Legacy row (empty worktree_path or base_branch) or worktree directory missing on disk
-        let needs_revert =
-            wt_path.is_empty() || base_branch.is_empty() || !std::path::Path::new(wt_path).exists();
+        let is_sentinel = |s: &str| s.is_empty() || s.starts_with("__LEGACY");
+
+        // Legacy row (sentinel worktree_path or base_branch) or worktree directory missing on disk
+        let needs_revert = is_sentinel(wt_path)
+            || is_sentinel(base_branch)
+            || !std::path::Path::new(wt_path).exists();
 
         if !needs_revert {
             continue;
         }
 
-        let reason = if wt_path.is_empty() {
-            "legacy row (empty worktree_path)"
-        } else if base_branch.is_empty() {
-            "legacy row (empty base_branch)"
+        let reason = if is_sentinel(wt_path) {
+            "legacy row (missing worktree_path)"
+        } else if is_sentinel(base_branch) {
+            "legacy row (missing base_branch)"
         } else {
             "worktree directory missing"
         };

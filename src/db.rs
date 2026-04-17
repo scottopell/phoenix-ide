@@ -2,8 +2,10 @@
 //!
 //! Provides persistence for conversations and messages.
 
+mod migrations;
 mod schema;
 
+pub use migrations::run_pending_migrations;
 pub use schema::*;
 use schema::{
     MIGRATION_CREATE_MCP_DISABLED_SERVERS, MIGRATION_CREATE_PROJECTS,
@@ -40,6 +42,11 @@ pub struct Database {
 }
 
 impl Database {
+    /// Access the underlying connection pool (for migrations and testing).
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Open or create database at the given path
     pub async fn open(path: &str) -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
@@ -986,16 +993,30 @@ impl Database {
 /// Parse a conversation row from the database
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
+    let id: String = row.try_get("id")?;
+
     let state_json: String = row.try_get("state")?;
-    let state: ConvState = serde_json::from_str(&state_json).unwrap_or_default();
+    let state: ConvState = match serde_json::from_str(&state_json) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(conv_id = %id, error = %e, raw = %state_json, "Failed to deserialize ConvState, defaulting to Idle");
+            ConvState::Idle
+        }
+    };
 
     // conv_mode: parse from JSON, default to Explore for old rows without the column
-    let conv_mode: ConvMode = row
-        .try_get::<Option<String>, _>("conv_mode")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let conv_mode_raw: Option<String> =
+        row.try_get::<Option<String>, _>("conv_mode").ok().flatten();
+    let conv_mode: ConvMode = match &conv_mode_raw {
+        Some(s) => match serde_json::from_str(s) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(conv_id = %id, error = %e, raw = %s, "Failed to deserialize ConvMode, defaulting to Explore");
+                ConvMode::default()
+            }
+        },
+        None => ConvMode::default(),
+    };
 
     let slug: Option<String> = row.try_get("slug")?;
     let title: Option<String> = row
@@ -1015,7 +1036,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .unwrap_or(None);
 
     Ok(Conversation {
-        id: row.try_get("id")?,
+        id,
         slug,
         title,
         cwd: row.try_get("cwd")?,

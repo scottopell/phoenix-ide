@@ -1906,7 +1906,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
 // Outcome Generators (for handle_outcome tests)
 // ============================================================================
 
-use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, PersistOutcome, ToolOutcome};
+use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 
 fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
     prop_oneof![
@@ -1956,15 +1956,16 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
         })
 }
 
-fn arb_tool_outcome() -> impl Strategy<Value = ToolOutcome> {
+fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
     prop_oneof![
-        arb_tool_result().prop_map(ToolOutcome::Completed),
-        ("[a-z]{8}", arb_abort_reason()).prop_map(|(tool_use_id, reason)| ToolOutcome::Aborted {
-            tool_use_id,
-            reason,
-        }),
+        arb_tool_result().prop_map(ToolExecOutcome::Completed),
+        ("[a-z]{8}", arb_abort_reason())
+            .prop_map(|(tool_use_id, reason)| ToolExecOutcome::Aborted {
+                tool_use_id,
+                reason,
+            }),
         ("[a-z]{8}", "[a-zA-Z ]{1,20}")
-            .prop_map(|(tool_use_id, error)| ToolOutcome::Failed { tool_use_id, error }),
+            .prop_map(|(tool_use_id, error)| ToolExecOutcome::Failed { tool_use_id, error }),
     ]
 }
 
@@ -2123,7 +2124,7 @@ proptest! {
         }
     }
 
-    // ToolOutcome::Completed with matching ID succeeds in ToolExecuting
+    // ToolExecOutcome::Completed with matching ID succeeds in ToolExecuting
     #[test]
     fn prop_tool_outcome_completed_succeeds(
         current in arb_tool_call(),
@@ -2149,12 +2150,12 @@ proptest! {
             display_data: None,
             images: vec![],
         };
-        let outcome = EffectOutcome::Tool(ToolOutcome::Completed(tool_result));
+        let outcome = EffectOutcome::Tool(ToolExecOutcome::Completed(tool_result));
         let result = handle_outcome(&state, &ctx, outcome);
-        prop_assert!(result.is_ok(), "ToolOutcome::Completed should succeed: {:?}", result);
+        prop_assert!(result.is_ok(), "ToolExecOutcome::Completed should succeed: {:?}", result);
     }
 
-    // ToolOutcome::Aborted produces ToolAborted event
+    // ToolExecOutcome::Aborted produces ToolAborted event
     #[test]
     fn prop_tool_outcome_aborted_in_cancelling(
         tool_use_id in "[a-z]{8}",
@@ -2173,7 +2174,7 @@ proptest! {
             assistant_message: AssistantMessage::new(content_blocks, None, None),
             pending_sub_agents: vec![],
         };
-        let outcome = EffectOutcome::Tool(ToolOutcome::Aborted {
+        let outcome = EffectOutcome::Tool(ToolExecOutcome::Aborted {
             tool_use_id,
             reason,
         });
@@ -2200,7 +2201,7 @@ proptest! {
         );
     }
 
-    // ToolOutcome in Idle is invalid (no active tool to complete)
+    // ToolExecOutcome in Idle is invalid (no active tool to complete)
     #[test]
     fn prop_tool_outcome_in_idle_is_invalid(outcome in arb_tool_outcome()) {
         let ctx = test_context();

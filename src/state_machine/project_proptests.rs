@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::db::ConvMode;
+    use crate::db::{ConvMode, NonEmptyString};
     use proptest::prelude::*;
 
     // ========================================================================
@@ -28,11 +28,11 @@ mod tests {
         )
             .prop_map(
                 |(branch_name, worktree_path, base_branch, task_id, task_title)| ConvMode::Work {
-                    branch_name,
-                    worktree_path,
-                    base_branch,
-                    task_id,
-                    task_title,
+                    branch_name: NonEmptyString::new(branch_name).unwrap(),
+                    worktree_path: NonEmptyString::new(worktree_path).unwrap(),
+                    base_branch: NonEmptyString::new(base_branch).unwrap(),
+                    task_id: NonEmptyString::new(task_id).unwrap(),
+                    task_title: NonEmptyString::new(task_title).unwrap(),
                 },
             )
     }
@@ -45,9 +45,9 @@ mod tests {
         )
             .prop_map(
                 |(branch_name, worktree_path, base_branch)| ConvMode::Branch {
-                    branch_name,
-                    worktree_path,
-                    base_branch,
+                    branch_name: NonEmptyString::new(branch_name).unwrap(),
+                    worktree_path: NonEmptyString::new(worktree_path).unwrap(),
+                    base_branch: NonEmptyString::new(base_branch).unwrap(),
                 },
             )
     }
@@ -66,11 +66,13 @@ mod tests {
     proptest! {
         /// Work mode always carries a non-empty task_id.
         /// This is the structural guarantee that distinguishes Work from Branch.
+        /// With NonEmptyString the type system enforces this; the test documents
+        /// the invariant and verifies it survives serde roundtrip.
         #[test]
         fn prop_work_mode_always_has_task_id(mode in arb_work_mode()) {
             match &mode {
                 ConvMode::Work { task_id, .. } => {
-                    prop_assert!(!task_id.is_empty(),
+                    prop_assert!(!task_id.as_str().is_empty(),
                         "Work mode must always have a non-empty task_id");
                 }
                 _ => prop_assert!(false, "Expected Work mode"),
@@ -82,7 +84,7 @@ mod tests {
         fn prop_work_mode_always_has_worktree_path(mode in arb_work_mode()) {
             match &mode {
                 ConvMode::Work { worktree_path, .. } => {
-                    prop_assert!(!worktree_path.is_empty(),
+                    prop_assert!(!worktree_path.as_str().is_empty(),
                         "Work mode must always have a non-empty worktree_path");
                 }
                 _ => prop_assert!(false, "Expected Work mode"),
@@ -94,7 +96,7 @@ mod tests {
         fn prop_work_mode_always_has_branch_name(mode in arb_work_mode()) {
             match &mode {
                 ConvMode::Work { branch_name, .. } => {
-                    prop_assert!(!branch_name.is_empty(),
+                    prop_assert!(!branch_name.as_str().is_empty(),
                         "Work mode must always have a non-empty branch_name");
                 }
                 _ => prop_assert!(false, "Expected Work mode"),
@@ -127,7 +129,7 @@ mod tests {
         fn prop_branch_mode_always_has_branch_name(mode in arb_branch_mode()) {
             match &mode {
                 ConvMode::Branch { branch_name, .. } => {
-                    prop_assert!(!branch_name.is_empty(),
+                    prop_assert!(!branch_name.as_str().is_empty(),
                         "Branch mode must always have a non-empty branch_name");
                 }
                 _ => prop_assert!(false, "Expected Branch mode"),
@@ -205,11 +207,11 @@ mod tests {
             prop_assert!(!is_valid_mode_transition(&mode, &ConvMode::Direct));
             // Cannot transition Work -> Work (different fields)
             let other_work = ConvMode::Work {
-                branch_name: "other".to_string(),
-                worktree_path: "/other".to_string(),
-                base_branch: "main".to_string(),
-                task_id: "XX999".to_string(),
-                task_title: "other".to_string(),
+                branch_name: NonEmptyString::new("other").unwrap(),
+                worktree_path: NonEmptyString::new("/other").unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("XX999").unwrap(),
+                task_title: NonEmptyString::new("other").unwrap(),
             };
             prop_assert!(!is_valid_mode_transition(&mode, &other_work));
         }

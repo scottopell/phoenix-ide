@@ -12,7 +12,7 @@
 //! REQ-BED-006: Error Recovery
 
 use super::effect::{compute_bash_display_data, CheckpointData};
-use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolOutcome};
+use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, PendingSubAgent, RecoveryKind, SubAgentResult,
     TaskApprovalOutcome, ToolCall, ToolInput,
@@ -1622,18 +1622,18 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
     }
 }
 
-/// Convert `ToolOutcome` to the equivalent `Event` for delegation to `transition()`.
-fn tool_outcome_to_event(outcome: ToolOutcome) -> Event {
+/// Convert `ToolExecOutcome` to the equivalent `Event` for delegation to `transition()`.
+fn tool_outcome_to_event(outcome: ToolExecOutcome) -> Event {
     match outcome {
-        ToolOutcome::Completed(result) => Event::ToolComplete {
+        ToolExecOutcome::Completed(result) => Event::ToolComplete {
             tool_use_id: result.tool_use_id.clone(),
             result,
         },
-        ToolOutcome::Aborted {
+        ToolExecOutcome::Aborted {
             tool_use_id,
             reason: _,
         } => Event::ToolAborted { tool_use_id },
-        ToolOutcome::Failed { tool_use_id, error } => Event::ToolComplete {
+        ToolExecOutcome::Failed { tool_use_id, error } => Event::ToolComplete {
             tool_use_id: tool_use_id.clone(),
             result: ToolResult::error(tool_use_id, error),
         },

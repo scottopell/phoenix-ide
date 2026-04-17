@@ -801,18 +801,18 @@ fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             worktree_path,
             ..
         } => ModeContext::Work {
-            branch_name: branch_name.clone(),
-            base_branch: base_branch.clone(),
-            worktree_path: worktree_path.clone(),
+            branch_name: branch_name.to_string(),
+            base_branch: base_branch.to_string(),
+            worktree_path: worktree_path.to_string(),
         },
         ConvMode::Branch {
             branch_name,
             base_branch,
             worktree_path,
         } => ModeContext::Branch {
-            branch_name: branch_name.clone(),
-            base_branch: base_branch.clone(),
-            worktree_path: worktree_path.clone(),
+            branch_name: branch_name.to_string(),
+            base_branch: base_branch.to_string(),
+            worktree_path: worktree_path.to_string(),
         },
         ConvMode::Direct => ModeContext::Direct,
     }

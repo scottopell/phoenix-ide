@@ -8,6 +8,72 @@ use serde_json::Value;
 use std::fmt;
 use std::path::Path;
 
+/// A string guaranteed to be non-empty at construction time.
+/// Serde deserialization rejects empty strings.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct NonEmptyString(String);
+
+impl NonEmptyString {
+    pub fn new(s: impl Into<String>) -> Result<Self, &'static str> {
+        let s = s.into();
+        if s.is_empty() {
+            Err("string must not be empty")
+        } else {
+            Ok(Self(s))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `#[serde(default)]` rollout shim for legacy DB rows predating `NonEmptyString`.
+/// Produces a sentinel value that startup reconciliation catches and reverts
+/// to Explore/Direct. The A2 migration phase will remove these defaults.
+impl Default for NonEmptyString {
+    fn default() -> Self {
+        Self("__LEGACY_EMPTY__".to_string())
+    }
+}
+
+impl fmt::Display for NonEmptyString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl AsRef<str> for NonEmptyString {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for NonEmptyString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            Err(serde::de::Error::custom("string must not be empty"))
+        } else {
+            Ok(Self(s))
+        }
+    }
+}
+
+/// Validated worktree configuration fields shared by Work and Branch modes.
+///
+/// Not embedded via `#[serde(flatten)]` because serde's internally-tagged enums
+/// don't support flatten. Exists as a logical grouping for accessor methods and
+/// future extraction.
+#[allow(dead_code)] // Introduced for A2/C1 phases; `worktree_config()` exercises it now
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    pub branch_name: NonEmptyString,
+    pub worktree_path: NonEmptyString,
+    pub base_branch: NonEmptyString,
+}
+
 /// SQL schema for initialization
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS conversations (
@@ -124,6 +190,12 @@ ALTER TABLE messages RENAME COLUMN id TO message_id;
 ///
 /// Stored as JSON in the `conv_mode` TEXT column on conversations.
 /// REQ-BED-027: Conversation-level field, NOT embedded in `ConvState`.
+///
+/// All string fields in Work and Branch use `NonEmptyString` to make empty
+/// strings structurally unrepresentable at construction time. The
+/// `#[serde(default)]` shims produce a sentinel value (`__LEGACY_EMPTY__`)
+/// for old DB rows -- startup reconciliation catches these and reverts to
+/// Explore/Direct. The A2 migration phase will remove the defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "mode")]
 pub enum ConvMode {
@@ -133,46 +205,46 @@ pub enum ConvMode {
     Explore,
     /// Direct mode: full tool access, no lifecycle ceremony.
     /// Default for all new conversations (git and non-git).
-    /// Serde alias ensures old DB rows with "Standalone" deserialize correctly.
-    #[serde(alias = "Standalone")]
     Direct,
     /// Write mode on a task branch (Managed workflow). Full tool suite with file write access.
     Work {
         /// The git branch name for this work conversation (e.g., `task-0042-fix-bug`)
-        branch_name: String,
-        /// Absolute path to the git worktree for this conversation.
-        /// `#[serde(default)]` is a rollout shim for existing Work rows -- startup
-        /// reconciliation reverts rows with empty `worktree_path` to Explore.
         #[serde(default)]
-        worktree_path: String,
+        branch_name: NonEmptyString,
+        /// Absolute path to the git worktree for this conversation.
+        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
+        #[serde(default)]
+        worktree_path: NonEmptyString,
         /// The branch that was checked out when the task was approved (e.g., `main`).
         /// Used as the merge target for Complete and the restore target for Abandon.
-        /// `#[serde(default)]` is a rollout shim -- startup reconciliation reverts
-        /// rows with empty `base_branch` to Explore.
+        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
         #[serde(default)]
-        base_branch: String,
+        base_branch: NonEmptyString,
         /// The task ID assigned at approval time (e.g., "YF042").
         /// Used to locate and update the task file in `tasks/`.
-        /// `#[serde(default)]` is a rollout shim for existing Work rows.
+        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
         #[serde(default)]
-        task_id: String,
+        task_id: NonEmptyString,
         /// Human-readable task title (e.g., "Fix auth middleware token storage").
-        /// `#[serde(default)]` is a rollout shim for existing Work rows.
+        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
         #[serde(default)]
-        task_title: String,
+        task_title: NonEmptyString,
     },
     /// Branch mode: work directly on an existing branch (e.g., fix a PR).
     /// No task file, no Explore phase. Full tool access.
     /// REQ-PROJ-024
     Branch {
         /// The existing branch name (e.g., "q-branch-observer")
-        branch_name: String,
+        #[serde(default)]
+        branch_name: NonEmptyString,
         /// Absolute path to the git worktree
+        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
         #[serde(default)]
-        worktree_path: String,
+        worktree_path: NonEmptyString,
         /// The branch this worktree was created from (same as `branch_name` for Branch mode)
+        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
         #[serde(default)]
-        base_branch: String,
+        base_branch: NonEmptyString,
     },
 }
 
@@ -190,7 +262,9 @@ impl ConvMode {
     /// The branch name if in Work or Branch mode, None otherwise.
     pub fn branch_name(&self) -> Option<&str> {
         match self {
-            Self::Work { branch_name, .. } | Self::Branch { branch_name, .. } => Some(branch_name),
+            Self::Work { branch_name, .. } | Self::Branch { branch_name, .. } => {
+                Some(branch_name.as_str())
+            }
             Self::Explore | Self::Direct => None,
         }
     }
@@ -199,7 +273,7 @@ impl ConvMode {
     pub fn worktree_path(&self) -> Option<&str> {
         match self {
             Self::Work { worktree_path, .. } | Self::Branch { worktree_path, .. } => {
-                Some(worktree_path)
+                Some(worktree_path.as_str())
             }
             Self::Explore | Self::Direct => None,
         }
@@ -208,7 +282,9 @@ impl ConvMode {
     /// The base branch if in Work or Branch mode, None otherwise.
     pub fn base_branch(&self) -> Option<&str> {
         match self {
-            Self::Work { base_branch, .. } | Self::Branch { base_branch, .. } => Some(base_branch),
+            Self::Work { base_branch, .. } | Self::Branch { base_branch, .. } => {
+                Some(base_branch.as_str())
+            }
             Self::Explore | Self::Direct => None,
         }
     }
@@ -217,7 +293,7 @@ impl ConvMode {
     #[allow(dead_code)] // Used by M4 Complete/Abandon flows (task 0604)
     pub fn task_id(&self) -> Option<&str> {
         match self {
-            Self::Work { task_id, .. } => Some(task_id),
+            Self::Work { task_id, .. } => Some(task_id.as_str()),
             Self::Explore | Self::Direct | Self::Branch { .. } => None,
         }
     }
@@ -225,14 +301,32 @@ impl ConvMode {
     /// The task title if in Work mode, None otherwise. Branch mode has no task.
     pub fn task_title(&self) -> Option<&str> {
         match self {
-            Self::Work { task_title, .. } => {
-                if task_title.is_empty() {
-                    None
-                } else {
-                    Some(task_title)
-                }
-            }
+            Self::Work { task_title, .. } => Some(task_title.as_str()),
             Self::Explore | Self::Direct | Self::Branch { .. } => None,
+        }
+    }
+
+    /// Extract `WorktreeConfig` from Work or Branch mode. Returns None for
+    /// Explore and Direct.
+    #[allow(dead_code)] // Introduced for A2/C1 phases; tested in conv_mode_tests
+    pub fn worktree_config(&self) -> Option<WorktreeConfig> {
+        match self {
+            Self::Work {
+                branch_name,
+                worktree_path,
+                base_branch,
+                ..
+            }
+            | Self::Branch {
+                branch_name,
+                worktree_path,
+                base_branch,
+            } => Some(WorktreeConfig {
+                branch_name: branch_name.clone(),
+                worktree_path: worktree_path.clone(),
+                base_branch: base_branch.clone(),
+            }),
+            Self::Explore | Self::Direct => None,
         }
     }
 }
@@ -800,10 +894,11 @@ mod conv_mode_tests {
     }
 
     #[test]
-    fn test_standalone_alias_deserializes_to_direct() {
+    fn test_standalone_no_longer_deserializes() {
+        // Migration 001 rewrites "Standalone" -> "Direct" in the DB.
+        // The serde alias is removed; raw "Standalone" JSON is now rejected.
         let old_json = r#"{"mode":"Standalone"}"#;
-        let parsed: ConvMode = serde_json::from_str(old_json).unwrap();
-        assert_eq!(parsed, ConvMode::Direct);
+        assert!(serde_json::from_str::<ConvMode>(old_json).is_err());
     }
 
     #[test]
@@ -816,9 +911,9 @@ mod conv_mode_tests {
     #[test]
     fn test_branch_serialization() {
         let mode = ConvMode::Branch {
-            branch_name: "fix-login".to_string(),
-            worktree_path: "/tmp/wt".to_string(),
-            base_branch: "main".to_string(),
+            branch_name: NonEmptyString::new("fix-login").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
         };
         let json = serde_json::to_string(&mode).unwrap();
         let parsed: ConvMode = serde_json::from_str(&json).unwrap();
@@ -826,6 +921,79 @@ mod conv_mode_tests {
         // Verify no task_id in JSON
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(value.get("task_id").is_none());
+    }
+
+    #[test]
+    fn test_work_serialization_roundtrip() {
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("task-0042-fix-bug").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt/abc").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("YF042").unwrap(),
+            task_title: NonEmptyString::new("Fix the bug").unwrap(),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: ConvMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_non_empty_string_rejects_empty() {
+        assert!(NonEmptyString::new("").is_err());
+        assert!(NonEmptyString::new("ok").is_ok());
+    }
+
+    #[test]
+    fn test_non_empty_string_serde_rejects_empty() {
+        let result: Result<NonEmptyString, _> = serde_json::from_str(r#""""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_empty_string_default_is_sentinel() {
+        let nes = NonEmptyString::default();
+        assert_eq!(nes.as_str(), "__LEGACY_EMPTY__");
+    }
+
+    #[test]
+    fn test_legacy_work_row_with_missing_fields_uses_sentinel() {
+        // Simulates a legacy DB row where only branch_name existed
+        let json = r#"{"mode":"Work","branch_name":"old-branch"}"#;
+        let parsed: ConvMode = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ConvMode::Work {
+                branch_name,
+                worktree_path,
+                base_branch,
+                task_id,
+                task_title,
+            } => {
+                assert_eq!(branch_name.as_str(), "old-branch");
+                assert_eq!(worktree_path.as_str(), "__LEGACY_EMPTY__");
+                assert_eq!(base_branch.as_str(), "__LEGACY_EMPTY__");
+                assert_eq!(task_id.as_str(), "__LEGACY_EMPTY__");
+                assert_eq!(task_title.as_str(), "__LEGACY_EMPTY__");
+            }
+            other => panic!("Expected Work, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worktree_config_extraction() {
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("task-1").unwrap(),
+            worktree_path: NonEmptyString::new("/wt").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("T1").unwrap(),
+            task_title: NonEmptyString::new("Title").unwrap(),
+        };
+        let config = mode.worktree_config().unwrap();
+        assert_eq!(config.branch_name.as_str(), "task-1");
+        assert_eq!(config.worktree_path.as_str(), "/wt");
+        assert_eq!(config.base_branch.as_str(), "main");
+
+        assert!(ConvMode::Explore.worktree_config().is_none());
+        assert!(ConvMode::Direct.worktree_config().is_none());
     }
 }
 

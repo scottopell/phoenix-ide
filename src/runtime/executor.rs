@@ -13,7 +13,7 @@ use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 
 use crate::db::{MessageContent, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
-use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolOutcome};
+use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{SubAgentMode, ToolCall, ToolInput};
 use crate::state_machine::{
     handle_outcome, transition, ConvContext, ConvState, Effect, Event, StepResult,
@@ -1052,7 +1052,7 @@ where
                 }
 
                 // Typed oneshot channel: background task gets Sender<LlmOutcome>,
-                // physically cannot send a ToolOutcome or other type.
+                // physically cannot send a ToolExecOutcome or other type.
                 let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
                 let outcome_tx = self.outcome_tx.clone();
 
@@ -1220,9 +1220,9 @@ where
                     return self.handle_spawn_agents_tool(tool).await;
                 }
 
-                // Typed oneshot channel: background task gets Sender<ToolOutcome>,
+                // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
                 // physically cannot send an LlmOutcome or other type.
-                let (tool_tx, tool_rx) = oneshot::channel::<ToolOutcome>();
+                let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
                 let outcome_tx = self.outcome_tx.clone();
 
                 // Create cancellation token for this tool execution
@@ -1270,7 +1270,7 @@ where
                             id = %tool_use_id,
                             "Tool cancelled"
                         );
-                        ToolOutcome::Aborted {
+                        ToolExecOutcome::Aborted {
                             tool_use_id,
                             reason: crate::state_machine::AbortReason::CancellationRequested,
                         }
@@ -1293,7 +1293,7 @@ where
                                     data: img.data,
                                 })
                                 .collect();
-                            ToolOutcome::Completed(ToolResult {
+                            ToolExecOutcome::Completed(ToolResult {
                                 tool_use_id: tool_use_id.clone(),
                                 success: out.success,
                                 output: out.output,
@@ -1308,7 +1308,7 @@ where
                                 id = %tool_use_id,
                                 "Tool not found"
                             );
-                            ToolOutcome::Failed {
+                            ToolExecOutcome::Failed {
                                 tool_use_id,
                                 error: format!("Unknown tool: {tool_name}"),
                             }
@@ -1902,6 +1902,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // NonEmptyString construction adds wrapping lines
     async fn execute_approve_task(
         &mut self,
         title: String,
@@ -1936,11 +1937,22 @@ where
             Ok(approval_result) => {
                 // Update conversation mode to Work (includes worktree_path, base_branch, task_number)
                 let work_mode = crate::db::ConvMode::Work {
-                    branch_name: approval_result.branch_name.clone(),
-                    worktree_path: approval_result.worktree_path.clone(),
-                    base_branch: approval_result.base_branch.clone(),
-                    task_id: approval_result.task_id.clone(),
-                    task_title: approval_result.task_title.clone(),
+                    branch_name: crate::db::NonEmptyString::new(
+                        approval_result.branch_name.clone(),
+                    )
+                    .expect("branch_name from task approval must be non-empty"),
+                    worktree_path: crate::db::NonEmptyString::new(
+                        approval_result.worktree_path.clone(),
+                    )
+                    .expect("worktree_path from task approval must be non-empty"),
+                    base_branch: crate::db::NonEmptyString::new(
+                        approval_result.base_branch.clone(),
+                    )
+                    .expect("base_branch from task approval must be non-empty"),
+                    task_id: crate::db::NonEmptyString::new(approval_result.task_id.clone())
+                        .expect("task_id from task approval must be non-empty"),
+                    task_title: crate::db::NonEmptyString::new(approval_result.task_title.clone())
+                        .expect("task_title from task approval must be non-empty"),
                 };
                 storage
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)

@@ -3,7 +3,7 @@
 //! Each outcome type is exhaustive -- no `Unknown`, no `_ =>` match arms.
 //! Adding a new variant is a compile error at every handler site.
 //!
-//! These types flow through oneshot channels: a `Sender<ToolOutcome>` physically
+//! These types flow through oneshot channels: a `Sender<ToolExecOutcome>` physically
 //! cannot send an `LlmOutcome`. The executor wraps received outcomes in
 //! `EffectOutcome` before passing to `handle_outcome()`.
 
@@ -56,7 +56,7 @@ pub enum LlmOutcome {
 
 /// Outcome of a tool execution, sent through a typed oneshot channel.
 #[derive(Debug)]
-pub enum ToolOutcome {
+pub enum ToolExecOutcome {
     /// Tool ran to completion with a result
     Completed(ToolResult),
     /// Tool was aborted before completion
@@ -130,7 +130,7 @@ pub enum EffectOutcome {
     /// LLM request completed
     Llm(LlmOutcome),
     /// Tool execution completed
-    Tool(ToolOutcome),
+    Tool(ToolExecOutcome),
     /// Sub-agent completed (arrives via event channel, wrapped here for `handle_outcome`)
     #[allow(dead_code)] // Sub-agent results still flow through event channel for now
     SubAgent {
