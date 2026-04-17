@@ -15,7 +15,7 @@ use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, ContextExhaustionBehavior, CoreState, ParentState, PendingSubAgent,
+    AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, PendingSubAgent,
     RecoveryKind, SubAgentResult, SubAgentState, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
@@ -1269,6 +1269,23 @@ pub fn transition_parent(
                 .iter()
                 .find(|t| matches!(t.input, ToolInput::ProposeTask(_)))
             {
+                // propose_task is only valid in Managed mode (Explore/Work lifecycle).
+                // Direct and Branch mode should never produce this tool call.
+                if context.mode == ModeKind::Direct || context.mode == ModeKind::Branch {
+                    return Ok(
+                        ParentTransitionResult::new(ParentState::Core(CoreState::Error {
+                            message: "propose_task is not available in Direct or Branch mode"
+                                .to_string(),
+                            error_kind: ErrorKind::InvalidRequest,
+                        }))
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change(
+                            "error",
+                            json!({"message": "propose_task not available in this mode"}),
+                        )),
+                    );
+                }
+
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
                     return Ok(
@@ -2283,6 +2300,7 @@ mod tests {
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
+            mode: ModeKind::Managed,
         };
 
         let result = handle_context_exhaustion(
@@ -2397,6 +2415,7 @@ mod tests {
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
+            mode: ModeKind::Managed,
         };
 
         let result = transition(
@@ -2496,6 +2515,7 @@ mod tests {
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
+            mode: ModeKind::Managed,
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -2542,6 +2562,7 @@ mod tests {
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
+            mode: ModeKind::Managed,
         };
 
         // Non-retryable error at attempt 1 → immediate failure

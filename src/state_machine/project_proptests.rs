@@ -919,5 +919,64 @@ mod random_walk {
                 // (e.g., UserTriggerContinuation from Idle, TaskResolved).
             }
         }
+
+        /// No Direct-mode conversation should ever reach AwaitingTaskApproval.
+        /// Uses the random walk pattern with ModeKind::Direct and injects
+        /// propose_task tool calls in LlmResponse events to exercise the guard.
+        #[test]
+        fn prop_direct_mode_never_reaches_task_approval(seed in 0u64..u64::MAX) {
+            use crate::state_machine::state::{ModeKind, ProposeTaskInput};
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut ctx = ConvContext::new(
+                "test-direct-walk",
+                PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+            );
+            ctx.mode = ModeKind::Direct;
+            let mut state = ConvState::Idle;
+
+            for _step in 0..200 {
+                if state.is_terminal() {
+                    break;
+                }
+
+                // When in LlmRequesting, sometimes inject a propose_task response
+                let event = if matches!(state, ConvState::LlmRequesting { .. }) && rng.gen_bool(0.3) {
+                    let tool_id = random_id(&mut rng);
+                    let tc = ToolCall::new(
+                        tool_id.clone(),
+                        ToolInput::ProposeTask(ProposeTaskInput {
+                            title: random_string(&mut rng, 10),
+                            priority: "p1".to_string(),
+                            plan: random_string(&mut rng, 20),
+                        }),
+                    );
+                    Event::LlmResponse {
+                        content: vec![ContentBlock::tool_use(
+                            &tool_id,
+                            "propose_task",
+                            serde_json::json!({}),
+                        )],
+                        tool_calls: vec![tc],
+                        end_turn: true,
+                        usage: Usage::default(),
+                    }
+                } else {
+                    generate_valid_event(&state, &mut rng)
+                };
+
+                if let Ok(result) = transition(&state, &ctx, event) {
+                    prop_assert!(
+                        !matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
+                        "Direct-mode conversation reached AwaitingTaskApproval from {}",
+                        state.variant_name(),
+                    );
+                    check_invariants(&state, &result.new_state, &result.effects, &ctx);
+                    state = result.new_state;
+                }
+            }
+        }
     }
 }

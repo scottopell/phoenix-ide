@@ -1197,6 +1197,16 @@ pub enum ContextExhaustionBehavior {
     IntentionallyUnhandled,
 }
 
+/// Simplified mode identifier for state machine guards.
+/// The full `ConvMode` (with branch names, worktree paths, etc.) is not needed --
+/// only which category matters for transition-level defense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeKind {
+    Direct,
+    Managed, // Explore or Work
+    Branch,
+}
+
 /// Context for a conversation (immutable configuration)
 #[derive(Debug, Clone)]
 pub struct ConvContext {
@@ -1216,6 +1226,8 @@ pub struct ConvContext {
     pub max_turns: u32,
     /// Desired base branch for Managed mode (set at creation, consumed at task approval)
     pub desired_base_branch: Option<String>,
+    /// Mode category for transition-level guards (defense-in-depth behind tool registry)
+    pub mode: ModeKind,
 }
 
 /// Default context window for unknown models (conservative)
@@ -1238,6 +1250,7 @@ impl ConvContext {
             mode_context: None,
             max_turns: 0,
             desired_base_branch: None,
+            mode: ModeKind::Managed,
         }
     }
 
@@ -1258,6 +1271,7 @@ impl ConvContext {
             mode_context: None,
             max_turns: 0,
             desired_base_branch: None,
+            mode: ModeKind::Managed,
         }
     }
 }

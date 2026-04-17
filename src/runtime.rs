@@ -21,7 +21,7 @@ pub use executor::ConversationRuntime;
 pub use traits::*;
 
 use crate::platform::PlatformCapability;
-use crate::state_machine::state::{SubAgentMode, SubAgentOutcome, SubAgentSpec};
+use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::{BrowserSessionManager, ToolRegistry};
 
 /// Type alias for production runtime with concrete implementations
@@ -386,6 +386,11 @@ impl RuntimeManager {
         );
         conv_context.max_turns = spec.max_turns;
         conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
+        conv_context.mode = match &sub_conv_mode {
+            ConvMode::Direct => ModeKind::Direct,
+            ConvMode::Explore | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Branch { .. } => ModeKind::Branch,
+        };
 
         // 4. Create channels for the sub-agent runtime
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -562,6 +567,11 @@ impl RuntimeManager {
         };
         context.mode_context = Some(mode_context);
         context.desired_base_branch = conv.desired_base_branch.clone();
+        context.mode = match &conv.conv_mode {
+            ConvMode::Direct => ModeKind::Direct,
+            ConvMode::Explore | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Branch { .. } => ModeKind::Branch,
+        };
 
         let (event_tx, event_rx) = mpsc::channel(32);
         let (broadcast_tx, _) = broadcast::channel(128);
