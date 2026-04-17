@@ -874,10 +874,13 @@ fn create_branch_worktree_blocking(
             if let Some(slug) = slug {
                 return Err(BranchWorktreeError::Conflict { slug });
             }
-            // No matching conversation found -- orphaned checkout. Report the git error.
+            // No matching Phoenix conversation -- branch is checked out in the
+            // main working tree or an external worktree.
             return Err(BranchWorktreeError::Git(format!(
-                "Branch '{branch_name}' is already checked out in another worktree. \
-                 Use `git worktree list` to inspect. Error: {e}"
+                "Branch '{branch_name}' is already checked out in your main working tree. \
+                 Git doesn't allow a branch to be checked out in two places at once. \
+                 Switch to a different branch in your main checkout first, or use \
+                 Direct mode to work there directly."
             )));
         }
         Err(e) => {
