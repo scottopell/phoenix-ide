@@ -50,12 +50,7 @@ function branchLabel(b: GitBranchEntry, currentBranch?: string | null): string {
   return label;
 }
 
-function branchTag(b: GitBranchEntry): { text: string; className: string; href?: string } | null {
-  if (b.conflict_slug) return {
-    text: 'in use',
-    className: 'branch-tag branch-tag--conflict',
-    href: `/c/${b.conflict_slug}`,
-  };
+function branchTag(b: GitBranchEntry): { text: string; className: string } | null {
   if (b.local && !b.remote) return { text: 'local only', className: 'branch-tag branch-tag--local' };
   return null;
 }
@@ -250,20 +245,11 @@ export function ConversationSettings({
                     return (
                       <div
                         key={b.name}
-                        className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}${b.conflict_slug ? ' branch-combobox-item--conflict' : ''}`}
-                        onClick={() => !b.conflict_slug && selectBranch(b.name)}
+                        className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
+                        onClick={() => selectBranch(b.name)}
                       >
                         <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
-                        {tag && (tag.href ? (
-                          <a
-                            href={tag.href}
-                            className={tag.className}
-                            onClick={(e) => e.stopPropagation()}
-                            title="Go to active conversation"
-                          >{tag.text}</a>
-                        ) : (
-                          <span className={tag.className}>{tag.text}</span>
-                        ))}
+                        {tag && <span className={tag.className}>{tag.text}</span>}
                       </div>
                     );
                   })}
@@ -275,6 +261,18 @@ export function ConversationSettings({
           </div>
         </div>
       )}
+
+      {(() => {
+        const selected = displayBranches.find(b => b.name === selectedName);
+        if (!selected?.conflict_slug || mode === 'direct') return null;
+        return (
+          <div className="branch-conflict-banner">
+            This branch already has an active conversation.{' '}
+            <a href={`/c/${selected.conflict_slug}`}>Continue there</a>{' '}
+            or abandon it first.
+          </div>
+        );
+      })()}
     </>
   );
 }

@@ -133,7 +133,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
     return () => { clearTimeout(timer); setBranchSearchLoading(false); };
   }, [isGitDir, mode, cwd, branchSearch]);
 
-  const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking';
+  // Check if selected branch has a conflict (active conversation already using it).
+  const selectedBranchConflict = (mode === 'branch' || mode === 'managed')
+    ? branches.find(b => b.name === (baseBranch ?? currentBranch))?.conflict_slug ?? null
+    : null;
+
+  const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && !selectedBranchConflict;
 
   const addImages = async (files: File[]) => {
     try {
