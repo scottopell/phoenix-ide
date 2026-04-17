@@ -477,6 +477,494 @@ pub enum ConvState {
     Terminal,
 }
 
+// ============================================================================
+// Split State Types — CoreState, ParentState, SubAgentState
+//
+// CoreState holds behavior shared between parent and sub-agent conversations.
+// ParentState wraps CoreState and adds parent-only variants.
+// SubAgentState wraps CoreState and adds sub-agent-only variants.
+//
+// ConvState remains as the DB serialization format. From/TryFrom conversions
+// bridge the split types to/from the flat ConvState.
+// ============================================================================
+
+/// Shared state variants common to both parent and sub-agent conversations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Wrapping in Box would add indirection for marginal gain
+pub enum CoreState {
+    #[default]
+    Idle,
+    LlmRequesting {
+        attempt: u32,
+    },
+    ToolExecuting {
+        current_tool: ToolCall,
+        remaining_tools: Vec<ToolCall>,
+        #[serde(default)]
+        completed_results: Vec<ToolResult>,
+        #[serde(default)]
+        pending_sub_agents: Vec<PendingSubAgent>,
+        #[serde(default)]
+        assistant_message: AssistantMessage,
+    },
+    CancellingTool {
+        tool_use_id: String,
+        skipped_tools: Vec<ToolCall>,
+        completed_results: Vec<ToolResult>,
+        assistant_message: AssistantMessage,
+        pending_sub_agents: Vec<PendingSubAgent>,
+    },
+    AwaitingSubAgents {
+        pending: Vec<PendingSubAgent>,
+        #[serde(default)]
+        completed_results: Vec<SubAgentResult>,
+        #[serde(default)]
+        spawn_tool_id: Option<String>,
+    },
+    CancellingSubAgents {
+        pending: Vec<PendingSubAgent>,
+        #[serde(default)]
+        completed_results: Vec<SubAgentResult>,
+    },
+    Error {
+        message: String,
+        error_kind: ErrorKind,
+    },
+    AwaitingContinuation {
+        rejected_tool_calls: Vec<ToolCall>,
+        attempt: u32,
+    },
+}
+
+/// Parent conversation state. Wraps `CoreState` for shared behavior and adds
+/// parent-only variants that are structurally excluded from sub-agent transitions.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Core variant is large but dominant path
+pub enum ParentState {
+    Core(CoreState),
+    AwaitingRecovery {
+        message: String,
+        error_kind: ErrorKind,
+        recovery_kind: RecoveryKind,
+    },
+    AwaitingTaskApproval {
+        title: String,
+        priority: String,
+        plan: String,
+    },
+    AwaitingUserResponse {
+        questions: Vec<UserQuestion>,
+        tool_use_id: String,
+    },
+    ContextExhausted {
+        summary: String,
+    },
+    Terminal,
+}
+
+/// Sub-agent conversation state. Wraps `CoreState` for shared behavior and adds
+/// sub-agent-only terminal variants that are structurally excluded from parent transitions.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Core variant is large but dominant path
+pub enum SubAgentState {
+    Core(CoreState),
+    Completed {
+        result: String,
+    },
+    Failed {
+        error: String,
+        error_kind: ErrorKind,
+    },
+}
+
+// ============================================================================
+// From/TryFrom: ConvState <-> ParentState / SubAgentState
+// ============================================================================
+
+impl From<ParentState> for ConvState {
+    fn from(ps: ParentState) -> Self {
+        match ps {
+            ParentState::Core(core) => core.into(),
+            ParentState::AwaitingRecovery {
+                message,
+                error_kind,
+                recovery_kind,
+            } => ConvState::AwaitingRecovery {
+                message,
+                error_kind,
+                recovery_kind,
+            },
+            ParentState::AwaitingTaskApproval {
+                title,
+                priority,
+                plan,
+            } => ConvState::AwaitingTaskApproval {
+                title,
+                priority,
+                plan,
+            },
+            ParentState::AwaitingUserResponse {
+                questions,
+                tool_use_id,
+            } => ConvState::AwaitingUserResponse {
+                questions,
+                tool_use_id,
+            },
+            ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
+            ParentState::Terminal => ConvState::Terminal,
+        }
+    }
+}
+
+impl From<SubAgentState> for ConvState {
+    fn from(ss: SubAgentState) -> Self {
+        match ss {
+            SubAgentState::Core(core) => core.into(),
+            SubAgentState::Completed { result } => ConvState::Completed { result },
+            SubAgentState::Failed { error, error_kind } => ConvState::Failed { error, error_kind },
+        }
+    }
+}
+
+impl From<CoreState> for ConvState {
+    fn from(cs: CoreState) -> Self {
+        match cs {
+            CoreState::Idle => ConvState::Idle,
+            CoreState::LlmRequesting { attempt } => ConvState::LlmRequesting { attempt },
+            CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            } => ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            },
+            CoreState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            } => ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            },
+            CoreState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            } => ConvState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            },
+            CoreState::CancellingSubAgents {
+                pending,
+                completed_results,
+            } => ConvState::CancellingSubAgents {
+                pending,
+                completed_results,
+            },
+            CoreState::Error {
+                message,
+                error_kind,
+            } => ConvState::Error {
+                message,
+                error_kind,
+            },
+            CoreState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            } => ConvState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            },
+        }
+    }
+}
+
+/// Error returned when a `ConvState` cannot be converted to the requested split type.
+#[derive(Debug, Clone)]
+pub struct StateConversionError {
+    pub from_variant: &'static str,
+    pub target_type: &'static str,
+}
+
+impl std::fmt::Display for StateConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot convert ConvState::{} to {}",
+            self.from_variant, self.target_type
+        )
+    }
+}
+
+impl std::error::Error for StateConversionError {}
+
+impl TryFrom<ConvState> for ParentState {
+    type Error = StateConversionError;
+
+    fn try_from(cs: ConvState) -> Result<Self, Self::Error> {
+        match cs {
+            // Core states
+            ConvState::Idle => Ok(ParentState::Core(CoreState::Idle)),
+            ConvState::LlmRequesting { attempt } => {
+                Ok(ParentState::Core(CoreState::LlmRequesting { attempt }))
+            }
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            } => Ok(ParentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            })),
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            } => Ok(ParentState::Core(CoreState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            })),
+            ConvState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            } => Ok(ParentState::Core(CoreState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            })),
+            ConvState::CancellingSubAgents {
+                pending,
+                completed_results,
+            } => Ok(ParentState::Core(CoreState::CancellingSubAgents {
+                pending,
+                completed_results,
+            })),
+            ConvState::Error {
+                message,
+                error_kind,
+            } => Ok(ParentState::Core(CoreState::Error {
+                message,
+                error_kind,
+            })),
+            ConvState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            } => Ok(ParentState::Core(CoreState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            })),
+            // Parent-only states
+            ConvState::AwaitingRecovery {
+                message,
+                error_kind,
+                recovery_kind,
+            } => Ok(ParentState::AwaitingRecovery {
+                message,
+                error_kind,
+                recovery_kind,
+            }),
+            ConvState::AwaitingTaskApproval {
+                title,
+                priority,
+                plan,
+            } => Ok(ParentState::AwaitingTaskApproval {
+                title,
+                priority,
+                plan,
+            }),
+            ConvState::AwaitingUserResponse {
+                questions,
+                tool_use_id,
+            } => Ok(ParentState::AwaitingUserResponse {
+                questions,
+                tool_use_id,
+            }),
+            ConvState::ContextExhausted { summary } => {
+                Ok(ParentState::ContextExhausted { summary })
+            }
+            ConvState::Terminal => Ok(ParentState::Terminal),
+            // Sub-agent-only states are invalid for parent
+            ConvState::Completed { .. } | ConvState::Failed { .. } => Err(StateConversionError {
+                from_variant: cs.variant_name(),
+                target_type: "ParentState",
+            }),
+        }
+    }
+}
+
+impl TryFrom<ConvState> for SubAgentState {
+    type Error = StateConversionError;
+
+    fn try_from(cs: ConvState) -> Result<Self, Self::Error> {
+        match cs {
+            // Core states
+            ConvState::Idle => Ok(SubAgentState::Core(CoreState::Idle)),
+            ConvState::LlmRequesting { attempt } => {
+                Ok(SubAgentState::Core(CoreState::LlmRequesting { attempt }))
+            }
+            ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            } => Ok(SubAgentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            })),
+            ConvState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            } => Ok(SubAgentState::Core(CoreState::CancellingTool {
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            })),
+            ConvState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            } => Ok(SubAgentState::Core(CoreState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            })),
+            ConvState::CancellingSubAgents {
+                pending,
+                completed_results,
+            } => Ok(SubAgentState::Core(CoreState::CancellingSubAgents {
+                pending,
+                completed_results,
+            })),
+            ConvState::Error {
+                message,
+                error_kind,
+            } => Ok(SubAgentState::Core(CoreState::Error {
+                message,
+                error_kind,
+            })),
+            ConvState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            } => Ok(SubAgentState::Core(CoreState::AwaitingContinuation {
+                rejected_tool_calls,
+                attempt,
+            })),
+            // Sub-agent-only states
+            ConvState::Completed { result } => Ok(SubAgentState::Completed { result }),
+            ConvState::Failed { error, error_kind } => {
+                Ok(SubAgentState::Failed { error, error_kind })
+            }
+            // Parent-only states are invalid for sub-agent
+            ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::Terminal => Err(StateConversionError {
+                from_variant: cs.variant_name(),
+                target_type: "SubAgentState",
+            }),
+        }
+    }
+}
+
+impl CoreState {
+    /// Stable variant name (mirrors `ConvState::variant_name`)
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            CoreState::Idle => "Idle",
+            CoreState::LlmRequesting { .. } => "LlmRequesting",
+            CoreState::ToolExecuting { .. } => "ToolExecuting",
+            CoreState::CancellingTool { .. } => "CancellingTool",
+            CoreState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
+            CoreState::CancellingSubAgents { .. } => "CancellingSubAgents",
+            CoreState::Error { .. } => "Error",
+            CoreState::AwaitingContinuation { .. } => "AwaitingContinuation",
+        }
+    }
+}
+
+impl ParentState {
+    /// Stable variant name
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ParentState::Core(c) => c.variant_name(),
+            ParentState::AwaitingRecovery { .. } => "AwaitingRecovery",
+            ParentState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
+            ParentState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
+            ParentState::ContextExhausted { .. } => "ContextExhausted",
+            ParentState::Terminal => "Terminal",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ParentState::ContextExhausted { .. } | ParentState::Terminal
+        )
+    }
+}
+
+impl SubAgentState {
+    /// Stable variant name
+    #[allow(dead_code)] // Will be used when callers migrate to split types
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            SubAgentState::Core(c) => c.variant_name(),
+            SubAgentState::Completed { .. } => "Completed",
+            SubAgentState::Failed { .. } => "Failed",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SubAgentState::Completed { .. } | SubAgentState::Failed { .. }
+        )
+    }
+
+    /// Get reference to core state if this is a Core variant
+    #[allow(dead_code)] // Will be used when callers migrate to split types
+    pub fn as_core(&self) -> Option<&CoreState> {
+        match self {
+            SubAgentState::Core(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
 /// Outcome of user's decision on a proposed task plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 351f6b23ec1fb672b15de7dcddc65ae6a7dc7af2e34ff34b1bfe064c79f57f78 # shrinks to summary = "", event = GraceTurnExhausted { result: None }

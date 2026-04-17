@@ -19,6 +19,9 @@ pub use effect::Effect;
 pub use event::Event;
 pub use outcome::AbortReason;
 pub use state::{ConvContext, ConvState, StepResult};
+// Re-exports for split state types (used by future callers that adopt the split API)
+#[allow(unused_imports)]
+pub use state::{CoreState, ParentState, SubAgentState};
 pub use transition::{handle_outcome, transition};
 
 // Re-exports for atomic persistence types (used by runtime/executor)
