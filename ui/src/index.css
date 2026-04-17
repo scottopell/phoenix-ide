@@ -6606,6 +6606,11 @@ html * {
   background: var(--bg-hover);
 }
 
+.auth-strip-link {
+  color: rgb(96, 165, 250);
+  text-decoration: underline;
+}
+
 /* --- Commit Message Modal --- */
 
 .commit-modal-overlay {

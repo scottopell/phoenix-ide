@@ -1,4 +1,23 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+
+const URL_RE = /https?:\/\/[^\s)>\]]+/g;
+
+function linkifyLine(line: string): ReactNode {
+  const parts: ReactNode[] = [];
+  let last = 0;
+  for (const match of line.matchAll(URL_RE)) {
+    const idx = match.index!;
+    if (idx > last) parts.push(line.slice(last, idx));
+    parts.push(
+      <a key={idx} href={match[0]} target="_blank" rel="noopener noreferrer" className="auth-strip-link">
+        {match[0]}
+      </a>
+    );
+    last = idx + match[0].length;
+  }
+  if (last < line.length) parts.push(line.slice(last));
+  return parts.length > 1 ? parts : line;
+}
 
 interface CredentialHelperPanelProps {
   /** When true, connects to the SSE endpoint and runs the helper */
@@ -155,7 +174,7 @@ export function CredentialHelperPanel({ active, onDismiss }: CredentialHelperPan
             <div className="auth-strip-output" ref={outputRef}>
               {lines.map((line, i) => (
                 <div key={i} className="auth-strip-line">
-                  {line || '\u00a0'}
+                  {line ? linkifyLine(line) : '\u00a0'}
                 </div>
               ))}
             </div>
