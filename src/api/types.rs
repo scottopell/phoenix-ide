@@ -404,6 +404,10 @@ pub struct GitBranchEntry {
     /// Only set when both local and remote exist and they diverge. 0 = up-to-date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behind_remote: Option<u32>,
+    /// If this branch is already checked out in a worktree with an active conversation,
+    /// the slug of that conversation. The UI can link to it or warn before selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_slug: Option<String>,
 }
 
 /// Response for git branch listing

@@ -296,6 +296,8 @@ export interface GitBranchEntry {
   local: boolean;
   remote: boolean;
   behind_remote?: number;
+  /** Slug of an active conversation already using this branch (conflict). */
+  conflict_slug?: string;
 }
 
 export interface GitBranchesResponse {

@@ -4463,6 +4463,22 @@ html * {
   border-bottom: 1px solid var(--border-color);
 }
 
+.branch-combobox-item--conflict {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.branch-tag--conflict {
+  background: rgba(251, 191, 36, 0.15);
+  color: rgb(251, 191, 36);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.branch-tag--conflict:hover {
+  text-decoration: underline;
+}
+
 /* Expanded settings inside card */
 .new-conv-settings-expanded {
   margin-top: 16px;

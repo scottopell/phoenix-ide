@@ -2885,6 +2885,7 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
 }
 
 async fn list_git_branches(
+    State(state): State<AppState>,
     Query(params): Query<GitBranchesQuery>,
 ) -> Result<Json<GitBranchesResponse>, AppError> {
     let cwd = PathBuf::from(&params.cwd);
@@ -2892,17 +2893,76 @@ async fn list_git_branches(
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
 
+    // Build branch -> conversation slug conflict map from worktree list + DB.
+    let conflict_map = build_branch_conflict_map(&state.db, &cwd).await;
+
     let search = params.search.clone();
     tokio::task::spawn_blocking(move || {
-        if let Some(query) = search {
-            search_remote_branches(&cwd, &query)
+        let mut resp = if let Some(query) = search {
+            search_remote_branches(&cwd, &query)?
         } else {
-            list_local_branches(&cwd)
+            list_local_branches(&cwd)?
+        };
+        // Annotate branches with conflict slugs.
+        for branch in &mut resp.branches {
+            branch.conflict_slug = conflict_map.get(&branch.name).cloned();
         }
+        Ok(resp)
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
     .map(Json)
+}
+
+/// Build a map of `branch_name` -> `conversation_slug` for branches that are
+/// checked out in worktrees with active conversations.
+async fn build_branch_conflict_map(
+    db: &crate::db::Database,
+    cwd: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+
+    // Get checked-out branches from git worktree list.
+    let checked_out: std::collections::HashMap<String, String> =
+        run_git(cwd, &["worktree", "list", "--porcelain"])
+            .map(|output| {
+                let mut result = std::collections::HashMap::new();
+                let mut current_path: Option<String> = None;
+                for line in output.lines() {
+                    if let Some(path) = line.strip_prefix("worktree ") {
+                        current_path = Some(path.to_string());
+                    } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                        if let Some(ref path) = current_path {
+                            result.insert(branch.to_string(), path.clone());
+                        }
+                    } else if line.is_empty() {
+                        current_path = None;
+                    }
+                }
+                result
+            })
+            .unwrap_or_default();
+
+    if checked_out.is_empty() {
+        return map;
+    }
+
+    // Cross-reference with active conversations.
+    let convs = db.get_work_conversations().await.unwrap_or_default();
+    for conv in &convs {
+        if conv.state.is_terminal() {
+            continue;
+        }
+        if let Some(branch) = conv.conv_mode.branch_name() {
+            if checked_out.contains_key(branch) {
+                if let Some(slug) = &conv.slug {
+                    map.insert(branch.to_string(), slug.clone());
+                }
+            }
+        }
+    }
+
+    map
 }
 
 /// REQ-PROJ-020: Local branches sorted by recency, no network.
@@ -2947,6 +3007,7 @@ fn list_local_branches(cwd: &std::path::Path) -> Result<GitBranchesResponse, App
                 remote: has_remote,
                 behind_remote,
                 name,
+                conflict_slug: None,
             }
         })
         .collect();
@@ -3011,6 +3072,7 @@ fn search_remote_branches(
                 remote: true,
                 behind_remote,
                 name: name.clone(),
+                conflict_slug: None,
             }
         })
         .collect();
@@ -3037,6 +3099,7 @@ fn search_remote_branches(
                 remote: has_remote,
                 behind_remote,
                 name: local_name.clone(),
+                conflict_slug: None,
             });
         }
     }
