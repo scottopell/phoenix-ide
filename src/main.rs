@@ -5,6 +5,7 @@
 
 mod api;
 mod db;
+pub(crate) mod git_ops;
 mod llm;
 mod message_expander;
 mod platform;

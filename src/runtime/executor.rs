@@ -2167,26 +2167,9 @@ fn get_next_task_id(tasks_dir: &std::path::Path) -> String {
     taskmd_core::ids::next_id(tasks_dir)
 }
 
-/// Run a git command in the given directory, returning stdout on success or an error message.
-///
-/// All git operations use a dedicated bot identity and disable commit signing
-/// to avoid depending on the user's SSH agent (which breaks in workspaces/tmux).
-pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .output()
-        .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(format!("git {} failed: {stderr}", args.join(" ")))
-    }
-}
+// Re-export git helpers so existing `crate::runtime::executor::{run_git, ensure_gitignore_has_phoenix}`
+// imports continue to resolve. Canonical definitions live in `crate::git_ops`.
+pub(crate) use crate::git_ops::{ensure_gitignore_has_phoenix, run_git};
 
 /// Global mutex serializing the scan-tasks + write + commit sequence.
 /// Task approval is rare; a single mutex is sufficient.
@@ -2228,76 +2211,8 @@ fn execute_approve_task_blocking(
         branch
     };
 
-    // REQ-PROJ-022: single-branch fetch to get the latest remote tip.
-    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
-    if let Err(e) = run_git(cwd, &["fetch", "origin", &refspec]) {
-        tracing::debug!(
-            branch = %base_branch,
-            error = %e,
-            "Single-branch fetch failed (non-fatal, using local ref)"
-        );
-    }
-
-    // Materialize branch: ensure a local ref exists.
-    let has_local = run_git(cwd, &["rev-parse", "--verify", &base_branch]).is_ok();
-    let remote_ref = format!("origin/{base_branch}");
-    let has_remote = run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok();
-
-    if has_local && has_remote {
-        // Fast-forward local to remote tip if possible.
-        // `git fetch origin <branch>:<branch>` does this atomically, but only if
-        // <branch> is not currently checked out. Use update-ref as fallback.
-        let local_sha = run_git(cwd, &["rev-parse", &base_branch]).unwrap_or_default();
-        let remote_sha = run_git(cwd, &["rev-parse", &remote_ref]).unwrap_or_default();
-        if local_sha.trim() != remote_sha.trim() {
-            // Check if fast-forward is possible (remote is descendant of local).
-            if run_git(
-                cwd,
-                &["merge-base", "--is-ancestor", &base_branch, &remote_ref],
-            )
-            .is_ok()
-            {
-                // Safe to fast-forward. Only works if branch is not checked out.
-                let current_head =
-                    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
-                if current_head.trim() == base_branch {
-                    tracing::debug!(
-                        branch = %base_branch,
-                        "Cannot fast-forward: branch is currently checked out"
-                    );
-                } else {
-                    let _ = run_git(
-                        cwd,
-                        &[
-                            "update-ref",
-                            &format!("refs/heads/{base_branch}"),
-                            remote_sha.trim(),
-                        ],
-                    );
-                    tracing::info!(branch = %base_branch, "Fast-forwarded local branch to remote tip");
-                }
-            } else {
-                tracing::debug!(
-                    branch = %base_branch,
-                    "Local and remote have diverged; using local ref as-is"
-                );
-            }
-        }
-    } else if !has_local && has_remote {
-        // Remote-only: create local tracking branch.
-        run_git(cwd, &["branch", "--track", &base_branch, &remote_ref]).map_err(|e| {
-            format!("Failed to create local branch '{base_branch}' from {remote_ref}: {e}")
-        })?;
-        tracing::info!(
-            branch = %base_branch,
-            "Created local tracking branch from remote"
-        );
-    } else if !has_local && !has_remote {
-        return Err(format!(
-            "Branch '{base_branch}' not found locally or at origin"
-        ));
-    }
-    // has_local && !has_remote: local-only branch, use as-is.
+    // REQ-PROJ-022: fetch + materialize base branch via consolidated git_ops.
+    crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
 
     let current_head = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_default()
@@ -2529,41 +2444,6 @@ fn execute_approve_task_blocking(
         worktree_path: worktree_path_str,
         base_branch,
     })
-}
-
-/// Ensure .gitignore in the given directory contains `.phoenix/`.
-/// Creates .gitignore if it doesn't exist. Stages the change if modified.
-pub(crate) fn ensure_gitignore_has_phoenix(dir: &std::path::Path) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let gitignore_path = dir.join(".gitignore");
-    let needs_update = if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
-        !content.lines().any(|line| line.trim() == ".phoenix/")
-    } else {
-        true
-    };
-
-    if needs_update {
-        let needs_leading_newline = gitignore_path.exists()
-            && std::fs::read(&gitignore_path)
-                .ok()
-                .is_some_and(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"));
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitignore_path)
-            .map_err(|e| format!("Failed to open .gitignore: {e}"))?;
-        if needs_leading_newline {
-            writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        }
-        writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        run_git(dir, &["add", ".gitignore"])?;
-        tracing::info!(dir = %dir.display(), "Added .phoenix/ to .gitignore");
-    }
-
-    Ok(())
 }
 
 /// Build the continuation prompt (REQ-BED-020)
