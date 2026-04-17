@@ -369,11 +369,47 @@ where
         }
     }
 
-    /// Broadcast `ConversationBecameTerminal` to all SSE subscribers.
+    /// Broadcast `ConversationBecameTerminal` to all SSE subscribers and clean
+    /// up any lingering worktree.
     ///
     /// Send errors (no active receivers) are intentionally ignored.
     fn emit_terminal_lifecycle_event(&self) {
+        self.cleanup_worktree_if_present();
         let _ = self.broadcast_tx.send(SseEvent::ConversationBecameTerminal);
+    }
+
+    /// Remove the conversation's worktree if it still exists on disk.
+    ///
+    /// REQ-PROJ-028 creates worktrees at first message. If the user never
+    /// approved a task (Explore mode), the worktree and temp branch leak.
+    /// Work/Branch conversations clean up via mark-merged/abandon before
+    /// reaching terminal, so this is a no-op for them in the normal case.
+    /// If a worktree somehow survives to terminal time, removing it is
+    /// always correct.
+    fn cleanup_worktree_if_present(&self) {
+        // Derive repo root: if working_dir is inside a worktree
+        // ({root}/.phoenix/worktrees/{id}), walk up to the .phoenix
+        // ancestor's parent; otherwise working_dir IS the root.
+        let wd = &self.context.working_dir;
+        let repo_root = wd
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
+            .and_then(|phoenix_dir| phoenix_dir.parent())
+            .map_or_else(|| wd.clone(), std::path::Path::to_path_buf);
+
+        let worktree_path = repo_root
+            .join(".phoenix")
+            .join("worktrees")
+            .join(&self.context.conversation_id);
+
+        if worktree_path.exists() {
+            let worktree_str = worktree_path.to_string_lossy().to_string();
+            tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
+            let _ = crate::git_ops::run_git(
+                &repo_root,
+                &["worktree", "remove", &worktree_str, "--force"],
+            );
+        }
     }
 
     /// Process a typed effect outcome from a background task.
@@ -1861,12 +1897,10 @@ where
     ) -> Result<(), String> {
         let conv_id = &self.context.conversation_id;
 
-        // Atomically update state, mode, and cwd
+        // Atomically update state and cwd. Mode is preserved (Branch stays Branch,
+        // Work stays Work) — the conversation is terminal, mode is frozen.
         self.storage
             .update_state(conv_id, &ConvState::Terminal)
-            .await?;
-        self.storage
-            .update_conversation_mode(conv_id, &crate::db::ConvMode::Explore)
             .await?;
         self.storage
             .update_conversation_cwd(conv_id, &repo_root)
@@ -1896,7 +1930,7 @@ where
                 cwd: Some(repo_root),
                 branch_name: None,
                 worktree_path: None,
-                conv_mode_label: Some("Explore".to_string()),
+                conv_mode_label: None,
                 base_branch: None,
                 commits_behind: None,
                 commits_ahead: None,
