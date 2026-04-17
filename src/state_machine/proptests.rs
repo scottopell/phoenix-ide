@@ -68,13 +68,12 @@ fn arb_tool_call() -> impl Strategy<Value = ToolCall> {
 }
 
 fn arb_tool_result() -> impl Strategy<Value = ToolResult> {
-    ("[a-z]{8}", any::<bool>(), "[a-zA-Z0-9 ]{0,50}").prop_map(|(id, success, output)| ToolResult {
-        tool_use_id: id,
-        success,
-        output,
-        is_error: !success,
-        display_data: None,
-        images: vec![],
+    ("[a-z]{8}", any::<bool>(), "[a-zA-Z0-9 ]{0,50}").prop_map(|(id, success, output)| {
+        if success {
+            ToolResult::success(id, output)
+        } else {
+            ToolResult::error(id, output)
+        }
     })
 }
 
@@ -514,13 +513,10 @@ proptest! {
         };
         let event = Event::ToolComplete {
             tool_use_id: current.id.clone(),
-            result: ToolResult {
-                tool_use_id: current.id,
-                success: result_success,
-                output: result_output,
-                is_error: !result_success,
-                display_data: None,
-                images: vec![],
+            result: if result_success {
+                ToolResult::success(current.id, result_output)
+            } else {
+                ToolResult::error(current.id, result_output)
             },
         };
 
@@ -917,14 +913,10 @@ proptest! {
         };
 
         // Tool completes naturally before abort takes effect
-        let actual_result = ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            success: true,
-            output: "actual output that should be discarded".to_string(),
-            is_error: false,
-            display_data: None,
-            images: vec![],
-        };
+        let actual_result = ToolResult::success(
+            tool_use_id.clone(),
+            "actual output that should be discarded".to_string(),
+        );
 
         let result = transition(
             &state,
@@ -945,7 +937,7 @@ proptest! {
             // Find the result for our tool - it should be marked as cancelled, not successful
             let our_result = tool_results.iter().find(|r| r.tool_use_id == tool_use_id);
             prop_assert!(our_result.is_some());
-            prop_assert!(!our_result.unwrap().success, "Cancelled tool should not show as successful");
+            prop_assert!(!our_result.unwrap().is_success(), "Cancelled tool should not show as successful");
         }
     }
 
@@ -964,14 +956,7 @@ proptest! {
         };
         let event = Event::ToolComplete {
             tool_use_id: "wrong-id".to_string(),
-            result: ToolResult {
-                tool_use_id: "wrong-id".to_string(),
-                success: true,
-                output: "output".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("wrong-id".to_string(), "output".to_string()),
         };
 
         let result = transition(&state, &test_context(), event);
@@ -1053,14 +1038,7 @@ fn test_complete_tool_cycle() {
         &ctx,
         Event::ToolComplete {
             tool_use_id: "tool-123".to_string(),
-            result: ToolResult {
-                tool_use_id: "tool-123".to_string(),
-                success: true,
-                output: "file1 file2".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("tool-123".to_string(), "file1 file2".to_string()),
         },
     )
     .unwrap();
@@ -1214,14 +1192,7 @@ fn test_multi_tool_chain() {
         &ctx,
         Event::ToolComplete {
             tool_use_id: "t1".to_string(),
-            result: ToolResult {
-                tool_use_id: "t1".to_string(),
-                success: true,
-                output: "1".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("t1".to_string(), "1".to_string()),
         },
     )
     .unwrap();
@@ -1248,14 +1219,7 @@ fn test_multi_tool_chain() {
         &ctx,
         Event::ToolComplete {
             tool_use_id: "t2".to_string(),
-            result: ToolResult {
-                tool_use_id: "t2".to_string(),
-                success: true,
-                output: "2".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("t2".to_string(), "2".to_string()),
         },
     )
     .unwrap();
@@ -1282,14 +1246,7 @@ fn test_multi_tool_chain() {
         &ctx,
         Event::ToolComplete {
             tool_use_id: "t3".to_string(),
-            result: ToolResult {
-                tool_use_id: "t3".to_string(),
-                success: true,
-                output: "3".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("t3".to_string(), "3".to_string()),
         },
     )
     .unwrap();
@@ -1308,14 +1265,7 @@ fn test_cancel_mid_tool_chain() {
     let ctx = test_context();
 
     // t1 already completed (stored in completed_results)
-    let t1_result = ToolResult {
-        tool_use_id: "t1".to_string(),
-        success: true,
-        output: "1".to_string(),
-        is_error: false,
-        display_data: None,
-        images: vec![],
-    };
+    let t1_result = ToolResult::success("t1".to_string(), "1".to_string());
 
     // Build AssistantMessage with tool_use blocks for all 4 tools
     let assistant_message = AssistantMessage::new(
@@ -1419,12 +1369,12 @@ fn test_cancel_mid_tool_chain() {
         );
         // t1 should be successful, t2/t3/t4 should be cancelled/skipped
         let t1 = tool_results.iter().find(|r| r.tool_use_id == "t1").unwrap();
-        assert!(t1.success, "t1 should be successful (was completed)");
+        assert!(t1.is_success(), "t1 should be successful (was completed)");
         assert!(
             tool_results
                 .iter()
                 .filter(|r| r.tool_use_id != "t1")
-                .all(|r| !r.success),
+                .all(|r| !r.is_success()),
             "t2/t3/t4 should be cancelled/skipped"
         );
     }
@@ -1464,14 +1414,7 @@ fn test_tool_completion_advances_to_next_tool() {
         &test_context(),
         Event::ToolComplete {
             tool_use_id: "t1".to_string(),
-            result: ToolResult {
-                tool_use_id: "t1".to_string(),
-                success: true,
-                output: "1".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("t1".to_string(), "1".to_string()),
         },
     )
     .unwrap();
@@ -1520,14 +1463,7 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
         &test_context(),
         Event::ToolComplete {
             tool_use_id: "t1".to_string(),
-            result: ToolResult {
-                tool_use_id: "t1".to_string(),
-                success: true,
-                output: "done".to_string(),
-                is_error: false,
-                display_data: None,
-                images: vec![],
-            },
+            result: ToolResult::success("t1".to_string(), "done".to_string()),
         },
     )
     .unwrap();
@@ -1807,14 +1743,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
 
     let event = Event::ToolComplete {
         tool_use_id: "t1".to_string(),
-        result: ToolResult {
-            tool_use_id: "t1".to_string(),
-            success: true,
-            output: "done".to_string(),
-            is_error: false,
-            display_data: None,
-            images: vec![],
-        },
+        result: ToolResult::success("t1".to_string(), "done".to_string()),
     };
 
     let result = transition(&state, &test_context(), event).unwrap();
@@ -1858,14 +1787,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
 
     let event = Event::SpawnAgentsComplete {
         tool_use_id: "spawn-1".to_string(),
-        result: ToolResult {
-            tool_use_id: "spawn-1".to_string(),
-            success: true,
-            output: "Spawned 2 agents".to_string(),
-            is_error: false,
-            display_data: None,
-            images: vec![],
-        },
+        result: ToolResult::success("spawn-1".to_string(), "Spawned 2 agents".to_string()),
         spawned: vec![
             PendingSubAgent {
                 agent_id: "new-agent-1".to_string(),
@@ -1959,11 +1881,12 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
 fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
     prop_oneof![
         arb_tool_result().prop_map(ToolExecOutcome::Completed),
-        ("[a-z]{8}", arb_abort_reason())
-            .prop_map(|(tool_use_id, reason)| ToolExecOutcome::Aborted {
+        ("[a-z]{8}", arb_abort_reason()).prop_map(|(tool_use_id, reason)| {
+            ToolExecOutcome::Aborted {
                 tool_use_id,
                 reason,
-            }),
+            }
+        }),
         ("[a-z]{8}", "[a-zA-Z ]{1,20}")
             .prop_map(|(tool_use_id, error)| ToolExecOutcome::Failed { tool_use_id, error }),
     ]
@@ -2142,14 +2065,7 @@ proptest! {
             pending_sub_agents: vec![],
             assistant_message: assistant_message_for_tools(&all_id_refs),
         };
-        let tool_result = ToolResult {
-            tool_use_id: current.id.clone(),
-            success: true,
-            output: "done".to_string(),
-            is_error: false,
-            display_data: None,
-            images: vec![],
-        };
+        let tool_result = ToolResult::success(current.id.clone(), "done".to_string());
         let outcome = EffectOutcome::Tool(ToolExecOutcome::Completed(tool_result));
         let result = handle_outcome(&state, &ctx, outcome);
         prop_assert!(result.is_ok(), "ToolExecOutcome::Completed should succeed: {:?}", result);

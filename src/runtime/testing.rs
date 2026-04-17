@@ -1209,7 +1209,7 @@ mod tests {
             let CheckpointData::ToolRound { tool_results, .. } = data;
             assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
-                tool_results.iter().all(|r| !r.success),
+                tool_results.iter().all(|r| !r.is_success()),
                 "All should be marked as failed/cancelled"
             );
         }

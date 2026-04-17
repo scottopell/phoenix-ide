@@ -19,7 +19,7 @@ use super::state::{
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -1665,13 +1665,6 @@ fn current_attempt(state: &ConvState) -> u32 {
 }
 
 // Helper functions
-
-impl ToolResult {
-    #[allow(dead_code)] // Used in tests; normal tool rounds use PersistCheckpoint
-    fn display_data(&self) -> Option<Value> {
-        self.display_data.clone()
-    }
-}
 
 /// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
 const CONTINUATION_THRESHOLD: f64 = 0.90;

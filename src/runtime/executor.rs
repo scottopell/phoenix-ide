@@ -11,7 +11,7 @@
 use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 
-use crate::db::{MessageContent, ToolResult};
+use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{SubAgentMode, ToolCall, ToolInput};
@@ -913,14 +913,7 @@ where
             spawned.len(),
             agent_ids.join(", ")
         );
-        let result = ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            success: true,
-            output,
-            is_error: false,
-            display_data: None,
-            images: vec![],
-        };
+        let result = ToolResult::success(tool_use_id.clone(), output);
 
         // Send SpawnAgentsComplete event (synchronously returned, not async)
         Ok(Some(Event::SpawnAgentsComplete {
@@ -1285,7 +1278,7 @@ where
                                 success = out.success,
                                 "Tool completed"
                             );
-                            let images = out
+                            let images: Vec<ToolContentImage> = out
                                 .images
                                 .into_iter()
                                 .map(|img| ToolContentImage {
@@ -1293,13 +1286,22 @@ where
                                     data: img.data,
                                 })
                                 .collect();
+                            let outcome = if out.success {
+                                ToolOutcome::Success {
+                                    output: out.output,
+                                    display_data: out.display_data,
+                                    images,
+                                }
+                            } else {
+                                ToolOutcome::Error {
+                                    output: out.output,
+                                    display_data: out.display_data,
+                                    images,
+                                }
+                            };
                             ToolExecOutcome::Completed(ToolResult {
                                 tool_use_id: tool_use_id.clone(),
-                                success: out.success,
-                                output: out.output,
-                                is_error: !out.success,
-                                display_data: out.display_data,
-                                images,
+                                outcome,
                             })
                         } else {
                             tracing::warn!(
@@ -1409,8 +1411,8 @@ where
                         for result in tool_results {
                             let tool_content = MessageContent::tool(
                                 &result.tool_use_id,
-                                &result.output,
-                                result.is_error,
+                                result.output(),
+                                result.is_error(),
                             );
                             let tool_msg_id = format!("{}-result", result.tool_use_id);
                             let tool_msg = self
@@ -1419,7 +1421,7 @@ where
                                     &tool_msg_id,
                                     &self.context.conversation_id,
                                     &tool_content,
-                                    result.display_data.as_ref(),
+                                    result.display_data(),
                                     None,
                                 )
                                 .await?;
@@ -1434,8 +1436,11 @@ where
 
             Effect::PersistToolResults { results } => {
                 for result in results {
-                    let content =
-                        MessageContent::tool(&result.tool_use_id, &result.output, result.is_error);
+                    let content = MessageContent::tool(
+                        &result.tool_use_id,
+                        result.output(),
+                        result.is_error(),
+                    );
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let msg = self
                         .storage

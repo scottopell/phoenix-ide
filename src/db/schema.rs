@@ -482,53 +482,67 @@ pub struct ToolContentImage {
     pub data: String,
 }
 
+/// Outcome of a tool execution. Replaces the contradictory `success: bool` +
+/// `is_error: bool` pair — this enum makes the three meaningful states explicit
+/// and the fourth (`success=false`, `is_error=false` but not cancelled) unrepresentable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolOutcome {
+    Success {
+        output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_data: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ToolContentImage>,
+    },
+    Error {
+        output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_data: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ToolContentImage>,
+    },
+    Cancelled {
+        message: String,
+    },
+}
+
 /// Tool execution result
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
     pub tool_use_id: String,
-    pub success: bool,
-    pub output: String,
-    #[serde(default)]
-    pub is_error: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_data: Option<serde_json::Value>,
-    /// Typed images for LLM consumption.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<ToolContentImage>,
+    pub outcome: ToolOutcome,
 }
 
 impl ToolResult {
-    #[allow(dead_code)] // Constructor for API completeness
     pub fn success(tool_use_id: String, output: String) -> Self {
         Self {
             tool_use_id,
-            success: true,
-            output,
-            is_error: false,
-            display_data: None,
-            images: vec![],
+            outcome: ToolOutcome::Success {
+                output,
+                display_data: None,
+                images: vec![],
+            },
         }
     }
 
     pub fn error(tool_use_id: String, error: String) -> Self {
         Self {
             tool_use_id,
-            success: false,
-            output: error,
-            is_error: true,
-            display_data: None,
-            images: vec![],
+            outcome: ToolOutcome::Error {
+                output: error,
+                display_data: None,
+                images: vec![],
+            },
         }
     }
 
     pub fn cancelled(tool_use_id: String, message: &str) -> Self {
         Self {
             tool_use_id,
-            success: false,
-            output: message.to_string(),
-            is_error: false,
-            display_data: None,
-            images: vec![],
+            outcome: ToolOutcome::Cancelled {
+                message: message.to_string(),
+            },
         }
     }
 
@@ -541,11 +555,44 @@ impl ToolResult {
     ) -> Self {
         Self {
             tool_use_id,
-            success: true,
-            output,
-            is_error: false,
-            display_data,
-            images: vec![],
+            outcome: ToolOutcome::Success {
+                output,
+                display_data,
+                images: vec![],
+            },
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self.outcome, ToolOutcome::Error { .. })
+    }
+
+    #[allow(dead_code)] // Used in tests; main code uses is_error()
+    pub fn is_success(&self) -> bool {
+        matches!(self.outcome, ToolOutcome::Success { .. })
+    }
+
+    pub fn output(&self) -> &str {
+        match &self.outcome {
+            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => output,
+            ToolOutcome::Cancelled { message } => message,
+        }
+    }
+
+    pub fn display_data(&self) -> Option<&serde_json::Value> {
+        match &self.outcome {
+            ToolOutcome::Success { display_data, .. } | ToolOutcome::Error { display_data, .. } => {
+                display_data.as_ref()
+            }
+            ToolOutcome::Cancelled { .. } => None,
+        }
+    }
+
+    #[allow(dead_code)] // Public API for completeness; used by tests
+    pub fn images(&self) -> &[ToolContentImage] {
+        match &self.outcome {
+            ToolOutcome::Success { images, .. } | ToolOutcome::Error { images, .. } => images,
+            ToolOutcome::Cancelled { .. } => &[],
         }
     }
 }
