@@ -3012,10 +3012,16 @@ fn list_local_branches(cwd: &std::path::Path) -> Result<GitBranchesResponse, App
         })
         .collect();
 
-    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let current_raw = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map_err(|e| AppError::Internal(format!("Failed to get current branch: {e}")))?
         .trim()
         .to_string();
+    // Detached HEAD returns literal "HEAD" -- not a real branch name.
+    let current = if current_raw == "HEAD" {
+        String::new()
+    } else {
+        current_raw
+    };
 
     // Detect remote default branch from cached symbolic ref (no network).
     let default_branch = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
@@ -3118,10 +3124,15 @@ fn search_remote_branches(
             .then(a.name.cmp(&b.name))
     });
 
-    let current = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let current_raw = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_default()
         .trim()
         .to_string();
+    let current = if current_raw == "HEAD" {
+        String::new()
+    } else {
+        current_raw
+    };
 
     Ok(GitBranchesResponse {
         branches,
