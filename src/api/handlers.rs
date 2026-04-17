@@ -2950,7 +2950,7 @@ async fn build_branch_conflict_map(
     // Cross-reference with active conversations.
     let convs = db.get_work_conversations().await.unwrap_or_default();
     for conv in &convs {
-        if conv.state.is_terminal() {
+        if conv.state.is_terminal() || conv.parent_conversation_id.is_some() {
             continue;
         }
         if let Some(branch) = conv.conv_mode.branch_name() {
