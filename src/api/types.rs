@@ -330,35 +330,6 @@ pub struct TaskApprovalResponse {
     pub first_task: Option<bool>,
 }
 
-/// Response for the complete-task pre-check endpoint (REQ-PROJ-009)
-#[derive(Debug, Serialize)]
-pub struct CompleteTaskResponse {
-    pub success: bool,
-    pub commit_message: String,
-    /// True when the task file exists but its status is not `done`
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_not_done: Option<bool>,
-}
-
-/// Request body for confirm-complete endpoint (REQ-PROJ-009)
-#[derive(Debug, Deserialize)]
-pub struct ConfirmCompleteRequest {
-    pub commit_message: String,
-    /// If true, auto-stash dirty main checkout before merge and pop after.
-    #[serde(default)]
-    pub auto_stash: bool,
-}
-
-/// Response for confirm-complete endpoint (REQ-PROJ-009)
-#[derive(Debug, Serialize)]
-pub struct ConfirmCompleteResponse {
-    pub success: bool,
-    pub commit_sha: String,
-    /// Warning message (e.g., stash pop failure) — displayed to user
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-}
-
 /// 409 Conflict error with typed `error_type` for frontend dispatch
 #[derive(Debug, Serialize)]
 pub struct ConflictErrorResponse {

@@ -44,7 +44,7 @@ commits-behind indicator shows base branch advancement in the StateBar.
 | **REQ-PROJ-006:** Task Files as Versioned Living Contracts | 🔄 Needs Update | Task file committed on branch, not main (REQ-PROJ-027) |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | 🔄 Partial | Sub-agents work but missing: mode parameter (explore/work), model override, one-writer constraint, MCP access |
-| **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Deprecated | Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
+| **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
 | **REQ-PROJ-010:** Abandon a Conversation | 🔄 Needs Update | Branch mode keeps branch on abandon; Managed deletes it |
 | **REQ-PROJ-011:** Passive Commits-Behind Indicator | ✅ Complete | Task 08604 (M4). StateBar badge |
 | **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
