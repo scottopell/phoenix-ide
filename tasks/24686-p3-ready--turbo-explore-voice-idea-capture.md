@@ -83,61 +83,77 @@ is mostly glue. Inventory:
 
 ## Prototype scope
 
-What's actually missing to get a working turbo Explore prototype:
+Research + design review on 2026-04-19 collapsed this into two
+orthogonal changes. There is no separate "turbo" mode or flag — it's
+just (a) Explore is fast by default, (b) voice works mid-conversation.
 
-1. **Pick Haiku automatically for top-level Explore conversations.**
-   Either (a) mirror the sub-agent pattern by auto-selecting Haiku in
-   `handlers.rs` when `conv_mode` resolves to Explore and no model was
-   passed, or (b) add an explicit `turbo: bool` flag on the create
-   request. (a) is fewer knobs; (b) is more explicit. Open question.
-2. **Reuse `VoiceRecorder` inside the conversation input area**, not
-   just on `NewConversationPage`. Today mid-conversation voice input
-   requires typing. For the interactive loop we need continuous
-   voice throughout.
-3. **"Auto-listen when idle" toggle.** Subscribe the
-   `VoiceRecorder` start to the conversation phase returning to
-   `idle`. Default on for turbo conversations, off otherwise.
-4. **Entry point.** A "Turbo voice" button next to `+ New` in
-   `ConversationList.tsx:94` that creates a conversation with
-   `mode=auto`, `model=claude-haiku-4-5`, and flips the voice/auto-
-   listen toggles on by default. (Or a URL param like
-   `/new?turbo=1` interpreted by `NewConversationPage`.)
+**Change 1: Explore defaults to Haiku.**
+When a conversation is created with `conv_mode` resolving to Explore
+and no `model` is supplied on the create request, the backend picks
+`claude-haiku-4-5`. An explicit `model` still wins (so deep-Explore on
+Sonnet remains possible for callers that want it). Site:
+`src/api/handlers.rs:473-480` (model validation) and whichever branch
+actually persists `conversation.model` — mirror the sub-agent pattern
+at `src/runtime/executor.rs:767` (`cheap_model_id_for_provider`).
 
-That's the MVP. Everything else — `phoenix-client.py` voice support,
-mobile entry, hotkey-to-turbo — is follow-up.
+**Change 2: Voice works during an ongoing conversation.**
+`VoiceRecorder` is currently only wired into `NewConversationPage`.
+Extend it into the in-conversation input area (wherever
+`ConversationPage` renders message composition). Use the full Explore
+tool set — no trimming. Behavior:
 
-## Open questions
+- User arms the mic once per conversation (browser autoplay policy
+  requires a click anyway).
+- Once armed, the mic auto-opens whenever the conversation phase
+  returns to `idle` (subscribe to the phase atom in
+  `ui/src/conversation/atom.ts`).
+- Visible listening indicator while open.
+- Small debounce on re-open so the user's reaction to the previous
+  turn isn't captured.
+- One-click disarm.
 
-- **Turbo flag vs. model inference.** If Explore is always Haiku,
-  turbo stops being a separate concept. Is there ever a reason to
-  want Explore on Sonnet? (Deep explore on a large codebase, maybe.)
-  If yes, turbo is an explicit flag; if no, just always pick Haiku
-  for Explore.
-- **Haiku + tool_search.** `claude-haiku-4-5` is marked
-  `supports_tool_search: false` (`src/llm/models.rs:98`). Does the
-  Explore tool set rely on tool_search? If so, turbo needs either
-  a different fallback or the Explore registry needs to avoid
-  tool_search when the model can't do it.
-- **Tool set for turbo.** Keep full Explore tools, or trim to
-  `keyword_search` + `think` + `propose_task` for predictable
-  latency? Full set first, trim later based on real use.
-- **Auto-listen barge-in.** If the mic re-opens the instant state
-  hits `idle`, the user might accidentally capture their own
-  reaction to the previous turn. Needs a short debounce and
-  probably a visible "listening" indicator.
-- **Voice across page reloads.** Web Speech API is session-scoped.
-  Reconnecting SSE after a reload is handled; re-arming the mic
-  probably needs explicit user click (browser autoplay policies).
+Entry point is just "+ New → Explore" — no dedicated turbo button.
+The speed is the feature.
 
-## Acceptance criteria (rough)
+## Resolved design decisions
 
-- [ ] Creating an Explore conversation results in Haiku being used
-      end-to-end (confirmed via StateBar model badge and backend
-      logs).
+Captured here so the next person (or the next session) doesn't re-open
+them:
+
+- **No separate "turbo" concept.** Two orthogonal changes — Explore
+  gets Haiku as the default, and voice works mid-conversation.
+- **Explicit model param still wins.** Callers who want deep-Explore
+  on Sonnet can pass `model` explicitly; Haiku only applies when no
+  model is supplied.
+- **Tool set: unchanged.** Full current Explore tool set for Haiku
+  conversations. Trim later only if latency disappoints.
+- **Tool search is a non-issue.** `tool_search` only activates for
+  `defer_loading` tools on models that support it
+  (`src/llm/anthropic.rs:331`). Haiku gets the Explore tool list
+  inline; nothing breaks.
+- **Mic UX: auto-open on idle after one-click arm.** Browser
+  autoplay policy forces the initial arm click anyway; after that,
+  the mic re-opens on every `idle` transition until disarmed.
+
+## Remaining open questions (implementation details)
+
+- Debounce window on mic re-open — 250ms? 500ms? Tune empirically.
+- Where exactly does the mic-arm / indicator live in the input
+  area? Probably next to the send button. Look at existing patterns
+  in `NewConversationPage` before inventing a new one.
+
+## Acceptance criteria
+
+- [ ] Creating an Explore conversation without specifying a model
+      results in Haiku being used end-to-end (confirmed via StateBar
+      model badge and backend logs).
+- [ ] Passing an explicit `model` on conversation creation still
+      overrides the Haiku default.
 - [ ] `VoiceRecorder` works inside an ongoing conversation, not just
       the new-conversation page.
-- [ ] In turbo mode, the mic re-opens automatically when the
-      conversation phase returns to `idle`.
+- [ ] Once the user arms the mic, it re-opens automatically when
+      the conversation phase returns to `idle` (with a short
+      debounce and a visible listening indicator).
 - [ ] User can iterate verbally — push back, redirect, refine — and
       the agent re-proposes via the existing `propose_task` feedback
       loop.
