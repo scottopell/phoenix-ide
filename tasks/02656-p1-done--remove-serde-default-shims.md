@@ -1,7 +1,7 @@
 ---
 created: 2026-04-20
 priority: p1
-status: ready
+status: done
 artifact: src/db/schema.rs
 ---
 
