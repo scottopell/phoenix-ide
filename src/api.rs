@@ -4,7 +4,9 @@
 
 mod assets;
 pub mod auth;
+mod git_handlers;
 mod handlers;
+mod lifecycle_handlers;
 mod sse;
 mod types;
 

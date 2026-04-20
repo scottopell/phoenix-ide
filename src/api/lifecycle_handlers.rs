@@ -1,0 +1,502 @@
+//! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
+
+use super::handlers::AppError;
+use super::types::{SuccessResponse, TaskApprovalResponse, TaskFeedbackRequest};
+use super::AppState;
+use crate::db::{ConvMode, MessageContent};
+use crate::git_ops::run_git;
+use crate::runtime::SseEvent;
+use crate::state_machine::state::TaskApprovalOutcome;
+use crate::state_machine::{ConvState, Event};
+use std::fmt::Write as _;
+
+use axum::{
+    extract::{Path, State},
+    Json,
+};
+use std::path::PathBuf;
+
+// ============================================================
+// Task Approval (REQ-BED-028)
+// ============================================================
+
+pub(crate) async fn approve_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskApprovalResponse>, AppError> {
+    // 1. Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    // 2. Non-project conversations cannot approve tasks (propose_task is project-only)
+    if conv.project_id.is_none() {
+        return Err(AppError::BadRequest(
+            "Task approval requires a project-scoped conversation".to_string(),
+        ));
+    }
+
+    // 3. Dispatch approval event to state machine
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Approved,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(TaskApprovalResponse {
+        success: true,
+        first_task: None, // Set by executor via SSE if applicable
+    }))
+}
+
+pub(crate) async fn reject_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::Rejected,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+pub(crate) async fn task_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TaskFeedbackRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // Validate conversation exists and is in AwaitingTaskApproval state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingTaskApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting task approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskApprovalResponse {
+                outcome: TaskApprovalOutcome::FeedbackProvided {
+                    annotations: req.annotations,
+                },
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Task Abandon (REQ-PROJ-010)
+// ============================================================
+
+/// Abandon a Work or Branch conversation: delete worktree, optionally delete branch,
+/// capture diff snapshot, transition to Terminal.
+/// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn abandon_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // 1. Validate conversation exists, is Work or Branch mode, Idle state, project-scoped
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to abandon a task".to_string(),
+        ));
+    }
+
+    // Accept both Work and Branch mode
+    let (branch_name, worktree_path, base_branch, task_id, is_work_mode) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            task_id,
+            ..
+        } => (
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            task_id.to_string(),
+            true,
+        ),
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            base_branch,
+            ..
+        } => (
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            String::new(), // Branch mode has no task
+            false,
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation must be in Work or Branch mode to abandon".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+
+    // 2a. Capture diff snapshot from worktree BEFORE deleting it (blocking)
+    let worktree_path_clone = worktree_path.clone();
+    let base_branch_clone = base_branch.clone();
+    let diff_snapshot: Option<String> = tokio::task::spawn_blocking(move || {
+        const MAX_DIFF_BYTES: usize = 100 * 1024; // 100KiB
+
+        let wt = PathBuf::from(&worktree_path_clone);
+        if !wt.exists() {
+            tracing::warn!(worktree = %worktree_path_clone, "Worktree gone before diff capture");
+            return None;
+        }
+
+        // Commit log of unmerged work
+        let commit_log = run_git(
+            &wt,
+            &["log", "--oneline", &format!("{base_branch_clone}..HEAD")],
+        )
+        .unwrap_or_default();
+
+        // Stage untracked files as intent-to-add so they appear in the diff.
+        // Agent-created files are typically untracked (patch tool doesn't git-add).
+        let _ = run_git(&wt, &["add", "-N", "."]);
+
+        // Full diff (uncommitted + newly created files)
+        let diff = run_git(&wt, &["diff", "HEAD"]).unwrap_or_default();
+
+        if commit_log.is_empty() && diff.is_empty() {
+            return None;
+        }
+
+        let mut snapshot = String::from("## Abandoned work snapshot\n");
+
+        if !commit_log.is_empty() {
+            snapshot.push_str("\n### Unmerged commits\n```\n");
+            snapshot.push_str(&commit_log);
+            snapshot.push_str("\n```\n");
+        }
+
+        if !diff.is_empty() {
+            snapshot.push_str("\n### Uncommitted changes\n```diff\n");
+            if diff.len() > MAX_DIFF_BYTES {
+                // Truncate at a valid UTF-8 char boundary
+                let end = diff.floor_char_boundary(MAX_DIFF_BYTES);
+                snapshot.push_str(diff.get(..end).unwrap_or(&diff));
+                let _ = write!(
+                    snapshot,
+                    "\n\n[truncated -- diff was {}KiB, showing first 100KiB]",
+                    diff.len() / 1024
+                );
+            } else {
+                snapshot.push_str(&diff);
+            }
+            snapshot.push_str("\n```\n");
+        }
+
+        Some(snapshot)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Diff capture failed: {e}")))?;
+
+    // 2b. Write diff snapshot as a system message (before worktree deletion)
+    let snapshot_msg = if let Some(ref snapshot) = diff_snapshot {
+        let snap_msg_id = uuid::Uuid::new_v4().to_string();
+        match state
+            .db
+            .add_message(
+                &snap_msg_id,
+                &id,
+                &MessageContent::system(snapshot),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 2c. Delete worktree + conditionally delete branch (blocking)
+    // Work mode: delete worktree AND branch (Phoenix-created), skip task file update
+    //   (the branch is being deleted, so any task file committed there goes with it).
+    // Branch mode: delete worktree only, keep user's branch, no task file.
+    let repo_root_clone = repo_root.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // Worktree cleanup
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(
+            &repo_root_clone,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal), trying filesystem fallback"
+            );
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
+        }
+
+        // Work mode: delete the managed branch.
+        // Branch mode: keep the user's branch.
+        if is_work_mode {
+            if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
+                tracing::warn!(
+                    error = %e,
+                    branch = %branch_name,
+                    "Failed to delete branch (non-fatal)"
+                );
+            }
+        } else {
+            tracing::info!(
+                branch = %branch_name,
+                "Branch mode abandon: keeping user's branch"
+            );
+        }
+
+        // Skip task file update entirely. For Work mode the branch (and its task file)
+        // is deleted above. For Branch mode there is no task file.
+        if !task_id.is_empty() {
+            tracing::info!(
+                task_id = %task_id,
+                "Skipping task file update -- branch deleted, task file goes with it"
+            );
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+
+    // 3. Broadcast diff snapshot (persisted above, before state transition)
+    if let Some(snap_msg) = snapshot_msg {
+        if let Ok(handle) = state.runtime.get_or_create(&id).await {
+            let _ = handle
+                .broadcast_tx
+                .send(SseEvent::Message { message: snap_msg });
+        }
+    }
+
+    // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
+    let repo_root_str = repo_root.display().to_string();
+    let mode_label = if is_work_mode { "Work" } else { "Branch" };
+    let system_message = if is_work_mode {
+        "Task abandoned. Worktree and branch deleted.".to_string()
+    } else {
+        "Abandoned. Worktree removed, branch kept.".to_string()
+    };
+    tracing::info!(
+        conversation_id = %id,
+        mode = mode_label,
+        "Abandon complete"
+    );
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskResolved {
+                system_message,
+                repo_root: repo_root_str,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Mark as Merged (REQ-PROJ-026)
+// ============================================================
+
+/// Mark a Work or Branch conversation as merged: delete worktree, optionally delete branch,
+/// transition to Terminal. The user has already merged/PR'd the branch externally.
+pub(crate) async fn mark_merged(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    // 1. Validate conversation exists, is Work or Branch mode, Idle state
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Idle) {
+        return Err(AppError::BadRequest(
+            "Conversation must be idle to mark as merged".to_string(),
+        ));
+    }
+
+    let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string(), true),
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string(), false),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation must be in Work or Branch mode to mark as merged".to_string(),
+            ));
+        }
+    };
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+    let repo_root_str = repo_root.display().to_string();
+
+    // 2. Delete worktree + conditionally delete branch (blocking)
+    let repo_root_clone = repo_root.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // Remove worktree
+        let worktree_dir = PathBuf::from(&worktree_path);
+        if let Err(e) = run_git(
+            &repo_root_clone,
+            &["worktree", "remove", &worktree_path, "--force"],
+        ) {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree_path,
+                "Failed to remove worktree (non-fatal), trying filesystem fallback"
+            );
+            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
+        }
+
+        // Work mode (Managed): delete the task branch -- it was created by Phoenix.
+        // Branch mode: keep the branch -- it's the user's PR branch.
+        if is_work_mode {
+            if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
+                tracing::warn!(
+                    error = %e,
+                    branch = %branch_name,
+                    "Failed to delete managed branch (non-fatal)"
+                );
+            }
+        } else {
+            tracing::info!(
+                branch = %branch_name,
+                "Branch mode: keeping user's branch after mark-merged"
+            );
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+
+    // 3. Route through state machine -> Terminal
+    let mode_label = if is_work_mode { "Work" } else { "Branch" };
+    let system_message = format!(
+        "Marked as merged. Worktree removed{}.",
+        if is_work_mode {
+            ", task branch deleted"
+        } else {
+            ""
+        }
+    );
+    tracing::info!(
+        conversation_id = %id,
+        mode = mode_label,
+        "Mark-merged complete"
+    );
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::TaskResolved {
+                system_message,
+                repo_root: repo_root_str,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
