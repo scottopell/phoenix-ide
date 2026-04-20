@@ -254,22 +254,19 @@ impl CoreTransitionResult {
 
 /// Core transition function handling behavior shared by both conversation types.
 ///
-/// Handles: user messages, tool execution, retries, sub-agent results,
-/// cancellation of tools and sub-agents, continuation flow.
+/// Routes (state, event) pairs to domain-specific handlers. Each handler is
+/// independently testable with explicit inputs and outputs.
 ///
 /// Does NOT handle: `propose_task` interception (parent-only), terminal tools
 /// (sub-agent-only), `LlmError` -> `Error` vs `Failed` (diverges by type),
 /// `UserCancel` from `LlmRequesting` (parent -> `Idle`, sub-agent -> `Failed`).
-#[allow(clippy::too_many_lines)]
 pub fn transition_core(
     state: &CoreState,
     context: &ConvContext,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
-    match (state, event) {
-        // ============================================================
+    match (state, &event) {
         // User Message Handling (REQ-BED-002)
-        // ============================================================
         (
             CoreState::Idle | CoreState::Error { .. },
             CoreEvent::UserMessage {
@@ -283,19 +280,18 @@ pub fn transition_core(
         ) => Ok(
             CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::persist_user_message(
-                    text,
-                    llm_text,
-                    images,
-                    message_id,
-                    user_agent,
-                    skill_invocation,
+                    text.clone(),
+                    llm_text.clone(),
+                    images.clone(),
+                    message_id.clone(),
+                    user_agent.clone(),
+                    skill_invocation.clone(),
                 ))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_llm_requesting(1))
                 .with_effect(Effect::RequestLlm),
         ),
 
-        // Busy states + UserMessage -> Reject
         (
             CoreState::LlmRequesting { .. }
             | CoreState::ToolExecuting { .. }
@@ -308,154 +304,153 @@ pub fn transition_core(
             CoreEvent::UserMessage { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
-        // ============================================================
         // LLM Response Processing (REQ-BED-003)
-        // ============================================================
-
-        // NOTE: propose_task interception, ask_user_question interception,
-        // context exhaustion check, and sub-agent terminal tool handling
-        // are done by the parent/sub-agent wrappers BEFORE this function
-        // is called. By the time we get here, LlmResponse means "normal
-        // tool execution or text-only response."
-        (
-            CoreState::LlmRequesting { .. },
-            CoreEvent::LlmResponse {
-                content,
-                tool_calls,
-                end_turn: _,
-                usage: usage_data,
-            },
-        ) => {
-            if tool_calls.is_empty() && content.is_empty() {
-                tracing::debug!("LLM returned end_turn with empty content — no message to persist");
-                Ok(CoreTransitionResult::new(CoreState::Idle)
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_agent_done()))
-            } else if tool_calls.is_empty() {
-                Ok(CoreTransitionResult::new(CoreState::Idle)
-                    .with_effect(Effect::persist_agent_message(
-                        content,
-                        Some(usage_data),
-                        &context.working_dir,
-                    ))
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_agent_done()))
-            } else {
-                // Has tools -> ToolExecuting
-                let first = tool_calls[0].clone();
-                let rest = tool_calls[1..].to_vec();
-                let remaining_count = rest.len();
-                let display_data = compute_bash_display_data(&content, &context.working_dir);
-                let assistant_message =
-                    AssistantMessage::new(content, Some(usage_data), display_data);
-
-                Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
-                    current_tool: first.clone(),
-                    remaining_tools: rest,
-                    completed_results: vec![],
-                    pending_sub_agents: vec![],
-                    assistant_message,
-                })
-                .with_effect(Effect::PersistState)
-                .with_effect(notify_tool_executing(
-                    first.name(),
-                    &first.id,
-                    remaining_count,
-                    0,
-                ))
-                .with_effect(Effect::execute_tool(first)))
-            }
+        (CoreState::LlmRequesting { .. }, CoreEvent::LlmResponse { .. }) => {
+            handle_core_llm_response(state, context, event)
         }
 
-        // ============================================================
         // Error Handling and Retry (REQ-BED-006)
-        // ============================================================
-
-        // Retryable LlmError below max -> retry (shared)
-        (CoreState::LlmRequesting { attempt }, CoreEvent::LlmError { error_kind, .. })
-            if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
-        {
-            let new_attempt = attempt + 1;
-            let delay = retry_delay(new_attempt);
-
-            Ok(CoreTransitionResult::new(CoreState::LlmRequesting {
-                attempt: new_attempt,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::ScheduleRetry {
-                delay,
-                attempt: new_attempt,
-            })
-            .with_effect(Effect::notify_state_change(
-                "llm_requesting",
-                json!({
-                    "attempt": new_attempt,
-                    "max_attempts": MAX_RETRY_ATTEMPTS,
-                    "message": format!("Retrying... (attempt {new_attempt})")
-                }),
-            )))
+        (CoreState::LlmRequesting { .. }, CoreEvent::LlmError { .. })
+        | (CoreState::LlmRequesting { .. }, CoreEvent::RetryTimeout { .. }) => {
+            handle_core_error_retry(state, event)
         }
 
-        // Non-retryable or exhausted LlmError -> Error (core default)
-        // Parent wrapper will use this. Sub-agent wrapper intercepts before reaching core.
-        (
-            CoreState::LlmRequesting { attempt },
-            CoreEvent::LlmError {
-                message,
-                error_kind,
-                ..
-            },
-        ) => {
-            let error_message = if error_kind.is_retryable() {
-                format!("Failed after {attempt} attempts: {message}")
-            } else {
-                message
-            };
-
-            Ok(CoreTransitionResult::new(CoreState::Error {
-                message: error_message.clone(),
-                error_kind,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change(
-                "error",
-                json!({
-                    "message": error_message
-                }),
-            )))
-        }
-
-        // RetryTimeout -> Make LLM request
-        (
-            CoreState::LlmRequesting { attempt },
-            CoreEvent::RetryTimeout {
-                attempt: retry_attempt,
-            },
-        ) if *attempt == retry_attempt => {
-            Ok(
-                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: *attempt })
-                    .with_effect(Effect::RequestLlm),
-            )
-        }
-
-        // ============================================================
         // Tool Execution (REQ-BED-004)
-        // ============================================================
+        (CoreState::ToolExecuting { .. }, CoreEvent::ToolComplete { .. })
+        | (CoreState::ToolExecuting { .. }, CoreEvent::SpawnAgentsComplete { .. }) => {
+            handle_core_tool_complete(state, event)
+        }
 
+        // Cancellation (REQ-BED-005)
+        (CoreState::AwaitingSubAgents { .. }, CoreEvent::UserCancel { .. })
+        | (CoreState::ToolExecuting { .. }, CoreEvent::UserCancel { .. })
+        | (CoreState::LlmRequesting { .. }, CoreEvent::UserCancel { .. })
+        | (CoreState::CancellingTool { .. }, CoreEvent::ToolAborted { .. })
+        | (CoreState::CancellingTool { .. }, CoreEvent::ToolComplete { .. })
+        | (CoreState::CancellingTool { .. }, CoreEvent::SubAgentResult { .. }) => {
+            handle_core_cancellation(state, event)
+        }
+
+        // Sub-Agent Results (REQ-BED-008)
+        (CoreState::AwaitingSubAgents { .. }, CoreEvent::SubAgentResult { .. })
+        | (CoreState::CancellingSubAgents { .. }, CoreEvent::SubAgentResult { .. }) => {
+            handle_core_sub_agents(state, event)
+        }
+
+        // Context Continuation (REQ-BED-019 through REQ-BED-024)
+        (CoreState::AwaitingContinuation { .. }, CoreEvent::LlmError { .. })
+        | (CoreState::AwaitingContinuation { .. }, CoreEvent::RetryTimeout { .. })
+        | (CoreState::Idle, CoreEvent::UserTriggerContinuation) => {
+            handle_core_continuation(state, event)
+        }
+
+        // Stale LlmResponse after cancel
+        (CoreState::Idle, CoreEvent::LlmResponse { .. }) => {
+            Ok(CoreTransitionResult::new(CoreState::Idle))
+        }
+
+        // Invalid Transitions
+        (state, event) => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }),
+    }
+}
+
+// ============================================================================
+// Domain-specific handlers for transition_core
+// ============================================================================
+
+/// Handles `LlmResponse` events when in `LlmRequesting` state.
+///
+/// By the time we get here, `propose_task` interception, `ask_user_question`
+/// interception, context exhaustion check, and sub-agent terminal tool handling
+/// have already been done by the parent/sub-agent wrappers. `LlmResponse` here
+/// means "normal tool execution or text-only response."
+#[allow(clippy::unnecessary_wraps)]
+fn handle_core_llm_response(
+    state: &CoreState,
+    context: &ConvContext,
+    event: CoreEvent,
+) -> Result<CoreTransitionResult, TransitionError> {
+    let CoreEvent::LlmResponse {
+        content,
+        tool_calls,
+        end_turn: _,
+        usage: usage_data,
+    } = event
+    else {
+        unreachable!("handle_core_llm_response called with non-LlmResponse event");
+    };
+    let CoreState::LlmRequesting { .. } = state else {
+        unreachable!("handle_core_llm_response called in non-LlmRequesting state");
+    };
+
+    if tool_calls.is_empty() && content.is_empty() {
+        tracing::debug!("LLM returned end_turn with empty content — no message to persist");
+        return Ok(CoreTransitionResult::new(CoreState::Idle)
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_agent_done()));
+    }
+
+    if tool_calls.is_empty() {
+        return Ok(CoreTransitionResult::new(CoreState::Idle)
+            .with_effect(Effect::persist_agent_message(
+                content,
+                Some(usage_data),
+                &context.working_dir,
+            ))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_agent_done()));
+    }
+
+    // Has tools -> ToolExecuting
+    let first = tool_calls[0].clone();
+    let rest = tool_calls[1..].to_vec();
+    let remaining_count = rest.len();
+    let display_data = compute_bash_display_data(&content, &context.working_dir);
+    let assistant_message = AssistantMessage::new(content, Some(usage_data), display_data);
+
+    Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
+        current_tool: first.clone(),
+        remaining_tools: rest,
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message,
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(notify_tool_executing(
+        first.name(),
+        &first.id,
+        remaining_count,
+        0,
+    ))
+    .with_effect(Effect::execute_tool(first)))
+}
+
+/// Handles `ToolComplete` and `SpawnAgentsComplete` events during `ToolExecuting` state.
+#[allow(clippy::too_many_lines)]
+fn handle_core_tool_complete(
+    state: &CoreState,
+    event: CoreEvent,
+) -> Result<CoreTransitionResult, TransitionError> {
+    let CoreState::ToolExecuting {
+        current_tool,
+        remaining_tools,
+        completed_results,
+        pending_sub_agents,
+        assistant_message,
+    } = state
+    else {
+        unreachable!("handle_core_tool_complete called in non-ToolExecuting state");
+    };
+
+    match event {
         // ToolComplete (more tools remaining) -> next tool
-        (
-            CoreState::ToolExecuting {
-                current_tool,
-                remaining_tools,
-                completed_results,
-                pending_sub_agents,
-                assistant_message,
-            },
-            CoreEvent::ToolComplete {
-                tool_use_id,
-                result,
-            },
-        ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result);
             let completed_count = new_results.len();
@@ -482,19 +477,10 @@ pub fn transition_core(
         }
 
         // ToolComplete (last tool, no sub-agents) -> LlmRequesting
-        (
-            CoreState::ToolExecuting {
-                current_tool,
-                remaining_tools,
-                completed_results,
-                pending_sub_agents,
-                assistant_message,
-            },
-            CoreEvent::ToolComplete {
-                tool_use_id,
-                result,
-            },
-        ) if tool_use_id == current_tool.id
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } if tool_use_id == current_tool.id
             && remaining_tools.is_empty()
             && pending_sub_agents.is_empty() =>
         {
@@ -514,19 +500,10 @@ pub fn transition_core(
         }
 
         // ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
-        (
-            CoreState::ToolExecuting {
-                current_tool,
-                remaining_tools,
-                completed_results,
-                pending_sub_agents,
-                assistant_message,
-            },
-            CoreEvent::ToolComplete {
-                tool_use_id,
-                result,
-            },
-        ) if tool_use_id == current_tool.id
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } if tool_use_id == current_tool.id
             && remaining_tools.is_empty()
             && !pending_sub_agents.is_empty() =>
         {
@@ -549,20 +526,11 @@ pub fn transition_core(
         }
 
         // SpawnAgentsComplete (more tools) -> accumulate
-        (
-            CoreState::ToolExecuting {
-                current_tool,
-                remaining_tools,
-                completed_results,
-                pending_sub_agents,
-                assistant_message,
-            },
-            CoreEvent::SpawnAgentsComplete {
-                tool_use_id,
-                result,
-                spawned,
-            },
-        ) if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
+        CoreEvent::SpawnAgentsComplete {
+            tool_use_id,
+            result,
+            spawned,
+        } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result);
             let completed_count = new_results.len();
@@ -592,20 +560,11 @@ pub fn transition_core(
         }
 
         // SpawnAgentsComplete (last tool) -> AwaitingSubAgents
-        (
-            CoreState::ToolExecuting {
-                current_tool,
-                remaining_tools,
-                completed_results,
-                pending_sub_agents,
-                assistant_message,
-            },
-            CoreEvent::SpawnAgentsComplete {
-                tool_use_id,
-                result,
-                spawned,
-            },
-        ) if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
+        CoreEvent::SpawnAgentsComplete {
+            tool_use_id,
+            result,
+            spawned,
+        } if tool_use_id == current_tool.id && remaining_tools.is_empty() => {
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(spawned);
 
@@ -626,10 +585,22 @@ pub fn transition_core(
             .with_effect(notify_awaiting_sub_agents(&all_pending, &[])))
         }
 
-        // ============================================================
-        // Cancellation (REQ-BED-005)
-        // ============================================================
+        // tool_use_id mismatch or unexpected event variant
+        _ => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }),
+    }
+}
 
+/// Handles cancellation-related events: `UserCancel` from active states,
+/// `ToolAborted`/`ToolComplete` during `CancellingTool`, `SubAgentResult` during `CancellingTool`.
+#[allow(clippy::too_many_lines)]
+fn handle_core_cancellation(
+    state: &CoreState,
+    event: CoreEvent,
+) -> Result<CoreTransitionResult, TransitionError> {
+    match (state, event) {
         // AwaitingSubAgents + UserCancel -> CancellingSubAgents
         (
             CoreState::AwaitingSubAgents {
@@ -649,8 +620,6 @@ pub fn transition_core(
         }
 
         // ToolExecuting + UserCancel -> CancellingTool
-        // NOTE: sub-agent wrapper intercepts UserCancel before reaching core
-        // (sub-agents go straight to Failed). Only parent reaches this.
         (
             CoreState::ToolExecuting {
                 current_tool,
@@ -685,7 +654,6 @@ pub fn transition_core(
         }
 
         // LlmRequesting + UserCancel -> Idle
-        // NOTE: sub-agent wrapper intercepts UserCancel -> Failed. Only parent reaches this.
         (CoreState::LlmRequesting { .. }, CoreEvent::UserCancel { .. }) => {
             Ok(CoreTransitionResult::new(CoreState::Idle)
                 .with_effect(Effect::PersistState)
@@ -706,17 +674,12 @@ pub fn transition_core(
                 tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
-            let mut all_results = completed_results.clone();
-            all_results.push(ToolResult::cancelled(
-                tool_use_id.clone(),
+            let all_results = build_cancellation_results(
+                completed_results,
+                tool_use_id,
                 "Cancelled by user",
-            ));
-            for tool in skipped_tools {
-                all_results.push(ToolResult::cancelled(
-                    tool.id.clone(),
-                    "Skipped due to cancellation",
-                ));
-            }
+                skipped_tools,
+            );
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in cancellation transition");
@@ -750,17 +713,12 @@ pub fn transition_core(
                 result: _,
             },
         ) if *tool_use_id == completed_id => {
-            let mut all_results = completed_results.clone();
-            all_results.push(ToolResult::cancelled(
-                tool_use_id.clone(),
+            let all_results = build_cancellation_results(
+                completed_results,
+                tool_use_id,
                 "Cancelled by user",
-            ));
-            for tool in skipped_tools {
-                all_results.push(ToolResult::cancelled(
-                    tool.id.clone(),
-                    "Skipped due to cancellation",
-                ));
-            }
+                skipped_tools,
+            );
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
@@ -806,10 +764,42 @@ pub fn transition_core(
             .with_effect(Effect::PersistState))
         }
 
-        // ============================================================
-        // Sub-Agent Results (REQ-BED-008)
-        // ============================================================
+        (state, event) => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }),
+    }
+}
 
+/// Builds the tool results list for cancellation transitions, including the
+/// cancelled current tool and skipped remaining tools.
+fn build_cancellation_results(
+    completed_results: &[ToolResult],
+    cancelled_tool_id: &str,
+    cancel_reason: &str,
+    skipped_tools: &[ToolCall],
+) -> Vec<ToolResult> {
+    let mut all_results = completed_results.to_vec();
+    all_results.push(ToolResult::cancelled(
+        cancelled_tool_id.to_string(),
+        cancel_reason,
+    ));
+    for tool in skipped_tools {
+        all_results.push(ToolResult::cancelled(
+            tool.id.clone(),
+            "Skipped due to cancellation",
+        ));
+    }
+    all_results
+}
+
+/// Handles `SubAgentResult` events in `AwaitingSubAgents` and `CancellingSubAgents` states.
+#[allow(clippy::too_many_lines)]
+fn handle_core_sub_agents(
+    state: &CoreState,
+    event: CoreEvent,
+) -> Result<CoreTransitionResult, TransitionError> {
+    match (state, event) {
         // AwaitingSubAgents + SubAgentResult (more pending)
         (
             CoreState::AwaitingSubAgents {
@@ -922,14 +912,99 @@ pub fn transition_core(
                 .with_effect(Effect::notify_agent_done()))
         }
 
-        // ============================================================
-        // Context Continuation (REQ-BED-019 through REQ-BED-024)
-        // ============================================================
+        (state, event) => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }),
+    }
+}
 
-        // ContinuationResponse -> ContextExhausted is parent-only (handled by parent wrapper)
-        // ContinuationFailed -> ContextExhausted is parent-only (handled by parent wrapper)
-        // UserCancel during continuation -> ContextExhausted is parent-only (handled by parent wrapper)
+/// Handles `LlmError` and `RetryTimeout` events during `LlmRequesting` state.
+fn handle_core_error_retry(
+    state: &CoreState,
+    event: CoreEvent,
+) -> Result<CoreTransitionResult, TransitionError> {
+    match (state, event) {
+        // Retryable LlmError below max -> retry (shared)
+        (CoreState::LlmRequesting { attempt }, CoreEvent::LlmError { error_kind, .. })
+            if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
+        {
+            let new_attempt = attempt + 1;
+            let delay = retry_delay(new_attempt);
 
+            Ok(CoreTransitionResult::new(CoreState::LlmRequesting {
+                attempt: new_attempt,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::ScheduleRetry {
+                delay,
+                attempt: new_attempt,
+            })
+            .with_effect(Effect::notify_state_change(
+                "llm_requesting",
+                json!({
+                    "attempt": new_attempt,
+                    "max_attempts": MAX_RETRY_ATTEMPTS,
+                    "message": format!("Retrying... (attempt {new_attempt})")
+                }),
+            )))
+        }
+
+        // Non-retryable or exhausted LlmError -> Error (core default)
+        (
+            CoreState::LlmRequesting { attempt },
+            CoreEvent::LlmError {
+                message,
+                error_kind,
+                ..
+            },
+        ) => {
+            let error_message = if error_kind.is_retryable() {
+                format!("Failed after {attempt} attempts: {message}")
+            } else {
+                message
+            };
+
+            Ok(CoreTransitionResult::new(CoreState::Error {
+                message: error_message.clone(),
+                error_kind,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change(
+                "error",
+                json!({
+                    "message": error_message
+                }),
+            )))
+        }
+
+        // RetryTimeout -> Make LLM request
+        (
+            CoreState::LlmRequesting { attempt },
+            CoreEvent::RetryTimeout {
+                attempt: retry_attempt,
+            },
+        ) if *attempt == retry_attempt => {
+            Ok(
+                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: *attempt })
+                    .with_effect(Effect::RequestLlm),
+            )
+        }
+
+        (state, event) => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        }),
+    }
+}
+
+/// Handles continuation-related events: `LlmError`/`RetryTimeout` during
+/// `AwaitingContinuation`, and `UserTriggerContinuation` from Idle.
+fn handle_core_continuation(
+    state: &CoreState,
+    event: CoreEvent,
+) -> Result<CoreTransitionResult, TransitionError> {
+    match (state, event) {
         // LlmError during continuation - retry
         (
             CoreState::AwaitingContinuation {
@@ -995,14 +1070,6 @@ pub fn transition_core(
             }))
         }
 
-        // Stale LlmResponse after cancel
-        (CoreState::Idle, CoreEvent::LlmResponse { .. }) => {
-            Ok(CoreTransitionResult::new(CoreState::Idle))
-        }
-
-        // ============================================================
-        // Invalid Transitions
-        // ============================================================
         (state, event) => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
