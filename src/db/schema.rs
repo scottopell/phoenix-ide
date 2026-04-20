@@ -29,15 +29,6 @@ impl NonEmptyString {
     }
 }
 
-/// `#[serde(default)]` rollout shim for legacy DB rows predating `NonEmptyString`.
-/// Produces a sentinel value that startup reconciliation catches and reverts
-/// to Explore/Direct. The A2 migration phase will remove these defaults.
-impl Default for NonEmptyString {
-    fn default() -> Self {
-        Self("__LEGACY_EMPTY__".to_string())
-    }
-}
-
 impl fmt::Display for NonEmptyString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -192,10 +183,8 @@ ALTER TABLE messages RENAME COLUMN id TO message_id;
 /// REQ-BED-027: Conversation-level field, NOT embedded in `ConvState`.
 ///
 /// All string fields in Work and Branch use `NonEmptyString` to make empty
-/// strings structurally unrepresentable at construction time. The
-/// `#[serde(default)]` shims produce a sentinel value (`__LEGACY_EMPTY__`)
-/// for old DB rows -- startup reconciliation catches these and reverts to
-/// Explore/Direct. The A2 migration phase will remove the defaults.
+/// strings structurally unrepresentable. The migration system backfills
+/// legacy rows; deserialization of missing fields is now a hard error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "mode")]
 pub enum ConvMode {
@@ -209,25 +198,16 @@ pub enum ConvMode {
     /// Write mode on a task branch (Managed workflow). Full tool suite with file write access.
     Work {
         /// The git branch name for this work conversation (e.g., `task-0042-fix-bug`)
-        #[serde(default)]
         branch_name: NonEmptyString,
         /// Absolute path to the git worktree for this conversation.
-        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
-        #[serde(default)]
         worktree_path: NonEmptyString,
         /// The branch that was checked out when the task was approved (e.g., `main`).
         /// Used as the merge target for Complete and the restore target for Abandon.
-        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
-        #[serde(default)]
         base_branch: NonEmptyString,
         /// The task ID assigned at approval time (e.g., "YF042").
         /// Used to locate and update the task file in `tasks/`.
-        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
-        #[serde(default)]
         task_id: NonEmptyString,
         /// Human-readable task title (e.g., "Fix auth middleware token storage").
-        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
-        #[serde(default)]
         task_title: NonEmptyString,
     },
     /// Branch mode: work directly on an existing branch (e.g., fix a PR).
@@ -235,15 +215,10 @@ pub enum ConvMode {
     /// REQ-PROJ-024
     Branch {
         /// The existing branch name (e.g., "q-branch-observer")
-        #[serde(default)]
         branch_name: NonEmptyString,
         /// Absolute path to the git worktree
-        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
-        #[serde(default)]
         worktree_path: NonEmptyString,
         /// The branch this worktree was created from (same as `branch_name` for Branch mode)
-        /// `#[serde(default)]` rollout shim -- A2 migration removes it.
-        #[serde(default)]
         base_branch: NonEmptyString,
     },
 }
@@ -997,32 +972,10 @@ mod conv_mode_tests {
     }
 
     #[test]
-    fn test_non_empty_string_default_is_sentinel() {
-        let nes = NonEmptyString::default();
-        assert_eq!(nes.as_str(), "__LEGACY_EMPTY__");
-    }
-
-    #[test]
-    fn test_legacy_work_row_with_missing_fields_uses_sentinel() {
-        // Simulates a legacy DB row where only branch_name existed
+    fn test_work_missing_fields_is_hard_error() {
+        // After migration cleanup, missing fields are rejected (no serde(default))
         let json = r#"{"mode":"Work","branch_name":"old-branch"}"#;
-        let parsed: ConvMode = serde_json::from_str(json).unwrap();
-        match &parsed {
-            ConvMode::Work {
-                branch_name,
-                worktree_path,
-                base_branch,
-                task_id,
-                task_title,
-            } => {
-                assert_eq!(branch_name.as_str(), "old-branch");
-                assert_eq!(worktree_path.as_str(), "__LEGACY_EMPTY__");
-                assert_eq!(base_branch.as_str(), "__LEGACY_EMPTY__");
-                assert_eq!(task_id.as_str(), "__LEGACY_EMPTY__");
-                assert_eq!(task_title.as_str(), "__LEGACY_EMPTY__");
-            }
-            other => panic!("Expected Work, got {other:?}"),
-        }
+        assert!(serde_json::from_str::<ConvMode>(json).is_err());
     }
 
     #[test]
