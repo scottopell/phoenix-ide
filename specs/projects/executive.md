@@ -2,35 +2,40 @@
 
 ## Requirements Summary
 
-The Projects feature gives PhoenixIDE a structured, git-backed workspace model. Every
-conversation begins in Explore mode: read-only, pinned to the current main branch HEAD,
-with no setup or risk. Users explore, ask questions, and plan freely. When an agent is
-ready to make real changes, it proposes a task via `propose_plan`. The task file
-(written to `tasks/` on main) is presented for human review using the prose reader.
-Users can annotate the plan, request revisions, or approve. On approval, a dedicated
-branch is created and the conversation enters Work mode. When work is complete, the user
-initiates a Complete action which squash merges the task branch into the base branch with
-an LLM-generated commit message; alternatively, the user can Abandon the task, which
-destructively discards the worktree and branch. Both actions transition the conversation
-to Terminal state. Task files on main give every conversation project-wide awareness of
-what is in-progress, planned, or done without any special API.
+The Projects feature gives PhoenixIDE a structured, git-backed workspace model with
+three conversation modes. Direct mode is the default for all conversations: full tool
+access, no worktrees, no ceremony. Managed mode is opt-in for git repositories and
+provides a two-phase lifecycle: conversations start in Explore (read-only worktree
+created on first message), then upgrade to Work when the user approves a task proposed
+via `propose_plan`. The plan is presented for human review; users can annotate, request
+revisions, or approve. On approval, the temporary branch is renamed to the final task
+branch, a task file is committed on that branch, and write tools are enabled. Branch
+mode lets users work directly on an existing branch with no Explore phase and no task
+file. A branch picker with local listing (sorted by recency, with staleness counts) and
+on-demand remote search (cached `git ls-remote`) supports both Managed and Branch mode
+branch selection. When work is complete, the agent pushes the branch to origin and the
+user merges via PR on their hosting platform. The user then marks the conversation as
+merged (terminal) or abandons it. In Managed mode, abandon deletes the worktree and
+branch; in Branch mode, abandon deletes only the worktree, keeping the user's branch.
 
 ## Technical Summary
 
-`ConvMode` (Explore or Work) is a conversation-level field stored in SQLite alongside
-the state machine state. `ConvMode::Work` includes `base_branch` recorded at approval
-time. The state machine emits typed effects for git operations; the executor performs
-them. One new state: `AwaitingTaskApproval` (task plan under human review). Task
-completion and abandonment are user-initiated executor actions (no
-`AwaitingMergeApproval` state). Complete does a squash merge into base_branch with
-LLM-generated commit message; abandon destructively deletes worktree+branch. Both
-transition to Terminal. Worktree paths are derived from conversation IDs -- collision
-is structurally impossible. One new tool: `propose_plan` (Explore mode only, pure
-data carrier intercepted like submit_result). During Work mode, agents update task
-files via the standard patch tool. Tool registry is configured by mode: patch is
-disabled in Explore, enabled in Work. Work sub-agents inherit the parent's worktree
-and can optionally receive write access (one at a time). A passive poll-based
-commits-behind indicator shows base branch advancement in the StateBar.
+`ConvMode` has three variants: Direct, Explore, Work -- plus a distinct Branch mode
+stored as a separate conversation-level field in SQLite. Direct carries no git metadata.
+Managed conversations start in Explore: a worktree is created on first message using a
+temporary branch (`task-pending-{id}`), with a best-effort single-branch fetch of the
+base branch. On task approval, the temp branch is renamed to `task-{NNNN}-{slug}`, a
+task file is committed on the task branch (not main), and the mode upgrades to Work.
+Branch mode creates a worktree on the user's chosen branch immediately, with no Explore
+phase and no task file. Worktree paths are derived from conversation IDs -- collision is
+structurally impossible. One tool: `propose_plan` (Explore mode only, pure data carrier
+intercepted like submit_result). Tool registry is configured by mode: write tools
+disabled in Explore, enabled in Work and Branch. Push is a regular bash command with no
+lifecycle side effects. Terminal actions are Mark as Merged and Abandon, both
+user-initiated. Managed mode deletes the branch on terminal; Branch mode keeps it. A
+remote-aware commits-behind poller does single-branch fetches on a 60-second interval
+and emits SSE updates. Branch discovery uses local `git for-each-ref` for instant
+listing and cached `git ls-remote` for on-demand remote search (5-minute TTL).
 
 ## Status Summary
 
@@ -55,18 +60,18 @@ commits-behind indicator shows base branch advancement in the StateBar.
 | **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Task 08603 (M3). ConvMode::Work stores base_branch |
 | **REQ-PROJ-018:** Direct Mode | ✅ Complete | Default for all conversations |
 | **REQ-PROJ-019:** Conversation List Filtering | ✅ Complete | Mode/project filters, auto-archive |
-| **REQ-PROJ-020:** Branch Discovery (Local, No Network) | 🔧 In Progress | Local branches sorted by recency, staleness signal |
-| **REQ-PROJ-021:** Remote Branch Search (On-Demand) | 🔧 In Progress | `git ls-remote` with caching, substring search |
-| **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | 🔧 In Progress | Auto-fetch selected branch at worktree creation |
-| **REQ-PROJ-023:** Remote-Aware Commits-Behind Polling | 🔧 In Progress | Single-branch fetch in poller |
-| **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ❌ Not Started | New mode: worktree on existing branch, no task file, no Explore |
-| **REQ-PROJ-025:** One Active Work Conversation Per Branch | ❌ Not Started | Redirect/prompt when branch already has active conversation |
-| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | ❌ Not Started | Push is not terminal; "Mark as merged" is the terminal action |
-| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ❌ Not Started | Replaces squash-merge with push; task file on branch, not main |
-| **REQ-PROJ-028:** Managed Mode Worktree from First Message | ❌ Not Started | Agent explores the selected branch, not the main checkout |
-| **REQ-PROJ-029:** Branch Mode in the Mode Picker | ❌ Not Started | Three modes: Direct, Managed, Branch |
+| **REQ-PROJ-020:** Branch Discovery (Local, No Network) | ✅ Complete | Branch picker with search, staleness counts, recency sort |
+| **REQ-PROJ-021:** Remote Branch Search (On-Demand) | ✅ Complete | Cached `git ls-remote` with 5-min TTL, substring filter |
+| **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | ✅ Complete | Best-effort single-branch fetch at worktree creation |
+| **REQ-PROJ-023:** Remote-Aware Commits-Behind Polling | ✅ Complete | 60s poller with single-branch fetch, SSE delta updates |
+| **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ✅ Complete | Worktree on existing branch, no task file, no Explore phase |
+| **REQ-PROJ-025:** One Active Work Conversation Per Branch | ✅ Complete | Conflict detection with redirect/delete/fresh-start options |
+| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | ✅ Complete | Push via bash; Mark as Merged and Abandon as terminal actions |
+| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ✅ Complete | Push branch, user merges via PR; task file on branch, not main |
+| **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
+| **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
 
-**Progress:** 12 of 27 complete (2 descoped, 1 partial, 4 in progress, 3 needs update, 6 not started)
+**Progress:** 23 of 27 complete (2 descoped, 1 partial, 3 needs update)
 
 ## Remaining Work
 
