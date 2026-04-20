@@ -767,7 +767,7 @@ mod tests {
         // Check specific model
         let opus = model_infos
             .iter()
-            .find(|m| m.id == "claude-opus-4-6")
+            .find(|m| m.id == "claude-opus-4-7")
             .unwrap();
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));

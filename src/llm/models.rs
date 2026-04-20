@@ -66,15 +66,35 @@ pub struct ModelSpec {
 pub fn all_models() -> Vec<ModelSpec> {
     vec![
         // Anthropic models
-        // Note: 4.6 models use stable (non-dated) API IDs; id matches api_name for correct lookup.
+        // Note: 4.6+ models use stable (non-dated) API IDs; id matches api_name for correct lookup.
+        ModelSpec {
+            id: "claude-opus-4-7".into(),
+            api_name: "claude-opus-4-7".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Opus 4.7 (most capable, slower)".into(),
+            context_window: 200_000,
+            recommended: true,
+            supports_tool_search: true,
+        },
+        ModelSpec {
+            id: "claude-opus-4-7-1m".into(),
+            api_name: "claude-opus-4-7".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Opus 4.7 (1M context)".into(),
+            context_window: 1_000_000,
+            recommended: false,
+            supports_tool_search: true,
+        },
         ModelSpec {
             id: "claude-opus-4-6".into(),
             api_name: "claude-opus-4-6".into(),
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.6 (most capable, slower)".into(),
+            description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 200_000,
-            recommended: true,
+            recommended: false,
             supports_tool_search: true,
         },
         ModelSpec {
@@ -102,7 +122,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             api_name: "claude-opus-4-6".into(),
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.6 (1M context)".into(),
+            description: "Claude Opus 4.6 (1M context, legacy)".into(),
             context_window: 1_000_000,
             recommended: false,
             supports_tool_search: true,
