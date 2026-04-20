@@ -18,6 +18,17 @@
 --   - Token streaming mechanics
 --   - System prompt construction
 --
+-- Architecture: The state machine uses a CoreState wrapper pattern.
+--   CoreState holds shared states (Idle, LlmRequesting, ToolExecuting, etc.)
+--   ParentConversation wraps CoreState and adds parent-only states
+--     (AwaitingRecovery, TaskApproval, UserResponse, ContextExhausted, Terminal)
+--   SubAgentConversation wraps CoreState and adds sub-agent-only states
+--     (Completed, Failed)
+--   Events are similarly split: CoreEvent (shared), ParentOnlyEvent,
+--     SubAgentOnlyEvent. The transition function dispatches based on
+--     conversation kind, eliminating match-arm ordering dependencies.
+--   ConvState remains as the serialization format with From/TryFrom conversions.
+--
 -- Requirement traceability: REQ-BED-001 through REQ-BED-030
 -- (3 deprecated: REQ-BED-014, REQ-BED-015, REQ-BED-016)
 
@@ -49,9 +60,10 @@ value ToolCall {
 
 value ToolResult {
     tool_use_id: String
-    content: String
-    is_error: Boolean
+    outcome: ToolOutcome
 }
+
+enum ToolOutcome { success | error | cancelled }
 
 value SubAgentResult {
     agent_id: String
@@ -87,33 +99,42 @@ enum RecoveryKind { credential }
 
 enum TaskApprovalDecision { approved | rejected | feedback_provided }
 
+-- Mode summary for transition guards (REQ-BED-030, REQ-PROJ-024).
+-- Threaded into ConvContext so the transition function can guard
+-- against invalid (mode, state) combinations.
+enum ModeKind { direct | managed | branch }
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
 
+-- Conversation uses a sum type to structurally separate parent and sub-agent
+-- conversations. The `kind` discriminator determines which status states are
+-- reachable and which events are valid -- the compiler enforces this.
 entity Conversation {
     -- Identity
-    is_sub_agent: Boolean
-    parent: Conversation?          -- set when is_sub_agent = true
+    kind: Parent | SubAgent         -- discriminator field
 
     -- Seed metadata (REQ-SEED-003, REQ-SEED-004)
     -- Decorative only. `seed_parent` is a UI breadcrumb pointer to the
     -- conversation the user spawned this one from via a "seed" action
-    -- (distinct from `parent` above, which is sub-agent parentage).
+    -- (distinct from sub-agent `parent`, which is structural parentage).
     -- Never traversed by runtime logic; if the referenced conversation
     -- is deleted, the UI renders the label as unlinked text.
     seed_parent: Conversation?
     seed_label:  String?
 
-    -- Lifecycle status
-    status: idle | llm_requesting | executing_tools
-           | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
-           | error | awaiting_recovery | awaiting_continuation
-           | awaiting_task_approval | awaiting_user_response
-           | context_exhausted | terminal | completed | failed
+    -- Core lifecycle status (shared between parent and sub-agent).
+    -- Parent-only and sub-agent-only states are on their respective variants.
+    core_status: idle | llm_requesting | executing_tools
+                | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
+                | error | awaiting_continuation
 
     -- Mode (orthogonal to status, persists across status transitions)
     mode: explore | direct | work | branch
+
+    -- Mode summary for transition guards
+    mode_kind: ModeKind
 
     -- Desired base branch for Managed mode (set at creation, consumed at task approval)
     desired_base_branch: String?
@@ -123,9 +144,11 @@ entity Conversation {
     model_context_window: Integer
 
     -- ----------------------------------------------------------------
-    -- Status transition graph (REQ-BED-001)
+    -- Core status transition graph (REQ-BED-001)
+    -- These transitions are shared by both parent and sub-agent.
+    -- Parent-only and sub-agent-only transitions are on variants below.
     -- ----------------------------------------------------------------
-    transitions status {
+    transitions core_status {
         -- User message handling (REQ-BED-002)
         idle -> llm_requesting
         error -> llm_requesting
@@ -133,12 +156,7 @@ entity Conversation {
         -- LLM response processing (REQ-BED-003)
         llm_requesting -> idle
         llm_requesting -> executing_tools
-        llm_requesting -> awaiting_task_approval
-        llm_requesting -> awaiting_user_response
-        llm_requesting -> awaiting_continuation
         llm_requesting -> error
-        llm_requesting -> completed
-        llm_requesting -> failed
 
         -- Tool execution (REQ-BED-004)
         executing_tools -> llm_requesting
@@ -159,41 +177,9 @@ entity Conversation {
         -- Error recovery (REQ-BED-006)
         -- (error -> llm_requesting declared above)
 
-        -- Active recovery (REQ-BED-030)
-        llm_requesting -> awaiting_recovery
-        awaiting_recovery -> llm_requesting
-        awaiting_recovery -> error
-        awaiting_recovery -> idle
-
         -- Context continuation (REQ-BED-019)
         idle -> awaiting_continuation
-        awaiting_continuation -> context_exhausted
-
-        -- Task approval (REQ-BED-028)
-        awaiting_task_approval -> llm_requesting
-        awaiting_task_approval -> idle
-
-        -- User question response
-        awaiting_user_response -> llm_requesting
-        awaiting_user_response -> idle
-
-        -- Sub-agent forced termination (REQ-BED-026, REQ-BED-024)
-        -- Any non-terminal sub-agent state can be terminated → failed
-        idle -> failed
-        executing_tools -> failed
-        cancelling_tool -> failed
-        awaiting_sub_agents -> failed
-        cancelling_sub_agents -> failed
-        awaiting_continuation -> failed
-        awaiting_task_approval -> failed
-        awaiting_user_response -> failed
-        awaiting_recovery -> failed
-        error -> failed
-
-        -- Task resolution (REQ-BED-029)
-        idle -> terminal
-
-        terminal: context_exhausted, terminal, completed, failed
+        awaiting_continuation -> error
     }
 
     -- ----------------------------------------------------------------
@@ -206,65 +192,42 @@ entity Conversation {
     }
 
     -- ----------------------------------------------------------------
-    -- State-dependent fields
+    -- Core state-dependent fields (shared by both variants)
     -- ----------------------------------------------------------------
 
     -- Retry tracking
-    retry_attempt: Integer when status = llm_requesting | awaiting_continuation
+    retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation
 
     -- Tool execution queue (REQ-BED-004)
-    tool_queue: List<ToolCall> when status = executing_tools
-    tool_results: List<ToolResult> when status = executing_tools | cancelling_tool
+    tool_queue: List<ToolCall> when core_status = executing_tools
+    tool_results: List<ToolResult> when core_status = executing_tools | cancelling_tool
     accumulated_sub_agents: Set<Conversation>
-        when status = executing_tools
+        when core_status = executing_tools
 
     -- Cancellation bookkeeping (REQ-BED-005)
-    skipped_tools: List<ToolCall> when status = cancelling_tool
+    skipped_tools: List<ToolCall> when core_status = cancelling_tool
     pending_sub_agents_cancelling: Set<Conversation>
-        when status = cancelling_tool
+        when core_status = cancelling_tool
 
     -- Sub-agent tracking (REQ-BED-008)
     sub_agents_pending: Set<Conversation>
-        when status = awaiting_sub_agents | cancelling_sub_agents
+        when core_status = awaiting_sub_agents | cancelling_sub_agents
     sub_agents_completed: List<SubAgentResult>
-        when status = awaiting_sub_agents | cancelling_sub_agents
-
-    -- Task approval content (REQ-BED-028)
-    proposal: TaskProposal when status = awaiting_task_approval
-
-    -- User question content
-    pending_questions: List<UserQuestion> when status = awaiting_user_response
+        when core_status = awaiting_sub_agents | cancelling_sub_agents
 
     -- Continuation tracking (REQ-BED-019)
-    rejected_tool_calls: List<ToolCall> when status = awaiting_continuation
+    rejected_tool_calls: List<ToolCall> when core_status = awaiting_continuation
 
-    -- Error info (REQ-BED-006, REQ-BED-030)
-    error_message: String when status in { error, awaiting_recovery }
-    error_class: ErrorClass when status = error
-
-    -- Active recovery (REQ-BED-030)
-    recovery_kind: RecoveryKind when status = awaiting_recovery
-
-    -- Context exhaustion (REQ-BED-021)
-    continuation_summary: String when status = context_exhausted
-
-    -- Sub-agent turn limit (REQ-BED-026)
-    grace_turn_granted: Boolean = false when is_sub_agent
-
-    -- Sub-agent terminal data
-    completion_result: String when status = completed
-    failure_error: String when status = failed
-    failure_error_class: ErrorClass? when status = failed
+    -- Error info (REQ-BED-006)
+    error_message: String when core_status = error
+    error_class: ErrorClass when core_status = error
 
     -- Worktree fields -- shared across all modes that have worktrees.
-    -- The structural distinction between Work and Branch is task_id presence,
-    -- not different field names for the same concept.
     branch_name: String when mode in { explore, work, branch }
     worktree_path: String when mode in { explore, work, branch }
     base_branch: String when mode in { explore, work, branch }
 
     -- Work-only: task_id is the structural discriminator.
-    -- Present in Work (Managed), absent in Branch and Explore.
     task_id: String when mode = work
 
     -- ----------------------------------------------------------------
@@ -276,10 +239,9 @@ entity Conversation {
     -- ----------------------------------------------------------------
     -- Derived values
     -- ----------------------------------------------------------------
-    is_busy: status in { llm_requesting, executing_tools,
-                         awaiting_sub_agents, cancelling_tool,
-                         cancelling_sub_agents, awaiting_recovery }
-    is_terminal: status in { context_exhausted, terminal, completed, failed }
+    is_busy: core_status in { llm_requesting, executing_tools,
+                              awaiting_sub_agents, cancelling_tool,
+                              cancelling_sub_agents }
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 
@@ -287,32 +249,99 @@ entity Conversation {
     -- Entity-level invariants
     -- ----------------------------------------------------------------
 
-    -- REQ-BED-009: Sub-agents cannot spawn sub-agents
-    invariant NoRecursiveSubAgents {
-        is_sub_agent implies sub_agents.count = 0
-    }
-
     -- REQ-BED-018: At most one Work sub-agent per parent
     invariant OneWorkSubAgent {
         work_sub_agents.count <= 1
     }
+}
 
-    -- REQ-BED-027: Work mode fields are structurally guaranteed present
-    -- by the `when mode = work` clause. No runtime invariant needed.
-    -- The `when` clause IS the structural guarantee.
+-- ----------------------------------------------------------------
+-- Variants: Parent and SubAgent
+-- ----------------------------------------------------------------
 
-    -- Sub-agent terminal states are sub-agent-only
-    invariant CompletedIsSubAgentOnly {
-        status = completed implies is_sub_agent
-    }
-    invariant FailedIsSubAgentOnly {
-        status = failed implies is_sub_agent
+-- Parent conversations: user-facing, can propose tasks, recover from
+-- auth errors, reach terminal state via task resolution.
+-- Structurally cannot reach Completed or Failed (sub-agent-only).
+variant Parent : Conversation {
+    parent_status: awaiting_recovery | awaiting_task_approval
+                  | awaiting_user_response | context_exhausted | terminal
+
+    -- Parent-only state-dependent fields
+    proposal: TaskProposal when parent_status = awaiting_task_approval
+    pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
+    recovery_kind: RecoveryKind when parent_status = awaiting_recovery
+    recovery_message: String when parent_status = awaiting_recovery
+    continuation_summary: String when parent_status = context_exhausted
+
+    -- Parent-only transitions (extends core_status graph)
+    transitions parent_status {
+        -- From core: LlmResponse interception
+        -- (triggered when core would transition idle, but interceptor fires)
+        awaiting_task_approval -> idle    -- rejected
+        awaiting_task_approval -> idle    -- feedback (back to explore)
+        awaiting_user_response -> idle    -- cancelled
+
+        -- Active recovery (REQ-BED-030)
+        awaiting_recovery -> idle         -- cancelled
+        awaiting_recovery -> error        -- helper failed
+
+        -- Terminal
+        context_exhausted -> terminal     -- (absorbed, no further transitions)
+        terminal: context_exhausted, terminal
     }
 
-    -- REQ-BED-030: Sub-agents fail fast on auth errors, never wait for recovery
-    invariant NoRecoveryForSubAgents {
-        is_sub_agent implies status != awaiting_recovery
+    is_busy: super.is_busy or parent_status = awaiting_recovery
+    is_terminal: parent_status in { context_exhausted, terminal }
+
+    -- REQ-BED-009: Sub-agents cannot spawn sub-agents (parents can)
+    -- (no constraint needed here; NoRecursiveSubAgents is on SubAgent)
+
+    @guidance
+        -- Parent conversations handle:
+        -- - propose_task interception (only when mode_kind != direct)
+        -- - ask_user_question interception
+        -- - AwaitingRecovery (credential helper running)
+        -- - Context continuation (threshold -> summary -> exhausted)
+        -- - Task resolution -> Terminal
+        -- Core events (UserMessage, LlmResponse, ToolComplete, etc.)
+        -- delegate to transition_core via the CoreState wrapper.
+}
+
+-- Sub-agent conversations: spawned by a parent, report results back,
+-- fail fast on non-retryable errors.
+-- Structurally cannot reach AwaitingRecovery, TaskApproval, UserResponse,
+-- ContextExhausted, or Terminal (parent-only).
+variant SubAgent : Conversation {
+    parent: Conversation              -- always set (not optional like on base)
+    sub_agent_status: completed | failed
+
+    -- Sub-agent-only fields
+    grace_turn_granted: Boolean = false
+    completion_result: String when sub_agent_status = completed
+    failure_error: String when sub_agent_status = failed
+    failure_error_class: ErrorClass? when sub_agent_status = failed
+
+    -- Sub-agent-only transitions
+    transitions sub_agent_status {
+        terminal: completed, failed
     }
+
+    is_terminal: sub_agent_status in { completed, failed }
+
+    -- REQ-BED-009: Sub-agents cannot spawn sub-agents
+    invariant NoRecursiveSubAgents {
+        sub_agents.count = 0
+    }
+
+    @guidance
+        -- Sub-agent conversations handle:
+        -- - GraceTurnExhausted (one extra LLM turn to call submit_result)
+        -- - UserCancel -> Failed + NotifyParent (not Idle like parents)
+        -- - LlmError (non-retryable/exhausted) -> Failed + NotifyParent
+        -- - Text-only LlmResponse with no tools -> implicit completion
+        -- Core events delegate to transition_core via the CoreState wrapper.
+        -- Sub-agents never see TaskApprovalResponse, UserQuestionResponse,
+        -- CredentialBecameAvailable, or TaskResolved events.
 }
 
 ------------------------------------------------------------
