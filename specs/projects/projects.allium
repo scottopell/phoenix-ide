@@ -4,19 +4,24 @@
 -- Phoenix Project Lifecycle: Behavioural Specification
 --
 -- Scope: Git-backed project lifecycle around bedrock conversations
--- Includes: Project detection, mode selection, branch discovery,
---           task approval git operations, worktree lifecycle,
---           task file lifecycle, complete flow, abandon flow,
+-- Includes: Project detection, mode selection (Direct/Managed/Branch),
+--           branch discovery, task approval, worktree lifecycle,
+--           task file lifecycle, mark-as-merged flow, abandon flow,
 --           write scoping, sub-agent worktree inheritance,
 --           server restart worktree reconciliation
 -- Excludes:
 --   - Conversation state machine (see bedrock.allium)
---   - LLM commit message generation (implementation detail)
 --   - Platform capability detection (infrastructure)
 --   - UI layout (confirmation dialogs, project switcher, badges)
---   - .gitignore management (infrastructure)
---   - Auto-stash mechanics (implementation detail)
+--   - .gitignore management (handled by git_ops module)
 --   - Diff snapshot capture (implementation detail of abandon)
+--
+-- Implementation notes (not normative):
+--   Git operations consolidated in src/git_ops.rs (materialize_branch,
+--   create_worktree, check_branch_conflict). API handlers split across
+--   src/api/handlers.rs, src/api/git_handlers.rs, src/api/lifecycle_handlers.rs.
+--   State machine uses CoreState/ParentState/SubAgentState wrapper pattern
+--   (see bedrock.allium task 02668 for spec alignment).
 --
 -- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
 -- (2 descoped: REQ-PROJ-009, REQ-PROJ-015)
