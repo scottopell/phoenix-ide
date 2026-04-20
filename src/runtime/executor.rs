@@ -14,9 +14,11 @@ use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
-use crate::state_machine::state::{SubAgentMode, ToolCall, ToolInput};
+use crate::state_machine::state::{
+    SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
+};
 use crate::state_machine::{
-    handle_outcome, transition, ConvContext, ConvState, Effect, Event, StepResult,
+    handle_outcome, transition, CheckpointData, ConvContext, ConvState, Effect, Event, StepResult,
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
@@ -620,8 +622,6 @@ where
     ///
     /// Called from the executor select loop when `sub_agent_deadline` fires (REQ-SA-006).
     async fn handle_sub_agent_timeout(&mut self) {
-        use crate::state_machine::state::SubAgentOutcome;
-
         self.sub_agent_deadline = None;
 
         let pending_ids: Vec<(String, String)> =
@@ -960,7 +960,7 @@ where
     }
 
     /// Execute an effect and optionally return a generated event
-    #[allow(clippy::too_many_lines)] // Effect handling is inherently complex
+    #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
             Effect::PersistMessage {
@@ -999,372 +999,9 @@ where
                 Ok(None)
             }
 
-            Effect::RequestLlm => {
-                // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
-                // have their own lifetime cap below (REQ-PROJ-008); this branch
-                // only fires for parent conversations. The counter is reset at
-                // the top of `process_event` on every `Event::UserMessage`.
-                if !self.context.is_sub_agent && self.parent_tool_cycle_cap > 0 {
-                    self.parent_tool_cycle_count += 1;
-                    if self.parent_tool_cycle_count > self.parent_tool_cycle_cap {
-                        let cap = self.parent_tool_cycle_cap;
-                        let attempted = self.parent_tool_cycle_count;
-                        tracing::warn!(
-                            conv_id = %self.context.conversation_id,
-                            attempted,
-                            cap,
-                            "parent conversation attempted to exceed tool-use cycle cap; halting"
-                        );
-                        self.halt_parent_cycle_cap(cap, attempted).await;
-                        return Ok(None);
-                    }
-                }
+            Effect::RequestLlm => self.dispatch_llm_request().await,
 
-                // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
-                // finite turn budget. Grace turn mechanism gives the model one extra LLM
-                // turn to call submit_result before hard-stopping.
-                if self.context.max_turns > 0 {
-                    self.llm_turn_count += 1;
-                    if self.llm_turn_count > self.context.max_turns {
-                        if self.grace_turn_granted {
-                            // Second hit: hard stop with partial result extraction
-                            // (REQ-BED-026 SubAgentTurnLimitHardStop)
-                            tracing::info!(
-                                conv_id = %self.context.conversation_id,
-                                turns = self.llm_turn_count,
-                                max = self.context.max_turns,
-                                "Sub-agent grace turn exhausted, extracting partial results"
-                            );
-
-                            self.handle_grace_turn_hard_stop().await;
-                            return Ok(None);
-                        }
-
-                        // First hit: grant grace turn (REQ-BED-026 SubAgentTurnLimitGraceTurn)
-                        self.grace_turn_granted = true;
-                        tracing::info!(
-                            conv_id = %self.context.conversation_id,
-                            turns = self.llm_turn_count,
-                            max = self.context.max_turns,
-                            "Sub-agent reached turn limit, granting grace turn"
-                        );
-
-                        // Inject a meta user message prompting submit_result.
-                        // Uses UserContent::meta() so it appears in the LLM context
-                        // via the existing User message path (not System, which is
-                        // UI-only bookkeeping and not sent to the LLM).
-                        let msg_id = uuid::Uuid::new_v4().to_string();
-                        let content = MessageContent::User(
-                            crate::db::UserContent::meta(
-                                "You have reached your turn limit. Please call submit_result now \
-                                 with whatever findings you have so far. Do not call any other tools.",
-                            ),
-                        );
-                        if let Err(e) = self
-                            .storage
-                            .add_message(
-                                &msg_id,
-                                &self.context.conversation_id,
-                                &content,
-                                None,
-                                None,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "Failed to persist grace turn message");
-                        }
-
-                        // Allow the normal LLM request to proceed (don't return, don't
-                        // send UserCancel). The meta message will appear in the next
-                        // build_llm_messages call as a user-role message.
-                    }
-                }
-
-                // Typed oneshot channel: background task gets Sender<LlmOutcome>,
-                // physically cannot send a ToolExecOutcome or other type.
-                let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-                let outcome_tx = self.outcome_tx.clone();
-
-                let llm_client = self.llm_client.clone();
-                let tool_executor = self.tool_executor.clone();
-                let storage = self.storage.clone();
-                let conv_id = self.context.conversation_id.clone();
-                let working_dir = self.context.working_dir.clone();
-                let is_sub_agent = self.context.is_sub_agent;
-                let mode_context = self.context.mode_context.clone();
-
-                // Token streaming channel (REQ-BED-025).
-                //
-                // Broadcast so the forwarding task can subscribe before the LLM
-                // task starts emitting chunks. The forwarder bridges this
-                // per-request broadcast to `self.broadcast_tx` (the per-
-                // conversation SSE broadcast) as `SseEvent::Token`.
-                //
-                // Task 24683: the LLM task owns the forwarder's `JoinHandle`
-                // and awaits it after the LLM call finishes. That forces a
-                // happens-before barrier so every `SseEvent::Token` has been
-                // sent to `self.broadcast_tx` before the main executor loop
-                // is ever told the call is done (and therefore before it
-                // broadcasts `SseEvent::Message`). Without this barrier a
-                // trailing Token could land on the SSE channel after its
-                // Message, producing a phantom streaming buffer on the
-                // client (the "repeated message" bug).
-                let (chunk_tx, chunk_rx) = broadcast::channel::<crate::llm::TokenChunk>(256);
-                let request_id = uuid::Uuid::new_v4().to_string();
-
-                let broadcast_tx_for_tokens = self.broadcast_tx.clone();
-                let request_id_for_fwd = request_id.clone();
-                let forwarder_handle = tokio::spawn(async move {
-                    let mut rx = chunk_rx;
-                    loop {
-                        match rx.recv().await {
-                            Ok(crate::llm::TokenChunk::Text(text)) => {
-                                let _ = broadcast_tx_for_tokens.send(SseEvent::Token {
-                                    text,
-                                    request_id: request_id_for_fwd.clone(),
-                                });
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(n, "Token forwarding lagged — some tokens dropped");
-                            }
-                        }
-                    }
-                });
-
-                let handle = tokio::spawn(async move {
-                    if is_sub_agent {
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            request_id = %request_id,
-                            sub_agent = true,
-                            "Making LLM request"
-                        );
-                    } else {
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            request_id = %request_id,
-                            "Making LLM request"
-                        );
-                    }
-
-                    // Build messages from history
-                    let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            // Build error → treated as InvalidRequest
-                            let _ = llm_tx.send(LlmOutcome::NetworkError { message: e });
-                            return;
-                        }
-                    };
-
-                    // Build system prompt with AGENTS.md content + mode context
-                    let system_prompt =
-                        build_system_prompt(&working_dir, is_sub_agent, mode_context.as_ref());
-
-                    // Build request — normalize messages against current tool set
-                    // to remove tool_use/tool_result blocks for tools no longer
-                    // available (e.g., propose_task after Explore→Work transition).
-                    let tools = tool_executor.definitions().await;
-                    let tool_names: std::collections::HashSet<&str> =
-                        tools.iter().map(|t| t.name.as_str()).collect();
-                    let messages = strip_unavailable_tool_blocks(messages, &tool_names);
-
-                    let request = LlmRequest {
-                        system: vec![SystemContent::cached(&system_prompt)],
-                        messages,
-                        tools,
-                        max_tokens: Some(16_384),
-                    };
-
-                    // Use streaming — chunk_tx forwards text tokens to SSE clients.
-                    let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await
-                    {
-                        Ok(response) => {
-                            // Extract tool calls from content and convert to typed ToolCall
-                            let tool_calls: Vec<ToolCall> = response
-                                .tool_uses()
-                                .into_iter()
-                                .map(|(id, name, input)| {
-                                    let typed_input =
-                                        ToolInput::from_name_and_value(name, input.clone());
-                                    ToolCall::new(id.to_string(), typed_input)
-                                })
-                                .collect();
-
-                            let usage = &response.usage;
-                            tracing::info!(
-                                input = usage.input_tokens,
-                                output = usage.output_tokens,
-                                cache_write = usage.cache_creation_tokens,
-                                cache_read = usage.cache_read_tokens,
-                                "LLM response token usage"
-                            );
-
-                            LlmOutcome::Response {
-                                content: response.content,
-                                tool_calls,
-                                end_turn: response.end_turn,
-                                usage: response.usage,
-                            }
-                        }
-                        Err(e) => llm_error_to_outcome(e),
-                    };
-
-                    // Happens-before barrier for task 24683: close the chunk
-                    // broadcast and wait for the forwarder to drain any
-                    // trailing tokens before the outcome (and therefore the
-                    // eventual `SseEvent::Message`) is allowed to proceed.
-                    //
-                    //   1. Drop `chunk_tx` explicitly. Relying on the end of
-                    //      the closure isn't enough — we need the forwarder
-                    //      to see `Err(Closed)` *before* the `.await` below.
-                    //   2. Await the forwarder's `JoinHandle`. This suspends
-                    //      this task until every buffered `TokenChunk` has
-                    //      been broadcast as `SseEvent::Token`.
-                    //   3. Only then send the outcome that will cause the
-                    //      main executor loop to broadcast `SseEvent::Message`.
-                    drop(chunk_tx);
-                    if let Err(e) = forwarder_handle.await {
-                        tracing::warn!(error = ?e, "token forwarder task joined with error");
-                    }
-
-                    let _ = llm_tx.send(llm_outcome);
-                });
-                self.llm_task_handle = Some(handle);
-
-                // Forward the typed outcome to the unified outcome channel
-                tokio::spawn(async move {
-                    if let Ok(llm_outcome) = llm_rx.await {
-                        let _ = outcome_tx.send(EffectOutcome::Llm(llm_outcome)).await;
-                    }
-                });
-
-                Ok(None)
-            }
-
-            Effect::ExecuteTool { tool } => {
-                // Special handling for spawn_agents tool
-                if tool.name() == "spawn_agents" {
-                    return self.handle_spawn_agents_tool(tool).await;
-                }
-
-                // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
-                // physically cannot send an LlmOutcome or other type.
-                let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
-                let outcome_tx = self.outcome_tx.clone();
-
-                // Create cancellation token for this tool execution
-                let cancel_token = CancellationToken::new();
-                self.tool_cancel_token = Some(cancel_token.clone());
-                let cancel_token_check = cancel_token.clone();
-
-                // Create ToolContext for this invocation
-                let tool_ctx = ToolContext::new(
-                    cancel_token,
-                    self.context.conversation_id.clone(),
-                    self.context.working_dir.clone(),
-                    self.browser_sessions.clone(),
-                    self.llm_registry.clone(),
-                    self.terminals.clone(),
-                );
-
-                let conv_id = self.context.conversation_id.clone();
-                let tool_executor = self.tool_executor.clone();
-                let tool_use_id = tool.id.clone();
-                let tool_name = tool.name().to_string();
-                let tool_input = tool.input.to_value();
-
-                tokio::spawn(async move {
-                    tracing::info!(
-                        conv_id = %conv_id,
-                        tool = %tool_name,
-                        id = %tool_use_id,
-                        "Executing tool"
-                    );
-                    let tool_start = std::time::Instant::now();
-
-                    let output = tool_executor
-                        .execute(&tool_name, tool_input, tool_ctx)
-                        .await;
-
-                    // Check if the tool was cancelled via the cancellation token.
-                    // IMPORTANT: We check the token state, NOT the output string.
-                    // The state machine only accepts ToolAborted from CancellingTool state,
-                    // which is entered when AbortTool effect cancels the token.
-                    let tool_outcome = if cancel_token_check.is_cancelled() {
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            tool = %tool_name,
-                            id = %tool_use_id,
-                            "Tool cancelled"
-                        );
-                        ToolExecOutcome::Aborted {
-                            tool_use_id,
-                            reason: crate::state_machine::AbortReason::CancellationRequested,
-                        }
-                    } else {
-                        use crate::db::ToolContentImage;
-                        if let Some(out) = output {
-                            tracing::info!(
-                                conv_id = %conv_id,
-                                tool = %tool_name,
-                                id = %tool_use_id,
-                                duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                                success = out.success,
-                                "Tool completed"
-                            );
-                            let images: Vec<ToolContentImage> = out
-                                .images
-                                .into_iter()
-                                .map(|img| ToolContentImage {
-                                    media_type: img.media_type,
-                                    data: img.data,
-                                })
-                                .collect();
-                            let outcome = if out.success {
-                                ToolOutcome::Success {
-                                    output: out.output,
-                                    display_data: out.display_data,
-                                    images,
-                                }
-                            } else {
-                                ToolOutcome::Error {
-                                    output: out.output,
-                                    display_data: out.display_data,
-                                    images,
-                                }
-                            };
-                            ToolExecOutcome::Completed(ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                outcome,
-                            })
-                        } else {
-                            tracing::warn!(
-                                conv_id = %conv_id,
-                                tool = %tool_name,
-                                id = %tool_use_id,
-                                "Tool not found"
-                            );
-                            ToolExecOutcome::Failed {
-                                tool_use_id,
-                                error: format!("Unknown tool: {tool_name}"),
-                            }
-                        }
-                    };
-                    // Send typed outcome through oneshot channel
-                    let _ = tool_tx.send(tool_outcome);
-                });
-
-                // Forward the typed outcome to the unified outcome channel
-                tokio::spawn(async move {
-                    if let Ok(tool_outcome) = tool_rx.await {
-                        let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
-                    }
-                });
-
-                Ok(None)
-            }
+            Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
 
             Effect::ScheduleRetry { delay, attempt } => {
                 // Typed oneshot for retry timeout
@@ -1420,55 +1057,7 @@ where
                 Ok(None)
             }
 
-            Effect::PersistCheckpoint { data } => {
-                use crate::state_machine::CheckpointData;
-                match data {
-                    CheckpointData::ToolRound {
-                        assistant_message,
-                        tool_results,
-                    } => {
-                        // Persist assistant message
-                        let agent_content = MessageContent::agent(assistant_message.content);
-                        let agent_msg = self
-                            .storage
-                            .add_message(
-                                &assistant_message.message_id,
-                                &self.context.conversation_id,
-                                &agent_content,
-                                assistant_message.display_data.as_ref(),
-                                assistant_message.usage.as_ref(),
-                            )
-                            .await?;
-                        let _ = self
-                            .broadcast_tx
-                            .send(SseEvent::Message { message: agent_msg });
-
-                        // Persist all tool results
-                        for result in tool_results {
-                            let tool_content = MessageContent::tool(
-                                &result.tool_use_id,
-                                result.output(),
-                                result.is_error(),
-                            );
-                            let tool_msg_id = format!("{}-result", result.tool_use_id);
-                            let tool_msg = self
-                                .storage
-                                .add_message(
-                                    &tool_msg_id,
-                                    &self.context.conversation_id,
-                                    &tool_content,
-                                    result.display_data(),
-                                    None,
-                                )
-                                .await?;
-                            let _ = self
-                                .broadcast_tx
-                                .send(SseEvent::Message { message: tool_msg });
-                        }
-                    }
-                }
-                Ok(None)
-            }
+            Effect::PersistCheckpoint { data } => self.persist_checkpoint(data).await,
 
             Effect::PersistToolResults { results } => {
                 for result in results {
@@ -1552,114 +1141,7 @@ where
             Effect::PersistSubAgentResults {
                 results,
                 spawn_tool_id,
-            } => {
-                // Build the display_data for subagent results
-                let display_data = serde_json::json!({
-                    "type": "subagent_summary",
-                    "results": results
-                });
-
-                // If we have a spawn_tool_id, update its message's content (for LLM history)
-                // and display_data (for UI). The message was persisted as "{spawn_tool_id}-result".
-                if let Some(tool_id) = spawn_tool_id {
-                    use crate::state_machine::state::SubAgentOutcome;
-                    let message_id = format!("{tool_id}-result");
-
-                    // Build a human-readable summary of sub-agent outcomes for the LLM.
-                    // This replaces the initial "Spawning N sub-agents..." acknowledgement so
-                    // build_llm_messages_static feeds the actual results to the model.
-                    let llm_content = results
-                        .iter()
-                        .map(|r| {
-                            let outcome = match &r.outcome {
-                                SubAgentOutcome::Success { result } => {
-                                    format!("Result: {result}")
-                                }
-                                SubAgentOutcome::Failure { error, .. } => {
-                                    format!("Failed: {error}")
-                                }
-                                SubAgentOutcome::TimedOut => {
-                                    "Timed out: sub-agent exceeded its time limit".to_string()
-                                }
-                            };
-                            format!("Task: \"{}\"\n{outcome}", r.task)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    let llm_content = format!(
-                        "Sub-agent results ({} completed):\n\n{llm_content}",
-                        results.len()
-                    );
-
-                    if let Err(e) = self
-                        .storage
-                        .update_tool_message_content(&message_id, &llm_content)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            message_id = %message_id,
-                            "Failed to update spawn_agents message content with sub-agent results"
-                        );
-                    }
-
-                    if let Err(e) = self
-                        .storage
-                        .update_message_display_data(&message_id, &display_data)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            message_id = %message_id,
-                            "Failed to update spawn_agents message display_data"
-                        );
-                    } else {
-                        // Fetch the updated message and broadcast it
-                        // This allows the frontend to update its message state
-                        match self.storage.get_message_by_id(&message_id).await {
-                            Ok(updated_msg) => {
-                                // This is a tool result message, not an agent message
-                                // No bash enrichment needed
-                                let _ = self.broadcast_tx.send(SseEvent::Message {
-                                    message: updated_msg,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    message_id = %message_id,
-                                    "Failed to fetch updated message for broadcast"
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    // No spawn_tool_id - create a standalone summary message
-                    // This happens when spawn_agents wasn't the last tool in a batch
-                    let summary_text = format!("{} sub-agent(s) completed", results.len());
-                    let content = crate::db::MessageContent::tool(
-                        uuid::Uuid::new_v4().to_string(),
-                        &summary_text,
-                        false,
-                    );
-                    let msg_id = uuid::Uuid::new_v4().to_string();
-                    let message = self
-                        .storage
-                        .add_message(
-                            &msg_id,
-                            &self.context.conversation_id,
-                            &content,
-                            Some(&display_data),
-                            None,
-                        )
-                        .await?;
-
-                    // Broadcast the new message (tool message, no bash enrichment needed)
-                    let _ = self.broadcast_tx.send(SseEvent::Message { message });
-                }
-
-                Ok(None)
-            }
+            } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
             Effect::RequestContinuation {
                 rejected_tool_calls,
@@ -1695,6 +1177,531 @@ where
                 Ok(None)
             }
         }
+    }
+
+    /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
+    /// messages, build the streaming pipeline, and spawn the LLM task.
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
+        // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
+        // have their own lifetime cap below (REQ-PROJ-008); this branch
+        // only fires for parent conversations. The counter is reset at
+        // the top of `process_event` on every `Event::UserMessage`.
+        if !self.context.is_sub_agent && self.parent_tool_cycle_cap > 0 {
+            self.parent_tool_cycle_count += 1;
+            if self.parent_tool_cycle_count > self.parent_tool_cycle_cap {
+                let cap = self.parent_tool_cycle_cap;
+                let attempted = self.parent_tool_cycle_count;
+                tracing::warn!(
+                    conv_id = %self.context.conversation_id,
+                    attempted,
+                    cap,
+                    "parent conversation attempted to exceed tool-use cycle cap; halting"
+                );
+                self.halt_parent_cycle_cap(cap, attempted).await;
+                return Ok(None);
+            }
+        }
+
+        // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
+        // finite turn budget. Grace turn mechanism gives the model one extra LLM
+        // turn to call submit_result before hard-stopping.
+        if self.context.max_turns > 0 {
+            self.llm_turn_count += 1;
+            if self.llm_turn_count > self.context.max_turns {
+                if self.grace_turn_granted {
+                    // Second hit: hard stop with partial result extraction
+                    // (REQ-BED-026 SubAgentTurnLimitHardStop)
+                    tracing::info!(
+                        conv_id = %self.context.conversation_id,
+                        turns = self.llm_turn_count,
+                        max = self.context.max_turns,
+                        "Sub-agent grace turn exhausted, extracting partial results"
+                    );
+
+                    self.handle_grace_turn_hard_stop().await;
+                    return Ok(None);
+                }
+
+                // First hit: grant grace turn (REQ-BED-026 SubAgentTurnLimitGraceTurn)
+                self.grace_turn_granted = true;
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    turns = self.llm_turn_count,
+                    max = self.context.max_turns,
+                    "Sub-agent reached turn limit, granting grace turn"
+                );
+
+                // Inject a meta user message prompting submit_result.
+                // Uses UserContent::meta() so it appears in the LLM context
+                // via the existing User message path (not System, which is
+                // UI-only bookkeeping and not sent to the LLM).
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let content = MessageContent::User(crate::db::UserContent::meta(
+                    "You have reached your turn limit. Please call submit_result now \
+                         with whatever findings you have so far. Do not call any other tools.",
+                ));
+                if let Err(e) = self
+                    .storage
+                    .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Failed to persist grace turn message");
+                }
+
+                // Allow the normal LLM request to proceed (don't return, don't
+                // send UserCancel). The meta message will appear in the next
+                // build_llm_messages call as a user-role message.
+            }
+        }
+
+        // Typed oneshot channel: background task gets Sender<LlmOutcome>,
+        // physically cannot send a ToolExecOutcome or other type.
+        let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
+        let outcome_tx = self.outcome_tx.clone();
+
+        let llm_client = self.llm_client.clone();
+        let tool_executor = self.tool_executor.clone();
+        let storage = self.storage.clone();
+        let conv_id = self.context.conversation_id.clone();
+        let working_dir = self.context.working_dir.clone();
+        let is_sub_agent = self.context.is_sub_agent;
+        let mode_context = self.context.mode_context.clone();
+
+        // Token streaming channel (REQ-BED-025).
+        //
+        // Broadcast so the forwarding task can subscribe before the LLM
+        // task starts emitting chunks. The forwarder bridges this
+        // per-request broadcast to `self.broadcast_tx` (the per-
+        // conversation SSE broadcast) as `SseEvent::Token`.
+        //
+        // Task 24683: the LLM task owns the forwarder's `JoinHandle`
+        // and awaits it after the LLM call finishes. That forces a
+        // happens-before barrier so every `SseEvent::Token` has been
+        // sent to `self.broadcast_tx` before the main executor loop
+        // is ever told the call is done (and therefore before it
+        // broadcasts `SseEvent::Message`). Without this barrier a
+        // trailing Token could land on the SSE channel after its
+        // Message, producing a phantom streaming buffer on the
+        // client (the "repeated message" bug).
+        let (chunk_tx, chunk_rx) = broadcast::channel::<crate::llm::TokenChunk>(256);
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        let broadcast_tx_for_tokens = self.broadcast_tx.clone();
+        let request_id_for_fwd = request_id.clone();
+        let forwarder_handle = tokio::spawn(async move {
+            let mut rx = chunk_rx;
+            loop {
+                match rx.recv().await {
+                    Ok(crate::llm::TokenChunk::Text(text)) => {
+                        let _ = broadcast_tx_for_tokens.send(SseEvent::Token {
+                            text,
+                            request_id: request_id_for_fwd.clone(),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(n, "Token forwarding lagged — some tokens dropped");
+                    }
+                }
+            }
+        });
+
+        let handle = tokio::spawn(async move {
+            if is_sub_agent {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    sub_agent = true,
+                    "Making LLM request"
+                );
+            } else {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    "Making LLM request"
+                );
+            }
+
+            // Build messages from history
+            let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    // Build error → treated as InvalidRequest
+                    let _ = llm_tx.send(LlmOutcome::NetworkError { message: e });
+                    return;
+                }
+            };
+
+            // Build system prompt with AGENTS.md content + mode context
+            let system_prompt =
+                build_system_prompt(&working_dir, is_sub_agent, mode_context.as_ref());
+
+            // Build request — normalize messages against current tool set
+            // to remove tool_use/tool_result blocks for tools no longer
+            // available (e.g., propose_task after Explore→Work transition).
+            let tools = tool_executor.definitions().await;
+            let tool_names: std::collections::HashSet<&str> =
+                tools.iter().map(|t| t.name.as_str()).collect();
+            let messages = strip_unavailable_tool_blocks(messages, &tool_names);
+
+            let request = LlmRequest {
+                system: vec![SystemContent::cached(&system_prompt)],
+                messages,
+                tools,
+                max_tokens: Some(16_384),
+            };
+
+            // Use streaming — chunk_tx forwards text tokens to SSE clients.
+            let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
+                Ok(response) => {
+                    // Extract tool calls from content and convert to typed ToolCall
+                    let tool_calls: Vec<ToolCall> = response
+                        .tool_uses()
+                        .into_iter()
+                        .map(|(id, name, input)| {
+                            let typed_input = ToolInput::from_name_and_value(name, input.clone());
+                            ToolCall::new(id.to_string(), typed_input)
+                        })
+                        .collect();
+
+                    let usage = &response.usage;
+                    tracing::info!(
+                        input = usage.input_tokens,
+                        output = usage.output_tokens,
+                        cache_write = usage.cache_creation_tokens,
+                        cache_read = usage.cache_read_tokens,
+                        "LLM response token usage"
+                    );
+
+                    LlmOutcome::Response {
+                        content: response.content,
+                        tool_calls,
+                        end_turn: response.end_turn,
+                        usage: response.usage,
+                    }
+                }
+                Err(e) => llm_error_to_outcome(e),
+            };
+
+            // Happens-before barrier for task 24683: close the chunk
+            // broadcast and wait for the forwarder to drain any
+            // trailing tokens before the outcome (and therefore the
+            // eventual `SseEvent::Message`) is allowed to proceed.
+            //
+            //   1. Drop `chunk_tx` explicitly. Relying on the end of
+            //      the closure isn't enough — we need the forwarder
+            //      to see `Err(Closed)` *before* the `.await` below.
+            //   2. Await the forwarder's `JoinHandle`. This suspends
+            //      this task until every buffered `TokenChunk` has
+            //      been broadcast as `SseEvent::Token`.
+            //   3. Only then send the outcome that will cause the
+            //      main executor loop to broadcast `SseEvent::Message`.
+            drop(chunk_tx);
+            if let Err(e) = forwarder_handle.await {
+                tracing::warn!(error = ?e, "token forwarder task joined with error");
+            }
+
+            let _ = llm_tx.send(llm_outcome);
+        });
+        self.llm_task_handle = Some(handle);
+
+        // Forward the typed outcome to the unified outcome channel
+        tokio::spawn(async move {
+            if let Ok(llm_outcome) = llm_rx.await {
+                let _ = outcome_tx.send(EffectOutcome::Llm(llm_outcome)).await;
+            }
+        });
+
+        Ok(None)
+    }
+
+    /// Dispatch tool execution: resolve the tool, build the execution context,
+    /// spawn the background task, and wire up the outcome channel.
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+        // Special handling for spawn_agents tool
+        if tool.name() == "spawn_agents" {
+            return self.handle_spawn_agents_tool(tool).await;
+        }
+
+        // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
+        // physically cannot send an LlmOutcome or other type.
+        let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
+        let outcome_tx = self.outcome_tx.clone();
+
+        // Create cancellation token for this tool execution
+        let cancel_token = CancellationToken::new();
+        self.tool_cancel_token = Some(cancel_token.clone());
+        let cancel_token_check = cancel_token.clone();
+
+        // Create ToolContext for this invocation
+        let tool_ctx = ToolContext::new(
+            cancel_token,
+            self.context.conversation_id.clone(),
+            self.context.working_dir.clone(),
+            self.browser_sessions.clone(),
+            self.llm_registry.clone(),
+            self.terminals.clone(),
+        );
+
+        let conv_id = self.context.conversation_id.clone();
+        let tool_executor = self.tool_executor.clone();
+        let tool_use_id = tool.id.clone();
+        let tool_name = tool.name().to_string();
+        let tool_input = tool.input.to_value();
+
+        tokio::spawn(async move {
+            tracing::info!(
+                conv_id = %conv_id,
+                tool = %tool_name,
+                id = %tool_use_id,
+                "Executing tool"
+            );
+            let tool_start = std::time::Instant::now();
+
+            let output = tool_executor
+                .execute(&tool_name, tool_input, tool_ctx)
+                .await;
+
+            // Check if the tool was cancelled via the cancellation token.
+            // IMPORTANT: We check the token state, NOT the output string.
+            // The state machine only accepts ToolAborted from CancellingTool state,
+            // which is entered when AbortTool effect cancels the token.
+            let tool_outcome = if cancel_token_check.is_cancelled() {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    tool = %tool_name,
+                    id = %tool_use_id,
+                    "Tool cancelled"
+                );
+                ToolExecOutcome::Aborted {
+                    tool_use_id,
+                    reason: crate::state_machine::AbortReason::CancellationRequested,
+                }
+            } else {
+                use crate::db::ToolContentImage;
+                if let Some(out) = output {
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        tool = %tool_name,
+                        id = %tool_use_id,
+                        duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        success = out.success,
+                        "Tool completed"
+                    );
+                    let images: Vec<ToolContentImage> = out
+                        .images
+                        .into_iter()
+                        .map(|img| ToolContentImage {
+                            media_type: img.media_type,
+                            data: img.data,
+                        })
+                        .collect();
+                    let outcome = if out.success {
+                        ToolOutcome::Success {
+                            output: out.output,
+                            display_data: out.display_data,
+                            images,
+                        }
+                    } else {
+                        ToolOutcome::Error {
+                            output: out.output,
+                            display_data: out.display_data,
+                            images,
+                        }
+                    };
+                    ToolExecOutcome::Completed(ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        outcome,
+                    })
+                } else {
+                    tracing::warn!(
+                        conv_id = %conv_id,
+                        tool = %tool_name,
+                        id = %tool_use_id,
+                        "Tool not found"
+                    );
+                    ToolExecOutcome::Failed {
+                        tool_use_id,
+                        error: format!("Unknown tool: {tool_name}"),
+                    }
+                }
+            };
+            // Send typed outcome through oneshot channel
+            let _ = tool_tx.send(tool_outcome);
+        });
+
+        // Forward the typed outcome to the unified outcome channel
+        tokio::spawn(async move {
+            if let Ok(tool_outcome) = tool_rx.await {
+                let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
+            }
+        });
+
+        Ok(None)
+    }
+
+    /// Persist a checkpoint (assistant message + tool results) atomically.
+    async fn persist_checkpoint(&mut self, data: CheckpointData) -> Result<Option<Event>, String> {
+        match data {
+            CheckpointData::ToolRound {
+                assistant_message,
+                tool_results,
+            } => {
+                // Persist assistant message
+                let agent_content = MessageContent::agent(assistant_message.content);
+                let agent_msg = self
+                    .storage
+                    .add_message(
+                        &assistant_message.message_id,
+                        &self.context.conversation_id,
+                        &agent_content,
+                        assistant_message.display_data.as_ref(),
+                        assistant_message.usage.as_ref(),
+                    )
+                    .await?;
+                let _ = self
+                    .broadcast_tx
+                    .send(SseEvent::Message { message: agent_msg });
+
+                // Persist all tool results
+                for result in tool_results {
+                    let tool_content = MessageContent::tool(
+                        &result.tool_use_id,
+                        result.output(),
+                        result.is_error(),
+                    );
+                    let tool_msg_id = format!("{}-result", result.tool_use_id);
+                    let tool_msg = self
+                        .storage
+                        .add_message(
+                            &tool_msg_id,
+                            &self.context.conversation_id,
+                            &tool_content,
+                            result.display_data(),
+                            None,
+                        )
+                        .await?;
+                    let _ = self
+                        .broadcast_tx
+                        .send(SseEvent::Message { message: tool_msg });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Persist aggregated sub-agent results: update the `spawn_agents` message
+    /// content and `display_data`, or create a standalone summary message.
+    async fn persist_sub_agent_results(
+        &mut self,
+        results: Vec<SubAgentResult>,
+        spawn_tool_id: Option<String>,
+    ) -> Result<Option<Event>, String> {
+        // Build the display_data for subagent results
+        let display_data = serde_json::json!({
+            "type": "subagent_summary",
+            "results": results
+        });
+
+        // If we have a spawn_tool_id, update its message's content (for LLM history)
+        // and display_data (for UI). The message was persisted as "{spawn_tool_id}-result".
+        if let Some(tool_id) = spawn_tool_id {
+            let message_id = format!("{tool_id}-result");
+
+            // Build a human-readable summary of sub-agent outcomes for the LLM.
+            // This replaces the initial "Spawning N sub-agents..." acknowledgement so
+            // build_llm_messages_static feeds the actual results to the model.
+            let llm_content = results
+                .iter()
+                .map(|r| {
+                    let outcome = match &r.outcome {
+                        SubAgentOutcome::Success { result } => {
+                            format!("Result: {result}")
+                        }
+                        SubAgentOutcome::Failure { error, .. } => {
+                            format!("Failed: {error}")
+                        }
+                        SubAgentOutcome::TimedOut => {
+                            "Timed out: sub-agent exceeded its time limit".to_string()
+                        }
+                    };
+                    format!("Task: \"{}\"\n{outcome}", r.task)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let llm_content = format!(
+                "Sub-agent results ({} completed):\n\n{llm_content}",
+                results.len()
+            );
+
+            if let Err(e) = self
+                .storage
+                .update_tool_message_content(&message_id, &llm_content)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    message_id = %message_id,
+                    "Failed to update spawn_agents message content with sub-agent results"
+                );
+            }
+
+            if let Err(e) = self
+                .storage
+                .update_message_display_data(&message_id, &display_data)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    message_id = %message_id,
+                    "Failed to update spawn_agents message display_data"
+                );
+            } else {
+                // Fetch the updated message and broadcast it
+                // This allows the frontend to update its message state
+                match self.storage.get_message_by_id(&message_id).await {
+                    Ok(updated_msg) => {
+                        let _ = self.broadcast_tx.send(SseEvent::Message {
+                            message: updated_msg,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            message_id = %message_id,
+                            "Failed to fetch updated message for broadcast"
+                        );
+                    }
+                }
+            }
+        } else {
+            // No spawn_tool_id - create a standalone summary message
+            // This happens when spawn_agents wasn't the last tool in a batch
+            let summary_text = format!("{} sub-agent(s) completed", results.len());
+            let content = crate::db::MessageContent::tool(
+                uuid::Uuid::new_v4().to_string(),
+                &summary_text,
+                false,
+            );
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let message = self
+                .storage
+                .add_message(
+                    &msg_id,
+                    &self.context.conversation_id,
+                    &content,
+                    Some(&display_data),
+                    None,
+                )
+                .await?;
+
+            // Broadcast the new message (tool message, no bash enrichment needed)
+            let _ = self.broadcast_tx.send(SseEvent::Message { message });
+        }
+
+        Ok(None)
     }
 
     /// Build LLM messages from conversation history (instance method)
