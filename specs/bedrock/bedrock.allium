@@ -18,16 +18,16 @@
 --   - Token streaming mechanics
 --   - System prompt construction
 --
--- Architecture: The state machine uses a CoreState wrapper pattern.
---   CoreState holds shared states (Idle, LlmRequesting, ToolExecuting, etc.)
---   ParentConversation wraps CoreState and adds parent-only states
---     (AwaitingRecovery, TaskApproval, UserResponse, ContextExhausted, Terminal)
---   SubAgentConversation wraps CoreState and adds sub-agent-only states
---     (Completed, Failed)
+-- Architecture: CoreState wrapper pattern.
+--   Parent and sub-agent conversations share a core state space but have
+--   structurally disjoint terminal/recovery states. The sum type (variants)
+--   makes invalid states unrepresentable: parents cannot reach Completed/Failed,
+--   sub-agents cannot reach AwaitingRecovery/TaskApproval/Terminal.
+--
 --   Events are similarly split: CoreEvent (shared), ParentOnlyEvent,
---     SubAgentOnlyEvent. The transition function dispatches based on
---     conversation kind, eliminating match-arm ordering dependencies.
---   ConvState remains as the serialization format with From/TryFrom conversions.
+--   SubAgentOnlyEvent. The transition function dispatches by conversation kind.
+--
+--   ConvState (the union of all states) remains as the serialization format.
 --
 -- Requirement traceability: REQ-BED-001 through REQ-BED-030
 -- (3 deprecated: REQ-BED-014, REQ-BED-015, REQ-BED-016)
@@ -36,14 +36,10 @@
 -- External Entities
 ------------------------------------------------------------
 
--- The LLM service produces responses or errors. This spec does not
--- govern how the LLM works, only how the conversation engine reacts.
 external entity LlmProvider {
     context_window: Integer
 }
 
--- A tool implementation executes a tool call and produces a result.
--- Individual tool semantics are specified in their own specs.
 external entity ToolImplementation {
     name: String
 }
@@ -55,15 +51,13 @@ external entity ToolImplementation {
 value ToolCall {
     tool_use_id: String
     name: String
-    input: String                  -- opaque serialised parameters
+    input: String
 }
 
 value ToolResult {
     tool_use_id: String
     outcome: ToolOutcome
 }
-
-enum ToolOutcome { success | error | cancelled }
 
 value SubAgentResult {
     agent_id: String
@@ -90,18 +84,10 @@ value TaskProposal {
 ------------------------------------------------------------
 
 enum ErrorClass { retryable | non_retryable }
-
+enum ToolOutcome { success | error | cancelled }
 enum SubAgentOutcome { success | failure | timed_out }
-
--- Active recovery mechanism in flight. Used by AwaitingRecovery state
--- to determine what the conversation is waiting for.
 enum RecoveryKind { credential }
-
 enum TaskApprovalDecision { approved | rejected | feedback_provided }
-
--- Mode summary for transition guards (REQ-BED-030, REQ-PROJ-024).
--- Threaded into ConvContext so the transition function can guard
--- against invalid (mode, state) combinations.
 enum ModeKind { direct | managed | branch }
 
 ------------------------------------------------------------
@@ -109,239 +95,136 @@ enum ModeKind { direct | managed | branch }
 ------------------------------------------------------------
 
 -- Conversation uses a sum type to structurally separate parent and sub-agent
--- conversations. The `kind` discriminator determines which status states are
--- reachable and which events are valid -- the compiler enforces this.
+-- conversations. The kind discriminator determines which states are reachable.
 entity Conversation {
-    -- Identity
-    kind: Parent | SubAgent         -- discriminator field
+    kind: Parent | SubAgent
 
     -- Seed metadata (REQ-SEED-003, REQ-SEED-004)
-    -- Decorative only. `seed_parent` is a UI breadcrumb pointer to the
-    -- conversation the user spawned this one from via a "seed" action
-    -- (distinct from sub-agent `parent`, which is structural parentage).
-    -- Never traversed by runtime logic; if the referenced conversation
-    -- is deleted, the UI renders the label as unlinked text.
     seed_parent: Conversation?
     seed_label:  String?
 
-    -- Core lifecycle status (shared between parent and sub-agent).
-    -- Parent-only and sub-agent-only states are on their respective variants.
+    -- Core status (shared by both variants)
     core_status: idle | llm_requesting | executing_tools
                 | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
                 | error | awaiting_continuation
 
-    -- Mode (orthogonal to status, persists across status transitions)
+    -- Mode (orthogonal to status)
     mode: explore | direct | work | branch
-
-    -- Mode summary for transition guards
     mode_kind: ModeKind
-
-    -- Desired base branch for Managed mode (set at creation, consumed at task approval)
     desired_base_branch: String?
 
     -- Context tracking (REQ-BED-012)
-    context_usage_ratio: Decimal   -- 0.0 to 1.0
+    context_usage_ratio: Decimal
     model_context_window: Integer
 
-    -- ----------------------------------------------------------------
-    -- Core status transition graph (REQ-BED-001)
-    -- These transitions are shared by both parent and sub-agent.
-    -- Parent-only and sub-agent-only transitions are on variants below.
-    -- ----------------------------------------------------------------
+    -- Core status transitions (shared)
     transitions core_status {
-        -- User message handling (REQ-BED-002)
         idle -> llm_requesting
         error -> llm_requesting
-
-        -- LLM response processing (REQ-BED-003)
         llm_requesting -> idle
         llm_requesting -> executing_tools
         llm_requesting -> error
-
-        -- Tool execution (REQ-BED-004)
         executing_tools -> llm_requesting
         executing_tools -> awaiting_sub_agents
         executing_tools -> cancelling_tool
-
-        -- Tool cancellation (REQ-BED-005)
         cancelling_tool -> idle
         cancelling_tool -> cancelling_sub_agents
-
-        -- Sub-agent fan-in (REQ-BED-008)
         awaiting_sub_agents -> llm_requesting
         awaiting_sub_agents -> cancelling_sub_agents
-
-        -- Sub-agent cancellation (REQ-BED-005)
         cancelling_sub_agents -> idle
-
-        -- Error recovery (REQ-BED-006)
-        -- (error -> llm_requesting declared above)
-
-        -- Context continuation (REQ-BED-019)
         idle -> awaiting_continuation
         awaiting_continuation -> error
     }
 
-    -- ----------------------------------------------------------------
-    -- Mode transition graph (REQ-BED-027)
-    -- ----------------------------------------------------------------
+    -- Mode transitions (REQ-BED-027)
     transitions mode {
-        explore -> work             -- Managed: approval upgrades permissions
-        direct -> branch            -- Branch mode: straight to work on existing branch (REQ-PROJ-024)
+        explore -> work
+        direct -> branch
         terminal: direct, work, branch
     }
 
-    -- ----------------------------------------------------------------
-    -- Core state-dependent fields (shared by both variants)
-    -- ----------------------------------------------------------------
-
-    -- Retry tracking
+    -- Core state-dependent fields
     retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation
-
-    -- Tool execution queue (REQ-BED-004)
     tool_queue: List<ToolCall> when core_status = executing_tools
     tool_results: List<ToolResult> when core_status = executing_tools | cancelling_tool
-    accumulated_sub_agents: Set<Conversation>
-        when core_status = executing_tools
-
-    -- Cancellation bookkeeping (REQ-BED-005)
+    accumulated_sub_agents: Set<Conversation> when core_status = executing_tools
     skipped_tools: List<ToolCall> when core_status = cancelling_tool
-    pending_sub_agents_cancelling: Set<Conversation>
-        when core_status = cancelling_tool
-
-    -- Sub-agent tracking (REQ-BED-008)
     sub_agents_pending: Set<Conversation>
         when core_status = awaiting_sub_agents | cancelling_sub_agents
     sub_agents_completed: List<SubAgentResult>
         when core_status = awaiting_sub_agents | cancelling_sub_agents
-
-    -- Continuation tracking (REQ-BED-019)
     rejected_tool_calls: List<ToolCall> when core_status = awaiting_continuation
-
-    -- Error info (REQ-BED-006)
     error_message: String when core_status = error
     error_class: ErrorClass when core_status = error
 
-    -- Worktree fields -- shared across all modes that have worktrees.
+    -- Worktree fields (shared across modes with worktrees)
     branch_name: String when mode in { explore, work, branch }
     worktree_path: String when mode in { explore, work, branch }
     base_branch: String when mode in { explore, work, branch }
-
-    -- Work-only: task_id is the structural discriminator.
     task_id: String when mode = work
 
-    -- ----------------------------------------------------------------
     -- Relationships
-    -- ----------------------------------------------------------------
     sub_agents: Conversation with parent = this
     work_sub_agents: sub_agents where mode in { work, branch }
 
-    -- ----------------------------------------------------------------
-    -- Derived values
-    -- ----------------------------------------------------------------
+    -- Derived
     is_busy: core_status in { llm_requesting, executing_tools,
                               awaiting_sub_agents, cancelling_tool,
                               cancelling_sub_agents }
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 
-    -- ----------------------------------------------------------------
     -- Entity-level invariants
-    -- ----------------------------------------------------------------
-
-    -- REQ-BED-018: At most one Work sub-agent per parent
     invariant OneWorkSubAgent {
         work_sub_agents.count <= 1
     }
 }
 
--- ----------------------------------------------------------------
--- Variants: Parent and SubAgent
--- ----------------------------------------------------------------
-
--- Parent conversations: user-facing, can propose tasks, recover from
--- auth errors, reach terminal state via task resolution.
--- Structurally cannot reach Completed or Failed (sub-agent-only).
+-- Parent conversations: user-facing. Can propose tasks, recover from auth
+-- errors, reach terminal via task resolution or context exhaustion.
+-- CANNOT reach Completed or Failed (sub-agent-only).
 variant Parent : Conversation {
     parent_status: awaiting_recovery | awaiting_task_approval
                   | awaiting_user_response | context_exhausted | terminal
 
-    -- Parent-only state-dependent fields
     proposal: TaskProposal when parent_status = awaiting_task_approval
     pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
     recovery_kind: RecoveryKind when parent_status = awaiting_recovery
     recovery_message: String when parent_status = awaiting_recovery
     continuation_summary: String when parent_status = context_exhausted
 
-    -- Parent-only transitions (extends core_status graph)
-    transitions parent_status {
-        -- From core: LlmResponse interception
-        -- (triggered when core would transition idle, but interceptor fires)
-        awaiting_task_approval -> idle    -- rejected
-        awaiting_task_approval -> idle    -- feedback (back to explore)
-        awaiting_user_response -> idle    -- cancelled
-
-        -- Active recovery (REQ-BED-030)
-        awaiting_recovery -> idle         -- cancelled
-        awaiting_recovery -> error        -- helper failed
-
-        -- Terminal
-        context_exhausted -> terminal     -- (absorbed, no further transitions)
-        terminal: context_exhausted, terminal
-    }
-
-    is_busy: super.is_busy or parent_status = awaiting_recovery
     is_terminal: parent_status in { context_exhausted, terminal }
 
-    -- REQ-BED-009: Sub-agents cannot spawn sub-agents (parents can)
-    -- (no constraint needed here; NoRecursiveSubAgents is on SubAgent)
-
-    @guidance
-        -- Parent conversations handle:
-        -- - propose_task interception (only when mode_kind != direct)
-        -- - ask_user_question interception
-        -- - AwaitingRecovery (credential helper running)
-        -- - Context continuation (threshold -> summary -> exhausted)
-        -- - Task resolution -> Terminal
-        -- Core events (UserMessage, LlmResponse, ToolComplete, etc.)
-        -- delegate to transition_core via the CoreState wrapper.
+    transitions parent_status {
+        awaiting_task_approval -> idle
+        awaiting_user_response -> idle
+        awaiting_recovery -> idle
+        awaiting_recovery -> error
+        terminal: context_exhausted, terminal
+    }
 }
 
--- Sub-agent conversations: spawned by a parent, report results back,
--- fail fast on non-retryable errors.
--- Structurally cannot reach AwaitingRecovery, TaskApproval, UserResponse,
--- ContextExhausted, or Terminal (parent-only).
+-- Sub-agent conversations: spawned by a parent, report results back.
+-- CANNOT reach AwaitingRecovery, TaskApproval, UserResponse, ContextExhausted,
+-- or Terminal (parent-only).
 variant SubAgent : Conversation {
-    parent: Conversation              -- always set (not optional like on base)
+    parent: Conversation
     sub_agent_status: completed | failed
 
-    -- Sub-agent-only fields
     grace_turn_granted: Boolean = false
     completion_result: String when sub_agent_status = completed
     failure_error: String when sub_agent_status = failed
     failure_error_class: ErrorClass? when sub_agent_status = failed
 
-    -- Sub-agent-only transitions
+    is_terminal: sub_agent_status in { completed, failed }
+
     transitions sub_agent_status {
         terminal: completed, failed
     }
 
-    is_terminal: sub_agent_status in { completed, failed }
-
-    -- REQ-BED-009: Sub-agents cannot spawn sub-agents
     invariant NoRecursiveSubAgents {
         sub_agents.count = 0
     }
-
-    @guidance
-        -- Sub-agent conversations handle:
-        -- - GraceTurnExhausted (one extra LLM turn to call submit_result)
-        -- - UserCancel -> Failed + NotifyParent (not Idle like parents)
-        -- - LlmError (non-retryable/exhausted) -> Failed + NotifyParent
-        -- - Text-only LlmResponse with no tools -> implicit completion
-        -- Core events delegate to transition_core via the CoreState wrapper.
-        -- Sub-agents never see TaskApprovalResponse, UserQuestionResponse,
-        -- CredentialBecameAvailable, or TaskResolved events.
 }
 
 ------------------------------------------------------------
@@ -357,92 +240,39 @@ config {
 }
 
 ------------------------------------------------------------
--- Rules
+-- Rules: Core (shared by parent and sub-agent)
 ------------------------------------------------------------
 
 -- ===========================================================
--- 1. USER MESSAGE HANDLING (REQ-BED-002)
+-- CORE 1. USER MESSAGE HANDLING (REQ-BED-002)
 -- ===========================================================
 
--- REQ-BED-002: User sends message while conversation is idle or in error
 rule UserSendsMessage {
     when: UserSendsMessage(conversation, text, images?)
-
-    requires: conversation.status in { idle, error }
+    requires: conversation.core_status in { idle, error }
     requires: not conversation.is_terminal
-
-    ensures: conversation.status = llm_requesting
+    ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
 }
 
--- REQ-BED-002: User sends message while agent is busy
 rule RejectMessageWhileBusy {
     when: UserSendsMessage(conversation, text, images?)
-
     requires: conversation.is_busy
-
     ensures: MessageRejected(conversation, reason: agent_busy)
 }
 
--- REQ-BED-002: Reject messages to terminal/approval/question states
-rule RejectMessageInSpecialState {
-    when: UserSendsMessage(conversation, text, images?)
-
-    requires: conversation.status in {
-        awaiting_task_approval, awaiting_user_response,
-        context_exhausted, terminal, completed, failed
-    }
-
-    ensures: MessageRejected(
-        conversation,
-        reason: if conversation.is_terminal: conversation_ended
-                else: awaiting_response
-    )
-}
-
 -- ===========================================================
--- 2. LLM RESPONSE PROCESSING (REQ-BED-003)
+-- CORE 2. LLM RESPONSE — TOOL DISPATCH (REQ-BED-003)
 -- ===========================================================
 
--- REQ-BED-003: LLM responds with text only
-rule LlmRespondsTextOnly {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: tool_calls.count = 0
-    requires: not conversation.is_sub_agent
-
-    ensures: conversation.status = idle
-    ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
-    ensures: AgentDone(conversation)
-}
-
--- REQ-BED-003: Sub-agent LLM responds with no tools and no content
--- (implicit completion without calling submit_result)
-rule SubAgentImplicitCompletion {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: conversation.is_sub_agent
-    requires: tool_calls.count = 0
-    requires: content = null
-
-    ensures: conversation.status = completed
-    ensures: conversation.completion_result = ""
-    ensures: SubAgentCompleted(conversation)
-}
-
--- REQ-BED-003: LLM responds with tool calls
 rule LlmRespondsWithTools {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
+    requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 0
     requires: not is_sole_intercepted_tool(tool_calls)
     requires: not conversation.context_at_threshold
-
-    ensures: conversation.status = executing_tools
+    ensures: conversation.core_status = executing_tools
     ensures: conversation.tool_queue = tool_calls
     ensures: conversation.tool_results = {}
     ensures: conversation.accumulated_sub_agents = {}
@@ -450,859 +280,580 @@ rule LlmRespondsWithTools {
     ensures: ToolExecutionStarted(conversation, tool_calls.first)
 }
 
--- REQ-BED-028: LLM calls propose_task (sole-tool interception)
-rule ProposeTaskIntercepted {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: tool_calls.count = 1
-    requires: tool_calls.first.name = "propose_task"
-    requires: conversation.mode = explore
-    requires: not conversation.is_sub_agent
-
-    let proposal = parse_task_proposal(tool_calls.first)
-
-    ensures: conversation.status = awaiting_task_approval
-    ensures: conversation.proposal = proposal
-    ensures: TaskApprovalRequested(conversation, proposal)
-}
-
--- LLM calls ask_user_question (sole-tool interception)
-rule AskUserQuestionIntercepted {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: tool_calls.count = 1
-    requires: tool_calls.first.name = "ask_user_question"
-
-    let questions = parse_questions(tool_calls.first)
-
-    ensures: conversation.status = awaiting_user_response
-    ensures: conversation.pending_questions = questions
-    ensures: UserQuestionAsked(conversation, questions)
-}
-
--- Sub-agent calls submit_result (sole-tool interception)
-rule SubAgentSubmitsResult {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: conversation.is_sub_agent
-    requires: tool_calls.count = 1
-    requires: tool_calls.first.name = "submit_result"
-
-    ensures: conversation.status = completed
-    ensures: conversation.completion_result = parse_result(tool_calls.first)
-    ensures: SubAgentCompleted(conversation)
-}
-
--- Sub-agent calls submit_error (sole-tool interception)
-rule SubAgentSubmitsError {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: conversation.is_sub_agent
-    requires: tool_calls.count = 1
-    requires: tool_calls.first.name = "submit_error"
-
-    ensures: conversation.status = failed
-    ensures: conversation.failure_error = parse_error(tool_calls.first)
-    ensures: SubAgentCompleted(conversation)
-}
-
--- Intercepted tool mixed with other tools → error
--- If the LLM returns propose_task, ask_user_question, submit_result,
--- or submit_error alongside other tool calls, the response is malformed.
--- These tools require sole-tool interception and cannot be combined.
+-- Intercepted tool mixed with other tools -> error
 rule InterceptedToolNotSole {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
+    requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 1
     requires: tool_calls.any(t => is_intercepted_tool(t.name))
-
-    ensures: conversation.status = error
+    ensures: conversation.core_status = error
     ensures: conversation.error_message =
         intercepted_tool_name(tool_calls) + " must be the only tool in response"
-
-    @guidance
-        -- The state machine transitions to Error (parent) or Failed
-        -- (sub-agent), persists the state, and notifies via SSE/parent.
-        -- The user can retry from Error state by sending a new message.
 }
 
--- REQ-BED-019: Context threshold reached during LLM response (parent)
+-- ===========================================================
+-- CORE 3. TOOL EXECUTION (REQ-BED-004)
+-- ===========================================================
+
+rule ToolCompletesWithMoreRemaining {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.core_status = executing_tools
+    requires: conversation.tool_queue.count > 0
+    ensures: conversation.tool_results.add(result)
+    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
+}
+
+rule LastToolCompletesNoSubAgents {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.core_status = executing_tools
+    requires: conversation.tool_queue.count = 0
+    requires: conversation.accumulated_sub_agents.count = 0
+    ensures: conversation.tool_results.add(result)
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: ToolRoundCheckpointed(conversation)
+    ensures: LlmRequestDispatched(conversation)
+}
+
+rule LastToolCompletesWithSubAgents {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.core_status = executing_tools
+    requires: conversation.tool_queue.count = 0
+    requires: conversation.accumulated_sub_agents.count > 0
+    ensures: conversation.tool_results.add(result)
+    ensures: conversation.core_status = awaiting_sub_agents
+    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
+    ensures: conversation.sub_agents_completed = {}
+    ensures: ToolRoundCheckpointed(conversation)
+}
+
+rule SpawnAgentsCompletesWithMoreTools {
+    when: SpawnAgentsCompletes(conversation, result, spawned_agents)
+    requires: conversation.core_status = executing_tools
+    requires: conversation.tool_queue.count > 0
+    ensures: conversation.tool_results.add(result)
+    ensures:
+        for agent in spawned_agents:
+            conversation.accumulated_sub_agents.add(agent)
+    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
+}
+
+rule SpawnAgentsCompletesAsLastTool {
+    when: SpawnAgentsCompletes(conversation, result, spawned_agents)
+    requires: conversation.core_status = executing_tools
+    requires: conversation.tool_queue.count = 0
+    ensures: conversation.tool_results.add(result)
+    ensures:
+        for agent in spawned_agents:
+            conversation.accumulated_sub_agents.add(agent)
+    ensures: conversation.core_status = awaiting_sub_agents
+    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
+    ensures: conversation.sub_agents_completed = {}
+    ensures: ToolRoundCheckpointed(conversation)
+}
+
+-- ===========================================================
+-- CORE 4. CANCELLATION (REQ-BED-005)
+-- ===========================================================
+
+rule CancelDuringToolExecution {
+    when: UserCancels(conversation)
+    requires: conversation.core_status = executing_tools
+    ensures: conversation.core_status = cancelling_tool
+    ensures: conversation.skipped_tools = conversation.tool_queue
+    ensures: ToolAbortRequested(conversation)
+}
+
+rule ToolAbortConfirmed {
+    when: ToolAborted(conversation)
+    requires: conversation.core_status = cancelling_tool
+    ensures: CancellationCheckpointed(conversation)
+    ensures:
+        if conversation.sub_agents_pending?.count = 0:
+            conversation.core_status = idle
+            AgentDone(conversation)
+        else:
+            conversation.core_status = cancelling_sub_agents
+            SubAgentsCancelRequested(conversation)
+}
+
+rule ToolCompletesDuringCancellation {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.core_status = cancelling_tool
+    ensures: CancellationCheckpointed(conversation)
+    ensures:
+        if conversation.sub_agents_pending?.count = 0:
+            conversation.core_status = idle
+            AgentDone(conversation)
+        else:
+            conversation.core_status = cancelling_sub_agents
+            SubAgentsCancelRequested(conversation)
+}
+
+rule CancelDuringSubAgentWait {
+    when: UserCancels(conversation)
+    requires: conversation.core_status = awaiting_sub_agents
+    ensures: conversation.core_status = cancelling_sub_agents
+    ensures: SubAgentsCancelRequested(conversation)
+}
+
+rule LastSubAgentDuringCancellation {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status = cancelling_sub_agents
+    requires: conversation.sub_agents_pending.count = 1
+    ensures: conversation.sub_agents_completed.add(result)
+    ensures: conversation.core_status = idle
+    ensures: AgentDone(conversation)
+}
+
+rule SubAgentResultDuringCancellation {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status = cancelling_sub_agents
+    requires: conversation.sub_agents_pending.count > 1
+    ensures: conversation.sub_agents_completed.add(result)
+}
+
+-- ===========================================================
+-- CORE 5. ERROR RECOVERY (REQ-BED-006)
+-- ===========================================================
+
+rule RetryableLlmError {
+    when: LlmErrors(conversation, message, error_class, attempt)
+    requires: conversation.core_status = llm_requesting
+    requires: error_class = retryable
+    requires: attempt < config.max_retry_attempts
+    ensures: conversation.retry_attempt = attempt + 1
+    ensures: RetryScheduled(conversation, delay: config.retry_base_delay * attempt)
+}
+
+rule RetryTimeoutFires {
+    when: RetryTimeoutExpires(conversation, attempt)
+    requires: conversation.core_status = llm_requesting
+    requires: conversation.retry_attempt = attempt
+    ensures: LlmRequestDispatched(conversation)
+}
+
+-- ===========================================================
+-- CORE 6. SUB-AGENT FAN-IN (REQ-BED-008)
+-- ===========================================================
+
+rule SubAgentReportsResultMorePending {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status = awaiting_sub_agents
+    requires: conversation.sub_agents_pending.count > 1
+    ensures: conversation.sub_agents_completed.add(result)
+}
+
+rule LastSubAgentReportsResult {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status = awaiting_sub_agents
+    requires: conversation.sub_agents_pending.count = 1
+    ensures: conversation.sub_agents_completed.add(result)
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: LlmRequestDispatched(conversation)
+}
+
+------------------------------------------------------------
+-- Rules: Parent-only
+------------------------------------------------------------
+
+-- ===========================================================
+-- PARENT 1. LLM RESPONSE — TEXT-ONLY AND INTERCEPTIONS
+-- ===========================================================
+
+rule ParentLlmRespondsTextOnly {
+    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 0
+    ensures: conversation.core_status = idle
+    ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
+    ensures: AgentDone(conversation)
+}
+
+-- REQ-BED-028: propose_task interception (parent-only, managed mode only)
+rule ProposeTaskIntercepted {
+    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "propose_task"
+    requires: conversation.mode_kind = managed
+    let proposal = parse_task_proposal(tool_calls.first)
+    ensures: conversation.parent_status = awaiting_task_approval
+    ensures: conversation.proposal = proposal
+    ensures: TaskApprovalRequested(conversation, proposal)
+
+    @guidance
+        -- Mode guard: propose_task is rejected in Direct and Branch modes.
+        -- The tool registry should prevent it, but the transition function
+        -- guards defensively with mode_kind != managed -> Error.
+}
+
+rule AskUserQuestionIntercepted {
+    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "ask_user_question"
+    let questions = parse_questions(tool_calls.first)
+    ensures: conversation.parent_status = awaiting_user_response
+    ensures: conversation.pending_questions = questions
+}
+
+-- REQ-BED-019: Context threshold reached (parent -> continuation)
 rule ContextThresholdReachedParent {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: not conversation.is_sub_agent
+    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
-
-    ensures: conversation.status = awaiting_continuation
+    ensures: conversation.core_status = awaiting_continuation
     ensures: conversation.rejected_tool_calls = tool_calls
     ensures: conversation.retry_attempt = 1
     ensures: ContinuationRequested(conversation, tool_calls)
 }
 
--- REQ-BED-024: Context threshold reached during LLM response (sub-agent)
-rule ContextThresholdReachedSubAgent {
-    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
-
-    requires: conversation.status = llm_requesting
-    requires: conversation.is_sub_agent
-    requires: conversation.context_at_threshold
-
-    ensures: conversation.status = failed
-    ensures: conversation.failure_error = "Context exhausted before result submission"
-    ensures: SubAgentCompleted(conversation)
-}
-
 -- ===========================================================
--- 3. TOOL EXECUTION (REQ-BED-004)
+-- PARENT 2. CANCELLATION (parent -> idle, not failed)
 -- ===========================================================
 
--- REQ-BED-004: Tool completes, more tools remain
-rule ToolCompletesWithMoreRemaining {
-    when: ToolCompletes(conversation, result)
-
-    requires: conversation.status = executing_tools
-    requires: conversation.tool_queue.count > 0
-
-    ensures: conversation.tool_results.add(result)
-    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
-}
-
--- REQ-BED-004: Last tool completes, no sub-agents pending
-rule LastToolCompletesNoSubAgents {
-    when: ToolCompletes(conversation, result)
-
-    requires: conversation.status = executing_tools
-    requires: conversation.tool_queue.count = 0
-    requires: conversation.accumulated_sub_agents.count = 0
-
-    ensures: conversation.tool_results.add(result)
-    ensures: conversation.status = llm_requesting
-    ensures: conversation.retry_attempt = 1
-    ensures: ToolRoundCheckpointed(conversation)
-    ensures: LlmRequestDispatched(conversation)
-}
-
--- REQ-BED-008: Last tool completes, sub-agents pending
-rule LastToolCompletesWithSubAgents {
-    when: ToolCompletes(conversation, result)
-
-    requires: conversation.status = executing_tools
-    requires: conversation.tool_queue.count = 0
-    requires: conversation.accumulated_sub_agents.count > 0
-
-    ensures: conversation.tool_results.add(result)
-    ensures: conversation.status = awaiting_sub_agents
-    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
-    ensures: conversation.sub_agents_completed = {}
-    ensures: ToolRoundCheckpointed(conversation)
-}
-
--- REQ-BED-008: spawn_agents tool completes, more tools remain
-rule SpawnAgentsCompletesWithMoreTools {
-    when: SpawnAgentsCompletes(conversation, result, spawned_agents)
-
-    requires: conversation.status = executing_tools
-    requires: conversation.tool_queue.count > 0
-
-    ensures: conversation.tool_results.add(result)
-    ensures:
-        for agent in spawned_agents:
-            conversation.accumulated_sub_agents.add(agent)
-    ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
-}
-
--- REQ-BED-008: spawn_agents is last tool
-rule SpawnAgentsCompletesAsLastTool {
-    when: SpawnAgentsCompletes(conversation, result, spawned_agents)
-
-    requires: conversation.status = executing_tools
-    requires: conversation.tool_queue.count = 0
-
-    ensures: conversation.tool_results.add(result)
-    ensures:
-        for agent in spawned_agents:
-            conversation.accumulated_sub_agents.add(agent)
-    ensures: conversation.status = awaiting_sub_agents
-    ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
-    ensures: conversation.sub_agents_completed = {}
-    ensures: ToolRoundCheckpointed(conversation)
-}
-
--- ===========================================================
--- 4. CANCELLATION (REQ-BED-005)
--- ===========================================================
-
--- REQ-BED-005: Cancel during LLM request (parent)
-rule CancelDuringLlmRequest {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = llm_requesting
-    requires: not conversation.is_sub_agent
-
-    ensures: conversation.status = idle
+rule ParentCancelDuringLlmRequest {
+    when: UserCancels(conversation: Parent)
+    requires: conversation.core_status = llm_requesting
+    ensures: conversation.core_status = idle
     ensures: LlmAborted(conversation)
     ensures: AgentDone(conversation)
 }
 
--- REQ-BED-005: Cancel during tool execution (parent)
-rule CancelDuringToolExecution {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = executing_tools
-    requires: not conversation.is_sub_agent
-
-    ensures: conversation.status = cancelling_tool
-    ensures: conversation.skipped_tools = conversation.tool_queue
-    ensures: ToolAbortRequested(conversation)
-}
-
--- REQ-BED-005: Tool abort confirmed during cancellation
-rule ToolAbortConfirmed {
-    when: ToolAborted(conversation)
-
-    requires: conversation.status = cancelling_tool
-
-    ensures: CancellationCheckpointed(conversation)
-    ensures:
-        if conversation.pending_sub_agents_cancelling.count = 0:
-            conversation.status = idle
-            AgentDone(conversation)
-        else:
-            conversation.status = cancelling_sub_agents
-            conversation.sub_agents_pending = conversation.pending_sub_agents_cancelling
-            conversation.sub_agents_completed = {}
-
-    @guidance
-        -- Synthetic tool results are generated for the aborted tool
-        -- ("Cancelled by user") and all skipped tools ("Skipped due
-        -- to cancellation"). These maintain message chain integrity.
-        -- If sub-agents were spawned earlier in this tool round,
-        -- phase 2 waits for their cancel results before returning to Idle.
-}
-
--- REQ-BED-005: Tool completes during cancellation (race condition)
-rule ToolCompletesDuringCancellation {
-    when: ToolCompletes(conversation, result)
-
-    requires: conversation.status = cancelling_tool
-
-    -- Actual result is discarded; synthetic results used instead
-    ensures: CancellationCheckpointed(conversation)
-    ensures:
-        if conversation.pending_sub_agents_cancelling.count = 0:
-            conversation.status = idle
-            AgentDone(conversation)
-        else:
-            conversation.status = cancelling_sub_agents
-            conversation.sub_agents_pending = conversation.pending_sub_agents_cancelling
-            conversation.sub_agents_completed = {}
-}
-
--- Sub-agent result arrives while still cancelling tool (early arrival)
-rule SubAgentResultDuringToolCancel {
-    when: SubAgentReportsResult(conversation, result)
-
-    requires: conversation.status = cancelling_tool
-
-    ensures: conversation.pending_sub_agents_cancelling.remove(result.agent)
-}
-
--- REQ-BED-005: Cancel during sub-agent wait
-rule CancelDuringSubAgentWait {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = awaiting_sub_agents
-
-    ensures: conversation.status = cancelling_sub_agents
-    ensures: SubAgentsCancelRequested(conversation)
-}
-
--- REQ-BED-005: Last sub-agent result during cancellation
-rule LastSubAgentDuringCancellation {
-    when: SubAgentReportsResult(conversation, result)
-
-    requires: conversation.status = cancelling_sub_agents
-    requires: conversation.sub_agents_pending.count = 1
-
-    ensures: conversation.sub_agents_completed.add(result)
-    ensures: conversation.status = idle
-    ensures: AgentDone(conversation)
-}
-
--- Sub-agent result during cancellation (more pending)
-rule SubAgentResultDuringCancellation {
-    when: SubAgentReportsResult(conversation, result)
-
-    requires: conversation.status = cancelling_sub_agents
-    requires: conversation.sub_agents_pending.count > 1
-
-    ensures: conversation.sub_agents_completed.add(result)
-    -- sub_agents_pending shrinks (agent removed)
-}
-
--- REQ-BED-005/026: Sub-agent cancelled by parent or timed out
-rule SubAgentForciblyTerminated {
-    when: UserCancels(conversation)
-
-    requires: conversation.is_sub_agent
-    requires: not conversation.is_terminal
-
-    ensures: conversation.status = failed
-    ensures: conversation.failure_error = UserCancels.reason or "Cancelled"
-    ensures: SubAgentCompleted(conversation)
-}
-
--- REQ-BED-026: Sub-agent turn limit grace turn
--- When a sub-agent reaches its max_turns, it gets one final LLM turn
--- to call submit_result with partial findings, rather than being killed.
--- This avoids wasting all tokens spent on the sub-agent's prior turns.
---
--- The grace turn is NOT a state transition -- the conversation stays in
--- llm_requesting. It is an executor-level concern: the executor injects
--- a system message and allows one more LLM request before hard-stopping.
-
-rule SubAgentTurnLimitGraceTurn {
-    when: TurnLimitReached(conversation)
-
-    requires: conversation.is_sub_agent
-    requires: not conversation.grace_turn_granted
-
-    ensures: conversation.grace_turn_granted = true
-    ensures: SystemMessageInjected(conversation,
-        "You have reached your turn limit. Please call submit_result "
-        "now with whatever findings you have so far. Do not call any "
-        "other tools.")
-    ensures: LlmRequestDispatched(conversation)
-    -- Status stays at llm_requesting (no transition).
-    -- The next TurnLimitReached triggers SubAgentTurnLimitHardStop.
-
-    @guidance
-        -- Implementation: in the executor's turn-count check, when
-        -- llm_turn_count == max_turns and grace_turn_granted is false:
-        --   1. Set grace_turn_granted = true
-        --   2. Persist a system message via self.storage.add_message()
-        --   3. Allow the normal LLM request flow to proceed
-        --   4. Do NOT send UserCancel
-        -- The system message appears in the LLM's context on the next
-        -- build_llm_messages call, prompting it to call submit_result.
-}
-
--- SubAgentTurnLimitHardStop: the grace turn was consumed but the model
--- did not call submit_result. The executor extracts the last assistant
--- text and sends Event::GraceTurnExhausted to the state machine.
--- This is a proper state machine event (not direct mutation) so the
--- transition table remains the authoritative specification of all
--- sub-agent terminal paths.
-
-rule SubAgentTurnLimitHardStop {
-    when: GraceTurnExhausted(conversation, partial_result)
-
-    requires: conversation.is_sub_agent
-    requires: conversation.grace_turn_granted = true
-
-    ensures: conversation.status = completed
-        if partial_result != null
-    ensures: conversation.completion_result = partial_result
-        if partial_result != null
-    ensures: SubAgentCompleted(conversation) with outcome = success
-        if partial_result != null
-
-    ensures: conversation.status = failed
-        if partial_result = null
-    ensures: conversation.failure_error = "Turn limit exceeded, no output"
-        if partial_result = null
-    ensures: SubAgentCompleted(conversation) with outcome = failure
-        if partial_result = null
-
-    @guidance
-        -- The executor is responsible for text extraction and event creation:
-        --   1. Detect grace_turn_granted = true and turn limit exceeded
-        --   2. Read conversation messages via self.storage.get_messages()
-        --   3. Walk backward for last assistant message with text blocks
-        --   4. Send Event::GraceTurnExhausted { result: Option<String> }
-        --      to the state machine via self.event_tx
-        --   5. The state machine handles the event, transitions to
-        --      Completed/Failed, and emits NotifyParent as an effect
-        --   6. The executor handles NotifyParent normally (no direct send)
-        --
-        -- This keeps the executor free of notification logic. The state
-        -- machine owns the (event, state) -> (terminal, NotifyParent)
-        -- contract. The executor only owns text extraction (I/O).
-        --
-        -- The happy path: the grace turn prompted the model to call
-        -- submit_result, which already completed via the normal
-        -- SubAgentSubmitsResult rule. GraceTurnExhausted only fires
-        -- if the model called another tool instead of submit_result.
-}
-
 -- ===========================================================
--- 5. ERROR RECOVERY (REQ-BED-006)
+-- PARENT 3. NON-RETRYABLE ERROR (parent -> error)
 -- ===========================================================
 
--- REQ-BED-006: Retryable LLM error with attempts remaining
-rule RetryableLlmError {
-    when: LlmErrors(conversation, message, error_class, attempt)
-
-    requires: conversation.status = llm_requesting
-    requires: error_class = retryable
-    requires: attempt < config.max_retry_attempts
-
-    ensures: conversation.retry_attempt = attempt + 1
-    ensures: RetryScheduled(
-        conversation,
-        delay: config.retry_base_delay * attempt
-    )
-}
-
--- REQ-BED-006: Non-retryable error or retries exhausted (parent)
-rule LlmErrorNonRecoverable {
-    when: LlmErrors(conversation, message, error_class, attempt)
-
-    requires: conversation.status = llm_requesting
-    requires: not conversation.is_sub_agent
-    requires:
-        error_class = non_retryable
-        or attempt >= config.max_retry_attempts
-
-    ensures: conversation.status = error
+rule ParentLlmErrorNonRecoverable {
+    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    requires: conversation.core_status = llm_requesting
+    requires: error_class = non_retryable or attempt >= config.max_retry_attempts
+    ensures: conversation.core_status = error
     ensures: conversation.error_message = message
     ensures: conversation.error_class = error_class
 }
 
--- REQ-BED-006: Sub-agent non-retryable or retries exhausted → fail + notify parent
-rule SubAgentLlmError {
-    when: LlmErrors(conversation, message, error_class, attempt)
-
-    requires: conversation.status = llm_requesting
-    requires: conversation.is_sub_agent
-    requires:
-        error_class = non_retryable
-        or attempt >= config.max_retry_attempts
-
-    ensures: conversation.status = failed
-    ensures: conversation.failure_error = message
-    ensures: conversation.failure_error_class = error_class
-    ensures: SubAgentCompleted(conversation)
-}
-
--- REQ-BED-006: Retry timeout fires
-rule RetryTimeoutFires {
-    when: RetryTimeoutExpires(conversation, attempt)
-
-    requires: conversation.status = llm_requesting
-    requires: conversation.retry_attempt = attempt
-
-    ensures: LlmRequestDispatched(conversation)
-}
-
 -- ===========================================================
--- 5b. ACTIVE RECOVERY (REQ-BED-030)
+-- PARENT 4. ACTIVE RECOVERY (REQ-BED-030)
 -- ===========================================================
 
--- REQ-BED-030: Auth error with credential helper running → await recovery
--- instead of transitioning to error. The helper is actively solving the
--- problem; going to error would unmount the UI that shows auth instructions.
 rule AuthErrorWithActiveRecovery {
-    when: LlmErrors(conversation, message, error_class, attempt)
-
-    requires: conversation.status = llm_requesting
-    requires: not conversation.is_sub_agent
+    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    requires: conversation.core_status = llm_requesting
     requires: error_class = non_retryable
     requires: error_kind = auth
     requires: CredentialHelperIsRunning
-
-    ensures: conversation.status = awaiting_recovery
+    ensures: conversation.parent_status = awaiting_recovery
     ensures: conversation.recovery_kind = credential
-    ensures: conversation.error_message = message
+    ensures: conversation.recovery_message = message
 
     @guidance
-        -- This rule MUST be checked before LlmErrorNonRecoverable.
-        -- Both match on (llm_requesting, non_retryable), but this one
-        -- has two additional preconditions: error_kind is auth AND the
-        -- credential helper is running. A ContentFilter or InvalidRequest
-        -- error should go to Error even if a helper happens to be running.
-        --
-        -- In the code, error_kind maps to ErrorKind::Auth. The
-        -- credential_helper_running flag is enriched on the LlmOutcome
-        -- by the executor (keeps the transition function pure).
-        --
-        -- The conversation stays in awaiting_recovery until one of:
-        --   1. CredentialBecameAvailable fires -> retry (RecoverySucceeded)
-        --   2. CredentialHelperFailed fires -> error (RecoveryFailed)
-        --   3. User cancels -> idle (CancelDuringRecovery)
+        -- Checked before ParentLlmErrorNonRecoverable. The
+        -- recovery_in_progress flag is enriched on the event by
+        -- the executor (keeps transition function pure).
 }
 
--- Cross-spec event: credential helper succeeded while a conversation
--- was waiting for recovery. Retry the LLM request.
 rule RecoverySucceeded {
     when: CredentialBecameAvailable
-
-    requires: conversation.status = awaiting_recovery
-    requires: conversation.recovery_kind = credential
-
-    ensures: conversation.status = llm_requesting
-    ensures: LlmRequestDispatched(conversation)
-
-    @guidance
-        -- CredentialBecameAvailable is emitted by the credential-helper spec's
-        -- HelperSucceeded rule. It is a broadcast event: ALL conversations
-        -- in awaiting_recovery with recovery_kind=credential should retry.
-        --
-        -- The executor re-dispatches the same LLM request that originally
-        -- failed. The credential helper now has a valid cached credential,
-        -- so resolve() will succeed on this attempt.
-}
-
--- Cross-spec event: credential helper failed or timed out while a
--- conversation was waiting for recovery. Fall through to error.
-rule RecoveryFailed {
-    when: CredentialHelperTerminatedWithoutCredential
-
-    requires: conversation.status = awaiting_recovery
-    requires: conversation.recovery_kind = credential
-
-    ensures: conversation.status = error
-    -- error_message was already set by AuthErrorWithActiveRecovery
-
-    @guidance
-        -- CredentialHelperTerminatedWithoutCredential is emitted by the
-        -- credential-helper spec's HelperFailed rule. This is a broadcast
-        -- event: ALL conversations in awaiting_recovery with
-        -- recovery_kind=credential transition to error.
-        --
-        -- The error_message was already set by AuthErrorWithActiveRecovery
-        -- and persists through the state change. The conversation is now
-        -- genuinely terminal (no recovery mechanism in flight).
-}
-
--- User cancels during recovery → idle (same as cancel during other waits)
-rule CancelDuringRecovery {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = awaiting_recovery
-
-    ensures: conversation.status = idle
-
-    @guidance
-        -- User can always escape awaiting_recovery by cancelling.
-        -- The credential helper continues running (it's a global resource,
-        -- not conversation-scoped), but this conversation stops waiting.
-}
-
--- ===========================================================
--- 6. SUB-AGENT LIFECYCLE (REQ-BED-008, 009, 018, 024, 026)
--- ===========================================================
-
--- REQ-BED-008: Sub-agent reports result (more pending)
-rule SubAgentReportsResultMorePending {
-    when: SubAgentReportsResult(conversation, result)
-
-    requires: conversation.status = awaiting_sub_agents
-    requires: conversation.sub_agents_pending.count > 1
-
-    ensures: conversation.sub_agents_completed.add(result)
-    -- sub_agents_pending shrinks (agent removed)
-}
-
--- REQ-BED-008: Last sub-agent reports result
-rule LastSubAgentReportsResult {
-    when: SubAgentReportsResult(conversation, result)
-
-    requires: conversation.status = awaiting_sub_agents
-    requires: conversation.sub_agents_pending.count = 1
-
-    ensures: conversation.sub_agents_completed.add(result)
-    ensures: conversation.status = llm_requesting
+    requires: conversation.parent_status = awaiting_recovery
+    ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
 }
 
+rule RecoveryFailed {
+    when: CredentialHelperTerminatedWithoutCredential
+    requires: conversation.parent_status = awaiting_recovery
+    ensures: conversation.core_status = error
+}
+
+rule CancelDuringRecovery {
+    when: UserCancels(conversation: Parent)
+    requires: conversation.parent_status = awaiting_recovery
+    ensures: conversation.core_status = idle
+}
+
 -- ===========================================================
--- 7. TASK APPROVAL (REQ-BED-028)
+-- PARENT 5. TASK APPROVAL (REQ-BED-028)
 -- ===========================================================
 
--- REQ-BED-028: User approves task
 rule UserApprovesTask {
-    when: TaskApprovalDecided(conversation, decision)
-
-    requires: conversation.status = awaiting_task_approval
+    when: TaskApprovalDecided(conversation: Parent, decision)
+    requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved
-
     ensures: conversation.mode = work
-    -- Work mode fields set by the approval process (projects spec)
-    ensures: conversation.status = llm_requesting
+    ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: ModeTransitioned(conversation, from: explore, to: work)
     ensures: LlmRequestDispatched(conversation)
 }
 
--- REQ-BED-028: User provides feedback on task proposal
 rule UserProvidesFeedback {
-    when: TaskApprovalDecided(conversation, decision)
-
-    requires: conversation.status = awaiting_task_approval
+    when: TaskApprovalDecided(conversation: Parent, decision)
+    requires: conversation.parent_status = awaiting_task_approval
     requires: decision = feedback_provided
-
-    ensures: conversation.status = llm_requesting
+    ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
-
-    @guidance
-        -- Feedback is delivered as a user message containing annotations.
-        -- The agent may revise its plan and call propose_task again.
 }
 
--- REQ-BED-028: User rejects task
 rule UserRejectsTask {
-    when: TaskApprovalDecided(conversation, decision)
-
-    requires: conversation.status = awaiting_task_approval
+    when: TaskApprovalDecided(conversation: Parent, decision)
+    requires: conversation.parent_status = awaiting_task_approval
     requires: decision = rejected
-
-    ensures: conversation.status = idle
+    ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
-
-    @guidance
-        -- No git operations are performed. The conversation
-        -- returns to Explore mode idle state.
 }
 
--- REQ-BED-028: User cancels during task approval
 rule CancelDuringTaskApproval {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = awaiting_task_approval
-
-    ensures: conversation.status = idle
+    when: UserCancels(conversation: Parent)
+    requires: conversation.parent_status = awaiting_task_approval
+    ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
-}
-
--- Stale TaskApprovalDecided events are absorbed as no-ops.
--- This handles double-click approve, SSE reconnect resend, or any
--- delivery after the state has already moved past awaiting_task_approval.
-rule StaleTaskApprovalAbsorbed {
-    when: TaskApprovalDecided(conversation, decision)
-
-    requires: conversation.status != awaiting_task_approval
-
-    ensures: conversation.status = conversation.status  -- no change
 }
 
 -- ===========================================================
--- 8. USER QUESTION RESPONSE
+-- PARENT 6. USER QUESTION RESPONSE
 -- ===========================================================
 
 rule UserAnswersQuestion {
-    when: UserAnswersQuestion(conversation, answers, annotations?)
-
-    requires: conversation.status = awaiting_user_response
-
-    ensures: conversation.status = llm_requesting
+    when: UserAnswersQuestion(conversation: Parent, answers, annotations?)
+    requires: conversation.parent_status = awaiting_user_response
+    ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
 }
 
 rule CancelDuringUserQuestion {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = awaiting_user_response
-
-    ensures: conversation.status = idle
+    when: UserCancels(conversation: Parent)
+    requires: conversation.parent_status = awaiting_user_response
+    ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
 }
 
 -- ===========================================================
--- 9. CONTEXT CONTINUATION (REQ-BED-019 through REQ-BED-024)
+-- PARENT 7. CONTEXT CONTINUATION (REQ-BED-019 through 024)
 -- ===========================================================
 
--- REQ-BED-023: User manually triggers continuation
 rule UserTriggersContinuation {
-    when: UserTriggersContinuation(conversation)
-
-    requires: conversation.status = idle
-    requires: not conversation.is_sub_agent
-
-    ensures: conversation.status = awaiting_continuation
+    when: UserTriggersContinuation(conversation: Parent)
+    requires: conversation.core_status = idle
+    ensures: conversation.core_status = awaiting_continuation
     ensures: conversation.rejected_tool_calls = {}
     ensures: conversation.retry_attempt = 1
     ensures: ContinuationRequested(conversation, {})
 }
 
--- REQ-BED-020: Continuation summary received
 rule ContinuationSummaryReceived {
-    when: ContinuationSummaryReady(conversation, summary)
-
-    requires: conversation.status = awaiting_continuation
-
-    ensures: conversation.status = context_exhausted
+    when: ContinuationSummaryReady(conversation: Parent, summary)
+    requires: conversation.core_status = awaiting_continuation
+    ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary = summary
-    ensures: ContextExhausted(conversation, summary)
 }
 
--- REQ-BED-020: Continuation request failed
 rule ContinuationFailed {
-    when: ContinuationRequestFailed(conversation, error)
-
-    requires: conversation.status = awaiting_continuation
-
-    ensures: conversation.status = context_exhausted
+    when: ContinuationRequestFailed(conversation: Parent, error)
+    requires: conversation.core_status = awaiting_continuation
+    ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary =
-        "Continuation summary unavailable. Previous conversation context was exhausted."
-    ensures: ContextExhausted(conversation, conversation.continuation_summary)
+        "Continuation summary unavailable. Context was exhausted."
 }
 
--- Cancel during continuation
 rule CancelDuringContinuation {
-    when: UserCancels(conversation)
-
-    requires: conversation.status = awaiting_continuation
-
-    ensures: conversation.status = context_exhausted
+    when: UserCancels(conversation: Parent)
+    requires: conversation.core_status = awaiting_continuation
+    ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary =
         "Conversation ended by user during context continuation."
-    ensures: LlmAborted(conversation)
-    ensures: ContextExhausted(conversation, conversation.continuation_summary)
 }
 
--- Retryable error during continuation
 rule ContinuationRetryableError {
-    when: LlmErrors(conversation, message, error_class, attempt)
-
-    requires: conversation.status = awaiting_continuation
+    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    requires: conversation.core_status = awaiting_continuation
     requires: error_class = retryable
     requires: attempt < config.max_retry_attempts
-
     ensures: conversation.retry_attempt = attempt + 1
-    ensures: RetryScheduled(
-        conversation,
-        delay: config.retry_base_delay * attempt
-    )
+    ensures: RetryScheduled(conversation, delay: config.retry_base_delay * attempt)
 }
 
--- Non-recoverable error during continuation → exhaust with fallback
 rule ContinuationNonRecoverableError {
-    when: LlmErrors(conversation, message, error_class, attempt)
-
-    requires: conversation.status = awaiting_continuation
-    requires:
-        error_class = non_retryable
-        or attempt >= config.max_retry_attempts
-
-    ensures: conversation.status = context_exhausted
+    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    requires: conversation.core_status = awaiting_continuation
+    requires: error_class = non_retryable or attempt >= config.max_retry_attempts
+    ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary =
-        "Continuation summary unavailable. Previous conversation context was exhausted."
-    ensures: ContextExhausted(conversation, conversation.continuation_summary)
-}
-
--- Continuation retry timeout fires
-rule ContinuationRetryTimeout {
-    when: RetryTimeoutExpires(conversation, attempt)
-
-    requires: conversation.status = awaiting_continuation
-    requires: conversation.retry_attempt = attempt
-
-    ensures: ContinuationRequested(conversation, conversation.rejected_tool_calls)
+        "Continuation summary unavailable. Context was exhausted."
 }
 
 -- ===========================================================
--- 10. TERMINAL STATES (REQ-BED-029, REQ-BED-021)
+-- PARENT 8. TERMINAL (REQ-BED-029)
 -- ===========================================================
 
--- REQ-BED-021: Reject user messages to context-exhausted conversations
-rule RejectMessageContextExhausted {
-    when: UserSendsMessage(conversation, text, images?)
-
-    requires: conversation.status = context_exhausted
-
-    ensures: MessageRejected(conversation, reason: context_exhausted)
-}
-
--- REQ-BED-029: Task resolution transitions to terminal
 rule TaskResolved {
-    when: TaskResolved(conversation, outcome)
-
-    requires: conversation.status = idle
+    when: TaskResolved(conversation: Parent, outcome)
+    requires: conversation.core_status = idle
     requires: conversation.mode in { work, branch }
-
-    ensures: conversation.status = terminal
+    ensures: conversation.parent_status = terminal
     ensures: ConversationBecameTerminal(conversation)
 }
 
--- Lifecycle announcement: emitted whenever any conversation reaches a terminal
--- state (context_exhausted, terminal, completed, failed).
--- Downstream specs (terminal, metrics, etc.) subscribe to this rather than
--- watching conversation.is_terminal directly, making the cross-spec contract
--- explicit and navigable. See specs/terminal/terminal.allium for the canonical
--- consumer. See tasks/08658 for the design rationale behind this choice.
+------------------------------------------------------------
+-- Rules: Sub-agent-only
+------------------------------------------------------------
+
+-- ===========================================================
+-- SUB-AGENT 1. IMPLICIT COMPLETION
+-- ===========================================================
+
+rule SubAgentImplicitCompletion {
+    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 0
+    requires: content = null
+    ensures: conversation.sub_agent_status = completed
+    ensures: conversation.completion_result = ""
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- Sub-agent text-only with content -> also implicit completion
+rule SubAgentTextOnlyCompletion {
+    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 0
+    requires: content != null
+    ensures: conversation.sub_agent_status = completed
+    ensures: conversation.completion_result = extract_text(content)
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- ===========================================================
+-- SUB-AGENT 2. SUBMIT RESULT / ERROR
+-- ===========================================================
+
+rule SubAgentSubmitsResult {
+    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "submit_result"
+    ensures: conversation.sub_agent_status = completed
+    ensures: conversation.completion_result = parse_result(tool_calls.first)
+    ensures: SubAgentCompleted(conversation)
+}
+
+rule SubAgentSubmitsError {
+    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "submit_error"
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = parse_error(tool_calls.first)
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- ===========================================================
+-- SUB-AGENT 3. CANCEL -> FAILED (not idle)
+-- ===========================================================
+
+rule SubAgentCancelled {
+    when: UserCancels(conversation: SubAgent)
+    requires: not conversation.is_terminal
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = UserCancels.reason or "Cancelled"
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- ===========================================================
+-- SUB-AGENT 4. NON-RETRYABLE ERROR -> FAILED
+-- ===========================================================
+
+rule SubAgentLlmError {
+    when: LlmErrors(conversation: SubAgent, message, error_class, attempt)
+    requires: conversation.core_status = llm_requesting
+    requires: error_class = non_retryable or attempt >= config.max_retry_attempts
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = message
+    ensures: conversation.failure_error_class = error_class
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- ===========================================================
+-- SUB-AGENT 5. CONTEXT EXHAUSTION -> FAILED
+-- ===========================================================
+
+rule SubAgentContextExhausted {
+    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: conversation.context_at_threshold
+    ensures: conversation.sub_agent_status = failed
+    ensures: conversation.failure_error = "Context exhausted before result submission"
+    ensures: SubAgentCompleted(conversation)
+}
+
+-- ===========================================================
+-- SUB-AGENT 6. GRACE TURN (REQ-BED-026)
+-- ===========================================================
+
+rule SubAgentTurnLimitGraceTurn {
+    when: TurnLimitReached(conversation: SubAgent)
+    requires: not conversation.grace_turn_granted
+    ensures: conversation.grace_turn_granted = true
+    ensures: SystemMessageInjected(conversation,
+        "You have reached your turn limit. Please call submit_result now.")
+    ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- Grace turn is an executor-level concern: the executor injects a
+        -- system message and allows one more LLM request. Status stays at
+        -- llm_requesting (no transition). If the model doesn't call
+        -- submit_result, GraceTurnExhausted fires.
+}
+
+rule SubAgentTurnLimitHardStop {
+    when: GraceTurnExhausted(conversation: SubAgent, partial_result)
+    requires: conversation.grace_turn_granted = true
+    ensures:
+        if partial_result != null:
+            conversation.sub_agent_status = completed
+            conversation.completion_result = partial_result
+            SubAgentCompleted(conversation) with outcome = success
+        else:
+            conversation.sub_agent_status = failed
+            conversation.failure_error = "Turn limit exceeded, no output"
+            SubAgentCompleted(conversation) with outcome = failure
+}
+
+------------------------------------------------------------
+-- Rules: Lifecycle and cross-cutting
+------------------------------------------------------------
+
+-- Lifecycle announcement: fires when any conversation reaches terminal.
 rule ConversationReachedTerminalState {
     when: conversation: Conversation.is_terminal becomes true
-
     ensures: ConversationBecameTerminal(conversation)
 
     @guidance
-        -- This relay rule exists solely to convert the structural derived-value
-        -- transition into a named, subscribable lifecycle event.
-        -- All rules that set status to a terminal value (context_exhausted,
-        -- terminal, completed, failed) could alternatively each emit
-        -- ConversationBecameTerminal directly. The relay pattern is preferred
-        -- here because it is DRY: new terminal-state transitions added to bedrock
-        -- are automatically covered without remembering to add the emission.
-        -- The tradeoff: the relay rule fires on ANY terminal-state entry,
-        -- including sub-agent completed/failed states. Downstream consumers
-        -- should check conversation.is_sub_agent if they care only about
-        -- top-level conversations.
+        -- Downstream specs (terminal, metrics) subscribe to this event.
+        -- Consumers should check conversation.kind if they care only
+        -- about parent conversations.
 }
-
--- Absorb stale events in terminal states silently
--- (ContextExhausted and Terminal accept events without error)
-
--- ===========================================================
--- 11. MODE COMMUNICATION (REQ-BED-017)
--- ===========================================================
 
 -- REQ-BED-017: Mode change injects synthetic message
 rule ModeChangeNotification {
     when: ModeTransitioned(conversation, from, to)
-
-    ensures: SyntheticMessageInjected(
-        conversation,
-        about: mode_changed
-    )
-
-    @guidance
-        -- The synthetic message informs the agent of the new mode
-        -- and its implications for tool availability. Tool descriptions
-        -- remain static; mode awareness comes through this message
-        -- and through actionable errors when blocked tools are called.
+    ensures: SyntheticMessageInjected(conversation, about: mode_changed)
 }
 
--- ===========================================================
--- 12. STATE PERSISTENCE (REQ-BED-007)
--- ===========================================================
-
--- REQ-BED-007: Persist state before effects
--- This is modeled as a cross-cutting concern rather than per-rule.
--- Every rule that changes conversation.status implicitly requires
--- state to be persisted before side effects execute.
+-- REQ-BED-007: Persist state before effects (cross-cutting)
+-- Every rule that changes status implicitly requires state persistence
+-- before side effects execute.
 
 -- REQ-BED-007: Server restart restores to idle
 rule ServerRestart {
     when: ServerRestarted(conversation)
-
     requires: conversation.is_busy
-
-    ensures: conversation.status = idle
-
-    @guidance
-        -- All conversations resume from idle on restart.
-        -- Message history is fully preserved.
-        -- Users can re-send their last message if interrupted.
+    ensures: conversation.core_status = idle
 }
 
 ------------------------------------------------------------
@@ -1311,59 +862,34 @@ rule ServerRestart {
 
 -- Sub-agent notifies parent exactly once
 invariant SubAgentNotifiesParentOnce {
-    for c in Conversations where c.is_sub_agent:
+    for c in SubAgent:
         count(SubAgentCompleted(c)) <= 1
-    -- Every terminal path (submit_result, forcible termination,
-    -- GraceTurnExhausted, context exhaustion) emits exactly one
-    -- SubAgentCompleted. No path may emit two.
 }
 
--- Sub-agent grace turn: turn limit produces success, not failure
+-- Grace turn resolves to terminal
 invariant GraceTurnOutcome {
-    for c in Conversations:
-        c.is_sub_agent and c.grace_turn_granted and c.is_terminal
-            implies (c.status = completed or c.status = failed)
-    -- Grace turn always resolves to a terminal state.
-    -- completed (with partial text) is preferred over failed.
-    -- failed only when no assistant text exists at all.
+    for c in SubAgent:
+        c.grace_turn_granted and c.is_terminal
+            implies (c.sub_agent_status = completed or c.sub_agent_status = failed)
 }
 
 -- REQ-BED-001: Pure state transitions
--- Determinism (same inputs → same outputs) is a property of the
--- transition function, not a point-in-time entity property.
--- It is enforced by construction: transitions are pure functions
--- with no I/O, no randomness, and no ambient state.
--- The transition function is a pure function: given identical
--- (state, event) pairs, it produces identical (new_state, effects)
--- pairs. No I/O, no clock reads, no mutable state.
+-- Enforced by construction: transitions are pure functions.
 
 -- REQ-BED-004: Tool round atomicity
--- Assistant message tool_use count must equal tool result count
--- when a tool round is persisted. Modeled as a construction
--- constraint on the checkpoint, not a runtime invariant.
--- See @guidance on ToolRoundCheckpointed.
+-- tool_use count = tool_result count at checkpoint time.
 
 -- REQ-BED-008: Sub-agent fan-in conservation
--- When in awaiting_sub_agents or cancelling_sub_agents:
--- pending.count + completed.count = total spawned (constant)
--- This is a historical property (compares to a past value) and cannot
--- be expressed as a point-in-time invariant in Allium. It is enforced
--- by construction: every SubAgentReportsResult rule removes exactly
--- one from pending and adds exactly one to completed. No other rule
--- mutates these collections.
+-- pending + completed = total spawned (constant).
+-- Enforced by construction: each SubAgentReportsResult moves one.
 
--- REQ-BED-019 > REQ-BED-023: Threshold ordering
 invariant ThresholdOrdering {
     config.context_continuation_threshold > config.context_warning_threshold
 }
 
--- Sole-tool constraint: intercepted tools must be the only tool in a response
--- Enforced structurally by rule preconditions (tool_calls.count = 1).
-
--- Sub-agent spawn limit
 invariant SpawnLimit {
     for c in Conversations:
-        c.status = executing_tools
+        c.core_status = executing_tools
             implies c.accumulated_sub_agents.count <= config.max_sub_agents_per_spawn
 }
 
@@ -1372,7 +898,7 @@ invariant SpawnLimit {
 ------------------------------------------------------------
 
 actor User {
-    identified_by: Conversation where not is_sub_agent
+    identified_by: Parent
 }
 
 ------------------------------------------------------------
@@ -1382,35 +908,37 @@ actor User {
 surface UserConversation {
     facing user: User
 
-    context conversation: Conversation where not is_sub_agent
+    context conversation: Parent
 
     exposes:
-        conversation.status
+        conversation.core_status
+        conversation.parent_status
         conversation.mode
         conversation.context_usage_ratio
         conversation.context_warning
-        conversation.proposal when conversation.status = awaiting_task_approval
-        conversation.pending_questions when conversation.status = awaiting_user_response
-        conversation.error_message when conversation.status in { error, awaiting_recovery }
-        conversation.recovery_kind when conversation.status = awaiting_recovery
-        conversation.continuation_summary when conversation.status = context_exhausted
+        conversation.proposal when conversation.parent_status = awaiting_task_approval
+        conversation.pending_questions when conversation.parent_status = awaiting_user_response
+        conversation.error_message when conversation.core_status = error
+        conversation.recovery_message when conversation.parent_status = awaiting_recovery
+        conversation.recovery_kind when conversation.parent_status = awaiting_recovery
+        conversation.continuation_summary when conversation.parent_status = context_exhausted
 
     provides:
         UserSendsMessage(conversation, text, images?)
-            when conversation.status in { idle, error }
+            when conversation.core_status in { idle, error }
         UserCancels(conversation)
             when conversation.is_busy
-                 or conversation.status in {
+                 or conversation.parent_status in {
                     awaiting_task_approval,
                     awaiting_user_response,
-                    awaiting_continuation
+                    awaiting_recovery
                  }
         TaskApprovalDecided(conversation, decision)
-            when conversation.status = awaiting_task_approval
+            when conversation.parent_status = awaiting_task_approval
         UserAnswersQuestion(conversation, answers, annotations?)
-            when conversation.status = awaiting_user_response
+            when conversation.parent_status = awaiting_user_response
         UserTriggersContinuation(conversation)
-            when conversation.status = idle and conversation.context_warning
+            when conversation.core_status = idle and conversation.context_warning
 
     @guarantee IdempotentMessages
         -- Duplicate message submissions (same message_id) are
@@ -1421,5 +949,4 @@ surface UserConversation {
         -- operation completion. Never queued behind current work.
 }
 
--- No open questions remain. All 5 ambiguities discovered during
--- distillation have been resolved with code fixes.
+-- No open questions remain.
