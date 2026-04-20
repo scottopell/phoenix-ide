@@ -18,7 +18,8 @@ use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
 use crate::state_machine::{
-    handle_outcome, transition, CheckpointData, ConvContext, ConvState, Effect, Event, StepResult,
+    handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
+    Effect, Event, StepResult,
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
@@ -1572,7 +1573,7 @@ where
                         result.output(),
                         result.is_error(),
                     );
-                    let tool_msg_id = format!("{}-result", result.tool_use_id);
+                    let tool_msg_id = tool_result_message_id(&result.tool_use_id);
                     let tool_msg = self
                         .storage
                         .add_message(
@@ -1606,9 +1607,9 @@ where
         });
 
         // If we have a spawn_tool_id, update its message's content (for LLM history)
-        // and display_data (for UI). The message was persisted as "{spawn_tool_id}-result".
+        // and display_data (for UI).
         if let Some(tool_id) = spawn_tool_id {
-            let message_id = format!("{tool_id}-result");
+            let message_id = tool_result_message_id(&tool_id);
 
             // Build a human-readable summary of sub-agent outcomes for the LLM.
             // This replaces the initial "Spawning N sub-agents..." acknowledgement so

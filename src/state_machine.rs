@@ -27,5 +27,6 @@ pub use transition::{handle_outcome, transition};
 // Re-exports for atomic persistence types (used by runtime/executor)
 #[allow(unused_imports)]
 pub use effect::{CheckpointData, PersistError};
+pub use effect::tool_result_message_id;
 #[allow(unused_imports)]
 pub use state::AssistantMessage;

@@ -67,6 +67,16 @@ impl CheckpointData {
     }
 }
 
+/// Derive the message ID used to persist a tool result.
+///
+/// Both `persist_checkpoint` and `persist_sub_agent_results` must agree on
+/// this ID: the former creates the message, the latter updates it in-place
+/// when sub-agent results arrive. Single-sourcing the convention here
+/// prevents silent divergence.
+pub fn tool_result_message_id(tool_use_id: &str) -> String {
+    format!("{tool_use_id}-result")
+}
+
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -214,8 +224,7 @@ impl Effect {
         images: Vec<ToolContentImage>,
     ) -> Self {
         let tool_use_id = tool_use_id.into();
-        // Use predictable message_id so we can update display_data later (e.g., subagent results)
-        let message_id = format!("{tool_use_id}-result");
+        let message_id = tool_result_message_id(&tool_use_id);
         Effect::PersistMessage {
             content: MessageContent::Tool(ToolContent {
                 tool_use_id: tool_use_id.clone(),
