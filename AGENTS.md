@@ -85,6 +85,16 @@ Each git worktree gets unique ports and database automatically.
 
 ---
 
+## Commits and pushes
+
+**Agents are authorized to commit in this repo without asking.** Commits are local and reversible; holding working-tree changes uncommitted across a long session costs more than it saves. (`./dev.py prod deploy` does warn loudly about dirty state but builds from HEAD regardless — easy to miss at the end of a long build log.) Commit completed units of work as you go.
+
+Prefer logical splits over a single kitchen-sink commit when concerns are distinct. Use conventional-commit-ish prefixes (`fix:`, `feat:`, `refactor:`, `build:`, `tasks:`, `docs:`) matching the existing log style.
+
+**Push still requires explicit user authorization.** Pushes affect others and trigger deploys; keep them opt-in.
+
+---
+
 ## Testing
 
 ```bash
