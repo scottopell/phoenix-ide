@@ -133,7 +133,6 @@ entity Conversation {
         awaiting_sub_agents -> cancelling_sub_agents
         cancelling_sub_agents -> idle
         idle -> awaiting_continuation
-        awaiting_continuation -> error
     }
 
     -- Mode transitions (REQ-BED-027)
@@ -195,11 +194,20 @@ variant Parent : Conversation {
 
     is_terminal: parent_status in { context_exhausted, terminal }
 
+    -- Parent-only status transitions.
+    -- Recovery/approval/question states exit by resetting to a core_status
+    -- (idle, llm_requesting, error). These are cross-field transitions:
+    -- parent_status clears while core_status is set.
     transitions parent_status {
+        -- Task approval exits (-> core idle or llm_requesting)
         awaiting_task_approval -> idle
+        -- User question exits (-> core idle or llm_requesting)
         awaiting_user_response -> idle
+        -- Recovery exits (-> core idle, llm_requesting, or error)
         awaiting_recovery -> idle
-        awaiting_recovery -> error
+        -- Continuation exits (-> context_exhausted, a parent terminal)
+        awaiting_continuation -> context_exhausted
+
         terminal: context_exhausted, terminal
     }
 }
@@ -459,6 +467,28 @@ rule LastSubAgentReportsResult {
 ------------------------------------------------------------
 
 -- ===========================================================
+-- PARENT 0. MESSAGE REJECTION IN PARENT-ONLY STATES
+-- ===========================================================
+
+rule RejectMessageDuringTaskApproval {
+    when: UserSendsMessage(conversation: Parent, text, images?)
+    requires: conversation.parent_status = awaiting_task_approval
+    ensures: MessageRejected(conversation, reason: awaiting_approval)
+}
+
+rule RejectMessageDuringUserQuestion {
+    when: UserSendsMessage(conversation: Parent, text, images?)
+    requires: conversation.parent_status = awaiting_user_response
+    ensures: MessageRejected(conversation, reason: awaiting_response)
+}
+
+rule RejectMessageContextExhausted {
+    when: UserSendsMessage(conversation: Parent, text, images?)
+    requires: conversation.parent_status = context_exhausted
+    ensures: MessageRejected(conversation, reason: context_exhausted)
+}
+
+-- ===========================================================
 -- PARENT 1. LLM RESPONSE — TEXT-ONLY AND INTERCEPTIONS
 -- ===========================================================
 
@@ -564,9 +594,11 @@ rule RecoverySucceeded {
 }
 
 rule RecoveryFailed {
-    when: CredentialHelperTerminatedWithoutCredential
+    when: CredentialHelperFailed(message)
     requires: conversation.parent_status = awaiting_recovery
     ensures: conversation.core_status = error
+    ensures: conversation.error_message = message
+    ensures: conversation.error_class = non_retryable
 }
 
 rule CancelDuringRecovery {
