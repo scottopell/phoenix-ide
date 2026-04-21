@@ -17,13 +17,25 @@ interface StateBarProps {
   contextWindowUsed: number;
   /** Model's maximum context window in tokens */
   modelContextWindow: number;
-  /** Available models from the API (used to detect 1M upgrade availability) */
+  /** Available models from the API (used to populate the model picker) */
   availableModels?: ModelInfo[];
   onRetryNow?: () => void;
   /** Callback to manually trigger continuation */
   onTriggerContinuation?: () => void;
-  /** Callback to upgrade the conversation to a 1M model variant */
+  /** Callback invoked when the user selects a different model for this conversation */
   onUpgradeModel?: (newModelId: string) => void;
+}
+
+/** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
+function formatContextWindow(n: number): string {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
+  if (n >= 1000) {
+    return `${Math.round(n / 1000)}k`;
+  }
+  return n.toString();
 }
 
 /** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-4o" -> "gpt-4o"
@@ -72,9 +84,10 @@ export function StateBar({
   onUpgradeModel,
 }: StateBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [upgradeConfirm, setUpgradeConfirm] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerShowAll, setPickerShowAll] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const upgradeRef = useRef<HTMLSpanElement>(null);
+  const pickerRef = useRef<HTMLSpanElement>(null);
 
   // Close menu on outside click
   useEffect(() => {
@@ -88,17 +101,27 @@ export function StateBar({
     return () => document.removeEventListener('mousedown', handleClick);
   }, [menuOpen]);
 
-  // Close upgrade confirmation on outside click
+  // Close model picker on outside click
   useEffect(() => {
-    if (!upgradeConfirm) return;
+    if (!pickerOpen) return;
     const handleClick = (e: MouseEvent) => {
-      if (upgradeRef.current && !upgradeRef.current.contains(e.target as Node)) {
-        setUpgradeConfirm(false);
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setPickerOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [upgradeConfirm]);
+  }, [pickerOpen]);
+
+  // Close model picker on Escape
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPickerOpen(false);
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [pickerOpen]);
 
   let dotClass = 'dot';
   let stateText = '';
@@ -222,26 +245,39 @@ export function StateBar({
   const modelAbbrev = conversation ? abbreviateModel(conversation.model ?? '') : '';
   const projectName = conversation ? getProjectName(conversation) : null;
 
-  // Model upgrade detection: check if a 1M variant exists for the current model
+  // Model picker: available on idle conversations when we have models and a callback.
   const currentModel = conversation?.model ?? '';
   const is1m = currentModel.endsWith('-1m');
-  const upgradeModelId = is1m ? null : currentModel + '-1m';
-  const canUpgrade = !!(
-    upgradeModelId &&
-    availableModels?.some(m => m.id === upgradeModelId) &&
-    convState.type === 'idle' &&
-    onUpgradeModel
+  const canPickModel = !!(
+    onUpgradeModel &&
+    availableModels &&
+    availableModels.length > 0 &&
+    convState.type === 'idle'
   );
 
-  const handleUpgradeClick = () => {
-    if (!canUpgrade) return;
-    setUpgradeConfirm(true);
+  // Default list: recommended models plus the currently selected one (if not recommended).
+  // "Show all" expands to the full list. Always deduplicate by id.
+  const pickerModels: ModelInfo[] = (() => {
+    if (!availableModels) return [];
+    if (pickerShowAll) return availableModels;
+    const recommended = availableModels.filter(m => m.recommended);
+    if (currentModel && !recommended.some(m => m.id === currentModel)) {
+      const current = availableModels.find(m => m.id === currentModel);
+      if (current) return [current, ...recommended];
+    }
+    return recommended;
+  })();
+
+  const handleModelTriggerClick = () => {
+    if (!canPickModel) return;
+    setPickerOpen(v => !v);
   };
 
-  const handleUpgradeConfirm = () => {
-    if (!upgradeModelId || !onUpgradeModel) return;
-    setUpgradeConfirm(false);
-    onUpgradeModel(upgradeModelId);
+  const handleSelectModel = (modelId: string) => {
+    setPickerOpen(false);
+    if (!onUpgradeModel) return;
+    if (modelId === currentModel) return;
+    onUpgradeModel(modelId);
   };
 
   // Git delta badges
@@ -273,40 +309,65 @@ export function StateBar({
                     {modeLabel}{modeSuffix}
                   </span>
                 )}
-                <span className="conv-model" title={`Model: ${conversation.model}`}>
-                  {modelAbbrev}
-                  {is1m && <span className="model-1m-badge">1M</span>}
+                <span className="conv-model-wrapper" ref={pickerRef}>
+                  {canPickModel ? (
+                    <button
+                      className="conv-model conv-model--button"
+                      title={`Model: ${conversation.model} (click to change)`}
+                      onClick={handleModelTriggerClick}
+                      aria-haspopup="listbox"
+                      aria-expanded={pickerOpen}
+                    >
+                      {modelAbbrev}
+                      {is1m && <span className="model-1m-badge">1M</span>}
+                      <span className="conv-model-caret" aria-hidden="true">&#9662;</span>
+                    </button>
+                  ) : (
+                    <span className="conv-model" title={`Model: ${conversation.model}`}>
+                      {modelAbbrev}
+                      {is1m && <span className="model-1m-badge">1M</span>}
+                    </span>
+                  )}
+                  {pickerOpen && canPickModel && (
+                    <div className="model-picker" role="listbox" aria-label="Select model">
+                      <div className="model-picker-list">
+                        {pickerModels.map(m => {
+                          const selected = m.id === currentModel;
+                          return (
+                            <button
+                              key={m.id}
+                              type="button"
+                              role="option"
+                              aria-selected={selected}
+                              className={
+                                'model-picker-item' +
+                                (selected ? ' model-picker-item--selected' : '')
+                              }
+                              onClick={() => handleSelectModel(m.id)}
+                              title={m.description || m.id}
+                            >
+                              <span className="model-picker-item-check" aria-hidden="true">
+                                {selected ? '✓' : ''}
+                              </span>
+                              <span className="model-picker-item-id">{m.id}</span>
+                              <span className="model-picker-item-ctx">
+                                {formatContextWindow(m.context_window)}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <label className="model-picker-show-all-toggle">
+                        <input
+                          type="checkbox"
+                          checked={pickerShowAll}
+                          onChange={(e) => setPickerShowAll(e.target.checked)}
+                        />
+                        <span>Show all models</span>
+                      </label>
+                    </div>
+                  )}
                 </span>
-                {canUpgrade && (
-                  <span className="model-upgrade" ref={upgradeRef}>
-                    {upgradeConfirm ? (
-                      <span className="model-upgrade-confirm">
-                        <span className="model-upgrade-prompt">Switch to 1M?</span>
-                        <button
-                          className="model-upgrade-yes"
-                          onClick={handleUpgradeConfirm}
-                          title="Upgrade to 1M context window"
-                        >
-                          Yes
-                        </button>
-                        <button
-                          className="model-upgrade-no"
-                          onClick={() => setUpgradeConfirm(false)}
-                        >
-                          No
-                        </button>
-                      </span>
-                    ) : (
-                      <button
-                        className="model-upgrade-btn"
-                        onClick={handleUpgradeClick}
-                        title="Upgrade to 1M context window"
-                      >
-                        1M
-                      </button>
-                    )}
-                  </span>
-                )}
               </div>
 
               {/* Line 2: task title (Work) + git info, or project name */}

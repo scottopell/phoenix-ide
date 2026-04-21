@@ -25,6 +25,7 @@ import {
   type ShellSnippet,
 } from '../shellIntegrationSnippets';
 import { useTheme } from '../hooks/useTheme';
+import { copyToClipboard } from '../utils/clipboard';
 
 /**
  * Read the current xterm-relevant CSS variables from `:root[data-theme=...]`.
@@ -714,11 +715,8 @@ export function TerminalPanel({
 
   const handleCopySnippet = async () => {
     if (!snippet) return;
-    try {
-      await navigator.clipboard.writeText(snippet.snippet);
+    if (await copyToClipboard(snippet.snippet)) {
       setCopyAck(true);
-    } catch {
-      // ignore — UI gives no special error path; user can select+copy manually
     }
   };
 

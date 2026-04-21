@@ -2,11 +2,9 @@ import { useEffect, useRef, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'r
 import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
-import { DIR_STATUS_CONFIG, SettingsFields } from '../components/SettingsFields';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { useCreateConversation } from '../hooks/useCreateConversation';
-import { useState } from 'react';
 
 interface NewConversationPageProps {
   desktopMode?: boolean;
@@ -17,7 +15,6 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [showSettings, setShowSettings] = useState(false);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -60,11 +57,6 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     }
   };
 
-  const { icon: dirStatusIcon, class: dirStatusClass } = DIR_STATUS_CONFIG[conv.dirStatus];
-  const cwdDisplay = (conv.homeDir && conv.cwd.trim().startsWith(conv.homeDir))
-    ? '~/' + conv.cwd.trim().slice(conv.homeDir.length).replace(/^\//, '')
-    : conv.cwd.trim() || '~/';
-  const modelDisplay = conv.models?.models.find(m => m.id === conv.selectedModel)?.id.replace(/-sonnet|-opus/g, '') || '...';
   const buttonText = conv.creating ? (conv.dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
 
   return (
@@ -127,41 +119,14 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             disabled={conv.creating}
           />
 
-          {/* Actions row: settings chips + send */}
+          {/* Actions row: send group */}
           <div className="new-conv-actions">
-            <div className="new-conv-chips">
-              <button className="new-conv-chip" title={conv.cwd} onClick={() => setShowSettings(!showSettings)}>
-                <span className={`chip-status ${dirStatusClass}`}>{dirStatusIcon}</span>
-                {cwdDisplay}
-              </button>
-              <button className="new-conv-chip" onClick={() => setShowSettings(!showSettings)}>
-                {modelDisplay}
-              </button>
-            </div>
             <div className="new-conv-send-group">
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
               {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
               <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
             </div>
           </div>
-
-          {/* Expanded settings (bare SettingsFields only — banner/error/recent/preview already shown above) */}
-          {showSettings && (
-            <div className="new-conv-settings-expanded">
-              <SettingsFields
-                cwd={conv.cwd}
-                setCwd={conv.setCwd}
-                dirStatus={conv.dirStatus}
-                onDirStatusChange={conv.setDirStatus}
-                onGitStatusChange={conv.setIsGitDir}
-                selectedModel={conv.selectedModel}
-                setSelectedModel={conv.setSelectedModel}
-                models={conv.models}
-                showAllModels={conv.showAllModels}
-                setShowAllModels={conv.setShowAllModels}
-              />
-            </div>
-          )}
         </div>
 
         {/* Mobile: keep existing layout */}

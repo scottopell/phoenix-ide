@@ -19,7 +19,7 @@ export interface ConversationAtom {
   messages: Message[];
   breadcrumbs: Breadcrumb[];
   breadcrumbSequenceIds: ReadonlySet<number>;
-  contextWindow: { used: number; total: number };
+  contextWindow: { used: number };
   systemPrompt: string | null;
   lastSequenceId: number;
   connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
@@ -33,7 +33,7 @@ export interface InitPayload {
   phase: ConversationState;
   breadcrumbs: Breadcrumb[];
   breadcrumbSequenceIds: ReadonlySet<number>;
-  contextWindow: { used: number; total: number };
+  contextWindow: { used: number };
   lastSequenceId: number;
 }
 
@@ -53,7 +53,7 @@ export type SSEAction =
       conversation: Conversation;
       messages: Message[];
       phase: ConversationState;
-      contextWindow: { used: number; total: number };
+      contextWindow: { used: number };
     }
   | { type: 'set_system_prompt'; systemPrompt: string | null };
 
@@ -65,7 +65,7 @@ export function createInitialAtom(): ConversationAtom {
     messages: [],
     breadcrumbs: [],
     breadcrumbSequenceIds: new Set(),
-    contextWindow: { used: 0, total: 200_000 },
+    contextWindow: { used: 0 },
     systemPrompt: null,
     lastSequenceId: 0,
     connectionState: 'connecting',

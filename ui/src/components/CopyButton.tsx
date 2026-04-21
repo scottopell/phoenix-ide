@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { copyToClipboard } from '../utils/clipboard';
 
 interface CopyButtonProps {
   text: string;
@@ -11,22 +12,7 @@ export function CopyButton({ text, className = '', title = 'Copy to clipboard' }
 
   const handleCopy = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation(); // Don't trigger parent click handlers
-    
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
-      // Fallback for older browsers
-      const textarea = document.createElement('textarea');
-      textarea.value = text;
-      textarea.style.position = 'fixed';
-      textarea.style.opacity = '0';
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
+    if (await copyToClipboard(text)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }

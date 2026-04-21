@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { api, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
+import { copyToClipboard } from '../utils/clipboard';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { InputArea } from '../components/InputArea';
@@ -156,7 +157,7 @@ export function ConversationPage() {
             conversation: cached,
             messages: cachedMessages,
             phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
-            contextWindow: { used: 0, total: 200_000 },
+            contextWindow: { used: 0 },
           });
         }
 
@@ -177,7 +178,6 @@ export function ConversationPage() {
                     : { type: 'idle' },
                 contextWindow: {
                   used: result.context_window_size || 0,
-                  total: 200_000,
                 },
               });
               await cacheDB.putConversation(result.conversation);
@@ -440,8 +440,8 @@ export function ConversationPage() {
 
     try {
       await api.upgradeModel(conversationId, newModelId);
-      // Backend evicts the runtime on upgrade; reload to reconnect with new model
-      window.location.reload();
+      showInfo(`Switched to ${newModelId}`);
+      dispatch({ type: 'sse_conversation_update', updates: { model: newModelId } });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
@@ -653,6 +653,13 @@ export function ConversationPage() {
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'context_exhausted';
 
+  // Derived: model context window is a pure function of the current model's
+  // spec. Falls back to 200_000 when availableModels hasn't loaded yet or the
+  // model isn't in the registry (matches prior denormalized default).
+  const modelContextWindow =
+    availableModels?.find((m) => m.id === atom.conversation?.model)?.context_window
+    ?? 200_000;
+
   // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list
   // when this conversation was spawned from another via a seed action.
   // If `seed_parent_slug` is present we link to it; if not (parent deleted),
@@ -714,12 +721,10 @@ export function ConversationPage() {
             </pre>
             <button
               className="context-exhausted-copy"
-              onClick={() => {
-                navigator.clipboard.writeText(
-                  convStateForChildren.type === 'context_exhausted'
-                    ? convStateForChildren.summary
-                    : ''
-                );
+              onClick={async () => {
+                if (convStateForChildren.type !== 'context_exhausted') return;
+                const ok = await copyToClipboard(convStateForChildren.summary);
+                showInfo(ok ? 'Summary copied to clipboard' : 'Copy failed -- select and copy manually');
               }}
             >
               Copy Summary
@@ -821,7 +826,7 @@ export function ConversationPage() {
         connectionAttempt={connectionInfo.attempt}
         nextRetryIn={connectionInfo.nextRetryIn}
         contextWindowUsed={atom.contextWindow.used}
-        modelContextWindow={atom.contextWindow.total}
+        modelContextWindow={modelContextWindow}
         availableModels={availableModels}
         onRetryNow={connectionInfo.retryNow}
         onTriggerContinuation={handleTriggerContinuation}

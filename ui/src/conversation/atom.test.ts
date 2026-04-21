@@ -38,7 +38,7 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     phase: { type: 'idle' },
     breadcrumbs: [],
     breadcrumbSequenceIds: new Set(),
-    contextWindow: { used: 1000, total: 200_000 },
+    contextWindow: { used: 1000 },
     lastSequenceId: 5,
     ...overrides,
   };
@@ -561,7 +561,7 @@ describe('conversationReducer', () => {
         conversation: testConversation,
         messages: [makeMessage(3)],
         phase: { type: 'idle' },
-        contextWindow: { used: 500, total: 100_000 },
+        contextWindow: { used: 500 },
       });
 
       expect(next.conversationId).toBe('conv-1');
@@ -578,7 +578,7 @@ describe('conversationReducer', () => {
         conversation: testConversation,
         messages: [],
         phase: { type: 'idle' },
-        contextWindow: { used: 0, total: 200_000 },
+        contextWindow: { used: 0 },
       });
 
       expect(next).toBe(atom);

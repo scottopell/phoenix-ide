@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Message, ContentBlock } from '../api';
+import { copyToClipboard } from '../utils/clipboard';
 import './MessageContextMenu.css';
 
 interface ToolContext {
@@ -151,7 +152,7 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
 
   const copyMarkdown = () => {
     const md = getRawMarkdown(menu.message);
-    navigator.clipboard.writeText(md);
+    void copyToClipboard(md);
     setMenu(null);
   };
 
@@ -160,13 +161,13 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       `.message[data-sequence-id="${menu.message.sequence_id}"]`
     ) as HTMLElement | null;
     const text = el ? getPlainText(el) : getRawMarkdown(menu.message);
-    navigator.clipboard.writeText(text);
+    void copyToClipboard(text);
     setMenu(null);
   };
 
   const copySelection = () => {
     const selection = window.getSelection()?.toString() || '';
-    navigator.clipboard.writeText(selection);
+    void copyToClipboard(selection);
     setMenu(null);
   };
 
@@ -186,14 +187,14 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
 
   const copyCommand = () => {
     if (menu.toolContext?.command) {
-      navigator.clipboard.writeText(menu.toolContext.command);
+      void copyToClipboard(menu.toolContext.command);
     }
     setMenu(null);
   };
 
   const copyOutput = () => {
     if (menu.toolContext?.output) {
-      navigator.clipboard.writeText(menu.toolContext.output);
+      void copyToClipboard(menu.toolContext.output);
     }
     setMenu(null);
   };

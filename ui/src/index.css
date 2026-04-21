@@ -2074,6 +2074,7 @@ pre:hover .copy-btn {
   font-size: 11px;
   color: var(--text-muted);
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
 }
 
@@ -2094,6 +2095,7 @@ pre:hover .copy-btn {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 200px;
+  min-width: 0;
   font-size: 12px;
 }
 
@@ -2119,100 +2121,139 @@ pre:hover .copy-btn {
   gap: 4px;
 }
 
-/* Purple badge shown when conversation is on a 1M model */
-.model-1m-badge {
-  display: inline-block;
-  font-size: 9px;
-  font-weight: 600;
-  padding: 0 4px;
-  border-radius: 4px;
-  line-height: 1.5;
-  color: var(--accent-purple);
-  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
-  letter-spacing: 0.3px;
-}
-
-/* Upgrade-to-1M affordance next to model display */
-.model-upgrade {
+/* Wrapper that anchors the picker popover to the model trigger. */
+.conv-model-wrapper {
+  position: relative;
   display: inline-flex;
   align-items: center;
   flex-shrink: 0;
 }
 
-.model-upgrade-btn {
-  all: unset;
-  cursor: pointer;
-  font-size: 9px;
-  font-weight: 600;
-  padding: 0 4px;
+/* Button variant of .conv-model (opens the model picker on idle conversations). */
+.conv-model--button {
+  background: none;
+  border: 1px solid transparent;
   border-radius: 4px;
-  line-height: 1.5;
-  letter-spacing: 0.3px;
-  color: var(--text-muted);
-  border: 1px dashed color-mix(in srgb, var(--accent-purple) 40%, transparent);
+  padding: 0 4px;
+  margin: 0;
+  font: inherit;
+  cursor: pointer;
   transition: color 150ms, border-color 150ms, background 150ms;
 }
 
-.model-upgrade-btn:hover {
-  color: var(--accent-purple);
-  border-color: var(--accent-purple);
-  background: color-mix(in srgb, var(--accent-purple) 8%, transparent);
+.conv-model--button:hover {
+  color: var(--text-primary);
+  border-color: var(--border-color);
+  background: color-mix(in srgb, var(--text-primary) 5%, transparent);
 }
 
-/* Inline confirmation for model upgrade */
-.model-upgrade-confirm {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10px;
-  white-space: nowrap;
-}
-
-.model-upgrade-prompt {
-  color: var(--text-secondary);
-}
-
-.model-upgrade-yes,
-.model-upgrade-no {
-  all: unset;
-  cursor: pointer;
-  font-size: 9px;
-  font-weight: 600;
-  padding: 0 5px;
-  border-radius: 4px;
-  line-height: 1.6;
-}
-
-.model-upgrade-yes {
-  color: var(--accent-purple);
-  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
-}
-
-.model-upgrade-yes:hover {
-  background: color-mix(in srgb, var(--accent-purple) 25%, transparent);
-}
-
-.model-upgrade-no {
+.conv-model-caret {
+  font-size: 8px;
   color: var(--text-muted);
+  margin-left: 2px;
 }
 
-.model-upgrade-no:hover {
-  color: var(--text-secondary);
-}
-
+/* Purple badge shown when conversation is on a 1M model */
 .model-1m-badge {
   display: inline-block;
-  margin-left: 4px;
-  padding: 0 4px;
   font-size: 9px;
   font-weight: 700;
-  letter-spacing: 0.03em;
-  line-height: 16px;
+  padding: 0 4px;
   border-radius: 3px;
+  line-height: 16px;
+  letter-spacing: 0.03em;
   color: #c4a5ff;
   border: 1px solid color-mix(in srgb, #c4a5ff 45%, transparent);
   background: color-mix(in srgb, #9b6dff 18%, transparent);
   vertical-align: 1px;
+}
+
+/* Model picker popover. The StateBar is anchored to the bottom of the
+   viewport on every breakpoint and its ancestors have overflow:hidden
+   (for slug ellipsis), which would clip an absolutely-positioned popover.
+   Use position:fixed so the popover escapes those clipping ancestors,
+   and open upward from just above the StateBar. */
+.model-picker {
+  position: fixed;
+  left: auto;
+  right: 8px;
+  bottom: calc(var(--state-bar-height, 42px) + 8px);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  z-index: 1000;
+  min-width: 240px;
+  max-width: calc(100vw - 16px);
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.model-picker-list {
+  overflow-y: auto;
+  padding: 4px 0;
+  flex: 1 1 auto;
+}
+
+.model-picker-item {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.model-picker-item:hover {
+  background: var(--bg-primary);
+}
+
+.model-picker-item--selected {
+  color: var(--accent-purple);
+  font-weight: 600;
+}
+
+.model-picker-item-check {
+  flex: 0 0 12px;
+  font-size: 11px;
+  color: var(--accent-purple);
+  text-align: center;
+}
+
+.model-picker-item-id {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-picker-item-ctx {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.model-picker-show-all-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-color);
+  cursor: pointer;
+  user-select: none;
+}
+
+.model-picker-show-all-toggle input {
+  margin: 0;
 }
 
 /* Line 2: git flow + delta badges + project name */
@@ -2223,6 +2264,7 @@ pre:hover .copy-btn {
   font-size: 11px;
   color: var(--text-muted);
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
 }
 

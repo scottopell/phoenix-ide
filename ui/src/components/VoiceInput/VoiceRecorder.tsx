@@ -252,17 +252,14 @@ export function VoiceRecorder({ onStart, onEnd, onSpeech, onInterim, disabled }:
     setError(null);
 
     try {
-      // Request microphone permission first
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      
       const recognition = createRecognition();
       recognitionRef.current = recognition;
       recognition.start();
     } catch (err) {
       console.error('Failed to start speech recognition:', err);
       setError({
-        type: 'permission',
-        message: 'Could not access microphone. Please check your browser permissions.',
+        type: 'unknown',
+        message: err instanceof Error ? err.message : 'Failed to start speech recognition.',
         recoverable: true,
       });
       setState('error');

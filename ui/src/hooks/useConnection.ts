@@ -69,7 +69,6 @@ function transformInitData(raw: SseInitData): InitPayload {
     breadcrumbSequenceIds,
     contextWindow: {
       used: raw.context_window_size ?? 0,
-      total: raw.model_context_window ?? 200_000,
     },
     lastSequenceId: raw.last_sequence_id ?? 0,
   };
