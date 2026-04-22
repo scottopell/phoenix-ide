@@ -266,6 +266,28 @@ export class ExpansionError extends Error {
   }
 }
 
+/** 409 Conflict payload from the server. `conflict_slug` points at the
+ *  conversation that owns the contested resource (e.g. an already-active
+ *  Branch-mode conversation on the same branch). */
+export interface ConflictErrorDetail {
+  error: string;
+  error_type: string;
+  conflict_slug?: string;
+  dirty_files?: string[];
+  can_auto_stash?: boolean;
+}
+
+/** Thrown by API methods that return 409 with a typed conflict payload. */
+export class ConflictError extends Error {
+  readonly detail: ConflictErrorDetail;
+
+  constructor(detail: ConflictErrorDetail) {
+    super(detail.error);
+    this.name = 'ConflictError';
+    this.detail = detail;
+  }
+}
+
 export interface McpServerStatus {
   name: string;
   tool_count: number;
@@ -358,6 +380,9 @@ export const api = {
     });
     if (!resp.ok) {
       const err = await resp.json();
+      if (resp.status === 409) {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
       throw new Error(err.error || 'Failed to create conversation');
     }
     return (await resp.json()).conversation;

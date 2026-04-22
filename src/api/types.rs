@@ -341,6 +341,11 @@ pub struct ConflictErrorResponse {
     /// Whether auto-stash is safe (stash will pop cleanly after merge)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub can_auto_stash: bool,
+    /// Slug of the conversation that owns the contested resource (branch
+    /// already active, etc.) — the UI routes to this slug instead of showing
+    /// the error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_slug: Option<String>,
 }
 
 impl ConflictErrorResponse {
@@ -350,7 +355,13 @@ impl ConflictErrorResponse {
             error_type: error_type.into(),
             dirty_files: vec![],
             can_auto_stash: false,
+            conflict_slug: None,
         }
+    }
+
+    pub fn with_conflict_slug(mut self, slug: impl Into<String>) -> Self {
+        self.conflict_slug = Some(slug.into());
+        self
     }
 }
 

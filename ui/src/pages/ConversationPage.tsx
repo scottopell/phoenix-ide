@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, ExpansionError, type Conversation, type ImageData } from '../api';
+import { api, ConflictError, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -96,6 +96,9 @@ export function ConversationPage() {
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
+  // Context-full banner: summary expanded by default; user can collapse to
+  // read the conversation above.
+  const [contextExhaustedExpanded, setContextExhaustedExpanded] = useState(true);
   // Terminal split-pane height — collapses to a 32px header strip
   const terminalPane = useResizablePane({
     key: 'terminal-height',
@@ -706,29 +709,93 @@ export function ConversationPage() {
         </div>
       )}
       {convStateForChildren.type === 'context_exhausted' && (
-        <div className="context-exhausted-banner">
-          <div className="context-exhausted-header">
+        <div className={`context-exhausted-banner${contextExhaustedExpanded ? ' context-exhausted-banner--expanded' : ''}`}>
+          <button
+            type="button"
+            className="context-exhausted-header"
+            onClick={() => setContextExhaustedExpanded((v) => !v)}
+            aria-expanded={contextExhaustedExpanded}
+          >
             <span className="context-exhausted-icon">⚠️</span>
             <span className="context-exhausted-title">Context Window Full</span>
-          </div>
+            <span className="context-exhausted-subtitle">
+              Continue in a new conversation to preserve progress
+            </span>
+            <span className={`context-exhausted-chevron${contextExhaustedExpanded ? ' context-exhausted-chevron--open' : ''}`} aria-hidden>
+              ▸
+            </span>
+          </button>
           <div className="context-exhausted-summary">
-            <p>
-              This conversation has reached its context limit. Copy the summary below
-              to continue in a new conversation:
-            </p>
-            <pre className="context-exhausted-content">
-              {convStateForChildren.summary}
-            </pre>
-            <button
-              className="context-exhausted-copy"
-              onClick={async () => {
-                if (convStateForChildren.type !== 'context_exhausted') return;
-                const ok = await copyToClipboard(convStateForChildren.summary);
-                showInfo(ok ? 'Summary copied to clipboard' : 'Copy failed -- select and copy manually');
-              }}
-            >
-              Copy Summary
-            </button>
+            <div className="context-exhausted-actions">
+              <button
+                type="button"
+                className="context-exhausted-continue"
+                onClick={async () => {
+                  if (convStateForChildren.type !== 'context_exhausted') return;
+                  if (!conversation?.id) return;
+                  const summary = convStateForChildren.summary;
+                  const seedLabel = 'Continued from context full';
+                  const messageId =
+                    crypto.randomUUID?.() ??
+                    `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                  // Branch mode continues the same branch in a fresh worktree —
+                  // the natural fit when the parent had one. Fall back to direct
+                  // when there's no branch context to carry forward.
+                  const branchForContinuation =
+                    conversation.branch_name ?? conversation.base_branch ?? null;
+                  const mode: 'branch' | 'direct' = branchForContinuation ? 'branch' : 'direct';
+                  try {
+                    const newConv = await api.createConversation(
+                      conversation.cwd,
+                      '',
+                      messageId,
+                      conversation.model ?? undefined,
+                      [],
+                      mode,
+                      branchForContinuation,
+                      conversation.id,
+                      seedLabel,
+                    );
+                    try {
+                      localStorage.setItem(`seed-draft:${newConv.id}`, summary);
+                    } catch {
+                      // non-fatal
+                    }
+                    if (newConv.slug) {
+                      navigate(`/c/${newConv.slug}`);
+                    }
+                  } catch (err) {
+                    // If another active conversation already owns the same
+                    // branch (e.g. the user spawned a child Branch conv off
+                    // this one manually), route there instead of surfacing
+                    // the raw server error.
+                    if (err instanceof ConflictError && err.detail.conflict_slug) {
+                      navigate(`/c/${err.detail.conflict_slug}`);
+                      return;
+                    }
+                    showInfo(err instanceof Error ? err.message : 'Failed to start new conversation');
+                  }
+                }}
+              >
+                Continue in new conversation
+              </button>
+              <button
+                type="button"
+                className="context-exhausted-copy"
+                onClick={async () => {
+                  if (convStateForChildren.type !== 'context_exhausted') return;
+                  const ok = await copyToClipboard(convStateForChildren.summary);
+                  showInfo(ok ? 'Summary copied to clipboard' : 'Copy failed -- select and copy manually');
+                }}
+              >
+                Copy Summary
+              </button>
+            </div>
+            {contextExhaustedExpanded && (
+              <pre className="context-exhausted-content">
+                {convStateForChildren.summary}
+              </pre>
+            )}
           </div>
         </div>
       )}

@@ -2509,13 +2509,26 @@ pre:hover .copy-btn {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
+  width: 100%;
+  padding: 10px 14px;
   background: rgba(var(--accent-yellow-rgb, 234, 179, 8), 0.1);
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-exhausted-header:hover {
+  background: rgba(var(--accent-yellow-rgb, 234, 179, 8), 0.15);
+}
+
+.context-exhausted-banner--expanded .context-exhausted-header {
   border-bottom: 1px solid var(--border-color);
 }
 
 .context-exhausted-icon {
-  font-size: 18px;
+  font-size: 16px;
 }
 
 .context-exhausted-title {
@@ -2523,14 +2536,31 @@ pre:hover .copy-btn {
   color: var(--text-primary);
 }
 
-.context-exhausted-summary {
-  padding: 16px;
+.context-exhausted-subtitle {
+  flex: 1 1 auto;
+  color: var(--text-secondary);
+  font-size: 13px;
 }
 
-.context-exhausted-summary p {
-  margin: 0 0 12px 0;
-  color: var(--text-secondary);
-  font-size: 14px;
+.context-exhausted-chevron {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: transform 0.15s ease;
+}
+
+.context-exhausted-chevron--open {
+  transform: rotate(90deg);
+}
+
+.context-exhausted-summary {
+  padding: 12px 14px;
+}
+
+.context-exhausted-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 .context-exhausted-content {
@@ -2538,7 +2568,7 @@ pre:hover .copy-btn {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   padding: 12px;
-  margin: 0 0 12px 0;
+  margin: 12px 0 0 0;
   font-size: 13px;
   line-height: 1.5;
   white-space: pre-wrap;
@@ -2548,7 +2578,7 @@ pre:hover .copy-btn {
   color: var(--text-primary);
 }
 
-.context-exhausted-copy {
+.context-exhausted-continue {
   padding: 8px 16px;
   background: var(--accent-blue);
   color: white;
@@ -2560,8 +2590,25 @@ pre:hover .copy-btn {
   transition: background-color 0.15s;
 }
 
-.context-exhausted-copy:hover {
+.context-exhausted-continue:hover {
   background: var(--accent-blue-hover, #2563eb);
+}
+
+.context-exhausted-copy {
+  padding: 8px 14px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.context-exhausted-copy:hover {
+  background: var(--bg-primary);
+  color: var(--text-primary);
 }
 
 /* Terminal conversation banner */

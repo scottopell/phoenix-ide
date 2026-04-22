@@ -611,13 +611,16 @@ async fn create_conversation(
                 (mode, info.worktree_path)
             }
             Err(BranchWorktreeError::Conflict { slug }) => {
-                return Err(AppError::Conflict(ConflictErrorResponse::new(
-                    format!(
-                        "Branch already has an active conversation: {slug}. \
-                         Navigate to that conversation or abandon it first."
-                    ),
-                    "branch_already_active",
-                )));
+                return Err(AppError::Conflict(
+                    ConflictErrorResponse::new(
+                        format!(
+                            "Branch already has an active conversation: {slug}. \
+                             Navigate to that conversation or abandon it first."
+                        ),
+                        "branch_already_active",
+                    )
+                    .with_conflict_slug(slug),
+                ));
             }
             Err(BranchWorktreeError::Git(msg)) => {
                 return Err(AppError::Internal(msg));
