@@ -5,55 +5,95 @@ description: Task tracking conventions for Phoenix IDE. Use when creating a task
 
 # Phoenix IDE Task Tracking
 
-## File Format
+## Happy path: `taskmd new`
+
+Always create tasks with `taskmd new`. It atomically allocates the next ID,
+synthesizes the frontmatter, and writes the file. **Do not** write task files
+directly, and **do not** use `taskmd next` + manual file writes — both risk ID
+collisions and frontmatter drift.
+
+```bash
+echo 'Brief description of what needs doing and why.' \
+  | taskmd new --slug fix-login --artifact src/auth.py --priority p1
+```
+
+Required:
+- `--slug` — URL-safe slug (dirty input is normalized). E.g. `fix-login`.
+- `--artifact` — the concrete output this task produces (file path, config
+  change, commit). If you can't name one, the task probably shouldn't exist.
+- stdin — the task body, non-empty. No frontmatter in the body; `taskmd`
+  synthesizes it.
+
+Optional:
+- `--priority` — `p0` (critical) … `p4` (nice-to-have). Default `p2`.
+- `--status` — default `ready`. Valid: `ready`, `in-progress`, `blocked`,
+  `brainstorming`, `done`, `wont-do`.
+
+Piping multi-line bodies:
+
+```bash
+cat <<'EOF' | taskmd new --slug ws-keepalive --artifact src/terminal/relay.rs --priority p1
+# Title
+
+## Summary
+What needs to happen.
+
+## Acceptance Criteria
+- [ ] ...
+EOF
+```
+
+## File format (reference — produced by `taskmd new`)
 
 ```
-tasks/NNN-pX-status-slug.md
+tasks/NNNNN-pX-status--slug.md
 ```
 
-Examples:
-```
-tasks/042-p1-ready-fix-executor-deadlock.md
-tasks/103-p2-in-progress-add-browser-click.md
-tasks/210-p0-done-critical-data-loss-fix.md
-```
+Example: `tasks/24691-p1-ready--terminal-ws-keepalive-reap-stale-sessions.md`
 
-### Fields
-
-| Field | Values |
-|-------|--------|
-| `NNN` | Zero-padded task number (001, 042, 103…) |
-| `pX` | Priority: `p0` (critical) → `p4` (nice-to-have) |
-| `status` | `ready`, `in-progress`, `pending`, `blocked`, `done`, `wont-do`, `brainstorming` |
+| Segment | Meaning |
+|---------|---------|
+| `NNNNN` | 5-digit task ID (`taskmd` allocates; don't hand-craft) |
+| `pX` | Priority `p0`–`p4` |
+| `status` | `ready`, `in-progress`, `blocked`, `brainstorming`, `done`, `wont-do` |
 | `slug` | Short hyphenated description |
 
 ### Required frontmatter
-
-Every task file must have:
 
 ```yaml
 ---
 created: YYYY-MM-DD
 priority: p2
 status: ready
+artifact: src/auth.py
 ---
 ```
 
-**The filename must match the frontmatter.** `./dev.py check` enforces this.
+Filename must match frontmatter. `./dev.py check` enforces this.
 
-## Commands
+## Updating a task
+
+Transition status with `taskmd status`:
 
 ```bash
-ls tasks/*-ready-*.md       # List tasks ready to work on
-./dev.py tasks validate     # Check all files for format errors
-./dev.py tasks fix          # Auto-fix: inject missing 'created', rename to match frontmatter
+taskmd status 24691 in-progress
+taskmd status 24691 done
 ```
 
-`fix` handles:
-- Missing `created` field (inferred from git log → file mtime → today)
-- Filename out of sync with frontmatter status/priority
+The file is renamed and frontmatter updated in one step.
 
-`fix` cannot handle (requires human): missing `status`, missing `priority`, invalid field values.
+## Maintenance
+
+```bash
+ls tasks/*-ready--*.md       # List tasks ready to work on
+./dev.py tasks validate      # Check all files for format errors
+./dev.py tasks fix           # Auto-repair: inject missing 'created', rename to
+                             # match frontmatter, migrate legacy ID formats,
+                             # resolve duplicate IDs
+```
+
+`fix` cannot handle (requires human): missing `status`, missing `priority`,
+missing `artifact`, invalid field values.
 
 ## Issue Discovery Protocol
 
@@ -61,37 +101,11 @@ ls tasks/*-ready-*.md       # List tasks ready to work on
 
 When you encounter ANY issue during work — even if unrelated to your current task:
 
-1. **Create a task file** in `tasks/` documenting the issue
-2. Include: what the problem is, how to reproduce it, relevant context
-3. Then continue with your original work
+1. Create a task with `taskmd new`, including what the problem is, how to
+   reproduce it, and relevant context.
+2. Then continue with your original work.
 
 **Do NOT:**
-- Note an issue and move on without filing it
-- Say "this is unrelated" and ignore it
-- Work around a problem silently
-
-## Creating a task
-
-1. Find the next number: `ls tasks/*.md | sort | tail -5`
-2. Create `tasks/NNN-pX-ready-short-description.md` using this exact template:
-
-```markdown
----
-created: YYYY-MM-DD
-priority: pX
-status: ready
----
-
-# Title
-
-## Summary
-What needs to be done.
-
-## Context
-Why this task exists.
-
-## Acceptance Criteria
-- [ ] ...
-```
-
-3. Run `./dev.py tasks validate` to confirm the file is valid before moving on.
+- Note an issue and move on without filing it.
+- Say "this is unrelated" and ignore it.
+- Work around a problem silently.

@@ -149,10 +149,13 @@ because their code changes never share a directory.
 ### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
 WHEN the user approves a task (REQ-PROJ-004)
-THE SYSTEM SHALL write a task file to `tasks/` with filename
-  `{NNNN}-{priority}-{status}--{slug}.md`
-AND include frontmatter with: task ID, priority, status, branch name, conversation ID,
-  and creation date
+THE SYSTEM SHALL allocate a task ID via `taskmd_core::ids::next_id` (a
+  5-digit `DDNNN` value — per-directory prefix + monotonic counter)
+AND write a task file to `tasks/` with filename
+  `{ID}-{priority}-{status}--{slug}.md`
+AND include frontmatter with `created`, `priority`, `status`, and `artifact`
+  fields (matching what `taskmd new` synthesizes, so the file round-trips
+  through `taskmd validate`/`fix`)
 AND include a Plan section containing the agent's proposed approach as approved
 AND include a Progress section (initially empty, updated by the agent via patch tool)
 AND commit the file on the task branch (never on main or the base branch)

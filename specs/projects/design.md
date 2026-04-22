@@ -104,21 +104,29 @@ present. Worktrees are ephemeral; they are never committed or pushed.
 
 Task files live at `{repo_root}/tasks/` and are committed to main.
 
-Filename convention: `{NNNN}-{priority}-{status}--{slug}.md`
-- `NNNN`: 4-digit zero-padded sequential integer, globally unique within the project
-- `priority`: p0 (critical) through p3 (low)
-- `status`: awaiting-approval | in-progress | ready-for-review | done | wont-do
-- `slug`: kebab-case title derived by Phoenix at creation time
+Filename convention: `{ID}-{priority}-{status}--{slug}.md`
+- `ID`: 5-digit numeric (`DDNNN`) allocated by `taskmd_core::ids::next_id`
+  — a per-directory prefix (derived from hostname + tasks-dir path) plus a
+  monotonic counter. Not a simple sequence.
+- `priority`: p0 (critical) through p4 (nice-to-have)
+- `status`: ready | in-progress | blocked | brainstorming | done | wont-do
+  (the status set accepted by `taskmd`)
+- `slug`: kebab-case title derived by Phoenix at creation time via
+  `taskmd_core::filename::derive_slug`
 
-Frontmatter:
+Frontmatter (synthesized by Phoenix at creation; matches what `taskmd new`
+produces so the files round-trip through `taskmd validate/fix`):
 ```
-id: "001"
+created: YYYY-MM-DD
 priority: p1
 status: in-progress
-branch: phoenix/001-refactor-auth
-conversation: {conv-id}
-started: 2025-01-15
+artifact: pending
 ```
+
+`artifact` is a required field — `pending` is an explicit placeholder for
+tasks Phoenix itself creates on plan approval, where the concrete artifact
+is "whatever this branch ships". Human/agent-authored tasks created via
+`taskmd new` must name a real artifact.
 
 Body sections:
 - `## Plan` — the agent's proposed approach as reviewed and approved by the user
@@ -215,10 +223,12 @@ executor. Only available in Explore mode, rejected from sub-agents.
 
 **On Approved (executor handles git):**
 
-1. Assign next sequential task ID (scan `tasks/` for highest existing NNNN)
-2. Derive filename slug from title
+1. Allocate next task ID via `taskmd_core::ids::next_id(tasks_dir)` (handles
+   per-directory prefix + monotonic counter atomically; do not scan by hand)
+2. Derive filename slug from title via `taskmd_core::filename::derive_slug`
 3. Record current checked-out branch as `base_branch`
-4. Write task file to `{repo_root}/tasks/{NNNN}-{priority}-in-progress--{slug}.md`
+4. Write task file to `{repo_root}/tasks/{ID}-{priority}-in-progress--{slug}.md`
+   using `taskmd_core::filename::format_filename`
 5. `git add tasks/{file} && git commit --only tasks/{file} -m "task {NNNN}: {title}"`
 6. `git worktree add .phoenix/worktrees/{conv-id} -b task-{NNNN}-{slug}`
 7. Update `conv_mode` to `Work { worktree_path, branch, task_id, base_branch }`
@@ -266,7 +276,7 @@ All git operations are side effects dispatched by the executor, not SM transitio
 | `DeleteWorktree` | `git worktree remove {path} --force` + `git branch -D {branch}` |
 | `SquashMergeWorktree` | `git checkout {base_branch} && git merge --squash {branch} && git commit -m {msg}` |
 | `CommitTaskFile` | `git add tasks/{file} && git commit --only tasks/{file} -m {msg}` |
-| `CommitTaskStatusOnBase` | `git checkout {base_branch} && taskmd rename {file} --status wont-do && git add tasks/ && git commit -m {msg}` |
+| `CommitTaskStatusOnBase` | `git checkout {base_branch}`, then transition the task's status via `taskmd_core` (renames the file + rewrites frontmatter), then `git add tasks/ && git commit -m {msg}` |
 
 These effects are typed -- the state machine emits the intent; the executor performs
 the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,

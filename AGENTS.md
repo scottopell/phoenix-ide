@@ -33,17 +33,38 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 ## Task Tracking
 
-**Format:** `NNNN-pX-status--slug.md` (e.g., `0042-p1-ready--fix-bug.md`)
+**Create tasks with `taskmd new` — do not write task files directly.**
 
-- `NNNN`: 4-digit task number | `pX`: Priority (p0 highest) | `status`: ready, in-progress, done, blocked, etc.
+```bash
+echo 'What the task does, in a few sentences.' \
+  | taskmd new --slug fix-login --artifact src/auth.py --priority p1
+```
+
+`taskmd new` allocates the next ID, synthesizes the frontmatter, and writes
+the file atomically. Direct file writes (and `taskmd next` + write-your-own)
+are discouraged because:
+
+- ID allocation races: two callers using `next` can get the same ID.
+- Frontmatter drifts from what `taskmd` produces (e.g. missing `artifact`
+  field), and `./dev.py check` will then fail.
+
+Required flags: `--slug`, `--artifact`, and a non-empty body on stdin.
+Optional: `--priority` (default `p2`), `--status` (default `ready`).
+
+**Filename format** (produced by `taskmd new`, don't hand-craft):
+`NNNNN-pX-status--slug.md` — e.g. `24691-p1-ready--fix-bug.md`.
+
+- `pX`: `p0` (critical) … `p4` (nice-to-have)
+- `status`: `ready`, `in-progress`, `blocked`, `brainstorming`, `done`, `wont-do`
+- Frontmatter must include `created`, `priority`, `status`, `artifact`; filename
+  must match frontmatter. Both invariants are enforced by `./dev.py check`.
 
 ```bash
 ls tasks/*-ready--*.md             # List ready tasks
-./dev.py tasks fix                 # Sync filenames to frontmatter
-./dev.py tasks validate            # Check consistency (runs in ./dev.py check)
+taskmd status <id> in-progress     # Transition a task's status
+./dev.py tasks fix                 # Sync filenames to frontmatter / repair legacy IDs
+./dev.py tasks validate            # Check consistency (also runs in ./dev.py check)
 ```
-
-Filename MUST match frontmatter. `./dev.py check` enforces this.
 
 ---
 
