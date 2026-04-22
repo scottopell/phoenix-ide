@@ -12,6 +12,8 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
 import type { UserQuestion } from '../api';
 import {
+  ArrowLeft,
+  ArrowRight,
   Check,
   ChevronDown,
   ChevronRight,
@@ -596,6 +598,9 @@ export function QuestionPanel({
       {/* Breadcrumb navigation: each question's header as a clickable tab */}
       {totalSteps > 1 && (
         <div className="question-breadcrumbs">
+          <span className="question-step-counter" aria-label="Question progress">
+            {currentStep + 1} of {totalSteps}
+          </span>
           {questions.map((q, i) => {
             const isCurrent = i === currentStep;
             const answered = isQuestionAnswered(q);
@@ -680,19 +685,42 @@ export function QuestionPanel({
               {feedback.message}
             </span>
           )}
-          <button
-            className="question-btn question-btn--submit"
-            onClick={handleSubmit}
-            disabled={!allAnswered || submitting}
-            title={
-              !allAnswered
-                ? 'Answer all questions before submitting'
-                : formatShortcut('Ctrl+Enter to submit')
-            }
-          >
-            <Check size={16} />
-            {submitting ? 'Sending...' : 'Submit'}
-          </button>
+          {totalSteps > 1 && (
+            <button
+              className="question-btn question-btn--nav"
+              onClick={goBack}
+              disabled={isFirstStep || submitting}
+              title={formatShortcut('Shift+Tab for previous')}
+            >
+              <ArrowLeft size={16} />
+              Back
+            </button>
+          )}
+          {!isLastStep ? (
+            <button
+              className="question-btn question-btn--next"
+              onClick={goNext}
+              disabled={submitting}
+              title={formatShortcut('Tab for next')}
+            >
+              Next
+              <ArrowRight size={16} />
+            </button>
+          ) : (
+            <button
+              className="question-btn question-btn--submit"
+              onClick={handleSubmit}
+              disabled={!allAnswered || submitting}
+              title={
+                !allAnswered
+                  ? 'Answer all questions before submitting'
+                  : formatShortcut('Ctrl+Enter to submit')
+              }
+            >
+              <Check size={16} />
+              {submitting ? 'Sending...' : 'Submit'}
+            </button>
+          )}
         </div>
       </div>
     </div>
