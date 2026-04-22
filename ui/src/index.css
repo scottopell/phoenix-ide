@@ -2168,6 +2168,30 @@ pre:hover .copy-btn {
   vertical-align: 1px;
 }
 
+/* One-click "upgrade to 1M" button next to the model picker. Dashed border
+   signals "affordance, not current state" — complements the solid 1M badge. */
+.model-upgrade-btn {
+  all: unset;
+  cursor: pointer;
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 0 4px;
+  border-radius: 3px;
+  line-height: 14px;
+  letter-spacing: 0.03em;
+  color: #c4a5ff;
+  border: 1px dashed color-mix(in srgb, #c4a5ff 45%, transparent);
+  background: transparent;
+  vertical-align: 1px;
+  transition: background 150ms, border-color 150ms;
+}
+
+.model-upgrade-btn:hover {
+  background: color-mix(in srgb, #9b6dff 18%, transparent);
+  border-style: solid;
+}
+
 /* Model picker popover. The StateBar is anchored to the bottom of the
    viewport on every breakpoint and its ancestors have overflow:hidden
    (for slug ellipsis), which would clip an absolutely-positioned popover.

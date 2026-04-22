@@ -255,6 +255,22 @@ export function StateBar({
     convState.type === 'idle'
   );
 
+  // Shortcut: one-click upgrade to the 1M variant of the current model, if it
+  // exists. The general picker also exposes 1M variants under "Show all", but
+  // context-window upgrades are frequent enough to deserve a visible button.
+  const upgradeTo1mId = is1m ? null : currentModel + '-1m';
+  const canUpgradeTo1m = !!(
+    upgradeTo1mId &&
+    availableModels?.some(m => m.id === upgradeTo1mId) &&
+    convState.type === 'idle' &&
+    onUpgradeModel
+  );
+
+  const handleUpgradeTo1m = () => {
+    if (!canUpgradeTo1m || !upgradeTo1mId || !onUpgradeModel) return;
+    onUpgradeModel(upgradeTo1mId);
+  };
+
   // Default list: recommended models plus the currently selected one (if not recommended).
   // "Show all" expands to the full list. Always deduplicate by id.
   const pickerModels: ModelInfo[] = (() => {
@@ -327,6 +343,15 @@ export function StateBar({
                       {modelAbbrev}
                       {is1m && <span className="model-1m-badge">1M</span>}
                     </span>
+                  )}
+                  {canUpgradeTo1m && (
+                    <button
+                      className="model-upgrade-btn"
+                      onClick={handleUpgradeTo1m}
+                      title={`Upgrade to 1M context (${upgradeTo1mId})`}
+                    >
+                      1M
+                    </button>
                   )}
                   {pickerOpen && canPickModel && (
                     <div className="model-picker" role="listbox" aria-label="Select model">
