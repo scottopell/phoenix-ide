@@ -661,8 +661,9 @@ rule UserAnswersQuestion {
 rule CancelDuringUserQuestion {
     when: UserCancels(conversation: Parent)
     requires: conversation.parent_status = awaiting_user_response
-    ensures: conversation.core_status = idle
-    ensures: AgentDone(conversation)
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: LlmRequestDispatched(conversation)
 }
 
 -- ===========================================================

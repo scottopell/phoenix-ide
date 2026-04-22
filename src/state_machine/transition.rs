@@ -1231,17 +1231,21 @@ pub fn transition_parent(
             ParentState::AwaitingUserResponse { .. },
             ParentEvent::Core(CoreEvent::UserCancel { .. }),
         ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
-                .with_effect(Effect::PersistMessage {
-                    content: crate::db::MessageContent::system(
-                        "User declined to answer questions.",
-                    ),
-                    display_data: None,
-                    usage_data: None,
-                    message_id: uuid::Uuid::new_v4().to_string(),
-                })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()),
+            ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
+                attempt: 1,
+            }))
+            .with_effect(Effect::PersistMessage {
+                content: crate::db::MessageContent::user(
+                    "I declined to answer those questions. Please proceed using your own judgment."
+                        .to_string(),
+                ),
+                display_data: None,
+                usage_data: None,
+                message_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(notify_llm_requesting(1))
+            .with_effect(Effect::RequestLlm),
         ),
 
         // ============================================================
@@ -2873,7 +2877,8 @@ mod tests {
     }
 
     #[test]
-    fn test_awaiting_user_response_cancel_goes_to_idle() {
+    fn test_awaiting_user_response_cancel_resumes_llm() {
+        use crate::db::MessageContent;
         use crate::state_machine::state::UserQuestion;
 
         let state = ConvState::AwaitingUserResponse {
@@ -2890,27 +2895,44 @@ mod tests {
             transition(&state, &test_context(), Event::UserCancel { reason: None }).unwrap();
 
         assert!(
-            matches!(result.new_state, ConvState::Idle),
-            "Should go to Idle, got {:?}",
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+            "Decline should re-enter LlmRequesting so the agent proceeds (REQ-AUQ-004), got {:?}",
             result.new_state
         );
 
-        // Should have PersistMessage (system: declined)
+        let decline_message = result.effects.iter().find_map(|e| {
+            if let Effect::PersistMessage {
+                content: MessageContent::User(user),
+                ..
+            } = e
+            {
+                Some(user.text.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            decline_message
+                .as_deref()
+                .map(|t| t.contains("declined"))
+                .unwrap_or(false),
+            "Decline must persist a user-role message telling the agent to proceed, got {decline_message:?}"
+        );
+
         assert!(
             result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::PersistMessage { .. })),
-            "Should have PersistMessage effect for decline"
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Should dispatch a new LLM request so the agent resumes"
         );
 
-        // Should have agent_done notification
         assert!(
-            result.effects.iter().any(|e| matches!(
+            !result.effects.iter().any(|e| matches!(
                 e,
                 Effect::NotifyClient { event_type, .. } if event_type == "agent_done"
             )),
-            "Should have agent_done notification"
+            "Decline must not notify agent_done — the agent is resuming, not stopping"
         );
     }
 
