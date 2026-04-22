@@ -249,6 +249,11 @@ rule BranchConflictDetected {
     -- Three conflict cases (case D -- terminal conversation -- is excluded):
     -- (A) Active conversation with worktree -> prompt redirect
     -- (B) Orphaned worktree (no conversation) -> prompt delete + fresh start
+    --     Rare in normal operation: ExploreWorktreeCleanupOnTerminal,
+    --     WorkBranchWorktreeCleanupOnContextExhausted, MarkAsMerged,
+    --     ConfirmAbandon, and ServerRestartWorktreeReconciliation
+    --     collectively close every expected path to orphaning. This case
+    --     only triggers for worktrees created by external git operations.
     -- (C) Stale conversation (no worktree) -> redirect to conversation
     -- All cases must be resolved before BranchModeSelected can proceed.
 
@@ -263,7 +268,9 @@ rule BranchConflictDetected {
         -- For orphaned worktrees: "An orphaned worktree exists. Delete and
         --   start fresh?"
         -- For stale conversations: redirect to the existing conversation.
-        -- Terminal conversations are excluded from conflict detection.
+        -- Terminal conversations are excluded from conflict detection; the
+        -- cleanup rules ensure their worktrees are gone by the time they
+        -- reach terminal, so there is no filesystem contention either.
 }
 
 -- REQ-PROJ-028: Managed mode creates worktree on first message
@@ -603,7 +610,8 @@ rule ConfirmAbandon {
 }
 
 -- ===========================================================
--- 5b. EXPLORE WORKTREE CLEANUP (REQ-PROJ-028)
+-- 5b. WORKTREE CLEANUP ON TERMINAL TRANSITION
+--     (REQ-PROJ-028, REQ-PROJ-025, REQ-BED-021)
 -- ===========================================================
 
 -- REQ-PROJ-028: Managed Explore conversation reaches terminal without
@@ -625,6 +633,58 @@ rule ExploreWorktreeCleanupOnTerminal {
         -- The temp branch (task-pending-*) and worktree are cleaned up.
         -- Complements ServerRestartWorktreeReconciliation, which catches
         -- the crash case. This rule handles the normal-operation case.
+}
+
+-- Work/Branch conversation exhausts its context window. The conversation
+-- becomes terminal (parent_status = context_exhausted) but no user action
+-- (MarkAsMerged / ConfirmAbandon) ran, so the worktree is still on disk.
+-- Remove it so the branch is free for a continuation, but preserve the
+-- branch itself — it holds the agent's committed work and a continuation
+-- conversation should resume on it.
+rule WorkBranchWorktreeCleanupOnContextExhausted {
+    when: bedrock/ConversationBecameTerminal(conversation)
+
+    requires: conversation.mode in { work, branch }
+    requires: conversation.parent_status = context_exhausted
+    requires: exists Worktree{conversation: conversation}
+
+    let worktree = Worktree{conversation: conversation}
+
+    ensures: not exists worktree
+    -- Branch is preserved: the user's committed progress stays reachable,
+    -- and a fresh Branch-mode conversation on the same branch can succeed
+    -- without hitting a filesystem-level worktree conflict.
+    --
+    -- Note the asymmetry with MarkAsMerged / ConfirmAbandon: those delete
+    -- the Work-mode task branch because the task is over. Here the task is
+    -- only stalled by context exhaustion, so the branch must survive for
+    -- the continuation conversation to resume on it.
+
+    @guidance
+        -- Fires on the context_exhausted pathway only. The TaskResolved
+        -- pathway (MarkAsMerged / ConfirmAbandon) removes the worktree at
+        -- action time, so by the time ConversationBecameTerminal fires
+        -- with parent_status = terminal, `exists Worktree` is already
+        -- false and this rule is inert. This keeps each user-facing
+        -- action's cleanup in one place while still closing the
+        -- context_exhausted gap.
+        --
+        -- Sequence:
+        --   1. git worktree remove {path} --force
+        --      On failure: rm -rf + git worktree prune
+        --   -- branch left untouched.
+        --
+        -- Uncommitted changes in the worktree are lost. Agents commit
+        -- progress as they go per repo convention, and the context-full
+        -- banner gives the user a chance to stash / commit externally
+        -- before clicking "Continue in new conversation."
+        --
+        -- Together with ExploreWorktreeCleanupOnTerminal and the
+        -- user-triggered MarkAsMerged / ConfirmAbandon rules, every
+        -- normal-operation path from "has worktree" to "terminal" now
+        -- removes the worktree. Remaining orphans come from crashes
+        -- (handled by ServerRestartWorktreeReconciliation) or external
+        -- git ops (out of scope).
 }
 
 -- ===========================================================

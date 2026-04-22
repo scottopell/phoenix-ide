@@ -303,6 +303,7 @@ impl ToolExecutor for DelayedMockToolExecutor {
 pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
+    modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     next_msg_id: Mutex<u64>,
 }
 
@@ -312,8 +313,20 @@ impl InMemoryStorage {
         Self {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
+            modes: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
         }
+    }
+
+    /// Seed the conv_mode for a conversation (used by tests that need to
+    /// exercise mode-aware effect handlers like `NotifyContextExhausted`).
+    pub fn set_mode(&self, conv_id: &str, mode: crate::db::ConvMode) {
+        self.modes.lock().unwrap().insert(conv_id.to_string(), mode);
+    }
+
+    /// Read back the stored conv_mode (test-only).
+    pub fn get_mode(&self, conv_id: &str) -> Option<crate::db::ConvMode> {
+        self.modes.lock().unwrap().get(conv_id).cloned()
     }
 
     /// Get all messages for a conversation
@@ -451,11 +464,24 @@ impl StateStore for InMemoryStorage {
 
     async fn update_conversation_mode(
         &self,
-        _conv_id: &str,
-        _mode: &crate::db::ConvMode,
+        conv_id: &str,
+        mode: &crate::db::ConvMode,
     ) -> Result<(), String> {
-        // In-memory storage doesn't track conv_mode separately
+        self.modes
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), mode.clone());
         Ok(())
+    }
+
+    async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
+        Ok(self
+            .modes
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn update_conversation_cwd(&self, _conv_id: &str, _cwd: &str) -> Result<(), String> {

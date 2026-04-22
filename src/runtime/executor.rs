@@ -60,6 +60,23 @@ fn parent_tool_cycle_cap_from_env() -> u32 {
     })
 }
 
+/// Derive the repo root from a managed-worktree path.
+///
+/// Worktrees live at `{repo_root}/.phoenix/worktrees/{conv_id}` (see
+/// [`specs/projects/projects.allium`] `WorktreePathDerivedFromConversation`).
+/// Walk up to the `.phoenix` ancestor and return its parent.
+///
+/// Returns `None` if the path doesn't follow the convention — the caller
+/// treats that as a signal to skip cleanup (we don't know which git repo
+/// owns the worktree) rather than guessing.
+fn derive_repo_root_from_worktree(worktree_path: &str) -> Option<String> {
+    std::path::Path::new(worktree_path)
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
+        .and_then(|phoenix_dir| phoenix_dir.parent())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
@@ -1153,7 +1170,21 @@ where
             }
 
             Effect::NotifyContextExhausted { summary } => {
-                // REQ-BED-021: Notify client of context exhaustion
+                // REQ-BED-021: Notify client of context exhaustion.
+                //
+                // Worktree cleanup for Work/Branch modes
+                // (specs/projects/projects.allium §5b
+                // `WorkBranchWorktreeCleanupOnContextExhausted`). Runs before
+                // the SSE broadcast so the StateChange + ConversationUpdate
+                // pair is coherent: by the time the client sees
+                // ContextExhausted, the worktree is already gone.
+                //
+                // Best-effort: git/FS failures are logged and do not block
+                // the terminal transition. Branch is preserved — the
+                // continuation conversation (Branch mode, same branch)
+                // needs it to resume the committed work.
+                self.cleanup_context_exhausted_worktree().await;
+
                 let _ = self.broadcast_tx.send(SseEvent::StateChange {
                     state: ConvState::ContextExhausted { summary },
                     display_state: self.state.display_state().as_str().to_string(),
@@ -1896,6 +1927,156 @@ where
     ///
     /// On failure: revert in-memory state to `AwaitingTaskApproval` so the user can retry.
     /// Collision check on retry handles partial state.
+    /// Clean up the worktree for a Work/Branch conversation that reached the
+    /// `ContextExhausted` terminal state without a user-triggered abandon/merge.
+    ///
+    /// Spec: `specs/projects/projects.allium` §5b
+    /// `WorkBranchWorktreeCleanupOnContextExhausted`. The branch is preserved
+    /// so a continuation conversation can resume on the same committed work.
+    ///
+    /// Inert for Explore/Direct modes and for Work/Branch conversations whose
+    /// worktree was already removed (`MarkAsMerged` / `ConfirmAbandon` path — those
+    /// delete the worktree and transition to Terminal, not `ContextExhausted`).
+    ///
+    /// Best-effort throughout: any failure is logged but never propagated.
+    /// The terminal transition is not blocked.
+    #[allow(clippy::too_many_lines)]
+    async fn cleanup_context_exhausted_worktree(&mut self) {
+        let conv_id = self.context.conversation_id.clone();
+
+        // Pull the concrete ConvMode from the DB. ConvContext only carries
+        // `ModeKind`, not the worktree path we need to clean up.
+        let mode = match self.storage.get_conversation_mode(&conv_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    error = %e,
+                    "ContextExhausted cleanup: could not load conv_mode — skipping worktree cleanup"
+                );
+                return;
+            }
+        };
+
+        let (worktree_path, branch_name, revert_mode, new_cwd) = match mode {
+            crate::db::ConvMode::Work {
+                worktree_path,
+                branch_name,
+                ..
+            } => {
+                let wt = worktree_path.as_str().to_string();
+                let bn = branch_name.as_str().to_string();
+                let repo_root = derive_repo_root_from_worktree(&wt);
+                (wt, bn, crate::db::ConvMode::Explore, repo_root)
+            }
+            crate::db::ConvMode::Branch {
+                worktree_path,
+                branch_name,
+                ..
+            } => {
+                let wt = worktree_path.as_str().to_string();
+                let bn = branch_name.as_str().to_string();
+                let repo_root = derive_repo_root_from_worktree(&wt);
+                (wt, bn, crate::db::ConvMode::Direct, repo_root)
+            }
+            crate::db::ConvMode::Explore | crate::db::ConvMode::Direct => {
+                // Rule is inert for these modes.
+                return;
+            }
+        };
+
+        let Some(repo_root) = new_cwd else {
+            tracing::warn!(
+                conv_id = %conv_id,
+                worktree = %worktree_path,
+                "ContextExhausted cleanup: worktree path does not match \
+                 `{{root}}/.phoenix/worktrees/{{id}}` convention — skipping"
+            );
+            return;
+        };
+
+        // Best-effort worktree removal on a blocking thread (git + filesystem I/O).
+        let repo_root_clone = repo_root.clone();
+        let worktree_path_clone = worktree_path.clone();
+        let branch_name_clone = branch_name.clone();
+        let removal_result = tokio::task::spawn_blocking(move || {
+            crate::git_ops::remove_worktree_preserve_branch(
+                std::path::Path::new(&repo_root_clone),
+                &worktree_path_clone,
+            )
+        })
+        .await;
+
+        match removal_result {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    worktree = %worktree_path,
+                    branch = %branch_name_clone,
+                    "ContextExhausted cleanup: worktree removed, branch preserved"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    worktree = %worktree_path,
+                    error = %e,
+                    "ContextExhausted cleanup: worktree removal failed (non-fatal)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    error = %e,
+                    "ContextExhausted cleanup: blocking task join error (non-fatal)"
+                );
+            }
+        }
+
+        // Update DB mode + cwd so:
+        //  1. `ServerRestartWorktreeReconciliation` won't try to re-handle this
+        //     on the next restart (it checks worktree_path presence + existence).
+        //  2. The persisted state matches what we're about to broadcast —
+        //     no parallel representation of a worktree that no longer exists.
+        if let Err(e) = self
+            .storage
+            .update_conversation_mode(&conv_id, &revert_mode)
+            .await
+        {
+            tracing::warn!(
+                conv_id = %conv_id,
+                error = %e,
+                "ContextExhausted cleanup: failed to update conv_mode (non-fatal)"
+            );
+        }
+        if let Err(e) = self
+            .storage
+            .update_conversation_cwd(&conv_id, &repo_root)
+            .await
+        {
+            tracing::warn!(
+                conv_id = %conv_id,
+                error = %e,
+                "ContextExhausted cleanup: failed to reset cwd (non-fatal)"
+            );
+        }
+
+        // Broadcast a ConversationUpdate so the UI reflects the cleaned-up
+        // state immediately (matches the pattern in `execute_resolve_task`).
+        let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
+            update: crate::runtime::ConversationMetadataUpdate {
+                cwd: Some(repo_root),
+                branch_name: None,
+                worktree_path: None,
+                conv_mode_label: Some(revert_mode.label().to_string()),
+                base_branch: None,
+                commits_behind: None,
+                commits_ahead: None,
+                task_title: None,
+            },
+        });
+    }
+
     /// Handle task resolution: finalize conversation state/mode/cwd, inject system message,
     /// and broadcast SSE events. Called after git operations have already completed.
     async fn execute_resolve_task(
@@ -2598,6 +2779,307 @@ mod error_mapping_tests {
         assert!(
             db_error.is_retryable(),
             "ServerError must be retryable after mapping to db::ErrorKind"
+        );
+    }
+}
+
+#[cfg(test)]
+mod derive_repo_root_from_worktree_tests {
+    use super::derive_repo_root_from_worktree;
+
+    #[test]
+    fn derives_root_from_canonical_worktree_path() {
+        assert_eq!(
+            derive_repo_root_from_worktree("/home/u/proj/.phoenix/worktrees/abc-123"),
+            Some("/home/u/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_non_phoenix_path() {
+        assert_eq!(derive_repo_root_from_worktree("/home/u/random/dir"), None);
+    }
+
+    #[test]
+    fn returns_none_for_empty_path() {
+        assert_eq!(derive_repo_root_from_worktree(""), None);
+    }
+}
+
+/// Integration tests for the ContextExhausted worktree-cleanup effect.
+///
+/// Covers the spec rule `WorkBranchWorktreeCleanupOnContextExhausted`
+/// (specs/projects/projects.allium §5b). Constructs a `ConversationRuntime`
+/// over a real git tempdir, seeds the `InMemoryStorage` with a concrete
+/// `ConvMode`, and directly invokes the `Effect::NotifyContextExhausted`
+/// handler. This keeps the test focused on the cleanup behaviour without
+/// depending on the exact transition-graph path that leads to the effect
+/// (already covered by transition.rs tests and the SM proptests).
+#[cfg(test)]
+mod context_exhausted_cleanup_tests {
+    use super::*;
+    use crate::db::{ConvMode, NonEmptyString};
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::ConvContext;
+    use crate::tools::BrowserSessionManager;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::{broadcast, mpsc};
+
+    fn init_repo() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+                "-q",
+            ][..],
+        ] {
+            let s = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {args:?} failed");
+        }
+        (tmp, root)
+    }
+
+    fn add_worktree(repo: &Path, id: &str, branch: &str) -> String {
+        let wt = repo.join(".phoenix").join("worktrees").join(id);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        let wt_s = wt.to_string_lossy().to_string();
+        let s = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", branch, &wt_s])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(s.success(), "git worktree add failed");
+        wt_s
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        let o = std::process::Command::new("git")
+            .args(["branch", "--list", branch])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+    }
+
+    /// Build a `ConversationRuntime` wired to the given storage and a fresh
+    /// mock LLM + tools. Returns (runtime, broadcast_rx).
+    fn build_runtime(
+        storage: Arc<InMemoryStorage>,
+        conv_id: &str,
+        working_dir: PathBuf,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        broadcast::Receiver<SseEvent>,
+    ) {
+        let context = ConvContext::new(conv_id, working_dir, "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(128);
+
+        let rt = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcast_tx,
+        );
+        (rt, broadcast_rx)
+    }
+
+    /// Drain up to `timeout` looking for a `ConversationUpdate` whose
+    /// `conv_mode_label` matches `expected_label`.
+    async fn wait_for_mode_update(
+        rx: &mut broadcast::Receiver<SseEvent>,
+        expected_label: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SseEvent::ConversationUpdate { update }))
+                    if update.conv_mode_label.as_deref() == Some(expected_label) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Work-mode: cleanup removes worktree, preserves branch, reverts mode
+    /// to Explore, broadcasts ConversationUpdate(mode=Explore).
+    #[tokio::test]
+    async fn work_mode_cleanup_removes_worktree_and_preserves_branch() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "ctx-work-1";
+        let branch = "task-42-fix-bug";
+        let wt_path = add_worktree(&repo_root, conv_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_mode(
+            conv_id,
+            ConvMode::Work {
+                branch_name: NonEmptyString::new(branch).unwrap(),
+                worktree_path: NonEmptyString::new(&wt_path).unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("YF042").unwrap(),
+                task_title: NonEmptyString::new("Fix bug").unwrap(),
+            },
+        );
+
+        let (mut rt, mut rx) = build_runtime(storage.clone(), conv_id, PathBuf::from(&wt_path));
+
+        rt.cleanup_context_exhausted_worktree().await;
+
+        assert!(
+            !Path::new(&wt_path).exists(),
+            "worktree must be removed from disk"
+        );
+        assert!(
+            branch_exists(&repo_root, branch),
+            "branch must survive — continuation needs it"
+        );
+        assert_eq!(
+            storage.get_mode(conv_id),
+            Some(ConvMode::Explore),
+            "conv_mode must revert to Explore so reconciliation doesn't double-handle"
+        );
+        assert!(
+            wait_for_mode_update(&mut rx, "Explore", Duration::from_secs(1)).await,
+            "must broadcast ConversationUpdate with conv_mode_label=Explore"
+        );
+    }
+
+    /// Branch-mode: cleanup removes worktree, preserves branch, reverts
+    /// mode to Direct, broadcasts ConversationUpdate(mode=Direct).
+    #[tokio::test]
+    async fn branch_mode_cleanup_removes_worktree_and_preserves_branch() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "ctx-branch-1";
+        let branch = "feature/pr-99";
+        let wt_path = add_worktree(&repo_root, conv_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_mode(
+            conv_id,
+            ConvMode::Branch {
+                branch_name: NonEmptyString::new(branch).unwrap(),
+                worktree_path: NonEmptyString::new(&wt_path).unwrap(),
+                base_branch: NonEmptyString::new(branch).unwrap(),
+            },
+        );
+
+        let (mut rt, mut rx) = build_runtime(storage.clone(), conv_id, PathBuf::from(&wt_path));
+
+        rt.cleanup_context_exhausted_worktree().await;
+
+        assert!(!Path::new(&wt_path).exists());
+        assert!(
+            branch_exists(&repo_root, branch),
+            "user's PR branch must survive"
+        );
+        assert_eq!(
+            storage.get_mode(conv_id),
+            Some(ConvMode::Direct),
+            "Branch → Direct after cleanup"
+        );
+        assert!(
+            wait_for_mode_update(&mut rx, "Direct", Duration::from_secs(1)).await,
+            "must broadcast ConversationUpdate with conv_mode_label=Direct"
+        );
+    }
+
+    /// Explore mode: cleanup is a no-op (rule is inert per spec).
+    /// Nothing on disk to clean up for non-Work/Branch modes.
+    #[tokio::test]
+    async fn explore_mode_cleanup_is_inert() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "ctx-explore-1";
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_mode(conv_id, ConvMode::Explore);
+
+        let (mut rt, mut rx) = build_runtime(storage.clone(), conv_id, repo_root.clone());
+
+        rt.cleanup_context_exhausted_worktree().await;
+
+        // Mode is untouched.
+        assert_eq!(storage.get_mode(conv_id), Some(ConvMode::Explore));
+        // No ConversationUpdate emitted.
+        assert!(
+            !wait_for_mode_update(&mut rx, "Explore", Duration::from_millis(200)).await,
+            "inert rule must not broadcast a mode-change update"
+        );
+    }
+
+    /// Direct mode: same invariant — rule inert, no broadcast, no mutation.
+    #[tokio::test]
+    async fn direct_mode_cleanup_is_inert() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "ctx-direct-1";
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_mode(conv_id, ConvMode::Direct);
+
+        let (mut rt, mut rx) = build_runtime(storage.clone(), conv_id, repo_root);
+
+        rt.cleanup_context_exhausted_worktree().await;
+
+        assert_eq!(storage.get_mode(conv_id), Some(ConvMode::Direct));
+        assert!(!wait_for_mode_update(&mut rx, "Direct", Duration::from_millis(200)).await);
+    }
+
+    /// Regression guard: MarkAsMerged / ConfirmAbandon go through
+    /// `Effect::ResolveTask`, never `Effect::NotifyContextExhausted`. If a
+    /// future refactor ever routes them through the context-exhausted path,
+    /// the cleanup would try to remove an already-removed worktree — which
+    /// is safe (remove_worktree_preserve_branch returns Ok when the dir is
+    /// already gone) but would spuriously revert the conv_mode to
+    /// Explore/Direct. We assert structural separation at the effect-enum
+    /// level: `Effect::ResolveTask` and `Effect::NotifyContextExhausted`
+    /// are distinct variants and the cleanup handler only runs for the
+    /// latter.
+    #[test]
+    fn resolve_task_and_context_exhausted_are_distinct_effects() {
+        // Compile-time discrimination: the match in execute_effect treats
+        // them as separate arms. This test pins that structural fact.
+        use crate::state_machine::Effect;
+        let a = Effect::ResolveTask {
+            system_message: String::new(),
+            repo_root: String::new(),
+        };
+        let b = Effect::NotifyContextExhausted {
+            summary: String::new(),
+        };
+        assert!(
+            !matches!(a, Effect::NotifyContextExhausted { .. }),
+            "ResolveTask must not be treated as NotifyContextExhausted"
+        );
+        assert!(
+            !matches!(b, Effect::ResolveTask { .. }),
+            "NotifyContextExhausted must not be treated as ResolveTask"
         );
     }
 }
