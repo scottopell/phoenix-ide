@@ -660,6 +660,16 @@ rule WorkBranchWorktreeCleanupOnContextExhausted {
     -- only stalled by context exhaustion, so the branch must survive for
     -- the continuation conversation to resume on it.
 
+    -- Mode revert matches ServerRestartWorktreeReconciliation exactly. The
+    -- asymmetry is type-driven (see that rule's @guidance): Work has
+    -- Explore as its graceful degradation; Branch has no worktree-less
+    -- equivalent in the ConvMode type and must fall to Direct. project_id
+    -- on the conversation row is preserved regardless.
+    ensures: conversation.mode =
+        if was_branch_mode then direct
+        else explore
+    ensures: conversation.working_dir = project_root(conversation)
+
     @guidance
         -- Fires on the context_exhausted pathway only. The TaskResolved
         -- pathway (MarkAsMerged / ConfirmAbandon) removes the worktree at
@@ -801,27 +811,49 @@ rule ServerRestartWorktreeReconciliation {
 
     ensures:
         if orphaned:
-            conversation.mode = explore
+            -- Asymmetric revert, forced by the type system:
+            -- Work has Explore as its graceful degradation (project-bound
+            -- conversation without a worktree). Branch has no equivalent --
+            -- "Branch without worktree" is not a representable state, so it
+            -- falls further, to Direct. project_id on the conversation row
+            -- is preserved independently, so sidebar grouping is retained
+            -- for both reverts.
+            conversation.mode =
+                if was_branch_mode then direct
+                else explore
             conversation.working_dir = project_root(conversation)
             GitWorktreePruned(conversation.project)
         -- else: worktree is intact, no action needed
 
     @guidance
-        -- Runs once per Work conversation at server startup, before
+        -- Runs once per Work/Branch conversation at server startup, before
         -- any conversation becomes active.
         --
         -- Sequence per affected conversation:
-        --   1. Query all Work-mode conversations from database
-        --   2. For each: check worktree_path and base_branch non-empty,
-        --      and worktree directory exists on disk
+        --   1. Query all Work/Branch-mode conversations from database
+        --   2. For each: check worktree_path and base_branch non-empty
+        --      (or not a __LEGACY_EMPTY__ sentinel from the NonEmptyString
+        --      shim that was introduced in schema phase A1), and worktree
+        --      directory exists on disk
         --   3. If any check fails:
-        --      a. Update conversation mode to Explore in database
+        --      a. Update conversation mode: Work -> Explore, Branch -> Direct
         --      b. Derive project root from worktree path
         --         ({root}/.phoenix/worktrees/{id} → {root})
         --      c. Reset conversation cwd to project root
         --      d. Run `git worktree prune` in project root (once per
         --         unique root, deduplicated across conversations)
         --   4. Log summary: "{reverted} reverted out of {total} Work"
+        --
+        -- The three orphan sources this recovers from:
+        --   A. Legacy rows: pre-NonEmptyString data with empty or
+        --      __LEGACY_EMPTY__ sentinel fields. Migration 002
+        --      (src/db/migrations.rs) sweeps these at startup; this rule
+        --      is belt-and-suspenders.
+        --   B. Crash window: process dies between `git worktree remove`
+        --      succeeding and the DB update landing. The on-disk check
+        --      catches this.
+        --   C. External intervention: user `rm -rf`s the worktree or runs
+        --      `git worktree prune` outside Phoenix. Same on-disk check.
         --
         -- Error handling:
         --   - Database update failure: logged, conversation skipped
