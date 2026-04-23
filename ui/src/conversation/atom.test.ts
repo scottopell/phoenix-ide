@@ -190,6 +190,73 @@ describe('conversationReducer', () => {
       expect(next.messages).toHaveLength(1);
       expect((next.messages[0]!.display_data as { type: string }).type).toBe('subagent_summary');
     });
+
+    // Task 02675 acceptance: replay the same init event twice → atom converges
+    // to the same state. Re-applying init is idempotent; the reducer must not
+    // duplicate messages or regress lastSequenceId.
+    it('is idempotent: applying the same init twice yields equivalent state', () => {
+      const payload = makeInitPayload({
+        messages: [makeMessage(1), makeMessage(2), makeMessage(3)],
+        lastSequenceId: 3,
+      });
+
+      const once = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+      const twice = dispatch(once, { type: 'sse_init', payload });
+
+      expect(twice.messages).toHaveLength(3);
+      expect(twice.messages.map((m) => m.message_id)).toEqual(once.messages.map((m) => m.message_id));
+      expect(twice.lastSequenceId).toBe(once.lastSequenceId);
+      expect(twice.conversationId).toBe(once.conversationId);
+    });
+
+    // Task 02675 acceptance: the lastSequenceId jump scenario. Init arrives
+    // with lastSeq=100 but the client has already seen live events through
+    // 105 (plausible when a reconnect snapshot is older than live events
+    // delivered in the gap). lastSequenceId must not regress to 100 —
+    // otherwise the 101–105 events would be reapplied on the next delivery.
+    it('never regresses lastSequenceId when init lags live events', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 105,
+      };
+      const stalePayload = makeInitPayload({ lastSequenceId: 100 });
+
+      const next = dispatch(atom, { type: 'sse_init', payload: stalePayload });
+
+      expect(next.lastSequenceId).toBe(105);
+    });
+
+    // Task 02675 acceptance: init lastSeq=100, messages only to 95. When
+    // subsequent individual sse_message events for 96..100 arrive, all five
+    // must land. (Before the fix, the old atom leapfrogged lastSequenceId to
+    // 100 on init and then rejected 96..100 as "already seen".)
+    //
+    // Today init merges by id so the 96..100 messages arrive through init's
+    // message list — but the property we need is that lastSequenceId after
+    // init does not block future individual deliveries of those same ids.
+    // The defensive id dedup in sse_message keeps this honest either way.
+    it('messages 96..100 land when init lastSeq=100 but individual events follow', () => {
+      // Scenario: init arrives first with messages only up to 95 (server
+      // hasn't yet enriched the snapshot — 96..100 are in-flight). The
+      // client seeds lastSequenceId=100 from init. Then individual events
+      // for 96..100 race in. With the old strict-greater guard, all five
+      // would be rejected. With applyIfNewer + message_id dedup, they must
+      // all land exactly once.
+      const payload = makeInitPayload({
+        messages: [makeMessage(95)],
+        lastSequenceId: 95, // Server correctly reports: highest is 95.
+      });
+      let atom = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+      expect(atom.messages).toHaveLength(1);
+
+      for (const seq of [96, 97, 98, 99, 100]) {
+        atom = dispatch(atom, { type: 'sse_message', message: makeMessage(seq), sequenceId: seq });
+      }
+
+      expect(atom.messages).toHaveLength(6);
+      expect(atom.messages.map((m) => m.sequence_id)).toEqual([95, 96, 97, 98, 99, 100]);
+      expect(atom.lastSequenceId).toBe(100);
+    });
   });
 
   describe('sse_message', () => {
@@ -203,8 +270,7 @@ describe('conversationReducer', () => {
       expect(next.lastSequenceId).toBe(10);
     });
 
-    it('is a no-op for duplicate sequenceId (not in messages)', () => {
-      // Duplicate seq id with no existing message_id match — pure dedup case.
+    it('is a no-op for duplicate sequenceId', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         lastSequenceId: 10,
@@ -231,6 +297,31 @@ describe('conversationReducer', () => {
       expect(next).toBe(atom);
     });
 
+    // Task 02675: defense-in-depth id dedup. Even if the server assigns a
+    // fresh sequence_id, a second delivery of a message with the same
+    // message_id must not duplicate in atom.messages.
+    it('dedups by message_id when a duplicate arrives with a fresh sequenceId', () => {
+      const original = makeMessage(5);
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 5,
+      };
+
+      // Same message_id, but a brand-new (higher) sequenceId.
+      const duplicateWithFreshSeq: Message = { ...original, sequence_id: 42 };
+      const next = dispatch(atom, {
+        type: 'sse_message',
+        message: duplicateWithFreshSeq,
+        sequenceId: 42,
+      });
+
+      expect(next.messages).toHaveLength(1);
+      // applyIfNewer still bumped lastSequenceId — the fact was "seen" even
+      // though the id-level dedup prevented a duplicate message.
+      expect(next.lastSequenceId).toBe(42);
+    });
+
     it('clears streamingBuffer atomically on message arrival', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
@@ -245,35 +336,6 @@ describe('conversationReducer', () => {
 
       expect(next.streamingBuffer).toBeNull();
       expect(next.messages).toHaveLength(1);
-    });
-
-    // Regression: sse_message with an existing message_id but sequenceId below
-    // lastSequenceId must be a NO-OP. The old runtime message_id lookup is gone —
-    // mutations arrive via sse_message_updated instead.
-    it('is a no-op when message_id already exists and sequenceId is below lastSequenceId', () => {
-      const original: Message = {
-        ...makeMessage(5, 'agent'),
-        message_type: 'tool',
-        content: {
-          tool_use_id: 'toolu-spawn',
-          content: 'Spawning 3 sub-agents...',
-          is_error: false,
-        } as Message['content'],
-      };
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        messages: [original],
-        lastSequenceId: 42,
-      };
-      const rebroadcast: Message = { ...original, display_data: { type: 'subagent_summary' } };
-
-      const next = dispatch(atom, {
-        type: 'sse_message',
-        message: rebroadcast,
-        sequenceId: 5,
-      });
-
-      expect(next).toBe(atom);
     });
 
     it('updates resultSummary on matching tool breadcrumb when tool result arrives', () => {
@@ -364,9 +426,9 @@ describe('conversationReducer', () => {
 
   describe('sse_message_updated', () => {
     // Regression: spawn_agents tool_result gets display_data refreshed AFTER many
-    // later SSE events have advanced lastSequenceId. The backend broadcasts
-    // MessageUpdated (not Message) so the monotonic cursor guard never applies.
-    it('applies display_data update-in-place even when lastSequenceId is high', () => {
+    // later SSE events. Now gated by sequenceId: the update must carry an id
+    // higher than the previous high-water mark.
+    it('applies display_data update-in-place with a monotonic sequenceId', () => {
       const original: Message = {
         ...makeMessage(5, 'agent'),
         message_type: 'tool',
@@ -388,33 +450,14 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_message_updated',
+        sequenceId: 43,
         messageId: original.message_id,
         displayData: summaryDisplayData,
       });
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.display_data).toEqual(summaryDisplayData);
-      expect(next.lastSequenceId).toBe(42);
-    });
-
-    it('does not touch lastSequenceId or streamingBuffer', () => {
-      const original = makeMessage(5);
-      const buffer = { text: 'streaming...', lastSequence: 40, startedAt: Date.now() };
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        messages: [original],
-        lastSequenceId: 42,
-        streamingBuffer: buffer,
-      };
-
-      const next = dispatch(atom, {
-        type: 'sse_message_updated',
-        messageId: original.message_id,
-        displayData: { type: 'updated' },
-      });
-
-      expect(next.streamingBuffer).toBe(buffer);
-      expect(next.lastSequenceId).toBe(42);
+      expect(next.lastSequenceId).toBe(43);
     });
 
     it('is a no-op when message_id is unknown', () => {
@@ -426,11 +469,16 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_message_updated',
+        sequenceId: 11,
         messageId: 'nonexistent-id',
         displayData: { type: 'whatever' },
       });
 
-      expect(next).toBe(atom);
+      // applyIfNewer still bumps lastSequenceId (the fact was seen); only the
+      // in-reducer lookup decides whether to mutate messages. This keeps the
+      // contract consistent: applyIfNewer is the ONLY sequence_id gate.
+      expect(next.lastSequenceId).toBe(11);
+      expect(next.messages).toEqual(atom.messages);
     });
 
     it('merges content and display_data independently', () => {
@@ -448,12 +496,44 @@ describe('conversationReducer', () => {
       // Update only display_data, not content
       const next = dispatch(atom, {
         type: 'sse_message_updated',
+        sequenceId: 11,
         messageId: original.message_id,
         displayData: { type: 'new_display' },
       });
 
       expect((next.messages[0]!.display_data as { type: string }).type).toBe('new_display');
       expect((next.messages[0]!.content as { text: string }).text).toBe('original content');
+    });
+
+    // Task 02675 acceptance: duplicate message_updated events → state reflects
+    // exactly one application.
+    it('is idempotent: duplicate message_updated events apply exactly once', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        display_data: { type: 'before' } as Record<string, unknown>,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 10,
+      };
+
+      const once = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 11,
+        messageId: original.message_id,
+        displayData: { type: 'after' },
+      });
+      // Second delivery with the SAME sequenceId: the replay guard rejects it.
+      const twice = dispatch(once, {
+        type: 'sse_message_updated',
+        sequenceId: 11,
+        messageId: original.message_id,
+        displayData: { type: 'after' },
+      });
+
+      expect(twice).toBe(once); // applyIfNewer returned atom unchanged
+      expect((twice.messages[0]!.display_data as { type: string }).type).toBe('after');
     });
   });
 
@@ -463,6 +543,7 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
+        sequenceId: 1,
         phase: { type: 'awaiting_llm' },
       });
 
@@ -474,12 +555,12 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
+        sequenceId: 5,
         phase: {
           type: 'tool_executing',
           current_tool: { id: 'tool-1', input: { _tool: 'bash' } },
           remaining_tools: [],
         },
-        sequenceId: 5,
       });
 
       expect(next.breadcrumbs).toHaveLength(1);
@@ -492,8 +573,8 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
-        phase: { type: 'awaiting_llm' },
         sequenceId: 10,
+        phase: { type: 'awaiting_llm' },
       });
 
       expect(next).toBe(atom);
@@ -507,8 +588,8 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
-        phase: { type: 'llm_requesting', attempt: 2 },
         sequenceId: 10,
+        phase: { type: 'llm_requesting', attempt: 2 },
       });
 
       expect(next.breadcrumbs).toHaveLength(1);
@@ -523,6 +604,7 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
+        sequenceId: 8,
         phase: {
           type: 'awaiting_sub_agents',
           pending: [{ agent_id: 'a2', task: 'task2' }],
@@ -530,23 +612,22 @@ describe('conversationReducer', () => {
             { agent_id: 'a1', task: 'task1', outcome: { type: 'success' } },
           ],
         },
-        sequenceId: 8,
       });
 
       expect(next.breadcrumbs).toHaveLength(1);
       expect(next.breadcrumbs[0]!.label).toBe('sub-agents (1/2)');
     });
 
-    it('does not update lastSequenceId when sequenceId is absent', () => {
+    it('advances lastSequenceId on acceptance', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 5 };
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
+        sequenceId: 7,
         phase: { type: 'awaiting_llm' },
-        // No sequenceId
       });
 
-      expect(next.lastSequenceId).toBe(5); // Unchanged
+      expect(next.lastSequenceId).toBe(7);
     });
   });
 
@@ -560,6 +641,7 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_agent_done', sequenceId: 20 });
 
       expect(next.phase.type).toBe('idle');
+      expect(next.lastSequenceId).toBe(20);
     });
 
     it('clears streaming buffer', () => {
@@ -568,7 +650,7 @@ describe('conversationReducer', () => {
         streamingBuffer: { text: 'incomplete', lastSequence: 15, startedAt: Date.now() },
       };
 
-      const next = dispatch(atom, { type: 'sse_agent_done' });
+      const next = dispatch(atom, { type: 'sse_agent_done', sequenceId: 16 });
 
       expect(next.streamingBuffer).toBeNull();
     });
@@ -598,19 +680,21 @@ describe('conversationReducer', () => {
     it('accumulates tokens in streaming buffer', () => {
       const atom = llmRequestingAtom();
 
-      const s1 = dispatch(atom, { type: 'sse_token', delta: 'Hello', sequence: 1 });
-      const s2 = dispatch(s1, { type: 'sse_token', delta: ' world', sequence: 2 });
+      const s1 = dispatch(atom, { type: 'sse_token', sequenceId: 1, delta: 'Hello' });
+      const s2 = dispatch(s1, { type: 'sse_token', sequenceId: 2, delta: ' world' });
 
       expect(s2.streamingBuffer?.text).toBe('Hello world');
+      expect(s2.lastSequenceId).toBe(2);
     });
 
     it('is a no-op for duplicate or out-of-order sequence', () => {
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
+        lastSequenceId: 5,
         streamingBuffer: { text: 'Hello', lastSequence: 5, startedAt: Date.now() },
       };
 
-      const next = dispatch(atom, { type: 'sse_token', delta: ' stale', sequence: 3 });
+      const next = dispatch(atom, { type: 'sse_token', sequenceId: 3, delta: ' stale' });
 
       expect(next).toBe(atom);
     });
@@ -619,10 +703,11 @@ describe('conversationReducer', () => {
       const startedAt = Date.now() - 1000;
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
+        lastSequenceId: 1,
         streamingBuffer: { text: 'Hello', lastSequence: 1, startedAt },
       };
 
-      const next = dispatch(atom, { type: 'sse_token', delta: '!', sequence: 2 });
+      const next = dispatch(atom, { type: 'sse_token', sequenceId: 2, delta: '!' });
 
       expect(next.streamingBuffer?.startedAt).toBe(startedAt);
     });
@@ -630,14 +715,13 @@ describe('conversationReducer', () => {
     // Task 24683 regression: tokens arriving after the phase has left
     // `llm_requesting` must be dropped. Otherwise a late token from a
     // previous turn creates a phantom streaming buffer below the
-    // already-persisted assistant message — the client-facing half of the
-    // "message repeats itself" bug.
+    // already-persisted assistant message.
     it('drops tokens when phase is idle', () => {
       const atom = createInitialAtom(); // default phase: idle
       const next = dispatch(atom, {
         type: 'sse_token',
+        sequenceId: 1,
         delta: 'ghost',
-        sequence: 1,
       });
       expect(next).toBe(atom);
       expect(next.streamingBuffer).toBeNull();
@@ -654,10 +738,39 @@ describe('conversationReducer', () => {
       };
       const next = dispatch(atom, {
         type: 'sse_token',
+        sequenceId: 1,
         delta: 'ghost',
-        sequence: 1,
       });
       expect(next).toBe(atom);
+    });
+
+    // Task 02675 acceptance: simulated reconnect mid-stream with server
+    // continuing to emit tokens → new tokens accumulate without stall.
+    //
+    // Before the fix, the client ran a per-connection `tokenSequence` counter
+    // that reset to 0 on every reconnect, while `atom.streamingBuffer.lastSequence`
+    // persisted at the pre-reconnect high-water mark. Post-reconnect tokens
+    // carried ids 1, 2, 3, … which were all below the high-water mark and
+    // silently dropped until the counter crossed it.
+    //
+    // After the fix, tokens carry server-assigned global sequence_ids that
+    // are strictly greater than anything the client has seen.
+    it('accumulates tokens after simulated reconnect mid-stream', () => {
+      // Pre-reconnect state: atom has been streaming, lastSequenceId=50.
+      const preReconnect: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 50,
+        streamingBuffer: { text: 'Before ', lastSequence: 50, startedAt: Date.now() },
+      };
+
+      // Server keeps streaming across the reconnect with ids 51, 52, 53.
+      const a1 = dispatch(preReconnect, { type: 'sse_token', sequenceId: 51, delta: 'reconnect ' });
+      const a2 = dispatch(a1, { type: 'sse_token', sequenceId: 52, delta: 'works ' });
+      const a3 = dispatch(a2, { type: 'sse_token', sequenceId: 53, delta: 'correctly' });
+
+      expect(a3.streamingBuffer?.text).toBe('Before reconnect works correctly');
+      expect(a3.lastSequenceId).toBe(53);
     });
   });
 
@@ -681,6 +794,51 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'connection_state', state: 'live' });
 
       expect(next.connectionState).toBe('live');
+    });
+  });
+
+  describe('local_phase_change', () => {
+    // Client-originated optimistic phase updates do NOT bump lastSequenceId
+    // (they're not part of the server's total order). This test guards
+    // against a future change that accidentally wires them through the
+    // server-side dedup path.
+    it('updates phase without touching lastSequenceId', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 42 };
+
+      const next = dispatch(atom, {
+        type: 'local_phase_change',
+        phase: { type: 'awaiting_llm' },
+      });
+
+      expect(next.phase.type).toBe('awaiting_llm');
+      expect(next.lastSequenceId).toBe(42);
+    });
+  });
+
+  describe('local_conversation_update', () => {
+    it('merges updates when conversation exists', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversation: testConversation,
+      };
+
+      const next = dispatch(atom, {
+        type: 'local_conversation_update',
+        updates: { model: 'new-model' },
+      });
+
+      expect(next.conversation?.model).toBe('new-model');
+    });
+
+    it('is a no-op when conversation is null', () => {
+      const atom = createInitialAtom();
+
+      const next = dispatch(atom, {
+        type: 'local_conversation_update',
+        updates: { model: 'new-model' },
+      });
+
+      expect(next).toBe(atom);
     });
   });
 

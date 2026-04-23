@@ -105,6 +105,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseInitDataSchema,
         makeEvent({
+          sequence_id: 0,
           conversation: { id: 'conv-1' },
           messages: [],
           agent_working: false,
@@ -117,6 +118,7 @@ describe('parseEvent', () => {
       if (res.ok) {
         expect(res.data.conversation.id).toBe('conv-1');
         expect(res.data.last_sequence_id).toBe(0);
+        expect(res.data.sequence_id).toBe(0);
       }
       expect(actions).toHaveLength(0);
     });
@@ -126,6 +128,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseInitDataSchema,
         makeEvent({
+          sequence_id: 0,
           conversation: { id: 'conv-1', next_gen_field: 'hello' },
           messages: [],
           agent_working: false,
@@ -144,6 +147,7 @@ describe('parseEvent', () => {
         const res = parseEvent(
           SseInitDataSchema,
           makeEvent({
+            sequence_id: 0,
             conversation: { id: 'conv-1' },
             messages: [],
             agent_working: false,
@@ -158,12 +162,33 @@ describe('parseEvent', () => {
       });
     });
 
+    it('rejects init with missing sequence_id (task 02675 contract)', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseInitDataSchema,
+          makeEvent({
+            // sequence_id missing — task 02675 requires every event to carry one
+            conversation: { id: 'conv-1' },
+            messages: [],
+            agent_working: false,
+            last_sequence_id: 0,
+          }),
+          'init',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+
     it('rejects init with non-number last_sequence_id (the sequence-id corruption case)', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseInitDataSchema,
           makeEvent({
+            sequence_id: 0,
             conversation: { id: 'conv-1' },
             messages: [],
             agent_working: false,
@@ -192,7 +217,7 @@ describe('parseEvent', () => {
       const { dispatch, actions } = mockDispatch();
       const res = parseEvent(
         SseMessageDataSchema,
-        makeEvent({ message: goodMsg }),
+        makeEvent({ sequence_id: 5, message: goodMsg }),
         'message',
         dispatch,
       );
@@ -206,6 +231,7 @@ describe('parseEvent', () => {
         const res = parseEvent(
           SseMessageDataSchema,
           makeEvent({
+            sequence_id: 5,
             message: { ...goodMsg, sequence_id: '5' },
           }),
           'message',
@@ -217,12 +243,27 @@ describe('parseEvent', () => {
       });
     });
 
+    it('rejects a message envelope missing the top-level sequence_id', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseMessageDataSchema,
+          makeEvent({ message: goodMsg }), // envelope sequence_id missing
+          'message',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+
     it('rejects a message with an unknown message_type', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseMessageDataSchema,
           makeEvent({
+            sequence_id: 5,
             message: { ...goodMsg, message_type: 'wizard' },
           }),
           'message',
@@ -240,7 +281,7 @@ describe('parseEvent', () => {
         delete rest['message_id'];
         const res = parseEvent(
           SseMessageDataSchema,
-          makeEvent({ message: rest }),
+          makeEvent({ sequence_id: 5, message: rest }),
           'message',
           dispatch,
         );
@@ -256,6 +297,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
+          sequence_id: 7,
           message_id: 'msg-1',
           display_data: { type: 'subagent_summary' },
           content: null,
@@ -271,7 +313,21 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseMessageUpdatedDataSchema,
-          makeEvent({ display_data: { type: 'x' } }),
+          makeEvent({ sequence_id: 7, display_data: { type: 'x' } }),
+          'message_updated',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+
+    it('rejects update missing sequence_id', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseMessageUpdatedDataSchema,
+          makeEvent({ message_id: 'msg-1', display_data: { type: 'x' } }),
           'message_updated',
           dispatch,
         );
@@ -287,6 +343,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseStateChangeDataSchema,
         makeEvent({
+          sequence_id: 12,
           state: { type: 'awaiting_llm' },
           display_state: 'working',
         }),
@@ -301,7 +358,21 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseStateChangeDataSchema,
-          makeEvent({ display_state: 'working' }),
+          makeEvent({ sequence_id: 12, display_state: 'working' }),
+          'state_change',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+
+    it('rejects state_change missing sequence_id', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseStateChangeDataSchema,
+          makeEvent({ state: { type: 'awaiting_llm' } }),
           'state_change',
           dispatch,
         );
@@ -316,7 +387,7 @@ describe('parseEvent', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseTokenDataSchema,
-        makeEvent({ text: 'Hello', request_id: 'req-1' }),
+        makeEvent({ sequence_id: 3, text: 'Hello', request_id: 'req-1' }),
         'token',
         dispatch,
       );
@@ -328,7 +399,7 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseTokenDataSchema,
-          makeEvent({ text: 42 }),
+          makeEvent({ sequence_id: 3, text: 42 }),
           'token',
           dispatch,
         );
@@ -338,6 +409,20 @@ describe('parseEvent', () => {
         expect(actions[0]!.type).toBe('sse_error');
       });
     });
+
+    it('rejects a token missing sequence_id', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseTokenDataSchema,
+          makeEvent({ text: 'hello' }),
+          'token',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
   });
 
   describe('conversation_update schema', () => {
@@ -345,7 +430,7 @@ describe('parseEvent', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseConversationUpdateDataSchema,
-        makeEvent({ conversation: { commits_behind: 2 } }),
+        makeEvent({ sequence_id: 9, conversation: { commits_behind: 2 } }),
         'conversation_update',
         dispatch,
       );
@@ -357,7 +442,7 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseConversationUpdateDataSchema,
-          makeEvent({ conversation: 'scalar' }),
+          makeEvent({ sequence_id: 9, conversation: 'scalar' }),
           'conversation_update',
           dispatch,
         );
@@ -368,22 +453,36 @@ describe('parseEvent', () => {
   });
 
   describe('agent_done / conversation_became_terminal schemas', () => {
-    it('accepts empty object for agent_done', () => {
+    it('accepts envelope with sequence_id for agent_done', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseAgentDoneDataSchema,
-        makeEvent({}),
+        makeEvent({ sequence_id: 15 }),
         'agent_done',
         dispatch,
       );
       expect(res.ok).toBe(true);
     });
 
-    it('accepts empty object for conversation_became_terminal', () => {
+    it('rejects agent_done missing sequence_id', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseAgentDoneDataSchema,
+          makeEvent({}),
+          'agent_done',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+
+    it('accepts envelope with sequence_id for conversation_became_terminal', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseConversationBecameTerminalDataSchema,
-        makeEvent({}),
+        makeEvent({ sequence_id: 42 }),
         'conversation_became_terminal',
         dispatch,
       );
@@ -394,7 +493,7 @@ describe('parseEvent', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseConversationBecameTerminalDataSchema,
-        makeEvent({ future_field: 'ok' }),
+        makeEvent({ sequence_id: 42, future_field: 'ok' }),
         'conversation_became_terminal',
         dispatch,
       );
@@ -403,11 +502,24 @@ describe('parseEvent', () => {
   });
 
   describe('error schema', () => {
-    it('accepts a backend error payload', () => {
+    // Errors are the one event type where sequence_id is optional — see the
+    // comment on SseErrorDataSchema in sseSchemas.ts for rationale.
+    it('accepts a backend error payload without sequence_id', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseErrorDataSchema,
         makeEvent({ message: 'rate limited', error: { kind: 'retryable' } }),
+        'error',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+    });
+
+    it('accepts a backend error payload with sequence_id', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseErrorDataSchema,
+        makeEvent({ sequence_id: 8, message: 'rate limited' }),
         'error',
         dispatch,
       );

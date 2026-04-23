@@ -37,22 +37,43 @@ export interface InitPayload {
   lastSequenceId: number;
 }
 
+// Task 02675: every wire-originated SSE action carries a `sequenceId` from
+// the server's per-conversation monotonic counter. The reducer routes each
+// one through a single `applyIfNewer` guard — see the comment on that helper
+// for the contract.
+//
+// Client-originated actions (`local_phase_change`, `local_conversation_update`,
+// `set_initial_data`, `connection_state`, `set_system_prompt`, `sse_error`,
+// `clear_error`) do not go through `applyIfNewer` and do not mutate
+// `lastSequenceId`. They exist so UI code can optimistically reflect a
+// user action (e.g. "I pressed send; show 'awaiting_llm'") without
+// colliding with the server's total order — the real server-side phase
+// change arrives afterwards via `sse_state_change` and takes precedence
+// when its sequence_id lands.
 export type SSEAction =
   | { type: 'sse_init'; payload: InitPayload }
   | { type: 'sse_message'; message: Message; sequenceId: number }
   | {
       type: 'sse_message_updated';
+      sequenceId: number;
       messageId: string;
       displayData?: Record<string, unknown>;
       content?: Message['content'];
     }
-  | { type: 'sse_state_change'; phase: ConversationState; sequenceId?: number }
-  | { type: 'sse_agent_done'; sequenceId?: number }
-  | { type: 'sse_token'; delta: string; sequence: number }
-  | { type: 'sse_conversation_update'; updates: Partial<Conversation> }
+  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState }
+  | { type: 'sse_agent_done'; sequenceId: number }
+  | { type: 'sse_token'; sequenceId: number; delta: string }
+  | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation> }
   | { type: 'sse_error'; error: UIError }
   | { type: 'clear_error' }
   | { type: 'connection_state'; state: ConversationAtom['connectionState'] }
+  // Client-originated optimistic phase change. No sequence_id — not part of
+  // the server's total order. Mutates `phase` only; does not touch
+  // `lastSequenceId`. The authoritative server-side phase change arrives
+  // later via `sse_state_change` and overrides this if it differs.
+  | { type: 'local_phase_change'; phase: ConversationState }
+  // Client-originated optimistic conversation update (e.g. model swap confirmation).
+  | { type: 'local_conversation_update'; updates: Partial<Conversation> }
   | {
       type: 'set_initial_data';
       conversationId: string;
@@ -157,6 +178,46 @@ function applyBreadcrumb(
   return { breadcrumbs: newBreadcrumbs, breadcrumbSequenceIds: newIds };
 }
 
+/**
+ * Single dedup guard for every wire-originated SSE action (task 02675).
+ *
+ * Contract: `sequenceId` is the server-assigned monotonic id for the whole
+ * conversation (tokens, state_change, message, message_updated, … all share
+ * one total order). If the atom has already seen an id ≥ this one, the event
+ * is a replay — skip the mutation and keep `lastSequenceId` as-is. Otherwise
+ * run `apply` and bump `lastSequenceId` to match.
+ *
+ * Why this exists — replaces four bespoke per-event guards in the old
+ * reducer that had silently diverged: `sse_message` only guarded by
+ * sequence_id but never by message_id (so a reconnect replay with a fresh id
+ * duplicated the message); `sse_message_updated` had no guard at all;
+ * `sse_token` used a separate per-connection closure counter (stalled on
+ * reconnect); `sse_state_change` guarded on an id the server never
+ * populated. Consolidating into one helper also makes dev-mode drops
+ * observable — you see which event was rejected and why.
+ */
+function applyIfNewer(
+  atom: ConversationAtom,
+  eventType: string,
+  sequenceId: number,
+  apply: (a: ConversationAtom) => ConversationAtom
+): ConversationAtom {
+  if (atom.lastSequenceId >= sequenceId) {
+    if (import.meta.env.DEV) {
+      // Structured warning mirrors 02674's handleSchemaViolation: dropped
+      // dispatches in dev become visible without spamming prod logs.
+      // eslint-disable-next-line no-console
+      console.warn('[sse] dropping replay', {
+        eventType,
+        incomingSeq: sequenceId,
+        atomLastSeq: atom.lastSequenceId,
+      });
+    }
+    return atom;
+  }
+  return { ...apply(atom), lastSequenceId: sequenceId };
+}
+
 export function conversationReducer(
   atom: ConversationAtom,
   action: SSEAction
@@ -206,6 +267,14 @@ export function conversationReducer(
         }
       }
 
+      // Init uses max() rather than replace for lastSequenceId. Rationale:
+      // task 02675 §2 — "Server-side sequence jumps strand messages". If
+      // init arrives with lastSequenceId=100 but we've already seen id 105
+      // from live events that raced ahead, we must not regress to 100 (that
+      // would re-accept the 101–105 events on re-delivery and corrupt
+      // state). `max()` keeps the floor monotonically non-decreasing.
+      const newLastSeq = Math.max(atom.lastSequenceId, p.lastSequenceId);
+
       return {
         ...atom,
         conversationId: p.conversation.id,
@@ -215,111 +284,96 @@ export function conversationReducer(
         breadcrumbs: finalBreadcrumbs,
         breadcrumbSequenceIds: finalBreadcrumbSeqIds,
         contextWindow: p.contextWindow,
-        lastSequenceId: p.lastSequenceId,
+        lastSequenceId: newLastSeq,
         streamingBuffer: null,
         uiError: null,
       };
     }
 
     case 'sse_message': {
-      // Strict monotonic guard: sse_message is for new messages only.
-      // In-place mutations arrive via sse_message_updated.
-      if (atom.lastSequenceId >= action.sequenceId) return atom;
+      // Defense-in-depth: even if applyIfNewer lets a message through, skip
+      // if the message_id is already present. The task spec (§"sse_message
+      // also needs id dedup") flags this as removing a load-bearing assumption
+      // that the server never re-emits a known message with a fresh seq id.
+      return applyIfNewer(atom, 'sse_message', action.sequenceId, (a) => {
+        if (a.messages.some((m) => m.message_id === action.message.message_id)) {
+          return a;
+        }
+        const newMessages = [...a.messages, action.message];
 
-      const newMessages = [...atom.messages, action.message];
+        // User and skill messages reset breadcrumbs to start a fresh agent turn
+        const isUserMessage =
+          action.message.message_type === 'user' ||
+          action.message.type === 'user' ||
+          action.message.message_type === 'skill';
 
-      // User and skill messages reset breadcrumbs to start a fresh agent turn
-      const isUserMessage =
-        action.message.message_type === 'user' || action.message.type === 'user'
-        || action.message.message_type === 'skill';
+        let breadcrumbs: Breadcrumb[] = isUserMessage
+          ? [{ type: 'user', label: 'User' }]
+          : a.breadcrumbs;
 
-      let breadcrumbs: Breadcrumb[] = isUserMessage
-        ? [{ type: 'user', label: 'User' }]
-        : atom.breadcrumbs;
-
-      // Tool result message: update matching breadcrumb with result summary
-      if (!isUserMessage && action.message.message_type === 'tool') {
-        const toolResult = action.message.content as ToolResultContent;
-        if (toolResult.tool_use_id) {
-          const matchIdx = breadcrumbs.findIndex(
-            (b) => b.type === 'tool' && b.toolId === toolResult.tool_use_id
-          );
-          if (matchIdx >= 0) {
-            const summary = deriveResultSummary(toolResult);
-            breadcrumbs = [...breadcrumbs];
-            breadcrumbs[matchIdx] = { ...breadcrumbs[matchIdx]!, resultSummary: summary };
+        // Tool result message: update matching breadcrumb with result summary
+        if (!isUserMessage && action.message.message_type === 'tool') {
+          const toolResult = action.message.content as ToolResultContent;
+          if (toolResult.tool_use_id) {
+            const matchIdx = breadcrumbs.findIndex(
+              (b) => b.type === 'tool' && b.toolId === toolResult.tool_use_id
+            );
+            if (matchIdx >= 0) {
+              const summary = deriveResultSummary(toolResult);
+              breadcrumbs = [...breadcrumbs];
+              breadcrumbs[matchIdx] = { ...breadcrumbs[matchIdx]!, resultSummary: summary };
+            }
           }
         }
-      }
 
-      return {
-        ...atom,
-        messages: newMessages,
-        lastSequenceId: action.sequenceId,
-        streamingBuffer: null,
-        breadcrumbs,
-      };
+        return {
+          ...a,
+          messages: newMessages,
+          streamingBuffer: null,
+          breadcrumbs,
+        };
+      });
     }
 
     case 'sse_message_updated': {
-      const idx = atom.messages.findIndex((m) => m.message_id === action.messageId);
-      if (idx < 0) return atom;
-      const merged = {
-        ...atom.messages[idx]!,
-        ...(action.displayData !== undefined && { display_data: action.displayData }),
-        ...(action.content !== undefined && { content: action.content }),
-      };
-      const newMessages = [...atom.messages];
-      newMessages[idx] = merged;
-      return { ...atom, messages: newMessages };
-      // Does not touch lastSequenceId or streamingBuffer.
+      return applyIfNewer(atom, 'sse_message_updated', action.sequenceId, (a) => {
+        const idx = a.messages.findIndex((m) => m.message_id === action.messageId);
+        if (idx < 0) return a;
+        const merged = {
+          ...a.messages[idx]!,
+          ...(action.displayData !== undefined && { display_data: action.displayData }),
+          ...(action.content !== undefined && { content: action.content }),
+        };
+        const newMessages = [...a.messages];
+        newMessages[idx] = merged;
+        return { ...a, messages: newMessages };
+      });
     }
 
     case 'sse_state_change': {
-      if (
-        action.sequenceId !== undefined &&
-        atom.lastSequenceId >= action.sequenceId
-      ) {
-        return atom;
-      }
-
-      const newCrumb = breadcrumbFromPhase(
-        action.phase,
-        action.sequenceId ?? atom.lastSequenceId
-      );
-      const { breadcrumbs, breadcrumbSequenceIds } = applyBreadcrumb(
-        atom.breadcrumbs,
-        atom.breadcrumbSequenceIds,
-        newCrumb,
-        action.sequenceId
-      );
-
-      return {
-        ...atom,
-        phase: action.phase,
-        breadcrumbs,
-        breadcrumbSequenceIds,
-        ...(action.sequenceId !== undefined
-          ? { lastSequenceId: action.sequenceId }
-          : {}),
-      };
+      return applyIfNewer(atom, 'sse_state_change', action.sequenceId, (a) => {
+        const newCrumb = breadcrumbFromPhase(action.phase, action.sequenceId);
+        const { breadcrumbs, breadcrumbSequenceIds } = applyBreadcrumb(
+          a.breadcrumbs,
+          a.breadcrumbSequenceIds,
+          newCrumb,
+          action.sequenceId
+        );
+        return {
+          ...a,
+          phase: action.phase,
+          breadcrumbs,
+          breadcrumbSequenceIds,
+        };
+      });
     }
 
     case 'sse_agent_done': {
-      if (
-        action.sequenceId !== undefined &&
-        atom.lastSequenceId >= action.sequenceId
-      ) {
-        return atom;
-      }
-      return {
-        ...atom,
+      return applyIfNewer(atom, 'sse_agent_done', action.sequenceId, (a) => ({
+        ...a,
         phase: { type: 'idle' },
         streamingBuffer: null,
-        ...(action.sequenceId !== undefined
-          ? { lastSequenceId: action.sequenceId }
-          : {}),
-      };
+      }));
     }
 
     case 'sse_token': {
@@ -330,24 +384,36 @@ export function conversationReducer(
       // turn — would otherwise spawn a "ghost" streaming message below the
       // already-persisted assistant message, which is the client-facing
       // half of the "message repeats itself" bug.
+      //
+      // `applyIfNewer` subsumes the old per-connection `tokenSequence`
+      // closure (task 02675 §"sse_token reconnect stall fix"). The server now
+      // allocates sequence_ids from the conversation's single counter, so
+      // tokens emitted after a reconnect start at ids strictly greater than
+      // anything the client has seen, and the stall goes away.
       if (atom.phase.type !== 'llm_requesting') {
         return atom;
       }
-      if (
-        atom.streamingBuffer &&
-        atom.streamingBuffer.lastSequence >= action.sequence
-      ) {
-        return atom;
-      }
-      return {
-        ...atom,
+      return applyIfNewer(atom, 'sse_token', action.sequenceId, (a) => ({
+        ...a,
         streamingBuffer: {
-          text: (atom.streamingBuffer?.text ?? '') + action.delta,
-          lastSequence: action.sequence,
-          startedAt: atom.streamingBuffer?.startedAt ?? Date.now(),
+          text: (a.streamingBuffer?.text ?? '') + action.delta,
+          lastSequence: action.sequenceId,
+          startedAt: a.streamingBuffer?.startedAt ?? Date.now(),
         },
-      };
+      }));
     }
+
+    case 'sse_conversation_update':
+      return applyIfNewer(atom, 'sse_conversation_update', action.sequenceId, (a) => {
+        // Merge updated fields into the existing conversation object. If no
+        // conversation exists yet (shouldn't happen — init always lands
+        // first) bail out rather than synthesising one.
+        if (!a.conversation) return a;
+        return {
+          ...a,
+          conversation: { ...a.conversation, ...action.updates },
+        };
+      });
 
     case 'sse_error':
       return { ...atom, uiError: action.error };
@@ -357,6 +423,14 @@ export function conversationReducer(
 
     case 'connection_state':
       return { ...atom, connectionState: action.state };
+
+    case 'local_phase_change':
+      // Optimistic client-side phase update — does NOT bump lastSequenceId.
+      return { ...atom, phase: action.phase };
+
+    case 'local_conversation_update':
+      if (!atom.conversation) return atom;
+      return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
 
     case 'set_initial_data':
       // Don't overwrite if SSE has already provided authoritative data
@@ -368,14 +442,6 @@ export function conversationReducer(
         messages: action.messages,
         phase: action.phase,
         contextWindow: action.contextWindow,
-      };
-
-    case 'sse_conversation_update':
-      // Merge updated fields into the existing conversation object
-      if (!atom.conversation) return atom;
-      return {
-        ...atom,
-        conversation: { ...atom.conversation, ...action.updates },
       };
 
     case 'set_system_prompt':

@@ -378,10 +378,13 @@ export function ConversationPage() {
           // Keep the queued entry visible until the server's SSE `message`
           // echo lands in atom.messages — a reconciliation effect below calls
           // markSent once atom.messages contains a row with message_id == localId.
-          // Do not optimistically dispatch sse_message here: the monotonic
-          // guard in conversationReducer drops any sequence_id <= lastSequenceId,
-          // so a sequence_id=-1 optimistic would be silently rejected.
-          dispatch({ type: 'sse_state_change', phase: { type: 'awaiting_llm' } });
+          // Optimistic phase update: user pressed send, show awaiting_llm
+          // immediately. The authoritative server-side phase change arrives
+          // later via `sse_state_change` (with its own sequence_id) and
+          // takes precedence. `local_phase_change` exists precisely to
+          // carve out this "client-originated, not part of server total
+          // order" action from the `applyIfNewer` guard (task 02675).
+          dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' } });
         } else {
           await queueOperation({
             type: 'send_message',
@@ -475,7 +478,7 @@ export function ConversationPage() {
     try {
       await api.upgradeModel(conversationId, newModelId);
       showInfo(`Switched to ${newModelId}`);
-      dispatch({ type: 'sse_conversation_update', updates: { model: newModelId } });
+      dispatch({ type: 'local_conversation_update', updates: { model: newModelId } });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
@@ -869,7 +872,7 @@ export function ConversationPage() {
         <ErrorBanner
           message={convStateForChildren.message}
           onRetry={() => handleSend('continue', [])}
-          onDismiss={() => dispatch({ type: 'sse_state_change', phase: { type: 'idle' } })}
+          onDismiss={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' } })}
         />
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel

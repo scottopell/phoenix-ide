@@ -96,6 +96,18 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
 // Event schemas. One per `addEventListener` in useConnection.ts.
 // ---------------------------------------------------------------------------
 
+// Every event schema below carries `sequence_id: v.number()` as a required
+// field (task 02675). The client's reducer routes every action through a
+// single `applyIfNewer(atom, sequence_id, apply)` helper, so a missing or
+// string-typed sequence_id is a protocol violation the schema must reject —
+// not something we want to quietly tolerate and then crash in the reducer.
+// `sse_error` is the one permitted exception: errors originate from the
+// server at points where allocating a counter id is inconvenient (e.g.
+// connection-level failures), they do not mutate `atom.lastSequenceId`, and
+// the UI only reads the `message` string. If the server later gains
+// sequence_ids on error events, making the field required here is a one-line
+// change.
+
 /** `init`: full state snapshot at connect / reconnect.
  *
  *  `conversation`, `messages`, `breadcrumbs` are the structured fields the
@@ -103,8 +115,13 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
  *  top-level mirrors that `transformInitData` in useConnection.ts merges
  *  back into the conversation object — they live at the top level on the
  *  wire because the Rust `SseEvent::Init` struct carries them as flat
- *  fields (src/runtime.rs:167-171). */
+ *  fields (src/runtime.rs:167-171).
+ *
+ *  `sequence_id` and `last_sequence_id` are the same number by construction
+ *  (the snapshot's own place in the total order equals the highest-ever-
+ *  emitted id at subscribe time). Both are required. */
 export const SseInitDataSchema = v.looseObject({
+  sequence_id: v.number(),
   conversation: ConversationSchema,
   messages: v.array(MessageSchema),
   agent_working: v.boolean(),
@@ -119,8 +136,14 @@ export const SseInitDataSchema = v.looseObject({
 });
 export type SseInitData = v.InferOutput<typeof SseInitDataSchema>;
 
-/** `message`: a newly-created message joins the conversation. */
+/** `message`: a newly-created message joins the conversation.
+ *
+ *  The envelope `sequence_id` is the same integer as `message.sequence_id`
+ *  by construction (server guarantees equality — see `SseBroadcaster::send_message`
+ *  in `src/runtime.rs`). The reducer uses the envelope id for ordering and
+ *  the message id for identity-based defense-in-depth dedup. */
 export const SseMessageDataSchema = v.looseObject({
+  sequence_id: v.number(),
   message: MessageSchema,
 });
 export type SseMessageData = v.InferOutput<typeof SseMessageDataSchema>;
@@ -128,8 +151,10 @@ export type SseMessageData = v.InferOutput<typeof SseMessageDataSchema>;
 /** `message_updated`: in-place mutation of an existing message's mutable
  *  fields. `display_data` and `content` are optional because either one can
  *  change independently — the server sends both keys (possibly `null`) every
- *  time (see `src/api/sse.rs:84-96`). */
+ *  time (see `src/api/sse.rs:84-96`). `sequence_id` is the envelope id; the
+ *  persisted `message.sequence_id` is immutable and not repeated here. */
 export const SseMessageUpdatedDataSchema = v.looseObject({
+  sequence_id: v.number(),
   message_id: v.string(),
   display_data: v.nullish(v.unknown()),
   content: v.nullish(v.unknown()),
@@ -142,6 +167,7 @@ export type SseMessageUpdatedData = v.InferOutput<typeof SseMessageUpdatedDataSc
  *  `parseConversationState` in utils.ts, which already performs its own
  *  tagged-union validation. We just assert the envelope is present. */
 export const SseStateChangeDataSchema = v.looseObject({
+  sequence_id: v.number(),
   state: v.unknown(),
   display_state: v.optional(v.string()),
 });
@@ -149,6 +175,7 @@ export type SseStateChangeData = v.InferOutput<typeof SseStateChangeDataSchema>;
 
 /** `token`: ephemeral streaming delta during an LLM request. */
 export const SseTokenDataSchema = v.looseObject({
+  sequence_id: v.number(),
   text: v.string(),
   request_id: v.optional(v.string()),
 });
@@ -160,20 +187,25 @@ export type SseTokenData = v.InferOutput<typeof SseTokenDataSchema>;
  *  merge it shallowly — forward compatibility matters here more than
  *  enforcement, because new metadata fields are added frequently. */
 export const SseConversationUpdateDataSchema = v.looseObject({
+  sequence_id: v.number(),
   conversation: v.record(v.string(), v.unknown()),
 });
 export type SseConversationUpdateData = v.InferOutput<typeof SseConversationUpdateDataSchema>;
 
-/** `agent_done`: empty envelope. Still validated so that a future server
- *  change that adds fields can be discovered by a type-check or a new test
- *  rather than a silent nop. */
-export const SseAgentDoneDataSchema = v.looseObject({});
+/** `agent_done`: empty envelope apart from the sequence_id. Still validated
+ *  so that a future server change that adds fields can be discovered by a
+ *  type-check or a new test rather than a silent nop. */
+export const SseAgentDoneDataSchema = v.looseObject({
+  sequence_id: v.number(),
+});
 export type SseAgentDoneData = v.InferOutput<typeof SseAgentDoneDataSchema>;
 
-/** `conversation_became_terminal`: empty envelope. Wired up as a no-op today
- *  but validated so that if the server starts including teardown detail
- *  (process id, terminal session id, …) it is not silently dropped. */
-export const SseConversationBecameTerminalDataSchema = v.looseObject({});
+/** `conversation_became_terminal`: carries only the sequence_id today.
+ *  Wired up as a no-op in the UI but validated so that if the server starts
+ *  including teardown detail it is not silently dropped. */
+export const SseConversationBecameTerminalDataSchema = v.looseObject({
+  sequence_id: v.number(),
+});
 export type SseConversationBecameTerminalData = v.InferOutput<
   typeof SseConversationBecameTerminalDataSchema
 >;
@@ -184,9 +216,16 @@ export type SseConversationBecameTerminalData = v.InferOutput<
  *  the backend emits a flat `message` string plus a typed `error` object;
  *  the UI has historically read `message` and we keep that contract.
  *
+ *  `sequence_id` is intentionally *not* required here: errors do not mutate
+ *  `atom.lastSequenceId`, the UI only displays `message`, and errors can be
+ *  emitted from non-runtime code paths where allocating a sequence id costs
+ *  more than it buys. The server currently does emit one, so we accept it
+ *  optionally for forward consistency without making it load-bearing.
+ *
  *  Native EventSource connection-reset errors go through a different path
  *  in useConnection.ts and do not use this schema. */
 export const SseErrorDataSchema = v.looseObject({
+  sequence_id: v.optional(v.number()),
   message: v.string(),
   error: v.optional(v.unknown()),
 });

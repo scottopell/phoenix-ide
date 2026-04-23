@@ -260,6 +260,7 @@ export function useConnection({
             const data = res.data;
             dispatchRef.current({
               type: 'sse_message_updated',
+              sequenceId: data.sequence_id,
               messageId: data.message_id,
               ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
               ...(data.content != null && { content: data.content as import('../api').Message['content'] }),
@@ -278,8 +279,8 @@ export function useConnection({
             // performs its own discriminated-union validation.
             dispatchRef.current({
               type: 'sse_state_change',
+              sequenceId: res.data.sequence_id,
               phase: parseConversationState(res.data.state),
-              // sequenceId intentionally absent — backend doesn't provide it on state_change
             });
           });
 
@@ -291,7 +292,7 @@ export function useConnection({
               dispatchRef.current,
             );
             if (!res.ok) return;
-            dispatchRef.current({ type: 'sse_agent_done' });
+            dispatchRef.current({ type: 'sse_agent_done', sequenceId: res.data.sequence_id });
           });
 
           // Terminal subsystem lifecycle event — wired up fully in Task 5.
@@ -317,21 +318,22 @@ export function useConnection({
             if (!res.ok) return;
             dispatchRef.current({
               type: 'sse_conversation_update',
+              sequenceId: res.data.sequence_id,
               updates: res.data.conversation as Partial<import('../api').Conversation>,
             });
           });
 
-          // Per-connection monotonic counter for sse_token dedup.
-          // Reset on each new connection so the reducer's lastSequence check works correctly.
-          let tokenSequence = 0;
+          // Task 02675: tokens share the server-side global sequence_id
+          // counter, so the old per-connection `tokenSequence` closure is
+          // gone. The reducer's `applyIfNewer` guard sees strictly
+          // increasing ids across reconnects and never stalls.
           es.addEventListener('token', (e) => {
             const res = parseEvent(SseTokenDataSchema, e, 'token', dispatchRef.current);
             if (!res.ok) return;
-            tokenSequence++;
             dispatchRef.current({
               type: 'sse_token',
+              sequenceId: res.data.sequence_id,
               delta: res.data.text,
-              sequence: tokenSequence,
             });
           });
 
