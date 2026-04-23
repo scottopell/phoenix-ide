@@ -1,7 +1,7 @@
 ---
 created: 2026-04-23
 priority: p2
-status: ready
+status: in-progress
 artifact: ui/src/hooks/useConnection.ts
 ---
 

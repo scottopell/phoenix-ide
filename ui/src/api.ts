@@ -1,5 +1,21 @@
 // Phoenix API Client
 
+// SSE event types are defined by runtime schemas in `sseSchemas.ts` so the
+// wire contract has a single source of truth. Re-exported here for
+// backward-compatible imports (`import type { SseMessageData } from '../api'`).
+export type {
+  SseInitData,
+  SseMessageData,
+  SseMessageUpdatedData,
+  SseStateChangeData,
+  SseTokenData,
+  SseConversationUpdateData,
+  SseAgentDoneData,
+  SseConversationBecameTerminalData,
+  SseErrorData,
+  SseBreadcrumb,
+} from './sseSchemas';
+
 export interface Conversation {
   id: string;
   slug: string;
@@ -156,50 +172,12 @@ export interface UsageData {
   cache_read_input_tokens?: number;
 }
 
-export interface SseBreadcrumb {
-  type: 'user' | 'llm' | 'tool' | 'subagents';
-  label: string;
-  tool_id?: string;
-  sequence_id?: number;
-  preview?: string;
-}
-
-export interface SseInitData {
-  conversation: Conversation;
-  messages: Message[];
-  agent_working: boolean;
-  /** Semantic state category from API: idle, working, error, terminal */
-  display_state?: string;
-  last_sequence_id: number;
-  /** Current context window usage in tokens */
-  context_window_size?: number;
-  /** Model's maximum context window in tokens */
-  model_context_window?: number;
-  breadcrumbs?: SseBreadcrumb[];
-  /** How many commits the base branch is ahead of the task branch (Work mode only) */
-  commits_behind?: number;
-  commits_ahead?: number;
-  project_name?: string | null;
-}
-
-export interface SseMessageData {
-  message: Message;
-}
-
-export interface SseMessageUpdatedData {
-  message_id: string;
-  display_data?: Record<string, unknown> | null;
-  content?: Message['content'] | null;
-}
-
-export interface SseStateChangeData {
-  state: ConversationState;
-  /** Semantic state category from API: idle, working, error, terminal */
-  display_state?: string;
-}
-
 export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'conversation_update' | 'disconnected';
-export type SseEventData = SseInitData | SseMessageData | SseStateChangeData | Record<string, never>;
+export type SseEventData =
+  | import('./sseSchemas').SseInitData
+  | import('./sseSchemas').SseMessageData
+  | import('./sseSchemas').SseStateChangeData
+  | Record<string, never>;
 
 export interface ModelInfo {
   id: string;
@@ -679,17 +657,17 @@ export const api = {
     const es = new EventSource(`/api/conversations/${convId}/stream`);
 
     es.addEventListener('init', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as SseInitData;
+      const data = JSON.parse((e as MessageEvent).data) as import('./sseSchemas').SseInitData;
       onEvent('init', data);
     });
 
     es.addEventListener('message', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as SseMessageData;
+      const data = JSON.parse((e as MessageEvent).data) as import('./sseSchemas').SseMessageData;
       onEvent('message', data);
     });
 
     es.addEventListener('state_change', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as SseStateChangeData;
+      const data = JSON.parse((e as MessageEvent).data) as import('./sseSchemas').SseStateChangeData;
       onEvent('state_change', data);
     });
 

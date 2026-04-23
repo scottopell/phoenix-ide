@@ -1,9 +1,20 @@
 import { useState, useCallback, useEffect, useRef, type Dispatch } from 'react';
-import type { SseInitData, SseMessageData, SseMessageUpdatedData, SseStateChangeData } from '../api';
+import * as v from 'valibot';
+import type { SseInitData, SseBreadcrumb } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import type { Breadcrumb } from '../types';
 import { parseConversationState } from '../utils';
-import type { SseBreadcrumb } from '../api';
+import {
+  SseInitDataSchema,
+  SseMessageDataSchema,
+  SseMessageUpdatedDataSchema,
+  SseStateChangeDataSchema,
+  SseTokenDataSchema,
+  SseConversationUpdateDataSchema,
+  SseAgentDoneDataSchema,
+  SseConversationBecameTerminalDataSchema,
+  SseErrorDataSchema,
+} from '../sseSchemas';
 import {
   ConnectionState,
   ConnectionMachineState,
@@ -14,6 +25,80 @@ import {
   initialState,
   RECONNECTED_DISPLAY_MS,
 } from './connectionMachine';
+
+/** Result of a schema-validated SSE parse. Callers branch on `ok` to either
+ *  dispatch the action or propagate the already-handled failure. */
+type ParseResult<T> = { ok: true; data: T } | { ok: false };
+
+/**
+ * Parse + validate an SSE event payload against its schema.
+ *
+ * On failure, consults `import.meta.env.DEV`:
+ *   - dev: log structured detail and throw (caught by the React error boundary)
+ *   - prod: dispatch `sse_error` with a readable violation message
+ * In both cases the caller receives `{ ok: false }` and must not dispatch.
+ */
+export function parseEvent<TSchema extends v.BaseSchema<unknown, unknown, v.BaseIssue<unknown>>>(
+  schema: TSchema,
+  event: Event,
+  eventType: string,
+  dispatch: Dispatch<SSEAction>,
+): ParseResult<v.InferOutput<TSchema>> {
+  const raw = (event as MessageEvent).data;
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch (jsonErr) {
+    handleSchemaViolation(eventType, raw, 'json_parse_failed', jsonErr, dispatch);
+    return { ok: false };
+  }
+  const result = v.safeParse(schema, json);
+  if (!result.success) {
+    handleSchemaViolation(eventType, raw, 'schema_violation', result.issues, dispatch);
+    return { ok: false };
+  }
+  return { ok: true, data: result.output };
+}
+
+/** Centralized dev-loud / prod-dispatch failure handler for SSE validation. */
+function handleSchemaViolation(
+  eventType: string,
+  raw: unknown,
+  kind: 'json_parse_failed' | 'schema_violation',
+  detail: unknown,
+  dispatch: Dispatch<SSEAction>,
+): void {
+  const summary =
+    kind === 'json_parse_failed'
+      ? `SSE ${eventType}: malformed JSON on wire`
+      : `SSE ${eventType}: payload failed schema validation`;
+
+  if (import.meta.env.DEV) {
+    // Loud. Contract drift in dev is a bug to fix, not a warning to skim.
+    console.error(summary, { eventType, raw, detail });
+    throw new Error(
+      `${summary} — see console for raw payload and issue list.`,
+    );
+  }
+
+  // Prod: surface via the sse_error channel so the UI shows a toast instead
+  // of crashing. `raw` may be a long JSON string; the existing
+  // `ParseError` / `BackendError` variants already carry the raw text.
+  if (kind === 'json_parse_failed') {
+    dispatch({
+      type: 'sse_error',
+      error: { type: 'ParseError', raw: typeof raw === 'string' ? raw : String(raw) },
+    });
+  } else {
+    dispatch({
+      type: 'sse_error',
+      error: {
+        type: 'BackendError',
+        message: `${summary} (client-side schema rejected server payload)`,
+      },
+    });
+  }
+}
 
 export type { ConnectionState } from './connectionMachine';
 
@@ -142,150 +227,132 @@ export function useConnection({
           eventSourceRef.current = es;
 
           es.addEventListener('init', (e) => {
-            let raw: SseInitData;
-            try {
-              raw = JSON.parse((e as MessageEvent).data) as SseInitData;
-            } catch {
-              dispatchRef.current({
-                type: 'sse_error',
-                error: { type: 'ParseError', raw: (e as MessageEvent).data },
-              });
-              return;
-            }
+            const res = parseEvent(SseInitDataSchema, e, 'init', dispatchRef.current);
+            if (!res.ok) return;
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
             dispatchRef.current({
               type: 'sse_init',
-              payload: transformInitData(raw),
+              payload: transformInitData(res.data),
             });
             dispatchRef.current({ type: 'connection_state', state: 'live' });
           });
 
           es.addEventListener('message', (e) => {
-            let data: SseMessageData;
-            try {
-              data = JSON.parse((e as MessageEvent).data) as SseMessageData;
-            } catch {
-              dispatchRef.current({
-                type: 'sse_error',
-                error: { type: 'ParseError', raw: (e as MessageEvent).data },
-              });
-              return;
-            }
-
-            const msg = data.message;
-            if (msg) {
-              dispatchRef.current({
-                type: 'sse_message',
-                message: msg,
-                sequenceId: msg.sequence_id,
-              });
-            }
+            const res = parseEvent(SseMessageDataSchema, e, 'message', dispatchRef.current);
+            if (!res.ok) return;
+            const msg = res.data.message;
+            dispatchRef.current({
+              type: 'sse_message',
+              message: msg,
+              sequenceId: msg.sequence_id,
+            });
           });
 
           es.addEventListener('message_updated', (e) => {
-            let data: SseMessageUpdatedData;
-            try {
-              data = JSON.parse((e as MessageEvent).data) as SseMessageUpdatedData;
-            } catch {
-              dispatchRef.current({
-                type: 'sse_error',
-                error: { type: 'ParseError', raw: (e as MessageEvent).data },
-              });
-              return;
-            }
-
-            if (data.message_id) {
-              dispatchRef.current({
-                type: 'sse_message_updated',
-                messageId: data.message_id,
-                ...(data.display_data != null && { displayData: data.display_data }),
-                ...(data.content != null && { content: data.content }),
-              });
-            }
+            const res = parseEvent(
+              SseMessageUpdatedDataSchema,
+              e,
+              'message_updated',
+              dispatchRef.current,
+            );
+            if (!res.ok) return;
+            const data = res.data;
+            dispatchRef.current({
+              type: 'sse_message_updated',
+              messageId: data.message_id,
+              ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
+              ...(data.content != null && { content: data.content as import('../api').Message['content'] }),
+            });
           });
 
           es.addEventListener('state_change', (e) => {
-            let data: SseStateChangeData;
-            try {
-              data = JSON.parse((e as MessageEvent).data) as SseStateChangeData;
-            } catch {
-              dispatchRef.current({
-                type: 'sse_error',
-                error: { type: 'ParseError', raw: (e as MessageEvent).data },
-              });
-              return;
-            }
-
+            const res = parseEvent(
+              SseStateChangeDataSchema,
+              e,
+              'state_change',
+              dispatchRef.current,
+            );
+            if (!res.ok) return;
+            // `data.state` is opaque at the SSE boundary; parseConversationState
+            // performs its own discriminated-union validation.
             dispatchRef.current({
               type: 'sse_state_change',
-              phase: data.state,
+              phase: parseConversationState(res.data.state),
               // sequenceId intentionally absent — backend doesn't provide it on state_change
             });
           });
 
-          es.addEventListener('agent_done', () => {
+          es.addEventListener('agent_done', (e) => {
+            const res = parseEvent(
+              SseAgentDoneDataSchema,
+              e,
+              'agent_done',
+              dispatchRef.current,
+            );
+            if (!res.ok) return;
             dispatchRef.current({ type: 'sse_agent_done' });
           });
 
           // Terminal subsystem lifecycle event — wired up fully in Task 5.
-          // Registered here to prevent unrecognized-event console noise.
-          es.addEventListener('conversation_became_terminal', () => {
+          // Still validated so a future server change that adds teardown
+          // detail cannot slip past this no-op without a schema update.
+          es.addEventListener('conversation_became_terminal', (e) => {
+            parseEvent(
+              SseConversationBecameTerminalDataSchema,
+              e,
+              'conversation_became_terminal',
+              dispatchRef.current,
+            );
             // no-op until terminal PTY teardown is implemented
           });
 
           es.addEventListener('conversation_update', (e) => {
-            try {
-              const data = JSON.parse((e as MessageEvent).data) as { conversation?: Record<string, unknown> };
-              if (data.conversation) {
-                dispatchRef.current({
-                  type: 'sse_conversation_update',
-                  updates: data.conversation as Partial<import('../api').Conversation>,
-                });
-              }
-            } catch {
-              // Non-fatal — conversation metadata update can be retried on reconnect
-            }
+            const res = parseEvent(
+              SseConversationUpdateDataSchema,
+              e,
+              'conversation_update',
+              dispatchRef.current,
+            );
+            if (!res.ok) return;
+            dispatchRef.current({
+              type: 'sse_conversation_update',
+              updates: res.data.conversation as Partial<import('../api').Conversation>,
+            });
           });
 
           // Per-connection monotonic counter for sse_token dedup.
           // Reset on each new connection so the reducer's lastSequence check works correctly.
           let tokenSequence = 0;
           es.addEventListener('token', (e) => {
-            let data: { text?: string; request_id?: string };
-            try {
-              data = JSON.parse((e as MessageEvent).data) as typeof data;
-            } catch {
-              // Token parse failures are non-fatal — ephemeral events, skip silently
-              return;
-            }
-            if (data.text) {
-              tokenSequence++;
-              dispatchRef.current({
-                type: 'sse_token',
-                delta: data.text,
-                sequence: tokenSequence,
-              });
-            }
+            const res = parseEvent(SseTokenDataSchema, e, 'token', dispatchRef.current);
+            if (!res.ok) return;
+            tokenSequence++;
+            dispatchRef.current({
+              type: 'sse_token',
+              delta: res.data.text,
+              sequence: tokenSequence,
+            });
           });
 
           es.addEventListener('error', (e) => {
             // Backend application errors arrive as SSE event type "error" WITH data.
-            // Native EventSource connection errors fire with NO data.
+            // Native EventSource connection errors fire with NO data — those are
+            // not a schema concern and take the connection-error path below.
             const me = e as MessageEvent;
             if (me.data) {
-              try {
-                const data = JSON.parse(me.data) as { message?: string };
-                if (data.message) {
-                  dispatchRef.current({
-                    type: 'sse_error',
-                    error: { type: 'BackendError', message: data.message },
-                  });
-                  return; // Don't treat as connection error
-                }
-              } catch {
-                // Parse failure — fall through to connection error handling
-              }
+              const res = parseEvent(
+                SseErrorDataSchema,
+                e,
+                'error',
+                dispatchRef.current,
+              );
+              if (!res.ok) return;
+              dispatchRef.current({
+                type: 'sse_error',
+                error: { type: 'BackendError', message: res.data.message },
+              });
+              return; // Don't treat as connection error
             }
             dispatchMachineRef.current({ type: 'SSE_ERROR' });
             dispatchRef.current({ type: 'connection_state', state: 'reconnecting' });
