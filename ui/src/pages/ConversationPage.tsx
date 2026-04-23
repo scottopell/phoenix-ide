@@ -358,10 +358,12 @@ export function ConversationPage() {
     }
   }, [atom.conversation]);
 
-  // Stable ref for markFailed — needed inside sendMessage which is memoized
-  // with a stable identity across renders.
+  // Stable refs — needed inside sendMessage which is memoized with a stable
+  // identity across renders.
   const markFailedRef = useRef(markFailed);
   useEffect(() => { markFailedRef.current = markFailed; }, [markFailed]);
+  const dismissRef = useRef(dismiss);
+  useEffect(() => { dismissRef.current = dismiss; }, [dismiss]);
 
   const sendMessage = useCallback(
     async (
@@ -406,9 +408,11 @@ export function ConversationPage() {
         }
       } catch (err) {
         if (err instanceof ExpansionError) {
-          // Don't mark as failed — the user needs to fix the reference.
-          // Remove from queue so it doesn't show as a failed message.
-          markFailedRef.current(localId);
+          // Don't mark as failed — InputArea restores the draft and shows
+          // an inline error so the user can fix or remove the broken
+          // @reference (REQ-IR-007). Keeping the message in the queue as
+          // "failed" would duplicate it alongside the restored draft.
+          dismissRef.current(localId);
           // Re-throw so InputArea can display inline error (REQ-IR-007)
           throw err;
         }
