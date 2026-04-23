@@ -70,13 +70,35 @@ taskmd status <id> in-progress     # Transition a task's status
 
 ## Issue Discovery Protocol
 
-> **Finding a bug is the beginning of a task, not an observation to note and move on.**
+The trigger: you just noticed something. For example:
 
-When you encounter ANY issue—related to your current work or not:
-1. **Create a task** in `tasks/` with reproduction steps and context
-2. Then continue with your original work
+- A comment that contradicts the code.
+- A legacy pattern left behind when the rest of the codebase moved on.
+- A security check that's theater because another tool already bypasses it.
+- An escape-hatch API that undermines a "correct by construction" design.
+- A reducer branch that skips a helper all other branches go through.
 
-Do NOT delete regression files, work around problems silently, or say "this is unrelated."
+### First question: is this my current work?
+
+- **Yes** — on-path, or a tiny adjacent fix the user would expect → just do it.
+- **No** — capture it, keep moving.
+
+### Capturing: default to in-conversation TODO
+
+`taskmd new` is for items that won't be addressed this session. During active work, an in-conversation TODO is lower friction and keeps context with the discussion.
+
+### Example
+
+Mid-QA on a sub-agent's commit you spot drift in a file that was out of their scope:
+
+- **Right**: add to in-conversation TODO, finish QA, batch cleanup at session end.
+- **Wrong**: interrupt QA with `taskmd new` for each observation — fragments review, dilutes the repo's task list.
+
+### Never
+
+- Silently delete regression files
+- Say "this is unrelated" and move on without recording
+- Leave mock data, hardcoded fixtures, or stub values committed
 
 ---
 
