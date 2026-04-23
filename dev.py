@@ -573,7 +573,13 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy → musl smoke check → test (share cargo lock)."""
+        """Rust lane: clippy → musl smoke check → test compile → test run (share cargo lock).
+
+        Test compile and run are split into two steps so each gets its own
+        CHECK_TIMEOUT budget. Cold test-binary compiles on this codebase can
+        approach 300s on their own, and when bundled with ~50s of test runtime
+        the combined step exceeds the timeout even though nothing is wrong.
+        """
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
             run_step("cargo check musl", [
@@ -585,7 +591,13 @@ def cmd_check():
             ["cargo", "nextest", "--version"],
             capture_output=True,
         ).returncode == 0
-        test_cmd = ["cargo", "nextest", "run"] if has_nextest else ["cargo", "test"]
+        if has_nextest:
+            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
+            test_cmd = ["cargo", "nextest", "run"]
+        else:
+            compile_cmd = ["cargo", "test", "--no-run"]
+            test_cmd = ["cargo", "test"]
+        run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd)
 
     def lane_fast():
