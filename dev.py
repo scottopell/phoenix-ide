@@ -635,6 +635,27 @@ def cmd_check():
             results.append(("task validation", 0 if ok else 1, elapsed, ""))
             print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
+    def check_package_lock_clean():
+        """Tripwire: fail if `ui/package-lock.json` has uncommitted changes.
+
+        `./dev.py prod deploy` builds in a fresh worktree and runs `npm ci`,
+        which is strict about lockfile sync. Local-only additions (e.g. a
+        native dep that adds transitive packages on the current platform)
+        can leave the developer's lock drifted from HEAD without `./dev.py
+        check` noticing, because vitest / eslint / tsc all tolerate the
+        drift. `npm ci` in the build worktree then fails the deploy.
+        """
+        run_step("pkglock-clean", ["bash", "-c", (
+            'out=$(git status --porcelain -- ui/package-lock.json); '
+            'if [ -n "$out" ]; then '
+            '  echo "ui/package-lock.json has uncommitted changes:"; '
+            '  echo "$out"; '
+            '  echo ""; '
+            '  echo "Commit these before deploying, or \'npm ci\' in the build worktree will fail."; '
+            '  exit 1; '
+            'fi'
+        )])
+
     def check_ast_grep():
         """Run structural lint rules via ast-grep (one result entry per rule file)."""
         import shutil
@@ -663,6 +684,7 @@ def cmd_check():
         threading.Thread(target=run_step, args=("vitest", ["npx", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
+        threading.Thread(target=check_package_lock_clean),
     ]
     for t in threads:
         t.start()
