@@ -128,6 +128,23 @@ Property tests live in `**/proptests.rs` files. Run with `cargo test proptests`.
 
 ---
 
+## TypeScript codegen for SSE types (task 02677)
+
+The SSE wire format is typed on the Rust side in [`src/api/wire.rs`](src/api/wire.rs) (`SseWireEvent`). `#[derive(ts_rs::TS)]` emits the matching TypeScript under `ui/src/generated/` during `cargo test` — those files are checked into git. The valibot schemas in `ui/src/sseSchemas.ts` are annotated `satisfies v.GenericSchema<unknown, WireInitData>` etc., so a Rust-side change surfaces as a tsc error until the schema is updated.
+
+```bash
+./dev.py codegen        # Regenerate ui/src/generated/ (fast path)
+./dev.py check          # Full check including codegen-stale guard
+```
+
+`./dev.py check` runs `git diff --exit-code -- ui/src/generated/` after the Rust tests; a dirty diff means a developer edited a typed SSE struct without regenerating. The generated files should **never** be hand-edited — their headers say so.
+
+Types that feed codegen need `#[derive(ts_rs::TS)]` + `#[ts(export, export_to = "../ui/src/generated/")]`. Types that are referenced but intentionally left opaque on the TS side (e.g. `MessageContent`, `ConvState`) are annotated `#[ts(type = "unknown")]` at their reference site.
+
+Byte-for-byte wire parity with the pre-typed `json!()` path is guarded by the `parity_*` tests in `src/api/sse.rs`.
+
+---
+
 ## Adding a New Tool
 
 See [`src/tools/think.rs`](src/tools/think.rs) as the simplest example.

@@ -573,12 +573,18 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy → musl smoke check → test compile → test run (share cargo lock).
+        """Rust lane: clippy → musl smoke check → test compile → test run → codegen staleness check.
 
         Test compile and run are split into two steps so each gets its own
         CHECK_TIMEOUT budget. Cold test-binary compiles on this codebase can
         approach 300s on their own, and when bundled with ~50s of test runtime
         the combined step exceeds the timeout even though nothing is wrong.
+
+        The final `codegen-stale` step guards against Rust-type edits landing
+        without a regenerated `ui/src/generated/` directory (task 02677).
+        `cargo test` runs ts-rs' per-type `export_bindings_*` tests which
+        overwrite the generated .ts files; if those differ from what's
+        committed to git, the developer forgot to regenerate.
         """
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
@@ -599,6 +605,23 @@ def cmd_check():
             test_cmd = ["cargo", "test"]
         run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd)
+        # Codegen staleness guard. `cargo test` above re-runs the ts-rs
+        # `export_bindings_*` tests, which overwrite files in
+        # `ui/src/generated/`. A non-empty porcelain status under that path
+        # — modified or untracked — means the developer's Rust types and
+        # the committed TS don't line up.
+        run_step("codegen-stale", ["bash", "-c", (
+            # Fail if `git status --porcelain -- ui/src/generated/` has
+            # any output at all (covers modified *and* untracked).
+            'out=$(git status --porcelain -- ui/src/generated/); '
+            'if [ -n "$out" ]; then '
+            '  echo "ui/src/generated/ has uncommitted changes:"; '
+            '  echo "$out"; '
+            '  echo ""; '
+            '  echo "Run \'./dev.py codegen\' and commit the result."; '
+            '  exit 1; '
+            'fi'
+        )])
 
     def lane_fast():
         """Fast lane: cargo fmt then task validation."""
@@ -701,6 +724,40 @@ def cmd_check():
 #     files seen, not just those with errors).
 #   - A FixResult.summary() -> str convenience method returning the canonical
 #     "patched N file(s), renamed M file(s)" string would reduce boilerplate.
+
+
+def cmd_codegen() -> bool:
+    """Regenerate `ui/src/generated/` from the Rust source of truth.
+
+    Delegates to ts-rs' per-type `export_bindings_*` tests (emitted by
+    `#[derive(ts_rs::TS)]`). Those tests run as part of `cargo test` too,
+    but this subcommand is the fast-path for iterating on a Rust type:
+
+        ./dev.py codegen     # regenerate only
+        ./dev.py check       # full check including codegen-stale guard
+
+    Returns True on success, False on any cargo failure.
+    """
+    # Run only the export tests so this is fast even on a cold target.
+    # Test filter `export_bindings` matches every ts-rs-emitted test name.
+    proc = subprocess.run(
+        ["cargo", "test", "--quiet", "export_bindings"],
+        cwd=ROOT,
+    )
+    if proc.returncode != 0:
+        print("✗ codegen tests failed", file=sys.stderr)
+        return False
+    print("✓ regenerated ui/src/generated/")
+    # Best-effort summary of what changed.
+    diff = subprocess.run(
+        ["git", "diff", "--stat", "--", "ui/src/generated/"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if diff.stdout.strip():
+        print(diff.stdout)
+    else:
+        print("  (no changes)")
+    return True
 
 
 def cmd_tasks_validate(quiet: bool = False) -> bool:
@@ -2059,6 +2116,9 @@ def main():
     # check
     sub.add_parser("check", help="Run lint, fmt check, and tests")
 
+    # codegen
+    sub.add_parser("codegen", help="Regenerate ui/src/generated/ from Rust types (task 02677)")
+
     # prod
     prod_parser = sub.add_parser("prod", help="Production deployment")
     prod_sub = prod_parser.add_subparsers(dest="prod_command", required=True)
@@ -2100,6 +2160,9 @@ def main():
         cmd_status()
     elif args.command == "check":
         cmd_check()
+    elif args.command == "codegen":
+        if not cmd_codegen():
+            sys.exit(1)
     elif args.command == "prod":
         if args.prod_command == "build":
             cmd_prod_build(args.version)
