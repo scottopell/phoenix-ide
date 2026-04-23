@@ -775,7 +775,7 @@ describe('conversationReducer', () => {
   });
 
   describe('sse_error', () => {
-    it('sets uiError', () => {
+    it('sets uiError when no sequenceId (client-synthesized)', () => {
       const atom = createInitialAtom();
 
       const next = dispatch(atom, {
@@ -784,6 +784,65 @@ describe('conversationReducer', () => {
       });
 
       expect(next.uiError).toEqual({ type: 'BackendError', message: 'Something went wrong' });
+      // Client-synthesized errors do not bump the total-order counter.
+      expect(next.lastSequenceId).toBe(0);
+    });
+
+    it('routes wire-originated errors through applyIfNewer', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 42 };
+
+      const next = dispatch(atom, {
+        type: 'sse_error',
+        sequenceId: 43,
+        error: { type: 'BackendError', message: 'server hiccup' },
+      });
+
+      expect(next.uiError).toEqual({ type: 'BackendError', message: 'server hiccup' });
+      expect(next.lastSequenceId).toBe(43);
+    });
+
+    it('drops replayed wire errors after the user has moved on', () => {
+      // Simulate: user dismissed the toast (uiError = null), lastSequenceId has
+      // since advanced past the error's sequenceId, then a reconnect replays
+      // the same error. Nothing should change.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 50,
+        uiError: null,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_error',
+        sequenceId: 43,
+        error: { type: 'BackendError', message: 'old error' },
+      });
+
+      expect(next.uiError).toBeNull();
+      expect(next.lastSequenceId).toBe(50);
+    });
+
+    it('applies a wire error only once when dispatched twice with the same sequenceId', () => {
+      const atom = createInitialAtom();
+
+      const a1 = dispatch(atom, {
+        type: 'sse_error',
+        sequenceId: 10,
+        error: { type: 'BackendError', message: 'first' },
+      });
+      // User dismisses.
+      const a2 = dispatch(a1, { type: 'clear_error' });
+      expect(a2.uiError).toBeNull();
+
+      // Replay of the same envelope (e.g. after a reconnect before the server
+      // advances its counter). Should be a no-op — the toast stays dismissed.
+      const a3 = dispatch(a2, {
+        type: 'sse_error',
+        sequenceId: 10,
+        error: { type: 'BackendError', message: 'first' },
+      });
+
+      expect(a3.uiError).toBeNull();
+      expect(a3.lastSequenceId).toBe(10);
     });
   });
 

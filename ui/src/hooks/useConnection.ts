@@ -352,6 +352,7 @@ export function useConnection({
               if (!res.ok) return;
               dispatchRef.current({
                 type: 'sse_error',
+                sequenceId: res.data.sequence_id,
                 error: { type: 'BackendError', message: res.data.message },
               });
               return; // Don't treat as connection error

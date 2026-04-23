@@ -43,9 +43,11 @@ export interface InitPayload {
 // for the contract.
 //
 // Client-originated actions (`local_phase_change`, `local_conversation_update`,
-// `set_initial_data`, `connection_state`, `set_system_prompt`, `sse_error`,
-// `clear_error`) do not go through `applyIfNewer` and do not mutate
-// `lastSequenceId`. They exist so UI code can optimistically reflect a
+// `set_initial_data`, `connection_state`, `set_system_prompt`, `clear_error`,
+// and `sse_error` when synthesized client-side) do not go through
+// `applyIfNewer` and do not mutate `lastSequenceId`. (Wire-originated
+// `sse_error` carries a `sequenceId` and IS routed through `applyIfNewer`.)
+// They exist so UI code can optimistically reflect a
 // user action (e.g. "I pressed send; show 'awaiting_llm'") without
 // colliding with the server's total order — the real server-side phase
 // change arrives afterwards via `sse_state_change` and takes precedence
@@ -64,7 +66,13 @@ export type SSEAction =
   | { type: 'sse_agent_done'; sequenceId: number }
   | { type: 'sse_token'; sequenceId: number; delta: string }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation> }
-  | { type: 'sse_error'; error: UIError }
+  // `sequenceId` is present when the error originated on the wire (server's
+  // monotonic counter) and absent when it was synthesized client-side for a
+  // schema / parse violation in useConnection.ts. Wire-originated errors are
+  // routed through `applyIfNewer` so a replay after reconnect cannot re-pop a
+  // toast the user already dismissed; client-synthesized errors are not part
+  // of the server's total order and apply unconditionally.
+  | { type: 'sse_error'; error: UIError; sequenceId?: number }
   | { type: 'clear_error' }
   | { type: 'connection_state'; state: ConversationAtom['connectionState'] }
   // Client-originated optimistic phase change. No sequence_id — not part of
@@ -415,6 +423,17 @@ export function conversationReducer(
       });
 
     case 'sse_error':
+      // Wire-originated errors carry a sequenceId and route through the
+      // standard dedup path, so a replay of the same error after reconnect
+      // can't re-pop a toast the user already dismissed. Client-synthesized
+      // errors (schema violations, malformed JSON) have no sequenceId and
+      // apply unconditionally — they're not on the server's total order.
+      if (action.sequenceId !== undefined) {
+        return applyIfNewer(atom, 'sse_error', action.sequenceId, (a) => ({
+          ...a,
+          uiError: action.error,
+        }));
+      }
       return { ...atom, uiError: action.error };
 
     case 'clear_error':
