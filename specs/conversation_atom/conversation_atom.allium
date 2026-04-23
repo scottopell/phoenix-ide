@@ -1,0 +1,487 @@
+-- allium: 3
+-- conversation_atom.allium
+--
+-- Phoenix Client Conversation Reducer: Behavioural Specification
+--
+-- Scope: The pure-function reducer in `ui/src/conversation/atom.ts` that
+--        folds dispatched actions (wire-originated SSE events + local
+--        optimistic updates) into the `ConversationAtom` state used to
+--        render the conversation view.
+--
+-- Includes: State shape; applyIfNewer guard; per-action transitions;
+--           sequence_id total ordering; sse_message atomic triple
+--           (append + clear buffer + advance seq); streaming buffer
+--           phase coupling; wire vs local dispatch distinction;
+--           init merge-by-id semantics for reconnect resync.
+--
+-- Excludes: HTTP/SSE transport (see sse_wire spec, if written).
+--           ConnectionMachine (see connection_machine spec, if written).
+--           Message rendering (how atom.messages projects to DOM).
+--           Server-side state machine (see bedrock).
+--           The queued-message derivation in useMessageQueue (see
+--           user_message_queue spec, if written).
+--
+-- Rationale: this reducer is the nexus of SSE-state fragility. Past bugs
+-- (02673, 02675, 02676, ongoing "streaming-finalizes-then-disappears")
+-- were all invariant violations of the atomic-triple or phase-coupling
+-- rules below. Naming them here makes the next violation diagnosable by
+-- construction instead of by refresh-and-hope.
+--
+-- Self-contained: this spec does not `use` any other spec. External
+-- types (Phase, Message content, Conversation metadata) are declared
+-- opaque. The reducer treats them opaquely; the server-side specs
+-- govern their internals.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A persisted conversation message. The reducer treats `content` opaquely;
+-- view code pattern-matches on `message_type`. `message_id` is the
+-- client-authored localId (API POST uses it as the canonical id); this
+-- makes identity-based dedup work across client-server boundaries.
+value Message {
+    message_id: String
+    sequence_id: Integer
+    message_type: String
+    -- content, display_data, usage_data, created_at elided; the reducer
+    -- does not inspect them.
+}
+
+-- Opaque conversation phase. The reducer only tests `phase.type` as a
+-- string and otherwise passes the value through. Full semantics live in
+-- bedrock's ConvState.
+value Phase {
+    type: String
+}
+
+-- The in-flight streaming text for an assistant turn. Populated only
+-- while phase.type = "llm_requesting". Cleared atomically on sse_message
+-- or sse_agent_done. `lastSequence` is the highest sequence_id this
+-- buffer has ingested — a replay guard against late tokens with stale
+-- ids.
+value StreamingBuffer {
+    text: String
+    lastSequence: Integer
+    startedAt: Timestamp
+}
+
+-- UI-facing error surfaced via a toast. Either a wire-originated backend
+-- error (carrying its own sequence_id) or a client-synthesized schema
+-- violation (no sequence_id).
+value UIError {
+    type: String
+    message: String
+}
+
+-- Breadcrumb displayed in the phase trail. Kind-discriminated; the
+-- reducer threads sequence_ids through for dedup on reconnect.
+value Breadcrumb {
+    kind: String
+    label: String
+    sequence_id: Integer?
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The reducer's state. Updated via pure transitions from dispatched
+-- actions.
+entity ConversationAtom {
+    conversationId: String?
+    phase: Phase
+    messages: List<Message>
+    breadcrumbs: List<Breadcrumb>
+    lastSequenceId: Integer
+    streamingBuffer: StreamingBuffer?
+    uiError: UIError?
+    connectionState: String
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The React reducer function itself, operating on a single
+-- ConversationAtom per mounted ConversationPage. Rules below describe
+-- what the reducer does on each dispatched action. The actor exists
+-- here primarily to anchor the ConversationAtom entity to a concrete
+-- runtime consumer; rules do not reference it by name.
+actor ClientReducer {
+    identified_by: ConversationAtom
+}
+
+------------------------------------------------------------
+-- Rules — wire-originated transitions
+------------------------------------------------------------
+-- Every wire rule routes through the applyIfNewer guard: the action's
+-- sequence_id must strictly exceed atom.lastSequenceId, or the event is
+-- dropped as a replay. On apply, lastSequenceId advances to the action's
+-- sequence_id. Sse_init is the exception (see its rule below).
+
+-- `init` on fresh connect: full state snapshot replaces atom.
+rule SseInitFreshConnect {
+    when: SseInitDispatched(atom, payload)
+
+    requires: atom.lastSequenceId = 0
+
+    ensures: atom.messages = payload.messages
+    ensures: atom.phase = payload.phase
+    ensures: atom.breadcrumbs = payload.breadcrumbs
+    ensures: atom.lastSequenceId = payload.last_sequence_id
+    ensures: atom.streamingBuffer = null
+    ensures: atom.uiError = null
+}
+
+-- `init` on reconnect: merge by message_id. Replace existing messages
+-- with incoming (captures mutations that happened while disconnected);
+-- append genuinely new messages. `lastSequenceId` advances to the
+-- max of its current value and the payload's — never regresses, even
+-- if the payload was produced before a live event that raced ahead.
+rule SseInitReconnectMerge {
+    when: SseInitDispatched(atom, payload)
+
+    requires: atom.lastSequenceId > 0
+
+    ensures: atom.messages = merge_by_id(atom.messages, payload.messages)
+    ensures: atom.phase = payload.phase
+    ensures: atom.breadcrumbs = payload.breadcrumbs
+    ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
+    ensures: atom.streamingBuffer = null
+    ensures: atom.uiError = null
+
+    @guidance
+        -- merge_by_id (ui/src/conversation/atom.ts:sse_init case):
+        --   1. Build a Map<message_id, Message> from payload.messages.
+        --   2. For each existing m in atom.messages: replace with the
+        --      incoming version if present, else keep as-is.
+        --   3. Filter payload.messages for entries whose message_id is
+        --      not already in atom.messages (genuinely new messages).
+        --   4. Concatenate (replaced ++ appended).
+        -- The merge is what lets a reconnect after a broadcast-lag close
+        -- resurrect messages that were lost to the silent-drop window.
+}
+
+-- `message` — a newly-persisted message appended to the conversation.
+-- THE LOAD-BEARING RULE: this transition is atomic and must mutate all
+-- three of messages / streamingBuffer / lastSequenceId simultaneously.
+-- The "streaming-finalizes-then-disappears" bug class is every shape of
+-- this triple being applied partially.
+rule SseMessageAppended {
+    when: SseMessageDispatched(atom, message, seq)
+
+    requires: seq > atom.lastSequenceId
+    requires: not message_in_list(atom.messages, message.message_id)
+
+    ensures: atom.messages = append(atom.messages, message)
+    ensures: atom.streamingBuffer = null
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- Each of the three ensures clauses above MUST hold jointly. A
+        -- partial apply (e.g. streamingBuffer cleared but the message
+        -- not appended) is exactly the "streaming-finalizes-then-
+        -- disappears" shape we see in production. The React reducer's
+        -- single return statement gives us atomicity by construction as
+        -- long as all three fields are set in that return.
+        --
+        -- User/skill messages additionally reset breadcrumbs to a fresh
+        -- agent turn. Tool-result messages update the matching tool
+        -- breadcrumb with a result summary derived from content. These
+        -- are local to breadcrumbs; they do not relax the triple.
+}
+
+-- `message` when the message_id is already present (defense-in-depth
+-- dedup against a server replay with a fresh sequence_id). The
+-- sequence_id still advances — we have observed the event — but
+-- messages and streamingBuffer are left intact.
+rule SseMessageDedupReplay {
+    when: SseMessageDispatched(atom, message, seq)
+
+    requires: seq > atom.lastSequenceId
+    requires: message_in_list(atom.messages, message.message_id)
+
+    ensures: atom.messages = atom.messages
+    ensures: atom.streamingBuffer = atom.streamingBuffer
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- A replay implies the original apply already ran and cleared
+        -- the buffer at the time. If buffer is non-null now, it is
+        -- from a later turn, not the replayed message's turn — so
+        -- leaving it untouched is correct.
+}
+
+-- Replays below the current watermark are dropped entirely.
+rule SseMessageReplayDropped {
+    when: SseMessageDispatched(atom, message, seq)
+
+    requires: seq <= atom.lastSequenceId
+
+    ensures: atom = atom
+}
+
+-- `message_updated` — in-place mutation of existing message fields
+-- (display_data, content). Target must exist; a missing target is a
+-- silent no-op (the update cannot land before its message, but a
+-- reconnect race could reorder — tolerating the no-op is safer than
+-- erroring).
+rule SseMessageUpdatedApplied {
+    when: SseMessageUpdatedDispatched(atom, messageId, seq)
+
+    requires: seq > atom.lastSequenceId
+    requires: message_in_list(atom.messages, messageId)
+
+    ensures: atom.messages = replace_message(atom.messages, messageId)
+    ensures: atom.lastSequenceId = seq
+    ensures: atom.streamingBuffer = atom.streamingBuffer
+}
+
+rule SseMessageUpdatedUnknownTarget {
+    when: SseMessageUpdatedDispatched(atom, messageId, seq)
+
+    requires: seq > atom.lastSequenceId
+    requires: not message_in_list(atom.messages, messageId)
+
+    ensures: atom.messages = atom.messages
+    ensures: atom.lastSequenceId = seq
+}
+
+-- `state_change` — phase transition from the server.
+rule SseStateChangeApplied {
+    when: SseStateChangeDispatched(atom, newPhase, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.phase = newPhase
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- Also threads the breadcrumb for the new phase (llm_requesting,
+        -- tool_executing, etc.) through applyBreadcrumb, which dedups
+        -- by sequence_id. Elided here to keep the rule focused.
+}
+
+-- `agent_done` — turn complete. Phase collapses to idle and the
+-- streaming buffer clears (whether or not a sse_message preceded it).
+-- If the preceding sse_message was lost (e.g. to the pre-736b37d
+-- broadcast-lag silent-drop path), this rule leaves the atom with no
+-- visible final message — the bug shape we spent much of April 23
+-- investigating.
+rule SseAgentDoneApplied {
+    when: SseAgentDoneDispatched(atom, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.phase.type = "idle"
+    ensures: atom.streamingBuffer = null
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- After this rule, streamingBuffer is null regardless of
+        -- whether the turn's sse_message ever arrived. A gap in the
+        -- expected event order (agent_done without preceding message)
+        -- is NOT recoverable at the reducer; the client must reconnect
+        -- to resync via sse_init. The broadcast-lag close fix in
+        -- src/api/sse.rs (commit 736b37d) forces this resync by ending
+        -- the stream on Lagged instead of silently skipping events.
+}
+
+-- `token` — streaming delta. Phase-guarded: only accumulates while the
+-- conversation is in llm_requesting. Tokens that arrive outside that
+-- phase (scheduler race, reconnect replay) are silently dropped. This
+-- is the client-side half of the "ghost streaming message" defense
+-- (task 24683). The applyIfNewer guard handles sequence-id replays.
+rule SseTokenAccumulated {
+    when: SseTokenDispatched(atom, delta, seq)
+
+    requires: atom.phase.type = "llm_requesting"
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.streamingBuffer = accumulate_token(atom.streamingBuffer, delta, seq)
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- accumulate_token: if streamingBuffer is null, start a new one
+        -- with text = delta, lastSequence = seq, startedAt = now. If
+        -- non-null, append delta to text, advance lastSequence to seq.
+        -- startedAt is preserved from the first token.
+}
+
+rule SseTokenDroppedOutOfPhase {
+    when: SseTokenDispatched(atom, delta, seq)
+
+    requires: atom.phase.type != "llm_requesting"
+
+    ensures: atom = atom
+
+    @guidance
+        -- lastSequenceId does NOT advance here: a token dropped for
+        -- phase reasons is not an observed event in the total-order
+        -- sense. It was emitted, but we refuse it.
+}
+
+-- `conversation_update` — partial metadata merge.
+rule SseConversationUpdateApplied {
+    when: SseConversationUpdateDispatched(atom, updates, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- Shallow merge into atom.conversation. If atom.conversation is
+        -- null (init hasn't landed), the rule applies lastSequenceId
+        -- but leaves the merge as a no-op.
+}
+
+-- `sse_error` with a sequence_id (wire-originated) routes through
+-- applyIfNewer. A replayed error after the user dismissed it does NOT
+-- re-pop the toast (because applyIfNewer drops it as a replay).
+rule SseErrorWireOriginated {
+    when: SseErrorDispatched(atom, error, seq)
+
+    requires: seq > 0
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.uiError = error
+    ensures: atom.lastSequenceId = seq
+}
+
+-- `sse_error` WITHOUT a sequence_id (client-synthesized, e.g. schema
+-- violation from parseEvent's prod failure path) applies
+-- unconditionally. These are not on the server's total order, so
+-- applyIfNewer cannot gate them.
+rule SseErrorClientSynthesized {
+    when: SseErrorDispatched(atom, error, seq)
+
+    requires: seq = 0
+
+    ensures: atom.uiError = error
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+}
+
+------------------------------------------------------------
+-- Rules — local (optimistic) transitions
+------------------------------------------------------------
+
+-- `local_phase_change` — used by sendMessage() to flip phase to
+-- awaiting_llm the moment the POST returns, without waiting for the
+-- server's sse_state_change. Does NOT touch lastSequenceId; a
+-- subsequent wire event will overwrite phase authoritatively.
+rule LocalPhaseChangeApplied {
+    when: LocalPhaseChangeDispatched(atom, newPhase)
+
+    ensures: atom.phase = newPhase
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+    ensures: atom.streamingBuffer = atom.streamingBuffer
+}
+
+rule LocalConversationUpdateApplied {
+    when: LocalConversationUpdateDispatched(atom, updates)
+
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- Shallow merge into atom.conversation. No-op if
+        -- atom.conversation is null.
+}
+
+rule ClearError {
+    when: ClearErrorDispatched(atom)
+
+    ensures: atom.uiError = null
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+}
+
+rule ConnectionStateChanged {
+    when: ConnectionStateDispatched(atom, newState)
+
+    ensures: atom.connectionState = newState
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+}
+
+-- Seeds initial data from localStorage cache or an initial REST fetch.
+-- No-op if SSE has already provided authoritative data.
+rule SetInitialData {
+    when: SetInitialDataDispatched(atom, snapshot)
+
+    requires: atom.lastSequenceId = 0
+
+    ensures: atom.conversationId = snapshot.conversationId
+    ensures: atom.messages = snapshot.messages
+    ensures: atom.phase = snapshot.phase
+}
+
+rule SetInitialDataNoOp {
+    when: SetInitialDataDispatched(atom, snapshot)
+
+    requires: atom.lastSequenceId > 0
+
+    ensures: atom = atom
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Messages are uniquely identified by message_id. The defense-in-depth
+-- dedup in SseMessageDedupReplay enforces this at the reducer level.
+invariant MessagesUniqueById {
+    for a in ConversationAtoms:
+        for i in a.messages:
+            for j in a.messages:
+                i != j implies i.message_id != j.message_id
+}
+
+-- The streaming buffer is valid only while the conversation is in the
+-- llm_requesting phase. Any transition that moves phase out of
+-- llm_requesting must clear the buffer.
+invariant StreamingBufferPhaseCoupled {
+    for a in ConversationAtoms:
+        a.streamingBuffer != null implies a.phase.type = "llm_requesting"
+}
+
+-- Sequence ids are non-negative.
+invariant LastSequenceIdNonNegative {
+    for a in ConversationAtoms:
+        a.lastSequenceId >= 0
+}
+
+-- Streaming buffer's internal lastSequence cannot exceed the atom's
+-- lastSequenceId. Tokens feed both; a buffer lastSequence ahead of the
+-- atom would mean a token was accumulated without its sequence_id
+-- being observed by applyIfNewer, which is impossible by construction
+-- (SseTokenAccumulated updates both).
+invariant BufferSequenceWithinAtomSequence {
+    for a in ConversationAtoms:
+        a.streamingBuffer != null
+            implies a.streamingBuffer.lastSequence <= a.lastSequenceId
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+-- Kept as prose rather than `open question` declarations so the file
+-- remains parseable. Both are design-intent clarifications rather than
+-- blocking ambiguities; they live here for the next reader.
+--
+-- Q1. SseErrorWireOriginated uses applyIfNewer, so a server replay of
+--     the same error on reconnect is dropped. But ClearError (user
+--     dismissed) sets uiError = null without touching lastSequenceId.
+--     A fresh error on a later sequence_id would therefore land and
+--     re-pop. Is that desired? Today it is — a new error is new
+--     information — but this is the kind of detail that wants
+--     explicit confirmation.
+--
+-- Q2. SseInitReconnectMerge uses max(atom.lastSequenceId,
+--     payload.last_sequence_id) to prevent regression when live
+--     events raced ahead of the init payload. Consider the reverse:
+--     if the client's atom.lastSequenceId was advanced by a
+--     dropped-but-seq-observed event (SseMessageDedupReplay), it
+--     could be ahead of events the payload actually reflects.
+--     Payload's per-message sequence_ids are the ground truth for
+--     what happened; the envelope last_sequence_id is the server's
+--     witness. Today this is fine; flag if the dedup behavior ever
+--     changes.
