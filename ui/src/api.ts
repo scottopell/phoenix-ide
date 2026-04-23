@@ -176,13 +176,6 @@ export interface UsageData {
   cache_read_input_tokens?: number;
 }
 
-export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'conversation_update' | 'disconnected';
-export type SseEventData =
-  | import('./generated/sse').SseInitData
-  | import('./generated/sse').SseMessageData
-  | import('./generated/sse').SseStateChangeData
-  | Record<string, never>;
-
 export interface ModelInfo {
   id: string;
   provider: string;
@@ -654,42 +647,4 @@ export const api = {
     return resp.json();
   },
 
-  streamConversation(
-    convId: string,
-    onEvent: (eventType: SseEventType, data: SseEventData) => void
-  ): EventSource {
-    const es = new EventSource(`/api/conversations/${convId}/stream`);
-
-    es.addEventListener('init', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as import('./generated/sse').SseInitData;
-      onEvent('init', data);
-    });
-
-    es.addEventListener('message', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as import('./generated/sse').SseMessageData;
-      onEvent('message', data);
-    });
-
-    es.addEventListener('state_change', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as import('./generated/sse').SseStateChangeData;
-      onEvent('state_change', data);
-    });
-
-    es.addEventListener('agent_done', () => {
-      onEvent('agent_done', {});
-    });
-
-    es.addEventListener('conversation_update', (e) => {
-      const data = JSON.parse((e as MessageEvent).data);
-      onEvent('conversation_update', data);
-    });
-
-    es.addEventListener('error', () => {
-      if (es.readyState === EventSource.CLOSED) {
-        onEvent('disconnected', {});
-      }
-    });
-
-    return es;
-  },
 };
