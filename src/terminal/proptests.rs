@@ -6,7 +6,10 @@
 //!   - `ParserDimensionSync` invariant (REQ-TERM-006, REQ-TERM-010)
 //!   - `is_terminal()` correctness (REQ-TERM-012 precondition)
 //!   - Dims validity (`ResizeFrameRejected` precondition)
-//!   - `try_insert` 409 semantics (`DuplicateTerminalRejected` rule)
+//!   - `try_insert` atomic semantics (used on the fresh-session path; the
+//!     reclaim path — task 24691 — goes through `get` + `stop_tx.send`
+//!     and is exercised in `terminal::ws::reclaim_tests` and
+//!     `terminal::relay::tests::*detach*`)
 //!   - remove/get lifecycle (`TerminalOpened` / `UserClosedTerminal` state transitions)
 
 #![allow(clippy::unwrap_used)]
@@ -47,6 +50,9 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
     // SAFETY: we own the fd, transferring to OwnedFd.
     let owned_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) };
 
+    use crate::terminal::session::StopReason;
+    let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
+
     super::session::TerminalHandle {
         master_fd: owned_fd,
         child_pid: nix::unistd::Pid::from_raw(1), // init — never reaped in tests
@@ -56,13 +62,18 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
         shell_integration_status: std::sync::Arc::new(std::sync::Mutex::new(
             ShellIntegrationStatus::Unknown,
         )),
+        stop_tx,
+        detached: std::sync::Arc::new(tokio::sync::Notify::new()),
     }
 }
 
 // ── Unit: OneTerminalPerConversation (registry semantics) ─────────────────────
 
-/// REQ-TERM-003 / `DuplicateTerminalRejected` rule:
-/// `try_insert` on an already-active conversation returns `None`.
+/// REQ-TERM-003 atomicity: `try_insert` on an already-active conversation
+/// returns `None`. The higher-level handler (see `ws.rs::acquire_handle`)
+/// treats that as a signal to reclaim the winner rather than reject —
+/// see task 24691 and `DuplicateConnectionReclaimsSession` in terminal.allium.
+/// This test covers only the registry-level atomicity used as the race guard.
 #[test]
 fn try_insert_rejects_duplicate() {
     let registry = ActiveTerminals::new();

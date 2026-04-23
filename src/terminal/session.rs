@@ -4,8 +4,28 @@ use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
+use tokio::sync::{watch, Notify};
 
 use super::command_tracker::CommandTracker;
+
+/// Why the current relay should stop.
+///
+/// `Running` is the initial value on a fresh session. The relay watches for
+/// transitions away from it:
+/// - `Detach`: drop this relay so a reclaiming connection can take over. The
+///   shell and `TerminalHandle` must survive.
+/// - `TearDown`: the conversation reached a terminal state (REQ-TERM-012) or
+///   another hard-stop path — the shell must die.
+///
+/// Branching on this value in the relay's exit handler lets us split "WS
+/// close" (no shell kill) from "conversation end" (kill shell) without a
+/// separate out-of-band flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Running,
+    Detach,
+    TearDown,
+}
 
 /// Shell integration detection state (REQ-TERM-015).
 ///
@@ -61,6 +81,18 @@ pub struct TerminalHandle {
     pub tracker: Arc<Mutex<CommandTracker>>,
     /// Shell integration detection state.
     pub shell_integration_status: Arc<Mutex<ShellIntegrationStatus>>,
+    /// Signal the currently-attached relay to stop.
+    ///
+    /// Kept on the handle (not the relay) so a reclaiming connection can
+    /// drive the sitting relay to exit without touching its local state.
+    /// Reset to `Running` before each new relay starts.
+    pub stop_tx: watch::Sender<StopReason>,
+    /// Notified when a relay observes a `Detach` stop and exits cleanly.
+    ///
+    /// A reclaiming connection sends `Detach` then awaits this notification;
+    /// `Notify` stores one permit so the wake races cleanly (the permit is
+    /// delivered whether the waiter shows up before or after `notify_one`).
+    pub detached: Arc<Notify>,
 }
 
 impl std::fmt::Debug for TerminalHandle {
@@ -85,9 +117,11 @@ impl ActiveTerminals {
 
     /// Returns `true` if a terminal is currently active for `conversation_id`.
     ///
-    /// Used as a fast pre-spawn check (REQ-TERM-003) to avoid wasting a
-    /// fork+exec on duplicate connections. `try_insert` is still the
-    /// authoritative atomic guard against races.
+    /// Retained for tests / external consumers; the `ws.rs` handler now goes
+    /// directly to `get` (reclaim path) or `try_insert` (fresh path) without
+    /// a separate pre-check, since a pre-check can't avoid the reclaim race.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn is_active(&self, conversation_id: &str) -> bool {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.contains_key(conversation_id)

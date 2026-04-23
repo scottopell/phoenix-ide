@@ -27,17 +27,21 @@ use futures::StreamExt;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use super::session::Dims;
+use super::session::{Dims, StopReason};
 
 /// How the relay loop exited.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// `Stopped` carries the `StopReason` the writer observed so the handler
+/// can branch on detach-vs-teardown without a follow-up `stop_rx.borrow()`
+/// (which would race with a concurrent reclaimer resetting the channel).
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RelayExit {
     /// PTY EOF: `read()` returned 0 bytes or EIO (shell exited). REQ-TERM-007.
     PtyEof,
     /// WebSocket stream closed by client or disconnected.
     WsClosed,
-    /// Stopped by external signal (stop channel or `ws_closed` notify).
-    Stopped,
+    /// Stopped by the external stop channel; payload is the reason observed.
+    Stopped(StopReason),
 }
 
 // ── PtyMasterIo ──────────────────────────────────────────────────────────────
@@ -166,7 +170,7 @@ const READ_BUF: usize = 4096;
 pub struct RelayConfig<F> {
     pub tracker: Arc<Mutex<CommandTracker>>,
     pub on_resize: F,
-    pub stop_rx: tokio::sync::watch::Receiver<bool>,
+    pub stop_rx: tokio::sync::watch::Receiver<StopReason>,
     pub conv_id: String,
 }
 
@@ -192,30 +196,45 @@ where
     let (pty_read, pty_write) = tokio::io::split(pty);
 
     let ws_closed = Arc::new(tokio::sync::Notify::new());
+    // Shared slot: writer publishes its exit reason here before firing
+    // `ws_closed`. If the reader wakes on that notify first, it reads the
+    // slot so callers see the writer's authoritative `StopReason(...)` /
+    // `WsClosed` rather than a generic stop. `None` means the writer is
+    // still running (or the reader's own read path fired first).
+    let writer_outcome: Arc<Mutex<Option<RelayExit>>> = Arc::new(Mutex::new(None));
 
-    let read_exit = relay_reader(
+    let read_future = relay_reader(
         pty_read,
         ws_outgoing,
         Arc::clone(&tracker),
         Arc::clone(&ws_closed),
+        Arc::clone(&writer_outcome),
         conv_id,
     );
 
-    let write_exit = relay_writer(
+    let write_future = relay_writer(
         pty_write,
         ws_incoming,
         on_resize,
         stop_rx,
         ws_closed,
+        writer_outcome,
         conv_id,
     );
 
     // Race: whichever side exits first determines the exit reason.
     // The other side is cancelled when select! resolves.
+    //
+    // `biased` polls the reader first so `PtyEof` wins over any writer-side
+    // condition that happens to be simultaneously ready (e.g. a `stream::empty`
+    // `ws_incoming` in tests). The writer communicates its stop-reason back
+    // to the reader via the shared `writer_outcome` slot before firing
+    // `ws_closed`, so the reader's fallback path can surface the reason
+    // honestly rather than substituting a generic `Stopped`.
     tokio::select! {
         biased;
-        exit = read_exit => exit,
-        exit = write_exit => exit,
+        exit = read_future => exit,
+        exit = write_future => exit,
     }
 }
 
@@ -226,6 +245,7 @@ async fn relay_reader<R, Out>(
     mut ws_outgoing: Out,
     tracker: Arc<Mutex<CommandTracker>>,
     ws_closed: Arc<tokio::sync::Notify>,
+    writer_outcome: Arc<Mutex<Option<RelayExit>>>,
     conv_id: &str,
 ) -> RelayExit
 where
@@ -239,8 +259,20 @@ where
         tokio::select! {
             biased;
             () = ws_closed.notified() => {
-                tracing::debug!(conv_id = %conv_id, "Terminal relay: WS closed, reader exiting");
-                return RelayExit::Stopped;
+                // The writer fired `ws_closed` because it's exiting. It
+                // published its reason in `writer_outcome` before notifying, so
+                // we surface that to the caller rather than a substituted
+                // `Stopped` value. Falling back to `WsClosed` is correct when
+                // the slot is somehow empty: `ws_closed` is only notified
+                // from writer-exit paths, all of which match `WsClosed`
+                // semantics if we have no further information.
+                let exit = writer_outcome
+                    .lock()
+                    .expect("writer_outcome lock")
+                    .take()
+                    .unwrap_or(RelayExit::WsClosed);
+                tracing::debug!(conv_id = %conv_id, ?exit, "Terminal relay: WS closed, reader exiting");
+                return exit;
             }
             result = pty_read.read(&mut buf) => match result {
                 Ok(0) => {
@@ -277,31 +309,42 @@ async fn relay_writer<W>(
     mut pty_write: W,
     mut ws_incoming: impl futures::Stream<Item = Vec<u8>> + Unpin,
     on_resize: impl Fn(Dims),
-    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    mut stop_rx: tokio::sync::watch::Receiver<StopReason>,
     ws_closed: Arc<tokio::sync::Notify>,
+    writer_outcome: Arc<Mutex<Option<RelayExit>>>,
     conv_id: &str,
 ) -> RelayExit
 where
     W: AsyncWrite + Unpin,
 {
+    // Publish our exit reason to the shared slot, wake the reader, and
+    // return. Must be called immediately before returning so the reader
+    // sees our reason if the select races to the reader first.
+    let exit_with = |exit: RelayExit| -> RelayExit {
+        *writer_outcome.lock().expect("writer_outcome lock") = Some(exit.clone());
+        ws_closed.notify_one();
+        exit
+    };
+
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    ws_closed.notify_one();
-                    return RelayExit::Stopped;
+                // Copy out the reason before notifying — the reader's wakeup
+                // could race with another caller resetting the channel (e.g.
+                // a reclaimer transitioning Running → Detach → Running for a
+                // new relay). The copy freezes our view.
+                let reason = *stop_rx.borrow();
+                if reason != StopReason::Running {
+                    return exit_with(RelayExit::Stopped(reason));
                 }
             }
             msg = ws_incoming.next() => {
                 let Some(data) = msg else {
-                    // Stream ended — WS closed.
-                    ws_closed.notify_one();
-                    return RelayExit::WsClosed;
+                    return exit_with(RelayExit::WsClosed);
                 };
 
                 if !dispatch_incoming_frame(&mut pty_write, &on_resize, &data, conv_id).await {
-                    ws_closed.notify_one();
-                    return RelayExit::WsClosed;
+                    return exit_with(RelayExit::WsClosed);
                 }
             }
         }
@@ -377,8 +420,8 @@ mod tests {
         Arc::new(Mutex::new(CommandTracker::new("test-session".to_string())))
     }
 
-    fn default_stop() -> tokio::sync::watch::Receiver<bool> {
-        watch::channel(false).1
+    fn default_stop() -> tokio::sync::watch::Receiver<StopReason> {
+        watch::channel(StopReason::Running).1
     }
 
     fn null_resize() -> impl Fn(Dims) {
@@ -768,5 +811,225 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    // ========================================================================
+    // Reclaim-on-reconnect: stop-reason branching
+    // ========================================================================
+    //
+    // Task 24691: a WS reconnect for an already-active session signals the
+    // sitting relay via `StopReason::Detach`. The relay must exit with
+    // `RelayExit::Stopped(Detach)` (not a generic `Stopped`), leaving the
+    // tracker and any other handle state untouched so a second relay can
+    // continue the session.
+
+    /// Detach exit: the relay returns `Stopped(Detach)` and the tracker
+    /// retains the command records it captured before the detach signal.
+    #[tokio::test]
+    async fn detach_exit_preserves_tracker_state() {
+        use crate::terminal::test_helpers::full_command;
+
+        let (mut shell_end, pty_end) = tokio::io::duplex(4096);
+        let tracker = make_tracker();
+        let (ws_tx, _ws_rx) = ws_out_channel(32);
+        let ws_in = futures::stream::pending::<Vec<u8>>().boxed();
+
+        let (stop_tx, stop_rx) = watch::channel(StopReason::Running);
+
+        // Write a complete command into the tracker before stopping.
+        let bytes = full_command("echo hi", "hi\n", Some(0));
+        shell_end.write_all(&bytes).await.unwrap();
+
+        // Drive the relay, then send Detach after the tracker has ingested.
+        let tracker_for_relay = Arc::clone(&tracker);
+        let relay = tokio::spawn(async move {
+            run_relay(
+                pty_end,
+                ws_tx,
+                ws_in,
+                RelayConfig {
+                    tracker: tracker_for_relay,
+                    on_resize: null_resize(),
+                    stop_rx,
+                    conv_id: "detach-test".to_string(),
+                },
+            )
+            .await
+        });
+
+        // Give the relay a moment to ingest the write, then signal detach.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stop_tx.send(StopReason::Detach).unwrap();
+
+        let exit = relay.await.unwrap();
+        assert_eq!(
+            exit,
+            RelayExit::Stopped(StopReason::Detach),
+            "detach signal must surface as Stopped(Detach)"
+        );
+
+        // Tracker kept the command record across the detach — shell-and-session
+        // state survives, only the relay is torn down.
+        let rec = tracker
+            .lock()
+            .unwrap()
+            .last_command()
+            .cloned()
+            .expect("tracker must retain the command record across detach");
+        assert_eq!(rec.command_text, "echo hi");
+        assert_eq!(rec.exit_code, Some(0));
+    }
+
+    /// TearDown exit: the relay returns `Stopped(TearDown)` so the handler
+    /// can branch into full shell teardown (REQ-TERM-012).
+    #[tokio::test]
+    async fn teardown_exit_returns_teardown_reason() {
+        let (_shell_end, pty_end) = tokio::io::duplex(4096);
+        let tracker = make_tracker();
+        let (ws_tx, _ws_rx) = ws_out_channel(32);
+        let ws_in = futures::stream::pending::<Vec<u8>>().boxed();
+
+        let (stop_tx, stop_rx) = watch::channel(StopReason::Running);
+
+        let relay = tokio::spawn(async move {
+            run_relay(
+                pty_end,
+                ws_tx,
+                ws_in,
+                RelayConfig {
+                    tracker,
+                    on_resize: null_resize(),
+                    stop_rx,
+                    conv_id: "teardown-test".to_string(),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        stop_tx.send(StopReason::TearDown).unwrap();
+
+        let exit = relay.await.unwrap();
+        assert_eq!(exit, RelayExit::Stopped(StopReason::TearDown));
+    }
+
+    /// Second relay over the same tracker continues processing after a detach.
+    /// Emulates the reclaim path: relay 1 exits via Detach, relay 2 starts
+    /// fresh on the same tracker and captures another command.
+    #[tokio::test]
+    async fn second_relay_continues_over_same_tracker() {
+        use crate::terminal::test_helpers::full_command;
+
+        let tracker = make_tracker();
+
+        // --- Relay 1: capture "first" command, then detach. ------------------
+        let (mut shell_end_1, pty_end_1) = tokio::io::duplex(4096);
+        let (ws_tx_1, _ws_rx_1) = ws_out_channel(32);
+        let ws_in_1 = futures::stream::pending::<Vec<u8>>().boxed();
+        let (stop_tx_1, stop_rx_1) = watch::channel(StopReason::Running);
+
+        let tracker_clone = Arc::clone(&tracker);
+        let relay_1 = tokio::spawn(async move {
+            run_relay(
+                pty_end_1,
+                ws_tx_1,
+                ws_in_1,
+                RelayConfig {
+                    tracker: tracker_clone,
+                    on_resize: null_resize(),
+                    stop_rx: stop_rx_1,
+                    conv_id: "relay-1".to_string(),
+                },
+            )
+            .await
+        });
+
+        shell_end_1
+            .write_all(&full_command("first", "ok\n", Some(0)))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stop_tx_1.send(StopReason::Detach).unwrap();
+
+        let exit_1 = relay_1.await.unwrap();
+        assert_eq!(exit_1, RelayExit::Stopped(StopReason::Detach));
+
+        // --- Relay 2: capture "second" command on the SAME tracker. ---------
+        let (mut shell_end_2, pty_end_2) = tokio::io::duplex(4096);
+        let (ws_tx_2, _ws_rx_2) = ws_out_channel(32);
+        let ws_in_2 = futures::stream::pending::<Vec<u8>>().boxed();
+        let (stop_tx_2, stop_rx_2) = watch::channel(StopReason::Running);
+
+        let tracker_clone_2 = Arc::clone(&tracker);
+        let relay_2 = tokio::spawn(async move {
+            run_relay(
+                pty_end_2,
+                ws_tx_2,
+                ws_in_2,
+                RelayConfig {
+                    tracker: tracker_clone_2,
+                    on_resize: null_resize(),
+                    stop_rx: stop_rx_2,
+                    conv_id: "relay-2".to_string(),
+                },
+            )
+            .await
+        });
+
+        shell_end_2
+            .write_all(&full_command("second", "also ok\n", Some(0)))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stop_tx_2.send(StopReason::Detach).unwrap();
+        let exit_2 = relay_2.await.unwrap();
+        assert_eq!(exit_2, RelayExit::Stopped(StopReason::Detach));
+
+        // Both commands are present in the same tracker, in order.
+        let tracker = tracker.lock().unwrap();
+        let recent = tracker.recent_commands(5);
+        let cmds: Vec<&str> = recent.iter().map(|r| r.command_text.as_str()).collect();
+        assert!(
+            cmds.contains(&"first") && cmds.contains(&"second"),
+            "tracker must contain both commands across the relay swap; got {cmds:?}"
+        );
+    }
+
+    /// PtyEof regression: if the shell exits while a stop signal is also
+    /// arriving, the exit reason must still be `PtyEof` so the handler runs
+    /// full teardown. The reader detects EOF first and wins the race.
+    #[tokio::test]
+    async fn pty_eof_triggers_full_teardown_even_with_pending_stop() {
+        let (shell_end, pty_end) = tokio::io::duplex(4096);
+        let tracker = make_tracker();
+        let (ws_tx, _ws_rx) = ws_out_channel(32);
+        let ws_in = futures::stream::pending::<Vec<u8>>().boxed();
+
+        // Pre-fill a Running channel — we never actually send a stop. This
+        // test's intent: when the shell closes, PtyEof wins, regardless of
+        // what the stop channel might have been poised to carry.
+        let (_stop_tx, stop_rx) = watch::channel(StopReason::Running);
+
+        // Close the shell end immediately — drops the write end, reader gets EOF.
+        drop(shell_end);
+
+        let exit = run_relay(
+            pty_end,
+            ws_tx,
+            ws_in,
+            RelayConfig {
+                tracker,
+                on_resize: null_resize(),
+                stop_rx,
+                conv_id: "eof-regression".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            exit,
+            RelayExit::PtyEof,
+            "PtyEof must be reported for shell-exit, not Stopped/WsClosed"
+        );
     }
 }

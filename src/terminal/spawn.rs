@@ -1,7 +1,7 @@
 //! PTY spawn path — REQ-TERM-001, REQ-TERM-002
 
 use super::command_tracker::CommandTracker;
-use super::session::{Dims, ShellIntegrationStatus, TerminalHandle};
+use super::session::{Dims, ShellIntegrationStatus, StopReason, TerminalHandle};
 use nix::{
     pty::openpty,
     unistd::{close, dup2, execve, fork, setsid, ForkResult},
@@ -107,11 +107,15 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
             // time, so we use the child PID as a unique session identifier.
             let session_id = child.to_string();
 
+            let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
+
             Ok(TerminalHandle {
                 master_fd,
                 child_pid: child,
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
                 shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
+                stop_tx,
+                detached: Arc::new(tokio::sync::Notify::new()),
             })
         }
     }

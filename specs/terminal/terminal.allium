@@ -253,18 +253,45 @@ rule ShellEnvironmentConstructed {
         -- and misbehaviour in vim, htop, and similar programs.
 }
 
--- REQ-TERM-003: Duplicate connection rejected
-rule DuplicateTerminalRejected {
+-- REQ-TERM-003: Duplicate connection reclaims the existing session.
+-- Task 24691: the prior 409-rejection behaviour stranded sessions when the
+-- browser-side WebSocket died silently (tab crash, network drop, laptop
+-- sleep); the shell was still healthy but no recovery was possible without a
+-- server-side kill. Reclaim evicts the sitting relay without tearing down
+-- the shell, then attaches the new WebSocket to the same handle.
+rule DuplicateConnectionReclaimsSession {
     when: UserOpensTerminal(conversation)
 
     requires: Terminal(conversation).status = active
 
-    ensures: WebSocketUpgradeRejected(conversation, status: 409)
+    ensures: Terminal(conversation).status = active
+        -- Terminal stays active throughout reclaim — shell, master_fd,
+        -- CommandTracker, and ring buffer are preserved.
+    ensures: WebSocketAttached(conversation)
+        -- The new WebSocket becomes the active relay target.
 
     @guidance
-        -- Return HTTP 409 Conflict on the WebSocket upgrade request.
-        -- The UI must not offer to open a terminal when one is already active,
-        -- making this path unreachable in normal operation.
+        -- Reclaim sequence (ws.rs handle_socket → acquire_handle → reclaim):
+        --   1. Look up the existing Arc<TerminalHandle> in ActiveTerminals.
+        --   2. Signal the sitting relay: stop_tx.send(StopReason::Detach).
+        --   3. Await TerminalHandle.detached.notified() — the old relay
+        --      fires this on clean exit. Bounded by a 5s timeout so a stuck
+        --      relay cannot deadlock the reclaimer.
+        --   4. Reset stop_tx to StopReason::Running before the new relay
+        --      subscribes so it does not observe the stale Detach.
+        --   5. Build a fresh PtyMasterIo via dup(master_fd) — each relay
+        --      owns its own fd so drops don't affect the master.
+        --   6. Start a new relay reusing the existing CommandTracker so
+        --      mid-command output continues streaming.
+        --
+        -- Concurrent reclaim (two connections race for the same session):
+        -- Notify's single-permit semantics allow exactly one waker to
+        -- consume a notify; the bounded 5s timeout ensures the loser
+        -- proceeds rather than deadlocking.
+        --
+        -- Out of scope: dead-peer detection. A separate follow-up task
+        -- will add WS ping/pong so abandoned sessions (user never
+        -- reconnects) are eventually reaped.
 }
 
 -- REQ-TERM-004, REQ-TERM-010: PTY output forwarded to WebSocket and command tracker
