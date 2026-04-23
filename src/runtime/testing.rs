@@ -850,7 +850,8 @@ mod tests {
 
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -965,7 +966,8 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1063,7 +1065,8 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1494,7 +1497,8 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let _broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let _broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1573,7 +1577,8 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1681,7 +1686,8 @@ mod tests {
             200_000,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0); let mut broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1808,7 +1814,8 @@ mod tests {
                 200_000,
             );
             let (event_tx, event_rx) = mpsc::channel(32);
-            let broadcast_tx = crate::runtime::SseBroadcaster::new(4096, 0); let mut broadcast_rx = broadcast_tx.subscribe();
+            let broadcast_tx = crate::runtime::SseBroadcaster::new(4096, 0);
+            let mut broadcast_rx = broadcast_tx.subscribe();
 
             let runtime = ConversationRuntime::new(
                 context,

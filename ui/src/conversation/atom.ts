@@ -206,7 +206,6 @@ function applyIfNewer(
     if (import.meta.env.DEV) {
       // Structured warning mirrors 02674's handleSchemaViolation: dropped
       // dispatches in dev become visible without spamming prod logs.
-      // eslint-disable-next-line no-console
       console.warn('[sse] dropping replay', {
         eventType,
         incomingSeq: sequenceId,

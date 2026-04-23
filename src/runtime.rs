@@ -78,27 +78,27 @@ pub struct RuntimeManager {
 /// Handle to interact with a running conversation
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    /// SSE broadcaster. Owns the per-conversation monotonic sequence_id counter
+    /// SSE broadcaster. Owns the per-conversation monotonic `sequence_id` counter
     /// that every emitted [`SseEvent`] must consume (task 02675). Callers never
-    /// hand-craft a sequence_id — they either go through [`SseBroadcaster::send_seq`]
+    /// hand-craft a `sequence_id` — they either go through [`SseBroadcaster::send_seq`]
     /// (which allocates the next id from the counter) or [`SseBroadcaster::send_message`]
     /// (which passes through the DB-allocated message id and advances the counter past
-    /// it). This makes the "every SSE event carries a monotonic sequence_id" contract
+    /// it). This makes the "every SSE event carries a monotonic `sequence_id`" contract
     /// structurally enforceable rather than a matter of caller discipline.
     pub broadcast_tx: SseBroadcaster,
 }
 
-/// Per-conversation SSE broadcaster with monotonic sequence_id allocation.
+/// Per-conversation SSE broadcaster with monotonic `sequence_id` allocation.
 ///
 /// Every [`SseEvent`] emitted for a conversation carries a `sequence_id` drawn
 /// from a single per-conversation counter. This broadcaster is the sole
 /// gateway: callers cannot construct a [`SseEvent`] and broadcast it without
-/// first obtaining a sequence_id from here, which means the total-order
+/// first obtaining a `sequence_id` from here, which means the total-order
 /// invariant is enforced by the type rather than by caller discipline.
 ///
 /// Two broadcast paths exist:
 ///
-/// 1. **Ephemeral/derived events** (Token, StateChange, MessageUpdated, …) —
+/// 1. **Ephemeral/derived events** (`Token`, `StateChange`, `MessageUpdated`, …) —
 ///    allocate a fresh id via [`SseBroadcaster::next_seq`] or use
 ///    [`SseBroadcaster::send_seq`], which hands the id to a construction
 ///    closure so the caller cannot forget to insert it.
@@ -121,7 +121,7 @@ pub struct SseBroadcaster {
 impl SseBroadcaster {
     /// Build a broadcaster from an existing `broadcast::Sender`.
     ///
-    /// `initial_last_seq` is the highest sequence_id the client can already
+    /// `initial_last_seq` is the highest `sequence_id` the client can already
     /// have observed (typically `db.get_last_sequence_id(conversation_id)`).
     /// The next allocated id will be `initial_last_seq + 1`.
     pub fn from_sender(tx: broadcast::Sender<SseEvent>, initial_last_seq: i64) -> Self {
@@ -139,7 +139,7 @@ impl SseBroadcaster {
         Self::from_sender(tx, initial_last_seq)
     }
 
-    /// Atomically allocate the next sequence_id and return it.
+    /// Atomically allocate the next `sequence_id` and return it.
     pub fn next_seq(&self) -> i64 {
         self.last_seq.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -154,7 +154,7 @@ impl SseBroadcaster {
         self.last_seq.fetch_max(seq, Ordering::AcqRel);
     }
 
-    /// Highest sequence_id emitted so far. Used to seed `SseEvent::Init`'s
+    /// Highest `sequence_id` emitted so far. Used to seed `SseEvent::Init`'s
     /// `last_sequence_id` so the client's `applyIfNewer` guard starts at the
     /// correct floor.
     pub fn current_seq(&self) -> i64 {
@@ -166,35 +166,32 @@ impl SseBroadcaster {
         self.tx.subscribe()
     }
 
-    /// Send an event that has already been stamped with a sequence_id.
+    /// Send an event that has already been stamped with a `sequence_id`.
     /// Prefer [`SseBroadcaster::send_seq`] or [`SseBroadcaster::send_message`]
     /// so the stamping is done at the broadcaster.
-    pub fn send(
-        &self,
-        event: SseEvent,
-    ) -> Result<usize, broadcast::error::SendError<SseEvent>> {
-        self.tx.send(event)
+    ///
+    /// Returns `Ok(receiver_count)` on success, `Err(())` when the channel has
+    /// no active receivers. The error payload is discarded on purpose —
+    /// `broadcast::error::SendError<SseEvent>` is ~320 bytes, which triggers
+    /// clippy's `result_large_err` lint, and every call site here only ever
+    /// reads `.is_err()`.
+    pub fn send(&self, event: SseEvent) -> Result<usize, ()> {
+        self.tx.send(event).map_err(|_| ())
     }
 
-    /// Allocate the next sequence_id, pass it to `build`, and broadcast the
+    /// Allocate the next `sequence_id`, pass it to `build`, and broadcast the
     /// resulting event. The closure's signature forces the caller to place the
     /// id on the event — forgetting is a compile error.
-    pub fn send_seq(
-        &self,
-        build: impl FnOnce(i64) -> SseEvent,
-    ) -> Result<usize, broadcast::error::SendError<SseEvent>> {
+    pub fn send_seq(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
         let seq = self.next_seq();
-        self.tx.send(build(seq))
+        self.send(build(seq))
     }
 
     /// Broadcast a `Message` event using the DB-allocated `message.sequence_id`,
     /// then advance the broadcaster's counter past it.
-    pub fn send_message(
-        &self,
-        message: crate::db::Message,
-    ) -> Result<usize, broadcast::error::SendError<SseEvent>> {
+    pub fn send_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         self.observe_seq(message.sequence_id);
-        self.tx.send(SseEvent::Message { message })
+        self.send(SseEvent::Message { message })
     }
 }
 
@@ -270,8 +267,8 @@ pub struct SseBreadcrumb {
 /// Every variant carries a `sequence_id` drawn from the conversation's single
 /// monotonic counter (task 02675). The client's `applyIfNewer` guard relies on
 /// this total order to dedup reconnect replays. Allocation is the
-/// responsibility of [`SseBroadcaster`] — do not hand-craft sequence_ids at
-/// call sites.
+/// responsibility of [`SseBroadcaster`] — do not hand-craft `sequence_id`
+/// values at call sites.
 #[derive(Debug, Clone)]
 pub enum SseEvent {
     Init {
@@ -283,7 +280,7 @@ pub enum SseEvent {
         agent_working: bool,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
-        /// Highest sequence_id ever emitted for this conversation — what the
+        /// Highest `sequence_id` ever emitted for this conversation — what the
         /// client seeds `atom.lastSequenceId` with so subsequent
         /// `applyIfNewer` checks start at the right floor.
         last_sequence_id: i64,
@@ -301,7 +298,7 @@ pub enum SseEvent {
         project_name: Option<String>,
     },
     /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
-    /// as its envelope sequence_id — no separate field needed because
+    /// as its envelope `sequence_id` — no separate field needed because
     /// `message.sequence_id` is already the DB-allocated id and, thanks to
     /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
