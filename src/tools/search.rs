@@ -28,7 +28,9 @@ struct SearchInput {
     max_results: Option<usize>,
 }
 
-/// Resolve and validate a search path within `working_dir`.
+/// Resolve a search path relative to `working_dir`. Absolute paths are used
+/// as-is; relative paths are joined to `working_dir`. No containment check —
+/// see the note on `read_file::resolve_and_validate` for rationale.
 fn resolve_and_validate(path_str: &str, working_dir: &std::path::Path) -> Result<PathBuf, String> {
     let raw = PathBuf::from(path_str);
     let resolved = if raw.is_absolute() {
@@ -37,20 +39,9 @@ fn resolve_and_validate(path_str: &str, working_dir: &std::path::Path) -> Result
         working_dir.join(&raw)
     };
 
-    let canonical = resolved
+    resolved
         .canonicalize()
-        .map_err(|e| format!("Cannot resolve path '{}': {e}", resolved.display()))?;
-    let canonical_wd = working_dir
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve working directory: {e}"))?;
-
-    if !canonical.starts_with(&canonical_wd) {
-        return Err(format!(
-            "Path '{path_str}' is outside the working directory"
-        ));
-    }
-
-    Ok(canonical)
+        .map_err(|e| format!("Cannot resolve path '{}': {e}", resolved.display()))
 }
 
 /// Check if a file appears to be binary by examining the first 8KB for null bytes.
@@ -346,20 +337,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_path_traversal_blocked() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_search_allows_paths_outside_working_dir() {
+        // Consistency with bash/read_file: search can walk any directory the
+        // process has permission to read. Guards against re-introducing the
+        // old working-directory containment check.
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir_in(outer.path()).unwrap();
+        let outside_dir = tempfile::tempdir_in(outer.path()).unwrap();
+        std::fs::write(outside_dir.path().join("hit.txt"), "findme\n").unwrap();
+
         let tool = SearchTool;
         let result = tool
             .run(
-                json!({"pattern": "test", "path": "../../etc"}),
-                test_context(dir.path().to_path_buf()),
+                json!({"pattern": "findme", "path": outside_dir.path().to_str().unwrap()}),
+                test_context(inner.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
-        assert!(
-            result.output.contains("outside the working directory")
-                || result.output.contains("Cannot resolve")
-        );
+        assert!(result.success, "search should resolve paths outside the working dir: {}", result.output);
+        assert!(result.output.contains("findme"));
     }
 
     #[test]

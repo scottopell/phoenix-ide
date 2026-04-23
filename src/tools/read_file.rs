@@ -21,7 +21,14 @@ struct ReadFileInput {
     limit: Option<usize>,
 }
 
-/// Resolve a path relative to `working_dir` and verify it stays within bounds.
+/// Resolve a path relative to `working_dir`. Absolute paths are used as-is;
+/// relative paths are joined to `working_dir`.
+///
+/// No containment check: the bash tool can read any file the process has
+/// access to, so restricting read_file to the working directory only blocked
+/// legitimate reads (stdlib sources, toolchain caches under $HOME, node_modules
+/// outside the project, /etc configs) without actually constraining capability.
+/// OS file permissions are the real perimeter.
 fn resolve_and_validate(path: &str, working_dir: &std::path::Path) -> Result<PathBuf, String> {
     let raw = PathBuf::from(path);
     let resolved = if raw.is_absolute() {
@@ -30,19 +37,9 @@ fn resolve_and_validate(path: &str, working_dir: &std::path::Path) -> Result<Pat
         working_dir.join(&raw)
     };
 
-    // Canonicalize both to resolve symlinks and `..` components
-    let canonical = resolved
+    resolved
         .canonicalize()
-        .map_err(|e| format!("Cannot resolve path '{}': {e}", resolved.display()))?;
-    let canonical_wd = working_dir
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve working directory: {e}"))?;
-
-    if !canonical.starts_with(&canonical_wd) {
-        return Err(format!("Path '{path}' is outside the working directory"));
-    }
-
-    Ok(canonical)
+        .map_err(|e| format!("Cannot resolve path '{}': {e}", resolved.display()))
 }
 
 #[async_trait]
@@ -202,20 +199,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_path_traversal_blocked() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_read_file_allows_paths_outside_working_dir() {
+        // Consistency with bash: read_file can reach any file the process has
+        // permission to read. This test guards against re-introducing the old
+        // working-directory containment check.
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir_in(outer.path()).unwrap();
+        let outside_file = outer.path().join("outside.txt");
+        std::fs::write(&outside_file, "reachable\n").unwrap();
+
         let tool = ReadFileTool;
         let result = tool
             .run(
-                json!({"path": "../../etc/passwd"}),
-                test_context(dir.path().to_path_buf()),
+                json!({"path": outside_file.to_str().unwrap()}),
+                test_context(inner.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
-        assert!(
-            result.output.contains("outside the working directory")
-                || result.output.contains("Cannot resolve")
-        );
+        assert!(result.success, "read_file should resolve paths outside the working dir: {}", result.output);
+        assert!(result.output.contains("reachable"));
     }
 
     #[tokio::test]
