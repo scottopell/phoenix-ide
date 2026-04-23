@@ -16,9 +16,9 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
-import { Terminal, type ITheme } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
-import 'xterm/css/xterm.css';
+import { Terminal, type ITheme } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import {
   getSnippetForShell,
   shellDisplayName,
