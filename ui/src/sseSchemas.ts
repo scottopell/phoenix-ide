@@ -64,6 +64,32 @@ const ConversationSchema = v.pipe(
   v.transform((obj): Conversation => obj as unknown as Conversation),
 );
 
+/** Hand-authored mirror of the Rust `MessageType` enum
+ *  (see `ui/src/generated/MessageType.ts`). The picklist is strict so an
+ *  unknown type surfaces as a schema violation (forward-compat risk accepted
+ *  for this field — new message types are rare and additive). A conversation's
+ *  history can include `error` messages (parse-error fallback) and
+ *  `continuation` messages (continuation summaries), so both must be listed
+ *  here — otherwise init for any conversation with those in history would
+ *  fail to validate.
+ *
+ *  Exported for a tripwire test in `sseSchemas.test.ts` that asserts this
+ *  list matches the generated `MessageType` union character-for-character.
+ *  Without the tripwire, a new Rust-side variant would fail only at runtime
+ *  (parse violation → toast) the first time a conversation carrying the new
+ *  type hit the client. `satisfies` on the schema below catches schemas that
+ *  are narrower than the wire type, but NOT a hand-authored picklist whose
+ *  narrowness is the intent. */
+export const MESSAGE_TYPE_OPTIONS = [
+  'user',
+  'agent',
+  'tool',
+  'system',
+  'skill',
+  'error',
+  'continuation',
+] as const;
+
 /** Message block carried in `init.messages` and `message.message`. Validates
  *  the reducer's load-bearing fields (`sequence_id` as number is the main
  *  point — a string would corrupt the dedup guard).
@@ -77,22 +103,7 @@ const MessageSchema = v.pipe(
     message_id: v.string(),
     sequence_id: v.number(),
     conversation_id: v.string(),
-    // Mirror the Rust `MessageType` enum. The picklist is strict so an
-    // unknown type surfaces as a schema violation (forward-compat risk
-    // accepted for this field — new message types are rare and additive).
-    // A conversation's history can include `error` messages (parse-error
-    // fallback) and `continuation` messages (continuation summaries), so
-    // both must be listed here — otherwise init for any conversation with
-    // those in history would fail to validate.
-    message_type: v.picklist([
-      'user',
-      'agent',
-      'tool',
-      'system',
-      'skill',
-      'error',
-      'continuation',
-    ]),
+    message_type: v.picklist(MESSAGE_TYPE_OPTIONS),
     content: v.unknown(),
     display_data: v.optional(v.unknown()),
     usage_data: v.optional(v.unknown()),

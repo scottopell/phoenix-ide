@@ -564,3 +564,46 @@ describe('parseEvent', () => {
     });
   });
 });
+
+describe('message_type picklist tripwire', () => {
+  // 02677's `satisfies v.GenericSchema<unknown, WireMessageData>` catches a
+  // schema that is narrower than the generated wire type at compile time, but
+  // not a hand-authored picklist whose narrowness is the intent. If a new
+  // `MessageType` variant lands on the Rust side and the picklist in
+  // sseSchemas.ts isn't updated, the only symptom is a runtime parse
+  // violation the first time a conversation carrying the new type reaches a
+  // client.
+  //
+  // This test closes that gap by asserting the exported
+  // `MESSAGE_TYPE_OPTIONS` list matches the generated `MessageType` union
+  // exactly. The direction works because a type-level object keyed by
+  // `MessageType` forces TSC to enumerate every variant: if a new variant is
+  // added to the generated type, the `expected` map will fail to compile
+  // until it's added here too. Conversely, if `MESSAGE_TYPE_OPTIONS` grows
+  // extras that aren't in `MessageType`, the runtime comparison fails.
+
+  it('MESSAGE_TYPE_OPTIONS matches the generated MessageType union', async () => {
+    // Dynamic imports so this describe block doesn't alter the loading order
+    // of the surrounding parseEvent tests.
+    const { MESSAGE_TYPE_OPTIONS } = await import('./sseSchemas');
+    const type = await import('./generated/MessageType');
+
+    // Compile-time exhaustiveness: this mapping must list every variant of
+    // `MessageType`. Adding a new variant to the generated union without
+    // extending this map is a TypeScript error here.
+    const expected: Record<type.MessageType, true> = {
+      user: true,
+      agent: true,
+      tool: true,
+      system: true,
+      skill: true,
+      error: true,
+      continuation: true,
+    };
+
+    const expectedSet = new Set(Object.keys(expected));
+    const actualSet = new Set<string>(MESSAGE_TYPE_OPTIONS);
+
+    expect(actualSet).toEqual(expectedSet);
+  });
+});
