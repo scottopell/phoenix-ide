@@ -342,6 +342,26 @@ export function ConversationPage() {
   useEffect(() => { markSentRef.current = markSent; }, [markSent]);
   useEffect(() => { markFailedRef.current = markFailed; }, [markFailed]);
 
+  // Reconcile queue ↔ atom.messages: the server uses the client's localId as
+  // the canonical message_id (see api.ts sendMessage + types.rs ChatRequest),
+  // so once the SSE `message` echo lands, atom.messages will contain a row
+  // whose message_id matches a queued entry's localId — at that point the
+  // queued entry is redundant and must be removed to avoid a double-render.
+  //
+  // This effect is the authoritative "the server has it" signal. Previously
+  // markSent was called eagerly on POST-200, which removed the queued entry
+  // during the window between POST success and the SSE echo arriving — the
+  // message briefly existed in no rendered state.
+  useEffect(() => {
+    if (queuedMessages.length === 0) return;
+    const serverIds = new Set(atom.messages.map((m) => m.message_id));
+    for (const q of queuedMessages) {
+      if (q.status === 'sending' && serverIds.has(q.localId)) {
+        markSentRef.current(q.localId);
+      }
+    }
+  }, [atom.messages, queuedMessages]);
+
   const sendMessage = useCallback(
     async (
       localId: string,
@@ -355,20 +375,13 @@ export function ConversationPage() {
       try {
         if (isOnline) {
           await api.sendMessage(conversationId, text, imgs, localId);
-          markSentRef.current(localId);
+          // Keep the queued entry visible until the server's SSE `message`
+          // echo lands in atom.messages — a reconciliation effect below calls
+          // markSent once atom.messages contains a row with message_id == localId.
+          // Do not optimistically dispatch sse_message here: the monotonic
+          // guard in conversationReducer drops any sequence_id <= lastSequenceId,
+          // so a sequence_id=-1 optimistic would be silently rejected.
           dispatch({ type: 'sse_state_change', phase: { type: 'awaiting_llm' } });
-          dispatch({
-            type: 'sse_message',
-            message: {
-              message_id: localId,
-              sequence_id: -1, // Optimistic — will be replaced by SSE
-              conversation_id: conversationId,
-              message_type: 'user',
-              content: { text },
-              created_at: new Date().toISOString(),
-            },
-            sequenceId: -1,
-          });
         } else {
           await queueOperation({
             type: 'send_message',
