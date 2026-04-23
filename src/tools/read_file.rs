@@ -25,10 +25,10 @@ struct ReadFileInput {
 /// relative paths are joined to `working_dir`.
 ///
 /// No containment check: the bash tool can read any file the process has
-/// access to, so restricting read_file to the working directory only blocked
-/// legitimate reads (stdlib sources, toolchain caches under $HOME, node_modules
-/// outside the project, /etc configs) without actually constraining capability.
-/// OS file permissions are the real perimeter.
+/// access to, so restricting `read_file` to the working directory only blocked
+/// legitimate reads (stdlib sources, toolchain caches under `$HOME`,
+/// `node_modules` outside the project, `/etc` configs) without actually
+/// constraining capability. OS file permissions are the real perimeter.
 fn resolve_and_validate(path: &str, working_dir: &std::path::Path) -> Result<PathBuf, String> {
     let raw = PathBuf::from(path);
     let resolved = if raw.is_absolute() {
@@ -215,7 +215,11 @@ mod tests {
                 test_context(inner.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "read_file should resolve paths outside the working dir: {}", result.output);
+        assert!(
+            result.success,
+            "read_file should resolve paths outside the working dir: {}",
+            result.output
+        );
         assert!(result.output.contains("reachable"));
     }
 

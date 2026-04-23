@@ -353,7 +353,11 @@ mod tests {
                 test_context(inner.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "search should resolve paths outside the working dir: {}", result.output);
+        assert!(
+            result.success,
+            "search should resolve paths outside the working dir: {}",
+            result.output
+        );
         assert!(result.output.contains("findme"));
     }
 
