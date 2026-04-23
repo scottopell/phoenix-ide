@@ -46,10 +46,10 @@ function extensionColor(name: string): string | undefined {
     case 'py': return 'var(--accent-green, #6ab04c)';
     case 'md': case 'txt': return 'var(--text-muted)';
     case 'json': case 'toml': case 'yaml': case 'yml': return 'var(--accent-yellow, #d4b84b)';
-    case 'css': return '#c678dd';
-    case 'html': return '#e06c75';
+    case 'css': return 'var(--accent-purple, #c678dd)';
+    case 'html': return 'var(--accent-red, #e06c75)';
     case 'sh': case 'bash': return 'var(--accent-green, #6ab04c)';
-    case 'sql': return '#61afef';
+    case 'sql': return 'var(--accent-blue, #61afef)';
     case 'lock': return 'var(--text-muted)';
     default: return undefined;
   }

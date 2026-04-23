@@ -23,6 +23,28 @@ import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 
+const CheckIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="20 6 9 17 4 12" />
+  </svg>
+);
+const XIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <line x1="18" y1="6" x2="6" y2="18" />
+    <line x1="6" y1="6" x2="18" y2="18" />
+  </svg>
+);
+const ChevronDownIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="6 9 12 15 18 9" />
+  </svg>
+);
+const ChevronUpIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="18 15 12 9 6 15" />
+  </svg>
+);
+
 // Stable plugin array — avoids creating a new array reference on every render
 const REMARK_PLUGINS = [remarkGfm];
 
@@ -436,7 +458,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
         <span className="tool-block-name">{name}</span>
         {hasOutput && (
           <span className={`tool-block-status ${isError ? 'error' : 'success'}`}>
-            {isError ? '✗' : '✓'}
+            {isError ? <XIcon /> : <CheckIcon />}
           </span>
         )}
       </div>
@@ -475,7 +497,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
                     className="tool-block-output-header" 
                     onClick={() => setOutputExpanded(false)}
                   >
-                    <span className="tool-block-output-chevron">▼</span>
+                    <span className="tool-block-output-chevron"><ChevronDownIcon /></span>
                     <span className="tool-block-output-label">output</span>
                     <span className="tool-block-output-size">{lineCount} lines</span>
                     <CopyButton text={resultText} title="Copy output" />
@@ -548,16 +570,17 @@ function isSubAgentSummaryData(data: unknown): data is SubAgentSummaryData {
 function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
   const [conversationExpanded, setConversationExpanded] = useState(false);
   const isError = result.outcome.type === 'failure';
-  const icon = isError ? '✗' : '✓';
   const resultText = getOutcomeText(result.outcome);
 
   return (
     <div className={`subagent-summary-row ${isError ? 'error' : ''}`}>
-      <div 
+      <div
         className="subagent-summary-header"
         onClick={() => setConversationExpanded(!conversationExpanded)}
       >
-        <span className={`subagent-summary-icon ${isError ? 'error' : 'success'}`}>{icon}</span>
+        <span className={`subagent-summary-icon ${isError ? 'error' : 'success'}`}>
+          {isError ? <XIcon /> : <CheckIcon />}
+        </span>
         <span className="subagent-summary-task" title={result.task}>
           {truncate(result.task, 60)}
         </span>
@@ -565,7 +588,7 @@ function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
           {truncate(resultText, 50)}
         </span>
         <span className="subagent-summary-expand">
-          {conversationExpanded ? '▲' : '▼'}
+          {conversationExpanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
         </span>
       </div>
       {conversationExpanded && (
@@ -586,8 +609,8 @@ function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
     <div className="subagent-summary-block">
       <div className="subagent-summary-title">
         <span className="subagent-summary-stats">
-          {successCount > 0 && <span className="success">✓ {successCount}</span>}
-          {failCount > 0 && <span className="error">✗ {failCount}</span>}
+          {successCount > 0 && <span className="success"><CheckIcon /> {successCount}</span>}
+          {failCount > 0 && <span className="error"><XIcon /> {failCount}</span>}
         </span>
         <span>completed</span>
       </div>
@@ -622,20 +645,19 @@ function getOutcomeText(outcome: SubAgentResult['outcome']): string {
 function CompletedSubAgent({ result }: { result: SubAgentResult }) {
   const [expanded, setExpanded] = useState(false);
   const isError = result.outcome.type === 'failure';
-  const icon = isError ? '✗' : '✓';
   const resultText = getOutcomeText(result.outcome);
   const hasLongResult = resultText.length > 100;
 
   return (
     <div className={`subagent-item completed ${isError ? 'error' : ''}`}>
       <div className="subagent-item-header" onClick={() => hasLongResult && setExpanded(!expanded)}>
-        <span className="subagent-icon">{icon}</span>
+        <span className="subagent-icon">{isError ? <XIcon /> : <CheckIcon />}</span>
         <span className="subagent-label" title={result.task}>
           {truncate(result.task, 50)}
         </span>
         {hasLongResult && (
           <span className="subagent-expand-toggle">
-            {expanded ? '▲' : '▼'}
+            {expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
           </span>
         )}
       </div>

@@ -5,6 +5,19 @@ import type { Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
+import { ThemeToggle } from './ThemeToggle';
+import { useTheme } from '../hooks';
+
+const ChevronLeft = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="15 18 9 12 15 6" />
+  </svg>
+);
+const ChevronRight = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="9 18 15 12 9 6" />
+  </svg>
+);
 
 interface SidebarProps {
   collapsed: boolean;
@@ -28,6 +41,7 @@ export function Sidebar({
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const { theme, toggleTheme } = useTheme();
   const [showArchived, setShowArchived] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
@@ -115,7 +129,7 @@ export function Sidebar({
     return (
       <aside className="sidebar sidebar-collapsed">
         <button className="sidebar-icon-btn sidebar-toggle" onClick={onToggle} title="Expand sidebar">
-          ▶
+          <ChevronRight />
         </button>
         <button className="sidebar-icon-btn" onClick={() => navigate('/')} title="Phoenix">
           <img src="/phoenix.svg" alt="Phoenix" className="sidebar-logo-icon" />
@@ -127,6 +141,7 @@ export function Sidebar({
         >
           +
         </button>
+        <ThemeToggle theme={theme} onToggle={toggleTheme} />
         <div className="sidebar-collapsed-dots">
           {conversations.slice(0, 15).map(conv => {
             const displayState = getDisplayState(conv.state?.type);
@@ -154,7 +169,7 @@ export function Sidebar({
     >
       <div className="sidebar-header">
         <button className="sidebar-toggle-expanded" onClick={onToggle} title="Collapse sidebar">
-          ◀
+          <ChevronLeft />
         </button>
         <button className="sidebar-brand" onClick={() => navigate('/')}>
           <img src="/phoenix.svg" alt="Phoenix" className="sidebar-logo" />
@@ -166,6 +181,7 @@ export function Sidebar({
         >
           + New
         </button>
+        <ThemeToggle theme={theme} onToggle={toggleTheme} />
       </div>
       {projects.length > 0 && (
         <div className="project-tabs">

@@ -2833,16 +2833,20 @@ pre:hover .copy-btn {
 .theme-toggle {
   background: transparent;
   border: none;
-  font-size: 18px;
   cursor: pointer;
-  padding: 4px 8px;
+  padding: 6px;
   border-radius: 6px;
-  transition: background 0.15s;
-  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
 }
 
 .theme-toggle:hover {
   background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 /* Smooth theme transition */

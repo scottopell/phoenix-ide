@@ -12,6 +12,22 @@ import {
 import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
 
+const ChevronRight = () => (
+  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="9 18 15 12 9 6" />
+  </svg>
+);
+const ChevronDown = () => (
+  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="6 9 12 15 18 9" />
+  </svg>
+);
+const MessageSquareIcon = () => (
+  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+  </svg>
+);
+
 interface MessageListProps {
   messages: Message[];
   queuedMessages: QueuedMessage[];
@@ -288,7 +304,8 @@ export function MessageList({
               >
                 <span className="system-prompt-label">System prompt</span>
                 <span className="system-prompt-toggle">
-                  {systemPromptExpanded ? '▼ hide' : '▶ show'}
+                  {systemPromptExpanded ? <ChevronDown /> : <ChevronRight />}
+                  {systemPromptExpanded ? ' hide' : ' show'}
                 </span>
               </div>
               {systemPromptExpanded && (
@@ -298,7 +315,7 @@ export function MessageList({
           )}
           {isEmpty ? (
             <div className="empty-state">
-              <div className="empty-state-icon">✨</div>
+              <div className="empty-state-icon"><MessageSquareIcon /></div>
               <p>Start a conversation</p>
             </div>
           ) : (

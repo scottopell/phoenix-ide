@@ -46,6 +46,26 @@ const TerminalPanel = lazy(() =>
 
 const TERMINAL_COLLAPSED_PX = 32;
 
+const AlertTriangle = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+    <line x1="12" y1="9" x2="12" y2="13" />
+    <line x1="12" y1="17" x2="12.01" y2="17" />
+  </svg>
+);
+const XCircle = () => (
+  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="10" />
+    <line x1="15" y1="9" x2="9" y2="15" />
+    <line x1="9" y1="9" x2="15" y2="15" />
+  </svg>
+);
+const ChevronRightSmall = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="9 18 15 12 9 6" />
+  </svg>
+);
+
 export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
@@ -600,7 +620,7 @@ export function ConversationPage() {
       <div id="app">
         <main id="main-area">
           <div className="empty-state">
-            <div className="empty-state-icon">❌</div>
+            <div className="empty-state-icon"><XCircle /></div>
             <p>{error}</p>
             <button
               className="btn-primary"
@@ -714,13 +734,13 @@ export function ConversationPage() {
             onClick={() => setContextExhaustedExpanded((v) => !v)}
             aria-expanded={contextExhaustedExpanded}
           >
-            <span className="context-exhausted-icon">⚠️</span>
+            <span className="context-exhausted-icon"><AlertTriangle /></span>
             <span className="context-exhausted-title">Context Window Full</span>
             <span className="context-exhausted-subtitle">
               Continue in a new conversation to preserve progress
             </span>
             <span className={`context-exhausted-chevron${contextExhaustedExpanded ? ' context-exhausted-chevron--open' : ''}`} aria-hidden>
-              ▸
+              <ChevronRightSmall />
             </span>
           </button>
           <div className="context-exhausted-summary">

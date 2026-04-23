@@ -10,6 +10,14 @@ import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
+
+const AlertTriangle = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-4px', marginRight: '8px' }}>
+    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+    <line x1="12" y1="9" x2="12" y2="13" />
+    <line x1="12" y1="17" x2="12.01" y2="17" />
+  </svg>
+);
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -274,7 +282,7 @@ export function ConversationListPage() {
     return (
       <div id="app" className="list-page">
         <div className="init-error">
-          <h2>⚠️ Storage Error</h2>
+          <h2><AlertTriangle />Storage Error</h2>
           <p>Failed to initialize local storage: {initError}</p>
           <p>Please try refreshing the page. If the problem persists, try clearing your browser data for this site.</p>
           <button onClick={() => window.location.reload()}>Refresh Page</button>

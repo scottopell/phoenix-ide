@@ -2,7 +2,7 @@ import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
-import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
+import { useGlobalKeyboardShortcuts, FocusScopeProvider, ThemeProvider } from './hooks';
 import { ConversationProvider } from './conversation';
 import { api } from './api';
 import './index.css';
@@ -103,25 +103,29 @@ function App() {
   }, []);
 
   if (authState.status === 'checking') {
-    return null;
+    return <ThemeProvider>{null}</ThemeProvider>;
   }
 
   if (authState.status === 'login_required') {
     return (
-      <Suspense fallback={<RouteFallback />}>
-        <LoginPage onSuccess={handleLoginSuccess} />
-      </Suspense>
+      <ThemeProvider>
+        <Suspense fallback={<RouteFallback />}>
+          <LoginPage onSuccess={handleLoginSuccess} />
+        </Suspense>
+      </ThemeProvider>
     );
   }
 
   return (
-    <BrowserRouter>
-      <FocusScopeProvider>
-        <ConversationProvider>
-          <AppRoutes />
-        </ConversationProvider>
-      </FocusScopeProvider>
-    </BrowserRouter>
+    <ThemeProvider>
+      <BrowserRouter>
+        <FocusScopeProvider>
+          <ConversationProvider>
+            <AppRoutes />
+          </ConversationProvider>
+        </FocusScopeProvider>
+      </BrowserRouter>
+    </ThemeProvider>
   );
 }
 

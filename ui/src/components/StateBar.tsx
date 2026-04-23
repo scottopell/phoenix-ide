@@ -4,6 +4,12 @@ import type { Conversation, ConversationState, ModelInfo } from '../api';
 import type { ConnectionState } from '../hooks';
 import { getStateDescription } from '../utils';
 
+const CheckIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="20 6 9 17 4 12" />
+  </svg>
+);
+
 // Thresholds (match backend constants)
 const WARNING_THRESHOLD = 0.80;
 const CONTINUATION_THRESHOLD = 0.90;
@@ -372,7 +378,7 @@ export function StateBar({
                               title={m.description || m.id}
                             >
                               <span className="model-picker-item-check" aria-hidden="true">
-                                {selected ? '✓' : ''}
+                                {selected ? <CheckIcon /> : null}
                               </span>
                               <span className="model-picker-item-id">{m.id}</span>
                               <span className="model-picker-item-ctx">
