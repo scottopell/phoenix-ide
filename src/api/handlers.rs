@@ -172,26 +172,19 @@ pub fn create_router(state: AppState) -> Router {
 // Message Transformation
 // ============================================================
 
-/// Transform a message for API output, enriching bash `tool_use` blocks with display info.
-///
 /// Transform a message for API output by merging `display_data` into content blocks.
 ///
 /// For agent messages with bash `tool_use` blocks, the `display` field shows a
 /// simplified command (with cd prefixes stripped when they match cwd).
 /// The `display_data` is pre-computed at message creation time and stored in DB.
+///
+/// This helper exists for non-SSE REST endpoints (conversation fetch, archived
+/// list, etc.). The SSE path goes through [`crate::api::wire::EnrichedMessage`]
+/// directly; both routes produce byte-for-byte identical output — there's a
+/// parity test for every `SseEvent` variant in `src/api/sse.rs`.
 pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
-    let mut json = serde_json::to_value(msg).unwrap_or(Value::Null);
-
-    // Only process agent messages with display_data
-    if msg.message_type != MessageType::Agent {
-        return json;
-    }
-
-    if let Some(display_data) = &msg.display_data {
-        merge_display_data_into_content(&mut json, display_data);
-    }
-
-    json
+    let enriched = super::wire::EnrichedMessage::from(msg);
+    serde_json::to_value(&enriched).unwrap_or(Value::Null)
 }
 
 /// Count how many commits `base_branch` is ahead of `task_branch` in `repo_root`.
@@ -324,47 +317,6 @@ async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conv
         );
     }
     val
-}
-
-fn merge_display_data_into_content(json: &mut Value, display_data: &Value) {
-    // Build a map from tool_use_id -> display
-    let bash_displays: std::collections::HashMap<String, String> = display_data
-        .get("bash")
-        .and_then(|b| b.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let id = item.get("tool_use_id")?.as_str()?;
-                    let display = item.get("display")?.as_str()?;
-                    Some((id.to_string(), display.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if bash_displays.is_empty() {
-        return;
-    }
-
-    // Merge into content blocks
-    if let Some(content) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
-        for block in content.iter_mut() {
-            let is_bash_tool_use = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                && block.get("name").and_then(|n| n.as_str()) == Some("bash");
-
-            if !is_bash_tool_use {
-                continue;
-            }
-
-            if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
-                if let Some(display) = bash_displays.get(id) {
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.insert("display".to_string(), Value::String(display.clone()));
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ============================================================

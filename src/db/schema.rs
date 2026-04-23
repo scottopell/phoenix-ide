@@ -874,8 +874,9 @@ pub struct Message {
 }
 
 /// Message type
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../ui/src/generated/")]
 pub enum MessageType {
     User,
     Agent,

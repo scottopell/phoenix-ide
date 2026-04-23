@@ -24,8 +24,9 @@ use crate::state_machine::transition::TransitionError;
 use serde::Serialize;
 
 /// Severity classification used by the client to decide retry affordances.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../ui/src/generated/")]
 pub enum UserFacingErrorKind {
     /// User might be able to retry the operation (rate limit, transient
     /// network, overload).
@@ -44,7 +45,8 @@ pub enum UserFacingErrorKind {
 /// Construct via the `*_factory*` helpers or the typed `From` impls in
 /// this module. The `String` fields are *user-visible*; callers must
 /// ensure they've been written for humans.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../ui/src/generated/")]
 pub struct UserFacingError {
     pub title: String,
     pub detail: Option<String>,
