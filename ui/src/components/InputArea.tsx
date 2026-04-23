@@ -38,7 +38,12 @@ interface InputAreaProps {
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
   isOffline: boolean;
-  queuedMessages: QueuedMessage[];
+  /**
+   * Messages whose POST was rejected. Rendered inline with retry/dismiss
+   * controls. The caller pre-filters — InputArea does not know about the
+   * full queue, only the failures surfacing here.
+   */
+  failedMessages: QueuedMessage[];
   /** Conversation mode label (e.g. "Explore", "Work", "Direct") */
   convModeLabel?: string | undefined;
   /**
@@ -58,7 +63,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   images,
   setImages,
   isOffline,
-  queuedMessages,
+  failedMessages,
   convModeLabel,
   onSend,
   onCancel,
@@ -564,7 +569,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Derived state
   // =========================================================================
 
-  const failedMessages = queuedMessages.filter(m => m.status === 'failed');
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
   const sendEnabled = (!agentWorking || isOffline) && hasContent && !expansionError;

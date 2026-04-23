@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, ConflictError, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -11,7 +11,14 @@ import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { QuestionPanel } from '../components/QuestionPanel';
-import { useMessageQueue, useConnection, useModels, useAutoAuth } from '../hooks';
+import {
+  useMessageQueue,
+  useConnection,
+  useModels,
+  useAutoAuth,
+  derivePendingMessages,
+  deriveFailedMessages,
+} from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
@@ -131,9 +138,24 @@ export function ConversationPage() {
   // Credential helper auto-open — shared hook consolidates the pattern.
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
-  // Message queue management
-  const { queuedMessages, enqueue, markSent, markFailed, dismiss } =
+  // Message queue management. `queuedMessages` is the raw store; the rendered
+  // split between "pending in the message list" and "failed in the input area"
+  // is derived below.
+  const { queuedMessages, enqueue, markFailed, dismiss } =
     useMessageQueue(conversationId);
+
+  // Pending messages shown in the conversation are a pure derivation of the
+  // queue and `atom.messages` — see `derivePendingMessages` for the rule.
+  const pendingMessages = useMemo(
+    () => derivePendingMessages(queuedMessages, atom.messages.map((m) => m.message_id)),
+    [atom.messages, queuedMessages],
+  );
+
+  // Failed messages are rendered in InputArea with retry/dismiss controls.
+  const failedMessages = useMemo(
+    () => deriveFailedMessages(queuedMessages),
+    [queuedMessages],
+  );
 
   const connectionInfo = useConnection({
     conversationId: conversationIdForSSE,
@@ -336,31 +358,10 @@ export function ConversationPage() {
     }
   }, [atom.conversation]);
 
-  // Stable refs for queue callbacks
-  const markSentRef = useRef(markSent);
+  // Stable ref for markFailed — needed inside sendMessage which is memoized
+  // with a stable identity across renders.
   const markFailedRef = useRef(markFailed);
-  useEffect(() => { markSentRef.current = markSent; }, [markSent]);
   useEffect(() => { markFailedRef.current = markFailed; }, [markFailed]);
-
-  // Reconcile queue ↔ atom.messages: the server uses the client's localId as
-  // the canonical message_id (see api.ts sendMessage + types.rs ChatRequest),
-  // so once the SSE `message` echo lands, atom.messages will contain a row
-  // whose message_id matches a queued entry's localId — at that point the
-  // queued entry is redundant and must be removed to avoid a double-render.
-  //
-  // This effect is the authoritative "the server has it" signal. Previously
-  // markSent was called eagerly on POST-200, which removed the queued entry
-  // during the window between POST success and the SSE echo arriving — the
-  // message briefly existed in no rendered state.
-  useEffect(() => {
-    if (queuedMessages.length === 0) return;
-    const serverIds = new Set(atom.messages.map((m) => m.message_id));
-    for (const q of queuedMessages) {
-      if (q.status === 'sending' && serverIds.has(q.localId)) {
-        markSentRef.current(q.localId);
-      }
-    }
-  }, [atom.messages, queuedMessages]);
 
   const sendMessage = useCallback(
     async (
@@ -375,9 +376,11 @@ export function ConversationPage() {
       try {
         if (isOnline) {
           await api.sendMessage(conversationId, text, imgs, localId);
-          // Keep the queued entry visible until the server's SSE `message`
-          // echo lands in atom.messages — a reconciliation effect below calls
-          // markSent once atom.messages contains a row with message_id == localId.
+          // Don't touch the queue here. The entry stays `pending` until
+          // `atom.messages` contains a row with `message_id == localId`
+          // (SSE echo), at which point `pendingMessages` filters it out
+          // via the derivation above.
+          //
           // Optimistic phase update: user pressed send, show awaiting_llm
           // immediately. The authoritative server-side phase change arrives
           // later via `sse_state_change` (with its own sequence_id) and
@@ -386,6 +389,12 @@ export function ConversationPage() {
           // order" action from the `applyIfNewer` guard (task 02675).
           dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' } });
         } else {
+          // Offline path: hand the send off to the offline operation queue
+          // for replay when connectivity returns. The entry stays in
+          // `useMessageQueue` too — offline and online converge on the same
+          // "wait for SSE echo to filter this out" rule. If we dropped it
+          // from the queue here, the user would see the message vanish
+          // during the offline window. (task 02676)
           await queueOperation({
             type: 'send_message',
             conversationId,
@@ -394,7 +403,6 @@ export function ConversationPage() {
             retryCount: 0,
             status: 'pending',
           });
-          markSentRef.current(localId);
         }
       } catch (err) {
         if (err instanceof ExpansionError) {
@@ -416,18 +424,17 @@ export function ConversationPage() {
   const sendMessageRef = useRef(sendMessage);
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
-  // Send queued messages when connection is restored
+  // Send queued messages when connection is restored. Iterate the derived
+  // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
+  // the server already has — those were filtered out by the derivation.
   useEffect(() => {
     if (!isConnected || !conversationId) return;
 
-    const pending = queuedMessages.filter(
-      (m) => m.status === 'sending' && !sendingMessagesRef.current.has(m.localId)
-    );
-
-    for (const msg of pending) {
+    for (const msg of pendingMessages) {
+      if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images);
     }
-  }, [isConnected, conversationId, queuedMessages]);
+  }, [isConnected, conversationId, pendingMessages]);
 
   const handleSend = async (text: string, attachedImages: ImageData[]) => {
     if (!conversationId) return;
@@ -724,7 +731,7 @@ export function ConversationPage() {
       {seedBreadcrumb}
       <MessageList
         messages={atom.messages}
-        queuedMessages={queuedMessages}
+        pendingMessages={pendingMessages}
         convState={convStateForChildren}
         onRetry={handleRetry}
         onOpenFile={handleOpenFileFromPatch}
@@ -860,7 +867,7 @@ export function ConversationPage() {
           images={images}
           setImages={setImages}
           isOffline={isOffline}
-          queuedMessages={queuedMessages}
+          failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
           onSend={handleSend}
           onCancel={handleCancel}
@@ -910,7 +917,7 @@ export function ConversationPage() {
           images={images}
           setImages={setImages}
           isOffline={isOffline}
-          queuedMessages={queuedMessages}
+          failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
           onSend={handleSend}
           onCancel={handleCancel}

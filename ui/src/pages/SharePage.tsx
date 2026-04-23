@@ -202,7 +202,7 @@ export function SharePage() {
       <main className="share-main">
         <MessageList
           messages={messages}
-          queuedMessages={[]}
+          pendingMessages={[]}
           convState={convState}
           onRetry={() => {}}
           onOpenFile={undefined}

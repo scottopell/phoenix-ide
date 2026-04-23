@@ -174,29 +174,17 @@ function UserMessageImpl({ message }: { message: Message }) {
 
 export const QueuedUserMessage = memo(QueuedUserMessageImpl);
 
-function QueuedUserMessageImpl({ message, onRetry }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
-  const isFailed = message.status === 'failed';
-  const isSending = message.status === 'sending';
-
+// Pending user message: queued client-side, not yet echoed by the server.
+// Failed-send messages render in InputArea, not here — this component assumes
+// the entry it receives is pending (task 02676).
+function QueuedUserMessageImpl({ message }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
   return (
-    <div className={`message user ${isFailed ? 'failed' : ''}`}>
+    <div className="message user">
       <div className="message-header">
         <span className="message-sender">You</span>
-        {isSending && (
-          <span className="message-status sending" title="Sending...">
-            <span className="sending-spinner">⏳</span>
-          </span>
-        )}
-        {isFailed && (
-          <span 
-            className="message-status failed" 
-            title="Failed - tap to retry"
-            onClick={() => onRetry(message.localId)}
-            style={{ cursor: 'pointer' }}
-          >
-            !
-          </span>
-        )}
+        <span className="message-status sending" title="Sending...">
+          <span className="sending-spinner">⏳</span>
+        </span>
       </div>
       <div className="message-content">
         {message.text}

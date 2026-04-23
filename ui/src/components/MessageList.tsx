@@ -30,7 +30,14 @@ const MessageSquareIcon = () => (
 
 interface MessageListProps {
   messages: Message[];
-  queuedMessages: QueuedMessage[];
+  /**
+   * Messages the client has queued that have NOT yet appeared in `messages`
+   * (by `message_id == localId` match). The parent computes this as a pure
+   * derivation of the queue and `atom.messages`, so "sending" is implicit —
+   * presence in this list means "still waiting for the server echo."
+   * Failed messages are NOT included here; they render in InputArea.
+   */
+  pendingMessages: QueuedMessage[];
   convState: ConversationState;
   onRetry: (localId: string) => void;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
@@ -52,7 +59,7 @@ function extractSkillArgs(trigger: string, name: string): string {
 
 interface MessageListBodyProps {
   messages: Message[];
-  sendingMessages: QueuedMessage[];
+  pendingMessages: QueuedMessage[];
   toolResults: Map<string, Message>;
   convState: ConversationState;
   onRetry: (localId: string) => void;
@@ -68,7 +75,7 @@ interface MessageListBodyProps {
  */
 const MessageListBody = memo(function MessageListBody({
   messages,
-  sendingMessages,
+  pendingMessages,
   toolResults,
   convState,
   onRetry,
@@ -127,8 +134,8 @@ const MessageListBody = memo(function MessageListBody({
         // Skip tool messages - they're rendered inline with their tool_use
         return null;
       })}
-      {/* Render queued messages (sending state) */}
-      {sendingMessages.map((msg) => (
+      {/* Render pending messages (queued client-side, not yet echoed). */}
+      {pendingMessages.map((msg) => (
         <QueuedUserMessage key={msg.localId} message={msg} onRetry={onRetry} />
       ))}
       {convState.type === 'awaiting_sub_agents' && (
@@ -140,7 +147,7 @@ const MessageListBody = memo(function MessageListBody({
 
 export function MessageList({
   messages,
-  queuedMessages,
+  pendingMessages,
   convState,
   onRetry,
   onOpenFile,
@@ -284,13 +291,7 @@ export function MessageList({
     return map;
   }, [messages]);
 
-  // Get queued messages that are in "sending" state (not failed - those show in InputArea)
-  const sendingMessages = useMemo(
-    () => queuedMessages.filter(m => m.status === 'sending'),
-    [queuedMessages],
-  );
-
-  const isEmpty = messages.length === 0 && sendingMessages.length === 0;
+  const isEmpty = messages.length === 0 && pendingMessages.length === 0;
 
   return (
     <main id="main-area" ref={mainRef} onScroll={handleScroll}>
@@ -321,7 +322,7 @@ export function MessageList({
           ) : (
             <MessageListBody
               messages={messages}
-              sendingMessages={sendingMessages}
+              pendingMessages={pendingMessages}
               toolResults={toolResults}
               convState={convState}
               onRetry={onRetry}
