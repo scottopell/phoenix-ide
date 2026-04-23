@@ -1,0 +1,15 @@
+# ts-rs TS codegen settings (task 02677).
+#
+# - `TS_RS_LARGE_INT = "number"` maps i64/u64/i128/u128 to TypeScript `number`
+#   instead of ts-rs' default `bigint`. Phoenix serializes sequence_ids as
+#   JSON numbers and the client treats them as JS `number` (the schemas in
+#   `ui/src/sseSchemas.ts` require `v.number()`). Using `bigint` on the
+#   generated side would force `BigInt` at every call site for no gain —
+#   our ids are bounded by the per-conversation event counter and stay
+#   well within Number.MAX_SAFE_INTEGER.
+# - `TS_RS_IMPORT_EXTENSION = ""` drops the trailing `.ts` on imports so
+#   the generated `import ... from "./EnrichedMessage"` matches how
+#   the Vite/tsc project resolves module paths.
+[env]
+TS_RS_LARGE_INT = "number"
+TS_RS_IMPORT_EXTENSION = ""
