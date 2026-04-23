@@ -13,21 +13,47 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use std::convert::Infallible;
 use std::time::Duration;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-/// Convert broadcast stream to SSE stream
+/// Stream `init_event` followed by broadcast events to an SSE client.
+///
+/// On `BroadcastStreamRecvError::Lagged` — the client fell far enough behind
+/// that the `broadcast::channel` overwrote unread entries — this stream ends.
+/// The client's `EventSource` observes the close, its `ConnectionMachine`
+/// reconnects, and the next `init` event pulls in everything that was in
+/// the gap (the server persisted it all to `SQLite` regardless). Silently
+/// dropping Lagged — which this function used to do — left the client's
+/// state strictly behind truth with no way to notice the gap.
+///
+/// `conv_id` is threaded through only for the Lagged log line; the stream
+/// itself does not consume it. Capacity of the underlying channel lives
+/// at `crate::runtime::SSE_BROADCAST_CAPACITY`.
 pub fn sse_stream(
+    conv_id: String,
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Create stream that starts with init event then broadcasts
     let init = futures::stream::once(async move { Ok(sse_event_to_axum(init_event)) });
 
-    let broadcasts = BroadcastStream::new(broadcast_rx).filter_map(|result| match result {
-        Ok(event) => Some(Ok(sse_event_to_axum(event))),
-        Err(_) => None, // Skip lagged messages
-    });
+    let broadcasts = BroadcastStream::new(broadcast_rx)
+        .take_while(move |result| {
+            if let Err(BroadcastStreamRecvError::Lagged(n)) = result {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    lagged_by = n,
+                    "SSE broadcast lagged; closing stream so client reconnects and resyncs"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .filter_map(|result| match result {
+            Ok(event) => Some(Ok(sse_event_to_axum(event))),
+            Err(_) => None, // Lagged already closed the stream above
+        });
 
     let combined = init.chain(broadcasts);
 

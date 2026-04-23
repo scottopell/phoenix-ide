@@ -88,6 +88,19 @@ pub struct ConversationHandle {
     pub broadcast_tx: SseBroadcaster,
 }
 
+/// Capacity of the per-conversation SSE broadcast channel.
+///
+/// Sized to cover a realistic worst-case stall of the slowest receiver
+/// (a background tab, a sleeping laptop resume, a long GC pause) during
+/// active LLM streaming. At ~50 tokens/sec this buys ~80 seconds of headroom.
+///
+/// When the channel overflows, `BroadcastStreamRecvError::Lagged` fires on
+/// the receive side. We handle that in `api::sse::sse_stream` by closing the
+/// stream — the client reconnects, `init` replays current state, and no
+/// silent gap results. Increasing this value reduces how often that resync
+/// dance happens; it does not change correctness.
+pub const SSE_BROADCAST_CAPACITY: usize = 4096;
+
 /// Per-conversation SSE broadcaster with monotonic `sequence_id` allocation.
 ///
 /// Every [`SseEvent`] emitted for a conversation carries a `sequence_id` drawn
@@ -559,7 +572,7 @@ impl RuntimeManager {
         // seeds its counter from the message we just inserted (sequence_id=1)
         // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcaster = SseBroadcaster::new(128, 1);
+        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1);
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -748,7 +761,7 @@ impl RuntimeManager {
             .get_last_sequence_id(conversation_id)
             .await
             .unwrap_or(0);
-        let broadcaster = SseBroadcaster::new(128, initial_last_seq);
+        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());

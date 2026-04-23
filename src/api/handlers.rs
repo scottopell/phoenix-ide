@@ -1302,7 +1302,7 @@ async fn stream_conversation(
         });
     }
 
-    Ok(sse_stream(init_event, broadcast_rx))
+    Ok(sse_stream(id, init_event, broadcast_rx))
 }
 
 // ============================================================
@@ -2709,7 +2709,7 @@ async fn shared_sse_stream(
         project_name,
     };
 
-    Ok(sse_stream(init_event, broadcast_rx))
+    Ok(sse_stream(conversation_id, init_event, broadcast_rx))
 }
 
 // ============================================================
