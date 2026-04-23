@@ -57,7 +57,23 @@ const MessageSchema = v.pipe(
     message_id: v.string(),
     sequence_id: v.number(),
     conversation_id: v.string(),
-    message_type: v.picklist(['user', 'agent', 'tool', 'system', 'skill']),
+    // Mirror the Rust `MessageType` enum at src/db/schema.rs:879. The
+    // picklist is strict so an unknown type surfaces as a schema violation
+    // (forward-compat risk accepted for this field — new message types are
+    // rare and additive). A conversation's history can include `error`
+    // messages (parse-error fallback) and `continuation` messages
+    // (continuation summaries), so both must be listed here — otherwise
+    // init for any conversation with those in history would fail to
+    // validate.
+    message_type: v.picklist([
+      'user',
+      'agent',
+      'tool',
+      'system',
+      'skill',
+      'error',
+      'continuation',
+    ]),
     content: v.unknown(),
     display_data: v.optional(v.unknown()),
     usage_data: v.optional(v.unknown()),
