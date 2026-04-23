@@ -173,6 +173,13 @@ pub enum SseEvent {
     Message {
         message: crate::db::Message,
     },
+    /// An existing message's mutable fields changed. Carries only the delta —
+    /// `message_id` and `sequence_id` are immutable and not repeated here.
+    MessageUpdated {
+        message_id: String,
+        display_data: Option<serde_json::Value>,
+        content: Option<crate::db::MessageContent>,
+    },
     StateChange {
         /// Full typed conversation state
         state: ConvState,

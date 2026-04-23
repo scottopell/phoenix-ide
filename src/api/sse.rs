@@ -34,6 +34,7 @@ pub fn sse_stream(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn sse_event_to_axum(event: SseEvent) -> Event {
     let (event_type, data) = match event {
         SseEvent::Init {
@@ -80,6 +81,19 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 }),
             )
         }
+        SseEvent::MessageUpdated {
+            message_id,
+            display_data,
+            content,
+        } => (
+            "message_updated",
+            json!({
+                "type": "message_updated",
+                "message_id": message_id,
+                "display_data": display_data,
+                "content": content,
+            }),
+        ),
         SseEvent::StateChange {
             state,
             display_state,
@@ -133,4 +147,40 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
     };
 
     Event::default().event(event_type).data(data.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_updated_serializes_to_correct_sse_event_type() {
+        let display_data = serde_json::json!({
+            "type": "subagent_summary",
+            "results": []
+        });
+        let event = SseEvent::MessageUpdated {
+            message_id: "msg-abc".to_string(),
+            display_data: Some(display_data.clone()),
+            content: None,
+        };
+
+        let axum_event = sse_event_to_axum(event);
+
+        // Verify by re-serializing via Debug and inspecting the output
+        // The axum Event encodes: event type and data fields
+        let debug_repr = format!("{axum_event:?}");
+        assert!(
+            debug_repr.contains("message_updated"),
+            "Expected SSE event type 'message_updated' in: {debug_repr}"
+        );
+        assert!(
+            debug_repr.contains("msg-abc"),
+            "Expected message_id 'msg-abc' in: {debug_repr}"
+        );
+        assert!(
+            debug_repr.contains("subagent_summary"),
+            "Expected display_data type 'subagent_summary' in: {debug_repr}"
+        );
+    }
 }

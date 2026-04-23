@@ -144,16 +144,16 @@ describe('conversationReducer', () => {
 
     it('drops overlapping messages by message_id on reconnect merge', () => {
       // Same story but the server reassigned sequence_id (hypothetical).
-      // message_id is the stable identifier and must win.
+      // message_id is the stable identifier; the incoming version replaces the existing.
       const existing: Message = { ...makeMessage(3), message_id: 'stable-id' };
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         lastSequenceId: 3,
         messages: [existing],
       };
-      const duplicated: Message = { ...makeMessage(4), message_id: 'stable-id' };
+      const incoming: Message = { ...makeMessage(4), message_id: 'stable-id' };
       const payload = makeInitPayload({
-        messages: [duplicated],
+        messages: [incoming],
         lastSequenceId: 4,
       });
 
@@ -161,6 +161,34 @@ describe('conversationReducer', () => {
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.message_id).toBe('stable-id');
+    });
+
+    // Reconnect gap: client disconnects, sub-agent run completes (display_data mutated
+    // in DB), client reconnects. The full message list from the server must overwrite the
+    // stale display_data the client already had — not silently skip it as a duplicate.
+    it('replaces existing message in-place on full-resync when display_data changed', () => {
+      const staleMsg: Message = {
+        ...makeMessage(5),
+        display_data: { type: 'spawning' } as Record<string, unknown>,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [staleMsg],
+        lastSequenceId: 5,
+      };
+      const freshMsg: Message = {
+        ...staleMsg,
+        display_data: { type: 'subagent_summary', results: [] } as Record<string, unknown>,
+      };
+      const payload = makeInitPayload({
+        messages: [freshMsg],
+        lastSequenceId: 5,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(1);
+      expect((next.messages[0]!.display_data as { type: string }).type).toBe('subagent_summary');
     });
   });
 
@@ -175,11 +203,11 @@ describe('conversationReducer', () => {
       expect(next.lastSequenceId).toBe(10);
     });
 
-    it('is a no-op for duplicate sequenceId', () => {
+    it('is a no-op for duplicate sequenceId (not in messages)', () => {
+      // Duplicate seq id with no existing message_id match — pure dedup case.
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         lastSequenceId: 10,
-        messages: [makeMessage(10)],
       };
 
       const next = dispatch(atom, {
@@ -219,23 +247,33 @@ describe('conversationReducer', () => {
       expect(next.messages).toHaveLength(1);
     });
 
-    it('updates existing message in-place by message_id', () => {
-      const original = makeMessage(5);
+    // Regression: sse_message with an existing message_id but sequenceId below
+    // lastSequenceId must be a NO-OP. The old runtime message_id lookup is gone —
+    // mutations arrive via sse_message_updated instead.
+    it('is a no-op when message_id already exists and sequenceId is below lastSequenceId', () => {
+      const original: Message = {
+        ...makeMessage(5, 'agent'),
+        message_type: 'tool',
+        content: {
+          tool_use_id: 'toolu-spawn',
+          content: 'Spawning 3 sub-agents...',
+          is_error: false,
+        } as Message['content'],
+      };
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 4,
+        lastSequenceId: 42,
       };
-      const updated = { ...original, content: { text: 'updated' } as Message['content'] };
+      const rebroadcast: Message = { ...original, display_data: { type: 'subagent_summary' } };
 
       const next = dispatch(atom, {
         type: 'sse_message',
-        message: updated,
+        message: rebroadcast,
         sequenceId: 5,
       });
 
-      expect(next.messages).toHaveLength(1);
-      expect((next.messages[0]!.content as { text: string }).text).toBe('updated');
+      expect(next).toBe(atom);
     });
 
     it('updates resultSummary on matching tool breadcrumb when tool result arrives', () => {
@@ -321,6 +359,101 @@ describe('conversationReducer', () => {
 
       expect(next.breadcrumbs).toHaveLength(1);
       expect(next.breadcrumbs[0]!.type).toBe('user');
+    });
+  });
+
+  describe('sse_message_updated', () => {
+    // Regression: spawn_agents tool_result gets display_data refreshed AFTER many
+    // later SSE events have advanced lastSequenceId. The backend broadcasts
+    // MessageUpdated (not Message) so the monotonic cursor guard never applies.
+    it('applies display_data update-in-place even when lastSequenceId is high', () => {
+      const original: Message = {
+        ...makeMessage(5, 'agent'),
+        message_type: 'tool',
+        content: {
+          tool_use_id: 'toolu-spawn',
+          content: 'Spawning 3 sub-agents...',
+          is_error: false,
+        } as Message['content'],
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 42,
+      };
+      const summaryDisplayData: Record<string, unknown> = {
+        type: 'subagent_summary',
+        results: [{ agent_id: 'a1', task: 't', outcome: { type: 'success', result: 'done' } }],
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        messageId: original.message_id,
+        displayData: summaryDisplayData,
+      });
+
+      expect(next.messages).toHaveLength(1);
+      expect(next.messages[0]!.display_data).toEqual(summaryDisplayData);
+      expect(next.lastSequenceId).toBe(42);
+    });
+
+    it('does not touch lastSequenceId or streamingBuffer', () => {
+      const original = makeMessage(5);
+      const buffer = { text: 'streaming...', lastSequence: 40, startedAt: Date.now() };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 42,
+        streamingBuffer: buffer,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        messageId: original.message_id,
+        displayData: { type: 'updated' },
+      });
+
+      expect(next.streamingBuffer).toBe(buffer);
+      expect(next.lastSequenceId).toBe(42);
+    });
+
+    it('is a no-op when message_id is unknown', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(5)],
+        lastSequenceId: 10,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        messageId: 'nonexistent-id',
+        displayData: { type: 'whatever' },
+      });
+
+      expect(next).toBe(atom);
+    });
+
+    it('merges content and display_data independently', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        display_data: { type: 'original' } as Record<string, unknown>,
+        content: { text: 'original content' } as Message['content'],
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 10,
+      };
+
+      // Update only display_data, not content
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        messageId: original.message_id,
+        displayData: { type: 'new_display' },
+      });
+
+      expect((next.messages[0]!.display_data as { type: string }).type).toBe('new_display');
+      expect((next.messages[0]!.content as { text: string }).text).toBe('original content');
     });
   });
 

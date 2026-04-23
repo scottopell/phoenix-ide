@@ -935,11 +935,6 @@ async fn get_system_prompt(
 // SSE Streaming (REQ-API-005)
 // ============================================================
 
-#[derive(Debug, Deserialize)]
-struct StreamQuery {
-    after: Option<i64>,
-}
-
 /// Type alias -- breadcrumb type now lives in `runtime.rs` as `SseBreadcrumb`.
 type Breadcrumb = crate::runtime::SseBreadcrumb;
 
@@ -1165,7 +1160,6 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
 async fn stream_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<StreamQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let conversation = state
         .runtime
@@ -1174,13 +1168,12 @@ async fn stream_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // Get messages (filtered by after if provided)
-    let messages = if let Some(after) = query.after {
-        state.runtime.db().get_messages_after(&id, after).await
-    } else {
-        state.runtime.db().get_messages(&id).await
-    }
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let messages = state
+        .runtime
+        .db()
+        .get_messages(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let last_sequence_id = state
         .runtime

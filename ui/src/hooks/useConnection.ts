@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef, type Dispatch } from 'react';
-import type { SseInitData, SseMessageData, SseStateChangeData } from '../api';
+import type { SseInitData, SseMessageData, SseMessageUpdatedData, SseStateChangeData } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import type { Breadcrumb } from '../types';
 import { parseConversationState } from '../utils';
@@ -26,8 +26,6 @@ export interface ConnectionInfo {
 
 interface UseConnectionOptions {
   conversationId: string | undefined;
-  /** Current lastSequenceId from the conversation atom, used to build ?after= URL. */
-  lastSequenceId: number;
   /** Dispatch SSE events directly to the conversation atom. */
   dispatch: Dispatch<SSEAction>;
 }
@@ -77,15 +75,15 @@ function transformInitData(raw: SseInitData): InitPayload {
 /**
  * Hook for managing SSE connection lifecycle with reconnection handling.
  *
- * After refactor: this hook is a socket lifecycle manager only.
- * - It receives `dispatch` from the conversation atom and calls it with SSEActions.
- * - It receives `lastSequenceId` from the atom for reconnection URL construction.
- * - It does NOT own lastSequenceId or maintain a seenIds set.
- *   Deduplication is handled by the reducer's `lastSequenceId >= event.sequenceId` check.
+ * Socket lifecycle manager only. Receives `dispatch` from the conversation
+ * atom and calls it with SSEActions. The server always returns the full
+ * message list on /stream init — update-in-place mutations arrive via the
+ * typed `message_updated` SSE event — so this hook carries no sequence-id
+ * state of its own. Reducer-side dedup by `lastSequenceId >= event.sequenceId`
+ * still applies inside the atom.
  */
 export function useConnection({
   conversationId,
-  lastSequenceId,
   dispatch,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
@@ -96,14 +94,8 @@ export function useConnection({
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const reconnectedTimeoutRef = useRef<number | null>(null);
-  const lastSequenceIdRef = useRef<number>(lastSequenceId);
   const dispatchRef = useRef(dispatch);
   const conversationIdRef = useRef(conversationId);
-
-  // Keep refs up to date
-  useEffect(() => {
-    lastSequenceIdRef.current = lastSequenceId;
-  }, [lastSequenceId]);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -145,11 +137,7 @@ export function useConnection({
             eventSourceRef.current = null;
           }
 
-          let url = `/api/conversations/${convId}/stream`;
-          if (lastSequenceIdRef.current > 0) {
-            url += `?after=${lastSequenceIdRef.current}`;
-          }
-
+          const url = `/api/conversations/${convId}/stream`;
           const es = new EventSource(url);
           eventSourceRef.current = es;
 
@@ -191,6 +179,28 @@ export function useConnection({
                 type: 'sse_message',
                 message: msg,
                 sequenceId: msg.sequence_id,
+              });
+            }
+          });
+
+          es.addEventListener('message_updated', (e) => {
+            let data: SseMessageUpdatedData;
+            try {
+              data = JSON.parse((e as MessageEvent).data) as SseMessageUpdatedData;
+            } catch {
+              dispatchRef.current({
+                type: 'sse_error',
+                error: { type: 'ParseError', raw: (e as MessageEvent).data },
+              });
+              return;
+            }
+
+            if (data.message_id) {
+              dispatchRef.current({
+                type: 'sse_message_updated',
+                messageId: data.message_id,
+                ...(data.display_data != null && { displayData: data.display_data }),
+                ...(data.content != null && { content: data.content }),
               });
             }
           });

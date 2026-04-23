@@ -186,6 +186,12 @@ export interface SseMessageData {
   message: Message;
 }
 
+export interface SseMessageUpdatedData {
+  message_id: string;
+  display_data?: Record<string, unknown> | null;
+  content?: Message['content'] | null;
+}
+
 export interface SseStateChangeData {
   state: ConversationState;
   /** Semantic state category from API: idle, working, error, terminal */

@@ -40,6 +40,12 @@ export interface InitPayload {
 export type SSEAction =
   | { type: 'sse_init'; payload: InitPayload }
   | { type: 'sse_message'; message: Message; sequenceId: number }
+  | {
+      type: 'sse_message_updated';
+      messageId: string;
+      displayData?: Record<string, unknown>;
+      content?: Message['content'];
+    }
   | { type: 'sse_state_change'; phase: ConversationState; sequenceId?: number }
   | { type: 'sse_agent_done'; sequenceId?: number }
   | { type: 'sse_token'; delta: string; sequence: number }
@@ -159,24 +165,20 @@ export function conversationReducer(
     case 'sse_init': {
       const p = action.payload;
 
-      // When reconnecting with ?after=N, the server returns only delta messages
-      // (sequence_id > N). Merge with existing to preserve full history. On
-      // fresh connect (lastSequenceId=0), replace.
-      //
-      // Defensive dedup (task 24683): filter incoming messages by
-      // sequence_id AND message_id before concatenating. The server contract
-      // is "deltas only", but the client must not rely on that — any
-      // accidental overlap (backend off-by-one, retry, or regression) would
-      // otherwise surface as visibly duplicated messages in the chat, fixable
-      // only by a full reload. `sse_message` already dedups; `sse_init` must
-      // match that discipline.
+      // On fresh connect (lastSequenceId=0): replace entirely.
+      // On reconnect (lastSequenceId>0): the server always returns the full
+      // message list so we get a current snapshot of any mutable state. Merge
+      // by replacing existing messages with the incoming version (handles
+      // display_data/content mutations that occurred while disconnected) and
+      // appending genuinely new messages.
       let mergedMessages: Message[];
       if (atom.lastSequenceId > 0) {
+        const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
+        // Replace existing messages with incoming version if present (captures mutations).
+        const replaced = atom.messages.map((m) => incomingById.get(m.message_id) ?? m);
         const existingIds = new Set(atom.messages.map((m) => m.message_id));
-        const delta = p.messages.filter(
-          (m) => m.sequence_id > atom.lastSequenceId && !existingIds.has(m.message_id)
-        );
-        mergedMessages = [...atom.messages, ...delta];
+        const appended = p.messages.filter((m) => !existingIds.has(m.message_id));
+        mergedMessages = [...replaced, ...appended];
       } else {
         mergedMessages = p.messages;
       }
@@ -220,19 +222,11 @@ export function conversationReducer(
     }
 
     case 'sse_message': {
+      // Strict monotonic guard: sse_message is for new messages only.
+      // In-place mutations arrive via sse_message_updated.
       if (atom.lastSequenceId >= action.sequenceId) return atom;
 
-      // Support update-in-place for messages with same message_id (e.g., display_data updates)
-      const existingIdx = atom.messages.findIndex(
-        (m) => m.message_id === action.message.message_id
-      );
-      let newMessages: Message[];
-      if (existingIdx >= 0) {
-        newMessages = [...atom.messages];
-        newMessages[existingIdx] = action.message;
-      } else {
-        newMessages = [...atom.messages, action.message];
-      }
+      const newMessages = [...atom.messages, action.message];
 
       // User and skill messages reset breadcrumbs to start a fresh agent turn
       const isUserMessage =
@@ -265,6 +259,20 @@ export function conversationReducer(
         streamingBuffer: null,
         breadcrumbs,
       };
+    }
+
+    case 'sse_message_updated': {
+      const idx = atom.messages.findIndex((m) => m.message_id === action.messageId);
+      if (idx < 0) return atom;
+      const merged = {
+        ...atom.messages[idx]!,
+        ...(action.displayData !== undefined && { display_data: action.displayData }),
+        ...(action.content !== undefined && { content: action.content }),
+      };
+      const newMessages = [...atom.messages];
+      newMessages[idx] = merged;
+      return { ...atom, messages: newMessages };
+      // Does not touch lastSequenceId or streamingBuffer.
     }
 
     case 'sse_state_change': {

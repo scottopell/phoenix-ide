@@ -115,10 +115,8 @@ export function ConversationPage() {
   const { queuedMessages, enqueue, markSent, markFailed, dismiss } =
     useMessageQueue(conversationId);
 
-  // Connection lifecycle — receives dispatch and lastSequenceId from atom
   const connectionInfo = useConnection({
     conversationId: conversationIdForSSE,
-    lastSequenceId: atom.lastSequenceId,
     dispatch,
   });
 

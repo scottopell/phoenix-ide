@@ -1668,6 +1668,9 @@ where
                 results.len()
             );
 
+            // Both writes must succeed before broadcasting. Otherwise the client
+            // would see state the DB can't corroborate on reconnect (full resync
+            // from DB would revert the UI to stale values).
             if let Err(e) = self
                 .storage
                 .update_tool_message_content(&message_id, &llm_content)
@@ -1678,6 +1681,7 @@ where
                     message_id = %message_id,
                     "Failed to update spawn_agents message content with sub-agent results"
                 );
+                return Ok(None);
             }
 
             if let Err(e) = self
@@ -1690,24 +1694,15 @@ where
                     message_id = %message_id,
                     "Failed to update spawn_agents message display_data"
                 );
-            } else {
-                // Fetch the updated message and broadcast it
-                // This allows the frontend to update its message state
-                match self.storage.get_message_by_id(&message_id).await {
-                    Ok(updated_msg) => {
-                        let _ = self.broadcast_tx.send(SseEvent::Message {
-                            message: updated_msg,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            message_id = %message_id,
-                            "Failed to fetch updated message for broadcast"
-                        );
-                    }
-                }
+                return Ok(None);
             }
+
+            let updated_content = crate::db::MessageContent::tool(&tool_id, &llm_content, false);
+            let _ = self.broadcast_tx.send(SseEvent::MessageUpdated {
+                message_id: message_id.clone(),
+                display_data: Some(display_data.clone()),
+                content: Some(updated_content),
+            });
         } else {
             // No spawn_tool_id - create a standalone summary message
             // This happens when spawn_agents wasn't the last tool in a batch
