@@ -17,6 +17,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Dispatch } from 'react';
 import { parseEvent } from './hooks/useConnection';
 import type { SSEAction } from './conversation/atom';
+import type { MessageType } from './generated/MessageType';
+import { MESSAGE_TYPE_OPTIONS } from './sseSchemas';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -582,16 +584,11 @@ describe('message_type picklist tripwire', () => {
   // until it's added here too. Conversely, if `MESSAGE_TYPE_OPTIONS` grows
   // extras that aren't in `MessageType`, the runtime comparison fails.
 
-  it('MESSAGE_TYPE_OPTIONS matches the generated MessageType union', async () => {
-    // Dynamic imports so this describe block doesn't alter the loading order
-    // of the surrounding parseEvent tests.
-    const { MESSAGE_TYPE_OPTIONS } = await import('./sseSchemas');
-    const type = await import('./generated/MessageType');
-
+  it('MESSAGE_TYPE_OPTIONS matches the generated MessageType union', () => {
     // Compile-time exhaustiveness: this mapping must list every variant of
     // `MessageType`. Adding a new variant to the generated union without
     // extending this map is a TypeScript error here.
-    const expected: Record<type.MessageType, true> = {
+    const expected: Record<MessageType, true> = {
       user: true,
       agent: true,
       tool: true,
