@@ -25,6 +25,16 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::OwnedSemaphorePermit;
+
+/// How long to wait for the sitting relay to release the `attach_permit`
+/// before bailing out. The permit is the authoritative single-occupancy
+/// mechanism; this timeout is a safety net against a pathologically stuck
+/// relay (e.g. blocked in a `poll_ready` we can't cancel from outside).
+/// If it fires, the reclaimer returns `None` rather than proceeding without
+/// the permit — that would create concurrent attached relays, which is the
+/// exact bug this permit exists to prevent.
+const ATTACH_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Axum handler: `GET /api/conversations/:id/terminal` (WebSocket upgrade).
 ///
@@ -66,8 +76,12 @@ async fn handle_socket(
         return;
     };
 
-    // Acquire a handle: reclaim an existing session, or spawn a new one.
-    let Some(arc_handle) = acquire_handle(
+    // Acquire a handle AND the single attach_permit: reclaim an existing
+    // session, or spawn a new one. The permit is the structural guarantee
+    // that only one relay is attached to this handle at a time; we hold it
+    // for the entire lifetime of this relay and drop it in the cleanup
+    // branch (full_teardown / detach_only).
+    let Some((arc_handle, attach_permit)) = acquire_handle(
         &conversation_id,
         &terminals,
         &cwd,
@@ -190,34 +204,44 @@ async fn handle_socket(
             detach_only(&conversation_id, arc_handle);
         }
     }
+    // Release the single-attach permit AFTER cleanup runs. This wakes the
+    // next reclaimer's `acquire_owned()` at the earliest point that the
+    // slot is actually free. `drop` is explicit here so the ordering is
+    // obvious at the call site; the code is correct without it, but the
+    // lint-free discipline helps anyone tracing the release point.
+    drop(attach_permit);
 }
 
-/// Acquire an `Arc<TerminalHandle>` for the relay: reclaim an existing session
-/// or spawn a new one.
+/// Acquire an `Arc<TerminalHandle>` AND the single `attach_permit` for the
+/// relay: reclaim an existing session or spawn a new one.
+///
+/// The permit is the structural single-occupancy mechanism: whoever holds it
+/// is the sole attached relay. Two concurrent reclaimers cannot both acquire
+/// it — the semaphore serializes them, so the second reclaimer's
+/// `acquire_owned()` blocks until the first relay releases the permit (on
+/// detach or teardown).
 ///
 /// Reclaim path (session already registered):
 ///   1. Clone the existing Arc (drops the registry mutex immediately).
 ///   2. Signal the sitting relay to detach via `stop_tx.send(Detach)`.
-///   3. Await `detached.notified()` — the old relay fires this on clean exit.
-///   4. Return the same Arc for the new relay to use.
+///   3. `acquire_owned()` on the permit — blocks until the sitting relay
+///      drops its permit. Bounded by `ATTACH_PERMIT_TIMEOUT` as a safety net.
+///   4. Return `(handle, permit)` to the caller.
 ///
 /// Fresh path (no session):
 ///   1. Spawn a new PTY via `spawn_blocking`.
 ///   2. `try_insert` into the registry. If that loses a race (another
-///      connection inserted first), recurse into reclaim with the winner.
-///
-/// The `Notify`'s one-permit semantics cover both orderings: if the old
-/// relay exits and calls `notify_one` before we call `notified()`, the
-/// permit is stored; our later `notified()` consumes it and returns
-/// immediately. This is the key property that makes concurrent reclaim
-/// safe: exactly one notify ↔ one wakeup, whichever order they arrive.
+///      connection inserted first), reap the losing child and reclaim the
+///      winner so the caller still gets an attached session.
+///   3. `acquire_owned()` the permit — available immediately since the
+///      handle is fresh and nobody holds it yet.
 async fn acquire_handle(
     conversation_id: &str,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-) -> Option<Arc<TerminalHandle>> {
+) -> Option<(Arc<TerminalHandle>, OwnedSemaphorePermit)> {
     // Fast path: reclaim if a handle already exists.
     if let Some(existing) = terminals.get(conversation_id) {
         return reclaim(conversation_id, existing).await;
@@ -245,7 +269,8 @@ async fn acquire_handle(
     // is dropped (closing master_fd → SIGHUP), and we fall back to reclaiming
     // the winner so the caller still gets an attached session.
     if let Some(arc_handle) = terminals.try_insert(conversation_id.to_string(), handle) {
-        return Some(arc_handle);
+        // Fresh handle — permit is available immediately (initialized with 1).
+        return acquire_permit(conversation_id, arc_handle).await;
     }
 
     tracing::warn!(conv_id = %conversation_id, "Terminal: post-spawn race lost, reclaiming winner");
@@ -268,45 +293,52 @@ async fn acquire_handle(
     reclaim(conversation_id, existing).await
 }
 
-/// Evict the relay currently attached to `existing` and return the handle for
-/// the caller to reuse. The handle's `tracker`, `master_fd`, etc. are preserved.
+/// Evict the relay currently attached to `existing` and take over the single
+/// attach slot. The handle's `tracker`, `master_fd`, etc. are preserved.
+///
+/// Returns `None` if we fail to acquire the permit within
+/// `ATTACH_PERMIT_TIMEOUT` — proceeding without it would break the
+/// single-attached-relay invariant (the permit is the authoritative slot).
 async fn reclaim(
     conversation_id: &str,
     existing: Arc<TerminalHandle>,
-) -> Option<Arc<TerminalHandle>> {
+) -> Option<(Arc<TerminalHandle>, OwnedSemaphorePermit)> {
     tracing::info!(conv_id = %conversation_id, "Terminal: reclaiming existing session");
 
-    let detached = Arc::clone(&existing.detached);
     // Signal the sitting relay to detach. `send` returns Err only if there
-    // are no receivers; that means no relay is actually attached — another
-    // reclaimer has already evicted it, or the relay hasn't subscribed yet.
-    // Either way, proceeding is safe: if no relay is attached, there's
-    // nothing to wait for.
-    let send_result = existing.stop_tx.send(StopReason::Detach);
+    // are no receivers; that means no relay is actually attached — the
+    // permit should be available and `acquire_permit` will return
+    // immediately. Either way we fall through to permit acquisition: the
+    // permit is what authoritatively gates the attach slot.
+    let _ = existing.stop_tx.send(StopReason::Detach);
 
-    if send_result.is_ok() {
-        // Await the old relay's clean exit. If a concurrent reclaimer races
-        // with us, `Notify`'s permit semantics ensure both wakers observe a
-        // valid notification (the old relay fires once; the second reclaimer
-        // either gets the stored permit from a prior cycle, or waits for the
-        // in-flight cycle's notify — still one-to-one).
-        //
-        // Bound the wait so a pathologically stuck relay (e.g. blocked in a
-        // poll_ready we can't cancel from outside) doesn't deadlock the
-        // reclaimer forever.
-        if tokio::time::timeout(Duration::from_secs(5), detached.notified())
-            .await
-            .is_err()
-        {
-            tracing::warn!(conv_id = %conversation_id,
-                "Terminal: reclaim timed out waiting for old relay to detach; proceeding anyway");
+    acquire_permit(conversation_id, existing).await
+}
+
+/// Acquire the `attach_permit` for `handle`, bounded by
+/// `ATTACH_PERMIT_TIMEOUT`. Returns `None` on timeout — the caller MUST
+/// NOT proceed to attach a relay without a permit, because that would
+/// create concurrent attached relays reading from the same PTY master.
+async fn acquire_permit(
+    conversation_id: &str,
+    handle: Arc<TerminalHandle>,
+) -> Option<(Arc<TerminalHandle>, OwnedSemaphorePermit)> {
+    let sem = Arc::clone(&handle.attach_permit);
+    match tokio::time::timeout(ATTACH_PERMIT_TIMEOUT, sem.acquire_owned()).await {
+        Ok(Ok(permit)) => Some((handle, permit)),
+        Ok(Err(e)) => {
+            // Semaphore closed — shouldn't happen (we never call `close()`).
+            tracing::error!(conv_id = %conversation_id, error = %e,
+                "Terminal: attach_permit semaphore closed unexpectedly");
+            None
         }
-    } else {
-        tracing::debug!(conv_id = %conversation_id,
-            "Terminal: reclaim found no attached relay (stop_tx has no receivers)");
+        Err(_timeout) => {
+            // Sitting relay is stuck. Bail rather than risk concurrent attach.
+            tracing::warn!(conv_id = %conversation_id,
+                "Terminal: timed out waiting for attach_permit; sitting relay appears stuck, aborting reclaim");
+            None
+        }
     }
-
-    Some(existing)
 }
 
 /// Full teardown: shell must die, registry entry goes away, child reaped.
@@ -327,10 +359,10 @@ async fn full_teardown(
 }
 
 /// Detach only: release our Arc clone but leave the registry entry intact so
-/// the shell stays alive awaiting a future reclaim. Signal the detach so a
-/// waiting reclaimer can proceed.
+/// the shell stays alive awaiting a future reclaim. The caller drops the
+/// `attach_permit` after this returns — that permit release is what wakes
+/// any pending reclaimer in `acquire_permit`.
 fn detach_only(conversation_id: &str, arc_handle: Arc<TerminalHandle>) {
-    arc_handle.detached.notify_one();
     // Dropping our clone is safe: the registry holds its own Arc, so the
     // refcount stays > 0 and master_fd remains open.
     drop(arc_handle);
@@ -385,13 +417,14 @@ mod reclaim_tests {
     #![allow(clippy::unwrap_used)]
     use super::super::relay::{run_relay, RelayConfig, RelayExit};
     use super::super::session::{ShellIntegrationStatus, StopReason, TerminalHandle};
+    use super::{acquire_permit, ATTACH_PERMIT_TIMEOUT};
     use crate::terminal::command_tracker::CommandTracker;
     use crate::terminal::test_helpers::full_command;
     use futures::channel::mpsc;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
     use tokio::io::{duplex, AsyncWriteExt};
-    use tokio::sync::{watch, Notify};
+    use tokio::sync::{watch, Semaphore};
 
     /// Build a `TerminalHandle`-shaped value suitable for reclaim tests.
     /// We reuse the real struct but back `master_fd` with `/dev/null` since
@@ -417,16 +450,27 @@ mod reclaim_tests {
             tracker: Arc::new(Mutex::new(CommandTracker::new("reclaim-test".to_string()))),
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
             stop_tx,
-            detached: Arc::new(Notify::new()),
+            attach_permit: Arc::new(Semaphore::new(1)),
         })
     }
 
     /// Emulate the handler's relay step for a single connection.
-    /// Returns the `RelayExit` so the test can assert on detach-vs-teardown.
+    ///
+    /// Follows the same acquire → run → release sequence as
+    /// `handle_socket`: acquire the `attach_permit`, run the relay, drop the
+    /// permit on exit. This way concurrency tests exercise the full
+    /// single-occupancy path, not just the signal level.
     async fn run_connection(
         handle: Arc<TerminalHandle>,
         shell_writes: Vec<u8>,
     ) -> (RelayExit, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        // Acquire the permit via the same path the handler uses. This blocks
+        // until any previous relay releases its permit, matching production
+        // behaviour exactly.
+        let (handle, permit) = acquire_permit("reclaim", handle)
+            .await
+            .expect("test acquire must succeed");
+
         let (mut shell_end, pty_end) = duplex(4096);
         let (ws_tx, mut ws_rx) = mpsc::channel::<Vec<u8>>(32);
 
@@ -446,7 +490,6 @@ mod reclaim_tests {
         });
 
         let tracker = Arc::clone(&handle.tracker);
-        let detached = Arc::clone(&handle.detached);
         let handle_clone = Arc::clone(&handle);
         let relay = tokio::spawn(async move {
             let exit = run_relay(
@@ -462,15 +505,11 @@ mod reclaim_tests {
             )
             .await;
 
-            // Mirror `ws.rs` behaviour for the detach path: notify waiters
-            // before dropping the handle clone.
-            if matches!(
-                exit,
-                RelayExit::Stopped(StopReason::Detach | StopReason::Running) | RelayExit::WsClosed
-            ) {
-                detached.notify_one();
-            }
             drop(handle_clone);
+            // Release the permit AFTER the relay has exited (mirrors the
+            // `drop(attach_permit)` at the end of `handle_socket`). This is
+            // the authoritative signal that the attach slot is free.
+            drop(permit);
             exit
         });
 
@@ -492,22 +531,14 @@ mod reclaim_tests {
     async fn two_sequential_connections_reclaim_same_handle() {
         let handle = build_handle();
 
-        // Connection 1: capture "cmd1", then reclaimer signals Detach.
+        // Connection 1: capture "cmd1", then signal Detach to evict.
         let h1 = Arc::clone(&handle);
         let writes_1 = full_command("cmd1", "out1\n", Some(0));
         let conn_1 = tokio::spawn(async move { run_connection(h1, writes_1).await });
 
-        // Simulate the "new connection's" reclaim signal.
+        // Give conn_1 time to acquire the permit and start its relay.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         handle.stop_tx.send(StopReason::Detach).unwrap();
-
-        // Reclaimer waits for detach notification, then subscribes for its own relay.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle.detached.notified(),
-        )
-        .await
-        .expect("detach notification must fire within the bound");
 
         let (exit_1, _) = conn_1.await.unwrap();
         assert_eq!(
@@ -516,13 +547,13 @@ mod reclaim_tests {
             "first connection must exit via Detach"
         );
 
-        // Connection 2: runs on the same handle, captures "cmd2".
+        // Connection 2: runs on the same handle, captures "cmd2". Its
+        // `acquire_permit` succeeds immediately because conn_1 released the
+        // permit on exit.
         let h2 = Arc::clone(&handle);
         let writes_2 = full_command("cmd2", "out2\n", Some(0));
         let conn_2 = tokio::spawn(async move { run_connection(h2, writes_2).await });
 
-        // Let relay 2 finish on its own (WsClosed via shell_end drop at end of run_connection).
-        // We need to give it a chance to stop — signal Detach so it exits cleanly.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         handle.stop_tx.send(StopReason::Detach).unwrap();
 
@@ -595,67 +626,177 @@ mod reclaim_tests {
         );
     }
 
-    /// Concurrent reclaim: two reclaimers race to evict the sitting relay.
-    /// Exactly one signal gets the relay to exit; both reclaimers observe
-    /// `detached` and proceed. No deadlock, no panic.
+    /// Concurrent reclaim — exactly-one-winner at the permit level.
+    ///
+    /// Two reclaimers race to acquire the `attach_permit` while a sitting
+    /// relay holds it. The semaphore's single-permit semantics guarantee
+    /// that at most ONE racer holds the permit at any moment; the other
+    /// blocks in `acquire_owned()` until the first releases.
+    ///
+    /// This is the structural property that prevents two relays from
+    /// concurrently reading the same PTY master — which is the actual bug
+    /// the permit exists to prevent. The prior signal-level test
+    /// (`detached.notified()`) could not catch that bug, because the bug
+    /// manifests only after both racers reach the relay step.
     #[tokio::test]
-    async fn concurrent_reclaim_two_racers_no_deadlock() {
+    async fn concurrent_reclaim_exactly_one_winner() {
         let handle = build_handle();
 
-        // Sitting relay.
+        // Sitting relay holds the one permit. We'll evict it after both
+        // reclaimers have started their acquire.
         let h_sit = Arc::clone(&handle);
         let sitting = tokio::spawn(async move { run_connection(h_sit, Vec::new()).await });
 
-        // Give the sitting relay time to subscribe to stop_tx.
+        // Give the sitting relay time to acquire the permit and subscribe
+        // to stop_tx.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            handle.attach_permit.available_permits(),
+            0,
+            "sitting relay must hold the one permit"
+        );
 
-        // Two reclaimers run in parallel. Each does:
-        //   1. send(Detach) — both succeed (watch::send never fails as long
-        //      as there's a receiver; a redundant Detach is a no-op on the
-        //      already-Detach channel but triggers `changed()` for any new
-        //      subscriber).
-        //   2. await detached.notified()
-        //
-        // The sitting relay fires `notify_one` exactly once on exit. The
-        // Notify's permit semantics allow the second racer to observe a
-        // stored permit from any later detach cycle — but since no further
-        // relay runs, the second racer would block forever in a naive
-        // implementation. The bounded timeout in `reclaim()` (in ws.rs) is
-        // what prevents that in production; here we cap the await.
-        let reclaimer = |label: &'static str| {
+        // Shared counter: how many racers are currently holding the permit.
+        // Must never exceed 1.
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        // Each racer goes through the real `acquire_permit` path, holds the
+        // permit briefly (simulating a relay lifetime), then releases. If
+        // the semaphore were broken, both racers could be inside the
+        // "holding" region simultaneously — we trip the max_seen > 1 check.
+        let racer = |label: &'static str| {
             let h = Arc::clone(&handle);
+            let inflight = Arc::clone(&inflight);
+            let max_seen = Arc::clone(&max_seen);
+            let order = Arc::clone(&order);
             tokio::spawn(async move {
-                h.stop_tx.send(StopReason::Detach).unwrap();
-                let got = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    h.detached.notified(),
-                )
-                .await;
-                (label, got.is_ok())
+                // Drive a detach on the sitting relay; idempotent if already
+                // driven by a sibling racer.
+                let _ = h.stop_tx.send(StopReason::Detach);
+                let got = acquire_permit("race", Arc::clone(&h)).await;
+                let (handle_back, permit) = got.expect("permit acquisition must succeed");
+
+                // Record entry order and check single-occupancy.
+                order.lock().unwrap().push(label);
+                let now = inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+
+                // Simulate a relay lifetime. If another racer is holding the
+                // permit concurrently, `max_seen` will observe > 1.
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+                inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                drop(permit);
+                drop(handle_back);
+                label
             })
         };
 
-        let r1 = reclaimer("r1");
-        let r2 = reclaimer("r2");
+        let r1 = racer("r1");
+        let r2 = racer("r2");
 
         let (exit_sit, _) = sitting.await.unwrap();
         assert_eq!(
             exit_sit,
             RelayExit::Stopped(StopReason::Detach),
-            "sitting relay must exit via Detach exactly once"
+            "sitting relay must exit via Detach"
         );
 
-        let (l1, ok1) = r1.await.unwrap();
-        let (l2, ok2) = r2.await.unwrap();
+        let l1 = r1.await.unwrap();
+        let l2 = r2.await.unwrap();
 
-        // At least one reclaimer observed the notify. The other may have
-        // raced ahead of the notify and timed out — that's acceptable: the
-        // runtime's bounded timeout surfaces the missed notify, and the
-        // reclaimer proceeds anyway (see `reclaim()` in ws.rs). What we
-        // must NOT see is a deadlock — both spawns must return.
+        // The exactly-one-winner invariant: at no point were two racers
+        // holding the permit simultaneously.
+        let peak = max_seen.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            peak, 1,
+            "attach_permit must enforce single-occupancy; saw {peak} concurrent holders"
+        );
+
+        // Both racers eventually got the permit — first one immediately
+        // after the sitting relay released, second one after the first
+        // released. No deadlock, no double-teardown.
+        let seen = order.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both racers must eventually acquire");
         assert!(
-            ok1 || ok2,
-            "at least one reclaimer must observe the detach notify ({l1}={ok1}, {l2}={ok2})"
+            seen.contains(&l1) && seen.contains(&l2),
+            "both labels present; got {seen:?}"
+        );
+
+        // Permit is released back to the semaphore when both racers drop.
+        assert_eq!(
+            handle.attach_permit.available_permits(),
+            1,
+            "permit must be released after all racers finish"
+        );
+    }
+
+    /// Reclaim timeout bail-out: if the sitting permit holder never
+    /// releases, a reclaimer must NOT proceed without the permit. Returning
+    /// `None` is the correct failure mode — proceeding anyway would create
+    /// concurrent relays reading from the same PTY master.
+    #[tokio::test]
+    async fn reclaim_times_out_rather_than_bypass_permit() {
+        let handle = build_handle();
+
+        // Take the permit permanently. Mirrors a pathologically stuck relay.
+        let stuck = Arc::clone(&handle.attach_permit)
+            .acquire_owned()
+            .await
+            .expect("initial acquire");
+
+        // Reclaimer should time out (not proceed without the permit).
+        let start = std::time::Instant::now();
+        let result = acquire_permit("stuck-test", Arc::clone(&handle)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "reclaimer must return None on permit timeout, not bypass and proceed"
+        );
+        // Bounded by ATTACH_PERMIT_TIMEOUT (with slack for CI scheduling).
+        assert!(
+            elapsed >= ATTACH_PERMIT_TIMEOUT,
+            "must actually wait the full timeout before bailing; got {elapsed:?}"
+        );
+
+        drop(stuck);
+
+        // After the stuck holder releases, a new reclaimer succeeds.
+        let after = acquire_permit("recovery", Arc::clone(&handle)).await;
+        assert!(
+            after.is_some(),
+            "after stuck holder releases, reclaim must succeed again"
+        );
+    }
+
+    /// Teardown path must release the permit so the session isn't stuck.
+    /// Simulates `full_teardown` (shell-exit) path: the permit is dropped
+    /// by the handler after cleanup; the semaphore returns to 1 permit.
+    #[tokio::test]
+    async fn teardown_releases_permit() {
+        let handle = build_handle();
+        let sem = Arc::clone(&handle.attach_permit);
+
+        // Attacher runs a connection to completion; `run_connection` releases
+        // the permit on exit regardless of which teardown branch the handler
+        // would take.
+        let h = Arc::clone(&handle);
+        let conn = tokio::spawn(async move { run_connection(h, Vec::new()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // TearDown path — models conversation-terminal cleanup (REQ-TERM-012).
+        handle.stop_tx.send(StopReason::TearDown).unwrap();
+        let (exit, _) = conn.await.unwrap();
+        assert_eq!(exit, RelayExit::Stopped(StopReason::TearDown));
+
+        // Permit returned to the semaphore → a future reclaimer can acquire.
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "permit must be released after teardown so the session isn't stuck"
         );
     }
 }

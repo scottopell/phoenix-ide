@@ -63,7 +63,7 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
             ShellIntegrationStatus::Unknown,
         )),
         stop_tx,
-        detached: std::sync::Arc::new(tokio::sync::Notify::new()),
+        attach_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
     }
 }
 

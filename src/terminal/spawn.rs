@@ -115,7 +115,10 @@ pub fn spawn_pty(cwd: &Path, initial_dims: Dims) -> Result<TerminalHandle, Strin
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
                 shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
                 stop_tx,
-                detached: Arc::new(tokio::sync::Notify::new()),
+                // 1 permit: the attached relay holds it for its lifetime; a
+                // reclaimer must wait for the sitting relay to drop the permit
+                // before proceeding. See `TerminalHandle::attach_permit`.
+                attach_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             })
         }
     }

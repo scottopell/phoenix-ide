@@ -274,20 +274,30 @@ rule DuplicateConnectionReclaimsSession {
         -- Reclaim sequence (ws.rs handle_socket → acquire_handle → reclaim):
         --   1. Look up the existing Arc<TerminalHandle> in ActiveTerminals.
         --   2. Signal the sitting relay: stop_tx.send(StopReason::Detach).
-        --   3. Await TerminalHandle.detached.notified() — the old relay
-        --      fires this on clean exit. Bounded by a 5s timeout so a stuck
-        --      relay cannot deadlock the reclaimer.
+        --   3. acquire_owned() the TerminalHandle.attach_permit semaphore.
+        --      The sitting relay holds the single permit for its lifetime
+        --      and releases it after cleanup; the acquire blocks until
+        --      release. Bounded by a 5s timeout — on timeout the reclaimer
+        --      returns None rather than proceeding, because attaching
+        --      without the permit would produce two concurrent relays
+        --      reading the same PTY master fd.
         --   4. Reset stop_tx to StopReason::Running before the new relay
         --      subscribes so it does not observe the stale Detach.
         --   5. Build a fresh PtyMasterIo via dup(master_fd) — each relay
         --      owns its own fd so drops don't affect the master.
         --   6. Start a new relay reusing the existing CommandTracker so
         --      mid-command output continues streaming.
+        --   7. The handler holds the OwnedSemaphorePermit for the relay's
+        --      full lifetime; drop(permit) happens after full_teardown /
+        --      detach_only runs, which is what wakes the next reclaimer.
         --
         -- Concurrent reclaim (two connections race for the same session):
-        -- Notify's single-permit semantics allow exactly one waker to
-        -- consume a notify; the bounded 5s timeout ensures the loser
-        -- proceeds rather than deadlocking.
+        -- The attach_permit semaphore is initialized with 1 permit. It
+        -- structurally enforces single-occupancy: at most one holder at
+        -- any moment, regardless of how many reclaimers race. The loser
+        -- blocks in acquire_owned() until the winner's relay exits and
+        -- releases the permit; "exactly one wins" is a structural property
+        -- of the semaphore, not of the stop-signal protocol.
         --
         -- Out of scope: dead-peer detection. A separate follow-up task
         -- will add WS ping/pong so abandoned sessions (user never

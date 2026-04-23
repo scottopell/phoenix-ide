@@ -4,7 +4,7 @@ use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Semaphore};
 
 use super::command_tracker::CommandTracker;
 
@@ -87,12 +87,18 @@ pub struct TerminalHandle {
     /// drive the sitting relay to exit without touching its local state.
     /// Reset to `Running` before each new relay starts.
     pub stop_tx: watch::Sender<StopReason>,
-    /// Notified when a relay observes a `Detach` stop and exits cleanly.
+    /// Single-occupant slot for the attached relay (exactly-one-winner guarantee).
     ///
-    /// A reclaiming connection sends `Detach` then awaits this notification;
-    /// `Notify` stores one permit so the wake races cleanly (the permit is
-    /// delivered whether the waiter shows up before or after `notify_one`).
-    pub detached: Arc<Notify>,
+    /// Initialized with 1 permit. The attached relay holds an
+    /// `OwnedSemaphorePermit` for its entire lifetime; releasing the permit
+    /// (by dropping it on detach / teardown) is the authoritative signal that
+    /// the slot is free for the next reclaimer to take.
+    ///
+    /// Two concurrent reclaimers cannot both acquire this permit — the
+    /// semaphore structurally enforces "exactly one relay attached at a time",
+    /// so neither reclaimer can proceed into the relay's acquire path while
+    /// another relay is still running. See task 24691 follow-up.
+    pub attach_permit: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for TerminalHandle {
