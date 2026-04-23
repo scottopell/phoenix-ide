@@ -558,7 +558,8 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
 
         let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, broadcast_rx) = broadcast::channel(128);
+        let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
+        let broadcast_rx = broadcaster.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -571,7 +572,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
             crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx.clone(),
-            broadcast_tx,
+            broadcaster,
         );
 
         let handle = tokio::spawn(async move {
@@ -623,7 +624,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub async fn wait_for_done(&mut self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) =
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(50), self.broadcast_rx.recv()).await
             {
                 return true;
@@ -830,7 +831,7 @@ mod tests {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         // Use a longer delay - we'll cancel before it completes
         let llm = Arc::new(DelayedMockLlmClient::new(
@@ -849,7 +850,7 @@ mod tests {
 
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -898,7 +899,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await {
-                Ok(Ok(SseEvent::AgentDone)) => {
+                Ok(Ok(SseEvent::AgentDone { .. })) => {
                     done = true;
                     break;
                 }
@@ -935,7 +936,7 @@ mod tests {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         // Fast LLM, long tool delay that we'll cancel
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -964,7 +965,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1012,7 +1013,7 @@ mod tests {
         let mut done = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) =
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
             {
                 done = true;
@@ -1039,7 +1040,7 @@ mod tests {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         // 5 second tool delay - we should NOT wait for this
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -1062,7 +1063,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1114,7 +1115,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) =
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(10), broadcast_rx.recv()).await
             {
                 agent_done = true;
@@ -1478,7 +1479,7 @@ mod tests {
         use crate::state_machine::state::SubAgentOutcome;
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         // Set up a parent runtime
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -1493,7 +1494,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let _broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1542,7 +1543,7 @@ mod tests {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         // LLM returns a single tool call
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -1572,7 +1573,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(128);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0); let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1607,7 +1608,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) =
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
             {
                 agent_done = true;
@@ -1650,7 +1651,7 @@ mod tests {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         let llm = Arc::new(MockLlmClient::new("test-model"));
         // Queue enough responses to outrun the cap. The cap is 3, so the
@@ -1680,7 +1681,7 @@ mod tests {
             200_000,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(256);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0); let mut broadcast_rx = broadcast_tx.subscribe();
 
         let runtime = ConversationRuntime::new(
             context,
@@ -1717,7 +1718,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut agent_done = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(SseEvent::AgentDone)) =
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
             {
                 agent_done = true;
@@ -1784,7 +1785,7 @@ mod tests {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;
         use std::path::PathBuf;
-        use tokio::sync::{broadcast, mpsc};
+        use tokio::sync::mpsc;
 
         // The race is inherently scheduler-dependent. Without the fix, a
         // single iteration catches the bug ~1 in 5 runs on a 4-worker
@@ -1807,7 +1808,7 @@ mod tests {
                 200_000,
             );
             let (event_tx, event_rx) = mpsc::channel(32);
-            let (broadcast_tx, mut broadcast_rx) = broadcast::channel(4096);
+            let broadcast_tx = crate::runtime::SseBroadcaster::new(4096, 0); let mut broadcast_rx = broadcast_tx.subscribe();
 
             let runtime = ConversationRuntime::new(
                 context,
@@ -1871,7 +1872,7 @@ mod tests {
                                     first_agent_msg_idx = Some(idx);
                                 }
                             }
-                            SseEvent::AgentDone => {
+                            SseEvent::AgentDone { .. } => {
                                 seen_agent_done = true;
                             }
                             _ => {}

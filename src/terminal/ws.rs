@@ -135,7 +135,7 @@ async fn handle_socket(
         tokio::spawn(async move {
             loop {
                 match bcast_rx.recv().await {
-                    Ok(SseEvent::ConversationBecameTerminal) => {
+                    Ok(SseEvent::ConversationBecameTerminal { .. }) => {
                         tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
                         let _ = teardown_stop.send(StopReason::TearDown);
                         break;

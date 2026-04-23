@@ -1265,13 +1265,22 @@ async fn stream_conversation(
         None
     };
 
+    // Ensure the broadcaster's counter has at least absorbed the highest
+    // persisted message id, then take the current tip as the Init's own
+    // sequence_id. Init's `sequence_id` and `last_sequence_id` are the same
+    // number by construction: the snapshot IS the highest fact the client has
+    // seen so far, and it sets the floor for subsequent `applyIfNewer` checks.
+    handle.broadcast_tx.observe_seq(last_sequence_id);
+    let init_seq = handle.broadcast_tx.current_seq();
+
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
+        sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
         messages,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
-        last_sequence_id,
+        last_sequence_id: init_seq,
         context_window_size,
         model_context_window,
         breadcrumbs,
@@ -1318,7 +1327,8 @@ async fn stream_conversation(
                 if new_behind != last_behind || new_ahead != last_ahead {
                     last_behind = new_behind;
                     last_ahead = new_ahead;
-                    let result = broadcast_tx.send(SseEvent::ConversationUpdate {
+                    let result = broadcast_tx.send_seq(|seq| SseEvent::ConversationUpdate {
+                        sequence_id: seq,
                         update: crate::runtime::ConversationMetadataUpdate {
                             cwd: None,
                             branch_name: None,
@@ -2729,12 +2739,16 @@ async fn shared_sse_stream(
         None
     };
 
+    handle.broadcast_tx.observe_seq(last_sequence_id);
+    let init_seq = handle.broadcast_tx.current_seq();
+
     let init_event = SseEvent::Init {
+        sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
         messages,
         agent_working: conversation.is_agent_working(),
         display_state: conversation.state.display_state().as_str().to_string(),
-        last_sequence_id,
+        last_sequence_id: init_seq,
         context_window_size,
         model_context_window,
         breadcrumbs,

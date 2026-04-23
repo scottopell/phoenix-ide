@@ -9,7 +9,7 @@
 //! The executor wraps received outcomes in `EffectOutcome` for `handle_outcome()`.
 
 use super::traits::{LlmClient, Storage, ToolExecutor};
-use super::{SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
+use super::{SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
@@ -97,7 +97,7 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    broadcast_tx: broadcast::Sender<SseEvent>,
+    broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
     /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection
@@ -161,7 +161,7 @@ where
         terminals: crate::terminal::ActiveTerminals,
         event_rx: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
-        broadcast_tx: broadcast::Sender<SseEvent>,
+        broadcast_tx: SseBroadcaster,
     ) -> Self {
         // Outcome channel for typed effect results.
         // Background tasks send typed outcomes (LlmOutcome, ToolOutcome, etc.)
@@ -243,7 +243,8 @@ where
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
             if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
                 tracing::error!(error = %e, "Failed to resume LLM request");
-                let _ = self.broadcast_tx.send(SseEvent::Error {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                    sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::with_action(
                         "resume the LLM request",
                     ),
@@ -395,7 +396,9 @@ where
     /// Send errors (no active receivers) are intentionally ignored.
     fn emit_terminal_lifecycle_event(&self) {
         self.cleanup_worktree_if_present();
-        let _ = self.broadcast_tx.send(SseEvent::ConversationBecameTerminal);
+        let _ = self
+            .broadcast_tx
+            .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
     }
 
     /// Remove the conversation's worktree if it still exists on disk.
@@ -515,7 +518,8 @@ where
                         state = self.state.variant_name(),
                         "Transition rejected"
                     );
-                    let _ = self.broadcast_tx.send(SseEvent::Error {
+                    let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                        sequence_id: seq,
                         error: crate::runtime::user_facing_error::from_transition_error(&e),
                     });
                     return Err(e.to_string());
@@ -761,7 +765,7 @@ where
             .await
         {
             Ok(msg) => {
-                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+                let _ = self.broadcast_tx.send_message(msg);
             }
             Err(e) => {
                 tracing::warn!(
@@ -999,7 +1003,7 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
-                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+                let _ = self.broadcast_tx.send_message(msg);
                 Ok(None)
             }
 
@@ -1010,7 +1014,8 @@ where
                     .await?;
 
                 // Broadcast state change with full state data
-                let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                    sequence_id: seq,
                     state: self.state.clone(),
                     display_state: self.state.display_state().as_str().to_string(),
                 });
@@ -1036,21 +1041,25 @@ where
             Effect::NotifyClient { event_type, data } => {
                 match event_type.as_str() {
                     "agent_done" => {
-                        let _ = self.broadcast_tx.send(SseEvent::AgentDone);
+                        let _ = self
+                            .broadcast_tx
+                            .send_seq(|seq| SseEvent::AgentDone { sequence_id: seq });
                     }
                     "state_change" => {
                         // data should contain the full state object; deserialize to typed ConvState
                         if let Some(state_val) = data.get("state") {
                             match serde_json::from_value::<ConvState>(state_val.clone()) {
                                 Ok(typed_state) => {
-                                    let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                                        state: typed_state,
-                                        display_state: self
-                                            .state
-                                            .display_state()
-                                            .as_str()
-                                            .to_string(),
-                                    });
+                                    let _ =
+                                        self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                                            sequence_id: seq,
+                                            state: typed_state,
+                                            display_state: self
+                                                .state
+                                                .display_state()
+                                                .as_str()
+                                                .to_string(),
+                                        });
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -1058,14 +1067,16 @@ where
                                         "Failed to deserialize NotifyClient state_change into ConvState; \
                                          falling back to current executor state"
                                     );
-                                    let _ = self.broadcast_tx.send(SseEvent::StateChange {
-                                        state: self.state.clone(),
-                                        display_state: self
-                                            .state
-                                            .display_state()
-                                            .as_str()
-                                            .to_string(),
-                                    });
+                                    let _ =
+                                        self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                                            sequence_id: seq,
+                                            state: self.state.clone(),
+                                            display_state: self
+                                                .state
+                                                .display_state()
+                                                .as_str()
+                                                .to_string(),
+                                        });
                                 }
                             }
                         }
@@ -1097,7 +1108,7 @@ where
                         .await?;
 
                     // Tool results don't contain bash tool_use blocks, no enrichment needed
-                    let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+                    let _ = self.broadcast_tx.send_message(msg);
                 }
                 Ok(None)
             }
@@ -1185,7 +1196,8 @@ where
                 // needs it to resume the committed work.
                 self.cleanup_context_exhausted_worktree().await;
 
-                let _ = self.broadcast_tx.send(SseEvent::StateChange {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                    sequence_id: seq,
                     state: ConvState::ContextExhausted { summary },
                     display_state: self.state.display_state().as_str().to_string(),
                 });
@@ -1326,7 +1338,8 @@ where
             loop {
                 match rx.recv().await {
                     Ok(crate::llm::TokenChunk::Text(text)) => {
-                        let _ = broadcast_tx_for_tokens.send(SseEvent::Token {
+                        let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
+                            sequence_id: seq,
                             text,
                             request_id: request_id_for_fwd.clone(),
                         });
@@ -1593,9 +1606,7 @@ where
                         assistant_message.usage.as_ref(),
                     )
                     .await?;
-                let _ = self
-                    .broadcast_tx
-                    .send(SseEvent::Message { message: agent_msg });
+                let _ = self.broadcast_tx.send_message(agent_msg);
 
                 // Persist all tool results
                 for result in tool_results {
@@ -1615,9 +1626,7 @@ where
                             None,
                         )
                         .await?;
-                    let _ = self
-                        .broadcast_tx
-                        .send(SseEvent::Message { message: tool_msg });
+                    let _ = self.broadcast_tx.send_message(tool_msg);
                 }
             }
         }
@@ -1698,7 +1707,8 @@ where
             }
 
             let updated_content = crate::db::MessageContent::tool(&tool_id, &llm_content, false);
-            let _ = self.broadcast_tx.send(SseEvent::MessageUpdated {
+            let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+                sequence_id: seq,
                 message_id: message_id.clone(),
                 display_data: Some(display_data.clone()),
                 content: Some(updated_content),
@@ -1725,7 +1735,7 @@ where
                 .await?;
 
             // Broadcast the new message (tool message, no bash enrichment needed)
-            let _ = self.broadcast_tx.send(SseEvent::Message { message });
+            let _ = self.broadcast_tx.send_message(message);
         }
 
         Ok(None)
@@ -2058,18 +2068,21 @@ where
 
         // Broadcast a ConversationUpdate so the UI reflects the cleaned-up
         // state immediately (matches the pattern in `execute_resolve_task`).
-        let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
-            update: crate::runtime::ConversationMetadataUpdate {
-                cwd: Some(repo_root),
-                branch_name: None,
-                worktree_path: None,
-                conv_mode_label: Some(revert_mode.label().to_string()),
-                base_branch: None,
-                commits_behind: None,
-                commits_ahead: None,
-                task_title: None,
-            },
-        });
+        let _ = self
+            .broadcast_tx
+            .send_seq(|seq| SseEvent::ConversationUpdate {
+                sequence_id: seq,
+                update: crate::runtime::ConversationMetadataUpdate {
+                    cwd: Some(repo_root),
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: Some(revert_mode.label().to_string()),
+                    base_branch: None,
+                    commits_behind: None,
+                    commits_ahead: None,
+                    task_title: None,
+                },
+            });
     }
 
     /// Handle task resolution: finalize conversation state/mode/cwd, inject system message,
@@ -2104,23 +2117,27 @@ where
             .await?;
 
         // Broadcast SSE events
-        let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
-        let _ = self.broadcast_tx.send(SseEvent::StateChange {
+        let _ = self.broadcast_tx.send_message(msg);
+        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+            sequence_id: seq,
             state: ConvState::Terminal,
             display_state: ConvState::Terminal.display_state().as_str().to_string(),
         });
-        let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
-            update: crate::runtime::ConversationMetadataUpdate {
-                cwd: Some(repo_root),
-                branch_name: None,
-                worktree_path: None,
-                conv_mode_label: None,
-                base_branch: None,
-                commits_behind: None,
-                commits_ahead: None,
-                task_title: None,
-            },
-        });
+        let _ = self
+            .broadcast_tx
+            .send_seq(|seq| SseEvent::ConversationUpdate {
+                sequence_id: seq,
+                update: crate::runtime::ConversationMetadataUpdate {
+                    cwd: Some(repo_root),
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    commits_behind: None,
+                    commits_ahead: None,
+                    task_title: None,
+                },
+            });
 
         Ok(())
     }
@@ -2228,23 +2245,26 @@ where
                     .storage
                     .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
                     .await?;
-                let _ = self.broadcast_tx.send(SseEvent::Message { message: msg });
+                let _ = self.broadcast_tx.send_message(msg);
 
                 // Push updated conversation metadata to the client so it
                 // reflects the new cwd, branch, worktree_path, and mode label
                 // without requiring a reconnect.
-                let _ = self.broadcast_tx.send(SseEvent::ConversationUpdate {
-                    update: crate::runtime::ConversationMetadataUpdate {
-                        cwd: Some(approval_result.worktree_path.clone()),
-                        branch_name: Some(approval_result.branch_name.clone()),
-                        worktree_path: Some(approval_result.worktree_path.clone()),
-                        conv_mode_label: Some("Work".to_string()),
-                        base_branch: Some(approval_result.base_branch.clone()),
-                        commits_behind: None,
-                        commits_ahead: None,
-                        task_title: Some(approval_result.task_title.clone()),
-                    },
-                });
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|seq| SseEvent::ConversationUpdate {
+                        sequence_id: seq,
+                        update: crate::runtime::ConversationMetadataUpdate {
+                            cwd: Some(approval_result.worktree_path.clone()),
+                            branch_name: Some(approval_result.branch_name.clone()),
+                            worktree_path: Some(approval_result.worktree_path.clone()),
+                            conv_mode_label: Some("Work".to_string()),
+                            base_branch: Some(approval_result.base_branch.clone()),
+                            commits_behind: None,
+                            commits_ahead: None,
+                            task_title: Some(approval_result.task_title.clone()),
+                        },
+                    });
 
                 Ok(())
             }
@@ -2265,7 +2285,8 @@ where
                 // Task 24682: use the typed UserFacingError. `e` is the
                 // approval-pipeline error (Display-formatted, no Debug leak)
                 // so it's safe to inline as the human detail.
-                let _ = self.broadcast_tx.send(SseEvent::Error {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                    sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::retryable(
                         "Task approval failed",
                         format!(
@@ -2886,7 +2907,8 @@ mod context_exhausted_cleanup_tests {
         let context = ConvContext::new(conv_id, working_dir, "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
-        let (broadcast_tx, broadcast_rx) = broadcast::channel(128);
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let broadcast_rx = broadcaster.subscribe();
 
         let rt = ConversationRuntime::new(
             context,
@@ -2899,7 +2921,7 @@ mod context_exhausted_cleanup_tests {
             crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx_dup,
-            broadcast_tx,
+            broadcaster,
         );
         (rt, broadcast_rx)
     }
@@ -2914,7 +2936,7 @@ mod context_exhausted_cleanup_tests {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-                Ok(Ok(SseEvent::ConversationUpdate { update }))
+                Ok(Ok(SseEvent::ConversationUpdate { update, .. }))
                     if update.conv_mode_label.as_deref() == Some(expected_label) =>
                 {
                     return true;

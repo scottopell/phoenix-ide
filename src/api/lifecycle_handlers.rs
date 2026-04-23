@@ -5,7 +5,6 @@ use super::types::{SuccessResponse, TaskApprovalResponse, TaskFeedbackRequest};
 use super::AppState;
 use crate::db::{ConvMode, MessageContent};
 use crate::git_ops::run_git;
-use crate::runtime::SseEvent;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
@@ -341,9 +340,7 @@ pub(crate) async fn abandon_task(
     // 3. Broadcast diff snapshot (persisted above, before state transition)
     if let Some(snap_msg) = snapshot_msg {
         if let Ok(handle) = state.runtime.get_or_create(&id).await {
-            let _ = handle
-                .broadcast_tx
-                .send(SseEvent::Message { message: snap_msg });
+            let _ = handle.broadcast_tx.send_message(snap_msg);
         }
     }
 

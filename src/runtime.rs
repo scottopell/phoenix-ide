@@ -34,6 +34,7 @@ use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -77,7 +78,124 @@ pub struct RuntimeManager {
 /// Handle to interact with a running conversation
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub broadcast_tx: broadcast::Sender<SseEvent>,
+    /// SSE broadcaster. Owns the per-conversation monotonic sequence_id counter
+    /// that every emitted [`SseEvent`] must consume (task 02675). Callers never
+    /// hand-craft a sequence_id — they either go through [`SseBroadcaster::send_seq`]
+    /// (which allocates the next id from the counter) or [`SseBroadcaster::send_message`]
+    /// (which passes through the DB-allocated message id and advances the counter past
+    /// it). This makes the "every SSE event carries a monotonic sequence_id" contract
+    /// structurally enforceable rather than a matter of caller discipline.
+    pub broadcast_tx: SseBroadcaster,
+}
+
+/// Per-conversation SSE broadcaster with monotonic sequence_id allocation.
+///
+/// Every [`SseEvent`] emitted for a conversation carries a `sequence_id` drawn
+/// from a single per-conversation counter. This broadcaster is the sole
+/// gateway: callers cannot construct a [`SseEvent`] and broadcast it without
+/// first obtaining a sequence_id from here, which means the total-order
+/// invariant is enforced by the type rather than by caller discipline.
+///
+/// Two broadcast paths exist:
+///
+/// 1. **Ephemeral/derived events** (Token, StateChange, MessageUpdated, …) —
+///    allocate a fresh id via [`SseBroadcaster::next_seq`] or use
+///    [`SseBroadcaster::send_seq`], which hands the id to a construction
+///    closure so the caller cannot forget to insert it.
+///
+/// 2. **Persisted `Message` events** already carry a `message.sequence_id`
+///    allocated by `add_message` in the DB layer. Use
+///    [`SseBroadcaster::send_message`], which reuses that id and atomically
+///    advances the broadcaster's counter past it so ephemeral events emitted
+///    afterwards are ordered strictly after the message.
+#[derive(Clone)]
+pub struct SseBroadcaster {
+    tx: broadcast::Sender<SseEvent>,
+    /// Highest `sequence_id` emitted so far for this conversation.
+    /// `next_seq()` returns `fetch_add(1)` + 1 atomically; `observe_seq(s)`
+    /// bumps this value up to at least `s` so message-originated ids integrate
+    /// into the same total order.
+    last_seq: Arc<AtomicI64>,
+}
+
+impl SseBroadcaster {
+    /// Build a broadcaster from an existing `broadcast::Sender`.
+    ///
+    /// `initial_last_seq` is the highest sequence_id the client can already
+    /// have observed (typically `db.get_last_sequence_id(conversation_id)`).
+    /// The next allocated id will be `initial_last_seq + 1`.
+    pub fn from_sender(tx: broadcast::Sender<SseEvent>, initial_last_seq: i64) -> Self {
+        Self {
+            tx,
+            last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
+        }
+    }
+
+    /// Construct a broadcaster with a fresh broadcast channel.
+    /// Convenience for call sites that also need the underlying channel's
+    /// capacity configured.
+    pub fn new(channel_capacity: usize, initial_last_seq: i64) -> Self {
+        let (tx, _rx) = broadcast::channel(channel_capacity);
+        Self::from_sender(tx, initial_last_seq)
+    }
+
+    /// Atomically allocate the next sequence_id and return it.
+    pub fn next_seq(&self) -> i64 {
+        self.last_seq.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Bump the internal counter so subsequent `next_seq()` values are strictly
+    /// greater than `seq`. No-op if the counter is already past `seq`.
+    ///
+    /// Called for `Message` events whose `sequence_id` is allocated by the DB
+    /// layer — we have to fold those into the same total order without
+    /// double-allocating.
+    pub fn observe_seq(&self, seq: i64) {
+        self.last_seq.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    /// Highest sequence_id emitted so far. Used to seed `SseEvent::Init`'s
+    /// `last_sequence_id` so the client's `applyIfNewer` guard starts at the
+    /// correct floor.
+    pub fn current_seq(&self) -> i64 {
+        self.last_seq.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to the SSE broadcast stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<SseEvent> {
+        self.tx.subscribe()
+    }
+
+    /// Send an event that has already been stamped with a sequence_id.
+    /// Prefer [`SseBroadcaster::send_seq`] or [`SseBroadcaster::send_message`]
+    /// so the stamping is done at the broadcaster.
+    pub fn send(
+        &self,
+        event: SseEvent,
+    ) -> Result<usize, broadcast::error::SendError<SseEvent>> {
+        self.tx.send(event)
+    }
+
+    /// Allocate the next sequence_id, pass it to `build`, and broadcast the
+    /// resulting event. The closure's signature forces the caller to place the
+    /// id on the event — forgetting is a compile error.
+    pub fn send_seq(
+        &self,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, broadcast::error::SendError<SseEvent>> {
+        let seq = self.next_seq();
+        self.tx.send(build(seq))
+    }
+
+    /// Broadcast a `Message` event using the DB-allocated `message.sequence_id`,
+    /// then advance the broadcaster's counter past it.
+    pub fn send_message(
+        &self,
+        message: crate::db::Message,
+    ) -> Result<usize, broadcast::error::SendError<SseEvent>> {
+        self.observe_seq(message.sequence_id);
+        self.tx.send(SseEvent::Message { message })
+    }
 }
 
 /// Typed update for conversation metadata pushed mid-session.
@@ -147,15 +265,27 @@ pub struct SseBreadcrumb {
     pub preview: Option<String>,
 }
 
-/// Events sent to SSE clients
+/// Events sent to SSE clients.
+///
+/// Every variant carries a `sequence_id` drawn from the conversation's single
+/// monotonic counter (task 02675). The client's `applyIfNewer` guard relies on
+/// this total order to dedup reconnect replays. Allocation is the
+/// responsibility of [`SseBroadcaster`] — do not hand-craft sequence_ids at
+/// call sites.
 #[derive(Debug, Clone)]
 pub enum SseEvent {
     Init {
+        /// Snapshot's own place in the total order. On init this equals
+        /// `last_sequence_id` — the snapshot is itself an event.
+        sequence_id: i64,
         conversation: Box<EnrichedConversation>,
         messages: Vec<crate::db::Message>,
         agent_working: bool,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
+        /// Highest sequence_id ever emitted for this conversation — what the
+        /// client seeds `atom.lastSequenceId` with so subsequent
+        /// `applyIfNewer` checks start at the right floor.
         last_sequence_id: i64,
         /// Current context window usage in tokens
         context_window_size: u64,
@@ -170,34 +300,51 @@ pub enum SseEvent {
         /// Human-readable project name derived from the repo root directory name.
         project_name: Option<String>,
     },
+    /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
+    /// as its envelope sequence_id — no separate field needed because
+    /// `message.sequence_id` is already the DB-allocated id and, thanks to
+    /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
         message: crate::db::Message,
     },
     /// An existing message's mutable fields changed. Carries only the delta —
-    /// `message_id` and `sequence_id` are immutable and not repeated here.
+    /// `message_id` is the target; `sequence_id` is the envelope id used by
+    /// the client reducer for dedup (task 02675). The message's persistent
+    /// `sequence_id` is immutable and not repeated here.
     MessageUpdated {
+        sequence_id: i64,
         message_id: String,
         display_data: Option<serde_json::Value>,
         content: Option<crate::db::MessageContent>,
     },
     StateChange {
+        sequence_id: i64,
         /// Full typed conversation state
         state: ConvState,
         /// Semantic state category for UI display (idle/working/error/terminal)
         display_state: String,
     },
-    /// Ephemeral streaming token — not persisted, no `sequence_id` (REQ-BED-025)
+    /// Ephemeral streaming token. Not persisted, but still carries a
+    /// `sequence_id` from the same counter so reconnects don't strand tokens
+    /// behind a per-connection closure counter (task 02675 fixes the
+    /// `lastSequence` leapfrog stall).
     Token {
+        sequence_id: i64,
         text: String,
         request_id: String,
     },
-    AgentDone,
+    AgentDone {
+        sequence_id: i64,
+    },
     /// Emitted once when a conversation's `is_terminal()` first becomes true.
     /// Consumed by the terminal subsystem to tear down any active PTY session.
-    ConversationBecameTerminal,
+    ConversationBecameTerminal {
+        sequence_id: i64,
+    },
     /// Pushed when conversation metadata changes mid-session (e.g., cwd/mode after approval).
     /// Typed struct instead of `Value` — the executor knows exactly which fields changed.
     ConversationUpdate {
+        sequence_id: i64,
         update: ConversationMetadataUpdate,
     },
     /// User-facing error for the SSE `error` channel. Carries a typed
@@ -205,6 +352,7 @@ pub enum SseEvent {
     /// accidentally leak — every construction goes through
     /// `runtime::user_facing_error`.
     Error {
+        sequence_id: i64,
         error: user_facing_error::UserFacingError,
     },
 }
@@ -399,9 +547,11 @@ impl RuntimeManager {
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
 
-        // 4. Create channels for the sub-agent runtime
+        // 4. Create channels for the sub-agent runtime. The broadcaster
+        // seeds its counter from the message we just inserted (sequence_id=1)
+        // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, _) = broadcast::channel(128);
+        let broadcaster = SseBroadcaster::new(128, 1);
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -426,7 +576,7 @@ impl RuntimeManager {
             self.terminals.clone(),
             event_rx,
             event_tx.clone(),
-            broadcast_tx.clone(),
+            broadcaster.clone(),
         )
         .with_parent(parent_event_tx.clone())
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
@@ -437,7 +587,7 @@ impl RuntimeManager {
             conv.id.clone(),
             ConversationHandle {
                 event_tx: event_tx.clone(),
-                broadcast_tx: broadcast_tx.clone(),
+                broadcast_tx: broadcaster.clone(),
             },
         );
 
@@ -581,7 +731,16 @@ impl RuntimeManager {
         };
 
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (broadcast_tx, _) = broadcast::channel(128);
+        // Seed the broadcaster's sequence_id counter from the highest seq
+        // already persisted for this conversation. Without this, a resumed
+        // conversation would allocate sequence_ids starting from 1 and collide
+        // with ids the client may have already observed in a previous session.
+        let initial_last_seq = self
+            .db
+            .get_last_sequence_id(conversation_id)
+            .await
+            .unwrap_or(0);
+        let broadcaster = SseBroadcaster::new(128, initial_last_seq);
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -637,7 +796,7 @@ impl RuntimeManager {
             self.terminals.clone(),
             event_rx,
             event_tx.clone(),
-            broadcast_tx.clone(),
+            broadcaster.clone(),
         )
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
@@ -690,7 +849,7 @@ impl RuntimeManager {
 
         let handle = ConversationHandle {
             event_tx: event_tx.clone(),
-            broadcast_tx: broadcast_tx.clone(),
+            broadcast_tx: broadcaster.clone(),
         };
 
         // Store handle
@@ -698,7 +857,7 @@ impl RuntimeManager {
             conversation_id.to_string(),
             ConversationHandle {
                 event_tx,
-                broadcast_tx,
+                broadcast_tx: broadcaster,
             },
         );
 

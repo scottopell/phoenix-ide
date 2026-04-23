@@ -38,6 +38,7 @@ pub fn sse_stream(
 fn sse_event_to_axum(event: SseEvent) -> Event {
     let (event_type, data) = match event {
         SseEvent::Init {
+            sequence_id,
             conversation,
             messages,
             agent_working,
@@ -57,6 +58,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
                 "init",
                 json!({
                     "type": "init",
+                    "sequence_id": sequence_id,
                     "conversation": conversation,
                     "messages": enriched_msgs,
                     "agent_working": agent_working,
@@ -72,16 +74,23 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             )
         }
         SseEvent::Message { message } => {
+            // `Message` uses its persisted `message.sequence_id` as the
+            // envelope `sequence_id` — they're the same event in the total
+            // order. The client reads the top-level `sequence_id` through
+            // its single `applyIfNewer` guard (task 02675).
+            let sequence_id = message.sequence_id;
             let message_value = enrich_message_for_api(&message);
             (
                 "message",
                 json!({
                     "type": "message",
+                    "sequence_id": sequence_id,
                     "message": message_value
                 }),
             )
         }
         SseEvent::MessageUpdated {
+            sequence_id,
             message_id,
             display_data,
             content,
@@ -89,50 +98,64 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             "message_updated",
             json!({
                 "type": "message_updated",
+                "sequence_id": sequence_id,
                 "message_id": message_id,
                 "display_data": display_data,
                 "content": content,
             }),
         ),
         SseEvent::StateChange {
+            sequence_id,
             state,
             display_state,
         } => (
             "state_change",
             json!({
                 "type": "state_change",
+                "sequence_id": sequence_id,
                 "state": serde_json::to_value(&state).unwrap_or(serde_json::Value::Null),
                 "display_state": display_state
             }),
         ),
-        SseEvent::Token { text, request_id } => (
+        SseEvent::Token {
+            sequence_id,
+            text,
+            request_id,
+        } => (
             "token",
             json!({
                 "type": "token",
+                "sequence_id": sequence_id,
                 "text": text,
                 "request_id": request_id
             }),
         ),
-        SseEvent::AgentDone => (
+        SseEvent::AgentDone { sequence_id } => (
             "agent_done",
             json!({
-                "type": "agent_done"
+                "type": "agent_done",
+                "sequence_id": sequence_id,
             }),
         ),
-        SseEvent::ConversationBecameTerminal => (
+        SseEvent::ConversationBecameTerminal { sequence_id } => (
             "conversation_became_terminal",
             json!({
-                "type": "conversation_became_terminal"
+                "type": "conversation_became_terminal",
+                "sequence_id": sequence_id,
             }),
         ),
-        SseEvent::ConversationUpdate { update } => (
+        SseEvent::ConversationUpdate {
+            sequence_id,
+            update,
+        } => (
             "conversation_update",
             json!({
                 "type": "conversation_update",
+                "sequence_id": sequence_id,
                 "conversation": update
             }),
         ),
-        SseEvent::Error { error } => (
+        SseEvent::Error { sequence_id, error } => (
             // Task 24682: emit both `message` (for the existing UI banner
             // that reads a flat string) and `error` (the typed payload) so
             // future UI code can render kind-aware affordances without a
@@ -140,6 +163,7 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
             "error",
             json!({
                 "type": "error",
+                "sequence_id": sequence_id,
                 "message": error.flat_message(),
                 "error": error,
             }),
@@ -160,6 +184,7 @@ mod tests {
             "results": []
         });
         let event = SseEvent::MessageUpdated {
+            sequence_id: 42,
             message_id: "msg-abc".to_string(),
             display_data: Some(display_data.clone()),
             content: None,
