@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, type Dispatch } from 'react';
 import { useParams } from 'react-router-dom';
 import type {
   Conversation,
@@ -14,6 +14,14 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import type { Breadcrumb } from '../types';
 import type { SseBreadcrumb } from '../api';
+import { parseEvent } from '../hooks/useConnection';
+import {
+  SseInitDataSchema,
+  SseMessageDataSchema,
+  SseStateChangeDataSchema,
+  SseTokenDataSchema,
+} from '../sseSchemas';
+import type { SSEAction } from '../conversation/atom';
 
 function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
   return {
@@ -72,52 +80,53 @@ export function SharePage() {
       return;
     }
 
+    // Adapter: `parseEvent` dispatches `SSEAction`s on validation failure. The
+    // share view has no reducer — just local error state — so translate the
+    // only action `parseEvent` ever dispatches (`sse_error`) into SharePage's
+    // error surface. Other SSEAction variants are unreachable here (parseEvent
+    // never emits them), so ignoring them is structurally safe.
+    const shareDispatch: Dispatch<SSEAction> = (action) => {
+      if (action.type !== 'sse_error') return;
+      setStatus('error');
+      const err = action.error;
+      if (err.type === 'ParseError') {
+        setErrorMessage('Failed to parse server data');
+      } else if (err.type === 'BackendError') {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage('Connection to share stream failed');
+      }
+    };
+
     // Connect to shared SSE stream
     const url = `/api/share/${encodeURIComponent(token)}/events`;
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
     es.addEventListener('init', (e) => {
-      try {
-        const raw = JSON.parse((e as MessageEvent).data) as SseInitData;
-        handleSseInit(raw);
-      } catch {
-        setStatus('error');
-        setErrorMessage('Failed to parse server data');
-      }
+      const res = parseEvent(SseInitDataSchema, e, 'init', shareDispatch);
+      if (!res.ok) return;
+      handleSseInit(res.data);
     });
 
     es.addEventListener('message', (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as SseMessageData;
-        handleSseMessage(data);
-      } catch {
-        // Ignore parse errors for individual messages
-      }
+      const res = parseEvent(SseMessageDataSchema, e, 'message', shareDispatch);
+      if (!res.ok) return;
+      handleSseMessage(res.data);
     });
 
     es.addEventListener('state_change', (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as SseStateChangeData;
-        handleSseStateChange(data);
-      } catch {
-        // Ignore parse errors
-      }
+      const res = parseEvent(SseStateChangeDataSchema, e, 'state_change', shareDispatch);
+      if (!res.ok) return;
+      handleSseStateChange(res.data);
     });
 
     es.addEventListener('token', (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as { text: string; request_id?: string };
-        if (data.text) {
-          setMessages(prev => {
-            // Append streaming token to the last agent message, or create a virtual one
-            // For simplicity in read-only mode, we just wait for the full message event
-            return prev;
-          });
-        }
-      } catch {
-        // Ignore
-      }
+      // Read-only mode: we don't render streaming deltas; wait for the
+      // full message event. The handler still validates the wire shape so
+      // a future server-side change surfaces as a schema error instead of
+      // silent drift.
+      parseEvent(SseTokenDataSchema, e, 'token', shareDispatch);
     });
 
     es.addEventListener('error', () => {
