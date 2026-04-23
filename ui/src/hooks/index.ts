@@ -14,7 +14,7 @@ export { useResizablePane } from './useResizablePane';
 export type { UseResizablePaneOptions, UseResizablePaneResult } from './useResizablePane';
 export { useModels } from './useModels';
 export { useAutoAuth } from './useAutoAuth';
-export { useTheme, ThemeProvider } from './useTheme';
+export { useTheme } from './useTheme';
 
 // Export state machine for testing
 export {
