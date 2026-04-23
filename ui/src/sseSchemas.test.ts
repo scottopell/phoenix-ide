@@ -100,17 +100,32 @@ describe('parseEvent', () => {
   });
 
   describe('init schema', () => {
+    // Task 02677 tightened the init schema so that fields the Rust side
+    // always sets (display_state, context_window_size, model_context_window,
+    // breadcrumbs, commits_behind, commits_ahead, project_name) are required
+    // here too. The generated TS type in `./generated/sse` is the source of
+    // truth; the schema `satisfies v.GenericSchema<unknown, WireInitData>`
+    // would fail to compile if these were still marked optional.
+    const validInit = {
+      sequence_id: 0,
+      conversation: { id: 'conv-1' },
+      messages: [],
+      agent_working: false,
+      last_sequence_id: 0,
+      display_state: 'idle',
+      context_window_size: 0,
+      model_context_window: 200_000,
+      breadcrumbs: [],
+      commits_behind: 0,
+      commits_ahead: 0,
+      project_name: null,
+    };
+
     it('accepts a minimal valid init payload', () => {
       const { dispatch, actions } = mockDispatch();
       const res = parseEvent(
         SseInitDataSchema,
-        makeEvent({
-          sequence_id: 0,
-          conversation: { id: 'conv-1' },
-          messages: [],
-          agent_working: false,
-          last_sequence_id: 0,
-        }),
+        makeEvent(validInit),
         'init',
         dispatch,
       );
@@ -128,11 +143,8 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseInitDataSchema,
         makeEvent({
-          sequence_id: 0,
+          ...validInit,
           conversation: { id: 'conv-1', next_gen_field: 'hello' },
-          messages: [],
-          agent_working: false,
-          last_sequence_id: 0,
           some_new_server_feature: 123,
         }),
         'init',
@@ -502,28 +514,39 @@ describe('parseEvent', () => {
   });
 
   describe('error schema', () => {
-    // Errors are the one event type where sequence_id is optional — see the
-    // comment on SseErrorDataSchema in sseSchemas.ts for rationale.
-    it('accepts a backend error payload without sequence_id', () => {
+    // Task 02677 tightened this schema: the Rust `SseWireEvent::Error`
+    // variant always emits `sequence_id`, `message`, and `error` — see
+    // `src/api/wire.rs`. The generated TS type requires all three, and
+    // the schema's `satisfies` annotation enforces alignment.
+    it('accepts a backend error payload with all required fields', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseErrorDataSchema,
-        makeEvent({ message: 'rate limited', error: { kind: 'retryable' } }),
+        makeEvent({
+          sequence_id: 8,
+          message: 'rate limited',
+          error: { title: 'Rate limited', detail: 'retry', kind: 'retryable' },
+        }),
         'error',
         dispatch,
       );
       expect(res.ok).toBe(true);
     });
 
-    it('accepts a backend error payload with sequence_id', () => {
-      const { dispatch } = mockDispatch();
-      const res = parseEvent(
-        SseErrorDataSchema,
-        makeEvent({ sequence_id: 8, message: 'rate limited' }),
-        'error',
-        dispatch,
-      );
-      expect(res.ok).toBe(true);
+    it('rejects a backend error payload without sequence_id', () => {
+      // Contract check: errors now carry sequence_id like every other event
+      // (task 02675 + 02677). Drops to sse_error in prod.
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseErrorDataSchema,
+          makeEvent({ message: 'rate limited', error: {} }),
+          'error',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
     });
 
     it('rejects an error payload missing message', () => {

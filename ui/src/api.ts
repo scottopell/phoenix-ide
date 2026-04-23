@@ -1,8 +1,12 @@
 // Phoenix API Client
 
-// SSE event types are defined by runtime schemas in `sseSchemas.ts` so the
-// wire contract has a single source of truth. Re-exported here for
-// backward-compatible imports (`import type { SseMessageData } from '../api'`).
+// SSE event types come from the runtime schemas in `./sseSchemas`, which
+// are typed against the Rust-generated wire shapes in `./generated/sse`
+// via `v.GenericSchema<unknown, T>`. The `Sse*Data` names re-exported
+// here are the schemas' *output* types (post-transform, so e.g.
+// `conversation` is `Conversation`, not `unknown`). Rust-side drift
+// surfaces at compile time when the generated type no longer satisfies
+// the schema's target annotation. Task 02677.
 export type {
   SseInitData,
   SseMessageData,
@@ -174,9 +178,9 @@ export interface UsageData {
 
 export type SseEventType = 'init' | 'message' | 'state_change' | 'agent_done' | 'conversation_update' | 'disconnected';
 export type SseEventData =
-  | import('./sseSchemas').SseInitData
-  | import('./sseSchemas').SseMessageData
-  | import('./sseSchemas').SseStateChangeData
+  | import('./generated/sse').SseInitData
+  | import('./generated/sse').SseMessageData
+  | import('./generated/sse').SseStateChangeData
   | Record<string, never>;
 
 export interface ModelInfo {
@@ -657,17 +661,17 @@ export const api = {
     const es = new EventSource(`/api/conversations/${convId}/stream`);
 
     es.addEventListener('init', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as import('./sseSchemas').SseInitData;
+      const data = JSON.parse((e as MessageEvent).data) as import('./generated/sse').SseInitData;
       onEvent('init', data);
     });
 
     es.addEventListener('message', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as import('./sseSchemas').SseMessageData;
+      const data = JSON.parse((e as MessageEvent).data) as import('./generated/sse').SseMessageData;
       onEvent('message', data);
     });
 
     es.addEventListener('state_change', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as import('./sseSchemas').SseStateChangeData;
+      const data = JSON.parse((e as MessageEvent).data) as import('./generated/sse').SseStateChangeData;
       onEvent('state_change', data);
     });
 

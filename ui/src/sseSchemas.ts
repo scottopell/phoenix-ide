@@ -1,4 +1,5 @@
-// SSE wire-format runtime validation (task 02674).
+// SSE wire-format runtime validation (task 02674) + compile-time
+// alignment to Rust-generated types (task 02677).
 //
 // Every SSE event handler in `hooks/useConnection.ts` used to cast the result
 // of `JSON.parse` with `as SomeType`, which the TypeScript compiler enforces
@@ -8,10 +9,12 @@
 // dangerously by letting a string `sequence_id` through, which breaks the
 // `atom.lastSequenceId >= action.sequenceId` dedup guard via string compare.
 //
-// The schemas in this file are the single source of truth for what the UI
-// expects to see on each SSE event channel. The corresponding TypeScript
-// types are derived via `v.InferOutput<typeof ...Schema>`, so there's no
-// possibility of the hand-written type drifting from the runtime validator.
+// As of task 02677 the schemas are typed with `v.GenericSchema<T>` where `T`
+// is the Rust-generated wire type from `./generated/sse`. That closes the
+// loop: a Rust type change bubbles up as a regenerated TS type, which tsc
+// then rejects against the valibot schema until the schema is updated to
+// match. Drift between the Rust wire format and the runtime validator is
+// now a compile error rather than a production runtime surprise.
 //
 // Strictness: object schemas are *loose* (extra top-level keys allowed). The
 // Rust backend adds forward-compatible fields routinely; rejecting unknown
@@ -21,6 +24,20 @@
 
 import * as v from 'valibot';
 import type { Conversation, Message } from './api';
+// Generated wire types — aliased so we can reuse the short `Sse*Data`
+// names for the transform-output types consumers actually want.
+import type {
+  SseInitData as WireInitData,
+  SseMessageData as WireMessageData,
+  SseMessageUpdatedData as WireMessageUpdatedData,
+  SseStateChangeData as WireStateChangeData,
+  SseTokenData as WireTokenData,
+  SseAgentDoneData as WireAgentDoneData,
+  SseConversationBecameTerminalData as WireConversationBecameTerminalData,
+  SseConversationUpdateData as WireConversationUpdateData,
+  SseErrorData as WireErrorData,
+  SseBreadcrumb as GeneratedSseBreadcrumb,
+} from './generated/sse';
 
 // ---------------------------------------------------------------------------
 // Supporting schemas for objects reused across event envelopes. These
@@ -38,7 +55,10 @@ import type { Conversation, Message } from './api';
  *  optional fields; we validate only `id` (the stable identifier every caller
  *  depends on) and trust the rest — the Rust backend's serde-serialized
  *  `EnrichedConversation` is the structural source of truth for optional
- *  fields (src/runtime.rs:110-134). */
+ *  fields. The generated `SseInitData.conversation` is `unknown` on purpose
+ *  (the full Conversation shape is hand-authored in `./api.ts` and the
+ *  generated wire type avoids duplicating it); the transform below is the
+ *  single boundary where we cast to the rich `Conversation` type. */
 const ConversationSchema = v.pipe(
   v.looseObject({ id: v.string() }),
   v.transform((obj): Conversation => obj as unknown as Conversation),
@@ -57,14 +77,13 @@ const MessageSchema = v.pipe(
     message_id: v.string(),
     sequence_id: v.number(),
     conversation_id: v.string(),
-    // Mirror the Rust `MessageType` enum at src/db/schema.rs:879. The
-    // picklist is strict so an unknown type surfaces as a schema violation
-    // (forward-compat risk accepted for this field — new message types are
-    // rare and additive). A conversation's history can include `error`
-    // messages (parse-error fallback) and `continuation` messages
-    // (continuation summaries), so both must be listed here — otherwise
-    // init for any conversation with those in history would fail to
-    // validate.
+    // Mirror the Rust `MessageType` enum. The picklist is strict so an
+    // unknown type surfaces as a schema violation (forward-compat risk
+    // accepted for this field — new message types are rare and additive).
+    // A conversation's history can include `error` messages (parse-error
+    // fallback) and `continuation` messages (continuation summaries), so
+    // both must be listed here — otherwise init for any conversation with
+    // those in history would fail to validate.
     message_type: v.picklist([
       'user',
       'agent',
@@ -82,18 +101,35 @@ const MessageSchema = v.pipe(
   v.transform((obj): Message => obj as unknown as Message),
 );
 
-/** Breadcrumb as it appears on the wire (snake_case) before the UI transform. */
+/** Breadcrumb as it appears on the wire (snake_case) before the UI transform.
+ *
+ *  The schema is stricter than the generated `SseBreadcrumb` type (which has
+ *  `type: string` because the Rust field is a `String`, not an enum). We
+ *  intentionally enforce the closed `picklist` here — the set of breadcrumb
+ *  kinds is small, stable, and UI code does symbol-style comparisons on it.
+ *  A Rust-side change that introduces a new crumb type would fail at runtime
+ *  in prod (toast via `sse_error`) until this list is updated.
+ *
+ *  `v.exactOptional` (rather than `v.optional`) lines up with ts-rs'
+ *  `#[ts(optional)]` emission — with `exactOptionalPropertyTypes: true`
+ *  in tsconfig, `field?: T` forbids an explicit `undefined` value. The
+ *  Rust wire uses `skip_serializing_if = "Option::is_none"`, so `None`
+ *  means "key absent", not "key = undefined". */
 const SseBreadcrumbSchema = v.looseObject({
   type: v.picklist(['user', 'llm', 'tool', 'subagents']),
   label: v.string(),
-  tool_id: v.optional(v.string()),
-  sequence_id: v.optional(v.number()),
-  preview: v.optional(v.string()),
-});
+  tool_id: v.exactOptional(v.string()),
+  sequence_id: v.exactOptional(v.number()),
+  preview: v.exactOptional(v.string()),
+}) satisfies v.GenericSchema<unknown, GeneratedSseBreadcrumb>;
 export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
 
 // ---------------------------------------------------------------------------
 // Event schemas. One per `addEventListener` in useConnection.ts.
+//
+// Each `SseXxxDataSchema` is annotated with `v.GenericSchema<SseXxxData>`,
+// where `SseXxxData` comes from `./generated/sse`. TSC rejects at compile
+// time if the schema's InferOutput drifts from the Rust-derived type.
 // ---------------------------------------------------------------------------
 
 // Every event schema below carries `sequence_id: v.number()` as a required
@@ -101,12 +137,6 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
 // single `applyIfNewer(atom, sequence_id, apply)` helper, so a missing or
 // string-typed sequence_id is a protocol violation the schema must reject —
 // not something we want to quietly tolerate and then crash in the reducer.
-// `sse_error` is the one permitted exception: errors originate from the
-// server at points where allocating a counter id is inconvenient (e.g.
-// connection-level failures), they do not mutate `atom.lastSequenceId`, and
-// the UI only reads the `message` string. If the server later gains
-// sequence_ids on error events, making the field required here is a one-line
-// change.
 
 /** `init`: full state snapshot at connect / reconnect.
  *
@@ -115,26 +145,29 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
  *  top-level mirrors that `transformInitData` in useConnection.ts merges
  *  back into the conversation object — they live at the top level on the
  *  wire because the Rust `SseEvent::Init` struct carries them as flat
- *  fields (src/runtime.rs:167-171).
+ *  fields.
  *
  *  `sequence_id` and `last_sequence_id` are the same number by construction
  *  (the snapshot's own place in the total order equals the highest-ever-
- *  emitted id at subscribe time). Both are required. */
+ *  emitted id at subscribe time). Both are required.
+ *
+ *  `display_state` is `string` (not optional) in the Rust wire type — task
+ *  02677 tightened this field from the previously-optional schema shape
+ *  after the generated type surfaced the actual wire contract. */
 export const SseInitDataSchema = v.looseObject({
   sequence_id: v.number(),
   conversation: ConversationSchema,
   messages: v.array(MessageSchema),
   agent_working: v.boolean(),
   last_sequence_id: v.number(),
-  display_state: v.optional(v.string()),
-  context_window_size: v.optional(v.number()),
-  model_context_window: v.optional(v.number()),
-  breadcrumbs: v.optional(v.array(SseBreadcrumbSchema)),
-  commits_behind: v.optional(v.number()),
-  commits_ahead: v.optional(v.number()),
-  project_name: v.nullish(v.string()),
-});
-export type SseInitData = v.InferOutput<typeof SseInitDataSchema>;
+  display_state: v.string(),
+  context_window_size: v.number(),
+  model_context_window: v.number(),
+  breadcrumbs: v.array(SseBreadcrumbSchema),
+  commits_behind: v.number(),
+  commits_ahead: v.number(),
+  project_name: v.nullable(v.string()),
+}) satisfies v.GenericSchema<unknown, WireInitData>;
 
 /** `message`: a newly-created message joins the conversation.
  *
@@ -145,21 +178,19 @@ export type SseInitData = v.InferOutput<typeof SseInitDataSchema>;
 export const SseMessageDataSchema = v.looseObject({
   sequence_id: v.number(),
   message: MessageSchema,
-});
-export type SseMessageData = v.InferOutput<typeof SseMessageDataSchema>;
+}) satisfies v.GenericSchema<unknown, WireMessageData>;
 
 /** `message_updated`: in-place mutation of an existing message's mutable
  *  fields. `display_data` and `content` are optional because either one can
  *  change independently — the server sends both keys (possibly `null`) every
- *  time (see `src/api/sse.rs:84-96`). `sequence_id` is the envelope id; the
- *  persisted `message.sequence_id` is immutable and not repeated here. */
+ *  time. `sequence_id` is the envelope id; the persisted `message.sequence_id`
+ *  is immutable and not repeated here. */
 export const SseMessageUpdatedDataSchema = v.looseObject({
   sequence_id: v.number(),
   message_id: v.string(),
-  display_data: v.nullish(v.unknown()),
-  content: v.nullish(v.unknown()),
-});
-export type SseMessageUpdatedData = v.InferOutput<typeof SseMessageUpdatedDataSchema>;
+  display_data: v.nullable(v.unknown()),
+  content: v.nullable(v.unknown()),
+}) satisfies v.GenericSchema<unknown, WireMessageUpdatedData>;
 
 /** `state_change`: conversation phase transition. The inner `state` is a
  *  discriminated union by `type` (idle / awaiting_llm / tool_executing / …).
@@ -169,17 +200,15 @@ export type SseMessageUpdatedData = v.InferOutput<typeof SseMessageUpdatedDataSc
 export const SseStateChangeDataSchema = v.looseObject({
   sequence_id: v.number(),
   state: v.unknown(),
-  display_state: v.optional(v.string()),
-});
-export type SseStateChangeData = v.InferOutput<typeof SseStateChangeDataSchema>;
+  display_state: v.string(),
+}) satisfies v.GenericSchema<unknown, WireStateChangeData>;
 
 /** `token`: ephemeral streaming delta during an LLM request. */
 export const SseTokenDataSchema = v.looseObject({
   sequence_id: v.number(),
   text: v.string(),
-  request_id: v.optional(v.string()),
-});
-export type SseTokenData = v.InferOutput<typeof SseTokenDataSchema>;
+  request_id: v.string(),
+}) satisfies v.GenericSchema<unknown, WireTokenData>;
 
 /** `conversation_update`: partial conversation metadata update. The backend
  *  sends a strict subset of the Conversation fields (see Rust
@@ -189,44 +218,51 @@ export type SseTokenData = v.InferOutput<typeof SseTokenDataSchema>;
 export const SseConversationUpdateDataSchema = v.looseObject({
   sequence_id: v.number(),
   conversation: v.record(v.string(), v.unknown()),
-});
-export type SseConversationUpdateData = v.InferOutput<typeof SseConversationUpdateDataSchema>;
+}) satisfies v.GenericSchema<unknown, WireConversationUpdateData>;
 
 /** `agent_done`: empty envelope apart from the sequence_id. Still validated
  *  so that a future server change that adds fields can be discovered by a
  *  type-check or a new test rather than a silent nop. */
 export const SseAgentDoneDataSchema = v.looseObject({
   sequence_id: v.number(),
-});
-export type SseAgentDoneData = v.InferOutput<typeof SseAgentDoneDataSchema>;
+}) satisfies v.GenericSchema<unknown, WireAgentDoneData>;
 
 /** `conversation_became_terminal`: carries only the sequence_id today.
  *  Wired up as a no-op in the UI but validated so that if the server starts
  *  including teardown detail it is not silently dropped. */
 export const SseConversationBecameTerminalDataSchema = v.looseObject({
   sequence_id: v.number(),
-});
-export type SseConversationBecameTerminalData = v.InferOutput<
-  typeof SseConversationBecameTerminalDataSchema
->;
+}) satisfies v.GenericSchema<unknown, WireConversationBecameTerminalData>;
 
 /** `error` (backend-application channel): distinguished from a native
  *  EventSource connection error (which arrives with no `data` at all) by
- *  the presence of a parseable JSON body. See `src/api/sse.rs:135-146` —
- *  the backend emits a flat `message` string plus a typed `error` object;
- *  the UI has historically read `message` and we keep that contract.
- *
- *  `sequence_id` is intentionally *not* required here: errors do not mutate
- *  `atom.lastSequenceId`, the UI only displays `message`, and errors can be
- *  emitted from non-runtime code paths where allocating a sequence id costs
- *  more than it buys. The server currently does emit one, so we accept it
- *  optionally for forward consistency without making it load-bearing.
+ *  the presence of a parseable JSON body. The backend emits a flat
+ *  `message` string plus a typed `error` object; the UI has historically
+ *  read `message` and we keep that contract while forwarding the typed
+ *  error for kind-aware affordances.
  *
  *  Native EventSource connection-reset errors go through a different path
  *  in useConnection.ts and do not use this schema. */
 export const SseErrorDataSchema = v.looseObject({
-  sequence_id: v.optional(v.number()),
+  sequence_id: v.number(),
   message: v.string(),
-  error: v.optional(v.unknown()),
-});
+  error: v.unknown(),
+}) satisfies v.GenericSchema<unknown, WireErrorData>;
+
+// The `Sse*Data` types callers import are the schemas' `InferOutput`s —
+// i.e. what the validator produces after transforming wire data into UI
+// types (Conversation, Message). This is what the reducer and hooks
+// actually consume. The schemas' `satisfies v.GenericSchema<unknown, T>`
+// annotations bind each schema to its Rust-generated wire shape for
+// compile-time drift detection.
+export type SseInitData = v.InferOutput<typeof SseInitDataSchema>;
+export type SseMessageData = v.InferOutput<typeof SseMessageDataSchema>;
+export type SseMessageUpdatedData = v.InferOutput<typeof SseMessageUpdatedDataSchema>;
+export type SseStateChangeData = v.InferOutput<typeof SseStateChangeDataSchema>;
+export type SseTokenData = v.InferOutput<typeof SseTokenDataSchema>;
+export type SseConversationUpdateData = v.InferOutput<typeof SseConversationUpdateDataSchema>;
+export type SseAgentDoneData = v.InferOutput<typeof SseAgentDoneDataSchema>;
+export type SseConversationBecameTerminalData = v.InferOutput<
+  typeof SseConversationBecameTerminalDataSchema
+>;
 export type SseErrorData = v.InferOutput<typeof SseErrorDataSchema>;
