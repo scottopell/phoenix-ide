@@ -167,15 +167,16 @@ impl SseBroadcaster {
     }
 
     /// Send an event that has already been stamped with a `sequence_id`.
-    /// Prefer [`SseBroadcaster::send_seq`] or [`SseBroadcaster::send_message`]
-    /// so the stamping is done at the broadcaster.
+    /// Private on purpose — callers must go through [`SseBroadcaster::send_seq`]
+    /// or [`SseBroadcaster::send_message`] so the stamping is done at the
+    /// broadcaster and forgetting a `sequence_id` is a compile error.
     ///
     /// Returns `Ok(receiver_count)` on success, `Err(())` when the channel has
     /// no active receivers. The error payload is discarded on purpose —
     /// `broadcast::error::SendError<SseEvent>` is ~320 bytes, which triggers
     /// clippy's `result_large_err` lint, and every call site here only ever
     /// reads `.is_err()`.
-    pub fn send(&self, event: SseEvent) -> Result<usize, ()> {
+    fn send(&self, event: SseEvent) -> Result<usize, ()> {
         self.tx.send(event).map_err(|_| ())
     }
 
