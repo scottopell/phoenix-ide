@@ -150,11 +150,15 @@ const PATH_LIKE_EXTENSIONS: &[&str] = &[
 /// Returns true if the token contains `/` (path separator) or ends with a known
 /// file extension. Returns false for bare words like "username" or "param".
 fn looks_like_file_path(token: &str) -> bool {
-    // Contains a path separator -- clearly a file path
+    // Bazel labels (@repo//pkg:target, @+canonical//...) and URL-ish strings
+    // (@https://...) contain "//". Real file paths do not. Exclude these before
+    // the single-slash check would otherwise match them.
+    if token.contains("//") {
+        return false;
+    }
     if token.contains('/') {
         return true;
     }
-    // Check for known file extension
     if let Some(ext) = token.rsplit('.').next() {
         if ext != token && PATH_LIKE_EXTENSIONS.contains(&ext) {
             return true;
@@ -738,5 +742,37 @@ mod tests {
         assert!(!looks_like_file_path("param"));
         assert!(!looks_like_file_path("override"));
         assert!(!looks_like_file_path("TODO"));
+    }
+
+    #[test]
+    fn test_bazel_label_passes_through() {
+        let tmp = make_tmp();
+        let result = expand("build @+go_fast+go_fast//:go_fast.exe target", tmp.path()).unwrap();
+        assert_eq!(
+            result.llm_text,
+            "build @+go_fast+go_fast//:go_fast.exe target"
+        );
+    }
+
+    #[test]
+    fn test_bare_bazel_label_passes_through() {
+        let tmp = make_tmp();
+        let result = expand("run @//pkg:target please", tmp.path()).unwrap();
+        assert_eq!(result.llm_text, "run @//pkg:target please");
+    }
+
+    #[test]
+    fn test_url_after_at_passes_through() {
+        let tmp = make_tmp();
+        let result = expand("see @https://example.com/docs", tmp.path()).unwrap();
+        assert_eq!(result.llm_text, "see @https://example.com/docs");
+    }
+
+    #[test]
+    fn test_looks_like_file_path_rejects_double_slash() {
+        assert!(!looks_like_file_path("+go_fast+go_fast//:go_fast.exe"));
+        assert!(!looks_like_file_path("//pkg:target"));
+        assert!(!looks_like_file_path("repo//pkg:target"));
+        assert!(!looks_like_file_path("https://example.com/docs"));
     }
 }
