@@ -198,18 +198,18 @@ variant Parent : Conversation {
     -- Recovery/approval/question states exit by resetting to a core_status
     -- (idle, llm_requesting, error). These are cross-field transitions:
     -- parent_status clears while core_status is set.
-    transitions parent_status {
-        -- Task approval exits (-> core idle or llm_requesting)
-        awaiting_task_approval -> idle
-        -- User question exits (-> core idle or llm_requesting)
-        awaiting_user_response -> idle
-        -- Recovery exits (-> core idle, llm_requesting, or error)
-        awaiting_recovery -> idle
-        -- Continuation exits (-> context_exhausted, a parent terminal)
-        awaiting_continuation -> context_exhausted
-
-        terminal: context_exhausted, terminal
-    }
+    --
+    -- Transition graph (not expressible as a v3 `transitions` block because
+    -- the Allium v3 grammar does not currently support transitions or
+    -- invariants inside `variant` bodies — see the triage note below):
+    --
+    --   awaiting_task_approval -> idle            (task approval exits)
+    --   awaiting_user_response -> idle            (user question exits)
+    --   awaiting_recovery      -> idle            (recovery exits)
+    --   awaiting_continuation  -> context_exhausted (continuation -> terminal)
+    --   terminal states: context_exhausted, terminal
+    --
+    -- The rules below (parent-only section) realise each transition.
 }
 
 -- Sub-agent conversations: spawned by a parent, report results back.
@@ -226,13 +226,15 @@ variant SubAgent : Conversation {
 
     is_terminal: sub_agent_status in { completed, failed }
 
-    transitions sub_agent_status {
-        terminal: completed, failed
-    }
-
-    invariant NoRecursiveSubAgents {
-        sub_agents.count = 0
-    }
+    -- Sub-agent status is set exactly once, at terminal transition. There are
+    -- no intermediate sub_agent_status values. Terminal states: completed,
+    -- failed. (Not expressed as a v3 `transitions` block: grammar does not
+    -- support transitions inside `variant` bodies.)
+    --
+    -- Entity-level invariant (grammar does not support `invariant` inside
+    -- `variant` bodies either): sub-agents cannot spawn further sub-agents —
+    -- for any SubAgent c, c.sub_agents.count = 0. Tracked as cross-cutting
+    -- invariant NoRecursiveSubAgents below.
 }
 
 ------------------------------------------------------------
@@ -892,6 +894,14 @@ rule ServerRestart {
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
+
+-- Sub-agents cannot spawn further sub-agents (was a variant-level invariant,
+-- moved here because Allium v3 grammar does not support invariants inside
+-- `variant` bodies).
+invariant NoRecursiveSubAgents {
+    for c in SubAgent:
+        c.sub_agents.count = 0
+}
 
 -- Sub-agent notifies parent exactly once
 invariant SubAgentNotifiesParentOnce {
