@@ -269,23 +269,29 @@ impl StreamAccumulator {
         }
     }
 
-    fn into_response(mut self) -> Result<LlmResponse, LlmError> {
+    fn into_response_with_diagnostics(
+        mut self,
+        diagnostics: &str,
+    ) -> Result<LlmResponse, LlmError> {
         // Flush any in-progress block that never received content_block_stop.
         // This happens when the stream is truncated (e.g. stop_reason=max_tokens):
         // Anthropic sends message_delta + message_stop but skips content_block_stop
         // for the block being generated, so the text/tool_use sits uncommitted.
         self.flush_current_block();
         self.content_blocks.sort_by_key(|(idx, _)| *idx);
-        normalize_response(AnthropicResponse {
-            content: self.content_blocks.into_iter().map(|(_, b)| b).collect(),
-            stop_reason: self.stop_reason,
-            usage: AnthropicUsage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                cache_creation_input_tokens: Some(self.cache_creation_tokens),
-                cache_read_input_tokens: Some(self.cache_read_tokens),
+        normalize_response_with_diagnostics(
+            AnthropicResponse {
+                content: self.content_blocks.into_iter().map(|(_, b)| b).collect(),
+                stop_reason: self.stop_reason,
+                usage: AnthropicUsage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    cache_creation_input_tokens: Some(self.cache_creation_tokens),
+                    cache_read_input_tokens: Some(self.cache_read_tokens),
+                },
             },
-        })
+            diagnostics,
+        )
     }
 }
 
@@ -393,12 +399,15 @@ pub async fn complete_streaming(
         }
     }
 
+    // Capture diagnostics before finish() consumes the parser.
+    let diagnostics = sse.diagnostic_dump();
+
     // Flush any trailing event (lenient: some gateways omit final blank line)
     for event in sse.finish() {
         acc.process_event(&event.event_type, &event.data, chunk_tx)?;
     }
 
-    acc.into_response()
+    acc.into_response_with_diagnostics(&diagnostics)
 }
 
 /// Complete using Anthropic Messages API
@@ -675,6 +684,14 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
 
 #[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
 pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
+    normalize_response_with_diagnostics(resp, "")
+}
+
+#[allow(clippy::too_many_lines)]
+fn normalize_response_with_diagnostics(
+    resp: AnthropicResponse,
+    sse_diagnostics: &str,
+) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
 
     for block in resp.content {
@@ -816,14 +833,26 @@ pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse,
     // Let it through as content: [] -- the state machine handles this by
     // transitioning to Idle without persisting an empty agent message.
     //
-    // Empty content WITHOUT end_turn is genuinely unexpected.
+    // Empty content WITHOUT end_turn is genuinely unexpected — most likely a
+    // gateway issue (e.g. the exe.dev gateway rejecting an unsupported beta
+    // header and returning an empty stream). Treat as a retryable server error
+    // and emit SSE diagnostics to distinguish gateway bugs from client bugs.
     if !has_client_content && !end_turn {
-        tracing::warn!(
-            stop_reason = ?resp.stop_reason,
-            output_tokens = resp.usage.output_tokens,
-            "Anthropic returned empty content without end_turn"
-        );
-        return Err(LlmError::invalid_response(format!(
+        if sse_diagnostics.is_empty() {
+            tracing::warn!(
+                stop_reason = ?resp.stop_reason,
+                output_tokens = resp.usage.output_tokens,
+                "Anthropic returned empty content without end_turn"
+            );
+        } else {
+            tracing::error!(
+                stop_reason = ?resp.stop_reason,
+                output_tokens = resp.usage.output_tokens,
+                "Anthropic returned empty content without end_turn; SSE diagnostics follow"
+            );
+            tracing::error!("{}", sse_diagnostics);
+        }
+        return Err(LlmError::server_error(format!(
             "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={})",
             resp.stop_reason, resp.usage.output_tokens
         )));
@@ -1255,6 +1284,12 @@ mod tests {
         assert!(
             result.is_err(),
             "Response with only server blocks and stop_reason=tool_use should be rejected"
+        );
+        // Must be retryable (ServerError) not InvalidRequest -- likely a gateway issue.
+        assert_eq!(
+            result.unwrap_err().kind,
+            crate::llm::LlmErrorKind::ServerError,
+            "Empty response without end_turn should be a retryable ServerError"
         );
     }
 }
