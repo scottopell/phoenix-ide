@@ -257,13 +257,16 @@ export class ExpansionError extends Error {
 
 /** 409 Conflict payload from the server. `conflict_slug` points at the
  *  conversation that owns the contested resource (e.g. an already-active
- *  Branch-mode conversation on the same branch). */
+ *  Branch-mode conversation on the same branch). `continuation_id` is set
+ *  when `error_type === 'continuation_exists'` (REQ-BED-031) so the UI can
+ *  route to the continuation without parsing the error message. */
 export interface ConflictErrorDetail {
   error: string;
   error_type: string;
   conflict_slug?: string;
   dirty_files?: string[];
   can_auto_stash?: boolean;
+  continuation_id?: string;
 }
 
 /** Thrown by API methods that return 409 with a typed conflict payload. */

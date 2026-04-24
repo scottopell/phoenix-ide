@@ -129,8 +129,9 @@ pub struct ContinueConversationResponse {
     pub slug: Option<String>,
     /// True iff the parent already had a continuation when the endpoint was
     /// called. The UI can use this to route directly (vs. announcing the
-    /// continuation as fresh).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// continuation as fresh). Always serialized so the wire shape matches
+    /// the typed client contract — callers don't have to treat absent as
+    /// false.
     pub already_existed: bool,
 }
 

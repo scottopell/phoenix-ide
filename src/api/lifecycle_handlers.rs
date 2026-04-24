@@ -188,9 +188,17 @@ pub(crate) async fn abandon_task(
     // The live conversation is the continuation; terminal actions belong there.
     reject_if_continued(&conv, "abandon")?;
 
-    if !matches!(conv.state, ConvState::Idle) {
+    // REQ-BED-031: abandon is permitted from Idle *and* ContextExhausted.
+    // A context-exhausted parent with no continuation is the canonical
+    // "user is done; tear it down" path — the gate above already ensured
+    // no continuation exists, so the worktree/branch are still ours to
+    // destroy.
+    if !matches!(
+        conv.state,
+        ConvState::Idle | ConvState::ContextExhausted { .. },
+    ) {
         return Err(AppError::BadRequest(
-            "Conversation must be idle to abandon a task".to_string(),
+            "Conversation must be idle or context-exhausted to abandon a task".to_string(),
         ));
     }
 
@@ -467,9 +475,16 @@ pub(crate) async fn mark_merged(
     // The live conversation is the continuation; terminal actions belong there.
     reject_if_continued(&conv, "mark as merged")?;
 
-    if !matches!(conv.state, ConvState::Idle) {
+    // REQ-BED-031: mark-as-merged is permitted from Idle *and*
+    // ContextExhausted. A context-exhausted parent whose work has already
+    // been merged (e.g. user committed and merged externally) needs a way
+    // to dispose of the worktree without forcing a continuation first.
+    if !matches!(
+        conv.state,
+        ConvState::Idle | ConvState::ContextExhausted { .. },
+    ) {
         return Err(AppError::BadRequest(
-            "Conversation must be idle to mark as merged".to_string(),
+            "Conversation must be idle or context-exhausted to mark as merged".to_string(),
         ));
     }
 
