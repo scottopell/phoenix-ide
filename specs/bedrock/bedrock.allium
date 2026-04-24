@@ -473,19 +473,19 @@ rule LastSubAgentReportsResult {
 -- ===========================================================
 
 rule RejectMessageDuringTaskApproval {
-    when: UserSendsMessage(conversation: Parent, text, images?)
+    when: UserSendsMessage(conversation, text, images?)
     requires: conversation.parent_status = awaiting_task_approval
     ensures: MessageRejected(conversation, reason: awaiting_approval)
 }
 
 rule RejectMessageDuringUserQuestion {
-    when: UserSendsMessage(conversation: Parent, text, images?)
+    when: UserSendsMessage(conversation, text, images?)
     requires: conversation.parent_status = awaiting_user_response
     ensures: MessageRejected(conversation, reason: awaiting_response)
 }
 
 rule RejectMessageContextExhausted {
-    when: UserSendsMessage(conversation: Parent, text, images?)
+    when: UserSendsMessage(conversation, text, images?)
     requires: conversation.parent_status = context_exhausted
     ensures: MessageRejected(conversation, reason: context_exhausted)
 }
@@ -495,7 +495,7 @@ rule RejectMessageContextExhausted {
 -- ===========================================================
 
 rule ParentLlmRespondsTextOnly {
-    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     ensures: conversation.core_status = idle
@@ -505,7 +505,7 @@ rule ParentLlmRespondsTextOnly {
 
 -- REQ-BED-028: propose_task interception (parent-only, managed mode only)
 rule ProposeTaskIntercepted {
-    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
@@ -522,7 +522,7 @@ rule ProposeTaskIntercepted {
 }
 
 rule AskUserQuestionIntercepted {
-    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "ask_user_question"
@@ -533,7 +533,7 @@ rule AskUserQuestionIntercepted {
 
 -- REQ-BED-019: Context threshold reached (parent -> continuation)
 rule ContextThresholdReachedParent {
-    when: LlmResponds(conversation: Parent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
     ensures: conversation.core_status = awaiting_continuation
@@ -547,7 +547,7 @@ rule ContextThresholdReachedParent {
 -- ===========================================================
 
 rule ParentCancelDuringLlmRequest {
-    when: UserCancels(conversation: Parent)
+    when: UserCancels(conversation)
     requires: conversation.core_status = llm_requesting
     ensures: conversation.core_status = idle
     ensures: LlmAborted(conversation)
@@ -559,7 +559,7 @@ rule ParentCancelDuringLlmRequest {
 -- ===========================================================
 
 rule ParentLlmErrorNonRecoverable {
-    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = llm_requesting
     requires: error_class = non_retryable or attempt >= config.max_retry_attempts
     ensures: conversation.core_status = error
@@ -572,7 +572,7 @@ rule ParentLlmErrorNonRecoverable {
 -- ===========================================================
 
 rule AuthErrorWithActiveRecovery {
-    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = llm_requesting
     requires: error_class = non_retryable
     requires: error_kind = auth
@@ -604,7 +604,7 @@ rule RecoveryFailed {
 }
 
 rule CancelDuringRecovery {
-    when: UserCancels(conversation: Parent)
+    when: UserCancels(conversation)
     requires: conversation.parent_status = awaiting_recovery
     ensures: conversation.core_status = idle
 }
@@ -614,7 +614,7 @@ rule CancelDuringRecovery {
 -- ===========================================================
 
 rule UserApprovesTask {
-    when: TaskApprovalDecided(conversation: Parent, decision)
+    when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved
     ensures: conversation.mode = work
@@ -625,7 +625,7 @@ rule UserApprovesTask {
 }
 
 rule UserProvidesFeedback {
-    when: TaskApprovalDecided(conversation: Parent, decision)
+    when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = feedback_provided
     ensures: conversation.core_status = llm_requesting
@@ -634,7 +634,7 @@ rule UserProvidesFeedback {
 }
 
 rule UserRejectsTask {
-    when: TaskApprovalDecided(conversation: Parent, decision)
+    when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = rejected
     ensures: conversation.core_status = idle
@@ -642,7 +642,7 @@ rule UserRejectsTask {
 }
 
 rule CancelDuringTaskApproval {
-    when: UserCancels(conversation: Parent)
+    when: UserCancels(conversation)
     requires: conversation.parent_status = awaiting_task_approval
     ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
@@ -653,7 +653,7 @@ rule CancelDuringTaskApproval {
 -- ===========================================================
 
 rule UserAnswersQuestion {
-    when: UserAnswersQuestion(conversation: Parent, answers, annotations?)
+    when: UserAnswersQuestion(conversation, answers, annotations?)
     requires: conversation.parent_status = awaiting_user_response
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
@@ -661,7 +661,7 @@ rule UserAnswersQuestion {
 }
 
 rule CancelDuringUserQuestion {
-    when: UserCancels(conversation: Parent)
+    when: UserCancels(conversation)
     requires: conversation.parent_status = awaiting_user_response
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
@@ -673,7 +673,7 @@ rule CancelDuringUserQuestion {
 -- ===========================================================
 
 rule UserTriggersContinuation {
-    when: UserTriggersContinuation(conversation: Parent)
+    when: UserTriggersContinuation(conversation)
     requires: conversation.core_status = idle
     ensures: conversation.core_status = awaiting_continuation
     ensures: conversation.rejected_tool_calls = {}
@@ -682,14 +682,14 @@ rule UserTriggersContinuation {
 }
 
 rule ContinuationSummaryReceived {
-    when: ContinuationSummaryReady(conversation: Parent, summary)
+    when: ContinuationSummaryReady(conversation, summary)
     requires: conversation.core_status = awaiting_continuation
     ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary = summary
 }
 
 rule ContinuationFailed {
-    when: ContinuationRequestFailed(conversation: Parent, error)
+    when: ContinuationRequestFailed(conversation, error)
     requires: conversation.core_status = awaiting_continuation
     ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary =
@@ -697,7 +697,7 @@ rule ContinuationFailed {
 }
 
 rule CancelDuringContinuation {
-    when: UserCancels(conversation: Parent)
+    when: UserCancels(conversation)
     requires: conversation.core_status = awaiting_continuation
     ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary =
@@ -705,7 +705,7 @@ rule CancelDuringContinuation {
 }
 
 rule ContinuationRetryableError {
-    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = awaiting_continuation
     requires: error_class = retryable
     requires: attempt < config.max_retry_attempts
@@ -714,7 +714,7 @@ rule ContinuationRetryableError {
 }
 
 rule ContinuationNonRecoverableError {
-    when: LlmErrors(conversation: Parent, message, error_class, attempt)
+    when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = awaiting_continuation
     requires: error_class = non_retryable or attempt >= config.max_retry_attempts
     ensures: conversation.parent_status = context_exhausted
@@ -727,7 +727,7 @@ rule ContinuationNonRecoverableError {
 -- ===========================================================
 
 rule TaskResolved {
-    when: TaskResolved(conversation: Parent, outcome)
+    when: TaskResolved(conversation, outcome)
     requires: conversation.core_status = idle
     requires: conversation.mode in { work, branch }
     ensures: conversation.parent_status = terminal
@@ -743,7 +743,7 @@ rule TaskResolved {
 -- ===========================================================
 
 rule SubAgentImplicitCompletion {
-    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     requires: content = null
@@ -754,7 +754,7 @@ rule SubAgentImplicitCompletion {
 
 -- Sub-agent text-only with content -> also implicit completion
 rule SubAgentTextOnlyCompletion {
-    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 0
     requires: content != null
@@ -768,7 +768,7 @@ rule SubAgentTextOnlyCompletion {
 -- ===========================================================
 
 rule SubAgentSubmitsResult {
-    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "submit_result"
@@ -778,7 +778,7 @@ rule SubAgentSubmitsResult {
 }
 
 rule SubAgentSubmitsError {
-    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "submit_error"
@@ -792,7 +792,7 @@ rule SubAgentSubmitsError {
 -- ===========================================================
 
 rule SubAgentCancelled {
-    when: UserCancels(conversation: SubAgent)
+    when: UserCancels(conversation)
     requires: not conversation.is_terminal
     ensures: conversation.sub_agent_status = failed
     ensures: conversation.failure_error = UserCancels.reason or "Cancelled"
@@ -804,7 +804,7 @@ rule SubAgentCancelled {
 -- ===========================================================
 
 rule SubAgentLlmError {
-    when: LlmErrors(conversation: SubAgent, message, error_class, attempt)
+    when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = llm_requesting
     requires: error_class = non_retryable or attempt >= config.max_retry_attempts
     ensures: conversation.sub_agent_status = failed
@@ -818,7 +818,7 @@ rule SubAgentLlmError {
 -- ===========================================================
 
 rule SubAgentContextExhausted {
-    when: LlmResponds(conversation: SubAgent, content, tool_calls, end_turn, usage)
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: conversation.context_at_threshold
     ensures: conversation.sub_agent_status = failed
@@ -831,7 +831,7 @@ rule SubAgentContextExhausted {
 -- ===========================================================
 
 rule SubAgentTurnLimitGraceTurn {
-    when: TurnLimitReached(conversation: SubAgent)
+    when: TurnLimitReached(conversation)
     requires: not conversation.grace_turn_granted
     ensures: conversation.grace_turn_granted = true
     ensures: SystemMessageInjected(conversation,
@@ -846,7 +846,7 @@ rule SubAgentTurnLimitGraceTurn {
 }
 
 rule SubAgentTurnLimitHardStop {
-    when: GraceTurnExhausted(conversation: SubAgent, partial_result)
+    when: GraceTurnExhausted(conversation, partial_result)
     requires: conversation.grace_turn_granted = true
     ensures:
         if partial_result != null:
