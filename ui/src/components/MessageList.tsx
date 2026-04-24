@@ -81,13 +81,21 @@ const MessageListBody = memo(function MessageListBody({
   onRetry,
   onOpenFile,
 }: MessageListBodyProps) {
+  // Tracks whether the previous rendered message was an agent message, so
+  // we can suppress the "Phoenix HH:MM" header on consecutive agent messages
+  // within the same turn. Any user / skill message resets the run; system
+  // messages and tool messages (which don't render as their own block here)
+  // leave the run intact — they don't represent a new turn.
+  let inAgentRun = false;
   return (
     <>
       {messages.map((msg) => {
         const type = msg.message_type || msg.type;
         if (type === 'user') {
+          inAgentRun = false;
           return <UserMessage key={msg.sequence_id} message={msg} />;
         } else if (type === 'skill') {
+          inAgentRun = false;
           const skillContent = msg.content as { name?: string; trigger?: string };
           const skillTrigger = skillContent.trigger || '';
           const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
@@ -112,12 +120,15 @@ const MessageListBody = memo(function MessageListBody({
             </div>
           );
         } else if (type === 'agent') {
+          const isFirstInTurn = !inAgentRun;
+          inAgentRun = true;
           return (
             <AgentMessage
               key={msg.sequence_id}
               message={msg}
               toolResults={toolResults}
               onOpenFile={onOpenFile}
+              isFirstInTurn={isFirstInTurn}
             />
           );
         }

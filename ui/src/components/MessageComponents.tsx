@@ -39,6 +39,11 @@ const ChevronDownIcon = () => (
     <polyline points="6 9 12 15 18 9" />
   </svg>
 );
+const ChevronRightIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="9 6 15 12 9 18" />
+  </svg>
+);
 const ChevronUpIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <polyline points="18 15 12 9 6 15" />
@@ -134,9 +139,92 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
         isMultiline: false,
       };
     }
+    case 'ask_user_question': {
+      const questions = (input['questions'] as Array<{ question?: string; options?: unknown[] }>) || [];
+      const first = questions[0];
+      const rawText = String(first?.question || '');
+      const flatText = rawText.replace(/\s+/g, ' ').trim();
+      const truncated = flatText.length > 80 ? flatText.slice(0, 80) + '…' : flatText;
+      const optionCount = Array.isArray(first?.options) ? first!.options!.length : 0;
+      const suffix = questions.length > 1
+        ? ` [+${questions.length - 1} more]`
+        : optionCount > 0 ? ` [${optionCount} options]` : '';
+      return { display: `"${truncated}"${suffix}`, isMultiline: false };
+    }
+    case 'search': {
+      const pattern = String(input['pattern'] || '');
+      const path = input['path'] ? String(input['path']) : '';
+      const include = input['include'] ? String(input['include']) : '';
+      let display = `"${pattern}"`;
+      if (path) display += ` in ${path}`;
+      if (include) display += ` (${include})`;
+      return { display, isMultiline: false };
+    }
     default: {
+      if (name.startsWith('browser_')) {
+        const display = formatBrowserInput(name, input);
+        return { display, isMultiline: display.includes('\n') };
+      }
       const str = JSON.stringify(input, null, 2);
       return { display: str, isMultiline: str.includes('\n') };
+    }
+  }
+}
+
+function truncateValue(s: string, max = 40): string {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+function formatBrowserInput(name: string, input: Record<string, unknown>): string {
+  switch (name) {
+    case 'browser_navigate': {
+      const url = String(input['url'] || '');
+      return `→ ${url}`;
+    }
+    case 'browser_eval': {
+      const expr = String(input['expression'] || '').replace(/\s+/g, ' ').trim();
+      return `eval: ${truncateValue(expr, 80)}`;
+    }
+    case 'browser_take_screenshot': {
+      const selector = input['selector'] ? String(input['selector']) : '';
+      return selector ? `screenshot of "${selector}"` : 'screenshot';
+    }
+    case 'browser_recent_console_logs': {
+      const limit = input['limit'] as number | undefined;
+      return limit !== undefined ? `console logs (${limit})` : 'console logs';
+    }
+    case 'browser_clear_console_logs': {
+      return 'clear console';
+    }
+    case 'browser_resize': {
+      const width = input['width'];
+      const height = input['height'];
+      return `resize ${width}x${height}`;
+    }
+    case 'browser_wait_for_selector': {
+      const selector = String(input['selector'] || '');
+      const visible = input['visible'] === true;
+      return visible ? `wait "${selector}" (visible)` : `wait "${selector}"`;
+    }
+    case 'browser_click': {
+      const selector = String(input['selector'] || '');
+      return `click "${selector}"`;
+    }
+    case 'browser_type': {
+      const selector = String(input['selector'] || '');
+      const text = String(input['text'] || '');
+      const clear = input['clear'] === true;
+      const verb = clear ? 'replace' : 'type';
+      return `${verb} "${selector}" = "${truncateValue(text)}"`;
+    }
+    case 'browser_key_press': {
+      const key = String(input['key'] || '');
+      const modifiers = (input['modifiers'] as string[]) || [];
+      const chord = modifiers.length > 0 ? `${modifiers.join('+')}+${key}` : key;
+      return `key: ${chord}`;
+    }
+    default: {
+      return JSON.stringify(input, null, 2);
     }
   }
 }
@@ -225,11 +313,18 @@ interface AgentMessageProps {
   message: Message;
   toolResults: Map<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  /**
+   * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
+   * to collapse repeated headers across a run of consecutive agent messages
+   * within the same turn. Defaults to true so callers that don't set it keep
+   * the original behavior.
+   */
+  isFirstInTurn?: boolean;
 }
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = true }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
 
@@ -318,14 +413,16 @@ function AgentMessageImpl({ message, toolResults, onOpenFile }: AgentMessageProp
 
   return (
     <div className="message agent" data-sequence-id={message.sequence_id}>
-      <div className="message-header">
-        <span className="message-sender">Phoenix</span>
-        {timestamp && (
-          <span className="message-time" title={new Date(timestamp).toLocaleString()}>
-            {formatMessageTime(timestamp)}
-          </span>
-        )}
-      </div>
+      {isFirstInTurn && (
+        <div className="message-header">
+          <span className="message-sender">Phoenix</span>
+          {timestamp && (
+            <span className="message-time" title={new Date(timestamp).toLocaleString()}>
+              {formatMessageTime(timestamp)}
+            </span>
+          )}
+        </div>
+      )}
       <div className="message-content">
         {blocks.map((block, i) => {
           if (block.type === 'text') {
@@ -344,6 +441,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile }: AgentMessageProp
               </div>
             );
           } else if (block.type === 'tool_use') {
+            // `think` renders as a subtle inline aside, not the full tool-block
+            // shell — it's model reasoning, not an action. Collapsed by default.
+            if (block.name === 'think') {
+              return <ThinkAside key={block.id || i} block={block} />;
+            }
             return (
               <ToolUseBlock
                 key={block.id || i}
@@ -356,6 +458,50 @@ function AgentMessageImpl({ message, toolResults, onOpenFile }: AgentMessageProp
           return null;
         })}
       </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Think Aside — subtle inline collapsed aside for `think` tool blocks
+// ============================================================================
+
+export const ThinkAside = memo(ThinkAsideImpl);
+
+function ThinkAsideImpl({ block }: { block: ContentBlock }) {
+  const input = (block.input || {}) as Record<string, unknown>;
+  const raw = String(input['thoughts'] || '');
+  const text = cleanThoughts(raw);
+  const [expanded, setExpanded] = useState(false);
+
+  // Empty thought after cleaning: render nothing.
+  if (!text) return null;
+
+  const lineCount = text.split('\n').length;
+
+  return (
+    <div className={`think-aside ${expanded ? 'expanded' : ''}`}>
+      <div
+        className="think-aside-header"
+        onClick={() => setExpanded(!expanded)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setExpanded(!expanded);
+          }
+        }}
+      >
+        <span className="think-aside-chevron">
+          {expanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
+        </span>
+        <span className="think-aside-label">
+          thinking ({lineCount} {lineCount === 1 ? 'line' : 'lines'})
+        </span>
+        {expanded && <CopyButton text={text} title="Copy thought" />}
+      </div>
+      {expanded && <div className="think-aside-body">{text}</div>}
     </div>
   );
 }
@@ -427,12 +573,26 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
     imageResult = parseImageResult(resultText);
   }
 
+  // Trivial patch detection: a single-patch call whose diff has ≤3 total
+  // changed lines is cheaper to read inline than click-through. We auto-expand
+  // it and suppress the (redundant) PatchFileSummary below.
+  const patchCount = name === 'patch'
+    ? ((input as { patches?: unknown[] }).patches?.length ?? 0)
+    : 0;
+  const patchLineDelta = name === 'patch' && patchDiff
+    ? patchDiff.split('\n').filter(l =>
+        (l.startsWith('+') && !l.startsWith('+++')) ||
+        (l.startsWith('-') && !l.startsWith('---'))
+      ).length
+    : 0;
+  const isTrivialPatch = name === 'patch' && patchCount === 1 && patchLineDelta <= 3;
+
   // Determine if output should be auto-expanded.
   // read_file auto-expands regardless of length: the file contents ARE the payload,
   // not supplementary evidence — hiding them defeats the tool's purpose. The
   // 5000-char maxDisplayLen below caps runaway reads.
   const shouldAutoExpand = resultLength > 0 && (
-    resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD || name === 'read_file'
+    resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD || name === 'read_file' || isTrivialPatch
   );
   const [outputExpanded, setOutputExpanded] = useState(shouldAutoExpand);
 
@@ -455,6 +615,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
   const rawInput = name === 'bash' ? String(input['command'] || '') :
                    name === 'think' ? String(input['thoughts'] || '') :
                    name === 'read_file' ? String(input['path'] || '') :
+                   name === 'ask_user_question' ? String(((input['questions'] as Array<{ question?: string }> | undefined)?.[0]?.question) || '') :
+                   name === 'search' ? String(input['pattern'] || '') :
+                   name === 'browser_navigate' ? String(input['url'] || '') :
+                   name === 'browser_eval' ? String(input['expression'] || '') :
+                   name === 'browser_click' ? String(input['selector'] || '') :
+                   name === 'browser_wait_for_selector' ? String(input['selector'] || '') :
+                   name === 'browser_type' ? String(input['text'] || '') :
                    JSON.stringify(input, null, 2);
 
   return (
@@ -536,7 +703,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
 
       {/* Patch file summary (REQ-PF-014) */}
       {/* Check display_data.diff first (new format), then fall back to resultText (old format) */}
-      {name === 'patch' && onOpenFile && (() => {
+      {/* Suppressed for trivial patches — the inline diff above already shows everything. */}
+      {name === 'patch' && onOpenFile && !isTrivialPatch && (() => {
         const patchDiff = (result?.display_data as { diff?: string })?.diff;
         const diffContent = patchDiff || resultText;
         return diffContent && containsUnifiedDiff(diffContent) ? (
