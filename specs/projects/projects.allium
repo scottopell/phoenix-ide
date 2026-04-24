@@ -250,13 +250,17 @@ rule BranchConflictDetected {
     requires: exists active_worktree_on_branch(conversation.project, branch_name)
 
     -- Three conflict cases (case D -- terminal conversation -- is excluded):
-    -- (A) Active conversation with worktree -> prompt redirect
-    -- (B) Orphaned worktree (no conversation) -> prompt delete + fresh start
+    -- (A) Active conversation with worktree -> prompt redirect.
+    --     A context-exhausted conversation counts as "active" here: its
+    --     worktree is preserved pending Continue / Abandon (REQ-BED-031),
+    --     so a user targeting the same branch should be offered the
+    --     existing conversation rather than a fresh start.
+    -- (B) Orphaned worktree (no conversation) -> prompt delete + fresh start.
     --     Rare in normal operation: ExploreWorktreeCleanupOnTerminal,
-    --     WorkBranchWorktreeCleanupOnContextExhausted, MarkAsMerged,
-    --     ConfirmAbandon, and ServerRestartWorktreeReconciliation
-    --     collectively close every expected path to orphaning. This case
-    --     only triggers for worktrees created by external git operations.
+    --     MarkAsMerged, ConfirmAbandon, and
+    --     ServerRestartWorktreeReconciliation collectively close every
+    --     expected path to orphaning. This case only triggers for
+    --     worktrees created by external git operations.
     -- (C) Stale conversation (no worktree) -> redirect to conversation
     -- All cases must be resolved before BranchModeSelected can proceed.
 
@@ -570,7 +574,11 @@ rule MarkAsMerged {
 -- 5. ABANDONMENT (REQ-PROJ-010, REQ-PROJ-026)
 -- ===========================================================
 
--- REQ-PROJ-010/026: User confirms abandonment
+-- REQ-PROJ-010/026, REQ-BED-031: User confirms abandonment.
+-- Gated on `continued_in_conv_id = absent`: a context-exhausted parent
+-- that has already been continued cannot be abandoned from the parent
+-- (the continuation is the live conversation -- any abandon decision is
+-- made there). See AbandonRequiresNoContinuation invariant.
 rule ConfirmAbandon {
     when: UserConfirmsAbandon(conversation)
 
@@ -578,6 +586,7 @@ rule ConfirmAbandon {
 
     requires: conversation.status = idle
     requires: conversation.mode in { work, branch }
+    requires: conversation.continued_in_conv_id = absent
 
     ensures: not exists worktree
     ensures:
@@ -638,74 +647,132 @@ rule ExploreWorktreeCleanupOnTerminal {
         -- the crash case. This rule handles the normal-operation case.
 }
 
--- Work/Branch conversation exhausts its context window. The conversation
--- becomes terminal (parent_status = context_exhausted) but no user action
--- (MarkAsMerged / ConfirmAbandon) ran, so the worktree is still on disk.
--- Remove it so the branch is free for a continuation, but preserve the
--- branch itself — it holds the agent's committed work and a continuation
--- conversation should resume on it.
--- Split by mode (variant-based dispatch). Work demotes to Explore; Branch
--- demotes to Direct (see @guidance on ServerRestartWorktreeReconciliation
--- for the type-driven asymmetry).
-rule WorkBranchWorktreeCleanupOnContextExhaustedWork {
-    when: ConversationBecameTerminal(conversation)
+-- REQ-BED-030/031: Context-exhausted Work/Branch conversations are a
+-- *paused* state, not a terminal cleanup. The worktree is preserved on
+-- disk; the branch is preserved in git; the conversation record is
+-- preserved for history navigation. The worktree stays until the user
+-- takes an explicit action:
+--   - Continue: worktree ownership transfers to the continuation
+--     (WorktreeTransferredOnContinuation below).
+--   - Abandon: normal abandon flow (ConfirmAbandon) runs; only permitted
+--     while `continued_in_conv_id` is null (AbandonRequiresNoContinuation).
+--   - Mark as merged on the continuation chain's tail: the chain's
+--     normal terminal semantics apply (MarkAsMerged / ConfirmAbandon
+--     there destroy the worktree; the parent's worktree_path becomes a
+--     stale history reference).
+--
+-- The prior destroy-on-terminal rule is gone; no ConversationBecameTerminal
+-- listener fires for Work/Branch + context_exhausted. Context-exhausted
+-- stays a first-class paused state of the conversation entity.
 
-    requires: conversation.mode = work
-    requires: conversation.parent_status = context_exhausted
-    requires: exists Worktree{conversation: conversation}
+-- REQ-BED-030: User initiates continuation from a context-exhausted
+-- parent with a live Work or Branch worktree. A new conversation is
+-- created that inherits the parent's environment; worktree ownership
+-- transfers atomically. No `git worktree add` or `git worktree remove`
+-- runs -- the filesystem state is unchanged.
+rule WorktreeTransferredOnContinuation {
+    when: UserTriggerContinuation(parent, new_conv)
 
-    let worktree = Worktree{conversation: conversation}
+    requires: parent.parent_status = context_exhausted
+    requires: parent.mode in { work, branch }
+    requires: exists Worktree{conversation: parent}
+    -- Single-continuation policy: the parent may not already have one.
+    requires: parent.continued_in_conv_id = absent
 
-    ensures: not exists worktree
-    ensures: conversation.mode = explore
-    ensures: conversation.working_dir = project_root(conversation)
+    let worktree = Worktree{conversation: parent}
+
+    -- New conversation inherits mode, cwd, and worktree from parent.
+    ensures: new_conv.mode = parent.mode
+    ensures: new_conv.working_dir = parent.working_dir
+    ensures: new_conv.worktree_path = parent.worktree_path
+    ensures: new_conv.branch_name = parent.branch_name
+    ensures: new_conv.base_branch = parent.base_branch
+
+    -- Parent retains its worktree_path as a read-only history reference;
+    -- ownership is derived from continued_in_conv_id (set => continuation
+    -- owns; absent => this record owns). See
+    -- WorktreeOwnershipFollowsContinuationPointer invariant.
+    ensures: parent.continued_in_conv_id = new_conv.id
+
+    -- Worktree ownership transfers: the Worktree entity's conversation
+    -- pointer moves from parent to new_conv. No filesystem mutation.
+    ensures: worktree.conversation = new_conv
 
     @guidance
-        -- Fires on the context_exhausted pathway only. The TaskResolved
-        -- pathway (MarkAsMerged / ConfirmAbandon) removes the worktree at
-        -- action time, so by the time ConversationBecameTerminal fires
-        -- with parent_status = terminal, `exists Worktree` is already
-        -- false and this rule is inert. This keeps each user-facing
-        -- action's cleanup in one place while still closing the
-        -- context_exhausted gap.
+        -- Cross-reference: bedrock/design.md "Context Continuation
+        -- Worktree Transfer (REQ-BED-030, REQ-BED-031)" for the data
+        -- model change (continued_in_conv_id column), the atomic
+        -- DB transaction sketch, and the mode-inheritance table.
         --
-        -- Branch is preserved: the user's committed progress stays
-        -- reachable, and a fresh Branch-mode conversation on the same
-        -- branch can succeed without hitting a filesystem-level worktree
-        -- conflict. Note the asymmetry with MarkAsMerged / ConfirmAbandon:
-        -- those delete the Work-mode task branch because the task is over.
-        -- Here the task is only stalled by context exhaustion, so the
-        -- branch must survive for a continuation conversation to resume.
+        -- Inheritance table (this rule covers the Work and Branch rows):
+        --   Work   -> Work:   worktree transferred, branch_name + task_id inherited
+        --   Branch -> Branch: worktree transferred, branch_name inherited
+        --   Explore, Direct: no worktree to transfer (covered by a
+        --     separate rule below; filesystem unchanged, only cwd
+        --     and mode are inherited).
         --
-        -- Sequence:
-        --   1. git worktree remove {path} --force
-        --      On failure: rm -rf + git worktree prune
-        --   -- branch left untouched.
+        -- Atomicity:
+        --   BEGIN;
+        --   INSERT INTO conversations (id, conv_mode, cwd, ..., task_id)
+        --     VALUES (new_id, <parent's mode clone>, <parent's cwd>, ...);
+        --   UPDATE conversations SET continued_in_conv_id = new_id
+        --     WHERE id = parent_id;
+        --   COMMIT;
+        -- Either the continuation is created with full inheritance, or
+        -- no state changes. A partial apply would leave the parent
+        -- claiming ownership of a worktree while the continuation
+        -- expected to inherit it (or strand a continuation with no
+        -- parent linkage).
         --
-        -- Uncommitted changes in the worktree are lost. Agents commit
-        -- progress as they go per repo convention, and the context-full
-        -- banner gives the user a chance to stash / commit externally
-        -- before clicking "Continue in new conversation."
+        -- The continuation_summary field (set by bedrock when entering
+        -- context_exhausted) is carried forward as the opening system
+        -- message of the new conversation. That contract is owned by
+        -- bedrock; this rule only models the worktree and mode
+        -- inheritance.
 }
 
-rule WorkBranchWorktreeCleanupOnContextExhaustedBranch {
-    when: ConversationBecameTerminal(conversation)
+-- REQ-BED-030: Work-mode continuation also inherits the parent's task_id
+-- (and therefore its task file, since the task file lives on the
+-- transferred branch inside the transferred worktree). Ensures a new
+-- task ID isn't minted for the same underlying task.
+rule WorkContinuationInheritsTaskId {
+    when: UserTriggerContinuation(parent, new_conv)
 
-    requires: conversation.mode = branch
-    requires: conversation.parent_status = context_exhausted
-    requires: exists Worktree{conversation: conversation}
+    requires: parent.parent_status = context_exhausted
+    requires: parent.mode = work
+    requires: parent.continued_in_conv_id = absent
 
-    let worktree = Worktree{conversation: conversation}
+    ensures: new_conv.task_id = parent.task_id
+}
 
-    ensures: not exists worktree
-    ensures: conversation.mode = direct
-    ensures: conversation.working_dir = project_root(conversation)
+-- REQ-BED-030: Explore and Direct parents have no worktree, so
+-- continuation inherits only cwd and mode. No ownership transfer
+-- happens; the filesystem is untouched; no WorktreeTransferred
+-- rule fires for these modes.
+rule WorktreelessContinuationInheritsCwd {
+    when: UserTriggerContinuation(parent, new_conv)
+
+    requires: parent.parent_status = context_exhausted
+    requires: parent.mode in { explore, direct }
+    requires: parent.continued_in_conv_id = absent
+
+    ensures: new_conv.mode = parent.mode
+    ensures: new_conv.working_dir = parent.working_dir
+    ensures: parent.continued_in_conv_id = new_conv.id
 
     @guidance
-        -- Branch has no worktree-less equivalent in the ConvMode type
-        -- and must fall to Direct. Otherwise identical to the Work
-        -- variant above. project_id on the conversation row is preserved
-        -- regardless, so sidebar grouping is retained across the demote.
+        -- For modes without a worktree (Explore, Direct), the
+        -- continuation inherits only the cwd and (via bedrock) the
+        -- continuation summary. No filesystem or registry changes.
+        -- Direct covers both git-repo and non-git working directories
+        -- per REQ-PROJ-018 -- there is no separate Standalone mode.
+        --
+        -- Note: an Explore conversation with a worktree (created by
+        -- ManagedWorktreeOnFirstMessage but never promoted to Work via
+        -- task approval) is outside this rule's scope. That worktree's
+        -- disposition is governed by ExploreWorktreeCleanupOnTerminal
+        -- at terminal time; context-exhausted preservation across
+        -- server restart is handled by the reconcile skip rule below.
 }
 
 -- ===========================================================
@@ -823,6 +890,12 @@ rule ServerRestartWorktreeReconciliationWork {
     when: ServerRestarted(conversation)
 
     requires: conversation.mode = work
+    -- REQ-BED-031 / REQ-PROJ-015 extension: context-exhausted conversations
+    -- and conversations that have already handed ownership off to a
+    -- continuation are NOT orphans. Their worktree is intentionally
+    -- preserved; skip them entirely. See @guidance.
+    requires: conversation.parent_status != context_exhausted
+    requires: conversation.continued_in_conv_id = absent
     requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
         or not exists_on_disk(conversation.worktree_path)
@@ -837,17 +910,25 @@ rule ServerRestartWorktreeReconciliationWork {
         --
         -- Sequence per affected conversation:
         --   1. Query all Work/Branch-mode conversations from database
-        --   2. For each: check worktree_path and base_branch non-empty
-        --      (or not a __LEGACY_EMPTY__ sentinel from the NonEmptyString
-        --      shim that was introduced in schema phase A1), and worktree
-        --      directory exists on disk
-        --   3. If any check fails: apply the mode-specific revert above
-        --   4. Derive project root from worktree path
+        --   2. Skip context_exhausted rows (REQ-BED-031): the worktree
+        --      is preserved pending user action (Continue / Abandon);
+        --      missing-on-disk shouldn't happen for these but if it does,
+        --      don't compound the problem by demoting.
+        --   3. Skip rows with continued_in_conv_id set (REQ-BED-030): the
+        --      parent's worktree_path is a history reference; the
+        --      continuation owns the worktree. The continuation itself
+        --      is reconciled under its own row.
+        --   4. For remaining rows: check worktree_path and base_branch
+        --      non-empty (or not a __LEGACY_EMPTY__ sentinel from the
+        --      NonEmptyString shim that was introduced in schema phase A1),
+        --      and worktree directory exists on disk.
+        --   5. If any check fails: apply the mode-specific revert above.
+        --   6. Derive project root from worktree path
         --      ({root}/.phoenix/worktrees/{id} → {root})
-        --   5. Reset conversation cwd to project root
-        --   6. Run `git worktree prune` in project root (once per unique
+        --   7. Reset conversation cwd to project root
+        --   8. Run `git worktree prune` in project root (once per unique
         --      root, deduplicated across conversations)
-        --   7. Log summary: "{reverted} reverted out of {total} Work"
+        --   9. Log summary: "{reverted} reverted out of {total} Work"
         --
         -- The three orphan sources this recovers from:
         --   A. Legacy rows: pre-NonEmptyString data with empty or
@@ -872,6 +953,10 @@ rule ServerRestartWorktreeReconciliationBranch {
     when: ServerRestarted(conversation)
 
     requires: conversation.mode = branch
+    -- REQ-BED-031 / REQ-PROJ-015 extension: skip context-exhausted and
+    -- handed-off rows. See Work variant @guidance for rationale.
+    requires: conversation.parent_status != context_exhausted
+    requires: conversation.continued_in_conv_id = absent
     requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
         or not exists_on_disk(conversation.worktree_path)
@@ -894,6 +979,11 @@ rule ServerRestartWorktreeReconciliationExplore {
     when: ServerRestarted(conversation)
 
     requires: conversation.mode = explore
+    -- REQ-BED-031 / REQ-PROJ-015 extension: Explore with a worktree can
+    -- also reach context_exhausted (if it stalled before task approval);
+    -- its worktree is preserved pending user action.
+    requires: conversation.parent_status != context_exhausted
+    requires: conversation.continued_in_conv_id = absent
     requires: conversation.worktree_path != ""
     requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
@@ -979,6 +1069,43 @@ invariant BranchEntryBehindRemoteNonNegative {
 invariant LsRemoteCacheTtlNonNegative {
     for c in LsRemoteCaches:
         c.ttl_seconds >= 0
+}
+
+-- REQ-BED-030: Single-continuation policy. A parent conversation has at
+-- most one continuation. Once `continued_in_conv_id` is set, it points
+-- at a valid conversation and is never overwritten. Structurally, the
+-- field holds a single optional conversation id; the only rule that
+-- writes it is WorktreeTransferredOnContinuation (and the worktree-less
+-- sibling), and both require `continued_in_conv_id = absent` as a
+-- precondition. Fork attempts therefore fail at the rule's guard.
+invariant ContinuationPointerIsSingleValued {
+    for c in Conversations:
+        c.continued_in_conv_id != absent implies
+            exists Conversation{id: c.continued_in_conv_id}
+}
+
+-- REQ-BED-030: Worktree ownership is derived from the continuation
+-- pointer. The Worktree entity has exactly one `conversation` pointer;
+-- when a parent has handed off, that pointer references the continuation,
+-- not the parent. The parent's `worktree_path` field remains set for
+-- history navigation but is no longer the authoritative owner.
+-- This invariant pins the rule: for every Worktree, its conversation
+-- has `continued_in_conv_id = absent` (the ownership row is the
+-- continuation row, if the chain has any hand-offs).
+invariant WorktreeOwnershipFollowsContinuationPointer {
+    for w in Worktrees:
+        w.conversation.continued_in_conv_id = absent
+}
+
+-- REQ-BED-031: A context-exhausted parent with a continuation cannot be
+-- abandoned; the abandon UI targets the continuation in that case.
+-- Structurally enforced by the `continued_in_conv_id = absent` clause
+-- on ConfirmAbandon. This invariant names the contract for auditability:
+-- any abandon that fires on a conversation leaves that conversation with
+-- `continued_in_conv_id = absent` at the time of the transition.
+invariant AbandonRequiresNoContinuation {
+    for c in Conversations:
+        UserConfirmsAbandon(c) implies c.continued_in_conv_id = absent
 }
 
 ------------------------------------------------------------
