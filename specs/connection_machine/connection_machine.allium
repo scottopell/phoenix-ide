@@ -1,0 +1,627 @@
+-- allium: 3
+-- connection_machine.allium
+--
+-- Phoenix Client SSE Connection Lifecycle: Behavioural Specification
+--
+-- Scope: The client-side pure state machine that manages the lifecycle of
+--        a single EventSource subscription to the server's SSE stream for
+--        a mounted conversation. Formalises the 5 client states
+--        (connecting, live, reconnecting, offline, reconnected_display)
+--        plus the implicit "disconnected" ground state, the external
+--        stimuli that drive transitions, and the effects (OPEN_SSE /
+--        CLOSE_SSE / retry-timer scheduling) each transition fires.
+--
+-- Source of truth:
+--   ui/src/hooks/connectionMachine.ts — pure transition function
+--   ui/src/hooks/useConnection.ts     — effect executor, event wiring
+--
+-- Includes: State transitions keyed on CONNECT / DISCONNECT / SSE_OPEN /
+--           SSE_ERROR / BROWSER_ONLINE / BROWSER_OFFLINE /
+--           RETRY_TIMER_FIRED / RECONNECTED_DISPLAY_DONE; the RetryTimer
+--           entity ("at most one per client, only while reconnecting");
+--           the EventSource entity ("exists iff the machine is in an
+--           active state; bound to exactly one SseStream at a time");
+--           server-close → client-reconnect coupling by reference to
+--           sse_wire's SseStream.status transition.
+--
+-- Excludes: The countdown-interval ticker (UI polish, modelled as
+--           @guidance); the reconnected-display grace timer as an
+--           entity (kept as prose — less load-bearing than RetryTimer);
+--           rendering of the connection badge; React effect-firing
+--           mechanics (setTimeout(..., 0) scheduling, refs); per-event
+--           schema validation inside OPEN_SSE (see sse_wire.allium and
+--           conversation_atom.allium for the wire / reducer halves).
+--
+-- Cross-references:
+--   specs/sse_wire/sse_wire.allium — the server-side dual. `SseStream`
+--       is imported and this spec's rules react to its status
+--       transitions (open → closed is what drives SseStreamClosedByServer
+--       here, which in turn becomes SSE_ERROR in code).
+--   specs/conversation_atom/conversation_atom.allium — the reducer-side
+--       spec. On reconnect, init replays through the reducer via
+--       SseInitReconnectMerge. The "close → reconnect → open → init
+--       merge" chain is load-bearing for 02679's bug recovery path.
+--   tasks/02681 — this spec.
+--   tasks/02679 — streaming-finalizes-then-disappears. The lag-close fix
+--                 in commit 736b37d makes the "server closes → client
+--                 reconnects → init resyncs" chain the recovery path.
+--
+-- Rationale: the reconnect lifecycle is the glue that turns sse_wire's
+--            LagCloseStream into conversation_atom's SseInitReconnectMerge.
+--            If a future change to connectionMachine.ts silently stops
+--            emitting OPEN_SSE after SSE_ERROR (e.g. a new terminal
+--            "reconnecting" state that forgets to schedule retry), the
+--            lag-close fix degrades into exactly the silent-drop bug it
+--            was built to prevent. Naming the chain here makes that
+--            regression structural rather than behavioural.
+
+use "../sse_wire/sse_wire.allium" as sse_wire
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The five observable machine states. `disconnected` is the implicit
+-- ground state represented in code as `state = 'disconnected'`; it
+-- exists only between ClientUnmounted and the next ClientMounted. When
+-- a ClientConnection entity exists, its state is one of these five.
+enum ConnectionState {
+    connecting
+    | live
+    | reconnecting
+    | offline
+    | reconnected_display
+    | disconnected
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- BACKOFF_BASE_MS = 1000 in connectionMachine.ts.
+    backoff_base_ms: Integer = 1000
+    -- BACKOFF_MAX_MS = 30000. Retry delay ceiling.
+    backoff_max_ms: Integer = 30000
+    -- OFFLINE_THRESHOLD = 3. After this many consecutive SSE_ERRORs,
+    -- the machine collapses from reconnecting to offline.
+    offline_threshold: Integer = 3
+    -- RECONNECTED_DISPLAY_MS = 2000. Grace-badge dwell time.
+    reconnected_display_ms: Integer = 2000
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One ClientConnection exists per mounted ConversationPage with a
+-- non-null conversationId. The entity is created on ClientMounted and
+-- destroyed on ClientUnmounted. Its `state` is the machine's current
+-- state; `attempt` is the consecutive-failure counter used for backoff
+-- and for the reconnecting → offline demotion.
+--
+-- `current_stream` names the SseStream (sse_wire entity) this client is
+-- currently subscribed to, or null when between subscriptions. Coupling
+-- is asserted structurally in StateAndStreamCoupled.
+entity ClientConnection {
+    conversation_id: String
+    state: ConnectionState
+    attempt: Integer
+    current_stream: sse_wire/SseStream?
+    next_retry_ms: Integer?
+
+    transitions state {
+        disconnected -> connecting
+        connecting -> live
+        connecting -> reconnecting
+        connecting -> offline
+        live -> reconnecting
+        live -> offline
+        reconnecting -> connecting
+        reconnecting -> live
+        reconnecting -> reconnected_display
+        reconnecting -> offline
+        offline -> connecting
+        offline -> reconnecting
+        offline -> live
+        reconnected_display -> live
+        reconnected_display -> reconnecting
+        reconnected_display -> offline
+        connecting -> disconnected
+        live -> disconnected
+        reconnecting -> disconnected
+        offline -> disconnected
+        reconnected_display -> disconnected
+        terminal: disconnected
+    }
+}
+
+-- A pending backoff retry timer. Created on entry to the "schedule
+-- retry" path (SSE_ERROR while browser online), destroyed on firing
+-- (RetryTimerFired), cancelled on any CANCEL_TIMERS effect.
+--
+-- Modelling this as an entity rather than @guidance makes
+-- AtMostOneRetryTimerPerClient structurally enforceable: the code
+-- clears retryTimeoutRef before scheduling a new one (useConnection.ts
+-- SCHEDULE_RETRY effect). A future refactor that drops the clear-before-
+-- schedule pattern would violate the invariant.
+entity RetryTimer {
+    client: ClientConnection
+    delay_ms: Integer
+}
+
+-- The live EventSource object bound to an SseStream. Created on
+-- OPEN_SSE (useConnection.ts: new EventSource(url)), destroyed on
+-- CLOSE_SSE (es.close()).
+--
+-- Coupling: EventSource exists iff the machine is in connecting, live,
+-- or reconnected_display. Reconnecting and offline states have no
+-- EventSource (the previous one was closed, the next is not yet open).
+entity EventSource {
+    client: ClientConnection
+    stream: sse_wire/SseStream
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The React hook useConnection. Each mounted ConversationPage has one
+-- instance, identified by its owning ClientConnection.
+actor ConnectionHook {
+    identified_by: ClientConnection
+}
+
+------------------------------------------------------------
+-- Rules — mount / unmount lifecycle
+------------------------------------------------------------
+
+-- ConversationPage mounts with a non-null conversationId. The CONNECT
+-- input is dispatched; if the machine was disconnected (always true on
+-- first mount), it enters `connecting` and the OPEN_SSE effect fires.
+-- The EventSource entity is created bound to a fresh SseStream that
+-- sse_wire's StreamOpened will materialise on the server.
+rule ClientMounted {
+    when: ClientMounted(conversation_id)
+
+    ensures: ClientConnection.created(
+        conversation_id: conversation_id,
+        state: connecting,
+        attempt: 0,
+        current_stream: null,
+        next_retry_ms: null
+    )
+
+    @guidance
+        -- useConnection.ts:
+        --   useEffect(() => {
+        --     if (conversationId) dispatchMachineRef.current({ type: 'CONNECT' });
+        --     else dispatchMachineRef.current({ type: 'DISCONNECT' });
+        --     return () => dispatchMachineRef.current({ type: 'DISCONNECT' });
+        --   }, [conversationId]);
+        --
+        -- The CONNECT transition (connectionMachine.ts) emits
+        -- effects=[OPEN_SSE]. The OPEN_SSE effect handler calls
+        --   new EventSource(`/api/conversations/${convId}/stream`)
+        -- which triggers sse_wire's StreamOpened on the server and
+        -- sets current_stream + creates the EventSource entity once
+        -- the server-side SseStream is observable.
+}
+
+-- ConversationPage unmounts (or conversationId becomes null).
+-- Everything shuts down: EventSource closes, any pending RetryTimer
+-- is cancelled, the ClientConnection entity is destroyed.
+rule ClientUnmounted {
+    when: ClientUnmounted(client)
+
+    ensures: not exists ClientConnection{conversation_id: client.conversation_id}
+    ensures: not exists EventSource{client: client}
+    ensures: not exists RetryTimer{client: client}
+
+    @guidance
+        -- useConnection.ts cleanup runs DISCONNECT, whose transition
+        -- emits effects=[CLOSE_SSE, CANCEL_TIMERS]. CLOSE_SSE destroys
+        -- the EventSource entity; CANCEL_TIMERS destroys any live
+        -- RetryTimer and clears the reconnected-display grace timer
+        -- (which is not modelled as an entity — see file header).
+}
+
+------------------------------------------------------------
+-- Rules — EventSource open / server close coupling
+------------------------------------------------------------
+
+-- The EventSource successfully opened: the server's StreamOpened fired,
+-- the init event was delivered, and the client's SSE_OPEN handler ran.
+-- Machine enters `live` from connecting; enters `reconnected_display`
+-- from reconnecting or offline (the user-visible "Reconnected" badge).
+--
+-- On any successful open, attempt resets to 0 and next_retry_ms clears.
+rule SseStreamOpenedByServer {
+    when: SseStreamOpenedByServer(client, stream)
+
+    requires: client.state in { connecting, reconnecting, offline }
+    requires: stream.status = open
+    requires: stream.init_sent
+
+    ensures: client.current_stream = stream
+    ensures: client.attempt = 0
+    ensures: client.next_retry_ms = null
+    ensures: EventSource.created(client: client, stream: stream)
+
+    @guidance
+        -- Wire-up: useConnection.ts's `es.addEventListener('init', ...)`
+        -- handler dispatches SSE_OPEN only after the init event arrives
+        -- AND passes schema validation. The init delivery is modelled
+        -- here as a precondition on the imported SseStream
+        -- (init_sent = true).
+        --
+        -- State transition rule (from connectionMachine.ts SSE_OPEN):
+        --   - if current_state in {reconnecting, offline}:
+        --       new_state = reconnected_display, schedule grace timer
+        --   - else (connecting):
+        --       new_state = live
+        -- The state mutation is not in `ensures:` because the
+        -- transition's dependency on prior state means the same
+        -- trigger has two possible post-states — split into the two
+        -- sibling rules below (SseStreamOpenedFromConnecting,
+        -- SseStreamOpenedFromReconnect) if the parser insists.
+}
+
+rule SseStreamOpenedFromConnecting {
+    when: SseStreamOpenedByServer(client, stream)
+
+    requires: client.state = connecting
+    requires: stream.status = open
+    requires: stream.init_sent
+
+    ensures: client.state = live
+}
+
+rule SseStreamOpenedFromReconnect {
+    when: SseStreamOpenedByServer(client, stream)
+
+    requires: client.state in { reconnecting, offline }
+    requires: stream.status = open
+    requires: stream.init_sent
+
+    ensures: client.state = reconnected_display
+
+    @guidance
+        -- Schedules the SCHEDULE_RECONNECTED_DISPLAY effect, which
+        -- sets a setTimeout(RECONNECTED_DISPLAY_MS) that dispatches
+        -- RECONNECTED_DISPLAY_DONE when it fires. See
+        -- ReconnectedDisplayDone below.
+}
+
+-- The server closed the stream (typically via sse_wire's LagCloseStream,
+-- but any server-side close — broadcast-channel drop, process exit,
+-- HTTP timeout — manifests identically on the client). EventSource's
+-- onerror fires, useConnection.ts dispatches SSE_ERROR, the machine
+-- schedules a retry (if online) or falls to offline (if not).
+rule SseStreamClosedByServer {
+    when: SseStreamClosedByServer(client, stream)
+
+    requires: client.current_stream = stream
+    requires: stream.status = closed
+
+    ensures: not exists EventSource{client: client}
+    ensures: client.current_stream = null
+
+    @guidance
+        -- Implementation: when sse_wire emits the stream-close
+        -- (LagCloseStream or any other cause), the browser's
+        -- EventSource fires its 'error' event with no .data payload.
+        -- useConnection.ts distinguishes backend-error events (have
+        -- .data, parsed via SseErrorDataSchema) from transport errors
+        -- (no .data); only transport errors become SSE_ERROR for the
+        -- connection machine. Backend errors flow to the conversation
+        -- atom via SseErrorWireOriginated (see conversation_atom.allium).
+        --
+        -- The state transition and retry scheduling are modelled in
+        -- SseErrorScheduleRetry and SseErrorGoOffline below; this
+        -- rule captures only the structural tear-down
+        -- (EventSource destroyed, current_stream cleared).
+}
+
+-- SSE_ERROR while the browser reports online: schedule a backoff retry.
+-- If this pushes attempt past OFFLINE_THRESHOLD, the user-visible state
+-- is `offline` even though the retry is still scheduled. Otherwise,
+-- state is `reconnecting`.
+rule SseErrorScheduleRetry {
+    when: SseStreamClosedByServer(client, stream)
+
+    requires: client.current_stream = stream
+    requires: browser_online
+
+    ensures: client.attempt = client.attempt + 1
+    ensures: RetryTimer.created(
+        client: client,
+        delay_ms: backoff_delay(client.attempt + 1)
+    )
+    ensures: client.next_retry_ms = backoff_delay(client.attempt + 1)
+
+    @guidance
+        -- Post-state (from connectionMachine.ts SSE_ERROR):
+        --   nextAttempt = current.attempt + 1
+        --   delayMs     = min(BASE_MS * 2^(nextAttempt - 1), MAX_MS)
+        --   nextState   = nextAttempt >= OFFLINE_THRESHOLD
+        --                    ? 'offline' : 'reconnecting'
+        --
+        -- Effects: [CLOSE_SSE, SCHEDULE_RETRY{delayMs}]. The
+        -- SCHEDULE_RETRY handler clears retryTimeoutRef before setting
+        -- the new setTimeout; that pre-clear is what makes
+        -- AtMostOneRetryTimerPerClient hold.
+        --
+        -- A separate pair of rules would split reconnecting vs
+        -- offline post-states, but the test (attempt >= threshold)
+        -- doesn't need a Boolean `browser_online`-style guard so
+        -- we leave it in prose.
+}
+
+-- SSE_ERROR while the browser reports offline: fall straight to the
+-- offline state without scheduling a retry. The BROWSER_ONLINE event
+-- will re-trigger OPEN_SSE when connectivity returns.
+rule SseErrorGoOfflineNoRetry {
+    when: SseStreamClosedByServer(client, stream)
+
+    requires: client.current_stream = stream
+    requires: not browser_online
+
+    ensures: client.state = offline
+    ensures: client.attempt = client.attempt + 1
+    ensures: client.next_retry_ms = null
+    ensures: not exists RetryTimer{client: client}
+}
+
+------------------------------------------------------------
+-- Rules — retry timer
+------------------------------------------------------------
+
+-- Backoff timer elapsed: issue a fresh OPEN_SSE. Works from either
+-- reconnecting or offline (the latter because a scheduled timer can
+-- outlive a BROWSER_OFFLINE transition).
+rule RetryTimerFired {
+    when: RetryTimerFired(client, timer)
+
+    requires: client.state in { reconnecting, offline }
+    requires: timer.client = client
+
+    ensures: not exists RetryTimer{client: client}
+    ensures: client.next_retry_ms = null
+
+    @guidance
+        -- connectionMachine.ts RETRY_TIMER_FIRED emits effects=[OPEN_SSE]
+        -- and leaves state unchanged (still reconnecting or offline).
+        -- The subsequent SSE_OPEN or SSE_ERROR from the new EventSource
+        -- will drive the next transition. State doesn't regress to
+        -- `connecting` in code — the user-visible "retrying" stays put
+        -- until the outcome is known.
+}
+
+------------------------------------------------------------
+-- Rules — browser connectivity events
+------------------------------------------------------------
+
+-- window.online fires OR document.visibilitychange with navigator.onLine
+-- true (see useConnection.ts — both paths dispatch BROWSER_ONLINE).
+-- If the machine was in offline or reconnecting, cancel any pending
+-- retry and immediately OPEN_SSE.
+rule BrowserReportedOnline {
+    when: BrowserOnline(client)
+
+    requires: client.state in { offline, reconnecting }
+
+    ensures: client.state = reconnecting
+    ensures: client.next_retry_ms = null
+    ensures: not exists RetryTimer{client: client}
+
+    @guidance
+        -- Effects: [CANCEL_TIMERS, OPEN_SSE]. The retryNow() helper
+        -- (exposed by useConnection for the "Retry now" button) also
+        -- dispatches BROWSER_ONLINE — the user-triggered retry and
+        -- the browser's connectivity-regained path converge here.
+        --
+        -- In states {connecting, live, disconnected, reconnected_display},
+        -- BROWSER_ONLINE is a no-op (see the connectionMachine.ts
+        -- guard `if (current.state === 'offline' || === 'reconnecting')`).
+}
+
+-- window.offline fires. If the machine was doing anything active, tear
+-- down the EventSource and any scheduled retry, collapse to offline.
+-- `attempt` is preserved (not reset) so a subsequent reconnect that
+-- fails continues the backoff progression rather than restarting at 0.
+rule BrowserReportedOffline {
+    when: BrowserOffline(client)
+
+    requires: client.state != disconnected
+
+    ensures: client.state = offline
+    ensures: client.current_stream = null
+    ensures: client.next_retry_ms = null
+    ensures: not exists EventSource{client: client}
+    ensures: not exists RetryTimer{client: client}
+
+    @guidance
+        -- Effects: [CLOSE_SSE, CANCEL_TIMERS]. Note `attempt` is not
+        -- modified (unlike SSE_ERROR, which increments it): the cause
+        -- here is local network, not a failed server handshake, so
+        -- counting it toward the threshold would distort the signal.
+}
+
+-- Tab returned from background (visibilitychange with
+-- document.visibilityState === 'visible' AND navigator.onLine). Treated
+-- as a BROWSER_ONLINE nudge — if the machine is stuck in offline or
+-- reconnecting while the tab was hidden, wake it up.
+rule TabVisibilityRegained {
+    when: TabVisible(client)
+
+    requires: client.state in { offline, reconnecting }
+
+    ensures: client.state = reconnecting
+    ensures: client.next_retry_ms = null
+    ensures: not exists RetryTimer{client: client}
+
+    @guidance
+        -- useConnection.ts:
+        --   document.addEventListener('visibilitychange', () => {
+        --     if (document.visibilityState === 'visible' && navigator.onLine) {
+        --       dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
+        --     }
+        --   });
+        --
+        -- The dispatch routes through the same handler as
+        -- BrowserReportedOnline; semantically distinct rules because
+        -- the triggering external event is different (visibility vs
+        -- connectivity).
+}
+
+------------------------------------------------------------
+-- Rules — reconnected-display grace period
+------------------------------------------------------------
+
+-- The RECONNECTED_DISPLAY_MS setTimeout fires. Machine transitions
+-- from reconnected_display to live; the "Reconnected" badge fades.
+-- If the state changed between entering reconnected_display and the
+-- timer firing (e.g. SSE_ERROR re-occurred mid-grace), this rule is
+-- a no-op (guarded by the state precondition).
+rule ReconnectedDisplayDone {
+    when: ReconnectedDisplayDone(client)
+
+    requires: client.state = reconnected_display
+
+    ensures: client.state = live
+
+    @guidance
+        -- connectionMachine.ts RECONNECTED_DISPLAY_DONE case: transitions
+        -- from reconnected → connected only if state is still
+        -- reconnected; otherwise ignored. The grace timer is not modelled
+        -- as an entity because it does not carry invariants the spec
+        -- needs to protect (at most one, only while in state, etc. — the
+        -- code does re-arm on every SCHEDULE_RECONNECTED_DISPLAY).
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The `live` state implies the client is subscribed to an open,
+-- initialised SseStream. This is the load-bearing coupling between
+-- this spec and sse_wire: the client's notion of "live" is defined by
+-- the server-side SseStream being open and having delivered init.
+invariant StateAndStreamCoupled {
+    for c in ClientConnections:
+        c.state = live implies c.current_stream != null
+}
+
+-- In the `live` and `reconnected_display` states, the current_stream
+-- must be open. Client states that imply an active subscription cannot
+-- coexist with a closed server stream — such a combination would mean
+-- SseStreamClosedByServer didn't fire or its rule didn't execute.
+invariant LiveImpliesOpenStream {
+    for c in ClientConnections:
+        c.current_stream != null
+            implies c.current_stream.status = open
+}
+
+-- A RetryTimer only exists while its client is reconnecting or offline.
+-- In any other state, the timer should have been cancelled
+-- (CANCEL_TIMERS effect on SSE_OPEN / DISCONNECT / BROWSER_ONLINE /
+-- BROWSER_OFFLINE / RECONNECTED_DISPLAY_DONE paths).
+invariant RetryTimerOnlyWhileBackingOff {
+    for t in RetryTimers:
+        t.client.state in { reconnecting, offline }
+}
+
+-- At most one RetryTimer per ClientConnection. Enforced in code by the
+-- SCHEDULE_RETRY effect clearing retryTimeoutRef before setting the new
+-- setTimeout. A future refactor that drops the pre-clear would leave
+-- orphaned timers firing — this invariant would catch the regression.
+invariant AtMostOneRetryTimerPerClient {
+    for c in ClientConnections:
+        for t1 in RetryTimers:
+            for t2 in RetryTimers:
+                (t1.client = c and t2.client = c) implies t1 = t2
+}
+
+-- EventSource entity exists iff the machine is in an active state —
+-- connecting, live, or reconnected_display. Reconnecting and offline
+-- states have closed the EventSource (CLOSE_SSE effect) and not yet
+-- opened the next one; disconnected states never have an EventSource.
+invariant EventSourceMatchesActiveStates {
+    for c in ClientConnections:
+        (exists EventSource{client: c})
+            implies c.state in { connecting, live, reconnected_display }
+}
+
+-- An EventSource's `stream` field points at the same SseStream as its
+-- client's `current_stream`. The two fields exist because
+-- current_stream can be null (between subscriptions) while EventSource
+-- cannot have a null stream; this invariant keeps them consistent
+-- whenever both exist.
+invariant EventSourceStreamMatchesClient {
+    for es in EventSources:
+        es.client.current_stream = es.stream
+}
+
+-- The offline state clears any live subscription. When the browser
+-- reports offline, the EventSource is closed and current_stream is
+-- nulled. Preserving either across a BROWSER_OFFLINE transition
+-- would leave the machine in an internally inconsistent state.
+invariant OfflineClearsSession {
+    for c in ClientConnections:
+        c.state = offline
+            implies (c.current_stream = null
+                     and not exists EventSource{client: c})
+}
+
+-- Attempt counter is non-negative.
+invariant AttemptNonNegative {
+    for c in ClientConnections:
+        c.attempt >= 0
+}
+
+-- Retry delay ceiling. The backoff function is
+--   min(BASE_MS * 2^(attempt-1), MAX_MS)
+-- so next_retry_ms, when non-null, is always at most BACKOFF_MAX_MS.
+invariant RetryDelayBounded {
+    for c in ClientConnections:
+        c.next_retry_ms != null
+            implies c.next_retry_ms <= config.backoff_max_ms
+}
+
+-- Retry timer's own delay is bounded by the same ceiling. Coupled with
+-- RetryDelayBounded: both the UI-countdown field and the setTimeout
+-- delay derive from the same backoff_delay() formula.
+invariant RetryTimerDelayBounded {
+    for t in RetryTimers:
+        t.delay_ms <= config.backoff_max_ms
+}
+
+-- The `next_retry_ms` UI-countdown field is only populated while the
+-- machine has a pending RetryTimer. In live / connecting / reconnected_display
+-- / disconnected states it must be null.
+invariant NextRetryMsOnlyWhilePending {
+    for c in ClientConnections:
+        c.next_retry_ms != null
+            implies c.state in { reconnecting, offline }
+}
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+-- Kept as prose rather than `open question` blocks because the parser
+-- does not accept them at the top level. Both are design-intent
+-- clarifications rather than blocking ambiguities.
+--
+-- Q1. The reconnected_display grace timer is modelled as prose
+--     (@guidance) rather than as an entity, because the code re-arms
+--     it unconditionally on every SCHEDULE_RECONNECTED_DISPLAY. If a
+--     future change adds a real invariant ("at most one grace timer
+--     per client" or "grace timer only while state = reconnected_display"),
+--     promote it to an entity mirroring RetryTimer.
+--
+-- Q2. BROWSER_OFFLINE preserves client.attempt rather than resetting to
+--     0. The rationale is that a local-network blip followed by a
+--     server-side failure should continue the backoff progression, not
+--     restart it. If observed behaviour drifts (user reports "reconnect
+--     storm after tab wake"), revisit by making the transition reset.
