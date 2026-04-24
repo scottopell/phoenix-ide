@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Two small, targeted changes ensure agent commits are attributable and non-blocking. First, git signing is disabled in the bash tool's process environment for all writable conversation contexts (Work, Work sub-agents, Standalone) so that 1Password, GPG, and other signing tools do not hang agent commits. Second, agents are instructed via system prompt to append a `Co-authored-by: phoenix-ide <phoenix-ide@noreply.local>` trailer to every commit message, making agent authorship visible in `git log` and on any git host. No SSH CA, certificates, push authentication, or audit infrastructure is involved. Agent commits live on the ephemeral task branch and are squashed on completion; the squash commit on main can be signed by the user through their normal workflow.
+Two small, targeted changes ensure agent commits are attributable and non-blocking. First, git signing is disabled in the bash tool's process environment for all writable conversation contexts (Work, Work sub-agents, Direct) so that 1Password, GPG, and other signing tools do not hang agent commits. Second, agents are instructed via system prompt to append a `Co-authored-by: phoenix-ide <phoenix-ide@noreply.local>` trailer to every commit message, making agent authorship visible in `git log` and on any git host. No SSH CA, certificates, push authentication, or audit infrastructure is involved. Agent commits live on the ephemeral task branch and are squashed on completion; the squash commit on main can be signed by the user through their normal workflow.
 
 ## Status Summary
 

@@ -465,14 +465,14 @@ THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
 ---
 
-### REQ-BED-027: Explore, Work, and Standalone Conversation Modes
+### REQ-BED-027: Explore, Work, and Direct Conversation Modes
 
 WHEN a conversation is created for a project (git-backed directory)
 THE SYSTEM SHALL initialize the conversation in Explore mode
 AND store the mode as a field on the conversation record (not inside state machine state)
 
 WHEN a conversation is created for a non-git directory
-THE SYSTEM SHALL initialize the conversation in Standalone mode
+THE SYSTEM SHALL initialize the conversation in Direct mode
 
 WHILE a conversation is in Explore mode
 THE SYSTEM SHALL configure the tool registry with read-only settings
@@ -482,7 +482,7 @@ WHILE a conversation is in Work mode
 THE SYSTEM SHALL configure the tool registry with write access scoped to the worktree path
 AND record the worktree path and associated task ID in the mode field
 
-WHILE a conversation is in Standalone mode
+WHILE a conversation is in Direct mode
 THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
 AND SHALL NOT provide `propose_plan` tool
 AND the mode SHALL NOT change for the lifetime of the conversation
@@ -494,11 +494,12 @@ THE SYSTEM SHALL persist the updated mode before resuming execution
 transitions and survives server restarts. Keeping it as a separate field (not embedded
 in every ConvState variant) prevents combinatorial explosion of state variants and
 makes crash recovery straightforward: the executor reads mode and state independently
-and configures the tool registry accordingly. Standalone mode exists for directories
-without git — it provides full tool access but without the safety features (worktrees,
-task tracking, branch isolation) that require a git repository.
+and configures the tool registry accordingly. Direct mode covers both non-git
+directories and git-backed conversations where the user wants full tool access
+without the managed (Explore/Work) ceremony — see REQ-PROJ-018 for the historical
+`Standalone` → `Direct` consolidation.
 
-**Dependencies:** REQ-PROJ-002, REQ-PROJ-007, REQ-PROJ-016
+**Dependencies:** REQ-PROJ-002, REQ-PROJ-007, REQ-PROJ-018
 
 ---
 

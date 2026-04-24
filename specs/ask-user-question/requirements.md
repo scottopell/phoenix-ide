@@ -121,7 +121,7 @@ confusing UI behavior.
 ### REQ-AUQ-006: Parent Conversation Availability
 
 THE SYSTEM SHALL register the question tool only in parent conversation tool
-registries (Explore, Standalone, Work modes)
+registries (Explore, Direct, Work modes)
 
 THE SYSTEM SHALL NOT register the question tool in sub-agent tool registries
 

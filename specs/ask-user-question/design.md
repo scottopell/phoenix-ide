@@ -175,7 +175,7 @@ impl Tool for AskUserQuestionTool {
 }
 ```
 
-The tool is registered in all non-sub-agent registries (Explore, Standalone,
+The tool is registered in all non-sub-agent registries (Explore, Direct,
 Work). It is NOT registered in `ToolRegistry::for_subagent()`.
 
 The tool uses `defer_loading: true` via the existing MCP tool search mechanism.
