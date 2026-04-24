@@ -570,3 +570,73 @@ Returning to Explore mode would create confusion about what the conversation's
 context represents (the old worktree is gone, the pinned commit is arbitrary).
 Terminal state is clean and explicit. The user creates a new Explore conversation
 to continue working on the project.
+
+---
+
+### REQ-BED-030: Context Continuation Inherits Parent Environment
+
+WHEN user initiates continuation from a context-exhausted conversation
+THE SYSTEM SHALL create a new conversation that inherits:
+  - the parent's conversation mode (Work → Work, Branch → Branch, Explore → Explore, Direct → Direct)
+  - the parent's working directory
+  - the parent's worktree, if any (Work and Branch modes), via ownership transfer rather than destroy-and-recreate
+  - any uncommitted changes in that worktree
+  - for Work mode, the parent's task_id and associated task file
+
+WHEN the parent has a worktree
+THE SYSTEM SHALL transfer worktree ownership atomically in a single database transaction:
+  - the parent retains its `worktree_path` field as a read-only reference for history navigation
+  - the continuation's `worktree_path` is set to the same value
+  - the worktree registry's owner pointer moves from parent to continuation
+  - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
+
+WHEN a parent conversation already has a continuation
+THE SYSTEM SHALL present the Continue action as a navigation link to the existing continuation
+AND NOT permit creation of a second continuation from the same parent
+
+**Rationale:** When a user hits context exhaustion mid-task, the most common
+next action is to keep working on the same task with a fresh context window.
+Preserving the full environment — mode, branch, worktree, uncommitted changes —
+matches that intent directly and eliminates the need for `git stash`/restore
+ceremony or a separate auto-stash feature. Transferring ownership rather than
+destroying and recreating is the only shape that preserves uncommitted work
+structurally, without a separate auto-stash mechanism. Single-continuation
+policy keeps worktree ownership unambiguous: at any moment, exactly one
+conversation in the parent→continuation chain owns the worktree.
+
+**Dependencies:** REQ-BED-021, REQ-PROJ-025, REQ-PROJ-026, REQ-PROJ-028
+
+---
+
+### REQ-BED-031: Exhausted Parent Post-Handoff Behavior
+
+WHILE a conversation is in context-exhausted state
+THE SYSTEM SHALL preserve the conversation record for history navigation
+AND preserve its worktree, if any, across server restarts
+AND preserve its branch in git
+
+WHEN a context-exhausted conversation has no continuation
+THE SYSTEM SHALL permit user-initiated abandon
+AND on abandon, apply the same worktree/branch disposition as abandon from a non-terminal state
+  (worktree removed; branch removed for Work mode, preserved for Branch mode, per REQ-PROJ-026)
+
+WHEN a context-exhausted conversation has an existing continuation
+THE SYSTEM SHALL NOT permit abandon on the parent
+(the continuation is the live conversation — any abandon decision is made there)
+
+WHEN the server restarts and encounters a context-exhausted conversation with a worktree
+THE SYSTEM SHALL preserve the worktree unchanged
+AND NOT demote the conversation's mode
+AND NOT remove it from the worktree registry
+
+**Rationale:** Context exhaustion is a pause, not an end. The user may
+return hours or days later to continue the work, and a surprise cleanup
+on server restart would be data loss. Abandon must stay available on the
+parent for the case where the user decides the work isn't worth
+continuing — without it, the only cleanup path is to create an unwanted
+continuation and then abandon that, which is clunky and produces a
+stranded continuation record. When a continuation exists, the live
+conversation is the continuation; operating on the parent would be
+ambiguous about which conversation the action affects.
+
+**Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, REQ-PROJ-026

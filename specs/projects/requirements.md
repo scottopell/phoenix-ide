@@ -368,9 +368,17 @@ THE SYSTEM SHALL reconcile the registry against worktrees on disk
 AND clean up orphaned registry entries
 AND report worktrees that exist on disk but have no registry entry
 
+WHEN a conversation is in context-exhausted state (REQ-BED-021)
+OR a conversation has `continued_in_conv_id` set (REQ-BED-030)
+THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
+AND SHALL NOT demote the conversation's mode
+  (the worktree is preserved pending explicit user action per REQ-BED-031)
+
 **Rationale:** The registry enables the UI to show all active worktrees and detect
 orphans. Reconciliation on startup handles worktrees deleted externally or
-conversations that ended without cleanup.
+conversations that ended without cleanup. Context-exhausted conversations and
+their continuations are an explicit exception: their worktrees are held
+intentionally and must survive restart unchanged.
 
 ---
 
