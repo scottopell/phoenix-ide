@@ -1352,9 +1352,13 @@ on-disk-missing `worktree_path`:
   this spec and is left as an open concern.
 - `ConfirmAbandon` / `MarkAsMerged` from a continuation's tail destroy
   the worktree per REQ-PROJ-026.
-- Sub-agents of the parent are unaffected. REQ-BED-024 specifies that
-  sub-agent context exhaustion fails immediately with no continuation;
-  sub-agents never reach a state where they would need worktree transfer.
+- Sub-agents of the parent are unaffected. Sub-agents are bounded
+  primarily by the turn-limit / grace-turn flow (REQ-BED-026), which
+  typically fires well before context exhaustion could. In the edge
+  case that a sub-agent does reach context exhaustion, REQ-BED-024
+  requires it to fail immediately with no continuation flow. Either
+  way, sub-agents never reach a state where they would need worktree
+  transfer — continuation is a parent-only concept.
 - Task 08678 (auto-stash on cleanup) is obviated: uncommitted changes
   ride the worktree to the continuation because no cleanup happens.
 
