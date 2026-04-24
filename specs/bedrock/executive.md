@@ -41,7 +41,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-027:** Explore, Work, and Direct Conversation Modes | ❌ Not Started | `ConvMode` as conversation-level field; replaces REQ-BED-014. `Direct` absorbed the former `Standalone` mode (see REQ-PROJ-018) |
 | **REQ-BED-028:** Task Approval State | ❌ Not Started | `AwaitingTaskApproval` state; replaces REQ-BED-015 |
 | **REQ-BED-029:** Conversation Terminal State on Task Resolution | ❌ Not Started | Work conversations go to Terminal on complete or abandon; replaces REQ-BED-016 |
-| **REQ-BED-030:** Context Continuation Inherits Parent Environment | ❌ Not Started | Worktree ownership transfer (not destroy+recreate); `continued_in_conv_id` linkage; mode mapping W→W/B→B/E→E/D→D. Root-cause fix for task 24696; obsoletes task 08678 |
-| **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ❌ Not Started | Worktree preserved across restart; abandon conditional on no-continuation; `reconcile_worktrees` skips context-exhausted convs |
+| **REQ-BED-030:** Context Continuation Inherits Parent Environment | ✅ Complete | Task 24696. Worktree ownership transfers via `continued_in_conv_id` pointer; mode mapping W→W/B→B/E→E/D→D; idempotent `POST /api/conversations/:id/continue`. Obsoletes task 08678 |
+| **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ✅ Complete | Task 24696. Auto-cleanup removed; `reconcile_worktrees` skips context-exhausted + continued rows; abandon/mark-as-merged gated on `continued_in_conv_id = NULL`; typed `continuation_id` on 409 response |
 
-**Progress:** 21 of 31 complete (3 deprecated, not counted)
+**Progress:** 23 of 31 complete (3 deprecated, not counted)
