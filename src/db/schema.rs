@@ -376,6 +376,13 @@ pub struct Conversation {
     /// Seed label for decorative UI display (REQ-SEED-004).
     #[serde(default)]
     pub seed_label: Option<String>,
+    /// Continuation pointer — if this conversation has been continued into a
+    /// new conversation (REQ-BED-030), this is the continuation's id. Nullable
+    /// for all conversations that have not been continued. When set, this
+    /// conversation no longer owns its worktree; the continuation does.
+    /// `#[serde(default)]` handles old DB rows that predate this column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_in_conv_id: Option<String>,
 }
 
 /// Derive a human-readable title from a kebab-case slug.
@@ -1060,5 +1067,86 @@ mod error_kind_tests {
 
         let parsed: ErrorKind = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ErrorKind::ServerError);
+    }
+}
+
+#[cfg(test)]
+mod conversation_serde_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn fixture_ts() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap()
+    }
+
+    fn fixture(continued_in_conv_id: Option<String>) -> Conversation {
+        Conversation {
+            id: "conv-1".to_string(),
+            slug: Some("test-conv".to_string()),
+            title: Some("Test Conv".to_string()),
+            cwd: "/tmp/work".to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: fixture_ts(),
+            created_at: fixture_ts(),
+            updated_at: fixture_ts(),
+            archived: false,
+            model: None,
+            project_id: None,
+            conv_mode: ConvMode::Explore,
+            desired_base_branch: None,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id,
+        }
+    }
+
+    /// REQ-BED-030 Phase 1: Conversation round-trips through serde with
+    /// `continued_in_conv_id` absent (the default for pre-continuation rows).
+    /// The field uses `skip_serializing_if = "Option::is_none"`, so the wire
+    /// form omits the key entirely when None.
+    #[test]
+    fn continued_in_conv_id_none_round_trips() {
+        let original = fixture(None);
+        let json = serde_json::to_value(&original).unwrap();
+        assert!(
+            json.get("continued_in_conv_id").is_none(),
+            "None should be omitted from serialization, got: {json}"
+        );
+        let parsed: Conversation = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.continued_in_conv_id, None);
+        assert_eq!(parsed.id, original.id);
+    }
+
+    /// REQ-BED-030 Phase 1: Conversation round-trips with
+    /// `continued_in_conv_id = Some(...)` — the wire form includes the key
+    /// and deserialization preserves the pointer.
+    #[test]
+    fn continued_in_conv_id_some_round_trips() {
+        let original = fixture(Some("other-conv-id".to_string()));
+        let json = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            json.get("continued_in_conv_id"),
+            Some(&serde_json::Value::String("other-conv-id".to_string())),
+        );
+        let parsed: Conversation = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            parsed.continued_in_conv_id,
+            Some("other-conv-id".to_string())
+        );
+    }
+
+    /// REQ-BED-030 Phase 1: legacy DB rows that predate the column deserialize
+    /// cleanly — `#[serde(default)]` fills `None` when the key is absent.
+    #[test]
+    fn continued_in_conv_id_defaults_to_none_for_legacy_rows() {
+        let mut json = serde_json::to_value(fixture(None)).unwrap();
+        if let serde_json::Value::Object(ref mut map) = json {
+            map.remove("continued_in_conv_id");
+        }
+        let parsed: Conversation = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.continued_in_conv_id, None);
     }
 }

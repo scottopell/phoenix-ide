@@ -241,6 +241,7 @@ mod tests {
             message_count: 3,
             seed_parent_id: None,
             seed_label: None,
+            continued_in_conv_id: None,
         }
     }
 
