@@ -20,7 +20,7 @@ Agent commits on the task branch are ephemeral — on task completion they are s
 
 ### REQ-AID-001: Git Signing Bypass
 
-WHEN the bash tool executes commands in a Work conversation, Work sub-agent, or Standalone conversation
+WHEN the bash tool executes commands in a Work conversation, Work sub-agent, or Direct conversation
 THE SYSTEM SHALL inject git configuration environment variables that disable commit signing and tag signing
 SO THAT `git commit` operations complete without prompting for signing credentials
 
@@ -33,7 +33,7 @@ THE SYSTEM SHALL NOT inject signing bypass variables
 
 ### REQ-AID-002: Co-Authored-By Trailer
 
-WHEN an agent makes a git commit in a Work conversation, Work sub-agent, or Standalone conversation
+WHEN an agent makes a git commit in a Work conversation, Work sub-agent, or Direct conversation
 THE SYSTEM SHALL instruct the agent via system prompt to append a `Co-authored-by` trailer to every commit message
 AND the trailer SHALL identify Phoenix IDE as the co-author
 

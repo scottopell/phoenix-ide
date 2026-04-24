@@ -38,7 +38,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
 | **REQ-BED-025:** Token-by-Token LLM Output | ✅ Complete | Task 582. Fire-and-forget `StreamToken` effects via SSE |
 | **REQ-BED-026:** Sub-Agent Timeout Enforcement | ✅ Complete | Task 578. Mandatory `timeout: Duration`, deadline in executor `select!` |
-| **REQ-BED-027:** Explore and Work Conversation Modes | ❌ Not Started | `ConvMode` as conversation-level field; replaces REQ-BED-014 |
+| **REQ-BED-027:** Explore, Work, and Direct Conversation Modes | ❌ Not Started | `ConvMode` as conversation-level field; replaces REQ-BED-014. `Direct` absorbed the former `Standalone` mode (see REQ-PROJ-018) |
 | **REQ-BED-028:** Task Approval State | ❌ Not Started | `AwaitingTaskApproval` state; replaces REQ-BED-015 |
 | **REQ-BED-029:** Conversation Terminal State on Task Resolution | ❌ Not Started | Work conversations go to Terminal on complete or abandon; replaces REQ-BED-016 |
 | **REQ-BED-030:** Context Continuation Inherits Parent Environment | ❌ Not Started | Worktree ownership transfer (not destroy+recreate); `continued_in_conv_id` linkage; mode mapping W→W/B→B/E→E/D→D. Root-cause fix for task 24696; obsoletes task 08678 |

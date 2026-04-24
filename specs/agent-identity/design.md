@@ -28,7 +28,7 @@ GIT_CONFIG_VALUE_1=false
 |---------|----------------|
 | Work conversation (parent) | Yes |
 | Work sub-agent | Yes |
-| Standalone conversation | Yes |
+| Direct conversation | Yes |
 | Explore conversation | No |
 | Explore sub-agent | No |
 
@@ -53,7 +53,7 @@ The agent is instructed via system prompt to append the trailer to every commit 
 
 ### System Prompt Instruction
 
-Included in the system prompt for Work conversations, Work sub-agents, and Standalone conversations:
+Included in the system prompt for Work conversations, Work sub-agents, and Direct conversations:
 
 ```
 When making git commits, always append the following trailer to the commit message
@@ -84,7 +84,7 @@ Co-authored-by: phoenix-ide <phoenix-ide@noreply.local>
 |---------|-----------------------------|
 | Work conversation (parent) | Yes |
 | Work sub-agent | Yes |
-| Standalone conversation | Yes |
+| Direct conversation | Yes |
 | Explore conversation | No (no commits possible) |
 | Explore sub-agent | No (no commits possible) |
 

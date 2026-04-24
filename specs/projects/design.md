@@ -329,7 +329,7 @@ SubAgentMode {
 Default mode resolution:
 - Parent in Explore mode: all sub-agents default to `Explore`. `Work` is rejected.
 - Parent in Work mode: sub-agents default to `Explore`. `Work` is available on request.
-- Parent in Standalone mode: all sub-agents default to `Explore` (no worktree context).
+- Parent in Direct mode: all sub-agents default to `Explore` (no worktree context).
 
 #### Tool Registry Per Mode
 
@@ -433,7 +433,7 @@ invoke multiple tools.
 | Explore | Explore | Parent's cwd (main checkout) |
 | Work | Explore | Parent's worktree path (reads current work state) |
 | Work | Work | Parent's worktree path (writes to worktree) |
-| Standalone | Explore | Parent's cwd |
+| Direct | Explore | Parent's cwd |
 
 The `cwd` field on `SubAgentTaskSpec` overrides this default. The override is
 validated: Work sub-agents cannot write outside the parent's worktree even if

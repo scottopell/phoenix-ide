@@ -56,7 +56,7 @@ listing and cached `git ls-remote` for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
-| **REQ-PROJ-016:** Standalone Conversation Mode | ✅ Complete | Task 08601 (M1). Non-git dirs get full tools, no project |
+| **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by REQ-PROJ-018 (Direct Mode). `Standalone` was folded into `Direct` via migration 001; the `ConvMode::Standalone` variant no longer exists |
 | **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Task 08603 (M3). ConvMode::Work stores base_branch |
 | **REQ-PROJ-018:** Direct Mode | ✅ Complete | Default for all conversations |
 | **REQ-PROJ-019:** Conversation List Filtering | ✅ Complete | Mode/project filters, auto-archive |

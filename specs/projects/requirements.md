@@ -35,14 +35,14 @@ AND associate the conversation with that project
 AND initialize the conversation in Explore mode
 
 WHEN the directory is NOT inside a git repository
-THE SYSTEM SHALL create the conversation in Standalone mode (REQ-PROJ-016)
+THE SYSTEM SHALL create the conversation in Direct mode (REQ-PROJ-018)
 AND NOT associate it with any project
 
 **Rationale:** Users think in terms of projects (codebases, repositories), not raw
 directories. Git is the structural foundation of the isolation model — without it the
 system cannot create worktrees or maintain task history in a versioned, shareable form.
 However, Phoenix must remain useful for non-git directories (ad-hoc scripts, /tmp,
-miscellaneous files). Standalone mode provides full tool access without git-backed
+miscellaneous files). Direct mode provides full tool access without git-backed
 safety features, letting users choose their level of structure.
 
 ---
@@ -382,7 +382,15 @@ intentionally and must survive restart unchanged.
 
 ---
 
-### REQ-PROJ-016: Standalone Conversation Mode
+### REQ-PROJ-016: Standalone Conversation Mode (Superseded)
+
+**SUPERSEDED BY REQ-PROJ-018.** Standalone mode was a distinct mode for
+non-git directories providing the full tool suite without git-backed
+features. It was folded into `ConvMode::Direct` — which now serves both
+git-backed and non-git working directories with identical semantics. See
+REQ-PROJ-018 for the canonical historical note and the current behavior.
+Retaining this REQ ID for traceability; content below describes the
+original pre-supersession design.
 
 WHEN a conversation is created for a directory that is not inside a git repository
 THE SYSTEM SHALL initialize the conversation in Standalone mode
@@ -443,8 +451,22 @@ name and the base branch.
 
 ### REQ-PROJ-018: Direct Mode (Implemented)
 
-Direct mode is the default for all new conversations (git and non-git). It replaces
-the former `Standalone` mode and is now the primary conversation mode.
+Direct mode is the default for all new conversations, git-backed and non-git alike.
+
+**Historical note — Standalone → Direct migration.** An earlier design
+split non-git directory conversations into a separate `Standalone` mode
+(see superseded REQ-PROJ-016 and the rationale in REQ-BED-027). In
+practice the two modes had identical runtime semantics (full tool suite,
+no `propose_plan`, no worktree, no task file, no branch, no project
+association beyond `cwd`), so the split produced no behavioral difference
+— only type-level ceremony. `Standalone` was folded into `Direct` via DB
+migration 001 (`UPDATE conversations SET conv_mode = REPLACE(conv_mode,
+'"Standalone"', '"Direct"')`), and the `ConvMode::Standalone` enum
+variant was removed from the code. All references to Standalone in the
+spec corpus have been updated to Direct; this REQ-PROJ-018 is the
+canonical landing for the history. If you encounter Standalone in old
+code comments, task files, or git history, treat it as an alias for
+Direct.
 
 WHEN a conversation is created in Direct mode
 THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
@@ -470,7 +492,7 @@ opt-in for users who want structured project management.
 ### REQ-PROJ-019: Conversation List Filtering and Auto-Archive
 
 WHEN the conversation list contains more than 20 conversations
-THE SYSTEM SHALL provide filtering by conversation mode (Explore, Work, Direct, Standalone)
+THE SYSTEM SHALL provide filtering by conversation mode (Explore, Work, Branch, Direct)
 AND provide filtering by project
 
 WHEN a conversation has been in Terminal state for more than 7 days
