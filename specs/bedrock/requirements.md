@@ -617,13 +617,15 @@ AND preserve its worktree, if any, across server restarts
 AND preserve its branch in git
 
 WHEN a context-exhausted conversation has no continuation
-THE SYSTEM SHALL permit user-initiated abandon
+THE SYSTEM SHALL permit user-initiated terminal actions (abandon or mark-as-merged)
 AND on abandon, apply the same worktree/branch disposition as abandon from a non-terminal state
   (worktree removed; branch removed for Work mode, preserved for Branch mode, per REQ-PROJ-026)
+AND on mark-as-merged, apply the same worktree/branch disposition as mark-as-merged from a non-terminal state
+  (worktree removed; branch removed for Work mode, preserved for Branch mode, per REQ-PROJ-026/027)
 
 WHEN a context-exhausted conversation has an existing continuation
-THE SYSTEM SHALL NOT permit abandon on the parent
-(the continuation is the live conversation — any abandon decision is made there)
+THE SYSTEM SHALL NOT permit abandon or mark-as-merged on the parent
+(the continuation is the live conversation — any terminal decision belongs on the continuation)
 
 WHEN the server restarts and encounters a context-exhausted conversation with a worktree
 THE SYSTEM SHALL preserve the worktree unchanged
