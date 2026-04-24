@@ -546,7 +546,14 @@ rule MarkAsMerged {
 
     let worktree = Worktree{conversation: conversation}
 
-    requires: conversation.status = idle
+    -- Agent must not be running (no live tool execution, LLM call, etc.).
+    requires: conversation.core_status = idle
+    -- REQ-BED-031: permitted in normal idle (parent_status absent) and
+    -- on a context-exhausted parent. Excludes awaiting_recovery /
+    -- awaiting_task_approval / awaiting_user_response (those need
+    -- user attention first) and terminal (already done).
+    requires: conversation.parent_status = absent
+           or conversation.parent_status = context_exhausted
     requires: conversation.mode in { work, branch }
     -- REQ-BED-031: same gate as ConfirmAbandon. A context-exhausted
     -- parent with an existing continuation cannot be marked-as-merged
@@ -590,7 +597,14 @@ rule ConfirmAbandon {
 
     let worktree = Worktree{conversation: conversation}
 
-    requires: conversation.status = idle
+    -- Agent must not be running (no live tool execution, LLM call, etc.).
+    requires: conversation.core_status = idle
+    -- REQ-BED-031: permitted in normal idle (parent_status absent) and
+    -- on a context-exhausted parent. Excludes awaiting_recovery /
+    -- awaiting_task_approval / awaiting_user_response (those need
+    -- user attention first) and terminal (already done).
+    requires: conversation.parent_status = absent
+           or conversation.parent_status = context_exhausted
     requires: conversation.mode in { work, branch }
     requires: conversation.continued_in_conv_id = absent
 
