@@ -827,10 +827,11 @@ impl Database {
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
-        let now = Utc::now();
-        let msg_type = content.message_type();
-
-        // Get next sequence ID
+        // Allocate sequence_id from the DB watermark. Callers that also
+        // broadcast the message over SSE must instead use
+        // `add_message_with_seq` with a sequence pre-allocated from the
+        // broadcaster's counter — see the PersistBeforeBroadcast invariant
+        // in specs/sse_wire/sse_wire.allium.
         let row = sqlx::query(
             "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
         )
@@ -838,6 +839,42 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         let sequence_id: i64 = row.get(0);
+
+        self.add_message_with_seq(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+        )
+        .await
+    }
+
+    /// Persist a message with an externally-allocated `sequence_id`.
+    ///
+    /// Used by the runtime executor and lifecycle handlers: the sequence
+    /// is pre-allocated from `SseBroadcaster::next_seq()` *before* the DB
+    /// write, so the message's own seq is strictly greater than any
+    /// ephemeral event (token / `state_change` / error) broadcast earlier.
+    /// This is what prevents the "message seq lower than client's
+    /// `lastSequenceId` → dropped by `applyIfNewer`" failure mode behind
+    /// task 02679.
+    ///
+    /// Formally: enforces the `PersistBeforeBroadcast` invariant in
+    /// `specs/sse_wire/sse_wire.allium` at the sequence-allocation level,
+    /// not just at the "DB write happens-before broadcast" level.
+    pub async fn add_message_with_seq(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&UsageData>,
+    ) -> DbResult<Message> {
+        let now = Utc::now();
+        let msg_type = content.message_type();
 
         let content_str = serde_json::to_string(&content.to_json()).unwrap();
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
@@ -1179,6 +1216,63 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    /// Regression for task 02679: messages must persist with the seq their
+    /// broadcaster pre-allocated, not with a `DB-MAX+1` seq.
+    /// `add_message_with_seq` writes the caller-supplied seq verbatim; the
+    /// broadcaster's seq is strictly greater than any ephemeral event
+    /// (token / `state_change` / error) emitted earlier, so the client's
+    /// `applyIfNewer` guard does not drop the message as stale. See
+    /// `PersistBeforeBroadcast` in `specs/sse_wire/sse_wire.allium`.
+    #[tokio::test]
+    async fn test_add_message_with_seq_writes_caller_seq() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-seq", "slug-seq", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        // Simulate: broadcaster has emitted several ephemeral events,
+        // advancing its counter well past the DB message count.
+        let pre_allocated_seq = 42;
+
+        let msg = db
+            .add_message_with_seq(
+                "msg-seq",
+                "conv-seq",
+                pre_allocated_seq,
+                &MessageContent::user("message after many tokens"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            msg.sequence_id, pre_allocated_seq,
+            "add_message_with_seq must use the caller-supplied seq verbatim"
+        );
+
+        // A subsequent add_message falls back to DB-MAX+1, which picks up
+        // the pre-allocated seq. This is the glue that keeps the
+        // non-broadcasting paths (sub-agent bootstrap, crash recovery)
+        // compatible with broadcasting paths: DB's MAX is the running
+        // watermark no matter which API wrote the last message.
+        let next = db
+            .add_message(
+                "msg-next",
+                "conv-seq",
+                &MessageContent::user("next message via MAX+1"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next.sequence_id,
+            pre_allocated_seq + 1,
+            "DB-MAX+1 allocation must observe seqs planted by add_message_with_seq"
+        );
     }
 
     #[tokio::test]

@@ -26,6 +26,31 @@ pub trait MessageStore: Send + Sync {
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String>;
 
+    /// Add a message with a pre-allocated `sequence_id`.
+    ///
+    /// Used by code paths that also broadcast the message over SSE: the
+    /// seq is taken from `SseBroadcaster::next_seq()` before this call, so
+    /// the message's own seq is strictly greater than any ephemeral event
+    /// (token, `state_change`, error) broadcast earlier on the same
+    /// conversation. This is what enforces `PersistBeforeBroadcast`
+    /// (`specs/sse_wire/sse_wire.allium`) at the sequence-allocation level
+    /// and prevents the "message seq < client `lastSequenceId` → dropped by
+    /// `applyIfNewer`" failure from task 02679.
+    ///
+    /// Callers that do NOT broadcast (e.g. sub-agent bootstrap user
+    /// message, crash-recovery system marker) may still use
+    /// [`MessageStore::add_message`]; their seq allocation race is benign
+    /// because no client ever sees a stale seq for them.
+    async fn add_message_with_seq(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+    ) -> Result<Message, String>;
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -132,6 +157,27 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<Message, String> {
         (**self)
             .add_message(message_id, conv_id, content, display_data, usage_data)
+            .await
+    }
+
+    async fn add_message_with_seq(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_with_seq(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+            )
             .await
     }
 
@@ -259,6 +305,28 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<Message, String> {
         self.db
             .add_message(message_id, conv_id, content, display_data, usage_data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn add_message_with_seq(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_with_seq(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+            )
             .await
             .map_err(|e| e.to_string())
     }

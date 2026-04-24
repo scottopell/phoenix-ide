@@ -388,6 +388,48 @@ impl MessageStore for InMemoryStorage {
         Ok(msg)
     }
 
+    async fn add_message_with_seq(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+    ) -> Result<Message, String> {
+        // Keep the monotonic id counter at least as high as the provided
+        // seq so any subsequent `add_message` call produces a strictly
+        // greater id. Mirrors DB.add_message_with_seq semantics.
+        {
+            let mut id_guard = self.next_msg_id.lock().unwrap();
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let floor = (sequence_id as u64).saturating_add(1);
+            if *id_guard < floor {
+                *id_guard = floor;
+            }
+        }
+
+        let msg = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conv_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at: chrono::Utc::now(),
+        };
+
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(msg.clone());
+
+        Ok(msg)
+    }
+
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         Ok(self.get_all_messages(conv_id))
     }

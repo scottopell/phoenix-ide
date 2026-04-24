@@ -1014,3 +1014,86 @@ fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
         ConvMode::Direct => ModeContext::Direct,
     }
 }
+
+#[cfg(test)]
+mod broadcaster_tests {
+    use super::*;
+
+    /// Regression for task 02679: when a caller pre-allocates a message's
+    /// `sequence_id` from the broadcaster *before* writing to the DB, the
+    /// message's seq is strictly greater than any ephemeral event emitted
+    /// earlier on the same broadcaster. A concurrent reader (the client's
+    /// `applyIfNewer` guard) will accept the message rather than dropping
+    /// it as stale.
+    ///
+    /// The failure shape this guards against:
+    /// - pre-fix, `add_message` allocated its own seq via `SELECT MAX+1`.
+    /// - After several ephemeral events (tokens advance `SseBroadcaster`'s
+    ///   counter to N ≫ DB message count), an assistant message persists
+    ///   with DB seq = (count+1) ≪ N.
+    /// - `send_message` broadcasts it with that stale seq; the client's
+    ///   `lastSequenceId ≥ N` causes `applyIfNewer` to drop it; the
+    ///   assistant's response visibly disappears.
+    ///
+    /// See `specs/sse_wire/sse_wire.allium`, invariant `PersistBeforeBroadcast`.
+    #[test]
+    fn next_seq_after_ephemeral_events_exceeds_prior_events() {
+        let b = SseBroadcaster::new(16, 0);
+
+        // Simulate many ephemeral events (token stream, state changes)
+        // each consuming one seq from the counter.
+        let mut last_ephemeral = 0;
+        for _ in 0..50 {
+            last_ephemeral = b.next_seq();
+        }
+
+        // Pre-allocate a seq for a message that's about to be persisted.
+        let message_seq = b.next_seq();
+
+        // The message seq must be strictly greater than every ephemeral
+        // event emitted before it. This is the structural property the
+        // client's applyIfNewer guard relies on.
+        assert!(
+            message_seq > last_ephemeral,
+            "pre-allocated message seq ({message_seq}) must exceed all prior \
+             ephemeral seqs ({last_ephemeral})"
+        );
+        assert_eq!(message_seq, last_ephemeral + 1);
+    }
+
+    /// `observe_seq` is idempotent when the broadcaster's counter is
+    /// already past the supplied seq — this is the normal path once
+    /// `send_message` runs with a pre-allocated seq (broadcaster counter
+    /// already = seq after `next_seq()`).
+    #[test]
+    fn observe_seq_is_idempotent_when_counter_already_past() {
+        let b = SseBroadcaster::new(16, 0);
+        let seq = b.next_seq();
+        b.observe_seq(seq);
+        assert_eq!(
+            b.current_seq(),
+            seq,
+            "observe_seq must not bump the counter past seq when already at seq"
+        );
+
+        // A subsequent next_seq advances by exactly one.
+        let next = b.next_seq();
+        assert_eq!(next, seq + 1);
+    }
+
+    /// `observe_seq` still catches up when a DB-allocated message seq
+    /// leapfrogs the broadcaster — the pre-fix path. Kept as a belt-and-
+    /// braces check: non-broadcasting paths (sub-agent bootstrap, crash
+    /// recovery) still use `add_message`, and the first `send_message` on
+    /// a restarted conversation must fold their DB seqs back in.
+    #[test]
+    fn observe_seq_catches_up_when_db_seq_leapfrogs() {
+        let b = SseBroadcaster::new(16, 0);
+        // Simulate: two direct-DB writes (bootstrap + restart marker)
+        // occurred before the broadcaster emitted anything; broadcaster
+        // is at 0, DB MAX is 2.
+        b.observe_seq(2);
+        let next = b.next_seq();
+        assert_eq!(next, 3, "broadcaster must allocate past the DB watermark");
+    }
+}

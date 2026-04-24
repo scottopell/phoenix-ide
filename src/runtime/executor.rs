@@ -759,9 +759,20 @@ where
         );
         let content = crate::db::MessageContent::system(text);
 
+        // Pre-allocate seq from the broadcaster so this message is ordered
+        // strictly after any ephemeral events (tokens, state_change) emitted
+        // earlier. See PersistBeforeBroadcast in specs/sse_wire/sse_wire.allium.
+        let seq = self.broadcast_tx.next_seq();
         match self
             .storage
-            .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+            .add_message_with_seq(
+                &msg_id,
+                &self.context.conversation_id,
+                seq,
+                &content,
+                None,
+                None,
+            )
             .await
         {
             Ok(msg) => {
@@ -991,11 +1002,13 @@ where
                 usage_data,
                 message_id,
             } => {
+                let seq = self.broadcast_tx.next_seq();
                 let msg = self
                     .storage
-                    .add_message(
+                    .add_message_with_seq(
                         &message_id,
                         &self.context.conversation_id,
+                        seq,
                         &content,
                         display_data.as_ref(),
                         usage_data.as_ref(),
@@ -1096,11 +1109,13 @@ where
                         result.is_error(),
                     );
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
+                    let seq = self.broadcast_tx.next_seq();
                     let msg = self
                         .storage
-                        .add_message(
+                        .add_message_with_seq(
                             &tool_msg_id,
                             &self.context.conversation_id,
+                            seq,
                             &content,
                             None,
                             None,
@@ -1596,11 +1611,13 @@ where
             } => {
                 // Persist assistant message
                 let agent_content = MessageContent::agent(assistant_message.content);
+                let agent_seq = self.broadcast_tx.next_seq();
                 let agent_msg = self
                     .storage
-                    .add_message(
+                    .add_message_with_seq(
                         &assistant_message.message_id,
                         &self.context.conversation_id,
+                        agent_seq,
                         &agent_content,
                         assistant_message.display_data.as_ref(),
                         assistant_message.usage.as_ref(),
@@ -1616,11 +1633,13 @@ where
                         result.is_error(),
                     );
                     let tool_msg_id = tool_result_message_id(&result.tool_use_id);
+                    let tool_seq = self.broadcast_tx.next_seq();
                     let tool_msg = self
                         .storage
-                        .add_message(
+                        .add_message_with_seq(
                             &tool_msg_id,
                             &self.context.conversation_id,
+                            tool_seq,
                             &tool_content,
                             result.display_data(),
                             None,
@@ -1723,11 +1742,13 @@ where
                 false,
             );
             let msg_id = uuid::Uuid::new_v4().to_string();
+            let seq = self.broadcast_tx.next_seq();
             let message = self
                 .storage
-                .add_message(
+                .add_message_with_seq(
                     &msg_id,
                     &self.context.conversation_id,
+                    seq,
                     &content,
                     Some(&display_data),
                     None,
@@ -2105,11 +2126,13 @@ where
 
         // Inject system message
         let msg_id = uuid::Uuid::new_v4().to_string();
+        let seq = self.broadcast_tx.next_seq();
         let msg = self
             .storage
-            .add_message(
+            .add_message_with_seq(
                 &msg_id,
                 conv_id,
+                seq,
                 &MessageContent::system(&system_message),
                 None,
                 None,
@@ -2241,9 +2264,17 @@ where
                 );
                 let msg_id = uuid::Uuid::new_v4().to_string();
                 let content = MessageContent::User(crate::db::UserContent::meta(&branch_msg));
+                let seq = self.broadcast_tx.next_seq();
                 let msg = self
                     .storage
-                    .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+                    .add_message_with_seq(
+                        &msg_id,
+                        &self.context.conversation_id,
+                        seq,
+                        &content,
+                        None,
+                        None,
+                    )
                     .await?;
                 let _ = self.broadcast_tx.send_message(msg);
 

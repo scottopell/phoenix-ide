@@ -261,23 +261,57 @@ pub(crate) async fn abandon_task(
     .await
     .map_err(|e| AppError::Internal(format!("Diff capture failed: {e}")))?;
 
-    // 2b. Write diff snapshot as a system message (before worktree deletion)
+    // 2b. Write diff snapshot as a system message (before worktree deletion).
+    //
+    // Pre-allocate the seq from the conversation's broadcaster so this
+    // message orders strictly after any ephemeral events already emitted
+    // on the stream. See PersistBeforeBroadcast in
+    // specs/sse_wire/sse_wire.allium. The handle obtained here is reused
+    // at step 3 to actually broadcast the persisted message.
     let snapshot_msg = if let Some(ref snapshot) = diff_snapshot {
         let snap_msg_id = uuid::Uuid::new_v4().to_string();
-        match state
-            .db
-            .add_message(
-                &snap_msg_id,
-                &id,
-                &MessageContent::system(snapshot),
-                None,
-                None,
-            )
-            .await
-        {
-            Ok(msg) => Some(msg),
+        match state.runtime.get_or_create(&id).await {
+            Ok(handle) => {
+                let seq = handle.broadcast_tx.next_seq();
+                match state
+                    .db
+                    .add_message_with_seq(
+                        &snap_msg_id,
+                        &id,
+                        seq,
+                        &MessageContent::system(snapshot),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(msg) => Some((handle, msg)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
+                        None
+                    }
+                }
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain broadcaster for diff snapshot; persisting without broadcast (client will see on next init)"
+                );
+                // Persist with a DB-allocated seq. No broadcast follows,
+                // so the seq-ordering concern doesn't apply.
+                if let Err(e) = state
+                    .db
+                    .add_message(
+                        &snap_msg_id,
+                        &id,
+                        &MessageContent::system(snapshot),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
+                }
                 None
             }
         }
@@ -337,11 +371,10 @@ pub(crate) async fn abandon_task(
     .await
     .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
 
-    // 3. Broadcast diff snapshot (persisted above, before state transition)
-    if let Some(snap_msg) = snapshot_msg {
-        if let Ok(handle) = state.runtime.get_or_create(&id).await {
-            let _ = handle.broadcast_tx.send_message(snap_msg);
-        }
+    // 3. Broadcast diff snapshot (persisted above, before state transition).
+    // Reuses the handle obtained during seq pre-allocation at step 2b.
+    if let Some((handle, snap_msg)) = snapshot_msg {
+        let _ = handle.broadcast_tx.send_message(snap_msg);
     }
 
     // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
