@@ -188,3 +188,24 @@ conversation covered: why formal specs exist in an LLM-first world, what Allium
 entities and rules are, the three trigger types, cross-spec trigger patterns, and
 the specific state-watch vs named-event tradeoff. That conversation is the primary
 reference for understanding the motivating case.
+
+## Related upstream-feedback tasks
+
+The subject matter of this task — cross-spec coordination via named lifecycle
+events — overlaps with two tasks collecting feedback for the Allium project
+itself:
+
+- **Task 02683** — `allium-cross-spec-resolution-feedback` (p3). Empirically
+  confirmed that `allium check` does not resolve cross-spec references:
+  `imported/NotARealEntity` passes, and typoed cross-spec trigger names only
+  surface as info-level noise mixed with legitimate subscription infos. The
+  Phoenix-side workaround (convention: declare events on surfaces, subscribe
+  by exact name) is exactly what this skill-pattern task formalizes — until
+  allium-upstream closes the enforcement gap, the skill pattern is the
+  primary mitigation.
+- **Task 27001** — `allium-temporal-ordering-feedback` (p3). Orthogonal
+  concern (temporal invariants) but shares the upstream recipient.
+
+If 02683 lands as an upstream allium feature, parts of this skill pattern may
+become redundant (the tool would catch the drift directly). Worth re-scoping
+this task at that point.
