@@ -588,7 +588,7 @@ rule AuthErrorWithActiveRecovery {
 }
 
 rule RecoverySucceeded {
-    when: CredentialBecameAvailable
+    when: CredentialBecameAvailable(conversation)
     requires: conversation.parent_status = awaiting_recovery
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
@@ -596,7 +596,7 @@ rule RecoverySucceeded {
 }
 
 rule RecoveryFailed {
-    when: CredentialHelperFailed(message)
+    when: CredentialHelperFailed(conversation, message)
     requires: conversation.parent_status = awaiting_recovery
     ensures: conversation.core_status = error
     ensures: conversation.error_message = message
