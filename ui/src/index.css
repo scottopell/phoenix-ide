@@ -2635,6 +2635,29 @@ pre:hover .copy-btn {
   color: var(--text-primary);
 }
 
+.context-exhausted-abandon {
+  padding: 8px 14px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.context-exhausted-abandon:hover:not(:disabled) {
+  background: var(--danger-bg, rgba(239, 68, 68, 0.1));
+  color: var(--danger, #ef4444);
+  border-color: var(--danger, #ef4444);
+}
+
+.context-exhausted-abandon:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* Terminal conversation banner */
 .terminal-banner {
   flex: 0 0 auto;

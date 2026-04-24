@@ -365,6 +365,10 @@ pub struct ConflictErrorResponse {
     /// the error text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict_slug: Option<String>,
+    /// Id of the continuation conversation when the action was rejected because
+    /// the parent has been continued (`error_type = "continuation_exists"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_id: Option<String>,
 }
 
 impl ConflictErrorResponse {
@@ -375,11 +379,17 @@ impl ConflictErrorResponse {
             dirty_files: vec![],
             can_auto_stash: false,
             conflict_slug: None,
+            continuation_id: None,
         }
     }
 
     pub fn with_conflict_slug(mut self, slug: impl Into<String>) -> Self {
         self.conflict_slug = Some(slug.into());
+        self
+    }
+
+    pub fn with_continuation_id(mut self, id: impl Into<String>) -> Self {
+        self.continuation_id = Some(id.into());
         self
     }
 }

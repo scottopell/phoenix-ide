@@ -36,12 +36,15 @@ use std::path::PathBuf;
 /// the continuation instead of showing the raw error text.
 fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError> {
     if let Some(continuation_id) = conv.continued_in_conv_id.as_deref() {
-        return Err(AppError::Conflict(ConflictErrorResponse::new(
-            format!(
-                "Cannot {action} a conversation that has been continued. \
-                 The action belongs on the continuation conversation ({continuation_id})."
-            ),
-            "continuation_exists",
+        return Err(AppError::Conflict(Box::new(
+            ConflictErrorResponse::new(
+                format!(
+                    "Cannot {action} a conversation that has been continued. \
+                     The action belongs on the continuation conversation ({continuation_id})."
+                ),
+                "continuation_exists",
+            )
+            .with_continuation_id(continuation_id),
         )));
     }
     Ok(())
@@ -648,6 +651,11 @@ mod tests {
         match err {
             AppError::Conflict(detail) => {
                 assert_eq!(detail.error_type, "continuation_exists");
+                assert_eq!(
+                    detail.continuation_id.as_deref(),
+                    Some("child-conv-id"),
+                    "typed continuation_id must be populated so FE doesn't regex-parse the message",
+                );
                 assert!(
                     detail.error.contains("Cannot abandon"),
                     "error must name the action: {}",
@@ -685,6 +693,11 @@ mod tests {
         match err {
             AppError::Conflict(detail) => {
                 assert_eq!(detail.error_type, "continuation_exists");
+                assert_eq!(
+                    detail.continuation_id.as_deref(),
+                    Some("child-conv-id"),
+                    "typed continuation_id must be populated so FE doesn't regex-parse the message",
+                );
                 assert!(
                     detail.error.contains("Cannot mark as merged"),
                     "error must name the action: {}",
