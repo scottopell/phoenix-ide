@@ -1,11 +1,28 @@
 ---
 created: 2026-04-22
 priority: p2
-status: ready
+status: wont-do
 artifact: src/runtime/executor.rs
 ---
 
 # Auto-stash uncommitted worktree changes on ContextExhausted cleanup
+
+## Wont-do (2026-04-24)
+
+Obsoleted by REQ-BED-030 / REQ-BED-031 (task 24696, branch
+`task-24696-continuation-worktree-transfer`). The worktree is no longer
+destroyed on `ContextExhausted`; instead, ownership transfers to the
+continuation conversation via the `continued_in_conv_id` pointer. The
+continuation inherits the *same* working tree, so uncommitted changes
+ride over by construction — there is nothing to stash because nothing is
+removed. Auto-cleanup and `remove_worktree_preserve_branch` were removed
+from the `ContextExhausted` path entirely; `reconcile_worktrees` now
+skips context-exhausted and continued rows.
+
+If a need for stash-based preservation ever resurfaces (e.g. a different
+terminal path that does destroy the worktree while data is live), file a
+fresh task — the implementation notes below no longer map onto the
+current runtime shape.
 
 ## Problem
 

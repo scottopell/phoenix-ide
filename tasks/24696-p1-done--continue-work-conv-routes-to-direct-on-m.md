@@ -1,8 +1,33 @@
 ---
 created: 2026-04-24
 priority: p1
-status: ready
+status: done
 artifact: ui/src/pages/ConversationPage.tsx
+---
+
+## Resolved (2026-04-24)
+
+Fixed root-cause on branch `task-24696-continuation-worktree-transfer`
+via REQ-BED-030 / REQ-BED-031:
+
+- New `continued_in_conv_id` column + typed field through
+  `Conversation` / `EnrichedConversation` / SSE wire types.
+- Idempotent `POST /api/conversations/:id/continue` transfers worktree
+  ownership to a new conversation of the same mode (W→W / B→B / E→E /
+  D→D), atomically linking parent → continuation.
+- Removed the old `cleanup_context_exhausted_worktree` path entirely;
+  `reconcile_worktrees` now skips context-exhausted and continued rows
+  (so a server restart preserves the worktree).
+- Abandon / mark-as-merged gated on `continued_in_conv_id = NULL`;
+  typed `continuation_id` on the 409 response so the FE can route.
+- Frontend: Continue button calls the new endpoint, seeds
+  `seed-draft:<new_id>` for the continuation input, and swaps to a
+  "Continued in a new conversation" link once the parent has a
+  continuation. Abandon button remains available on the parent banner
+  until a continuation exists.
+- Obsoletes task 08678 (auto-stash) — uncommitted changes now ride the
+  worktree transfer by construction.
+
 ---
 
 Continuing a Work-mode (or Branch-mode) conversation via "Continue in
