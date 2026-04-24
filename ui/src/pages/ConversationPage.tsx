@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, ConflictError, ExpansionError, type Conversation, type ImageData } from '../api';
+import { api, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -764,7 +764,9 @@ export function ConversationPage() {
             <span className="context-exhausted-icon"><AlertTriangle /></span>
             <span className="context-exhausted-title">Context Window Full</span>
             <span className="context-exhausted-subtitle">
-              Continue in a new conversation to preserve progress
+              {conversation.continued_in_conv_id
+                ? 'This conversation has been continued'
+                : 'Continue in a new conversation to preserve progress'}
             </span>
             <span className={`context-exhausted-chevron${contextExhaustedExpanded ? ' context-exhausted-chevron--open' : ''}`} aria-hidden>
               <ChevronRightSmall />
@@ -772,58 +774,54 @@ export function ConversationPage() {
           </button>
           <div className="context-exhausted-summary">
             <div className="context-exhausted-actions">
-              <button
-                type="button"
-                className="context-exhausted-continue"
-                onClick={async () => {
-                  if (convStateForChildren.type !== 'context_exhausted') return;
-                  if (!conversation?.id) return;
-                  const summary = convStateForChildren.summary;
-                  const seedLabel = 'Continued from context full';
-                  const messageId =
-                    crypto.randomUUID?.() ??
-                    `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-                  // Branch mode continues the same branch in a fresh worktree —
-                  // the natural fit when the parent had one. Fall back to direct
-                  // when there's no branch context to carry forward.
-                  const branchForContinuation =
-                    conversation.branch_name ?? conversation.base_branch ?? null;
-                  const mode: 'branch' | 'direct' = branchForContinuation ? 'branch' : 'direct';
-                  try {
-                    const newConv = await api.createConversation(
-                      conversation.cwd,
-                      '',
-                      messageId,
-                      conversation.model ?? undefined,
-                      [],
-                      mode,
-                      branchForContinuation,
-                      conversation.id,
-                      seedLabel,
-                    );
+              {conversation.continued_in_conv_id ? (
+                // REQ-BED-030 single-continuation policy: once a parent has a
+                // continuation, the Continue button is replaced with a link to
+                // that continuation. Clicking re-hits the idempotent
+                // continuation endpoint, which returns the existing id + slug
+                // and lets us navigate without caching the slug client-side.
+                <button
+                  type="button"
+                  className="context-exhausted-continue"
+                  data-testid="continuation-link"
+                  onClick={async () => {
+                    if (!conversation?.id) return;
                     try {
-                      localStorage.setItem(`seed-draft:${newConv.id}`, summary);
-                    } catch {
-                      // non-fatal
+                      const res = await api.continueConversation(conversation.id);
+                      if (res.slug) {
+                        navigate(`/c/${res.slug}`);
+                      }
+                    } catch (err) {
+                      showInfo(err instanceof Error ? err.message : 'Failed to open continuation');
                     }
-                    if (newConv.slug) {
-                      navigate(`/c/${newConv.slug}`);
+                  }}
+                >
+                  {'→'} Continued in a new conversation
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="context-exhausted-continue"
+                  data-testid="continue-button"
+                  onClick={async () => {
+                    if (convStateForChildren.type !== 'context_exhausted') return;
+                    if (!conversation?.id) return;
+                    try {
+                      const res = await api.continueConversation(conversation.id);
+                      if (res.already_existed) {
+                        showInfo('Returning to your existing continuation');
+                      }
+                      if (res.slug) {
+                        navigate(`/c/${res.slug}`);
+                      }
+                    } catch (err) {
+                      showInfo(err instanceof Error ? err.message : 'Failed to start new conversation');
                     }
-                  } catch (err) {
-                    // If another active conversation already owns the same
-                    // branch (e.g. the user spawned a child Branch conv off
-                    // this one manually), route there instead of surfacing
-                    // the raw server error.
-                    if (err instanceof ConflictError && err.detail.conflict_slug) {
-                      navigate(`/c/${err.detail.conflict_slug}`);
-                      return;
-                    }
-                    showInfo(err instanceof Error ? err.message : 'Failed to start new conversation');
-                  }
-                }}
-              >
-                Continue in new conversation
-              </button>
+                  }}
+                >
+                  Continue in new conversation
+                </button>
+              )}
               <button
                 type="button"
                 className="context-exhausted-copy"
@@ -900,6 +898,7 @@ export function ConversationPage() {
             phaseType={convStateForChildren.type}
             branchName={conversation.branch_name ?? undefined}
             baseBranch={conversation.base_branch}
+            continuedInConvId={conversation.continued_in_conv_id}
             onSendMessage={(text) => handleSend(text, [])}
           />
         )}

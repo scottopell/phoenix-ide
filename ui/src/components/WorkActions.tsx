@@ -8,6 +8,12 @@ interface WorkActionsProps {
   phaseType: string;
   branchName: string | undefined;
   baseBranch: string | null | undefined;
+  /** When set, the parent has been continued into another conversation.
+   *  REQ-BED-031 forbids abandon / mark-as-merged on a continued parent —
+   *  the action belongs on the continuation. Server enforces with 409; UI
+   *  disables the controls with a tooltip so the user never sees that
+   *  error. */
+  continuedInConvId: string | null | undefined;
   /** Send a user message to the conversation (for "ask agent to fix" flows) */
   onSendMessage?: (text: string) => void;
 }
@@ -16,6 +22,7 @@ export function WorkActions({
   conversationId,
   convModeLabel,
   phaseType,
+  continuedInConvId,
 }: WorkActionsProps) {
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
@@ -31,13 +38,19 @@ export function WorkActions({
   if (phaseType !== 'idle') return null;
 
   const isLoading = markingMerged || abandoning;
+  const hasContinuation = !!continuedInConvId;
+  const continuationTooltip = hasContinuation
+    ? 'This conversation has been continued. Abandon the continuation instead.'
+    : undefined;
 
   return (
     <div className="work-actions-bar">
       <span className="work-actions-label">Done?</span>
       <button
         className="work-actions-btn work-actions-complete"
-        disabled={isLoading}
+        disabled={isLoading || hasContinuation}
+        title={continuationTooltip}
+        data-testid="mark-merged-button"
         onClick={async () => {
           setError(null);
           setMarkingMerged(true);
@@ -54,7 +67,9 @@ export function WorkActions({
       </button>
       <button
         className="work-actions-btn work-actions-abandon"
-        disabled={isLoading}
+        disabled={isLoading || hasContinuation}
+        title={continuationTooltip}
+        data-testid="abandon-button"
         onClick={async () => {
           const confirmText = isBranch
             ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
@@ -74,6 +89,11 @@ export function WorkActions({
       >
         {abandoning ? 'Abandoning...' : 'Abandon'}
       </button>
+      {hasContinuation && (
+        <span className="work-actions-continuation-note">
+          Continued — actions belong on the continuation.
+        </span>
+      )}
       {error && (
         <div className="work-actions-error">{error}</div>
       )}

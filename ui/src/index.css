@@ -6555,6 +6555,12 @@ html * {
   margin-top: 4px;
 }
 
+.work-actions-continuation-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
 .work-actions-dirty-details {
   margin-top: 6px;
 }
