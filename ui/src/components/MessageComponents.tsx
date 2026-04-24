@@ -114,6 +114,18 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
       const path = String(input['path'] || '');
       return { display: path, isMultiline: false };
     }
+    case 'read_file': {
+      const path = String(input['path'] || '');
+      const offset = input['offset'] as number | undefined;
+      const limit = input['limit'] as number | undefined;
+      let display = path;
+      if (offset !== undefined || limit !== undefined) {
+        const start = offset ?? 1;
+        const end = limit !== undefined ? start + limit - 1 : undefined;
+        display = end !== undefined ? `${path}:${start}-${end}` : `${path}:${start}+`;
+      }
+      return { display, isMultiline: false };
+    }
     case 'spawn_agents': {
       const tasks = (input['tasks'] as Array<{ task?: string }>) || [];
       const count = tasks.length;
@@ -415,8 +427,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
     imageResult = parseImageResult(resultText);
   }
 
-  // Determine if output should be auto-expanded
-  const shouldAutoExpand = resultLength > 0 && resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
+  // Determine if output should be auto-expanded.
+  // read_file auto-expands regardless of length: the file contents ARE the payload,
+  // not supplementary evidence — hiding them defeats the tool's purpose. The
+  // 5000-char maxDisplayLen below caps runaway reads.
+  const shouldAutoExpand = resultLength > 0 && (
+    resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD || name === 'read_file'
+  );
   const [outputExpanded, setOutputExpanded] = useState(shouldAutoExpand);
 
   // For display, truncate very long outputs even when expanded
@@ -437,6 +454,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
   // Get the raw input for copying (not the formatted display)
   const rawInput = name === 'bash' ? String(input['command'] || '') :
                    name === 'think' ? String(input['thoughts'] || '') :
+                   name === 'read_file' ? String(input['path'] || '') :
                    JSON.stringify(input, null, 2);
 
   return (
