@@ -354,7 +354,7 @@ visibility prevents confusion about what a conversation can do.
 
 ### REQ-PROJ-015: Project Worktree Registry
 
-**DESCOPED:** The dedicated worktree registry table is not needed. `ConvMode::Work` on each conversation serves as the de facto registry -- querying all Work conversations for a project yields the active worktree list. Startup reconciliation (M3) handles orphan detection by checking worktree paths on disk. This requirement is retained for historical context but will not be implemented.
+**Partially DESCOPED:** The dedicated worktree registry *table* is not implemented — `ConvMode::Work` on each conversation serves as the de facto registry, and querying all Work conversations for a project yields the active worktree list. The first three clauses below (register/deregister/reconcile on disk) are therefore conceptual descriptions of that de facto registry's behavior, not a separate table's behavior. The fourth clause (context-exhausted / continued-conversation exclusion) is **normative and active** — it constrains how the conceptual-registry reconciliation treats those conversations, regardless of the registry's storage shape.
 
 WHEN a worktree is created for a task
 THE SYSTEM SHALL register it in the project record with task ID, worktree path,

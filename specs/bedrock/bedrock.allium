@@ -982,6 +982,9 @@ surface UserConversation {
             when conversation.parent_status = awaiting_user_response
         UserTriggersContinuation(conversation)
             when conversation.core_status = idle and conversation.context_warning
+        UserStartsContinuationConversation(conversation, new_conv)
+            when conversation.parent_status = context_exhausted
+                 and conversation.continued_in_conv_id = absent
 
     @guarantee IdempotentMessages
         -- Duplicate message submissions (same message_id) are
