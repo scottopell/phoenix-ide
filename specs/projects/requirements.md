@@ -166,7 +166,8 @@ Branch mode conversations (REQ-PROJ-024) do not create task files.
 
 WHEN the agent updates a task file during Work mode (via patch tool)
 THE SYSTEM SHALL allow edits to the task file on the task branch like any other file
-AND the updates SHALL be pushed with the rest of the code changes (REQ-PROJ-027)
+(if and when the agent pushes via bash, the task-file commits ride along with
+the rest of the branch)
 
 **Rationale:** Task files live on the task branch alongside the code changes, keeping
 the branch self-contained. This avoids committing to main (which may be protected)
@@ -672,11 +673,7 @@ iterative work on the same branch.
 
 ---
 
-### REQ-PROJ-026: Branch Mode Lifecycle -- Push, Mark Merged, Abandon
-
-WHILE a conversation is in Branch mode Work state
-THE SYSTEM SHALL allow the agent to commit and push to the branch when instructed
-AND the conversation SHALL remain in Work mode after pushing (push is not terminal)
+### REQ-PROJ-026: Branch Mode Lifecycle -- Mark Merged, Abandon
 
 WHEN the user initiates "Mark as merged" on a Branch mode conversation
 THE SYSTEM SHALL delete the worktree (keep the branch -- it is not ours to delete)
@@ -687,21 +684,20 @@ THE SYSTEM SHALL delete the worktree (keep the branch)
 AND transition the conversation to terminal state
 
 THE SYSTEM SHALL NOT offer "Complete (squash-merge)" for Branch mode conversations
+THE SYSTEM SHALL NOT push to origin on the user's behalf (push is the agent's
+responsibility, run through the bash tool when the user requests it)
 
 **Rationale:** Branch mode conversations track the PR lifecycle, not the task
-lifecycle. Push is a milestone, not an endpoint -- the PR may need reviews, CI
-fixes, and follow-up pushes before merge. "Mark as merged" is the user-initiated
-terminal action when the PR is merged through their normal workflow. Abandon
-means "I'm done with this conversation" but doesn't touch the branch. In both
-cases the branch survives because it belongs to the user's PR, not to Phoenix.
+lifecycle. The agent commits and pushes from bash on the user's instruction;
+Phoenix observes no push event and gates no lifecycle on it. "Mark as merged"
+is the user-initiated terminal action when the PR is merged through their
+normal workflow. Abandon means "I'm done with this conversation" but doesn't
+touch the branch. In both cases the branch survives because it belongs to the
+user's PR, not to Phoenix.
 
 ---
 
-### REQ-PROJ-027: Simplified Managed Mode Completion -- Push Branch
-
-WHEN the user initiates completion of a Managed mode conversation
-THE SYSTEM SHALL push the task branch to origin
-AND the conversation SHALL remain in Work mode after pushing
+### REQ-PROJ-027: Simplified Managed Mode Completion -- User Merges via PR
 
 WHEN the user initiates "Mark as merged" on a Managed mode conversation
 THE SYSTEM SHALL delete the worktree AND delete the task branch
@@ -712,16 +708,21 @@ THE SYSTEM SHALL delete the worktree AND delete the task branch
 AND transition the conversation to terminal state
 
 THE SYSTEM SHALL NOT squash-merge to the base branch
+THE SYSTEM SHALL NOT push to origin (push is the agent's responsibility, run
+through the bash tool when the user requests it)
 THE SYSTEM SHALL commit the task file on the task branch (never on main/base)
 
 **Rationale:** Many repositories protect their main branch and require PR-based
 merges. Squash-merging in Phoenix bypasses code review and branch protection
-rules. Pushing the task branch and letting the user merge via PR is simpler,
+rules. Letting the user merge through their normal PR workflow is simpler,
 works with protected branches, and aligns with how teams actually ship code.
 The task file lives on the task branch alongside the code changes, keeping the
-task branch self-contained. On "Mark as merged," Phoenix cleans up both the
-worktree and the task branch (since Phoenix created it). On abandon, same
-cleanup -- the task branch was a Phoenix artifact that the user is discarding.
+task branch self-contained. Phoenix never pushes on the user's behalf — the
+agent runs `git push` from bash if and when instructed; Phoenix observes no
+push event and gates no lifecycle on it. On "Mark as merged," Phoenix cleans
+up both the worktree and the task branch (since Phoenix created it). On
+abandon, same cleanup -- the task branch was a Phoenix artifact that the user
+is discarding.
 
 ---
 

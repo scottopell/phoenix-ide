@@ -162,6 +162,26 @@ entity Conversation {
     base_branch: String when mode in { explore, work, branch }
     task_id: String when mode = work
 
+    -- Filesystem cwd. For mode in { explore, work, branch } this equals
+    -- worktree_path; for mode = direct it is the user-supplied directory.
+    -- Persists with the conversation row (DB column `cwd`); referenced by
+    -- spawn rules and by the projects/ spec when comparing parent and
+    -- continuation environments.
+    working_dir: String
+
+    -- REQ-BED-030: continuation pointer. When set, this conversation has
+    -- been continued and the worktree (if any) belongs to the
+    -- continuation. Used by reconcile, abandon/mark-merged gates, and
+    -- the FE "Continued in X" affordance. Single-valued by construction
+    -- (see TerminalActionRequiresNoContinuation in projects).
+    continued_in_conv_id: Conversation?
+
+    -- True iff at least one SSE subscriber is currently listening.
+    -- Pollers gate on this to avoid waking the runtime for nobody —
+    -- behavioural, not just an optimisation: when no clients are
+    -- connected, polling is suppressed (REQ-PROJ-023).
+    has_connected_clients: Boolean
+
     -- Relationships
     sub_agents: Conversation with parent = this
     work_sub_agents: sub_agents where mode in { work, branch }

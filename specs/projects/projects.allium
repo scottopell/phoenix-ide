@@ -152,6 +152,12 @@ entity Worktree {
     base_branch: String            -- recorded at creation time
     task_file: TaskFile?           -- present only for managed (work mode) worktrees
 
+    -- REQ-PROJ-023: commits ahead/behind remote tracking ref.
+    -- Updated by CommitsBehindPoll. Absent before the first poll fires
+    -- (or when the conversation has no connected clients).
+    commits_behind: Integer?
+    commits_ahead: Integer?
+
     -- Derived
     is_clean: git_status_clean(path)
 }
@@ -408,11 +414,9 @@ rule MaterializeBranch {
         if exists git_ref(repo, "refs/heads/" + base_branch_name):
             -- Local branch exists. If fetch succeeded, fast-forward to remote tip.
             FastForwardIfPossible(repo, base_branch_name)
-            conversation.resolved_base = base_branch_name
         else if exists git_ref(repo, "refs/remotes/origin/" + base_branch_name):
             -- Remote-only. Create local tracking branch.
             CreateTrackingBranch(repo, base_branch_name, "origin/" + base_branch_name)
-            conversation.resolved_base = base_branch_name
         else:
             -- Neither local nor remote. Fail.
             error("Branch '" + base_branch_name + "' not found locally or at origin")
@@ -497,48 +501,23 @@ rule TaskApprovalExecuted {
         --   Branch rename failure: keep temp name, log warning
 }
 
--- REQ-PROJ-004: User provides feedback — no git operations
-rule TaskFeedbackNoGitOps {
-    -- Subscribes to bedrock's UserProvidesFeedback event.
-    when: UserProvidesFeedback(conversation, decision)
-
-    -- No git operations. Plan exists only in memory.
-    -- Agent may revise and call propose_plan again.
-    ensures: NoGitOperations(conversation)
-}
-
--- REQ-PROJ-004: User rejects task — no git operations
-rule TaskRejectionNoGitOps {
-    -- Subscribes to bedrock's UserRejectsTask event.
-    when: UserRejectsTask(conversation, decision)
-
-    -- Nothing was written to disk. Free to discard.
-    ensures: NoGitOperations(conversation)
-}
+-- REQ-PROJ-004 propose/feedback/reject loop: no git operations. The plan
+-- exists only in memory until UserApprovesTask fires; until then the
+-- agent can revise (UserProvidesFeedback) or the user can reject. This
+-- spec emits no rule for those events because there is nothing to
+-- specify — the bedrock state machine handles the transitions; this
+-- file only describes git side-effects, and there are none.
 
 -- ===========================================================
--- 4. PUSH AND TERMINAL ACTIONS (REQ-PROJ-026, REQ-PROJ-027)
+-- 4. TERMINAL ACTIONS (REQ-PROJ-026, REQ-PROJ-027)
 -- ===========================================================
-
--- REQ-PROJ-026/027: Agent pushes branch to origin (not a state transition)
-rule PushBranch {
-    when: AgentPushesCommits(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    requires: conversation.status = idle
-    requires: conversation.mode in { work, branch }
-
-    -- Push does NOT change mode or status. Conversation stays as-is.
-    ensures: conversation.status = idle
-
-    @guidance
-        -- Push is a bash command the agent runs (`git push origin <branch>`).
-        -- It is not a Phoenix UI action or state machine event.
-        -- This rule exists to document that push has no lifecycle side effects.
-        -- Push failures surface as tool output (auth, branch protection, etc.)
-        -- and the agent handles them like any other command failure.
-}
+--
+-- Push to remote is not modelled here. `git push` is a bash command the
+-- agent may run from inside a worktree; Phoenix imposes no policy
+-- beyond the bash-tool ban on `--force` (REQ-PROJ-019). Push has no
+-- lifecycle side effects and no Phoenix-side observable state — the
+-- terminal actions below (Mark-as-merged, Abandon) are the only
+-- user-initiated lifecycle events on a Work/Branch conversation.
 
 -- REQ-PROJ-026/027: User marks conversation as merged
 rule MarkAsMerged {
@@ -830,15 +809,17 @@ rule CommitsBehindPoll {
     -- Single-branch fetch before comparison (best-effort)
     ensures: BestEffortFetch(worktree.project.repo, worktree.base_branch)
 
-    ensures: conversation.commits_behind =
+    ensures: worktree.commits_behind =
         commits_between(worktree.branch_name, worktree.base_branch)
-    ensures: conversation.commits_ahead =
+    ensures: worktree.commits_ahead =
         commits_between(worktree.base_branch, worktree.branch_name)
 
-    -- Emit SSE only when values change
+    -- Emit SSE only when values change. SSE is conversation-scoped
+    -- (frontend subscribers attach to a conversation) but the values
+    -- belong to the worktree.
     ensures:
         if values_changed:
-            SseEmit(conversation, commits_behind, commits_ahead)
+            SseEmit(conversation, worktree.commits_behind, worktree.commits_ahead)
 
     @guidance
         -- `git fetch origin <base_branch>` before rev-list comparison.
@@ -1159,7 +1140,7 @@ surface ProjectManagement {
     facing: bedrock/User
 
     context conversation: bedrock/Conversation
-        where mode in { work, branch } and status = idle
+        where mode in { work, branch } and core_status = idle
 
     let worktree = Worktree{conversation: conversation}
 
