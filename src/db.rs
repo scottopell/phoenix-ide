@@ -1872,11 +1872,11 @@ mod tests {
     // precondition gates.
     //
     // These tests force-set parent state to ContextExhausted via
-    // `update_conversation_state` (public API on Database). This path
-    // bypasses the executor, so `cleanup_context_exhausted_worktree`
-    // never fires during setup — we can test Work/Branch/Explore
-    // worktree inheritance without needing a mocked filesystem
-    // worktree cleanup.
+    // `update_conversation_state` (public API on Database). As of
+    // task 24696 Phase 3 the executor no longer auto-cleans
+    // worktrees on context exhaustion, so the force-set path
+    // matches production behaviour: the parent's worktree fields
+    // are preserved for inheritance by the continuation.
     // ============================================================
 
     /// Helper: create a parent conversation with the given ConvMode, force-set its
