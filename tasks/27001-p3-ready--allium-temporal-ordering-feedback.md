@@ -139,3 +139,22 @@ causal ordering can be reframed as structural co-existence.
   least-invasive improvement
 - Related art: TLA+ has temporal operators; Alloy has `after`/`before`
   in its trace model; Event-B has event sequencing constraints
+
+## Related Allium feedback tasks
+
+- **Task 02683** — `allium-cross-spec-resolution-feedback` (p3).
+  `allium check` doesn't resolve cross-spec references: a bogus
+  `imported/NotARealEntity` is accepted without a diagnostic, and
+  typoed trigger names (e.g. `UserTriggerContinuation` vs the actual
+  `UserTriggersContinuation`) only surface as info-level, drowned in
+  legitimate cross-spec subscription infos. Orthogonal concern to the
+  temporal-ordering gap documented here; same upstream recipient.
+  Bundle them for submission if convenient.
+- **Task 08661** — `allium-skill-cross-spec-coordination-pattern`
+  (p3). Phoenix-local skill documentation proposal for a "Cross-Spec
+  Coordination" pattern in the Allium skill's `patterns.md`. Not
+  upstream feedback, but covers the same structural territory
+  (cross-spec rule subscriptions) that 02683 flags as an enforcement
+  gap. Useful context for the upstream recipient: Phoenix has been
+  working around this by convention and thinks the pattern deserves
+  documentation even before any language change.
