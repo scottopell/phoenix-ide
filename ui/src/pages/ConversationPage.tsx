@@ -846,34 +846,42 @@ export function ConversationPage() {
               >
                 Copy Summary
               </button>
-              {!conversation.continued_in_conv_id && (
-                // REQ-BED-031: abandon remains available on a context-exhausted
-                // parent as long as no continuation exists. Once continued, the
-                // abandon action belongs on the continuation.
-                <button
-                  type="button"
-                  className="context-exhausted-abandon"
-                  data-testid="context-exhausted-abandon"
-                  disabled={abandoningContextExhausted}
-                  onClick={async () => {
-                    if (!conversation?.id) return;
-                    const confirmed = window.confirm(
-                      'Abandon this conversation? Its worktree and task branch will be deleted.',
-                    );
-                    if (!confirmed) return;
-                    setAbandoningContextExhausted(true);
-                    try {
-                      await api.abandonTask(conversation.id);
-                    } catch (err) {
-                      showInfo(err instanceof Error ? err.message : 'Failed to abandon task');
-                    } finally {
-                      setAbandoningContextExhausted(false);
-                    }
-                  }}
-                >
-                  {abandoningContextExhausted ? 'Abandoning...' : 'Abandon'}
-                </button>
-              )}
+              {!conversation.continued_in_conv_id &&
+                (conversation.conv_mode_label === 'Work' ||
+                  conversation.conv_mode_label === 'Branch') && (
+                  // REQ-BED-031: abandon remains available on a context-exhausted
+                  // parent as long as no continuation exists. Once continued, the
+                  // abandon action belongs on the continuation. Only Work/Branch
+                  // mode have a worktree to tear down — `abandon-task` rejects
+                  // Explore/Direct with a 400, so the button only renders for
+                  // modes that the API accepts.
+                  <button
+                    type="button"
+                    className="context-exhausted-abandon"
+                    data-testid="context-exhausted-abandon"
+                    disabled={abandoningContextExhausted}
+                    onClick={async () => {
+                      if (!conversation?.id) return;
+                      const isBranch = conversation.conv_mode_label === 'Branch';
+                      const confirmed = window.confirm(
+                        isBranch
+                          ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
+                          : 'Abandon this task? The worktree and task branch will be deleted.',
+                      );
+                      if (!confirmed) return;
+                      setAbandoningContextExhausted(true);
+                      try {
+                        await api.abandonTask(conversation.id);
+                      } catch (err) {
+                        showInfo(err instanceof Error ? err.message : 'Failed to abandon task');
+                      } finally {
+                        setAbandoningContextExhausted(false);
+                      }
+                    }}
+                  >
+                    {abandoningContextExhausted ? 'Abandoning...' : 'Abandon'}
+                  </button>
+                )}
             </div>
             {contextExhaustedExpanded && (
               <pre className="context-exhausted-content">

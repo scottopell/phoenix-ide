@@ -660,9 +660,16 @@ impl Database {
         // UUIDs are ASCII; a `[..8]` char boundary always aligns. We still
         // guard with `get(..8)` to keep clippy's string-slice lint happy.
         let new_id_prefix = new_id.get(..8).unwrap_or(new_id.as_str());
-        let base_slug = parent.slug.as_deref().map_or_else(
+        // Always include the new conversation's id prefix in the slug so
+        // each call is unique-by-construction. Two concurrent same-parent
+        // calls can otherwise both observe the slug as available, both
+        // INSERT, and one hit a UNIQUE constraint failure *before* the
+        // TOCTOU `continued_in_conv_id IS NULL` UPDATE has a chance to
+        // arbitrate idempotency. Including the per-call UUID prefix
+        // eliminates that race entirely.
+        let actual_slug = parent.slug.as_deref().map_or_else(
             || format!("continued-{new_id_prefix}"),
-            |s| format!("{s}-continued"),
+            |s| format!("{s}-continued-{new_id_prefix}"),
         );
 
         let now = Utc::now();
@@ -670,28 +677,6 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let conv_mode_json = serde_json::to_string(&parent.conv_mode).unwrap();
 
-        // Resolve slug against the UNIQUE constraint *before* opening the
-        // transaction. Retrying INSERT inside a tx complicates rollback; we
-        // probe availability first and only suffix if the base is taken.
-        let mut actual_slug = base_slug.clone();
-        let mut attempts = 0u8;
-        loop {
-            let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1)")
-                .bind(&actual_slug)
-                .fetch_one(&self.pool)
-                .await?;
-            let exists: bool = row.get(0);
-            if !exists {
-                break;
-            }
-            attempts += 1;
-            if attempts >= 10 {
-                let uuid_str = uuid::Uuid::new_v4().to_string();
-                actual_slug = format!("{base_slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
-                break;
-            }
-            actual_slug = format!("{base_slug}-{:04x}", rand::random::<u16>());
-        }
         let title_str = schema::title_from_slug(&actual_slug);
 
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
