@@ -1,0 +1,416 @@
+-- allium: 3
+-- sse_wire.allium
+--
+-- SSE Wire Protocol: Server-Side Contract
+--
+-- Scope: The SSE wire protocol — what the server is obliged to emit,
+--        in what order, and under what conditions. The server-side
+--        dual to conversation_atom.allium (the client-side reducer).
+--
+-- Includes: All nine SSE event types (init, message, message_updated,
+--           state_change, token, agent_done, conversation_became_terminal,
+--           conversation_update, error); ordering constraints between them;
+--           the persist-before-broadcast invariant; broadcast-lag semantics.
+--
+-- Excludes: Client-side reducer behaviour (see conversation_atom.allium).
+--           Client reconnect lifecycle (see connection_machine.allium, task 02681).
+--           Bedrock state machine internals (see bedrock.allium).
+--           HTTP transport mechanics, TLS, authentication.
+--           Message content shape (opaque to this spec).
+--
+-- Self-contained: no `use` imports. External types (ConvState,
+--           MessageContent, Conversation shape) are declared opaque.
+--           Server-side specs govern their internals.
+--
+-- Rationale: task 02679 (streaming-finalizes-then-disappears) identified
+--           a class of bugs at the ordering boundary between DB persistence
+--           and SSE broadcast. Naming the ordering invariants formally makes
+--           emit-vs-persist races a spec violation rather than an open mystery.
+--
+-- Cross-references:
+--   specs/conversation_atom/conversation_atom.allium — client reducer (the dual)
+--   tasks/02679 — streaming-finalize-disappear bug; PersistBeforeBroadcast is
+--                 the formal statement of the leading fix hypothesis
+--   tasks/02681 — connection_machine.allium (reconnect lifecycle)
+--   src/api/wire.rs — SseWireEvent, the Rust wire type
+--   src/runtime.rs  — SseBroadcaster, sequence counter, send_message/send_seq
+--   src/api/sse.rs  — sse_stream, BroadcastStreamRecvError::Lagged handling
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Data carried in the init event. The reducer (conversation_atom.allium)
+-- governs how each field is applied. This spec stores last_sequence_id
+-- on the stream to anchor the sequence ordering guarantee.
+value InitSnapshot {
+    last_sequence_id: Integer
+    -- conversation, messages, breadcrumbs, agent_working, display_state,
+    -- context_window_size, model_context_window, commits_behind,
+    -- commits_ahead, project_name: opaque at this level.
+}
+
+-- A user-facing error broadcast as an error event. Carries a flat
+-- message string (for toasts) and an opaque typed kind (for
+-- future kind-aware affordances).
+value UserFacingError {
+    message: String
+    -- error kind and details: opaque
+}
+
+-- A partial conversation metadata update broadcast as conversation_update.
+-- All fields are optional; the client merges shallowly onto its local
+-- Conversation copy.
+value ConversationMetadataUpdate {
+    cwd: String?
+    -- branch_name, worktree_path, conv_mode_label, base_branch,
+    -- commits_behind, commits_ahead, task_title: opaque
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A message committed to SQLite for this conversation.
+-- Created by MessageCommittedToDb when the DB write completes.
+-- The sequence_id is pre-allocated by the broadcast channel before
+-- the DB write, then observed back via SseBroadcaster.observe_seq().
+entity PersistedMessage {
+    conversation_id: String
+    message_id: String
+    sequence_id: Integer
+}
+
+-- Join entity: records that a message-type SSE event was delivered
+-- on a specific stream. One StreamMessage is created per open stream
+-- when MessageBroadcast fires. Used by PersistBeforeBroadcast to
+-- assert every delivered message has a backing PersistedMessage.
+entity StreamMessage {
+    stream: SseStream
+    message_id: String
+    sequence_id: Integer
+}
+
+-- An active or closed SSE connection for one conversation.
+-- Created when a client subscribes (GET /api/conversations/:id/events).
+-- Closed when the client disconnects or broadcast lag is detected.
+entity SseStream {
+    conversation_id: String
+    status: StreamStatus
+    -- True once the init event has been delivered. No other event
+    -- may be delivered before init_sent becomes true.
+    init_sent: Boolean
+    -- The sequence_id of the last event delivered on this stream.
+    -- Starts at 0. Advances with every delivered event.
+    last_delivered_seq: Integer
+    -- The snapshot used to initialise this stream. Carries
+    -- last_sequence_id (the DB watermark at subscribe time) and
+    -- anchors the InitSnapshot type.
+    init_snapshot: InitSnapshot
+    -- The most recent user-facing error broadcast on this stream,
+    -- or null if no error has been broadcast.
+    last_error: UserFacingError?
+    -- The most recent metadata update broadcast on this stream,
+    -- or null if no update has been broadcast.
+    last_update: ConversationMetadataUpdate?
+
+    -- All message events delivered on this stream.
+    stream_messages: StreamMessage with stream = this
+
+    transitions status {
+        open -> closed
+        terminal: closed
+    }
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum StreamStatus { open | closed }
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Capacity of the per-conversation tokio broadcast channel.
+    -- Sized for ~80 seconds at 50 tokens/second. Exceeding this
+    -- triggers LagCloseStream.
+    broadcast_capacity: Integer = 4096
+}
+
+------------------------------------------------------------
+-- Rules — stream lifecycle
+------------------------------------------------------------
+
+-- On subscribe, a new SseStream is created and the init event is
+-- delivered as the very first event. init_sent is set true at
+-- creation; no other rule may deliver events to a stream with
+-- init_sent = false.
+rule StreamOpened {
+    when: ClientSubscribes(conversation_id, snapshot)
+
+    ensures: SseStream.created(
+        conversation_id: conversation_id,
+        status: open,
+        init_sent: true,
+        last_delivered_seq: snapshot.last_sequence_id,
+        init_snapshot: snapshot
+    )
+
+    @guidance
+        -- The init payload is a consistent DB snapshot taken at
+        -- subscribe time. It includes all persisted messages with
+        -- sequence_id <= snapshot.last_sequence_id. Because
+        -- PersistBeforeBroadcast holds, any message that was already
+        -- broadcast before this subscribe has sequence_id <=
+        -- last_sequence_id and appears in the snapshot — the client
+        -- receives no gaps.
+        --
+        -- init_sent is set true atomically with last_delivered_seq
+        -- at creation, enforcing InitAlwaysFirst by construction:
+        -- a stream that has observed any event (last_delivered_seq > 0)
+        -- necessarily has init_sent = true.
+}
+
+-- When the broadcast channel reports a lag (the client fell so far
+-- behind that the ring buffer wrapped), the stream closes. The client's
+-- EventSource observes the close, its ConnectionMachine schedules a
+-- reconnect, and the next subscribe delivers a fresh init that
+-- resyncs from the DB.
+rule LagCloseStream {
+    when: BroadcastLagDetected(stream, lagged_by)
+
+    requires: stream.status = open
+
+    ensures: stream.status = closed
+
+    @guidance
+        -- Implementation: BroadcastStream::take_while returns false on
+        -- BroadcastStreamRecvError::Lagged (src/api/sse.rs:sse_stream).
+        -- A tracing::warn! is emitted with conversation_id and lagged_by.
+        --
+        -- No events are silently dropped: SQLite holds all state
+        -- regardless of broadcast lag. The reconnect init snapshot is
+        -- equivalent to a fresh load — no gaps visible to the client.
+        -- See connection_machine.allium (task 02681) for the client-side
+        -- reconnect lifecycle.
+}
+
+------------------------------------------------------------
+-- Rules — message persistence and broadcast
+------------------------------------------------------------
+
+-- A message is committed to the SQLite database. The sequence_id was
+-- pre-allocated by SseBroadcaster.next_seq() before the DB write;
+-- this rule models the completion of that write.
+rule MessageCommittedToDb {
+    when: MessageCommittedToDb(conversation_id, message_id, sequence_id)
+
+    requires: sequence_id > 0
+
+    ensures: PersistedMessage.created(
+        conversation_id: conversation_id,
+        message_id: message_id,
+        sequence_id: sequence_id
+    )
+}
+
+-- After a message is persisted, a message event is broadcast to every
+-- open, initialized stream for this conversation. A StreamMessage join
+-- entity is created for each delivery, anchoring PersistBeforeBroadcast.
+rule MessageBroadcast {
+    when: msg: PersistedMessage.created
+
+    ensures:
+        for stream in SseStreams where conversation_id = msg.conversation_id and status = open and init_sent:
+            StreamMessage.created(
+                stream: stream,
+                message_id: msg.message_id,
+                sequence_id: msg.sequence_id
+            )
+            stream.last_delivered_seq = msg.sequence_id
+
+    @guidance
+        -- Implementation: SseBroadcaster.send_message(message) is called
+        -- after db.save_message() returns Ok (src/runtime.rs). The chain
+        -- PersistedMessage.created → MessageBroadcast mirrors this:
+        -- the DB commit is the enabling condition; the broadcast follows.
+        --
+        -- The message event's envelope sequence_id equals the message's
+        -- own sequence_id: SseWireEvent::Message { sequence_id, message }
+        -- where sequence_id = message.sequence_id (see src/api/wire.rs).
+}
+
+-- A message's mutable fields (display_data, content) changed.
+-- A message_updated event is broadcast to open streams.
+rule MessageUpdatedBroadcast {
+    when: MessageFieldsMutated(conv_id, message_id, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+
+    @guidance
+        -- message_updated is only meaningful after the corresponding
+        -- message event has been delivered (or is present in the init
+        -- snapshot). A client that receives message_updated before
+        -- message treats it as a silent no-op
+        -- (SseMessageUpdatedUnknownTarget in conversation_atom.allium).
+}
+
+------------------------------------------------------------
+-- Rules — state machine events
+------------------------------------------------------------
+
+-- A conversation phase transition is broadcast as state_change.
+rule StateChangeBroadcast {
+    when: ConversationStateTransitioned(conv_id, new_state, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+
+    @guidance
+        -- new_state is the opaque ConvState discriminated union. The
+        -- client routes it through parseConversationState for validation.
+        -- display_state is a human-readable string derived from new_state.
+}
+
+-- When a conversation reaches a terminal state, the terminal event is
+-- broadcast. The terminal subsystem uses this to tear down PTYs.
+rule ConversationBecameTerminalBroadcast {
+    when: ConversationEnteredTerminalState(conv_id, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+}
+
+-- Partial conversation metadata changes are broadcast as conversation_update.
+-- The client merges the payload shallowly onto its local Conversation copy.
+rule ConversationUpdateBroadcast {
+    when: ConversationMetadataChanged(conv_id, update, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+            stream.last_update = update
+}
+
+------------------------------------------------------------
+-- Rules — LLM turn events
+------------------------------------------------------------
+
+-- During an LLM turn, each streaming token is broadcast as a token
+-- event. Tokens are ephemeral: not persisted to SQLite and not
+-- included in reconnect init snapshots.
+rule TokenBroadcast {
+    when: LlmTokenReceived(conv_id, request_id, text, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+
+    @guidance
+        -- Tokens share the monotonic sequence counter with persisted
+        -- events (SseBroadcaster.send_seq). A reconnecting client's
+        -- applyIfNewer guard silently drops tokens whose seq <=
+        -- lastSequenceId — no gap visible to the user.
+        --
+        -- No StreamMessage is created for tokens: they are ephemeral
+        -- and PersistBeforeBroadcast does not apply to them.
+}
+
+-- When an LLM turn completes, agent_done is broadcast. The client uses
+-- this to clear the streaming buffer and transition phase to idle.
+rule AgentDoneBroadcast {
+    when: LlmTurnCompleted(conv_id, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+
+    @guidance
+        -- agent_done is emitted after the final message has been
+        -- persisted and broadcast (MessageBroadcast fires first via
+        -- the PersistedMessage.created chain). The client's
+        -- SseAgentDoneApplied rule clears streamingBuffer regardless
+        -- of whether sse_message arrived (replay recovery).
+}
+
+------------------------------------------------------------
+-- Rules — error events
+------------------------------------------------------------
+
+-- A user-facing error is broadcast as an error event.
+rule ErrorBroadcast {
+    when: UserFacingErrorOccurred(conv_id, error, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+            stream.last_error = error
+
+    @guidance
+        -- The error payload carries both a flat message string (for the
+        -- existing toast) and the typed UserFacingError (for future
+        -- kind-aware affordances). On reconnect, the error's sequence_id
+        -- routes through applyIfNewer — a replayed error is dropped.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- LOAD-BEARING: every message-type SSE event delivered on a stream
+-- (recorded as a StreamMessage) has a corresponding PersistedMessage
+-- in the database. This formalises the persist-before-broadcast
+-- ordering: the DB write commits before the broadcast fires.
+--
+-- Violation scenario (task 02679 hypothesis): MessageBroadcast fires
+-- before db.save_message() completes. A client that reconnects during
+-- the broadcast-lag close window issues a fresh init. The init reads
+-- from a DB that has not yet committed the message — the message
+-- appears to vanish from the conversation view.
+--
+-- The structural model captures this: a StreamMessage exists iff
+-- MessageBroadcast ran; a PersistedMessage exists iff
+-- MessageCommittedToDb ran. This invariant requires both to exist
+-- simultaneously, enforcing the ordering.
+invariant PersistBeforeBroadcast {
+    for stream in SseStreams:
+        for sm in stream.stream_messages:
+            exists PersistedMessage{message_id: sm.message_id, conversation_id: stream.conversation_id}
+}
+
+-- The init event is always the first event delivered on a stream.
+-- Structurally enforced: StreamOpened sets init_sent = true at
+-- stream creation, simultaneously with last_delivered_seq. A stream
+-- that has delivered any event (last_delivered_seq > 0) necessarily
+-- has init_sent = true.
+invariant InitAlwaysFirst {
+    for stream in SseStreams:
+        not stream.init_sent implies stream.last_delivered_seq = 0
+}
+
+-- Sequence IDs are non-negative on all streams.
+invariant SequencesNonNegative {
+    for stream in SseStreams:
+        stream.last_delivered_seq >= 0
+}
