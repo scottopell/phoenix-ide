@@ -1,7 +1,7 @@
 ---
 created: 2026-04-23
 priority: p1
-status: ready
+status: done
 artifact: src/api/sse.rs
 ---
 
@@ -154,3 +154,78 @@ integrates with `SseBroadcaster`.
 - **Task 02682** (`distill-user-message-queue-allium-spec`, p3) —
   unrelated to this bug but completes the set of client-side SSE
   specs recommended from the conversation that produced this task.
+
+## Resolution (2026-04-24)
+
+Fixed in commit `e1175ce` on main: **fix(sse): pre-allocate message seq
+from broadcaster before DB write (task 02679)**.
+
+### The actual bug (distinct from "option 4" in the plan above)
+
+The investigation plan proposed "persist to DB before broadcasting" as
+the lighter-weight fix. Reading the executor, the code *already* did
+that: every `send_message` was preceded by `storage.add_message(...)`.
+A literal happens-before read of PersistBeforeBroadcast was satisfied.
+
+The real bug is at one level deeper: **sequence-ID allocation**, not
+write ordering.
+
+- `db.add_message` allocated `sequence_id` via `SELECT MAX(seq)+1 FROM
+  messages` — a per-conversation message counter rooted in the DB.
+- `SseBroadcaster` has its own atomic counter that ephemeral events
+  (state_change, init, tokens, errors) increment via `next_seq()`.
+- These counters diverge: after a streaming LLM turn with many tokens,
+  `SseBroadcaster`'s counter sits at N ≫ DB message count. The
+  finalizing assistant message persists with DB seq ≈ `DB_count` ≪ N,
+  then `send_message` broadcasts it with that stale seq.
+- Client's `applyIfNewer` guard (`lastSequenceId = N`) drops the
+  message. Page refresh resurrects it because the fresh `init` reads
+  from DB, where it is persisted.
+
+Observed on prod via an `EventSource`-intercepting SSE log:
+`init seq=3 last_seq=3, token seq=4, token seq=5, message seq=2
+(dropped), state_change seq=6, agent_done seq=7` — the AI response
+vanishes visually despite being persisted.
+
+### Fix
+
+Pre-allocate `sequence_id` from `SseBroadcaster::next_seq()` *before*
+the DB write; persist via a new `Database::add_message_with_seq(seq,
+...)`. The message's own seq is strictly greater than every ephemeral
+event emitted earlier. `applyIfNewer` accepts it.
+
+- 7 call sites in `src/runtime/executor.rs` + 1 in
+  `src/api/lifecycle_handlers.rs` converted.
+- `MessageStore` trait extended with `add_message_with_seq` (plus
+  `Arc<T>`, `DatabaseStorage`, `InMemoryStorage` impls).
+- Non-broadcasting call sites (sub-agent bootstrap message in
+  `spawn_sub_agent`, crash-recovery restart marker) keep the plain
+  `add_message` — their seq-allocation race is benign because no
+  client ever observes their seq out of order.
+
+### Regression tests
+
+- `db::tests::test_add_message_with_seq_writes_caller_seq`
+- `runtime::broadcaster_tests::next_seq_after_ephemeral_events_exceeds_prior_events`
+- `runtime::broadcaster_tests::observe_seq_is_idempotent_when_counter_already_past`
+- `runtime::broadcaster_tests::observe_seq_catches_up_when_db_seq_leapfrogs`
+
+647 tests pass (+4 new). `./dev.py check` 12/12 pass.
+
+### Spec implications
+
+The `PersistBeforeBroadcast` invariant in
+`specs/sse_wire/sse_wire.allium` (on the `task-24694-distill-sse-wire-
+allium-spec` branch, not yet merged to main) correctly captures this
+bug as a spec violation: the join entity `StreamMessage` existing
+implies a `PersistedMessage` exists. Pre-fix, that held at a moment
+in time (the DB write did complete before the broadcast), but the
+*client's effective ordering* is by `sequence_id`, and a stale seq
+made the persisted message invisible. The fix restores alignment
+between the structural invariant and the observable client state.
+
+A follow-up task should update the allium temporal-ordering feedback
+(also on that branch) to note this lesson: "happens-before" intuitions
+that don't explicitly model the sequence-ID watermark miss
+sequence-allocation races like this one. The feedback item's existing
+workaround (join entity) survived contact with the real bug.
