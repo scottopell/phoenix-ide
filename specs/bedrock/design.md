@@ -1343,10 +1343,13 @@ on-disk-missing `worktree_path`:
 ### Interaction with other flows
 
 - `ApproveTask` from a continuation (Work mode) commits task completion
-  and destroys the worktree per REQ-BED-029. The parent's
-  `worktree_path` remains as a history reference but the path no longer
-  exists on disk — UI handles this gracefully by degrading file refs to
-  plain text rather than clickable links.
+  and destroys the worktree per REQ-BED-029 — the chain's normal
+  terminal semantics apply at the tail. The parent's `worktree_path`
+  is retained in its record for history navigation, but the path no
+  longer exists on disk after the destroy. UX handling of stale
+  references in the parent's transcript (clickable file refs, tool
+  invocations against the old worktree path, etc.) is not resolved by
+  this spec and is left as an open concern.
 - `ConfirmAbandon` / `MarkAsMerged` from a continuation's tail destroy
   the worktree per REQ-PROJ-026.
 - Sub-agents of the parent are unaffected. REQ-BED-024 specifies that
