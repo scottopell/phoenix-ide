@@ -71,12 +71,55 @@ subscriptions in general (most are legitimate — a rule listening for
 an event the runtime emits). But when 22 legitimate infos drown out
 3 typo infos, the signal is lost.
 
-## Suggested features (any one would have caught B1)
+## Second concrete bug (2026-04-24, found post-merge of 24696)
+
+While tightening the spec preconditions on `ConfirmAbandon` and
+`MarkAsMerged` in `specs/projects/projects.allium`, I discovered the
+rules had been carrying `requires: conversation.status = idle` for an
+unknown amount of time. The bedrock `Conversation` entity (defined in
+`specs/bedrock/bedrock.allium`) has **no `status` attribute** — only
+`core_status` (the run-status axis: idle/llm_requesting/etc.) and
+`parent_status` (the lifecycle axis: awaiting_recovery/
+awaiting_user_response/context_exhausted/terminal).
+
+The rule was attribute-typo'd, referencing a field that doesn't exist
+on the imported entity. `allium check` passed cleanly because the
+checker doesn't walk into bedrock to verify which fields
+`bedrock/Conversation` actually has. There are at least 4 occurrences
+of `conversation.status = ...` in `projects.allium` (lines 529, 533,
+549, 593 prior to the fix); each one is a no-op precondition that
+doesn't constrain anything.
+
+This is not a "did you mean?" miss — the right fix isn't a fuzzy
+suggestion (`status` -> `core_status` is plausible but `status` ->
+`parent_status` is also plausible, and the answer depends on what the
+rule means to gate). It's a structural-resolution miss: the checker
+should reject `conversation.status` outright when bedrock declares no
+such attribute on `Conversation`.
+
+This bug had real semantic teeth. The runtime check
+`if !matches!(conv.state, ConvState::Idle)` was *stricter* than what
+the spec said (`status = idle` resolved to nothing, so the spec
+imposed no state constraint at all). When a sub-agent in 24696 Phase 4
+asked "should I allow ContextExhausted here too?" the spec had no
+answer to give — the precondition that should have anchored the
+discussion was vacuous.
+
+Severity argument: the cross-spec bug in B1 (subscribing to a
+non-existent event) prevented a rule from ever firing — bad, but
+loudly visible at runtime. This bug is worse: a precondition that
+silently never constrains anything looks correct in code review and
+hides actual divergence between the spec contract and the runtime.
+
+## Suggested features (any one would have caught B1; #1 also catches the second bug)
 
 1. **Cross-spec resolution when imports are present.** When
-   `foo.allium` `use`s `bar.allium` and references `bar/Thing`, the
-   checker walks bar's declarations and looks for `Thing`. Unresolved
-   references become errors (or loud warnings).
+   `foo.allium` `use`s `bar.allium` and references `bar/Thing` or
+   `var.attribute` where `var` is typed as `bar/Thing`, the checker
+   walks bar's declarations to verify `Thing` exists *and* that
+   `Thing` has the named attribute. Unresolved references become
+   errors. This catches both the cross-spec event-name typo (B1) and
+   the cross-spec attribute typo (the second bug above).
 2. **"Did you mean?" fuzzy matching on unreachable triggers.** Given
    `when: UserTriggerContinuation(...)` with no provider, if an
    imported surface provides `UserTriggersContinuation(...)`, emit a
