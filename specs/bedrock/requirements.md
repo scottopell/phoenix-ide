@@ -449,19 +449,26 @@ THE SYSTEM SHALL immediately reflect the stopped state
 
 ---
 
-### REQ-BED-026: Sub-Agent Timeout Enforcement
+### REQ-BED-026: Sub-Agent Turn Limit and Timeout Enforcement
 
 WHEN sub-agent is spawned
 THE SYSTEM SHALL assign a mandatory time limit
+AND assign a mandatory turn limit (maximum LLM turns before termination)
 
 WHEN sub-agent exceeds its time limit without submitting a result
 THE SYSTEM SHALL terminate the sub-agent
 AND report timeout failure to parent conversation
 
-WHEN sub-agent timeout fires
+WHEN sub-agent reaches its turn limit without submitting a result
+THE SYSTEM SHALL grant one final "grace turn" in which tool use is disabled
+  (the sub-agent gets exactly one more LLM response to submit a result via the result-submission tool; any other output is ignored)
+AND if the grace turn does not produce a submitted result, terminate the sub-agent
+AND report turn-limit failure to parent conversation
+
+WHEN sub-agent timeout or turn limit fires
 THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
-**Rationale:** Without enforced time limits, a stuck or slow sub-agent can hold the parent conversation indefinitely. Users need assurance that sub-agent work will complete or fail within a bounded time.
+**Rationale:** Without enforced limits, a stuck or verbose sub-agent can hold the parent conversation indefinitely — either by wall-clock time (time limit) or by open-ended tool use (turn limit). Users need assurance that sub-agent work will complete or fail within bounded resources. The grace turn on turn-limit exit gives the sub-agent one last chance to synthesize a result from the work it already did, preserving useful output that would otherwise be discarded.
 
 ---
 

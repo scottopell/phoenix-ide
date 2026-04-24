@@ -688,7 +688,7 @@ rule ExploreWorktreeCleanupOnTerminal {
 -- transfers atomically. No `git worktree add` or `git worktree remove`
 -- runs -- the filesystem state is unchanged.
 rule WorktreeTransferredOnContinuation {
-    when: UserTriggerContinuation(parent, new_conv)
+    when: UserStartsContinuationConversation(parent, new_conv)
 
     requires: parent.parent_status = context_exhausted
     -- Explore is included: REQ-PROJ-028 / ManagedWorktreeOnFirstMessage
@@ -759,7 +759,7 @@ rule WorktreeTransferredOnContinuation {
 -- transferred branch inside the transferred worktree). Ensures a new
 -- task ID isn't minted for the same underlying task.
 rule WorkContinuationInheritsTaskId {
-    when: UserTriggerContinuation(parent, new_conv)
+    when: UserStartsContinuationConversation(parent, new_conv)
 
     requires: parent.parent_status = context_exhausted
     requires: parent.mode = work
@@ -775,7 +775,7 @@ rule WorkContinuationInheritsTaskId {
 -- above because REQ-PROJ-028 ensures every Explore conversation acquires
 -- a worktree on first message.
 rule DirectContinuationInheritsCwd {
-    when: UserTriggerContinuation(parent, new_conv)
+    when: UserStartsContinuationConversation(parent, new_conv)
 
     requires: parent.parent_status = context_exhausted
     requires: parent.mode = direct

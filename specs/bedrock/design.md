@@ -1377,10 +1377,13 @@ on-disk-missing `worktree_path`:
 
 ### Implementation sketch
 
-On the backend, a new `UserTriggerContinuation` handler (or extension of
-the existing Continue endpoint) constructs the new conversation's
-`ConvMode` variant by cloning the parent's and applying the inheritance
-table above. The DB transaction shape:
+On the backend, a new `UserStartsContinuationConversation` handler
+(distinct from the existing `UserTriggersContinuation` event which
+fires at the 80% warning threshold per REQ-BED-023) constructs the new
+conversation's `ConvMode` variant by cloning the parent's and applying
+the inheritance table above. Exposed on the `UserConversation` surface
+in bedrock.allium with the precondition `parent_status = context_exhausted
+and continued_in_conv_id = absent`. The DB transaction shape:
 
 ```sql
 BEGIN;
