@@ -580,7 +580,7 @@ WHEN user initiates continuation from a context-exhausted conversation
 THE SYSTEM SHALL create a new conversation that inherits:
   - the parent's conversation mode (Work → Work, Branch → Branch, Explore → Explore, Direct → Direct)
   - the parent's working directory
-  - the parent's worktree, if any (Work and Branch modes), via ownership transfer rather than destroy-and-recreate
+  - the parent's worktree, if any (Work, Branch, and Explore modes all have worktrees — see REQ-PROJ-028 for Explore worktree creation on first message), via ownership transfer rather than destroy-and-recreate
   - any uncommitted changes in that worktree
   - for Work mode, the parent's task_id and associated task file
 
