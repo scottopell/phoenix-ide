@@ -1,9 +1,11 @@
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
 use super::handlers::AppError;
-use super::types::{SuccessResponse, TaskApprovalResponse, TaskFeedbackRequest};
+use super::types::{
+    ConflictErrorResponse, SuccessResponse, TaskApprovalResponse, TaskFeedbackRequest,
+};
 use super::AppState;
-use crate::db::{ConvMode, MessageContent};
+use crate::db::{ConvMode, Conversation, MessageContent};
 use crate::git_ops::run_git;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
@@ -14,6 +16,36 @@ use axum::{
     Json,
 };
 use std::path::PathBuf;
+
+// ============================================================
+// Terminal-action gate (REQ-BED-031)
+// ============================================================
+
+/// Reject terminal user actions (abandon / mark-as-merged) when the
+/// conversation has an existing continuation. REQ-BED-031, enforced by
+/// the Allium `TerminalActionRequiresNoContinuation` invariant and the
+/// `continued_in_conv_id = absent` clause on the `ConfirmAbandon` and
+/// `MarkAsMerged` rules in `specs/projects/projects.allium`.
+///
+/// `action` is a human-readable verb phrase (e.g. `"abandon"`,
+/// `"mark as merged"`) that appears in the error message so the UI can
+/// present a coherent reason.
+///
+/// Returns 409 Conflict with `error_type = "continuation_exists"` so
+/// the frontend can dispatch on it (Phase 5) — e.g. offer to route to
+/// the continuation instead of showing the raw error text.
+fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError> {
+    if let Some(continuation_id) = conv.continued_in_conv_id.as_deref() {
+        return Err(AppError::Conflict(ConflictErrorResponse::new(
+            format!(
+                "Cannot {action} a conversation that has been continued. \
+                 The action belongs on the continuation conversation ({continuation_id})."
+            ),
+            "continuation_exists",
+        )));
+    }
+    Ok(())
+}
 
 // ============================================================
 // Task Approval (REQ-BED-028)
@@ -148,6 +180,10 @@ pub(crate) async fn abandon_task(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    // REQ-BED-031: reject if the conversation has already been continued.
+    // The live conversation is the continuation; terminal actions belong there.
+    reject_if_continued(&conv, "abandon")?;
 
     if !matches!(conv.state, ConvState::Idle) {
         return Err(AppError::BadRequest(
@@ -411,6 +447,7 @@ pub(crate) async fn abandon_task(
 
 /// Mark a Work or Branch conversation as merged: delete worktree, optionally delete branch,
 /// transition to Terminal. The user has already merged/PR'd the branch externally.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -422,6 +459,10 @@ pub(crate) async fn mark_merged(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    // REQ-BED-031: reject if the conversation has already been continued.
+    // The live conversation is the continuation; terminal actions belong there.
+    reject_if_continued(&conv, "mark as merged")?;
 
     if !matches!(conv.state, ConvState::Idle) {
         return Err(AppError::BadRequest(
@@ -529,4 +570,133 @@ pub(crate) async fn mark_merged(
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    //! REQ-BED-031 gate tests for the abandon and mark-as-merged handlers.
+    //!
+    //! The gate logic lives in [`reject_if_continued`], which both
+    //! `abandon_task` and `mark_merged` invoke immediately after reading
+    //! the conversation and before any worktree/branch destruction. The
+    //! "state did NOT change on reject" property in REQ-BED-031 is
+    //! therefore enforced structurally: the handler returns `Err` via
+    //! `?` before reaching the `run_git` or `send_event` calls. These
+    //! tests cover the gate itself; integration coverage of the full
+    //! handler flow would require a full `AppState` harness that does
+    //! not currently exist in the repo (Phase 2 tested `Database::
+    //! continue_conversation` at the DB layer for the same reason).
+    use super::*;
+    use crate::db::{ConvMode, Conversation, NonEmptyString};
+    use crate::state_machine::state::ConvState;
+    use chrono::{TimeZone, Utc};
+
+    fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
+        let ts = Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap();
+        Conversation {
+            id: id.to_string(),
+            slug: Some(format!("slug-{id}")),
+            title: Some(format!("Title {id}")),
+            cwd: "/tmp/work".to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: ts,
+            created_at: ts,
+            updated_at: ts,
+            archived: false,
+            model: None,
+            project_id: Some("proj-1".to_string()),
+            conv_mode: ConvMode::Work {
+                branch_name: NonEmptyString::new("task-24696-gate").unwrap(),
+                worktree_path: NonEmptyString::new("/tmp/wt/gate").unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("TK24696").unwrap(),
+                task_title: NonEmptyString::new("Gate test").unwrap(),
+            },
+            desired_base_branch: None,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id,
+        }
+    }
+
+    // ---- abandon gate -------------------------------------------------
+
+    /// Unblocked: `continued_in_conv_id = None` — gate passes, handler
+    /// proceeds with existing abandon logic.
+    #[test]
+    fn abandon_gate_passes_when_no_continuation() {
+        let conv = fixture("parent-a", None);
+        assert!(reject_if_continued(&conv, "abandon").is_ok());
+    }
+
+    /// Blocked: `continued_in_conv_id = Some(...)` — gate returns 409
+    /// with `error_type = "continuation_exists"` and a message naming
+    /// the continuation id. Structurally prevents the handler from
+    /// reaching worktree/branch destruction (REQ-BED-031).
+    #[test]
+    fn abandon_gate_rejects_when_continuation_exists() {
+        let conv = fixture("parent-a", Some("child-conv-id".to_string()));
+        let err = reject_if_continued(&conv, "abandon")
+            .expect_err("gate must reject when continued_in_conv_id is set");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "continuation_exists");
+                assert!(
+                    detail.error.contains("Cannot abandon"),
+                    "error must name the action: {}",
+                    detail.error
+                );
+                assert!(
+                    detail.error.contains("child-conv-id"),
+                    "error must include the continuation id for FE routing: {}",
+                    detail.error
+                );
+            }
+            _ => panic!("expected AppError::Conflict, got a different variant"),
+        }
+    }
+
+    // ---- mark-as-merged gate ------------------------------------------
+
+    /// Unblocked: `continued_in_conv_id = None` — gate passes, handler
+    /// proceeds with existing mark-merged logic.
+    #[test]
+    fn mark_merged_gate_passes_when_no_continuation() {
+        let conv = fixture("parent-m", None);
+        assert!(reject_if_continued(&conv, "mark as merged").is_ok());
+    }
+
+    /// Blocked: `continued_in_conv_id = Some(...)` — gate returns 409
+    /// with `error_type = "continuation_exists"` and a message naming
+    /// the continuation id. Structurally prevents the handler from
+    /// reaching worktree/branch destruction (REQ-BED-031).
+    #[test]
+    fn mark_merged_gate_rejects_when_continuation_exists() {
+        let conv = fixture("parent-m", Some("child-conv-id".to_string()));
+        let err = reject_if_continued(&conv, "mark as merged")
+            .expect_err("gate must reject when continued_in_conv_id is set");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "continuation_exists");
+                assert!(
+                    detail.error.contains("Cannot mark as merged"),
+                    "error must name the action: {}",
+                    detail.error
+                );
+                assert!(
+                    detail.error.contains("child-conv-id"),
+                    "error must include the continuation id for FE routing: {}",
+                    detail.error
+                );
+            }
+            _ => panic!("expected AppError::Conflict, got a different variant"),
+        }
+    }
 }
