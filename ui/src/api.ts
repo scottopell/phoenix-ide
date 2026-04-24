@@ -52,6 +52,10 @@ export interface Conversation {
   /** Slug of the seed parent, resolved server-side for the breadcrumb link.
    *  `null` if the parent has been deleted; UI renders unlinked text. */
   seed_parent_slug?: string | null;
+  /** Continuation pointer (REQ-BED-030). If this conversation has been
+   *  continued into a new conversation (context-exhausted handoff), this is
+   *  the continuation's id. Unused by the UI in Phase 1 of task 24696. */
+  continued_in_conv_id?: string | null;
 }
 
 export interface Project {

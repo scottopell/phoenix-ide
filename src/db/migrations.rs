@@ -24,6 +24,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "backfill_empty_convmode_fields",
         sql: MIGRATION_002,
     },
+    Migration {
+        version: 3,
+        name: "add_continued_in_conv_id_column",
+        sql: MIGRATION_003,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -71,6 +76,16 @@ SET conv_mode = '{"mode":"Explore"}',
     state = '{"type":"idle"}'
 WHERE conv_mode LIKE '%__LEGACY_EMPTY__%';
 "#;
+
+/// Add the `continued_in_conv_id` column to `conversations` (REQ-BED-030).
+///
+/// Phase 1 of task 24696: data-foundation for Context Continuation Worktree
+/// Transfer. A nullable self-referential foreign key; existing rows default to
+/// NULL (`SQLite`'s default for a nullable ADD COLUMN). The column is unused at
+/// runtime in Phase 1 — later phases wire it into the continuation handoff.
+const MIGRATION_003: &str = r"
+ALTER TABLE conversations ADD COLUMN continued_in_conv_id TEXT REFERENCES conversations(id);
+";
 
 /// Run all pending migrations against the database.
 ///
@@ -170,7 +185,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 2);
+        assert_eq!(first, 3);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -309,6 +324,48 @@ mod tests {
         assert!(
             state.contains("tool_executing"),
             "State should be preserved: {state}"
+        );
+    }
+
+    /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`
+    /// column on `conversations`. Existing rows default to NULL and the column
+    /// should be queryable via `PRAGMA table_info` after migration.
+    #[tokio::test]
+    async fn migration_003_adds_continued_in_conv_id_column() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // Seed a row before the migration so we can assert the backfill is NULL.
+        sqlx::query(
+            "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+             VALUES ('c-pre', '{\"mode\":\"Explore\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "continued_in_conv_id"),
+            "Expected continued_in_conv_id column after migration 003, got: {columns:?}"
+        );
+
+        let row = sqlx::query("SELECT continued_in_conv_id FROM conversations WHERE id = 'c-pre'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let continued: Option<String> = row.get("continued_in_conv_id");
+        assert!(
+            continued.is_none(),
+            "Existing rows should backfill NULL, got: {continued:?}"
         );
     }
 }

@@ -59,7 +59,12 @@ impl Database {
         Ok(db)
     }
 
-    /// Open an in-memory database (for testing)
+    /// Open an in-memory database (for testing).
+    ///
+    /// Runs both the legacy idempotent ALTER TABLEs (`run_migrations`) and the
+    /// numbered migrations (`run_pending_migrations`), mirroring the production
+    /// startup sequence in `main.rs`. Without this, tests that exercise columns
+    /// added by numbered migrations would fail against a half-initialized DB.
     #[allow(dead_code)] // Used in tests
     pub async fn open_in_memory() -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
@@ -73,6 +78,7 @@ impl Database {
             .await?;
         let db = Self { pool };
         db.run_migrations().await?;
+        migrations::run_pending_migrations(&db.pool).await?;
         Ok(db)
     }
 
@@ -430,6 +436,8 @@ impl Database {
             message_count: 0,
             seed_parent_id: seed_parent_id.map(String::from),
             seed_label: seed_label.map(String::from),
+            // REQ-BED-030: fresh conversations have not been continued.
+            continued_in_conv_id: None,
         })
     }
 
@@ -439,7 +447,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -459,7 +467,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -479,7 +487,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -498,7 +506,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -603,7 +611,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -1071,6 +1079,9 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let seed_label: Option<String> = row
         .try_get::<Option<String>, _>("seed_label")
         .unwrap_or(None);
+    let continued_in_conv_id: Option<String> = row
+        .try_get::<Option<String>, _>("continued_in_conv_id")
+        .unwrap_or(None);
 
     Ok(Conversation {
         id,
@@ -1093,6 +1104,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         message_count: row.try_get("message_count")?,
         seed_parent_id,
         seed_label,
+        continued_in_conv_id,
     })
 }
 
@@ -1572,6 +1584,50 @@ mod tests {
         assert_eq!(
             db.get_conversation("id-2").await.unwrap().slug,
             Some(second_slug)
+        );
+    }
+
+    /// REQ-BED-030 Phase 1 (task 24696): the `continued_in_conv_id` column
+    /// round-trips through the sqlx read/write path. Fresh rows read back as
+    /// `None`; rows with the column populated (via direct SQL here, since
+    /// the public handoff API arrives in Phase 2) read back as `Some`.
+    #[tokio::test]
+    async fn test_continued_in_conv_id_db_round_trip() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Fresh conversation: the column is NULL, so the struct field is None.
+        let fresh = db
+            .create_conversation("conv-parent", "parent-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.continued_in_conv_id, None);
+
+        let fetched = db.get_conversation("conv-parent").await.unwrap();
+        assert_eq!(fetched.continued_in_conv_id, None);
+
+        // Simulate a continuation: create a second conversation, then point
+        // parent -> child via direct SQL. Phase 2 will expose a typed API;
+        // Phase 1 just needs the read path to surface the column.
+        db.create_conversation("conv-child", "child-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind("conv-child")
+            .bind("conv-parent")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let parent = db.get_conversation("conv-parent").await.unwrap();
+        assert_eq!(parent.continued_in_conv_id, Some("conv-child".to_string()));
+
+        // List paths surface the same field.
+        let list = db.list_conversations().await.unwrap();
+        let from_list = list.iter().find(|c| c.id == "conv-parent").unwrap();
+        assert_eq!(
+            from_list.continued_in_conv_id,
+            Some("conv-child".to_string())
         );
     }
 
