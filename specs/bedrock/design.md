@@ -1234,6 +1234,149 @@ enum ErrorKind {
 | ContextExhausted | * | ContextExhausted | No-op |
 | Idle | UserTriggerContinuation | AwaitingContinuation | PersistState, RequestContinuation |
 
+## Context Continuation Worktree Transfer (REQ-BED-030, REQ-BED-031)
+
+### Problem
+
+When a Work- or Branch-mode conversation hits context exhaustion mid-task,
+the user's environment — branch, worktree, uncommitted changes — needs to
+survive the handoff to a continuation conversation. The prior design
+destroyed the worktree on the terminal transition (Work demoted to Explore,
+Branch demoted to Direct; branch preserved in git but the conversation
+record lost its `branch_name` field). The continuation flow had no
+mechanism to reach the preserved branch, and uncommitted changes were lost
+to `git worktree remove --force`.
+
+### Design
+
+Worktree cleanup is removed from the automatic context-exhausted terminal
+transition. Context-exhausted is a paused state: the worktree persists
+until the user takes an explicit action (continue, abandon, or
+mark-as-merged on the continuation chain's tail).
+
+When the user clicks Continue on a context-exhausted parent:
+
+1. A new conversation record is created. It inherits the parent's
+   `conv_mode` (Work → Work, Branch → Branch, Explore → Explore,
+   Direct → Direct) and the parent's `cwd`. For Work/Branch, it
+   inherits the parent's `branch_name`, `base_branch`, `worktree_path`,
+   and (Work only) `task_id`.
+2. The parent's record gains a `continued_in_conv_id: String?` field
+   pointing at the new conversation.
+
+Both steps execute in a single DB transaction. Either the continuation
+is created with the full inheritance or no state changes.
+
+### Data model
+
+`conversations` table gains:
+
+```sql
+continued_in_conv_id TEXT NULLABLE REFERENCES conversations(id)
+```
+
+The parent retains `worktree_path` in its `ConvMode::Work` / `ConvMode::Branch`
+as a read-only history reference. The continuation's `ConvMode` holds the
+same `worktree_path`. Two rows reference the same worktree path; ownership
+is derived from the `continued_in_conv_id` pointer:
+
+- A Work/Branch row with `continued_in_conv_id = null` owns its worktree.
+- A Work/Branch row with `continued_in_conv_id` set does NOT own its worktree
+  (the continuation does). The path is retained for history, not mutation.
+
+There is no separate worktree registry table (per REQ-PROJ-015 DESCOPED);
+`ConvMode::Work` and `ConvMode::Branch` rows serve as the de facto
+registry. Ownership queries filter by `continued_in_conv_id = null` to
+find active owners.
+
+### Mode-specific inheritance
+
+| Parent mode | Continuation mode | Worktree | Branch | Task |
+|---|---|---|---|---|
+| Work | Work | transferred | same `branch_name` | same `task_id` |
+| Branch | Branch | transferred | same `branch_name` | — |
+| Explore | Explore | — (no worktree) | — | — |
+| Direct | Direct | — (no worktree) | — | — |
+
+For modes without a worktree (Explore, Direct), the continuation
+inherits only the `cwd` and the continuation summary. No filesystem or
+registry changes are needed. Direct covers both git-repo and non-git
+working directories per the `ConvMode::Direct` variant in the
+implementation — there is no separate Standalone mode.
+
+### Fork policy
+
+`continued_in_conv_id` is single-valued. A parent has at most one
+continuation. If the user revisits the parent after continuing, the
+Continue action is replaced by a navigation link to the existing
+continuation. Users who want to fork must use git operations outside
+the app to create a second branch.
+
+### Abandon policy
+
+| Parent state | Abandon available |
+|---|---|
+| Context-exhausted, `continued_in_conv_id = null` | Yes; normal abandon flow applies |
+| Context-exhausted, `continued_in_conv_id != null` | No; user abandons the continuation instead |
+
+The semantics match REQ-PROJ-026's abandon flow. Work abandon removes
+the worktree and the branch; Branch abandon removes the worktree and
+preserves the branch.
+
+### Server restart reconciliation
+
+`reconcile_worktrees` at startup treats context-exhausted conversations
+as preserved, not orphaned. For each Work/Branch row with an
+on-disk-missing `worktree_path`:
+
+- If the conversation is context-exhausted, skip it entirely (worktree
+  was intentionally preserved pending user action; missing-on-disk
+  shouldn't happen but if it does, don't compound the problem by
+  demoting).
+- If the conversation has `continued_in_conv_id` set, skip it — the
+  history reference on the parent is expected to point at a path the
+  continuation may have destroyed via its own terminal action.
+- Otherwise, apply the existing demotion: Work → Explore, Branch →
+  Direct, cwd reset to project root. This path now covers only genuine
+  orphans (crashes, external `git worktree remove` by the user).
+
+### Interaction with other flows
+
+- `ApproveTask` from a continuation (Work mode) commits task completion
+  and destroys the worktree per REQ-BED-029. The parent's
+  `worktree_path` remains as a history reference but the path no longer
+  exists on disk — UI handles this gracefully by degrading file refs to
+  plain text rather than clickable links.
+- `ConfirmAbandon` / `MarkAsMerged` from a continuation's tail destroy
+  the worktree per REQ-PROJ-026.
+- Sub-agents of the parent are unaffected. REQ-BED-024 specifies that
+  sub-agent context exhaustion fails immediately with no continuation;
+  sub-agents never reach a state where they would need worktree transfer.
+- Task 08678 (auto-stash on cleanup) is obviated: uncommitted changes
+  ride the worktree to the continuation because no cleanup happens.
+
+### Implementation sketch
+
+On the backend, a new `UserTriggerContinuation` handler (or extension of
+the existing Continue endpoint) constructs the new conversation's
+`ConvMode` variant by cloning the parent's and applying the inheritance
+table above. The DB transaction shape:
+
+```sql
+BEGIN;
+INSERT INTO conversations (id, conv_mode, cwd, ..., task_id)
+  VALUES (new_id, <parent's mode clone>, <parent's cwd>, ...);
+UPDATE conversations
+  SET continued_in_conv_id = new_id
+  WHERE id = parent_id;
+COMMIT;
+```
+
+The atomicity of both steps is load-bearing: a partial apply would leave
+the parent claiming ownership of a worktree while the continuation
+expects to inherit it, or a continuation record with no parent linkage
+back (stranding the continuation if the parent row is later read).
+
 ## File Organization
 
 ```
