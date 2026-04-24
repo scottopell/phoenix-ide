@@ -1295,14 +1295,20 @@ find active owners.
 |---|---|---|---|---|
 | Work | Work | transferred | same `branch_name` | same `task_id` |
 | Branch | Branch | transferred | same `branch_name` | — |
-| Explore | Explore | — (no worktree) | — | — |
+| Explore | Explore | transferred | same temp `branch_name` (pre-approval) | — |
 | Direct | Direct | — (no worktree) | — | — |
 
-For modes without a worktree (Explore, Direct), the continuation
-inherits only the `cwd` and the continuation summary. No filesystem or
-registry changes are needed. Direct covers both git-repo and non-git
+Explore has a worktree in all cases: REQ-PROJ-028 /
+`ManagedWorktreeOnFirstMessage` creates one on first message with a
+temp branch name (e.g., `task-pending-{conv_id}`) before any task
+approval. A context-exhausted Explore conversation therefore has a
+worktree to transfer, same semantics as Work/Branch.
+
+Only Direct has no worktree. Direct covers both git-repo and non-git
 working directories per the `ConvMode::Direct` variant in the
-implementation — there is no separate Standalone mode.
+implementation — there is no separate Standalone mode. The
+continuation inherits only the `cwd` and the continuation summary. No
+filesystem or registry changes are needed for Direct.
 
 ### Fork policy
 

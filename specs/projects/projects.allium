@@ -633,6 +633,15 @@ rule ExploreWorktreeCleanupOnTerminal {
 
     requires: conversation.mode = explore
     requires: exists Worktree{conversation: conversation}
+    -- REQ-BED-031 exemption: context-exhausted Explore conversations
+    -- with a worktree are paused pending user action (continue or
+    -- abandon), not normal-flow terminal cleanups. The worktree is
+    -- preserved; cleanup fires only on actual terminal actions
+    -- (ConfirmAbandon, MarkAsMerged) where continued_in_conv_id is
+    -- absent. See WorktreeTransferredOnContinuation for the transfer
+    -- path and AbandonRequiresNoContinuation for the gate.
+    requires: conversation.parent_status != context_exhausted
+    requires: conversation.continued_in_conv_id = absent
 
     let worktree = Worktree{conversation: conversation}
 
@@ -645,6 +654,8 @@ rule ExploreWorktreeCleanupOnTerminal {
         -- The temp branch (task-pending-*) and worktree are cleaned up.
         -- Complements ServerRestartWorktreeReconciliation, which catches
         -- the crash case. This rule handles the normal-operation case.
+        -- Skips context-exhausted conversations and conversations with
+        -- a continuation — those paths preserve the worktree.
 }
 
 -- REQ-BED-030/031: Context-exhausted Work/Branch conversations are a
@@ -674,7 +685,11 @@ rule WorktreeTransferredOnContinuation {
     when: UserTriggerContinuation(parent, new_conv)
 
     requires: parent.parent_status = context_exhausted
-    requires: parent.mode in { work, branch }
+    -- Explore is included: REQ-PROJ-028 / ManagedWorktreeOnFirstMessage
+    -- creates a worktree (on a temp branch) for every Explore conversation
+    -- on first message, before any task approval. A context-exhausted
+    -- Explore conversation therefore has a worktree to transfer.
+    requires: parent.mode in { work, branch, explore }
     requires: exists Worktree{conversation: parent}
     -- Single-continuation policy: the parent may not already have one.
     requires: parent.continued_in_conv_id = absent
@@ -704,12 +719,14 @@ rule WorktreeTransferredOnContinuation {
         -- model change (continued_in_conv_id column), the atomic
         -- DB transaction sketch, and the mode-inheritance table.
         --
-        -- Inheritance table (this rule covers the Work and Branch rows):
-        --   Work   -> Work:   worktree transferred, branch_name + task_id inherited
-        --   Branch -> Branch: worktree transferred, branch_name inherited
-        --   Explore, Direct: no worktree to transfer (covered by a
-        --     separate rule below; filesystem unchanged, only cwd
-        --     and mode are inherited).
+        -- Inheritance table (this rule covers the Work, Branch, and
+        -- Explore rows):
+        --   Work    -> Work:    worktree transferred, branch_name + task_id inherited
+        --   Branch  -> Branch:  worktree transferred, branch_name inherited
+        --   Explore -> Explore: worktree transferred, temp branch_name inherited
+        --   Direct  -> Direct:  no worktree to transfer (covered by
+        --     DirectContinuationInheritsCwd below; filesystem
+        --     unchanged, only cwd and mode are inherited).
         --
         -- Atomicity:
         --   BEGIN;
@@ -745,15 +762,17 @@ rule WorkContinuationInheritsTaskId {
     ensures: new_conv.task_id = parent.task_id
 }
 
--- REQ-BED-030: Explore and Direct parents have no worktree, so
--- continuation inherits only cwd and mode. No ownership transfer
--- happens; the filesystem is untouched; no WorktreeTransferred
--- rule fires for these modes.
-rule WorktreelessContinuationInheritsCwd {
+-- REQ-BED-030: Direct parents have no worktree, so continuation
+-- inherits only cwd and mode. No ownership transfer happens; the
+-- filesystem is untouched; WorktreeTransferredOnContinuation does not
+-- fire for Direct. Explore is covered by WorktreeTransferredOnContinuation
+-- above because REQ-PROJ-028 ensures every Explore conversation acquires
+-- a worktree on first message.
+rule DirectContinuationInheritsCwd {
     when: UserTriggerContinuation(parent, new_conv)
 
     requires: parent.parent_status = context_exhausted
-    requires: parent.mode in { explore, direct }
+    requires: parent.mode = direct
     requires: parent.continued_in_conv_id = absent
 
     ensures: new_conv.mode = parent.mode
@@ -761,11 +780,10 @@ rule WorktreelessContinuationInheritsCwd {
     ensures: parent.continued_in_conv_id = new_conv.id
 
     @guidance
-        -- For modes without a worktree (Explore, Direct), the
-        -- continuation inherits only the cwd and (via bedrock) the
-        -- continuation summary. No filesystem or registry changes.
         -- Direct covers both git-repo and non-git working directories
         -- per REQ-PROJ-018 -- there is no separate Standalone mode.
+        -- The continuation inherits only the cwd and (via bedrock) the
+        -- continuation summary. No filesystem or registry changes.
         --
         -- Note: an Explore conversation with a worktree (created by
         -- ManagedWorktreeOnFirstMessage but never promoted to Work via
