@@ -126,6 +126,7 @@ export function ConversationPage() {
   // Context-full banner: summary expanded by default; user can collapse to
   // read the conversation above.
   const [contextExhaustedExpanded, setContextExhaustedExpanded] = useState(true);
+  const [abandoningContextExhausted, setAbandoningContextExhausted] = useState(false);
   // Terminal split-pane height — collapses to a 32px header strip
   const terminalPane = useResizablePane({
     key: 'terminal-height',
@@ -806,10 +807,22 @@ export function ConversationPage() {
                   onClick={async () => {
                     if (convStateForChildren.type !== 'context_exhausted') return;
                     if (!conversation?.id) return;
+                    const summary = convStateForChildren.summary;
                     try {
                       const res = await api.continueConversation(conversation.id);
                       if (res.already_existed) {
                         showInfo('Returning to your existing continuation');
+                      } else if (res.conversation_id && summary) {
+                        // Pre-populate the continuation's input with the
+                        // summary so the user can edit it before sending
+                        // the first message. The seed-draft hydration
+                        // useEffect on the new page picks this up and
+                        // clears the key.
+                        try {
+                          localStorage.setItem(`seed-draft:${res.conversation_id}`, summary);
+                        } catch {
+                          // ignore storage failures — navigation still works
+                        }
                       }
                       if (res.slug) {
                         navigate(`/c/${res.slug}`);
@@ -833,6 +846,34 @@ export function ConversationPage() {
               >
                 Copy Summary
               </button>
+              {!conversation.continued_in_conv_id && (
+                // REQ-BED-031: abandon remains available on a context-exhausted
+                // parent as long as no continuation exists. Once continued, the
+                // abandon action belongs on the continuation.
+                <button
+                  type="button"
+                  className="context-exhausted-abandon"
+                  data-testid="context-exhausted-abandon"
+                  disabled={abandoningContextExhausted}
+                  onClick={async () => {
+                    if (!conversation?.id) return;
+                    const confirmed = window.confirm(
+                      'Abandon this conversation? Its worktree and task branch will be deleted.',
+                    );
+                    if (!confirmed) return;
+                    setAbandoningContextExhausted(true);
+                    try {
+                      await api.abandonTask(conversation.id);
+                    } catch (err) {
+                      showInfo(err instanceof Error ? err.message : 'Failed to abandon task');
+                    } finally {
+                      setAbandoningContextExhausted(false);
+                    }
+                  }}
+                >
+                  {abandoningContextExhausted ? 'Abandoning...' : 'Abandon'}
+                </button>
+              )}
             </div>
             {contextExhaustedExpanded && (
               <pre className="context-exhausted-content">

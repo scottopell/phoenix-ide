@@ -568,7 +568,7 @@ async fn create_conversation(
                 (mode, info.worktree_path)
             }
             Err(BranchWorktreeError::Conflict { slug }) => {
-                return Err(AppError::Conflict(
+                return Err(AppError::Conflict(Box::new(
                     ConflictErrorResponse::new(
                         format!(
                             "Branch already has an active conversation: {slug}. \
@@ -577,7 +577,7 @@ async fn create_conversation(
                         "branch_already_active",
                     )
                     .with_conflict_slug(slug),
-                ));
+                )));
             }
             Err(BranchWorktreeError::Git(msg)) => {
                 return Err(AppError::Internal(msg));
@@ -1573,13 +1573,13 @@ async fn continue_conversation(
                 state = state_variant,
                 "continuation rejected: parent is not context-exhausted",
             );
-            Err(AppError::Conflict(ConflictErrorResponse::new(
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 format!(
                     "Conversation is not in context-exhausted state (current: {state_variant}); \
                      only context-exhausted conversations can be continued."
                 ),
                 "parent_not_context_exhausted",
-            )))
+            ))))
         }
     }
 }
@@ -1610,10 +1610,10 @@ async fn respond_to_question(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
-        return Err(AppError::Conflict(ConflictErrorResponse::new(
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
-        )));
+        ))));
     }
 
     // 2. Dispatch response event to state machine
@@ -2817,8 +2817,11 @@ pub(super) enum AppError {
     BadRequest(String),
     NotFound(String),
     Internal(String),
-    /// 409 — conflict (dirty worktree, merge conflicts, etc.)
-    Conflict(ConflictErrorResponse),
+    /// 409 — conflict (dirty worktree, merge conflicts, etc.). Boxed because
+    /// `ConflictErrorResponse` is the largest variant and grew with
+    /// `continuation_id` (REQ-BED-031) — boxing keeps `AppError` compact so
+    /// `Result<_, AppError>` isn't needlessly heavy in every handler.
+    Conflict(Box<ConflictErrorResponse>),
     /// 422 — expansion reference validation failure (REQ-IR-007)
     UnprocessableEntity(ExpansionErrorResponse),
 }
@@ -2848,7 +2851,7 @@ impl IntoResponse for AppError {
             }
             AppError::Conflict(detail) => {
                 tracing::warn!(error_type = %detail.error_type, error = %detail.error, "409 Conflict");
-                (StatusCode::CONFLICT, Json(detail)).into_response()
+                (StatusCode::CONFLICT, Json(*detail)).into_response()
             }
             AppError::UnprocessableEntity(ref detail) => {
                 tracing::warn!(error = %detail.error, "422 Unprocessable Entity");
