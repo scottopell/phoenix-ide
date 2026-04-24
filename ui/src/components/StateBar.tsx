@@ -44,7 +44,7 @@ function formatContextWindow(n: number): string {
   return n.toString();
 }
 
-/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-4o" -> "gpt-4o"
+/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5"
  *  For 1M variants, strip the "-1m" suffix (the 1M badge handles display). */
 function abbreviateModel(model: string): string {
   // Claude models: strip "claude-" prefix, strip "-1m" suffix, convert trailing version hyphen to dot

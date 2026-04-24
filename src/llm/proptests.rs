@@ -336,7 +336,7 @@ proptest! {
             content: vec![ContentBlock::Text { text: text.clone() }],
         };
         let req = make_llm_request(vec![msg]);
-        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
 
         prop_assert_eq!(responses_req.input.len(), 1);
         if let ResponsesApiInputItem::Message { content, .. } = &responses_req.input[0] {
@@ -369,7 +369,7 @@ proptest! {
             ],
         };
         let req = make_llm_request(vec![msg]);
-        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
 
         prop_assert_eq!(responses_req.input.len(), 1);
         if let ResponsesApiInputItem::Message { content, .. } = &responses_req.input[0] {
@@ -405,7 +405,7 @@ proptest! {
             }],
         };
         let req = make_llm_request(vec![msg]);
-        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
 
         prop_assert_eq!(responses_req.input.len(), 1);
         if let ResponsesApiInputItem::FunctionCallOutput { output, .. } = &responses_req.input[0] {
@@ -445,7 +445,7 @@ proptest! {
             }],
         };
         let req = make_llm_request(vec![msg]);
-        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-4o", &req);
+        let responses_req = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
 
         prop_assert_eq!(responses_req.input.len(), 1);
         if let ResponsesApiInputItem::FunctionCallOutput { output, .. } = &responses_req.input[0] {

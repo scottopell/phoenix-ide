@@ -599,10 +599,10 @@ impl ModelRegistry {
     }
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
-    /// Prefers: claude-haiku-4-5 > gpt-4o-mini > any available model
+    /// Prefers: claude-haiku-4-5 > gpt-5.4-mini > any available model
     pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
         // Priority order for cheap models
-        const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-4o-mini", "gpt-5-mini"];
+        const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-5.4-mini"];
 
         for model_id in CHEAP_MODELS {
             if let Some(service) = self.get(model_id) {
@@ -623,7 +623,7 @@ impl ModelRegistry {
 
         let candidates: &[&str] = match parent_provider {
             Some(Provider::Anthropic) => &["claude-haiku-4-5"],
-            Some(Provider::OpenAI) => &["gpt-4o-mini", "gpt-5-mini"],
+            Some(Provider::OpenAI) => &["gpt-5.4-mini"],
             Some(Provider::Mock) => return "mock".to_string(),
             None => return parent_model_id.to_string(),
         };
@@ -682,7 +682,7 @@ mod tests {
         assert!(!registry.available_models().is_empty());
         // Should have models from multiple providers
         assert!(registry.get("claude-sonnet-4-6").is_some());
-        assert!(registry.get("gpt-4o").is_some());
+        assert!(registry.get("gpt-5.5").is_some());
     }
 
     #[test]
@@ -742,7 +742,7 @@ mod tests {
         let registry = ModelRegistry::new(&config);
         assert!(!registry.available_models().is_empty());
         assert!(registry.get("claude-sonnet-4-6").is_some());
-        assert!(registry.get("gpt-4o").is_some());
+        assert!(registry.get("gpt-5.5").is_some());
     }
 
     #[test]
