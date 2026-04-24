@@ -9,13 +9,13 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    CancelResponse, ChatRequest, ChatResponse, ConflictErrorResponse, ConversationListResponse,
-    ConversationResponse, ConversationWithMessagesResponse, CreateConversationRequest,
-    CredentialStatusApi, DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry,
-    FileSearchEntry, FileSearchQuery, FileSearchResponse, GatewayStatusApi, ListDirectoryResponse,
-    ListFilesResponse, MkdirResponse, ModelsResponse, ReadFileResponse, RenameRequest, SkillEntry,
-    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse,
-    UpgradeModelRequest, ValidateCwdResponse,
+    CancelResponse, ChatRequest, ChatResponse, ConflictErrorResponse, ContinueConversationResponse,
+    ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
+    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
+    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
+    GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
@@ -80,6 +80,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/trigger-continuation",
             post(trigger_continuation),
+        )
+        // Context continuation worktree transfer (REQ-BED-030)
+        .route(
+            "/api/conversations/:id/continue",
+            post(continue_conversation),
         )
         // Task approval (REQ-BED-028)
         .route("/api/conversations/:id/approve-task", post(approve_task))
@@ -1485,6 +1490,98 @@ async fn trigger_continuation(
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+/// Context continuation worktree transfer (REQ-BED-030).
+///
+/// Creates a new conversation that inherits the parent's environment
+/// (`conv_mode`, `cwd`, worktree fields for Work/Branch/Explore, `task_id`
+/// for Work). Parent's `continued_in_conv_id` is atomically set to the new
+/// conversation's id in the same DB transaction.
+///
+/// Single-continuation policy: if the parent already has a continuation,
+/// the endpoint returns the existing continuation's id with `already_existed:
+/// true` (idempotent-return rather than 409 reject — friendlier to UI
+/// retries, and the UI can route directly to the existing continuation).
+///
+/// Error shape:
+///   - 404 if the parent id does not exist
+///   - 409 if the parent is not in `ContextExhausted` state
+///   - 500 on DB/transaction failure
+async fn continue_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ContinueConversationResponse>, AppError> {
+    use crate::db::{ContinueOutcome, DbError};
+
+    let outcome = state
+        .runtime
+        .db()
+        .continue_conversation(&id)
+        .await
+        .map_err(|e| match e {
+            DbError::ConversationNotFound(msg) => AppError::NotFound(msg),
+            other => AppError::Internal(other.to_string()),
+        })?;
+
+    match outcome {
+        ContinueOutcome::Created(new_conv) => {
+            tracing::info!(
+                parent_id = %id,
+                continuation_id = %new_conv.id,
+                mode = new_conv.conv_mode.label(),
+                "continuation created",
+            );
+            // Spawn runtime for the new conversation so SSE subscribers can
+            // immediately find it. Fire-and-forget: the DB transaction is
+            // the load-bearing side; a spawn failure does not roll the
+            // conversation back (the handler's contract is the DB write
+            // succeeded, not that the runtime is up).
+            let conv_id = new_conv.id.clone();
+            let runtime = state.runtime.clone();
+            tokio::spawn(async move {
+                if let Err(e) = runtime.get_or_create(&conv_id).await {
+                    tracing::warn!(
+                        conv_id = %conv_id,
+                        error = %e,
+                        "failed to spawn runtime for continuation (SSE subscribers will retry)",
+                    );
+                }
+            });
+
+            Ok(Json(ContinueConversationResponse {
+                conversation_id: new_conv.id,
+                slug: new_conv.slug,
+                already_existed: false,
+            }))
+        }
+        ContinueOutcome::AlreadyContinued(existing) => {
+            tracing::info!(
+                parent_id = %id,
+                existing_continuation = %existing.id,
+                "continuation already existed; returning existing id idempotently",
+            );
+            Ok(Json(ContinueConversationResponse {
+                conversation_id: existing.id,
+                slug: existing.slug,
+                already_existed: true,
+            }))
+        }
+        ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+            tracing::debug!(
+                parent_id = %id,
+                state = state_variant,
+                "continuation rejected: parent is not context-exhausted",
+            );
+            Err(AppError::Conflict(ConflictErrorResponse::new(
+                format!(
+                    "Conversation is not in context-exhausted state (current: {state_variant}); \
+                     only context-exhausted conversations can be continued."
+                ),
+                "parent_not_context_exhausted",
+            )))
+        }
+    }
 }
 
 // ============================================================

@@ -35,6 +35,25 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+/// Outcome of [`Database::continue_conversation`] (REQ-BED-030).
+///
+/// The DB layer returns a typed outcome so the handler can map each arm to a
+/// distinct HTTP status without restringifying error messages. Each variant
+/// is a first-class result, not an error.
+#[derive(Debug)]
+pub enum ContinueOutcome {
+    /// The transaction applied: a new conversation was created and the
+    /// parent's `continued_in_conv_id` now points at it.
+    Created(Conversation),
+    /// The parent already had a continuation. The transaction did not run;
+    /// the returned conversation is the pre-existing continuation (the
+    /// endpoint returns this idempotently rather than rejecting).
+    AlreadyContinued(Conversation),
+    /// The parent exists but is not in `ContextExhausted` state. The
+    /// transaction did not run.
+    ParentNotContextExhausted { state_variant: &'static str },
+}
+
 /// Thread-safe database handle
 #[derive(Clone)]
 pub struct Database {
@@ -587,6 +606,176 @@ impl Database {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Create a continuation conversation for a context-exhausted parent, atomically.
+    ///
+    /// Implements REQ-BED-030 (see `specs/bedrock/design.md` §"Context Continuation
+    /// Worktree Transfer" and `projects.allium` rules
+    /// `WorktreeTransferredOnContinuation` / `DirectContinuationInheritsCwd`).
+    ///
+    /// Within a single `SQLite` transaction:
+    ///   1. INSERT a new `conversations` row with the parent's `conv_mode` cloned
+    ///      verbatim (Work: `branch_name`/`worktree_path`/`base_branch`/`task_id`/`task_title`;
+    ///      Branch/Explore with a worktree: `branch_name`/`worktree_path`/`base_branch`;
+    ///      Direct: no worktree fields). `cwd`, `project_id`, and `model` are inherited.
+    ///      State is fresh `Idle`; `continued_in_conv_id` is NULL.
+    ///   2. UPDATE the parent's `continued_in_conv_id` to the new row's id.
+    ///
+    /// Preconditions checked before the INSERT runs:
+    ///   - Parent exists (else `ConversationNotFound`).
+    ///   - Parent state is `ContextExhausted`
+    ///     (else `Ok(ContinueOutcome::ParentNotContextExhausted)`).
+    ///   - Parent's `continued_in_conv_id` is NULL
+    ///     (else `Ok(ContinueOutcome::AlreadyContinued)` — idempotent return of the
+    ///     existing continuation).
+    ///
+    /// The transaction is rolled back via `Drop` if any step fails before `commit`.
+    #[allow(clippy::too_many_lines)] // single atomic flow; splitting hurts readability
+    pub async fn continue_conversation(&self, parent_id: &str) -> DbResult<ContinueOutcome> {
+        // Fetch parent outside the transaction — the subsequent INSERT+UPDATE
+        // guards against concurrent continuation via the parent's
+        // `continued_in_conv_id` still being NULL at UPDATE time.
+        let parent = self.get_conversation(parent_id).await?;
+
+        // Idempotent shortcut: parent already has a continuation.
+        if let Some(ref existing_id) = parent.continued_in_conv_id {
+            tracing::info!(
+                parent_id = %parent_id,
+                existing_continuation = %existing_id,
+                "continue_conversation: idempotent return of existing continuation",
+            );
+            let existing = self.get_conversation(existing_id).await?;
+            return Ok(ContinueOutcome::AlreadyContinued(existing));
+        }
+
+        // Gate on context-exhausted state.
+        if !matches!(parent.state, ConvState::ContextExhausted { .. }) {
+            return Ok(ContinueOutcome::ParentNotContextExhausted {
+                state_variant: parent.state.variant_name(),
+            });
+        }
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        // UUIDs are ASCII; a `[..8]` char boundary always aligns. We still
+        // guard with `get(..8)` to keep clippy's string-slice lint happy.
+        let new_id_prefix = new_id.get(..8).unwrap_or(new_id.as_str());
+        let base_slug = parent.slug.as_deref().map_or_else(
+            || format!("continued-{new_id_prefix}"),
+            |s| format!("{s}-continued"),
+        );
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
+        let conv_mode_json = serde_json::to_string(&parent.conv_mode).unwrap();
+
+        // Resolve slug against the UNIQUE constraint *before* opening the
+        // transaction. Retrying INSERT inside a tx complicates rollback; we
+        // probe availability first and only suffix if the base is taken.
+        let mut actual_slug = base_slug.clone();
+        let mut attempts = 0u8;
+        loop {
+            let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1)")
+                .bind(&actual_slug)
+                .fetch_one(&self.pool)
+                .await?;
+            let exists: bool = row.get(0);
+            if !exists {
+                break;
+            }
+            attempts += 1;
+            if attempts >= 10 {
+                let uuid_str = uuid::Uuid::new_v4().to_string();
+                actual_slug = format!("{base_slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
+                break;
+            }
+            actual_slug = format!("{base_slug}-{:04x}", rand::random::<u16>());
+        }
+        let title_str = schema::title_from_slug(&actual_slug);
+
+        // Atomic INSERT + UPDATE. On any error before `commit()`, the
+        // transaction guard drops and SQLite rolls back.
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id)
+             VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+        )
+        .bind(&new_id)
+        .bind(&actual_slug)
+        .bind(&title_str)
+        .bind(&parent.cwd)
+        .bind(&idle_state)
+        .bind(&now_str)
+        .bind(parent.model.as_deref())
+        .bind(parent.project_id.as_deref())
+        .bind(&conv_mode_json)
+        .bind(parent.desired_base_branch.as_deref())
+        // Continuations do not inherit the parent's seed fields — those are
+        // decorative UI metadata for a different concept (REQ-SEED-003/004).
+        .bind::<Option<&str>>(None)
+        .bind::<Option<&str>>(None)
+        .execute(&mut *tx)
+        .await?;
+
+        // Guard against TOCTOU: only clear-parent continues succeed. This
+        // WHERE clause is the concurrent-continuation check — if another
+        // caller raced us between the SELECT above and this UPDATE, the
+        // rows_affected will be 0 and we roll back.
+        let updated = sqlx::query(
+            "UPDATE conversations SET continued_in_conv_id = ?1, updated_at = ?2 \
+             WHERE id = ?3 AND continued_in_conv_id IS NULL",
+        )
+        .bind(&new_id)
+        .bind(&now_str)
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            // Parent got continued by another request between our fetch and
+            // our UPDATE. Drop `tx` (rollback) and report the existing
+            // continuation via a fresh fetch.
+            drop(tx);
+            let refetched = self.get_conversation(parent_id).await?;
+            if let Some(ref existing_id) = refetched.continued_in_conv_id {
+                let existing = self.get_conversation(existing_id).await?;
+                tracing::info!(
+                    parent_id = %parent_id,
+                    existing_continuation = %existing_id,
+                    "continue_conversation: lost TOCTOU race, returning winner's continuation",
+                );
+                return Ok(ContinueOutcome::AlreadyContinued(existing));
+            }
+            // Parent vanished during the race. Surface as NotFound.
+            return Err(DbError::ConversationNotFound(parent_id.to_string()));
+        }
+
+        tx.commit().await?;
+
+        let new_conversation = Conversation {
+            id: new_id,
+            slug: Some(actual_slug),
+            title: Some(title_str),
+            cwd: parent.cwd,
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: parent.model,
+            project_id: parent.project_id,
+            conv_mode: parent.conv_mode,
+            desired_base_branch: parent.desired_base_branch,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+        };
+        Ok(ContinueOutcome::Created(new_conversation))
     }
 
     /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
@@ -1675,5 +1864,317 @@ mod tests {
             !title.contains('-'),
             "title should be human-readable, not kebab-case. Got: {title}"
         );
+    }
+
+    // ============================================================
+    // REQ-BED-030 Phase 2 (task 24696): continue_conversation
+    // transaction — inheritance table, single-continuation policy,
+    // precondition gates.
+    //
+    // These tests force-set parent state to ContextExhausted via
+    // `update_conversation_state` (public API on Database). This path
+    // bypasses the executor, so `cleanup_context_exhausted_worktree`
+    // never fires during setup — we can test Work/Branch/Explore
+    // worktree inheritance without needing a mocked filesystem
+    // worktree cleanup.
+    // ============================================================
+
+    /// Helper: create a parent conversation with the given ConvMode, force-set its
+    /// state to ContextExhausted, and return the refreshed record.
+    async fn setup_exhausted_parent(
+        db: &Database,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        conv_mode: &ConvMode,
+    ) -> Conversation {
+        db.create_conversation_with_project(
+            id,
+            slug,
+            cwd,
+            true,
+            None,
+            Some("claude-opus-test"),
+            None,
+            conv_mode,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let exhausted = ConvState::ContextExhausted {
+            summary: "parent's summary of what happened".to_string(),
+        };
+        db.update_conversation_state(id, &exhausted).await.unwrap();
+        db.get_conversation(id).await.unwrap()
+    }
+
+    fn work_mode_fixture() -> ConvMode {
+        ConvMode::Work {
+            branch_name: NonEmptyString::new("task-24696-continue").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt/parent-work").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("TK24696").unwrap(),
+            task_title: NonEmptyString::new("Test continuation transfer").unwrap(),
+        }
+    }
+
+    fn branch_mode_fixture() -> ConvMode {
+        ConvMode::Branch {
+            branch_name: NonEmptyString::new("feature-login").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt/parent-branch").unwrap(),
+            base_branch: NonEmptyString::new("feature-login").unwrap(),
+        }
+    }
+
+    /// Work -> Work: worktree fields and task_id all transfer; parent's
+    /// `continued_in_conv_id` points at the new conv.
+    #[tokio::test]
+    async fn test_continue_conversation_work_to_work() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_mode = work_mode_fixture();
+        let parent =
+            setup_exhausted_parent(&db, "parent-work", "parent-work", "/tmp", &parent_mode).await;
+
+        let outcome = db.continue_conversation("parent-work").await.unwrap();
+        let new_conv = match outcome {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Inheritance: every ConvMode::Work field copied verbatim.
+        match (&parent.conv_mode, &new_conv.conv_mode) {
+            (
+                ConvMode::Work {
+                    branch_name: pb,
+                    worktree_path: pw,
+                    base_branch: pbb,
+                    task_id: pt,
+                    task_title: ptt,
+                },
+                ConvMode::Work {
+                    branch_name: nb,
+                    worktree_path: nw,
+                    base_branch: nbb,
+                    task_id: nt,
+                    task_title: ntt,
+                },
+            ) => {
+                assert_eq!(pb, nb, "branch_name must be inherited");
+                assert_eq!(pw, nw, "worktree_path must be inherited");
+                assert_eq!(pbb, nbb, "base_branch must be inherited");
+                assert_eq!(pt, nt, "task_id must be inherited (REQ-BED-030 Work-only)");
+                assert_eq!(ptt, ntt, "task_title must be inherited");
+            }
+            _ => panic!("both parent and new conv must be Work mode"),
+        }
+        assert_eq!(new_conv.cwd, parent.cwd);
+        assert_eq!(new_conv.model, parent.model);
+        assert!(matches!(new_conv.state, ConvState::Idle));
+        assert_eq!(new_conv.continued_in_conv_id, None);
+        assert_eq!(new_conv.parent_conversation_id, None);
+
+        // Parent's continued_in_conv_id now points at the continuation.
+        let refreshed_parent = db.get_conversation("parent-work").await.unwrap();
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(new_conv.id));
+    }
+
+    /// Branch -> Branch: branch_name/worktree_path/base_branch transfer; no task_id.
+    #[tokio::test]
+    async fn test_continue_conversation_branch_to_branch() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_mode = branch_mode_fixture();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-branch",
+            "parent-branch",
+            "/tmp/branch-cwd",
+            &parent_mode,
+        )
+        .await;
+
+        let outcome = db.continue_conversation("parent-branch").await.unwrap();
+        let new_conv = match outcome {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        match (&parent.conv_mode, &new_conv.conv_mode) {
+            (
+                ConvMode::Branch {
+                    branch_name: pb,
+                    worktree_path: pw,
+                    base_branch: pbb,
+                },
+                ConvMode::Branch {
+                    branch_name: nb,
+                    worktree_path: nw,
+                    base_branch: nbb,
+                },
+            ) => {
+                assert_eq!(pb, nb);
+                assert_eq!(pw, nw);
+                assert_eq!(pbb, nbb);
+            }
+            _ => panic!("both must be Branch mode"),
+        }
+        assert_eq!(new_conv.cwd, parent.cwd);
+        // task_id is Work-only — there's no field on Branch ConvMode, so this
+        // is enforced structurally rather than via an assertion.
+
+        let refreshed_parent = db.get_conversation("parent-branch").await.unwrap();
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(new_conv.id));
+    }
+
+    /// Explore -> Explore: mode is cloned (Explore has no worktree fields on
+    /// the ConvMode variant — REQ-PROJ-028's on-first-message worktree isn't
+    /// encoded in ConvMode::Explore, so this is just cwd + mode inheritance).
+    #[tokio::test]
+    async fn test_continue_conversation_explore_to_explore() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-explore",
+            "parent-explore",
+            "/tmp/explore-cwd",
+            &ConvMode::Explore,
+        )
+        .await;
+
+        let outcome = db.continue_conversation("parent-explore").await.unwrap();
+        let new_conv = match outcome {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        assert!(matches!(new_conv.conv_mode, ConvMode::Explore));
+        assert_eq!(new_conv.cwd, parent.cwd);
+        assert_eq!(new_conv.model, parent.model);
+        let refreshed_parent = db.get_conversation("parent-explore").await.unwrap();
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(new_conv.id));
+    }
+
+    /// Direct -> Direct: no worktree, only cwd and model inheritance.
+    #[tokio::test]
+    async fn test_continue_conversation_direct_to_direct() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-direct",
+            "parent-direct",
+            "/tmp/direct-cwd",
+            &ConvMode::Direct,
+        )
+        .await;
+
+        let outcome = db.continue_conversation("parent-direct").await.unwrap();
+        let new_conv = match outcome {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        assert!(matches!(new_conv.conv_mode, ConvMode::Direct));
+        assert_eq!(new_conv.cwd, parent.cwd);
+        assert_eq!(new_conv.model, parent.model);
+        let refreshed_parent = db.get_conversation("parent-direct").await.unwrap();
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(new_conv.id));
+    }
+
+    /// Double-continue: the second call returns the same continuation id as
+    /// the first (idempotent return) and does NOT create a second new conv.
+    /// The parent's `continued_in_conv_id` is unchanged by the second call.
+    #[tokio::test]
+    async fn test_continue_conversation_idempotent_double_continue() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "parent-double",
+            "parent-double",
+            "/tmp",
+            &work_mode_fixture(),
+        )
+        .await;
+
+        let first = match db.continue_conversation("parent-double").await.unwrap() {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("first call should create, got {other:?}"),
+        };
+
+        let second = match db.continue_conversation("parent-double").await.unwrap() {
+            ContinueOutcome::AlreadyContinued(c) => c,
+            other => panic!("second call should return AlreadyContinued, got {other:?}"),
+        };
+
+        assert_eq!(
+            first.id, second.id,
+            "idempotent return must yield the same continuation id"
+        );
+
+        // Parent pointer unchanged.
+        let refreshed_parent = db.get_conversation("parent-double").await.unwrap();
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(first.id));
+
+        // No phantom third conversation exists.
+        let all = db.list_conversations().await.unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "only parent + single continuation should be listed; got: {:?}",
+            all.iter().map(|c| &c.id).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Parent not in ContextExhausted state: transaction does not run;
+    /// parent state is unchanged.
+    #[tokio::test]
+    async fn test_continue_conversation_rejects_idle_parent() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Create a Work-mode parent but leave it in Idle.
+        db.create_conversation_with_project(
+            "parent-idle",
+            "parent-idle",
+            "/tmp",
+            true,
+            None,
+            Some("claude-opus-test"),
+            None,
+            &work_mode_fixture(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let outcome = db.continue_conversation("parent-idle").await.unwrap();
+        match outcome {
+            ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                assert_eq!(state_variant, "Idle");
+            }
+            other => panic!("expected ParentNotContextExhausted, got {other:?}"),
+        }
+
+        // Parent unchanged.
+        let refreshed = db.get_conversation("parent-idle").await.unwrap();
+        assert!(matches!(refreshed.state, ConvState::Idle));
+        assert_eq!(refreshed.continued_in_conv_id, None);
+
+        // No new conversation created.
+        let all = db.list_conversations().await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    /// Parent id does not exist: returns DbError::ConversationNotFound so the
+    /// HTTP handler can map to 404.
+    #[tokio::test]
+    async fn test_continue_conversation_parent_not_found() {
+        let db = Database::open_in_memory().await.unwrap();
+        let result = db.continue_conversation("no-such-conv").await;
+        match result {
+            Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "no-such-conv"),
+            other => panic!("expected ConversationNotFound, got {other:?}"),
+        }
     }
 }

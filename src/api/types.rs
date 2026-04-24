@@ -115,6 +115,25 @@ pub struct SuccessResponse {
     pub success: bool,
 }
 
+/// Response for the context-continuation transfer endpoint (REQ-BED-030).
+///
+/// Returned from `POST /api/conversations/:id/continue`. The caller receives
+/// the id (and slug, if present) of the continuation conversation. When the
+/// parent already had a continuation, this returns that existing id
+/// idempotently — callers distinguish "just created" from "already existed"
+/// via the `already_existed` flag.
+#[derive(Debug, Serialize)]
+pub struct ContinueConversationResponse {
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// True iff the parent already had a continuation when the endpoint was
+    /// called. The UI can use this to route directly (vs. announcing the
+    /// continuation as fresh).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_existed: bool,
+}
+
 /// Response for directory validation
 #[derive(Debug, Serialize)]
 pub struct ValidateCwdResponse {
