@@ -1,11 +1,26 @@
 ---
 created: 2026-04-12
 priority: p1
-status: ready
+status: wont-do
 artifact: pending
 ---
 
 # auto-mark-task-done-on-squash-merge
+
+## Wont-do (2026-04-24)
+
+Obsoleted by the deprecation of REQ-PROJ-009 (squash-merge) in favour of
+REQ-PROJ-027 (push branch, user merges via PR). The UI flow this task
+described — a merge-plan modal that runs a squash-merge after task-file
+validation — no longer exists. Phoenix never merges to main; the agent
+pushes the branch and the user merges through their normal PR workflow,
+where task-file rename and status update happen as ordinary code edits
+on the branch (not as part of any Phoenix-driven merge step).
+
+If the underlying ergonomic complaint resurfaces (e.g. the agent should
+mark the task file done before pushing rather than after Mark-as-merged),
+file a fresh task — the squash-merge implementation notes below no
+longer map onto the runtime.
 
 ## Problem
 
