@@ -1318,16 +1318,23 @@ Continue action is replaced by a navigation link to the existing
 continuation. Users who want to fork must use git operations outside
 the app to create a second branch.
 
-### Abandon policy
+### Abandon / mark-as-merged policy
 
-| Parent state | Abandon available |
+Both terminal user actions follow the same gate:
+
+| Parent state | Abandon / mark-as-merged available |
 |---|---|
-| Context-exhausted, `continued_in_conv_id = null` | Yes; normal abandon flow applies |
-| Context-exhausted, `continued_in_conv_id != null` | No; user abandons the continuation instead |
+| Context-exhausted, `continued_in_conv_id = null` | Yes; normal flow applies |
+| Context-exhausted, `continued_in_conv_id != null` | No; user acts on the continuation instead |
 
-The semantics match REQ-PROJ-026's abandon flow. Work abandon removes
+The abandon semantics match REQ-PROJ-026's flow. Work abandon removes
 the worktree and the branch; Branch abandon removes the worktree and
-preserves the branch.
+preserves the branch. Mark-as-merged follows REQ-PROJ-026/027 — same
+worktree/branch disposition, different system message.
+
+The same gate applies to both because a continuation is the "live
+conversation" for the work; any terminal decision belongs there, not
+on the paused parent.
 
 ### Server restart reconciliation
 

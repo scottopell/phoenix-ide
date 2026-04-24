@@ -548,6 +548,12 @@ rule MarkAsMerged {
 
     requires: conversation.status = idle
     requires: conversation.mode in { work, branch }
+    -- REQ-BED-031: same gate as ConfirmAbandon. A context-exhausted
+    -- parent with an existing continuation cannot be marked-as-merged
+    -- from the parent — the live conversation is the continuation, and
+    -- any terminal decision on the work belongs there. See
+    -- TerminalActionRequiresNoContinuation invariant.
+    requires: conversation.continued_in_conv_id = absent
 
     ensures: not exists worktree
     ensures:
@@ -578,7 +584,7 @@ rule MarkAsMerged {
 -- Gated on `continued_in_conv_id = absent`: a context-exhausted parent
 -- that has already been continued cannot be abandoned from the parent
 -- (the continuation is the live conversation -- any abandon decision is
--- made there). See AbandonRequiresNoContinuation invariant.
+-- made there). See TerminalActionRequiresNoContinuation invariant.
 rule ConfirmAbandon {
     when: UserConfirmsAbandon(conversation)
 
@@ -639,7 +645,7 @@ rule ExploreWorktreeCleanupOnTerminal {
     -- preserved; cleanup fires only on actual terminal actions
     -- (ConfirmAbandon, MarkAsMerged) where continued_in_conv_id is
     -- absent. See WorktreeTransferredOnContinuation for the transfer
-    -- path and AbandonRequiresNoContinuation for the gate.
+    -- path and TerminalActionRequiresNoContinuation for the gate.
     requires: conversation.parent_status != context_exhausted
     requires: conversation.continued_in_conv_id = absent
 
@@ -666,7 +672,7 @@ rule ExploreWorktreeCleanupOnTerminal {
 --   - Continue: worktree ownership transfers to the continuation
 --     (WorktreeTransferredOnContinuation below).
 --   - Abandon: normal abandon flow (ConfirmAbandon) runs; only permitted
---     while `continued_in_conv_id` is null (AbandonRequiresNoContinuation).
+--     while `continued_in_conv_id` is null (TerminalActionRequiresNoContinuation).
 --   - Mark as merged on the continuation chain's tail: the chain's
 --     normal terminal semantics apply (MarkAsMerged / ConfirmAbandon
 --     there destroy the worktree; the parent's worktree_path becomes a
@@ -1117,13 +1123,18 @@ invariant WorktreeOwnershipFollowsContinuationPointer {
 
 -- REQ-BED-031: A context-exhausted parent with a continuation cannot be
 -- abandoned; the abandon UI targets the continuation in that case.
--- Structurally enforced by the `continued_in_conv_id = absent` clause
--- on ConfirmAbandon. This invariant names the contract for auditability:
--- any abandon that fires on a conversation leaves that conversation with
--- `continued_in_conv_id = absent` at the time of the transition.
-invariant AbandonRequiresNoContinuation {
+-- Structurally enforced by the `continued_in_conv_id = absent` clauses
+-- on ConfirmAbandon and MarkAsMerged. This invariant names the contract
+-- for auditability: any user-triggered terminal action on a conversation
+-- leaves that conversation with `continued_in_conv_id = absent` at the
+-- time of the transition. A context-exhausted parent that has been
+-- continued is operated on via the continuation, not the parent — both
+-- abandon and mark-as-merged follow the same rule.
+invariant TerminalActionRequiresNoContinuation {
     for c in Conversations:
         UserConfirmsAbandon(c) implies c.continued_in_conv_id = absent
+    for c in Conversations:
+        UserMarksAsMerged(c) implies c.continued_in_conv_id = absent
 }
 
 ------------------------------------------------------------
