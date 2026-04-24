@@ -1,7 +1,7 @@
 ---
 created: 2026-04-23
 priority: p2
-status: in-progress
+status: done
 artifact: specs/connection_machine/connection_machine.allium
 ---
 
