@@ -54,7 +54,11 @@ export interface Conversation {
   seed_parent_slug?: string | null;
   /** Continuation pointer (REQ-BED-030). If this conversation has been
    *  continued into a new conversation (context-exhausted handoff), this is
-   *  the continuation's id. Unused by the UI in Phase 1 of task 24696. */
+   *  the continuation's id. The UI uses this to (a) swap the Continue
+   *  button for a "Continued in a new conversation" link on the parent, and
+   *  (b) gate abandon / mark-as-merged on the parent (REQ-BED-031 — the
+   *  action belongs on the continuation, enforced server-side with a 409
+   *  `error_type = "continuation_exists"`). */
   continued_in_conv_id?: string | null;
 }
 
@@ -564,6 +568,38 @@ export const api = {
   async markMerged(conversationId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${conversationId}/mark-merged`, { method: 'POST' });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to mark as merged'); }
+    return resp.json();
+  },
+
+  /** POST /api/conversations/:id/continue — context-exhausted handoff.
+   *
+   *  The endpoint is idempotent: if the parent already has a continuation,
+   *  this returns that existing continuation with `already_existed: true`.
+   *  Callers can therefore dispatch this unconditionally and let the server
+   *  resolve the race (see REQ-BED-030 / task 24696 Phase 2).
+   *
+   *  Error shape:
+   *   - 404 → `Error` (parent id not found)
+   *   - 409 → `ConflictError` (parent not in context-exhausted state;
+   *           `error_type = "parent_not_context_exhausted"`)
+   *   - other non-2xx → generic `Error`
+   */
+  async continueConversation(convId: string): Promise<{
+    conversation_id: string;
+    slug?: string;
+    already_existed: boolean;
+  }> {
+    const resp = await fetch(`/api/conversations/${convId}/continue`, { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.json();
+      if (resp.status === 409) {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
+      if (resp.status === 404) {
+        throw new Error(err.error || 'Conversation not found');
+      }
+      throw new Error(err.error || 'Failed to continue conversation');
+    }
     return resp.json();
   },
 
