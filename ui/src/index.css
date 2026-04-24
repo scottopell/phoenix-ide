@@ -2484,13 +2484,13 @@ pre:hover .copy-btn {
 
 .context-menu {
   position: absolute;
-  top: 100%;
+  bottom: 100%;
   right: 0;
-  margin-top: 4px;
+  margin-bottom: 4px;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
   z-index: 1000;
   min-width: 200px;
 }
