@@ -33,19 +33,16 @@ use "./bedrock.allium" as bedrock
 ------------------------------------------------------------
 
 -- A git repository on disk. This spec does not govern git internals,
--- only what operations the project lifecycle performs.
+-- only what operations the project lifecycle performs. The single
+-- remote "origin" is implicit: every git operation in this spec either
+-- targets origin or is a local operation; no rule here enumerates
+-- multiple remotes.
 external entity GitRepository {
     root_path: String
     current_branch: String
     -- Cached symbolic ref: refs/remotes/origin/HEAD → short name.
     -- Set by git clone, updated by git fetch. May be absent.
     remote_default_branch: String?
-}
-
--- The remote "origin". ls-remote queries target this.
-external entity GitRemote {
-    repo: GitRepository
-    name: String = "origin"
 }
 
 ------------------------------------------------------------
@@ -64,8 +61,6 @@ value WorktreePath {
 
 enum TaskFileStatus { in_progress | done | wont_do }
 
-enum TaskResolutionOutcome { completed | abandoned }
-
 -- Worktree lifecycle is determined by conversation.mode (work vs branch).
 -- No separate WorktreeKind enum needed -- the mode IS the kind.
 
@@ -74,7 +69,7 @@ value BranchEntry {
     name: String
     local: Boolean                   -- exists as a local ref
     remote: Boolean                  -- exists as a remote tracking ref
-    behind_remote: Natural?          -- commits local is behind origin (local compare, no network)
+    behind_remote: Integer?          -- commits local is behind origin (local compare, no network); non-negative
 }
 
 -- Cached output of `git ls-remote` for a repository.
@@ -82,7 +77,7 @@ value LsRemoteCache {
     repo_path: String
     refs: List<RemoteRef>
     fetched_at: Timestamp
-    ttl: Duration = 5 minutes
+    ttl_seconds: Integer = 300        -- 5 minutes
 }
 
 value RemoteRef {
@@ -101,6 +96,14 @@ enum RefKind { branch | tag }
 -- Non-git directories do not have a Project entity.
 entity Project {
     repo: GitRepository
+
+    -- ls-remote output cached for branch-picker typeahead.
+    -- Refreshed on miss/expiry by SearchRemoteBranches.
+    ls_remote_cache: LsRemoteCache?
+
+    -- Most recent branch-picker response (local listing or search result).
+    -- A BranchEntry list rendered to the UI.
+    branch_picker_entries: List<BranchEntry>
 
     -- Relationships
     conversations: bedrock/Conversation with project = this
@@ -209,7 +212,7 @@ rule BranchModeSelected {
     when: UserSelectsBranch(conversation, branch_name)
 
     requires: is_git_repository(conversation.working_dir)
-    requires: branch_name is not empty
+    requires: branch_name != ""
 
     -- REQ-PROJ-025: check for existing worktree/conversation on this branch
     requires: not exists active_worktree_on_branch(conversation.project, branch_name)
@@ -282,7 +285,7 @@ rule ManagedWorktreeOnFirstMessage {
 
     let base_branch = conversation.desired_base_branch
         or conversation.project.repo.current_branch
-    let branch_name = "task-pending-" + conversation.id[0..8]
+    let branch_name = derive_pending_branch_name(conversation.id)
 
     -- Single-branch fetch (REQ-PROJ-022)
     ensures: BestEffortFetch(conversation.project.repo, base_branch)
@@ -315,30 +318,19 @@ rule ManagedWorktreeOnFirstMessage {
 -- ===========================================================
 
 -- REQ-PROJ-020: Local branch listing (no network)
+-- Fires when the user opens the branch picker without a search query.
+-- Emits a BranchEntry for each local branch, sorted by recency, with
+-- `behind_remote` populated from local remote-tracking refs (no fetch).
 rule ListLocalBranches {
     when: UserOpensBranchPicker(project)
 
-    -- No search query provided. Instant, local-only.
-    requires: no search query
-
     let repo = project.repo
-    let local_branches = git_for_each_ref(repo, "refs/heads/",
-        sort: "-committerdate")
 
-    ensures: for each branch in local_branches:
-        BranchEntry {
-            name: branch.short_name,
-            local: true,
-            remote: exists git_ref(repo, "refs/remotes/origin/" + branch.short_name),
-            behind_remote:
-                if exists git_ref(repo, "refs/remotes/origin/" + branch.short_name):
-                    commits_between(branch.sha, remote_tracking_sha)
-                else:
-                    absent
-        }
-
-    ensures: if repo.remote_default_branch is present:
-        response.default_branch = repo.remote_default_branch
+    -- For each local branch on disk, a BranchEntry is produced with
+    -- local = true, remote set iff the remote-tracking ref exists, and
+    -- behind_remote computed as commits_between(local, remote-tracking)
+    -- when the remote-tracking ref exists (otherwise absent).
+    ensures: LocalBranchListingEmitted(project)
 
     @guidance
         -- `git for-each-ref --sort=-committerdate refs/heads/` returns
@@ -348,44 +340,50 @@ rule ListLocalBranches {
         --   `git rev-list --count <local>..<remote-tracking>`
         -- Both refs are local; this is a graph walk, not a fetch.
         --
-        -- remote_default_branch detected via:
-        --   `git symbolic-ref refs/remotes/origin/HEAD`
-        -- Stripped to short name. Absent if symref is missing (never fetched,
-        -- or remote has no HEAD). No fallback guessing.
+        -- remote_default_branch (if set on the repo) is included in the
+        -- response so the UI can highlight it. Absent if symref is missing
+        -- (never fetched, or remote has no HEAD). No fallback guessing.
+        --
+        -- Per-branch emission shape:
+        --   BranchEntry {
+        --       name: branch.short_name,
+        --       local: true,
+        --       remote: <exists remote-tracking ref>,
+        --       behind_remote: commits_between(local, remote-tracking)
+        --                      when remote-tracking ref exists, else absent
+        --   }
 }
 
--- REQ-PROJ-021: Remote branch search (network, on-demand)
+-- REQ-PROJ-021: Remote branch search (network, on-demand).
+-- Fires when the user types a non-empty query into the branch picker.
+-- If the ls-remote cache is fresh, filter it; otherwise refresh and
+-- filter. Response is a list of BranchEntry values matching the query
+-- substring (case-insensitive). local is populated from the local
+-- ref database; remote is always true; behind_remote is absent for
+-- search results.
 rule SearchRemoteBranches {
     when: UserSearchesBranches(project, query)
 
-    requires: query is not empty
+    requires: query != ""
 
-    let cache = LsRemoteCache.for(project.repo.root_path)
-
-    ensures:
-        if cache is absent or cache.expired:
-            cache = LsRemoteCache {
-                repo_path: project.repo.root_path,
-                refs: git_ls_remote(project.repo, "--heads", "--tags", "origin"),
-                fetched_at: now,
-                ttl: 5 minutes
-            }
-
-    ensures: response.branches = cache.refs
-        .where(ref => ref.name.contains_case_insensitive(query))
-        .map(ref => BranchEntry {
-            name: ref.name,
-            local: exists git_ref(project.repo, "refs/heads/" + ref.name),
-            remote: true,
-            behind_remote: absent   -- not computed for search results
-        })
+    ensures: LsRemoteCacheRefreshedIfExpired(project)
+    ensures: RemoteBranchSearchEmitted(project, query)
 
     @guidance
         -- `git ls-remote --heads --tags origin` lists all remote refs.
         -- Transfers only ref names and SHAs, no pack data.
         --
-        -- Cache is keyed on repo_path. TTL is 5 minutes.
-        -- Subsequent searches within TTL filter the cached list.
+        -- Cache is keyed on repo_path. TTL is 5 minutes
+        -- (LsRemoteCache.ttl_seconds = 300). Subsequent searches within
+        -- TTL filter the cached list.
+        --
+        -- Per-result emission shape:
+        --   BranchEntry {
+        --       name: ref.name,
+        --       local: <local ref exists>,
+        --       remote: true,
+        --       behind_remote: absent  -- not computed for search results
+        --   }
         --
         -- Tags are included in results but only version-like tags
         -- (matching `v\d` or semver patterns) are useful in practice.
@@ -440,8 +438,9 @@ rule MaterializeBranch {
 -- Tool availability (Explore only, no sub-agents) enforced by bedrock.
 
 -- REQ-PROJ-004/006/028: User approves task — permission upgrade + task file
+-- Subscribes to bedrock's UserApprovesTask event (see bedrock.allium).
 rule TaskApprovalExecuted {
-    when: bedrock/UserApprovesTask(conversation, decision)
+    when: UserApprovesTask(conversation, decision)
 
     -- Bedrock handles the state transition (AwaitingTaskApproval -> LlmRequesting).
     -- This rule specifies the git side effects.
@@ -496,7 +495,8 @@ rule TaskApprovalExecuted {
 
 -- REQ-PROJ-004: User provides feedback — no git operations
 rule TaskFeedbackNoGitOps {
-    when: bedrock/UserProvidesFeedback(conversation, decision)
+    -- Subscribes to bedrock's UserProvidesFeedback event.
+    when: UserProvidesFeedback(conversation, decision)
 
     -- No git operations. Plan exists only in memory.
     -- Agent may revise and call propose_plan again.
@@ -505,7 +505,8 @@ rule TaskFeedbackNoGitOps {
 
 -- REQ-PROJ-004: User rejects task — no git operations
 rule TaskRejectionNoGitOps {
-    when: bedrock/UserRejectsTask(conversation, decision)
+    -- Subscribes to bedrock's UserRejectsTask event.
+    when: UserRejectsTask(conversation, decision)
 
     -- Nothing was written to disk. Free to discard.
     ensures: NoGitOperations(conversation)
@@ -616,8 +617,10 @@ rule ConfirmAbandon {
 
 -- REQ-PROJ-028: Managed Explore conversation reaches terminal without
 -- entering Work mode. Clean up the worktree and temp branch.
+-- Subscribes to bedrock's ConversationBecameTerminal lifecycle event
+-- (see bedrock.allium).
 rule ExploreWorktreeCleanupOnTerminal {
-    when: bedrock/ConversationBecameTerminal(conversation)
+    when: ConversationBecameTerminal(conversation)
 
     requires: conversation.mode = explore
     requires: exists Worktree{conversation: conversation}
@@ -641,33 +644,20 @@ rule ExploreWorktreeCleanupOnTerminal {
 -- Remove it so the branch is free for a continuation, but preserve the
 -- branch itself — it holds the agent's committed work and a continuation
 -- conversation should resume on it.
-rule WorkBranchWorktreeCleanupOnContextExhausted {
-    when: bedrock/ConversationBecameTerminal(conversation)
+-- Split by mode (variant-based dispatch). Work demotes to Explore; Branch
+-- demotes to Direct (see @guidance on ServerRestartWorktreeReconciliation
+-- for the type-driven asymmetry).
+rule WorkBranchWorktreeCleanupOnContextExhaustedWork {
+    when: ConversationBecameTerminal(conversation)
 
-    requires: conversation.mode in { work, branch }
+    requires: conversation.mode = work
     requires: conversation.parent_status = context_exhausted
     requires: exists Worktree{conversation: conversation}
 
     let worktree = Worktree{conversation: conversation}
 
     ensures: not exists worktree
-    -- Branch is preserved: the user's committed progress stays reachable,
-    -- and a fresh Branch-mode conversation on the same branch can succeed
-    -- without hitting a filesystem-level worktree conflict.
-    --
-    -- Note the asymmetry with MarkAsMerged / ConfirmAbandon: those delete
-    -- the Work-mode task branch because the task is over. Here the task is
-    -- only stalled by context exhaustion, so the branch must survive for
-    -- the continuation conversation to resume on it.
-
-    -- Mode revert matches ServerRestartWorktreeReconciliation exactly. The
-    -- asymmetry is type-driven (see that rule's @guidance): Work has
-    -- Explore as its graceful degradation; Branch has no worktree-less
-    -- equivalent in the ConvMode type and must fall to Direct. project_id
-    -- on the conversation row is preserved regardless.
-    ensures: conversation.mode =
-        if was_branch_mode then direct
-        else explore
+    ensures: conversation.mode = explore
     ensures: conversation.working_dir = project_root(conversation)
 
     @guidance
@@ -679,6 +669,14 @@ rule WorkBranchWorktreeCleanupOnContextExhausted {
         -- action's cleanup in one place while still closing the
         -- context_exhausted gap.
         --
+        -- Branch is preserved: the user's committed progress stays
+        -- reachable, and a fresh Branch-mode conversation on the same
+        -- branch can succeed without hitting a filesystem-level worktree
+        -- conflict. Note the asymmetry with MarkAsMerged / ConfirmAbandon:
+        -- those delete the Work-mode task branch because the task is over.
+        -- Here the task is only stalled by context exhaustion, so the
+        -- branch must survive for a continuation conversation to resume.
+        --
         -- Sequence:
         --   1. git worktree remove {path} --force
         --      On failure: rm -rf + git worktree prune
@@ -688,13 +686,26 @@ rule WorkBranchWorktreeCleanupOnContextExhausted {
         -- progress as they go per repo convention, and the context-full
         -- banner gives the user a chance to stash / commit externally
         -- before clicking "Continue in new conversation."
-        --
-        -- Together with ExploreWorktreeCleanupOnTerminal and the
-        -- user-triggered MarkAsMerged / ConfirmAbandon rules, every
-        -- normal-operation path from "has worktree" to "terminal" now
-        -- removes the worktree. Remaining orphans come from crashes
-        -- (handled by ServerRestartWorktreeReconciliation) or external
-        -- git ops (out of scope).
+}
+
+rule WorkBranchWorktreeCleanupOnContextExhaustedBranch {
+    when: ConversationBecameTerminal(conversation)
+
+    requires: conversation.mode = branch
+    requires: conversation.parent_status = context_exhausted
+    requires: exists Worktree{conversation: conversation}
+
+    let worktree = Worktree{conversation: conversation}
+
+    ensures: not exists worktree
+    ensures: conversation.mode = direct
+    ensures: conversation.working_dir = project_root(conversation)
+
+    @guidance
+        -- Branch has no worktree-less equivalent in the ConvMode type
+        -- and must fall to Direct. Otherwise identical to the Work
+        -- variant above. project_id on the conversation row is preserved
+        -- regardless, so sidebar grouping is retained across the demote.
 }
 
 -- ===========================================================
@@ -796,37 +807,32 @@ rule ExploreSubAgentDirectory {
 -- REQ-PROJ-015 descoped the dedicated registry, but acknowledged that
 -- startup reconciliation handles orphan detection via ConvMode::Work
 -- queries. This rule models that existing behaviour.
-rule ServerRestartWorktreeReconciliation {
-    when: bedrock/ServerRestarted(conversation)
+-- Orphan detection: worktree is orphaned if worktree_path is empty,
+-- base_branch is empty, or the path does not exist on disk. The revert
+-- action is split by source mode (variant-based dispatch) because
+-- allium does not support `if X then A else B` in ensures clauses:
+--
+--   Work   -> Explore  (graceful degradation: project-bound, no worktree)
+--   Branch -> Direct   ("Branch without worktree" is not a representable
+--                       ConvMode state; falls further)
+--   Explore with worktree -> Explore (drop the worktree fields only)
+--
+-- project_id on the conversation row is preserved independently, so
+-- sidebar grouping is retained for both reverts.
+rule ServerRestartWorktreeReconciliationWork {
+    when: ServerRestarted(conversation)
 
-    -- REQ-PROJ-028: Explore conversations with worktrees also need reconciliation
-    requires: conversation.mode in { work, branch }
-        or (conversation.mode = explore and conversation.worktree_path != "")
-
-    -- Detection: worktree is orphaned if any of these hold
-    let orphaned =
-        conversation.worktree_path = ""
+    requires: conversation.mode = work
+    requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
         or not exists_on_disk(conversation.worktree_path)
 
-    ensures:
-        if orphaned:
-            -- Asymmetric revert, forced by the type system:
-            -- Work has Explore as its graceful degradation (project-bound
-            -- conversation without a worktree). Branch has no equivalent --
-            -- "Branch without worktree" is not a representable state, so it
-            -- falls further, to Direct. project_id on the conversation row
-            -- is preserved independently, so sidebar grouping is retained
-            -- for both reverts.
-            conversation.mode =
-                if was_branch_mode then direct
-                else explore
-            conversation.working_dir = project_root(conversation)
-            GitWorktreePruned(conversation.project)
-        -- else: worktree is intact, no action needed
+    ensures: conversation.mode = explore
+    ensures: conversation.working_dir = project_root(conversation)
+    ensures: GitWorktreePruned(conversation.project)
 
     @guidance
-        -- Runs once per Work/Branch conversation at server startup, before
+        -- Runs once per affected conversation at server startup, before
         -- any conversation becomes active.
         --
         -- Sequence per affected conversation:
@@ -835,14 +841,13 @@ rule ServerRestartWorktreeReconciliation {
         --      (or not a __LEGACY_EMPTY__ sentinel from the NonEmptyString
         --      shim that was introduced in schema phase A1), and worktree
         --      directory exists on disk
-        --   3. If any check fails:
-        --      a. Update conversation mode: Work -> Explore, Branch -> Direct
-        --      b. Derive project root from worktree path
-        --         ({root}/.phoenix/worktrees/{id} → {root})
-        --      c. Reset conversation cwd to project root
-        --      d. Run `git worktree prune` in project root (once per
-        --         unique root, deduplicated across conversations)
-        --   4. Log summary: "{reverted} reverted out of {total} Work"
+        --   3. If any check fails: apply the mode-specific revert above
+        --   4. Derive project root from worktree path
+        --      ({root}/.phoenix/worktrees/{id} → {root})
+        --   5. Reset conversation cwd to project root
+        --   6. Run `git worktree prune` in project root (once per unique
+        --      root, deduplicated across conversations)
+        --   7. Log summary: "{reverted} reverted out of {total} Work"
         --
         -- The three orphan sources this recovers from:
         --   A. Legacy rows: pre-NonEmptyString data with empty or
@@ -861,6 +866,41 @@ rule ServerRestartWorktreeReconciliation {
         --   - git worktree prune failure: logged at debug (non-fatal)
         --   - No exceptions propagated; process continues for remaining
         --     conversations
+}
+
+rule ServerRestartWorktreeReconciliationBranch {
+    when: ServerRestarted(conversation)
+
+    requires: conversation.mode = branch
+    requires: conversation.worktree_path = ""
+        or conversation.base_branch = ""
+        or not exists_on_disk(conversation.worktree_path)
+
+    ensures: conversation.mode = direct
+    ensures: conversation.working_dir = project_root(conversation)
+    ensures: GitWorktreePruned(conversation.project)
+
+    @guidance
+        -- "Branch without worktree" is not a representable ConvMode state,
+        -- so the demote target is Direct rather than Explore. All other
+        -- semantics match the Work variant.
+}
+
+-- REQ-PROJ-028: Explore conversations with a worktree also need
+-- reconciliation when the worktree is orphaned. Explore has no further
+-- demote target -- the conversation stays Explore, but its worktree
+-- fields are cleared and its cwd resets to the project root.
+rule ServerRestartWorktreeReconciliationExplore {
+    when: ServerRestarted(conversation)
+
+    requires: conversation.mode = explore
+    requires: conversation.worktree_path != ""
+    requires: conversation.worktree_path = ""
+        or conversation.base_branch = ""
+        or not exists_on_disk(conversation.worktree_path)
+
+    ensures: conversation.working_dir = project_root(conversation)
+    ensures: GitWorktreePruned(conversation.project)
 }
 
 ------------------------------------------------------------
@@ -919,12 +959,26 @@ invariant TaskFileStatusMatchesLifecycle {
             t.project.work_conversations.any(c => c.task_id = t.task_id)
 }
 
--- REQ-PROJ-020/022: No blanket fetches
--- Every `git fetch` call must include a refspec targeting a single branch.
--- `git fetch --prune` (all refs) is prohibited.
-invariant NoBlanketFetch {
-    for all git_fetch_invocations:
-        refspec is not empty
+-- REQ-PROJ-020/022: No blanket fetches. Every `git fetch` call produced by
+-- any rule in this spec must include a refspec targeting a single branch;
+-- `git fetch --prune` (all refs) is prohibited. Every BestEffortFetch
+-- emitted above carries a concrete branch name as its second argument --
+-- this is an audit property of the @guidance, not a structural claim about
+-- entities.
+
+-- REQ-PROJ-020: behind_remote, when present, counts commits on the remote
+-- tracking ref that are not yet on the local branch; it is never negative.
+invariant BranchEntryBehindRemoteNonNegative {
+    for e in BranchEntries:
+        e.behind_remote != absent implies e.behind_remote >= 0
+}
+
+-- REQ-PROJ-021: The ls-remote cache TTL is a non-negative duration.
+-- Freshness is decided by (now - fetched_at) vs ttl_seconds; a negative
+-- TTL would leave the cache permanently expired.
+invariant LsRemoteCacheTtlNonNegative {
+    for c in LsRemoteCaches:
+        c.ttl_seconds >= 0
 }
 
 ------------------------------------------------------------
@@ -932,7 +986,7 @@ invariant NoBlanketFetch {
 ------------------------------------------------------------
 
 surface ProjectManagement {
-    facing user: bedrock/User
+    facing: bedrock/User
 
     context conversation: bedrock/Conversation
         where mode in { work, branch } and status = idle
@@ -956,7 +1010,7 @@ surface ProjectManagement {
 }
 
 surface BranchPicker {
-    facing user: bedrock/User
+    facing: bedrock/User
 
     context project: Project
 
