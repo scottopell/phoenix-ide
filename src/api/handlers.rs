@@ -2157,6 +2157,7 @@ async fn search_conversation_files(
         .git_global(true)
         .git_exclude(true)
         .ignore(true)
+        .filter_entry(|e| e.file_name() != ".git") // .git/ is not gitignored, exclude explicitly
         .build();
 
     let mut items: Vec<(i32, FileSearchEntry)> = Vec::new();
