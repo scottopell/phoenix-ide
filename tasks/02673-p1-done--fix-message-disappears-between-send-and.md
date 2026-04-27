@@ -1,7 +1,7 @@
 ---
 created: 2026-04-23
 priority: p1
-status: in-progress
+status: done
 artifact: ui/src/pages/ConversationPage.tsx
 ---
 

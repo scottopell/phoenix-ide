@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import type { Message, ToolResultContent, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import type { StreamingBuffer } from '../conversation/atom';
@@ -175,6 +175,20 @@ export function MessageList({
   const initialMessageCount = useRef<number | null>(null);
   const lastScrollTop = useRef(0);
   const prevMessagesHeight = useRef(0);
+  // Tracks message count between renders so the ResizeObserver knows whether a
+  // new message arrived (fix: height can *decrease* when streaming clears and the
+  // finalized message is shorter, which would otherwise suppress auto-scroll).
+  const prevMessageCountRef = useRef(messages.length);
+  // 'force' = new system message → scroll regardless of pin state.
+  // 'soft'  = new non-system message → scroll only if pinned.
+  // 'none'  = no new message this render.
+  const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
+  if (messages.length > prevMessageCountRef.current) {
+    const newMsgs = messages.slice(prevMessageCountRef.current);
+    const hasSystem = newMsgs.some(m => (m.message_type || m.type) === 'system');
+    scrollTriggerRef.current = hasSystem ? 'force' : 'soft';
+    prevMessageCountRef.current = messages.length;
+  }
 
   // Check if user is near bottom of scroll
   const checkIfPinnedToBottom = useCallback(() => {
@@ -189,10 +203,8 @@ export function MessageList({
     isPinnedToBottom.current = checkIfPinnedToBottom();
     const el = mainRef.current;
     if (el) lastScrollTop.current = el.scrollTop;
-    if (showJumpToNewest && isPinnedToBottom.current) {
-      setShowJumpToNewest(false);
-    }
-  }, [checkIfPinnedToBottom, showJumpToNewest]);
+    if (isPinnedToBottom.current) setShowJumpToNewest(false);
+  }, [checkIfPinnedToBottom]);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback(() => {
@@ -205,7 +217,8 @@ export function MessageList({
   // Fires after layout is complete (unlike rAF which fires before paint), so
   // scrollHeight is always the settled value — no mid-render jumps.
   // Triggers on any content growth: streaming tokens, new messages, new tool blocks.
-  // Does NOT trigger on phase-only state changes that produce no visible content.
+  // Also fires on net-zero or negative height changes when a new message arrived
+  // (streaming clears + finalized message renders = possible height decrease).
   useEffect(() => {
     const messagesEl = messagesRef.current;
     if (!messagesEl) return;
@@ -213,12 +226,17 @@ export function MessageList({
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const newHeight = entry.contentRect.height;
-        if (newHeight > prevMessagesHeight.current) {
-          if (isPinnedToBottom.current) {
-            // Content grew and user is pinned — follow it
+        const trigger = scrollTriggerRef.current;
+        scrollTriggerRef.current = 'none';
+
+        const heightGrew = newHeight > prevMessagesHeight.current;
+        const shouldAct = heightGrew || trigger !== 'none';
+
+        if (shouldAct) {
+          if (isPinnedToBottom.current || trigger === 'force') {
             mainRef.current!.scrollTop = mainRef.current!.scrollHeight;
+            if (trigger === 'force') isPinnedToBottom.current = true;
           } else {
-            // Content grew but user scrolled up — nudge them
             setShowJumpToNewest(true);
           }
         }
@@ -250,8 +268,11 @@ export function MessageList({
     };
   }, [conversationId, messages.length]);
 
-  // Restore scroll position on mount after messages render (REQ-UI-013)
-  useEffect(() => {
+  // Restore scroll position on mount after messages render (REQ-UI-013).
+  // useLayoutEffect runs synchronously after DOM commit and before the browser
+  // fires ResizeObserver, so isPinnedToBottom is correctly set before the
+  // observer decides whether to auto-scroll — no rAF, no flash to bottom first.
+  useLayoutEffect(() => {
     if (!conversationId || messages.length === 0 || scrollRestored.current) return;
     scrollRestored.current = true;
     const savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
@@ -259,27 +280,26 @@ export function MessageList({
     if (savedPos !== null) {
       const pos = parseInt(savedPos, 10);
       const prevCount = savedCount ? parseInt(savedCount, 10) : messages.length;
-      requestAnimationFrame(() => {
-        const el = mainRef.current;
-        if (!el) return;
+      const el = mainRef.current;
+      if (el) {
         el.scrollTop = pos;
         lastScrollTop.current = pos;
         isPinnedToBottom.current = checkIfPinnedToBottom();
-        // Show "jump to newest" if new messages arrived while away
         if (messages.length > prevCount && !isPinnedToBottom.current) {
           setShowJumpToNewest(true);
         }
-      });
+      }
     }
-    // Record initial message count for jump-to-newest logic
     initialMessageCount.current = messages.length;
   }, [conversationId, messages.length, checkIfPinnedToBottom]);
 
-  // Reset scrollRestored when conversation changes
+  // Reset all scroll state when conversation changes
   useEffect(() => {
     scrollRestored.current = false;
     prevMessagesHeight.current = 0;
-    isPinnedToBottom.current = true; // Re-pin on every conversation switch
+    prevMessageCountRef.current = 0;
+    scrollTriggerRef.current = 'none';
+    isPinnedToBottom.current = true;
     setShowJumpToNewest(false);
     initialMessageCount.current = null;
   }, [conversationId]);
