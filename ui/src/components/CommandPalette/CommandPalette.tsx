@@ -40,21 +40,53 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
-  const activeConversation = useMemo(
-    () => conversations.find(c => c.slug === currentSlug) ?? null,
-    [conversations, currentSlug],
+
+  // Stable scalars for the active conversation — only update when id/cwd actually change,
+  // not on every 5s poll that produces a new array reference from DesktopLayout.
+  const activeConversationRaw = conversations.find(c => c.slug === currentSlug) ?? null;
+  const activeConvId = activeConversationRaw?.id ?? null;
+  const activeConvCwd = activeConversationRaw?.cwd ?? null;
+
+  // Stable conversation ids string — only changes when the *set* of conversations changes.
+  const conversationIdsKey = useMemo(
+    () => conversations.map(c => c.id).join(','),
+    [conversations],
   );
 
-  // Sources — file source only when inside a conversation
-  const sources: PaletteSource[] = useMemo(
-    () => [
-      createConversationSource(conversations, (slug) => navigate(`/c/${slug}`)),
-      ...(activeConversation
-        ? [createFileSource(activeConversation.id, activeConversation.cwd, (path, rootDir) => openFile(path, rootDir))]
-        : []),
-    ],
-    [conversations, navigate, activeConversation, openFile],
+  // ConversationSource — recomputed only when the conversation set changes (by id key).
+  // conversations ref changes every 5s (DesktopLayout poll) but conversationIdsKey is
+  // stable across same-content polls; use key as the real dep, capture conversations.
+  const conversationSource = useMemo(
+    () => createConversationSource(conversations, (slug) => navigate(`/c/${slug}`)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [conversationIdsKey, navigate],
   );
+
+  // FileSource — recomputed only when conversation id or cwd actually changes.
+  const fileSource = useMemo(
+    () =>
+      activeConvId && activeConvCwd
+        ? createFileSource(activeConvId, activeConvCwd, (path, rootDir) => openFile(path, rootDir))
+        : null,
+    [activeConvId, activeConvCwd, openFile],
+  );
+
+  // Stable sources array — changes only when conversationSource or fileSource identity changes.
+  const sources: PaletteSource[] = useMemo(
+    () => (fileSource ? [conversationSource, fileSource] : [conversationSource]),
+    [conversationSource, fileSource],
+  );
+
+  // Keep a ref so the search effect always sees the latest sources without
+  // needing sources in its dep array (which would re-fire the effect on every
+  // sources identity change, even when only the conversation list content shifted).
+  const sourcesRef = useRef<PaletteSource[]>(sources);
+  useEffect(() => {
+    sourcesRef.current = sources;
+  });
+
+  // Stable boolean for downstream consumers — true when inside a conversation route.
+  const hasActiveConversation = activeConvId !== null;
 
   const actions: PaletteAction[] = useMemo(
     () =>
@@ -111,8 +143,10 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
       const controller = new AbortController();
       searchAbortRef.current = controller;
 
+      // Read sources via ref — latest value without making sources a dep.
+      // This prevents the 5s conversation-poll from re-aborting in-flight requests.
       const allResults = await Promise.all(
-        sources.map(s => s.search(query, controller.signal))
+        sourcesRef.current.map(s => s.search(query, controller.signal))
       );
 
       if (!controller.signal.aborted) {
@@ -123,7 +157,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [isOpen, searchMode, searchQuery, sources, actions]);
+  }, [isOpen, searchMode, searchQuery, actions]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {
@@ -247,6 +281,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
         <CommandPaletteInput
           value={state.rawInput}
           mode={state.mode}
+          hasActiveConversation={hasActiveConversation}
           onChange={(value) => dispatch({ type: 'SET_QUERY', rawInput: value })}
           onKeyDown={handleKeyDown}
         />

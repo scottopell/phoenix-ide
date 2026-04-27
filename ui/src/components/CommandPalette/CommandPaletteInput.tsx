@@ -3,11 +3,12 @@ import { useRef, useEffect } from 'react';
 interface Props {
   value: string;
   mode: 'search' | 'action';
+  hasActiveConversation: boolean;
   onChange: (value: string) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
 }
 
-export function CommandPaletteInput({ value, mode, onChange, onKeyDown }: Props) {
+export function CommandPaletteInput({ value, mode, hasActiveConversation, onChange, onKeyDown }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -16,7 +17,9 @@ export function CommandPaletteInput({ value, mode, onChange, onKeyDown }: Props)
 
   const placeholder = mode === 'action'
     ? 'Type a command...'
-    : 'Search conversations...';
+    : hasActiveConversation
+      ? 'Search conversations and files...'
+      : 'Search conversations...';
 
   // In action mode, show > as styled indicator, strip from input
   const displayValue = mode === 'action' && value.startsWith('>') ? value.slice(1) : value;
