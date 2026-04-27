@@ -9,8 +9,9 @@
 
 use super::wire::SseWireEvent;
 use crate::runtime::SseEvent;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::stream::Stream;
+use axum::response::IntoResponse;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -30,12 +31,21 @@ use tokio_stream::StreamExt;
 /// `conv_id` is threaded through only for the Lagged log line; the stream
 /// itself does not consume it. Capacity of the underlying channel lives
 /// at `crate::runtime::SSE_BROADCAST_CAPACITY`.
+///
+/// Sets `X-Accel-Buffering: no` so any HTTP-aware intermediary on the path
+/// (nginx, ingress controllers, etc.) flushes events immediately rather than
+/// batching them. Without this hint such a proxy may hold `state_change`
+/// events long enough to mask client UI as "stuck on stale phase" between
+/// transitions. No-op for TCP-level forwarders, harmless either way.
 pub fn sse_stream(
     conv_id: String,
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let init = futures::stream::once(async move { Ok(sse_event_to_axum(init_event)) });
+) -> impl IntoResponse {
+    let init =
+        futures::stream::once(
+            async move { Ok::<Event, Infallible>(sse_event_to_axum(init_event)) },
+        );
 
     let broadcasts = BroadcastStream::new(broadcast_rx)
         .take_while(move |result| {
@@ -57,11 +67,15 @@ pub fn sse_stream(
 
     let combined = init.chain(broadcasts);
 
-    Sse::new(combined).keep_alive(
+    let sse = Sse::new(combined).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("ping"),
-    )
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    (headers, sse)
 }
 
 fn sse_event_to_axum(event: SseEvent) -> Event {
