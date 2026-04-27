@@ -2222,7 +2222,12 @@ async fn search_conversation_files(
 
 /// Score a file path against a fuzzy query using nucleo-matcher.
 /// Returns None if the path doesn't match. Higher scores = better matches.
-/// Prefers filename matches over scattered path-segment matches.
+///
+/// Scores each path segment individually and takes the best, so a query like
+/// "fake-nvml" that exactly matches a directory component scores much higher
+/// than a file whose long hyphenated basename merely contains the right chars
+/// scattered across it (e.g. releasenotes UUID filenames ending in .yaml).
+/// Bonus: +1000 for filename match, +500 for directory segment match.
 fn fuzzy_score_path(
     path: &str,
     query: &str,
@@ -2238,27 +2243,27 @@ fn fuzzy_score_path(
         AtomKind::Fuzzy,
     );
 
-    // Score against filename first (much more relevant for file search)
-    let filename = path.rsplit('/').next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').collect();
+    let last_idx = segments.len().saturating_sub(1);
 
-    buf.clear();
-    buf.extend(filename.chars());
-    let haystack = nucleo_matcher::Utf32Str::Unicode(buf);
+    let best_segment = segments.iter().enumerate().find_map(|(i, seg)| {
+        buf.clear();
+        buf.extend(seg.chars());
+        let haystack = nucleo_matcher::Utf32Str::Unicode(buf);
+        pattern.score(haystack, matcher).map(|s| {
+            let bonus = if i == last_idx { 1000 } else { 500 };
+            i32::try_from(s).unwrap_or(i32::MAX).saturating_add(bonus)
+        })
+    });
 
-    if let Some(score) = pattern.score(haystack, matcher) {
-        // Filename match: boost score significantly
-        return Some(
-            i32::try_from(score)
-                .unwrap_or(i32::MAX)
-                .saturating_add(1000),
-        );
+    if best_segment.is_some() {
+        return best_segment;
     }
 
-    // Fall back to full path match (but with lower base score)
+    // Nothing matched on any segment — try full path as last resort.
     buf.clear();
     buf.extend(path.chars());
     let haystack = nucleo_matcher::Utf32Str::Unicode(buf);
-
     pattern
         .score(haystack, matcher)
         .map(|s| i32::try_from(s).unwrap_or(i32::MAX))

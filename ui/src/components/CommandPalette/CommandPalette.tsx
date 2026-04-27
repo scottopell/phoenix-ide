@@ -73,7 +73,7 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
 
   // Stable sources array — changes only when conversationSource or fileSource identity changes.
   const sources: PaletteSource[] = useMemo(
-    () => (fileSource ? [conversationSource, fileSource] : [conversationSource]),
+    () => (fileSource ? [fileSource, conversationSource] : [conversationSource]),
     [conversationSource, fileSource],
   );
 
