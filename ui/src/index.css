@@ -5141,6 +5141,51 @@ html * {
     padding: 10px 20px;
     font-size: 14px;
   }
+
+  /* Hide trajectory bar on mobile -- not worth the pixels */
+  #breadcrumb-bar {
+    display: none;
+  }
+
+  /* Collapsed StateBar: thin one-line summary, tap to expand.
+     Mirror of `(max-width: 768px)` in StateBar.tsx isMobile state. */
+  #state-bar.statebar-mobile-collapsed {
+    height: 32px;
+    cursor: pointer;
+    padding: 0 8px;
+  }
+
+  #state-bar.statebar-mobile-collapsed .statebar-line2,
+  #state-bar.statebar-mobile-collapsed .statebar-mode,
+  #state-bar.statebar-mobile-collapsed .conv-model-wrapper,
+  #state-bar.statebar-mobile-collapsed #state-text,
+  #state-bar.statebar-mobile-collapsed .context-bar {
+    display: none;
+  }
+
+  #state-bar.statebar-mobile-collapsed .statebar-slug {
+    max-width: 40vw;
+    font-size: 13px;
+  }
+
+  .statebar-chevron {
+    background: none;
+    border: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    margin-left: 4px;
+    flex-shrink: 0;
+  }
+
+  .statebar-chevron:hover {
+    color: var(--text-primary);
+  }
 }
 
 /* IndexedDB init error state */

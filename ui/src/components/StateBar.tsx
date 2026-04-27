@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
 import type { Conversation, ConversationState, ModelInfo } from '../api';
 import type { ConnectionState } from '../hooks';
@@ -92,8 +92,21 @@ export function StateBar({
   const [menuOpen, setMenuOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
+  // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 768px)').matches);
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)');
+    const handler = (e: MediaQueryListEvent) => {
+      setIsMobile(e.matches);
+      if (!e.matches) setMobileExpanded(false);
+    };
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
 
   // Close menu on outside click
   useEffect(() => {
@@ -309,9 +322,27 @@ export function StateBar({
   const branchName = conversation?.branch_name;
   const taskTitle = conversation?.task_title;
 
+  const showMobileCollapsed = isMobile && !mobileExpanded;
+  const headerProps = showMobileCollapsed
+    ? {
+        className: 'statebar-mobile-collapsed',
+        role: 'button',
+        tabIndex: 0,
+        'aria-expanded': false,
+        'aria-label': 'Expand status bar',
+        onClick: () => setMobileExpanded(true),
+        onKeyDown: (e: ReactKeyboardEvent) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setMobileExpanded(true);
+          }
+        },
+      }
+    : {};
+
   return (
     <>
-      <header id="state-bar">
+      <header id="state-bar" {...headerProps}>
         <div id="state-bar-left">
           {conversation ? (
             <>
@@ -492,6 +523,20 @@ export function StateBar({
             </div>
           )}
         </div>
+        {isMobile && (
+          <button
+            type="button"
+            className="statebar-chevron"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMobileExpanded(v => !v);
+            }}
+            aria-label={mobileExpanded ? 'Collapse status bar' : 'Expand status bar'}
+            aria-expanded={mobileExpanded}
+          >
+            {mobileExpanded ? '▾' : '▴'}
+          </button>
+        )}
       </header>
       {showOfflineBanner && (
         <div className="offline-banner">
