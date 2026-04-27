@@ -937,6 +937,7 @@ export function ConversationPage() {
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
+          onSubmitted={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 } })}
         />
       ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'terminal' ? (
         <>

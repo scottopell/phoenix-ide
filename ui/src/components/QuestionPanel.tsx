@@ -28,6 +28,13 @@ export interface QuestionPanelProps {
   questions: UserQuestion[];
   conversationId: string;
   showToast: (message: string, duration?: number) => void;
+  /** Called after a successful respond/cancel POST. The parent uses this to
+   *  optimistically advance the local phase out of awaiting_user_response so
+   *  the wizard dismisses immediately, instead of waiting for the SSE state
+   *  echo (which can lag or be missed entirely on a flaky connection). The
+   *  authoritative server-side phase change arrives via sse_state_change and
+   *  reconciles. Mirrors handleSend in ConversationPage.tsx. */
+  onSubmitted: () => void;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -45,6 +52,7 @@ export function QuestionPanel({
   questions,
   conversationId,
   showToast,
+  onSubmitted,
 }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
 
@@ -228,6 +236,7 @@ export function QuestionPanel({
         buildAnswerMap(),
         buildAnnotations()
       );
+      onSubmitted();
       showToast('Response sent', 3000);
     } catch (err) {
       const msg =
@@ -242,6 +251,7 @@ export function QuestionPanel({
     conversationId,
     buildAnswerMap,
     buildAnnotations,
+    onSubmitted,
     showToast,
   ]);
 
@@ -257,6 +267,7 @@ export function QuestionPanel({
     setFeedback(null);
     try {
       await api.cancelConversation(conversationId);
+      onSubmitted();
       showToast('Declined to answer', 3000);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to decline';
@@ -264,7 +275,7 @@ export function QuestionPanel({
     } finally {
       setSubmitting(false);
     }
-  }, [submitting, conversationId, showToast]);
+  }, [submitting, conversationId, onSubmitted, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(
