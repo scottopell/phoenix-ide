@@ -24,12 +24,9 @@ export function getInitialTheme(): Theme {
   return getSystemTheme();
 }
 
-export const ThemeContext = createContext<ThemeContextValue | null>(null);
+const defaultThemeValue: ThemeContextValue = { theme: 'dark', toggleTheme: () => {} };
+export const ThemeContext = createContext<ThemeContextValue>(defaultThemeValue);
 
 export function useTheme(): ThemeContextValue {
-  const ctx = useContext(ThemeContext);
-  if (!ctx) {
-    throw new Error('useTheme must be used within a ThemeProvider');
-  }
-  return ctx;
+  return useContext(ThemeContext);
 }

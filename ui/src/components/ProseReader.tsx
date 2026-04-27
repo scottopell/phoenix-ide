@@ -12,10 +12,11 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { SyntaxHighlighter, createElement, oneDark } from '../utils/syntaxHighlighter';
+import { SyntaxHighlighter, createElement, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { createElementProps } from '../utils/syntaxHighlighter';
 import { generateUUID } from '../utils/uuid';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
+import { useTheme } from '../hooks/useTheme';
 import {
   ArrowLeft,
   X,
@@ -230,6 +231,8 @@ export function ProseReader({
   inline,
 }: ProseReaderProps) {
   useRegisterFocusScope('prose-reader');
+  const { theme } = useTheme();
+  const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -530,7 +533,7 @@ export function ProseReader({
             const match = /language-(\w+)/.exec(className || '');
             return !inline && match ? (
               <SyntaxHighlighter
-                style={oneDark}
+                style={syntaxStyle}
                 language={match[1]}
                 PreTag="div"
                 {...props}
@@ -548,7 +551,7 @@ export function ProseReader({
         {content}
       </ReactMarkdown>
     );
-  }, [content, fileType, patchContext?.modifiedLines, highlightedLine, handleLongPress]);
+  }, [content, fileType, patchContext?.modifiedLines, highlightedLine, handleLongPress, syntaxStyle]);
 
   // Get file name from path
   const fileName = filePath.split('/').pop() || filePath;

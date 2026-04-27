@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
+import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { StreamingBuffer } from '../conversation/atom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 
@@ -29,6 +30,8 @@ interface StreamingMessageProps {
  *   dimensions so the swap to SyntaxHighlighter causes no layout shift.
  */
 export function StreamingMessage({ buffer }: StreamingMessageProps) {
+  const { theme } = useTheme();
+  const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   // rAF-gated display buffer: accumulates incoming text and flushes once per frame.
   const pendingText = useRef<string>('');
   const rafHandle = useRef<number | null>(null);
@@ -62,7 +65,7 @@ export function StreamingMessage({ buffer }: StreamingMessageProps) {
     <div className="streaming-message agent-message">
       <div className="streaming-message-content">
         {blocks.map((block, i) => (
-          <StreamingBlock key={`${block.type}-${i}`} block={block} />
+          <StreamingBlock key={`${block.type}-${i}`} block={block} syntaxStyle={syntaxStyle} />
         ))}
       </div>
       <span className="streaming-cursor" aria-hidden="true" />
@@ -70,7 +73,7 @@ export function StreamingMessage({ buffer }: StreamingMessageProps) {
   );
 }
 
-function StreamingBlock({ block }: { block: StreamingBlock }) {
+function StreamingBlock({ block, syntaxStyle }: { block: StreamingBlock; syntaxStyle: Record<string, React.CSSProperties> }) {
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
@@ -84,7 +87,7 @@ function StreamingBlock({ block }: { block: StreamingBlock }) {
   if (block.complete) {
     return (
       <SyntaxHighlighter
-        style={oneDark}
+        style={syntaxStyle}
         language={block.lang || 'text'}
         PreTag="div"
       >

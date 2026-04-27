@@ -72,4 +72,4 @@ for (const [name, grammar] of registrations) {
 
 export { SyntaxHighlighter, createElement };
 export type { createElementProps };
-export { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+export { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';

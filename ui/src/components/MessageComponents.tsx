@@ -15,9 +15,10 @@
 import React, { memo, useState, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
+import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { QueuedMessage } from '../hooks';
+import { useTheme } from '../hooks/useTheme';
 
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
@@ -327,6 +328,8 @@ export const AgentMessage = memo(AgentMessageImpl);
 function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = true }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
+  const { theme } = useTheme();
+  const syntaxStyle = theme === 'light' ? oneLight : oneDark;
 
   // Stable markdown component map — only recreated when onOpenFile identity changes.
   // Keeps ReactMarkdown from remounting SyntaxHighlighter on every parent re-render.
@@ -338,7 +341,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       if (!inline && match) {
         return (
           <SyntaxHighlighter
-            style={oneDark}
+            style={syntaxStyle}
             language={match[1]}
             PreTag="div"
             {...props}
@@ -393,7 +396,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       };
       return <li>{processChildren(children)}</li>;
     },
-  }), [onOpenFile]);
+  }), [onOpenFile, syntaxStyle]);
 
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {
