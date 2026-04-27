@@ -3,16 +3,13 @@ import { Link } from 'react-router-dom';
 import type { Conversation, ConversationState, ModelInfo } from '../api';
 import type { ConnectionState } from '../hooks';
 import { getStateDescription } from '../utils';
+import { ContextIndicator } from './ContextIndicator';
 
 const CheckIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <polyline points="20 6 9 17 4 12" />
   </svg>
 );
-
-// Thresholds (match backend constants)
-const WARNING_THRESHOLD = 0.80;
-const CONTINUATION_THRESHOLD = 0.90;
 
 interface StateBarProps {
   conversation: Conversation | null;
@@ -89,13 +86,11 @@ export function StateBar({
   onTriggerContinuation,
   onUpgradeModel,
 }: StateBarProps) {
-  const [menuOpen, setMenuOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
   // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
   const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 768px)').matches);
   const [mobileExpanded, setMobileExpanded] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
@@ -107,18 +102,6 @@ export function StateBar({
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
   }, []);
-
-  // Close menu on outside click
-  useEffect(() => {
-    if (!menuOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen]);
 
   // Close model picker on outside click
   useEffect(() => {
@@ -223,35 +206,10 @@ export function StateBar({
 
   const showOfflineBanner = connectionState === 'offline' && nextRetryIn !== null;
 
-  // Context window indicator - use model-specific limit
-  const maxTokens = modelContextWindow || 200_000; // Fallback for legacy
-  const contextPercent = Math.min((contextWindowUsed / maxTokens) * 100, 100);
-  const contextWarning = contextPercent / 100 >= WARNING_THRESHOLD;
-  const contextCritical = contextPercent / 100 >= CONTINUATION_THRESHOLD;
-
-  let contextClass = 'context-indicator';
-  if (contextCritical) {
-    contextClass += ' critical';
-  } else if (contextWarning) {
-    contextClass += ' warning';
-  }
-
-  const formatTokens = (n: number): string => {
-    if (n >= 1000) {
-      return `${(n / 1000).toFixed(0)}k`;
-    }
-    return n.toString();
-  };
-
-  const tooltipText = `Context window usage: ${formatTokens(contextWindowUsed)} / ${formatTokens(maxTokens)} tokens (${contextPercent.toFixed(1)}%). When full, the conversation will need to be summarized.`;
-
-  // Show menu trigger only when warning threshold reached and in idle state
-  const canTriggerContinuation = contextWarning && convState.type === 'idle' && onTriggerContinuation;
-
-  const handleTriggerContinuation = () => {
-    setMenuOpen(false);
-    onTriggerContinuation?.();
-  };
+  // Context window indicator -- use model-specific limit, fallback for legacy
+  const maxTokens = modelContextWindow || 200_000;
+  // Trigger menu only available in idle phase, regardless of threshold (the indicator gates on threshold itself).
+  const indicatorTrigger = convState.type === 'idle' ? onTriggerContinuation : undefined;
 
   // Derived display values
   const mode = conversation?.conv_mode_label?.toLowerCase();
@@ -486,41 +444,11 @@ export function StateBar({
             <span id="state-text">{stateText}</span>
           </div>
           {conversation && contextWindowUsed > 0 && (
-            <div
-              className={contextClass}
-              title={tooltipText}
-              ref={menuRef}
-            >
-              <div
-                className="context-bar-wrapper"
-                onClick={() => canTriggerContinuation && setMenuOpen(!menuOpen)}
-                style={{ cursor: canTriggerContinuation ? 'pointer' : 'default' }}
-              >
-                <div className="context-bar">
-                  <div
-                    className="context-fill"
-                    style={{ width: `${contextPercent}%` }}
-                  />
-                </div>
-                <span className="context-label">{formatTokens(contextWindowUsed)}</span>
-                {canTriggerContinuation && (
-                  <span className="context-menu-indicator">&#9660;</span>
-                )}
-              </div>
-              {menuOpen && canTriggerContinuation && (
-                <div className="context-menu">
-                  <button
-                    className="context-menu-item"
-                    onClick={handleTriggerContinuation}
-                  >
-                    End & summarize conversation
-                  </button>
-                  <div className="context-menu-hint">
-                    Creates a summary to continue in a new conversation
-                  </div>
-                </div>
-              )}
-            </div>
+            <ContextIndicator
+              used={contextWindowUsed}
+              max={maxTokens}
+              onTriggerContinuation={indicatorTrigger}
+            />
           )}
         </div>
         {isMobile && (
