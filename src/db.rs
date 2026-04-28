@@ -1212,7 +1212,6 @@ impl Database {
     ///
     /// `root_conversation_id` is the top-level conversation that owns the work
     /// tree; for a top-level conversation it equals `conversation_id`.
-    #[allow(dead_code)] // Callers added in Phase 2
     pub async fn insert_turn_usage(
         &self,
         conversation_id: &str,

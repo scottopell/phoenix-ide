@@ -1296,6 +1296,8 @@ where
         let tool_executor = self.tool_executor.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
+        let root_conv_id = self.context.root_conversation_id.clone();
+        let model_id = self.context.model_id.clone();
         let working_dir = self.context.working_dir.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
@@ -1406,6 +1408,33 @@ where
                         cache_read = usage.cache_read_tokens,
                         "LLM response token usage"
                     );
+
+                    // Fire-and-forget: persist token usage for this turn.
+                    // Errors are logged and do not affect the conversation.
+                    let storage_for_usage = storage.clone();
+                    let conv_id_for_usage = conv_id.clone();
+                    let root_id_for_usage = root_conv_id.clone();
+                    let model_for_usage = model_id.clone();
+                    let input_tokens = usage.input_tokens;
+                    let output_tokens = usage.output_tokens;
+                    let cache_creation_tokens = usage.cache_creation_tokens;
+                    let cache_read_tokens = usage.cache_read_tokens;
+                    tokio::spawn(async move {
+                        if let Err(e) = storage_for_usage
+                            .insert_turn_usage(
+                                &conv_id_for_usage,
+                                &root_id_for_usage,
+                                &model_for_usage,
+                                input_tokens,
+                                output_tokens,
+                                cache_creation_tokens,
+                                cache_read_tokens,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to write turn_usage row");
+                        }
+                    });
 
                     LlmOutcome::Response {
                         content: response.content,

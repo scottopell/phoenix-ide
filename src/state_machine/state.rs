@@ -1211,6 +1211,10 @@ pub enum ModeKind {
 #[derive(Debug, Clone)]
 pub struct ConvContext {
     pub conversation_id: String,
+    /// The top-level conversation that owns this work tree.
+    /// For root conversations this equals `conversation_id`.
+    /// For sub-agents it is the root ancestor's id.
+    pub root_conversation_id: String,
     pub working_dir: PathBuf,
     #[allow(dead_code)] // Used by LLM client selection
     pub model_id: String,
@@ -1240,8 +1244,10 @@ impl ConvContext {
         model_id: impl Into<String>,
         context_window: usize,
     ) -> Self {
+        let id = conversation_id.into();
         Self {
-            conversation_id: conversation_id.into(),
+            root_conversation_id: id.clone(),
+            conversation_id: id,
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: false,
@@ -1260,9 +1266,11 @@ impl ConvContext {
         working_dir: PathBuf,
         model_id: impl Into<String>,
         context_window: usize,
+        root_conversation_id: impl Into<String>,
     ) -> Self {
         Self {
             conversation_id: conversation_id.into(),
+            root_conversation_id: root_conversation_id.into(),
             working_dir,
             model_id: model_id.into(),
             is_sub_agent: true,

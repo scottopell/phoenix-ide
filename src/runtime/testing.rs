@@ -530,6 +530,20 @@ impl StateStore for InMemoryStorage {
         // In-memory storage doesn't track cwd separately
         Ok(())
     }
+
+    async fn insert_turn_usage(
+        &self,
+        _conversation_id: &str,
+        _root_conversation_id: &str,
+        _model: &str,
+        _input_tokens: u64,
+        _output_tokens: u64,
+        _cache_creation_tokens: u64,
+        _cache_read_tokens: u64,
+    ) -> Result<(), String> {
+        // In-memory storage discards turn usage (tests that need it use a real DB)
+        Ok(())
+    }
 }
 
 // ============================================================================

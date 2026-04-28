@@ -553,12 +553,15 @@ impl RuntimeManager {
         }
 
         // 3. Create sub-agent context with max_turns from spec (REQ-PROJ-008)
+        let root_conversation_id =
+            find_root_conversation_id(&self.db, &parent_conversation_id).await;
         let context_window = self.llm_registry.context_window(&spec.model_id);
         let mut conv_context = ConvContext::sub_agent(
             &conv.id,
             PathBuf::from(&conv.cwd),
             &spec.model_id,
             context_window,
+            root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
         conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
@@ -729,11 +732,13 @@ impl RuntimeManager {
         let context_window = self.llm_registry.context_window(&model_id);
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
+            let root_id = find_root_conversation_id(&self.db, conversation_id).await;
             ConvContext::sub_agent(
                 &conv.id,
                 PathBuf::from(&conv.cwd),
                 &model_id,
                 context_window,
+                root_id,
             )
         } else {
             ConvContext::new(
@@ -986,6 +991,26 @@ impl RuntimeManager {
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
         &self.llm_registry
     }
+}
+
+/// Walk up the parent chain to find the root (top-level) conversation id.
+///
+/// For a root conversation the function returns immediately. For deeply nested
+/// sub-agents it follows `parent_conversation_id` links until it reaches a
+/// conversation with no parent, or until the 10-iteration guard fires on
+/// corrupt data.
+async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> String {
+    let mut current_id = conversation_id.to_string();
+    for _ in 0..10 {
+        match db.get_conversation(&current_id).await {
+            Ok(conv) => match conv.parent_conversation_id {
+                None => return current_id,
+                Some(parent_id) => current_id = parent_id,
+            },
+            Err(_) => return current_id,
+        }
+    }
+    current_id
 }
 
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.

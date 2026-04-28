@@ -94,6 +94,19 @@ pub trait StateStore: Send + Sync {
 
     /// Update the conversation working directory (e.g., after worktree creation)
     async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String>;
+
+    /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
+    /// by the caller and do not affect the conversation.
+    async fn insert_turn_usage(
+        &self,
+        conversation_id: &str,
+        root_conversation_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Result<(), String>;
 }
 
 /// Client for making LLM requests
@@ -230,6 +243,29 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
         (**self).update_conversation_cwd(conv_id, cwd).await
+    }
+
+    async fn insert_turn_usage(
+        &self,
+        conversation_id: &str,
+        root_conversation_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Result<(), String> {
+        (**self)
+            .insert_turn_usage(
+                conversation_id,
+                root_conversation_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            )
+            .await
     }
 }
 
@@ -405,6 +441,30 @@ impl StateStore for DatabaseStorage {
     async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
         self.db
             .update_conversation_cwd(conv_id, cwd)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn insert_turn_usage(
+        &self,
+        conversation_id: &str,
+        root_conversation_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Result<(), String> {
+        self.db
+            .insert_turn_usage(
+                conversation_id,
+                root_conversation_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            )
             .await
             .map_err(|e| e.to_string())
     }
