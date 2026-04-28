@@ -1207,6 +1207,107 @@ impl Database {
         }
         Ok(())
     }
+
+    /// Insert one row into `turn_usage` for token accounting.
+    ///
+    /// `root_conversation_id` is the top-level conversation that owns the work
+    /// tree; for a top-level conversation it equals `conversation_id`.
+    #[allow(dead_code)] // Callers added in Phase 2
+    pub async fn insert_turn_usage(
+        &self,
+        conversation_id: &str,
+        root_conversation_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> DbResult<()> {
+        let now_str = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO turn_usage \
+             (conversation_id, root_conversation_id, model, \
+              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(conversation_id)
+        .bind(root_conversation_id)
+        .bind(model)
+        .bind(input_tokens as i64)
+        .bind(output_tokens as i64)
+        .bind(cache_creation_tokens as i64)
+        .bind(cache_read_tokens as i64)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return aggregated token usage for a conversation.
+    ///
+    /// `own` covers only rows where `conversation_id` matches; `total` covers
+    /// all rows under the same root (i.e. the top-level conversation plus all
+    /// its sub-agents).
+    #[allow(dead_code)] // Callers added in Phase 4
+    pub async fn get_conversation_usage(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<ConversationUsage> {
+        // --- own ---
+        let own_row = sqlx::query(
+            "SELECT \
+             COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+             COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+             COUNT(*) AS turns \
+             FROM turn_usage WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let own = UsageTotals {
+            input_tokens: own_row.try_get("input_tokens")?,
+            output_tokens: own_row.try_get("output_tokens")?,
+            cache_creation_tokens: own_row.try_get("cache_creation_tokens")?,
+            cache_read_tokens: own_row.try_get("cache_read_tokens")?,
+            turns: own_row.try_get("turns")?,
+        };
+
+        // --- total: find root_conversation_id, fall back to conversation_id ---
+        let root_id: String = sqlx::query_scalar(
+            "SELECT root_conversation_id FROM turn_usage \
+             WHERE conversation_id = ?1 LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_else(|| conversation_id.to_string());
+
+        let total_row = sqlx::query(
+            "SELECT \
+             COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+             COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+             COUNT(*) AS turns \
+             FROM turn_usage WHERE root_conversation_id = ?1",
+        )
+        .bind(&root_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total = UsageTotals {
+            input_tokens: total_row.try_get("input_tokens")?,
+            output_tokens: total_row.try_get("output_tokens")?,
+            cache_creation_tokens: total_row.try_get("cache_creation_tokens")?,
+            cache_read_tokens: total_row.try_get("cache_read_tokens")?,
+            turns: total_row.try_get("turns")?,
+        };
+
+        Ok(ConversationUsage { own, total })
+    }
 }
 
 /// Parse a conversation row from the database

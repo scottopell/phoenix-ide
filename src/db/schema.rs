@@ -103,6 +103,21 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
+
+CREATE TABLE IF NOT EXISTS turn_usage (
+    id INTEGER PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    root_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_usage_conversation ON turn_usage(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_turn_usage_root ON turn_usage(root_conversation_id);
 "#;
 
 /// Migration SQL to convert old state format to typed JSON
@@ -910,6 +925,26 @@ impl fmt::Display for MessageType {
 
 /// Type alias for backward compatibility — `Usage` is the canonical type.
 pub type UsageData = crate::llm::Usage;
+
+/// Aggregated token counts and turn count for a query scope.
+#[derive(Debug, Serialize)]
+pub struct UsageTotals {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub turns: i64,
+}
+
+/// Token usage for a conversation, broken out by scope.
+///
+/// `own` covers only the conversation itself; `total` includes all sub-agents
+/// that share the same root conversation id.
+#[derive(Debug, Serialize)]
+pub struct ConversationUsage {
+    pub own: UsageTotals,
+    pub total: UsageTotals,
+}
 
 #[cfg(test)]
 mod conv_mode_tests {

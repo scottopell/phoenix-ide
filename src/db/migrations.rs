@@ -29,6 +29,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_continued_in_conv_id_column",
         sql: MIGRATION_003,
     },
+    Migration {
+        version: 4,
+        name: "create_turn_usage_table",
+        sql: MIGRATION_004,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -76,6 +81,24 @@ SET conv_mode = '{"mode":"Explore"}',
     state = '{"type":"idle"}'
 WHERE conv_mode LIKE '%__LEGACY_EMPTY__%';
 "#;
+
+/// Create the `turn_usage` table for per-LLM-turn token tracking.
+const MIGRATION_004: &str = r"
+CREATE TABLE IF NOT EXISTS turn_usage (
+    id INTEGER PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    root_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_usage_conversation ON turn_usage(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_turn_usage_root ON turn_usage(root_conversation_id);
+";
 
 /// Add the `continued_in_conv_id` column to `conversations` (REQ-BED-030).
 ///
