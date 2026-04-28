@@ -9,13 +9,29 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::io::BufRead;
-use std::path::PathBuf;
+use std::io::{BufRead, Read};
+use std::path::{Path, PathBuf};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_ENTRIES_VISITED: usize = 100_000;
 
-/// Directories to always skip (in addition to gitignore rules).
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "__pycache__"];
+/// Directories to prune from the walk (applied via `WalkBuilder::filter_entry`,
+/// so descent into these subtrees is skipped entirely).
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".next",
+    "__pycache__",
+    "vendor",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    ".tox",
+];
 
 /// Search for text patterns across files.
 pub struct SearchTool;
@@ -31,7 +47,7 @@ struct SearchInput {
 /// Resolve a search path relative to `working_dir`. Absolute paths are used
 /// as-is; relative paths are joined to `working_dir`. No containment check —
 /// see the note on `read_file::resolve_and_validate` for rationale.
-fn resolve_and_validate(path_str: &str, working_dir: &std::path::Path) -> Result<PathBuf, String> {
+fn resolve_and_validate(path_str: &str, working_dir: &Path) -> Result<PathBuf, String> {
     let raw = PathBuf::from(path_str);
     let resolved = if raw.is_absolute() {
         raw
@@ -45,7 +61,7 @@ fn resolve_and_validate(path_str: &str, working_dir: &std::path::Path) -> Result
 }
 
 /// Check if a file appears to be binary by examining the first 8KB for null bytes.
-fn is_binary(path: &std::path::Path) -> bool {
+fn is_binary(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
@@ -129,102 +145,186 @@ impl Tool for SearchTool {
             },
         };
 
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
-
-        // Use the `ignore` crate for gitignore-aware walking
-        let walker = WalkBuilder::new(&search_path)
-            .hidden(true) // respect hidden files (skip by default)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
-
         let canonical_wd = match ctx.working_dir.canonicalize() {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(format!("Cannot resolve working directory: {e}")),
         };
 
-        let mut results = Vec::new();
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+        let include = input.include;
+        let pattern_str = input.pattern;
+        let cancel = ctx.cancel.clone();
+        let conv_id = ctx.conversation_id.clone();
 
-        for entry in walker {
-            if ctx.cancel.is_cancelled() {
-                return ToolOutput::error("Cancelled");
-            }
-
-            let Ok(entry) = entry else {
-                continue;
-            };
-
-            let path = entry.path();
-
-            // Skip directories
-            if path.is_dir() {
-                // Check if this directory should be skipped
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if SKIP_DIRS.contains(&name) {
-                        continue;
-                    }
-                }
-                continue;
-            }
-
-            // Apply include filter
-            if let Some(ref include_pattern) = input.include {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !matches_glob(name, include_pattern) {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-
-            // Skip binary files
-            if is_binary(path) {
-                continue;
-            }
-
-            // Read and search the file
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue; // skip unreadable files
-            };
-
-            // Compute display path relative to working directory
-            let display_path = path
-                .strip_prefix(&canonical_wd)
-                .unwrap_or(path)
-                .display()
-                .to_string();
-
-            for (line_num, line) in content.lines().enumerate() {
-                if re.is_match(line) {
-                    results.push(format!("{}:{}: {}", display_path, line_num + 1, line));
-                    if results.len() >= max_results {
-                        break;
-                    }
-                }
-            }
-
-            if results.len() >= max_results {
-                break;
-            }
+        match tokio::task::spawn_blocking(move || {
+            run_search(SearchArgs {
+                re,
+                search_path,
+                canonical_wd,
+                include,
+                max_results,
+                cancel,
+                conv_id,
+                pattern_str,
+            })
+        })
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => ToolOutput::error(format!("Search task failed: {e}")),
         }
-
-        if results.is_empty() {
-            return ToolOutput::success("No matches found.");
-        }
-
-        let total = results.len();
-        let mut output = results.join("\n");
-        if total >= max_results {
-            let _ = write!(
-                output,
-                "\n\n[Results limited to {max_results} matches. Use a more specific pattern or path to narrow results.]"
-            );
-        }
-
-        ToolOutput::success(output)
     }
+}
+
+struct SearchArgs {
+    re: Regex,
+    search_path: PathBuf,
+    canonical_wd: PathBuf,
+    include: Option<String>,
+    max_results: usize,
+    cancel: CancellationToken,
+    conv_id: String,
+    pattern_str: String,
+}
+
+fn run_search(args: SearchArgs) -> ToolOutput {
+    let SearchArgs {
+        re,
+        search_path,
+        canonical_wd,
+        include,
+        max_results,
+        cancel,
+        conv_id,
+        pattern_str,
+    } = args;
+
+    let walker = WalkBuilder::new(&search_path)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .build();
+
+    let mut results = Vec::new();
+    let mut entries_visited: usize = 0;
+    let mut walk_truncated = false;
+
+    for entry in walker {
+        if cancel.is_cancelled() {
+            return ToolOutput::error("Cancelled");
+        }
+
+        entries_visited += 1;
+        if entries_visited > MAX_ENTRIES_VISITED {
+            walk_truncated = true;
+            tracing::warn!(
+                conv_id = %conv_id,
+                cap = MAX_ENTRIES_VISITED,
+                path = %search_path.display(),
+                pattern = %pattern_str,
+                "search walk truncated at entry cap; agent should narrow path or include"
+            );
+            break;
+        }
+
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+
+        if path.is_dir() {
+            continue;
+        }
+
+        if let Some(ref include_pattern) = include {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !matches_glob(name, include_pattern) {
+                continue;
+            }
+        }
+
+        if scan_file(path, &re, &canonical_wd, &mut results, max_results) {
+            break;
+        }
+    }
+
+    format_output(&results, max_results, walk_truncated)
+}
+
+/// Scan one file for `re`, appending `display_path:lineno: line` to `results`.
+/// Returns `true` if `max_results` was hit and the outer walk should stop.
+fn scan_file(
+    path: &Path,
+    re: &Regex,
+    canonical_wd: &Path,
+    results: &mut Vec<String>,
+    max_results: usize,
+) -> bool {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_FILE_BYTES {
+            return false;
+        }
+    }
+    if is_binary(path) {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file.take(MAX_FILE_BYTES));
+    let display_path = path
+        .strip_prefix(canonical_wd)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+
+    for (line_num, line_res) in reader.lines().enumerate() {
+        let Ok(line) = line_res else {
+            break;
+        };
+        if re.is_match(&line) {
+            results.push(format!("{}:{}: {}", display_path, line_num + 1, line));
+            if results.len() >= max_results {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn format_output(results: &[String], max_results: usize, walk_truncated: bool) -> ToolOutput {
+    if results.is_empty() && !walk_truncated {
+        return ToolOutput::success("No matches found.");
+    }
+
+    let mut output = results.join("\n");
+    if results.len() >= max_results {
+        let _ = write!(
+            output,
+            "\n\n[Results limited to {max_results} matches. Use a more specific pattern or path to narrow results.]"
+        );
+    }
+    if walk_truncated {
+        let _ = write!(
+            output,
+            "\n\n[Walk truncated at {MAX_ENTRIES_VISITED} entries. Narrow `path` or `include`.]"
+        );
+    }
+
+    ToolOutput::success(output)
 }
 
 #[cfg(test)]
@@ -366,5 +466,92 @@ mod tests {
         assert!(matches_glob("test.rs", "*.rs"));
         assert!(!matches_glob("test.ts", "*.rs"));
         assert!(matches_glob("test.tsx", "*.tsx"));
+    }
+
+    #[tokio::test]
+    async fn test_search_prunes_skip_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        for skipped in &["node_modules", "target", "vendor", "dist", ".git"] {
+            let sub = dir.path().join(skipped);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("inside.txt"), "findme\n").unwrap();
+        }
+        std::fs::write(dir.path().join("real.rs"), "findme\n").unwrap();
+
+        let tool = SearchTool;
+        let result = tool
+            .run(
+                json!({"pattern": "findme"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("real.rs"),
+            "should find real source: {}",
+            result.output
+        );
+        for skipped in &["node_modules", "target", "vendor", "dist", ".git"] {
+            assert!(
+                !result.output.contains(skipped),
+                "should not descend into {skipped}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_skips_files_over_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let big_path = dir.path().join("big.log");
+        let cap = usize::try_from(MAX_FILE_BYTES).unwrap();
+        let mut big = vec![b'x'; cap + 1024];
+        big.extend_from_slice(b"\nfindme matchhere\n");
+        std::fs::write(&big_path, &big).unwrap();
+
+        std::fs::write(dir.path().join("small.txt"), "findme matchhere\n").unwrap();
+
+        let tool = SearchTool;
+        let result = tool
+            .run(
+                json!({"pattern": "findme"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("small.txt"), "{}", result.output);
+        assert!(
+            !result.output.contains("big.log"),
+            "oversize file should be skipped: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_streams_lines_without_full_load() {
+        // A file just under the size cap should still be searched. This exercises
+        // the streamed-read path (no read_to_string of the full content).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medium.txt");
+        let filler_line = "x".repeat(1024);
+        let cap = usize::try_from(MAX_FILE_BYTES).unwrap();
+        let mut content = String::with_capacity(cap);
+        while content.len() + filler_line.len() + 1 < cap - 256 {
+            content.push_str(&filler_line);
+            content.push('\n');
+        }
+        content.push_str("findme matchhere\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = SearchTool;
+        let result = tool
+            .run(
+                json!({"pattern": "findme"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("medium.txt"), "{}", result.output);
     }
 }
