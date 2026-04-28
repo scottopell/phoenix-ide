@@ -2563,6 +2563,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "globset",
  "ignore",
  "libc",
  "libsqlite3-sys",

@@ -63,6 +63,9 @@ vte = "0.15"
 # Gitignore-aware directory walking (for file search)
 ignore = "0.4"
 
+# Glob matching for search tool's include/exclude params
+globset = "0.4"
+
 # Regex for search tool
 regex = "1"
 
