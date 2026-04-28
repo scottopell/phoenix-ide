@@ -2504,7 +2504,7 @@ pre:hover .copy-btn {
   display: flex;
   align-items: center;
   gap: 6px;
-  cursor: help;
+  cursor: pointer;
   position: relative;
 }
 
@@ -2550,6 +2550,7 @@ pre:hover .copy-btn {
   display: flex;
   align-items: center;
   gap: 6px;
+  cursor: pointer;
 }
 
 .context-menu-indicator {
@@ -2593,6 +2594,65 @@ pre:hover .copy-btn {
   font-size: 11px;
   color: var(--text-muted);
   border-top: 1px solid var(--border-color);
+}
+
+/* Usage stats panel (token tracking) */
+.usage-panel {
+  min-width: 220px;
+  padding: 4px 0;
+}
+
+.usage-panel-loading,
+.usage-panel-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.usage-stats-section {
+  padding: 8px 12px;
+}
+
+.usage-stats-section + .usage-stats-section {
+  border-top: 1px solid var(--border-color);
+}
+
+.usage-stats-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.usage-stats-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.usage-stat-name {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 2px 0;
+}
+
+.usage-stat-value {
+  font-size: 12px;
+  color: var(--text-primary);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-stats-turns {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.context-menu-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 0;
 }
 
 /* Context exhausted banner (REQ-BED-021) */

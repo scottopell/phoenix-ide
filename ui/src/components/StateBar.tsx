@@ -447,6 +447,7 @@ export function StateBar({
             <ContextIndicator
               used={contextWindowUsed}
               max={maxTokens}
+              conversationId={conversation.id}
               onTriggerContinuation={indicatorTrigger}
             />
           )}

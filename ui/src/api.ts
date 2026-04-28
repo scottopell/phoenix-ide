@@ -313,6 +313,19 @@ export interface AuthStatus {
   authenticated: boolean;
 }
 
+export interface UsageTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  turns: number;
+}
+
+export interface ConversationUsage {
+  own: UsageTotals;
+  total: UsageTotals;
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -462,6 +475,12 @@ export const api = {
       method: 'POST',
     });
     if (!resp.ok) throw new Error('Failed to trigger continuation');
+    return resp.json();
+  },
+
+  async getConversationUsage(convId: string): Promise<ConversationUsage> {
+    const resp = await fetch(`/api/conversations/${convId}/usage`);
+    if (!resp.ok) throw new Error('Failed to fetch usage');
     return resp.json();
   },
 
