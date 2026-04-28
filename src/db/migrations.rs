@@ -208,7 +208,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 3);
+        assert_eq!(first, 4);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

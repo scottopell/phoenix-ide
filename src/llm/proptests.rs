@@ -187,7 +187,7 @@ proptest! {
         text in "[a-zA-Z0-9 ]{1,100}"
     ) {
         let anth_resp = make_anthropic_response(
-            vec![AnthropicContentBlock::Text { text }],
+            vec![AnthropicContentBlock::Text { text, cache_control: None }],
             Some("end_turn"),
         );
         if let Ok(resp) = anthropic::test_helpers::normalize_response(anth_resp) {

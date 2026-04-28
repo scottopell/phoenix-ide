@@ -331,7 +331,13 @@ mod state_machine_props {
     }
 
     fn subagent_context() -> ConvContext {
-        ConvContext::sub_agent("test-sub", PathBuf::from("/tmp"), "test-model", 200_000)
+        ConvContext::sub_agent(
+            "test-sub",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "test-root",
+        )
     }
 
     // ====================================================================
@@ -902,6 +908,7 @@ mod random_walk {
                 PathBuf::from("/tmp"),
                 "test-model",
                 200_000,
+                "test-root",
             );
             let mut state = ConvState::Idle;
 

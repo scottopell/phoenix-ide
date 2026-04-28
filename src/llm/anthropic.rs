@@ -538,20 +538,14 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
     // three deterministic cache anchor points per request.
     let mut messages = messages;
     if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
-        if let Some(last_block) = last_user.content.last_mut() {
-            match last_block {
-                AnthropicContentBlock::Text { cache_control, .. } => {
-                    *cache_control = Some(CacheControl {
-                        r#type: "ephemeral".to_string(),
-                    });
-                }
-                AnthropicContentBlock::Image { cache_control, .. } => {
-                    *cache_control = Some(CacheControl {
-                        r#type: "ephemeral".to_string(),
-                    });
-                }
-                _ => {}
-            }
+        if let Some(
+            AnthropicContentBlock::Text { cache_control, .. }
+            | AnthropicContentBlock::Image { cache_control, .. },
+        ) = last_user.content.last_mut()
+        {
+            *cache_control = Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            });
         }
     }
 
@@ -1196,6 +1190,7 @@ mod tests {
             content: vec![
                 AnthropicContentBlock::Text {
                     text: "Here is my analysis.".to_string(),
+                    cache_control: None,
                 },
                 AnthropicContentBlock::ServerToolUse {
                     id: "srvtoolu_abc123".to_string(),

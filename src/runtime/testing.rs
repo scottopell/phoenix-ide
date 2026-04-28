@@ -536,12 +536,8 @@ impl StateStore for InMemoryStorage {
         _conversation_id: &str,
         _root_conversation_id: &str,
         _model: &str,
-        _input_tokens: u64,
-        _output_tokens: u64,
-        _cache_creation_tokens: u64,
-        _cache_read_tokens: u64,
+        _usage: &crate::llm::Usage,
     ) -> Result<(), String> {
-        // In-memory storage discards turn usage (tests that need it use a real DB)
         Ok(())
     }
 }
@@ -1313,8 +1309,13 @@ mod tests {
         use std::path::PathBuf;
 
         // Create sub-agent context
-        let context =
-            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "test-root",
+        );
 
         // Start from LlmRequesting
         let state = ConvState::LlmRequesting { attempt: 1 };
@@ -1363,8 +1364,13 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Effect, Event};
         use std::path::PathBuf;
 
-        let context =
-            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "test-root",
+        );
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1411,8 +1417,13 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Effect, Event};
         use std::path::PathBuf;
 
-        let context =
-            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "test-root",
+        );
 
         // Can be in various states when cancelled
         let states = [ConvState::Idle, ConvState::LlmRequesting { attempt: 1 }];
@@ -1449,8 +1460,13 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context =
-            ConvContext::sub_agent("sub-agent-1", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::sub_agent(
+            "sub-agent-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "test-root",
+        );
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 

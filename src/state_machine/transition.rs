@@ -2364,6 +2364,7 @@ mod tests {
         let subagent_ctx = ConvContext {
             mode_context: None,
             conversation_id: "subagent-1".to_string(),
+            root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
             is_sub_agent: true,
@@ -2479,6 +2480,7 @@ mod tests {
         let subagent_ctx = ConvContext {
             mode_context: None,
             conversation_id: "subagent-1".to_string(),
+            root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
             is_sub_agent: true,
@@ -2579,6 +2581,7 @@ mod tests {
         let subagent_ctx = ConvContext {
             mode_context: None,
             conversation_id: "subagent-1".to_string(),
+            root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
             is_sub_agent: true,
@@ -2626,6 +2629,7 @@ mod tests {
         let subagent_ctx = ConvContext {
             mode_context: None,
             conversation_id: "subagent-1".to_string(),
+            root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
             model_id: "test-model".to_string(),
             is_sub_agent: true,

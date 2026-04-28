@@ -1217,10 +1217,7 @@ impl Database {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        usage: &crate::llm::Usage,
     ) -> DbResult<()> {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1232,10 +1229,10 @@ impl Database {
         .bind(conversation_id)
         .bind(root_conversation_id)
         .bind(model)
-        .bind(input_tokens as i64)
-        .bind(output_tokens as i64)
-        .bind(cache_creation_tokens as i64)
-        .bind(cache_read_tokens as i64)
+        .bind(usage.input_tokens.cast_signed())
+        .bind(usage.output_tokens.cast_signed())
+        .bind(usage.cache_creation_tokens.cast_signed())
+        .bind(usage.cache_read_tokens.cast_signed())
         .bind(&now_str)
         .execute(&self.pool)
         .await?;

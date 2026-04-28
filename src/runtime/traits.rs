@@ -102,10 +102,7 @@ pub trait StateStore: Send + Sync {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        usage: &crate::llm::Usage,
     ) -> Result<(), String>;
 }
 
@@ -250,21 +247,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        usage: &crate::llm::Usage,
     ) -> Result<(), String> {
         (**self)
-            .insert_turn_usage(
-                conversation_id,
-                root_conversation_id,
-                model,
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            )
+            .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
             .await
     }
 }
@@ -450,21 +436,10 @@ impl StateStore for DatabaseStorage {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        usage: &crate::llm::Usage,
     ) -> Result<(), String> {
         self.db
-            .insert_turn_usage(
-                conversation_id,
-                root_conversation_id,
-                model,
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            )
+            .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
             .await
             .map_err(|e| e.to_string())
     }

@@ -1415,20 +1415,14 @@ where
                     let conv_id_for_usage = conv_id.clone();
                     let root_id_for_usage = root_conv_id.clone();
                     let model_for_usage = model_id.clone();
-                    let input_tokens = usage.input_tokens;
-                    let output_tokens = usage.output_tokens;
-                    let cache_creation_tokens = usage.cache_creation_tokens;
-                    let cache_read_tokens = usage.cache_read_tokens;
+                    let usage_for_insert = usage.clone();
                     tokio::spawn(async move {
                         if let Err(e) = storage_for_usage
                             .insert_turn_usage(
                                 &conv_id_for_usage,
                                 &root_id_for_usage,
                                 &model_for_usage,
-                                input_tokens,
-                                output_tokens,
-                                cache_creation_tokens,
-                                cache_read_tokens,
+                                &usage_for_insert,
                             )
                             .await
                         {

@@ -105,7 +105,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
         // Token usage (Phase 4)
-        .route("/api/conversations/:id/usage", get(get_conversation_usage_handler))
+        .route(
+            "/api/conversations/:id/usage",
+            get(get_conversation_usage_handler),
+        )
         // System prompt inspection
         .route(
             "/api/conversations/:id/system-prompt",
