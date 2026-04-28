@@ -389,10 +389,23 @@ where
     /// REQ-PROJ-028 creates worktrees at first message. If the user never
     /// approved a task (Explore mode), the worktree and temp branch leak.
     /// Work/Branch conversations clean up via mark-merged/abandon before
-    /// reaching terminal, so this is a no-op for them in the normal case.
-    /// If a worktree somehow survives to terminal time, removing it is
-    /// always correct.
+    /// reaching `ConvState::Terminal`, so this is a no-op for them in the
+    /// normal case.
+    ///
+    /// REQ-BED-031: `ContextExhausted` is also a terminal state, but its
+    /// worktree must be preserved pending a user action (Continue / Abandon
+    /// / `MarkAsMerged`) — or transferred to a continuation under
+    /// REQ-BED-030. Skip cleanup in that case; reconcile / abandon /
+    /// mark-merged are the only paths permitted to remove the worktree.
     fn cleanup_worktree_if_present(&self) {
+        if matches!(self.state, ConvState::ContextExhausted { .. }) {
+            tracing::debug!(
+                conv_id = %self.context.conversation_id,
+                "REQ-BED-031: skipping terminal worktree cleanup for ContextExhausted"
+            );
+            return;
+        }
+
         // Derive repo root: if working_dir is inside a worktree
         // ({root}/.phoenix/worktrees/{id}), walk up to the .phoenix
         // ancestor's parent; otherwise working_dir IS the root.
@@ -2753,6 +2766,18 @@ mod context_exhausted_preserves_worktree_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
         broadcast::Receiver<SseEvent>,
     ) {
+        build_runtime_with_state(storage, conv_id, working_dir, ConvState::Idle)
+    }
+
+    fn build_runtime_with_state(
+        storage: Arc<InMemoryStorage>,
+        conv_id: &str,
+        working_dir: PathBuf,
+        initial_state: ConvState,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        broadcast::Receiver<SseEvent>,
+    ) {
         let context = ConvContext::new(conv_id, working_dir, "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -2761,7 +2786,7 @@ mod context_exhausted_preserves_worktree_tests {
 
         let rt = ConversationRuntime::new(
             context,
-            ConvState::Idle,
+            initial_state,
             storage,
             Arc::new(MockLlmClient::new("test-model")),
             Arc::new(MockToolExecutor::new()),
@@ -2881,5 +2906,88 @@ mod context_exhausted_preserves_worktree_tests {
             "Branch mode must NOT demote to Direct"
         );
         assert!(wait_for_context_exhausted_broadcast(&mut rx, Duration::from_secs(1)).await);
+    }
+
+    /// REQ-BED-031 regression: the executor's terminal-exit lifecycle hook
+    /// (`emit_terminal_lifecycle_event` → `cleanup_worktree_if_present`) must
+    /// NOT remove the worktree when the terminal state is `ContextExhausted`.
+    ///
+    /// The `Effect::NotifyContextExhausted` tests above only exercise the
+    /// effect dispatcher; they do not drive the executor-loop exit path
+    /// where `cleanup_worktree_if_present` is called. The original Phase 3
+    /// commit (e82c1db) removed `cleanup_context_exhausted_worktree` but
+    /// missed this sibling cleanup added in 4a94509 for Explore-mode leaks.
+    /// As a result, every Work/Branch conversation that hit
+    /// `ContextExhausted` had its worktree force-removed on executor exit,
+    /// breaking the continuation handoff because the child inherits the
+    /// parent's now-missing `worktree_path`.
+    #[tokio::test]
+    async fn terminal_exit_preserves_worktree_when_context_exhausted() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "term-exit-ctx-1";
+        let branch = "task-99-preserve-me";
+        let wt_path = add_worktree(&repo_root, conv_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let original_mode = ConvMode::Work {
+            branch_name: NonEmptyString::new(branch).unwrap(),
+            worktree_path: NonEmptyString::new(&wt_path).unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("YF099").unwrap(),
+            task_title: NonEmptyString::new("Preserve me").unwrap(),
+        };
+        storage.set_mode(conv_id, original_mode);
+
+        let (rt, _rx) = build_runtime_with_state(
+            storage,
+            conv_id,
+            PathBuf::from(&wt_path),
+            ConvState::ContextExhausted {
+                summary: "ran out of context".to_string(),
+            },
+        );
+
+        // Fire the exact lifecycle hook the executor's `run()` loop calls
+        // when it observes a terminal state.
+        rt.emit_terminal_lifecycle_event();
+
+        assert!(
+            Path::new(&wt_path).exists(),
+            "REQ-BED-031: terminal-exit cleanup must NOT remove a \
+             ContextExhausted worktree — continuation transfer depends on it"
+        );
+        assert!(
+            branch_exists(&repo_root, branch),
+            "branch must also survive — worktree remove --force would have nuked it"
+        );
+    }
+
+    /// Negative control: the original Explore-mode-leak intent of
+    /// `cleanup_worktree_if_present` (commit 4a94509) is preserved.
+    /// A non-context-exhausted terminal exit (here `ConvState::Terminal`,
+    /// the post-abandon / post-mark-merged sink) still cleans up any
+    /// stray worktree at `.phoenix/worktrees/{conv_id}`.
+    #[tokio::test]
+    async fn terminal_exit_still_cleans_up_non_context_exhausted_terminal() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "term-exit-stray-1";
+        let branch = "stray-explore-branch";
+        let wt_path = add_worktree(&repo_root, conv_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let (rt, _rx) = build_runtime_with_state(
+            storage,
+            conv_id,
+            PathBuf::from(&wt_path),
+            ConvState::Terminal,
+        );
+
+        rt.emit_terminal_lifecycle_event();
+
+        assert!(
+            !Path::new(&wt_path).exists(),
+            "Non-ContextExhausted terminal exit must still reap stray worktrees \
+             (the original 4a94509 intent for Explore-mode leaks)"
+        );
     }
 }
