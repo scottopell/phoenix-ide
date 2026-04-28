@@ -142,7 +142,7 @@ export function QuestionPanel({
       ...prev,
       [questionText]: {
         ...prev[questionText],
-        ...(notes ? { notes } : {}),
+        notes: notes || undefined,
       },
     }));
   }, []);
@@ -436,9 +436,11 @@ export function QuestionPanel({
         return;
       }
 
-      // If typing in a text input (Other field), handle Enter for single-select
+      // If typing in a text input (Other field), handle Enter for single-select.
+      // Scope to HTMLInputElement only — textareas (notes, preview-Other) need
+      // Enter to insert newlines, not navigate.
       if (isInInput) {
-        if (e.key === 'Enter' && !e.shiftKey && !currentQuestion.multiSelect) {
+        if (e.target instanceof HTMLInputElement && e.key === 'Enter' && !e.shiftKey && !currentQuestion.multiSelect) {
           e.preventDefault();
           e.stopPropagation();
           if (!isLastStep) {
@@ -854,6 +856,10 @@ function QuestionItem({
               onSelect(q.question, OTHER_SENTINEL);
             }
           }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setTimeout(() => otherInputRef.current?.focus(), 0);
+          }}
           tabIndex={-1}
         />
         <input
@@ -896,6 +902,7 @@ function QuestionItem({
               type="checkbox"
               checked={checked}
               onChange={() => onMultiToggle(q.question, opt.label)}
+              onClick={(e) => e.stopPropagation()}
               tabIndex={-1}
             />
             <div className="question-option-content">
