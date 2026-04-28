@@ -241,6 +241,7 @@ impl StreamAccumulator {
                     idx,
                     AnthropicContentBlock::Text {
                         text: self.current_text.clone(),
+                        cache_control: None,
                     },
                 ));
                 self.current_text.clear();
@@ -532,14 +533,31 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
         }));
     }
 
+    // Set explicit cache breakpoint on last content block of last user message.
+    // Combined with system-prompt and last-tool breakpoints, this gives Anthropic
+    // three deterministic cache anchor points per request.
+    let mut messages = messages;
+    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+        if let Some(last_block) = last_user.content.last_mut() {
+            match last_block {
+                AnthropicContentBlock::Text { cache_control, .. } => {
+                    *cache_control = Some(CacheControl {
+                        r#type: "ephemeral".to_string(),
+                    });
+                }
+                AnthropicContentBlock::Image { cache_control, .. } => {
+                    *cache_control = Some(CacheControl {
+                        r#type: "ephemeral".to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
     AnthropicRequest {
         model: spec.api_name.clone(),
         max_tokens: request.max_tokens.unwrap_or(16_384),
-        // Top-level automatic caching: API auto-places breakpoint on last
-        // cacheable message block, walks back up to 20 blocks for prior writes.
-        cache_control: Some(CacheControl {
-            r#type: "ephemeral".to_string(),
-        }),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
@@ -558,7 +576,10 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
         .content
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
+            ContentBlock::Text { text } => AnthropicContentBlock::Text {
+                text: text.clone(),
+                cache_control: None,
+            },
             ContentBlock::Image { source } => {
                 let ImageSource::Base64 { media_type, data } = source;
                 AnthropicContentBlock::Image {
@@ -567,6 +588,7 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                         media_type: media_type.clone(),
                         data: data.clone(),
                     },
+                    cache_control: None,
                 }
             }
             ContentBlock::ToolUse { id, name, input } => AnthropicContentBlock::ToolUse {
@@ -696,7 +718,7 @@ fn normalize_response_with_diagnostics(
 
     for block in resp.content {
         match block {
-            AnthropicContentBlock::Text { text } => {
+            AnthropicContentBlock::Text { text, .. } => {
                 if !text.is_empty() {
                     content.push(ContentBlock::Text { text });
                 }
@@ -884,9 +906,6 @@ fn normalize_response_with_diagnostics(
 struct AnthropicRequest {
     model: String,
     max_tokens: u32,
-    /// Top-level automatic caching: API places breakpoint on last cacheable block.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<CacheControl>,
     system: Vec<AnthropicSystemBlock>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -903,8 +922,8 @@ struct AnthropicSystemBlock {
     cache_control: Option<CacheControl>,
 }
 
-#[derive(Debug, Serialize)]
-struct CacheControl {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct CacheControl {
     r#type: String,
 }
 
@@ -919,9 +938,13 @@ pub(crate) struct AnthropicMessage {
 pub(crate) enum AnthropicContentBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Image {
         source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
