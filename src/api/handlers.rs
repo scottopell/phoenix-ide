@@ -18,7 +18,7 @@ use super::types::{
     SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
-use crate::db::{ConvMode, ImageData, Message, MessageContent, MessageType};
+use crate::db::{ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict, GitOpError,
 };
@@ -104,6 +104,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
+        // Token usage (Phase 4)
+        .route("/api/conversations/:id/usage", get(get_conversation_usage_handler))
         // System prompt inspection
         .route(
             "/api/conversations/:id/system-prompt",
@@ -2353,6 +2355,19 @@ async fn list_conversation_tasks(
         .collect();
 
     Ok(Json(TasksResponse { tasks }))
+}
+
+/// Token usage totals for a conversation (own turns + root rollup including sub-agents).
+async fn get_conversation_usage_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationUsage>, AppError> {
+    let usage = state
+        .db
+        .get_conversation_usage(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(usage))
 }
 
 // ============================================================
