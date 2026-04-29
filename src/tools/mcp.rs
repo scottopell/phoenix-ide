@@ -616,9 +616,9 @@ impl McpClientManager {
                     let oauth = Arc::clone(&manager.pending_oauth_urls);
                     tokio::spawn(async move {
                         let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
-                        oauth.write().await.remove(&name);
                         match result {
                             Ok(server) => {
+                                oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
                                 mgr.servers.write().await.insert(name.clone(), server);
                                 tracing::info!(
@@ -629,6 +629,8 @@ impl McpClientManager {
                                 Some((name, tool_count))
                             }
                             Err(e) => {
+                                // Leave any OAuth URL in pending_oauth_urls so the UI
+                                // keeps the panel visible with a reconnect affordance.
                                 tracing::warn!(server = %name, "Skipping MCP server: {e}");
                                 None
                             }
@@ -1010,10 +1012,12 @@ impl McpClientManager {
             }
 
             let oauth = Arc::clone(&self.pending_oauth_urls);
-            let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+            // Clear any stale OAuth URL before retrying so the UI shows a fresh one.
             oauth.write().await.remove(&name);
+            let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
             match result {
                 Ok(server) => {
+                    oauth.write().await.remove(&name);
                     let tool_count = server.tools.len();
                     self.servers.write().await.insert(name.clone(), server);
                     tracing::info!(

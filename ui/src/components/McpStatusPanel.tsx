@@ -134,17 +134,19 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
       <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
         <span className={`mcp-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
         <span className="mcp-panel-summary">
-          {servers.length === 0
-            ? 'No MCP servers'
-            : <>
-                MCP &middot; {servers.length} server{servers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
-                {disabledCount > 0 && (
-                  <span className="mcp-disabled-count"> ({disabledCount} off)</span>
-                )}
-              </>
+          {pendingOAuth.length > 0 && enabledServers.length === 0
+            ? <span className="mcp-auth-needed">MCP &middot; auth needed</span>
+            : servers.length === 0
+              ? 'No MCP servers'
+              : <>
+                  MCP &middot; {enabledServers.length} server{enabledServers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
+                  {disabledCount > 0 && (
+                    <span className="mcp-disabled-count"> ({disabledCount} off)</span>
+                  )}
+                </>
           }
         </span>
-        {servers.length > 0 && (
+        {(servers.length > 0 || pendingOAuth.length > 0) && (
           <span
             className={`mcp-panel-reload ${reloading ? 'reloading' : ''}`}
             role="button"
