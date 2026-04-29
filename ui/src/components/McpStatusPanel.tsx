@@ -58,6 +58,10 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
     e.stopPropagation();
     if (reloading) return;
     setReloading(true);
+    // Synchronously drop stale pending-OAuth entries from local state so the
+    // settling effect below doesn't treat them as "fresh content arrived" and
+    // clear `reloading` prematurely. Connected servers are kept untouched.
+    setServers(prev => prev.filter(s => !s.pending_oauth_url));
     // Ensure polling is active — connection happens as a background task on the
     // server, so the new OAuth URL won't be in the status we fetch immediately.
     if (!pollRef.current) {
@@ -71,8 +75,8 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
       if (result.removed.length > 0) parts.push(`-${result.removed.length} removed`);
       if (result.unchanged.length > 0) parts.push(`${result.unchanged.length} unchanged`);
       showToast(`MCP reload: ${parts.join(', ') || 'no servers'}`, 3000);
-      // Keep reloading=true until the next poll shows new content (effect below)
-      // or the safety timeout fires.
+      // Keep reloading=true until the next poll shows fresh OAuth content
+      // (effect below) or the safety timeout fires.
     } catch {
       showToast('MCP reload failed', 3000);
       setReloading(false);
