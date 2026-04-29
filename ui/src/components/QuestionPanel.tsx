@@ -91,7 +91,7 @@ export function QuestionPanel({
     Record<string, Set<string>>
   >({});
 
-  const otherInputRef = useRef<HTMLInputElement>(null);
+  const otherInputRef = useRef<HTMLTextAreaElement>(null);
 
   const currentQuestion = questions[currentStep];
   const isLastStep = currentStep === questions.length - 1;
@@ -751,7 +751,7 @@ interface QuestionItemProps {
   notesExpanded: boolean;
   notesText: string;
   focusedIndex: number;
-  otherInputRef: React.RefObject<HTMLInputElement | null>;
+  otherInputRef: React.RefObject<HTMLTextAreaElement | null>;
   onSelect: (questionText: string, value: string) => void;
   onOtherText: (questionText: string, value: string) => void;
   onMultiToggle: (questionText: string, label: string) => void;
@@ -862,9 +862,8 @@ function QuestionItem({
           }}
           tabIndex={-1}
         />
-        <input
-          ref={otherInputRef as React.RefObject<HTMLInputElement>}
-          type="text"
+        <textarea
+          ref={otherInputRef}
           className="question-other-input"
           placeholder="Other..."
           value={otherText}
@@ -879,6 +878,7 @@ function QuestionItem({
               onSelect(q.question, OTHER_SENTINEL);
             }
           }}
+          rows={1}
           tabIndex={-1}
         />
       </div>

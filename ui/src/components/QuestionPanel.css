@@ -341,10 +341,15 @@
   border-radius: 4px;
   padding: 6px 8px;
   font-size: 13px;
+  line-height: 1.5;
   color: var(--text-primary);
   font-family: inherit;
   outline: none;
   transition: border-color 0.15s;
+  resize: vertical;
+  field-sizing: content;
+  min-height: 2em;
+  max-height: 50vh;
 }
 
 .question-other-input:focus {
