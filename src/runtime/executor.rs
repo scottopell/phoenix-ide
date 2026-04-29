@@ -2314,6 +2314,261 @@ fn strip_unavailable_tool_blocks(
         .collect()
 }
 
+#[cfg(test)]
+mod strip_tool_blocks_tests {
+    use super::*;
+    use crate::llm::{
+        ContentBlock, ImageSource, LlmMessage, MessageRole, ToolReference, ToolSearchResultContent,
+    };
+
+    fn user_text(s: &str) -> LlmMessage {
+        LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(s)],
+        }
+    }
+
+    fn assistant(blocks: Vec<ContentBlock>) -> LlmMessage {
+        LlmMessage {
+            role: MessageRole::Assistant,
+            content: blocks,
+        }
+    }
+
+    fn user(blocks: Vec<ContentBlock>) -> LlmMessage {
+        LlmMessage {
+            role: MessageRole::User,
+            content: blocks,
+        }
+    }
+
+    fn tool_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+            images: vec![],
+            is_error: false,
+        }
+    }
+
+    fn server_tool_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ServerToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn tool_search_result(tool_use_id: &str, refs: &[&str]) -> ContentBlock {
+        ContentBlock::ToolSearchToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: ToolSearchResultContent {
+                r#type: "tool_search_tool_search_result".into(),
+                tool_references: refs
+                    .iter()
+                    .map(|n| ToolReference {
+                        r#type: "tool_reference".into(),
+                        tool_name: (*n).into(),
+                    })
+                    .collect(),
+                error_code: None,
+            },
+        }
+    }
+
+    // ----- strip_all_tool_blocks -----
+
+    #[test]
+    fn strip_all_keeps_text_only_history_unchanged() {
+        let msgs = vec![
+            user_text("hello"),
+            assistant(vec![ContentBlock::text("hi")]),
+        ];
+        let out = strip_all_tool_blocks(msgs.clone());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content.len(), 1);
+        assert_eq!(out[1].content.len(), 1);
+    }
+
+    #[test]
+    fn strip_all_keeps_image_blocks() {
+        // Continuation summary should retain images (e.g. screenshots from
+        // the user's earlier turns) so the model has the visual context.
+        let msgs = vec![user(vec![
+            ContentBlock::text("look"),
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "AAA".into(),
+                },
+            },
+        ])];
+        let out = strip_all_tool_blocks(msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.len(), 2);
+    }
+
+    #[test]
+    fn strip_all_drops_regular_tool_use_and_result() {
+        let msgs = vec![
+            assistant(vec![
+                ContentBlock::text("calling bash"),
+                tool_use("t1", "bash"),
+            ]),
+            user(vec![tool_result("t1")]),
+            assistant(vec![ContentBlock::text("done")]),
+        ];
+        let out = strip_all_tool_blocks(msgs);
+        assert_eq!(
+            out.len(),
+            2,
+            "tool-result-only user message must be dropped"
+        );
+        // First survivor: assistant with just text (tool_use stripped)
+        assert_eq!(out[0].content.len(), 1);
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "calling bash")
+        );
+        // Second survivor: assistant "done"
+        assert!(matches!(&out[1].content[0], ContentBlock::Text { text } if text == "done"));
+    }
+
+    #[test]
+    fn strip_all_drops_server_tool_use_and_tool_search_result() {
+        // Reproduces the production failure shape: tool_search-discovered MCP
+        // tool referenced in history with tools=[] in the request.
+        let msgs = vec![
+            assistant(vec![
+                server_tool_use("srv1", "tool_search_tool_regex"),
+                tool_search_result("srv1", &["datadog-mcp-prod__aggregate_events"]),
+                tool_use("call1", "datadog-mcp-prod__aggregate_events"),
+            ]),
+            user(vec![tool_result("call1")]),
+            assistant(vec![ContentBlock::text("summary so far")]),
+        ];
+        let out = strip_all_tool_blocks(msgs);
+        // Only the two text-bearing messages should remain (the tool_result
+        // user message and the all-server-blocks message after stripping
+        // are empty, but the first assistant survives if it had any text;
+        // here it had no text, so it should be dropped entirely).
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "summary so far")
+        );
+    }
+
+    #[test]
+    fn strip_all_drops_messages_that_become_empty() {
+        let msgs = vec![
+            assistant(vec![tool_use("t1", "bash")]),
+            user(vec![tool_result("t1")]),
+        ];
+        let out = strip_all_tool_blocks(msgs);
+        assert!(out.is_empty());
+    }
+
+    // ----- strip_unavailable_tool_blocks -----
+
+    #[test]
+    fn strip_unavailable_noop_when_all_tools_available() {
+        let available: std::collections::HashSet<&str> = ["bash", "patch"].into_iter().collect();
+        let msgs = vec![
+            assistant(vec![ContentBlock::text("x"), tool_use("t1", "bash")]),
+            user(vec![tool_result("t1")]),
+        ];
+        let out = strip_unavailable_tool_blocks(msgs.clone(), &available);
+        assert_eq!(out.len(), msgs.len());
+        assert_eq!(out[0].content.len(), 2);
+        assert_eq!(out[1].content.len(), 1);
+    }
+
+    #[test]
+    fn strip_unavailable_removes_tool_use_and_paired_result() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let msgs = vec![
+            assistant(vec![
+                ContentBlock::text("mixed"),
+                tool_use("keep", "bash"),
+                tool_use("drop", "propose_task"),
+            ]),
+            user(vec![tool_result("keep"), tool_result("drop")]),
+        ];
+        let out = strip_unavailable_tool_blocks(msgs, &available);
+        // Assistant: text + the bash tool_use survive; propose_task tool_use is gone
+        assert_eq!(out[0].content.len(), 2);
+        assert!(out[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "keep")));
+        // User message: only the tool_result for the surviving tool_use remains
+        assert_eq!(out[1].content.len(), 1);
+        assert!(
+            matches!(&out[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep")
+        );
+    }
+
+    #[test]
+    fn strip_unavailable_filters_tool_search_references_in_place() {
+        // Mode transition mid-conversation: some referenced tools are gone.
+        // The ToolSearchToolResult block must survive (paired with its
+        // ServerToolUse) but its tool_references list is filtered.
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let msgs = vec![assistant(vec![
+            tool_use("ghost", "removed_tool"), // forces stripped_ids non-empty path
+            server_tool_use("srv1", "tool_search_tool_regex"),
+            tool_search_result("srv1", &["bash", "removed_tool", "other"]),
+        ])];
+        let out = strip_unavailable_tool_blocks(msgs, &available);
+        assert_eq!(out.len(), 1);
+
+        let ts_block = out[0]
+            .content
+            .iter()
+            .find_map(|b| {
+                if let ContentBlock::ToolSearchToolResult { content, .. } = b {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .expect("tool_search block should survive");
+        assert_eq!(
+            ts_block.tool_references.len(),
+            1,
+            "only references to available tools should remain"
+        );
+        assert_eq!(ts_block.tool_references[0].tool_name, "bash");
+
+        // ServerToolUse must NOT be stripped — it pairs with the tool_search
+        // result and orphaning it would 400 the request.
+        assert!(out[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ServerToolUse { id, .. } if id == "srv1")));
+    }
+
+    #[test]
+    fn strip_unavailable_drops_messages_that_become_empty() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let msgs = vec![
+            assistant(vec![tool_use("t1", "removed_tool")]),
+            user(vec![tool_result("t1")]),
+            assistant(vec![ContentBlock::text("survives")]),
+        ];
+        let out = strip_unavailable_tool_blocks(msgs, &available);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0].content[0], ContentBlock::Text { text } if text == "survives"));
+    }
+}
+
 /// Get the next task ID using taskmd-core library.
 fn get_next_task_id(tasks_dir: &std::path::Path) -> String {
     taskmd_core::ids::next_id(tasks_dir)
