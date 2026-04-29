@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { generateUUID } from '../utils/uuid';
 import type { ImageData } from '../api';
 
@@ -75,7 +75,6 @@ interface UseMessageQueueReturn {
  */
 export function useMessageQueue(conversationId: string | undefined): UseMessageQueueReturn {
   const storageKey = conversationId ? `phoenix:queue:${conversationId}` : null;
-  const initializedRef = useRef(false);
 
   // Load initial value from localStorage. Coerce the legacy `'sending'` status
   // to `'pending'` (renamed in task 02676) so rehydrated entries survive the
@@ -99,17 +98,14 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     }
   }, [storageKey]);
 
-  const [messages, setMessages] = useState<QueuedMessage[]>([]);
+  const [messages, setMessages] = useState<QueuedMessage[]>(() => loadFromStorage());
 
-  // Initialize from storage when conversationId is available
+  // Reload (or clear) the queue whenever the conversation identity changes.
+  // The previous `initializedRef` guard skipped reloads on truthy→truthy
+  // transitions, which leaked queue items across navigations when the
+  // ConversationPage instance was reused (no `key={slug}` on the Route).
   useEffect(() => {
-    if (conversationId && !initializedRef.current) {
-      setMessages(loadFromStorage());
-      initializedRef.current = true;
-    } else if (!conversationId) {
-      setMessages([]);
-      initializedRef.current = false;
-    }
+    setMessages(conversationId ? loadFromStorage() : []);
   }, [conversationId, loadFromStorage]);
 
   // Save to localStorage

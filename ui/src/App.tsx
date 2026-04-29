@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useParams } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -33,6 +33,14 @@ function RouteFallback() {
   return <div style={{ minHeight: '100vh' }} />;
 }
 
+// Force a fresh ConversationPage instance per slug so per-conversation
+// component state (queued messages, refs, image attachments) cannot bleed
+// across navigations between two `/c/:slug` routes.
+function KeyedConversationPage() {
+  const { slug } = useParams<{ slug: string }>();
+  return <ConversationPage key={slug} />;
+}
+
 type AuthState =
   | { status: 'checking' }
   | { status: 'authenticated' }
@@ -61,7 +69,7 @@ function AppRoutes() {
               <Routes>
                 <Route path="/" element={<ConversationListPage />} />
                 <Route path="/new" element={<NewConversationPage />} />
-                <Route path="/c/:slug" element={<ConversationPage />} />
+                <Route path="/c/:slug" element={<KeyedConversationPage />} />
               </Routes>
             </DesktopLayout>
           } />

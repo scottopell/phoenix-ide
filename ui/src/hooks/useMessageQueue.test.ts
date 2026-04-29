@@ -170,6 +170,47 @@ describe('useMessageQueue', () => {
     expect(second.current.queuedMessages[0]!.status).toBe('pending');
   });
 
+  // Regression: when the ConversationPage instance is reused across a
+//   `/c/:fooSlug` → `/c/:barSlug` navigation, the hook must reload (or
+  // clear) the queue. Before the fix, an `initializedRef` guard skipped
+  // the reload on truthy→truthy conversationId transitions, so conv A's
+  // queued items rendered as pending in conv B's view.
+  it('reloads the queue when conversationId changes between two truthy values', () => {
+    // Seed conv-a and conv-b storage with disjoint queues.
+    localStorage.setItem(
+      'phoenix:queue:conv-a',
+      JSON.stringify([queued('a-1', { text: 'from A' })]),
+    );
+    localStorage.setItem(
+      'phoenix:queue:conv-b',
+      JSON.stringify([queued('b-1', { text: 'from B' })]),
+    );
+
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useMessageQueue(id),
+      { initialProps: { id: 'conv-a' } },
+    );
+    expect(result.current.queuedMessages.map((q) => q.text)).toEqual(['from A']);
+
+    rerender({ id: 'conv-b' });
+    expect(result.current.queuedMessages.map((q) => q.text)).toEqual(['from B']);
+  });
+
+  it('clears the queue when conversationId becomes undefined', () => {
+    localStorage.setItem(
+      'phoenix:queue:conv-a',
+      JSON.stringify([queued('a-1')]),
+    );
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string | undefined }) => useMessageQueue(id),
+      { initialProps: { id: 'conv-a' as string | undefined } },
+    );
+    expect(result.current.queuedMessages).toHaveLength(1);
+
+    rerender({ id: undefined });
+    expect(result.current.queuedMessages).toEqual([]);
+  });
+
   it("migrates legacy 'sending' status to 'pending' on rehydration", () => {
     // Seed storage with the pre-02676 shape where pending was stored as
     // 'sending'. The hook must coerce it so derivation works.
