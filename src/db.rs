@@ -908,14 +908,26 @@ impl Database {
     /// Scan all conversations for orphaned `tool_use` and inject synthetic `tool_result`.
     /// An orphaned `tool_use` is an agent message containing `tool_use` blocks where
     /// not all `tool_use` IDs have a corresponding `tool_result` in the following messages.
+    ///
+    /// Skips conversations in preserved (frozen) states — `context_exhausted`,
+    /// `terminal`, `awaiting_task_approval`, `awaiting_user_response`. Those
+    /// match the allowlist in `reset_all_to_idle` (the conversation is not
+    /// going to make another LLM call, so injecting a synthetic `tool_result`
+    /// only adds noise to history).
     async fn repair_orphaned_tool_use(&self, now: &DateTime<Utc>) -> DbResult<()> {
         use crate::llm::ContentBlock;
 
-        // Get all conversations
-        let conv_rows: Vec<String> = sqlx::query("SELECT id FROM conversations")
-            .try_map(|row: SqliteRow| row.try_get("id"))
-            .fetch_all(&self.pool)
-            .await?;
+        // Skip conversations whose state is preserved across restarts; their
+        // history is frozen and shouldn't be amended with synthetic results.
+        let conv_rows: Vec<String> = sqlx::query(
+            "SELECT id FROM conversations
+             WHERE json_extract(state, '$.type') NOT IN
+                 ('context_exhausted', 'terminal',
+                  'awaiting_task_approval', 'awaiting_user_response')",
+        )
+        .try_map(|row: SqliteRow| row.try_get("id"))
+        .fetch_all(&self.pool)
+        .await?;
 
         for conv_id in conv_rows {
             // Get all messages for this conversation in order
@@ -1822,6 +1834,59 @@ mod tests {
         assert!(tool_ids.contains(&"tool-1".to_string()));
         assert!(tool_ids.contains(&"tool-2".to_string()));
         assert!(tool_ids.contains(&"tool-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_reset_skips_repair_for_preserved_state_conversations() {
+        use crate::llm::ContentBlock;
+        use crate::state_machine::ConvState;
+
+        let db = Database::open_in_memory().await.unwrap();
+
+        for (id, state) in [
+            (
+                "ctx-exhausted",
+                ConvState::ContextExhausted {
+                    summary: "summary".into(),
+                },
+            ),
+            ("terminal", ConvState::Terminal),
+        ] {
+            db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
+                .await
+                .unwrap();
+
+            // Agent message with an orphaned tool_use (no matching result).
+            db.add_message(
+                &format!("{id}-msg-1"),
+                id,
+                &MessageContent::agent(vec![ContentBlock::tool_use(
+                    &format!("{id}-tool"),
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            db.update_conversation_state(id, &state).await.unwrap();
+        }
+
+        db.reset_all_to_idle().await.unwrap();
+
+        for id in ["ctx-exhausted", "terminal"] {
+            let msgs = db.get_messages(id).await.unwrap();
+            assert_eq!(
+                msgs.len(),
+                1,
+                "frozen conversation {id} should not get a synthetic tool_result, \
+                 got {} messages",
+                msgs.len()
+            );
+            assert_eq!(msgs[0].message_type, MessageType::Agent);
+        }
     }
 
     #[tokio::test]
