@@ -1003,7 +1003,9 @@ impl McpClientManager {
             }
         }
 
-        // Connect new servers (skip those already connected).
+        // Spawn background connections for new servers (same pattern as
+        // start_background_discovery — returns immediately so the HTTP
+        // response isn't held open for the full connect timeout).
         for (name, entry) in configs {
             let already_exists = self.servers.read().await.contains_key(&name);
             if already_exists {
@@ -1012,27 +1014,30 @@ impl McpClientManager {
             }
 
             let oauth = Arc::clone(&self.pending_oauth_urls);
-            // Clear any stale OAuth URL before retrying so the UI shows a fresh one.
+            // Clear stale OAuth URL before retrying so the UI gets a fresh one.
             oauth.write().await.remove(&name);
-            let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
-            match result {
-                Ok(server) => {
-                    oauth.write().await.remove(&name);
-                    let tool_count = server.tools.len();
-                    self.servers.write().await.insert(name.clone(), server);
-                    tracing::info!(
-                        server = %name,
-                        tools = tool_count,
-                        "MCP server connected during reload"
-                    );
-                    added.push(name);
-                }
-                Err(e) => {
-                    tracing::warn!(server = %name, "Failed to connect during reload: {e}");
-                }
-            }
-        }
+            added.push(name.clone());
 
+            let servers = Arc::clone(&self.servers);
+            tokio::spawn(async move {
+                let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                match result {
+                    Ok(server) => {
+                        oauth.write().await.remove(&name);
+                        let tool_count = server.tools.len();
+                        servers.write().await.insert(name.clone(), server);
+                        tracing::info!(
+                            server = %name,
+                            tools = tool_count,
+                            "MCP server connected during reload"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(server = %name, "Failed to connect during reload: {e}");
+                    }
+                }
+            });
+        }
         McpReloadResult {
             added,
             removed,

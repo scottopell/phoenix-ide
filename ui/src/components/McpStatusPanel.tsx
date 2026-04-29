@@ -118,7 +118,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
 
   return (
     <div className="mcp-panel">
-      {pendingOAuth.map(s => (
+      {!reloading && pendingOAuth.map(s => (
         <div key={s.name} className="mcp-oauth-banner">
           <span className="mcp-oauth-label">Auth required:</span>
           <a
