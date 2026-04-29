@@ -191,12 +191,20 @@ the source Q&A and thread:
 | `seed_label` | `"Q&A: <question excerpt>"` (truncated to a display-appropriate length) |
 
 The new conversation is created with no `continued_in_conv_id` linking back
-to it from any thread member, satisfying REQ-THR-008. Lineage display is
-provided by REQ-SEED-003's existing `seed_parent_id` breadcrumb mechanism;
-visual styling distinguishes it from the in-thread continuation breadcrumb
-in the conversation detail view (continuation breadcrumbs are tagged
-"continued from"; kickstart breadcrumbs are tagged "kickstarted from
-thread").
+to it from any thread member, satisfying REQ-THR-008. **It is not a member
+of the source thread**: the forward CTE walk from the source thread's root
+will not include the kickstarted conversation, the source thread's member
+list will not include it, and the source thread's sidebar block will not
+list it. The kickstarted conversation is structurally a standalone
+conversation; if it is later continued, those continuations form a new
+thread rooted at the kickstarted conversation, independent of the source
+thread.
+
+Lineage display is provided by REQ-SEED-003's existing `seed_parent_id`
+breadcrumb mechanism; visual styling distinguishes it from the in-thread
+continuation breadcrumb in the conversation detail view (continuation
+breadcrumbs are tagged "continued from"; kickstart breadcrumbs are tagged
+"kickstarted from thread").
 
 ## Out-of-Scope Properties
 

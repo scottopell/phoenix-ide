@@ -140,16 +140,23 @@ stays put.
 
 ### REQ-THR-006: Consistent Quality As Q&A Accumulates
 
-WHILE a user has asked multiple questions in a thread
-THE SYSTEM SHALL produce answers whose quality, latency, and content are
-not materially influenced by the number or content of prior questions
-or answers in the same thread
+WHILE a user is asking questions on a thread page
+THE SYSTEM SHALL produce answers whose quality, latency, and content do
+not materially degrade as more questions and answers accumulate in that
+thread's Q&A history
 
-**Rationale:** Each question should be answered against the canonical
-thread content, not against the model's own prior answers. This
-prevents drift (an early misunderstanding compounding) and bounds cost
-as the Q&A history grows. The user-visible property is that the tenth
-question feels as fast and accurate as the first.
+**Rationale:** Each question is answered against the canonical thread
+content, not against the model's own prior answers. This prevents drift
+(an early misunderstanding compounding into later answers) and bounds
+cost as the Q&A history grows. The user-visible property is that the
+tenth question feels as fast and accurate as the first.
+
+**Implication:** v1 Q&A invocations are intentionally disjoint — the
+model does not see prior questions or answers from the same thread. A
+follow-up like "tell me more about #2" will not work unless the user
+restates the prior context in the new question. See the non-requirements
+list for the v1.5 path that addresses this without breaking
+REQ-THR-006.
 
 ---
 
@@ -173,33 +180,48 @@ seeded conversations already work in Phoenix.
 ### REQ-THR-008: Kickstart Diverges, Does Not Continue
 
 WHEN a kickstarted conversation is created from a thread Q&A
-THE SYSTEM SHALL NOT add the new conversation to the source thread's
-continuation chain
-AND SHALL display a navigable lineage from the new conversation back
-to the source thread, distinct from any continuation breadcrumb
+THE SYSTEM SHALL create the new conversation outside the source thread's
+membership — it is not added to the source thread's continuation chain
+and does not appear in the source thread's member list
+
+THE SYSTEM SHALL display a navigable lineage from the new conversation
+back to the source thread, visually distinct from any continuation
+breadcrumb
 
 **Rationale:** The user has explicitly distinguished two actions:
 "continue where we left off" (the existing continuation flow, which
 extends the chain) and "the topic is still active but the prior stream
 is done — take a new direction" (kickstart, which does not). Conflating
-them breaks both. Lineage display ensures the user can find their way
-back to the thread that informed the kickstart.
+them breaks both.
+
+The lineage breadcrumb is **decorative only** — it does not affect
+thread membership computation. If the kickstarted conversation is
+later continued, it forms its own new thread, structurally
+independent from the source thread. The breadcrumb just helps the user
+find their way back to the original thread.
 
 ---
 
 ## Non-Requirements (explicit out-of-scope for v1)
 
-- **Post-hoc thread membership.** Manually adding a conversation to a
-  thread it is not continuation-linked to. v1 derives threads strictly
-  from the continuation graph.
+- **Post-hoc thread membership editing.** A user-driven action to
+  manually add an unrelated conversation as a member of an existing
+  thread (or remove a member from one). v1 derives thread membership
+  strictly from the continuation graph; the kickstart breadcrumb
+  (REQ-THR-008) is a decorative back-pointer, not a membership
+  operation, and does not violate this exclusion.
 - **Thread renaming.** v1 displays the root conversation's title as the
   thread name.
-- **Q&A editing or deletion.** Q&A history is append-only in v1.
-- **Follow-up Q&A referencing prior Q&A.** Each question is answered
-  against the thread, not against the prior Q&A history. A future
-  "follow-up mode" can layer on this.
+- **Q&A editing or deletion.** Q&A history is append-only.
+- **Follow-up Q&A with prior-Q&A model context.** REQ-THR-006 keeps
+  invocations stateless; the model never sees prior Q&A from the same
+  thread. Named v1.5 path: a "reply" affordance on each prior Q&A that
+  pre-fills the input with a quoted snippet from that Q&A. The user's
+  question becomes self-contained (with the relevant prior context
+  embedded as quoted text), so follow-ups work without breaking the
+  stateless invocation contract that protects REQ-THR-006.
 - **Cross-thread linking.** "This thread spawned that thread" is not
-  represented in v1 beyond the kickstart breadcrumb on the kickstarted
+  represented beyond the single kickstart breadcrumb on the kickstarted
   conversation.
 - **Project-level summary or steering doc.** A separate concept,
   explicitly deferred.
