@@ -16,8 +16,11 @@ Days or weeks later I want to recall something specific from that chain
 I want to navigate to the chain as a unit (a *thread*), ask it a question,
 and get a focused answer. Sometimes that answer makes me want to start a
 new conversation taking the topic in a *slightly different direction* —
-not a continuation of the chain (the prior stream is done), but a sibling
-that inherits the recap as starting context.
+not a continuation of the chain (the prior stream is done), but a *branch*
+of the same thread that inherits the recap as starting context. The
+branch is part of the thread (visible in the thread's member list and
+sidebar block) but is structurally distinct from the main continuation
+line.
 
 ## Why the User Cares
 
@@ -47,35 +50,48 @@ The user must be able to confidently answer:
 
 ### REQ-THR-001: Recall Past Work Without Re-Explaining Context
 
-WHEN a user wants to recall information from a chain of related
-conversations
+WHEN a user wants to recall information from a thread (a group of
+related conversations linked by continuation, kickstart, or both)
 THE SYSTEM SHALL provide an interaction surface that returns an answer
-derived from the content of those conversations
+derived from the content of every member of that thread, including
+both main-line members and branch members
 AND SHALL NOT require the user to extend any of those conversations or
 to re-supply their content as input
 
 **Rationale:** This is the headline benefit. Without it the user pays
 full token cost twice — once to do the work originally, and again to
-retrieve from it.
+retrieve from it. The "every member" clause prevents a partial-recall
+failure mode: if Q&A only saw the main line, a user asking "where did
+we leave off?" on a thread whose latest meaningful work was on a branch
+would get an incomplete or misleading answer.
 
 ---
 
-### REQ-THR-002: Continuation Chains Surface as Threads
+### REQ-THR-002: Conversations Form Threads as Trees of Related Work
 
-WHEN two or more conversations share a continuation lineage (one was
-created via "continue in new conversation" from another)
+WHEN two or more conversations are linked through continuation
+("continue in new conversation") or through kickstart (a Q&A-spawned
+conversation pointing back to a thread)
 THE SYSTEM SHALL present them as a grouped thread in conversation
-navigation surfaces, identifiable by a shared thread identity
+navigation surfaces, identifiable by a shared thread identity (the
+thread's root conversation)
 
-WHEN a conversation has not been continued and was not itself a
-continuation
+THE SYSTEM SHALL distinguish two kinds of thread members:
+the **main line** (the continuation chain rooted at the thread's root
+conversation) and **branches** (kickstart-derived sub-chains rooted at
+conversations whose seed lineage points to the thread's root)
+
+WHEN a conversation has not been continued, was not itself a
+continuation, and is not a kickstart-derived branch root
 THE SYSTEM SHALL render it as a standalone (non-thread) navigation entry
 
 **Rationale:** Thread membership emerges automatically from how the
-user already structures work via continuations — no manual grouping
-action is required. Keeping single conversations un-grouped avoids
-visually inflating every conversation into a degenerate one-member
-thread.
+user already structures work — both via continuations (resume same
+direction) and via kickstart (new direction in same topic). Both kinds
+of links represent topic continuity from the user's perspective and
+should both surface as part of the thread. Keeping single conversations
+ungrouped avoids visually inflating every conversation into a
+degenerate one-member thread.
 
 ---
 
@@ -177,39 +193,52 @@ seeded conversations already work in Phoenix.
 
 ---
 
-### REQ-THR-008: Kickstart Diverges, Does Not Continue
+### REQ-THR-008: Kickstart Adds a Branch to the Thread, Not a Continuation
 
 WHEN a kickstarted conversation is created from a thread Q&A
-THE SYSTEM SHALL create the new conversation outside the source thread's
-membership — it is not added to the source thread's continuation chain
-and does not appear in the source thread's member list
+THE SYSTEM SHALL include the new conversation in the source thread as
+a **branch member** — it appears in the source thread's member list and
+sidebar block, distinct from the main continuation line
+AND SHALL NOT add it to the source thread's continuation chain (its
+relationship to the thread is via seed lineage, not via
+`continued_in_conv_id`)
 
-THE SYSTEM SHALL display a navigable lineage from the new conversation
-back to the source thread, visually distinct from any continuation
-breadcrumb
+WHEN a branch member is itself continued via "continue in new
+conversation"
+THE SYSTEM SHALL include the resulting continuation as part of the
+same source thread (rendered as a sub-chain extending that branch),
+not as a separate thread
+
+THE SYSTEM SHALL render the branch hierarchy on the thread page and in
+the sidebar so the main line and branches are visually distinguished
 
 **Rationale:** The user has explicitly distinguished two actions:
 "continue where we left off" (the existing continuation flow, which
-extends the chain) and "the topic is still active but the prior stream
-is done — take a new direction" (kickstart, which does not). Conflating
-them breaks both.
+extends the main line) and "the topic is still active but the prior
+stream is done — take a new direction" (kickstart, which adds a
+branch). Both belong to the same thread of related work, but they have
+different structural roles: the main line is the canonical narrative
+of the thread, branches are divergent sub-explorations. Treating
+branches as members rather than as separate orphaned conversations
+matches how the user thinks about ownership of their own work — they
+kickstarted from this thread, so this thread "owns" the branch.
 
-The lineage breadcrumb is **decorative only** — it does not affect
-thread membership computation. If the kickstarted conversation is
-later continued, it forms its own new thread, structurally
-independent from the source thread. The breadcrumb just helps the user
-find their way back to the original thread.
+The continuation chain remains a clean primitive (no kickstart
+conversations in it), so the existing continuation flow and Q&A
+context bundling for the main line are unaffected.
 
 ---
 
 ## Non-Requirements (explicit out-of-scope for v1)
 
-- **Post-hoc thread membership editing.** A user-driven action to
-  manually add an unrelated conversation as a member of an existing
+- **Post-hoc manual thread membership editing.** A user-driven action
+  to manually add an unrelated conversation as a member of an existing
   thread (or remove a member from one). v1 derives thread membership
-  strictly from the continuation graph; the kickstart breadcrumb
-  (REQ-THR-008) is a decorative back-pointer, not a membership
-  operation, and does not violate this exclusion.
+  strictly from the conversation graph: continuation edges produce main
+  line members, seed-pointer edges (kickstart) produce branch members.
+  Kickstart is a system-generated membership action with a single
+  well-defined edge type, not arbitrary user editing — it does not
+  violate this exclusion.
 - **Thread renaming.** v1 displays the root conversation's title as the
   thread name.
 - **Q&A editing or deletion.** Q&A history is append-only.
