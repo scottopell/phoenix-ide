@@ -138,13 +138,15 @@ export function QuestionPanel({
   }, []);
 
   const setNotes = useCallback((questionText: string, notes: string) => {
-    setAnnotations((prev) => ({
-      ...prev,
-      [questionText]: {
-        ...prev[questionText],
-        notes: notes || undefined,
-      },
-    }));
+    setAnnotations((prev) => {
+      const next = { ...prev[questionText] };
+      if (notes) {
+        next.notes = notes;
+      } else {
+        delete next.notes;
+      }
+      return { ...prev, [questionText]: next };
+    });
   }, []);
 
   // --- allAnswered check ---
@@ -863,7 +865,7 @@ function QuestionItem({
           tabIndex={-1}
         />
         <textarea
-          ref={otherInputRef}
+          ref={otherInputRef as React.RefObject<HTMLTextAreaElement>}
           className="question-other-input"
           placeholder="Other..."
           value={otherText}
