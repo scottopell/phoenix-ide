@@ -112,7 +112,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
 
   const pendingOAuth = servers.filter(s => s.pending_oauth_url);
 
-  if (servers.length === 0 && !expanded) {
+  if (servers.length === 0 && pendingOAuth.length === 0 && !expanded) {
     return null;
   }
 
