@@ -1878,7 +1878,7 @@ where
 
         let handle = tokio::spawn(async move {
             // Build messages from history and add continuation request
-            let mut messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
+            let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build messages for continuation");
@@ -1887,20 +1887,14 @@ where
                 }
             };
 
-            // Add synthetic tool results for rejected tool calls to maintain valid conversation
-            // history. These tools were never executed because context was exhausted before
-            // they could run.
-            for rejected_tool in &rejected_tool_calls {
-                messages.push(LlmMessage {
-                    role: MessageRole::User,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: rejected_tool.id.clone(),
-                        content: "Tool execution was skipped — context limit reached before this tool could run.".to_string(),
-                        images: vec![],
-                        is_error: false,
-                    }],
-                });
-            }
+            // The continuation request is tool-less: strip every tool-related
+            // block (regular ToolUse/ToolResult, server-handled ServerToolUse,
+            // ToolSearchToolResult, MCP, etc.) so the API doesn't reject the
+            // request because history references tools we're no longer
+            // declaring. The model still has the assistant's narration to
+            // summarize from. Rejected tool calls are described in prose in
+            // the continuation prompt instead of synthetic tool_result blocks.
+            let mut messages = strip_all_tool_blocks(messages);
 
             // Add the continuation request as a user message
             messages.push(LlmMessage {
@@ -2199,6 +2193,38 @@ struct TaskApprovalResult {
     worktree_path: String,
     /// The branch that was checked out when the task was approved (merge target)
     base_branch: String,
+}
+
+/// Drop every tool-related block from the message history.
+///
+/// Used by the continuation summary path: that request is sent with
+/// `tools: []`, so any `tool_use`, `tool_result`, `server_tool_use`,
+/// `tool_search_tool_result`, or MCP block in history would cause the
+/// API to 400 with "Tool reference X not found in available tools".
+/// The summary still has the assistant's text narration to work with.
+fn strip_all_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
+    use crate::llm::ContentBlock;
+
+    messages
+        .into_iter()
+        .map(|msg| {
+            let filtered: Vec<ContentBlock> = msg
+                .content
+                .into_iter()
+                .filter(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { .. } | ContentBlock::Image { .. }
+                    )
+                })
+                .collect();
+            LlmMessage {
+                role: msg.role,
+                content: filtered,
+            }
+        })
+        .filter(|msg| !msg.content.is_empty())
+        .collect()
 }
 
 /// Remove `tool_use` and `tool_result` blocks that reference tools not in the current set.
