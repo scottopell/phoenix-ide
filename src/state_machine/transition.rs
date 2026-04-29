@@ -349,6 +349,20 @@ pub fn transition_core(
             Ok(CoreTransitionResult::new(CoreState::Idle))
         }
 
+        // Stale UserTriggerContinuation: any non-Idle Core state means the
+        // conversation is already in flight (LLM round, tools, sub-agents,
+        // continuation summary) or in a sub-agent terminal state. The user's
+        // intent ("summarize now") is either being served by the in-flight
+        // path or no longer meaningful. Absorbing avoids the SSE-vs-click
+        // race surfacing as an error to the user.
+        (state, CoreEvent::UserTriggerContinuation) => {
+            tracing::debug!(
+                state = state.variant_name(),
+                "Absorbing stale UserTriggerContinuation"
+            );
+            Ok(CoreTransitionResult::new(state.clone()))
+        }
+
         // Invalid Transitions
         (state, event) => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
@@ -2970,6 +2984,106 @@ mod tests {
         assert!(
             matches!(result, Err(TransitionError::AwaitingUserResponse)),
             "Should reject user messages with AwaitingUserResponse error, got {result:?}"
+        );
+    }
+
+    /// Race scenario: SSE-stream connect triggers `should_auto_continue`,
+    /// state moves Idle -> LlmRequesting before the client receives the
+    /// state change. User clicks "trigger continuation" against the stale
+    /// Idle UI. The state machine must absorb the event, not surface it as
+    /// an InvalidTransition error to the user.
+    #[test]
+    fn user_trigger_continuation_in_llm_requesting_is_absorbed() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::UserTriggerContinuation,
+        )
+        .expect("absorb, not error");
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+            "state must not change when absorbing, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result.effects.is_empty(),
+            "absorb arm must produce no effects, got {} effects",
+            result.effects.len()
+        );
+    }
+
+    #[test]
+    fn user_trigger_continuation_in_tool_executing_is_absorbed() {
+        use crate::state_machine::state::{
+            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
+        };
+
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-1",
+                ToolInput::Bash(BashInput {
+                    command: "echo".to_string(),
+                    mode: BashMode::Default,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+
+        let result = transition(&state, &test_context(), Event::UserTriggerContinuation)
+            .expect("absorb, not error");
+
+        assert!(matches!(result.new_state, ConvState::ToolExecuting { .. }));
+        assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn user_trigger_continuation_in_awaiting_continuation_is_absorbed() {
+        // Already summarizing — clicking again is a redundant intent, not
+        // an invalid one.
+        let state = ConvState::AwaitingContinuation {
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+
+        let result = transition(&state, &test_context(), Event::UserTriggerContinuation)
+            .expect("absorb, not error");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingContinuation { attempt: 1, .. }
+        ));
+        assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn user_trigger_continuation_from_idle_still_starts_continuation() {
+        // Regression guard: the absorb arm must not steal the Idle path,
+        // which is the actual user-initiated continuation flow.
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::UserTriggerContinuation,
+        )
+        .expect("Idle path should succeed");
+
+        assert!(
+            matches!(
+                result.new_state,
+                ConvState::AwaitingContinuation { attempt: 1, .. }
+            ),
+            "Idle + UserTriggerContinuation must enter AwaitingContinuation, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestContinuation { .. })),
+            "Idle path must fire RequestContinuation effect"
         );
     }
 }
