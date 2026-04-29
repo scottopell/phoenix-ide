@@ -58,6 +58,11 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
     e.stopPropagation();
     if (reloading) return;
     setReloading(true);
+    // Ensure polling is active — connection happens as a background task on the
+    // server, so the new OAuth URL won't be in the status we fetch immediately.
+    if (!pollRef.current) {
+      pollRef.current = setInterval(() => { void fetchStatus(); }, 3000);
+    }
     try {
       const result = await api.reloadMcp();
       await fetchStatus();
@@ -66,12 +71,25 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
       if (result.removed.length > 0) parts.push(`-${result.removed.length} removed`);
       if (result.unchanged.length > 0) parts.push(`${result.unchanged.length} unchanged`);
       showToast(`MCP reload: ${parts.join(', ') || 'no servers'}`, 3000);
+      // Keep reloading=true until the next poll shows new content (effect below)
+      // or the safety timeout fires.
     } catch {
       showToast('MCP reload failed', 3000);
-    } finally {
       setReloading(false);
     }
   }, [reloading, fetchStatus, showToast]);
+
+  // Clear `reloading` once new content arrives, with a 5s safety timeout to
+  // avoid a stuck spinner if the backend connection never emits anything.
+  useEffect(() => {
+    if (!reloading) return;
+    if (servers.length > 0) {
+      setReloading(false);
+      return;
+    }
+    const t = setTimeout(() => setReloading(false), 5000);
+    return () => clearTimeout(t);
+  }, [reloading, servers.length]);
 
   const handleToggleEnabled = useCallback(async (serverName: string, currentlyEnabled: boolean) => {
     setTogglingServers(prev => new Set(prev).add(serverName));
@@ -112,7 +130,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
 
   const pendingOAuth = servers.filter(s => s.pending_oauth_url);
 
-  if (servers.length === 0 && pendingOAuth.length === 0 && !expanded) {
+  if (servers.length === 0 && pendingOAuth.length === 0 && !expanded && !reloading) {
     return null;
   }
 
