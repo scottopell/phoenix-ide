@@ -18,8 +18,8 @@ use tokio::sync::{Mutex, RwLock};
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longer timeout for initialize + tools/list during server connection.
-/// MCP-remote wrappers need time for OAuth discovery + transport negotiation.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Five minutes gives OAuth flows (mcp-remote prompts, browser redirect) time to complete.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // McpToolDef
@@ -40,6 +40,8 @@ pub struct McpServerStatus {
     pub tool_count: usize,
     pub tools: Vec<String>,
     pub enabled: bool,
+    /// Set while the server is waiting for the user to complete an OAuth flow.
+    pub pending_oauth_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +66,9 @@ pub struct McpServer {
     tools_changed: AtomicBool,
     /// Handle to the stderr drain task -- aborted on shutdown/respawn.
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    /// Shared map of server name → OAuth URL; written by the stderr drain,
+    /// read by `McpClientManager::status()`. Retained for reuse on respawn.
+    pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl McpServer {
@@ -74,6 +79,7 @@ impl McpServer {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -97,8 +103,11 @@ impl McpServer {
             .ok_or_else(|| format!("MCP server '{name}': stdout not captured"))?;
 
         // Drain stderr to debug logs so the child doesn't block on a full pipe.
+        // Lines containing URLs are surfaced at warn and stored as pending OAuth
+        // URLs so the UI can display a clickable auth link.
         let stderr_task = child.stderr.take().map(|stderr| {
             let server_name = name.to_string();
+            let oauth_sink = Arc::clone(&pending_oauth_urls);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -108,12 +117,15 @@ impl McpServer {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             let trimmed = line.trim_end();
-                            // OAuth prompts and error messages need to be visible.
-                            if trimmed.contains("http://") || trimmed.contains("https://") {
+                            if trimmed.contains("https://") {
                                 tracing::warn!(
                                     server = %server_name,
                                     "MCP stderr: {trimmed}"
                                 );
+                                oauth_sink
+                                    .write()
+                                    .await
+                                    .insert(server_name.clone(), trimmed.to_string());
                             } else {
                                 tracing::debug!(
                                     server = %server_name,
@@ -138,6 +150,7 @@ impl McpServer {
             spawn_env: env.clone(),
             tools_changed: AtomicBool::new(false),
             stderr_task,
+            pending_oauth_urls,
         })
     }
 
@@ -508,6 +521,7 @@ impl McpServer {
             &self.spawn_command,
             &self.spawn_args,
             &self.spawn_env,
+            Arc::clone(&self.pending_oauth_urls),
         )
         .await?;
 
@@ -540,6 +554,9 @@ pub struct McpClientManager {
     /// Server names whose tools should be excluded from conversations.
     /// The servers remain connected for instant re-enable.
     disabled_servers: RwLock<std::collections::HashSet<String>>,
+    /// Servers currently blocked on an OAuth flow: name → auth URL.
+    /// Written by the stderr drain; cleared when the server connects or fails.
+    pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl McpClientManager {
@@ -549,6 +566,7 @@ impl McpClientManager {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
+            pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -595,8 +613,11 @@ impl McpClientManager {
                 .into_iter()
                 .map(|(name, entry)| {
                     let mgr = Arc::clone(&manager);
+                    let oauth = Arc::clone(&manager.pending_oauth_urls);
                     tokio::spawn(async move {
-                        match Self::connect_one(&name, &entry).await {
+                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        oauth.write().await.remove(&name);
+                        match result {
                             Ok(server) => {
                                 let tool_count = server.tools.len();
                                 mgr.servers.write().await.insert(name.clone(), server);
@@ -637,19 +658,37 @@ impl McpClientManager {
         });
     }
 
-    /// Return status of all connected MCP servers.
+    /// Return status of all connected MCP servers plus any pending OAuth entries.
     pub async fn status(&self) -> Vec<McpServerStatus> {
         let servers = self.servers.read().await;
         let disabled = self.disabled_servers.read().await;
-        servers
+        let pending = self.pending_oauth_urls.read().await;
+
+        let mut result: Vec<McpServerStatus> = servers
             .iter()
             .map(|(name, server)| McpServerStatus {
                 name: name.clone(),
                 tool_count: server.tools.len(),
                 tools: server.tools.iter().map(|t| t.name.clone()).collect(),
                 enabled: !disabled.contains(name),
+                pending_oauth_url: None,
             })
-            .collect()
+            .collect();
+
+        // Servers blocked on OAuth haven't entered the connected map yet.
+        for (name, url) in pending.iter() {
+            if !servers.contains_key(name) {
+                result.push(McpServerStatus {
+                    name: name.clone(),
+                    tool_count: 0,
+                    tools: vec![],
+                    enabled: true,
+                    pending_oauth_url: Some(url.clone()),
+                });
+            }
+        }
+
+        result
     }
 
     /// Return (`server_name`, `tool_def`) pairs for all currently connected servers.
@@ -802,8 +841,19 @@ impl McpClientManager {
     }
 
     /// Spawn and initialize a single MCP server.
-    async fn connect_one(name: &str, entry: &McpServerConfig) -> Result<McpServer, String> {
-        let mut server = McpServer::spawn(name, &entry.command, &entry.args, &entry.env).await?;
+    async fn connect_one(
+        name: &str,
+        entry: &McpServerConfig,
+        pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+    ) -> Result<McpServer, String> {
+        let mut server = McpServer::spawn(
+            name,
+            &entry.command,
+            &entry.args,
+            &entry.env,
+            pending_oauth_urls,
+        )
+        .await?;
         server.initialize().await?;
         server.list_tools().await?;
         Ok(server)
@@ -959,7 +1009,10 @@ impl McpClientManager {
                 continue;
             }
 
-            match Self::connect_one(&name, &entry).await {
+            let oauth = Arc::clone(&self.pending_oauth_urls);
+            let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+            oauth.write().await.remove(&name);
+            match result {
                 Ok(server) => {
                     let tool_count = server.tools.len();
                     self.servers.write().await.insert(name.clone(), server);

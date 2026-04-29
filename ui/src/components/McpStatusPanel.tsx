@@ -25,25 +25,34 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
     }
   }, []);
 
-  // Fetch on mount, then poll every 3s until servers appear (background
-  // discovery may still be running). Stop once we have results.
+  // Poll every 3s until servers are connected. Keep polling while any server
+  // has a pending OAuth URL so the UI can update when auth completes.
   useEffect(() => {
     let cancelled = false;
+    const shouldStopPolling = (s: McpServerStatus[]) =>
+      s.length > 0 && s.every(srv => !srv.pending_oauth_url);
+
     fetchStatus().then(count => {
-      if (cancelled || count > 0) return;
+      if (cancelled) return;
+      if (count > 0 && shouldStopPolling(servers)) return;
       pollRef.current = setInterval(async () => {
-        const n = await fetchStatus();
-        if (n > 0 && pollRef.current) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
+        await fetchStatus();
+        // Re-evaluate stop condition after each fetch via the state update.
       }, 3000);
     });
     return () => {
       cancelled = true;
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [fetchStatus]);
+  }, [fetchStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Stop polling once all OAuth flows have resolved.
+  useEffect(() => {
+    if (servers.length > 0 && servers.every(s => !s.pending_oauth_url) && pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, [servers]);
 
   const handleReload = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -101,12 +110,27 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
   const totalTools = enabledServers.reduce((sum, s) => sum + s.tool_count, 0);
   const disabledCount = servers.length - enabledServers.length;
 
+  const pendingOAuth = servers.filter(s => s.pending_oauth_url);
+
   if (servers.length === 0 && !expanded) {
     return null;
   }
 
   return (
     <div className="mcp-panel">
+      {pendingOAuth.map(s => (
+        <div key={s.name} className="mcp-oauth-banner">
+          <span className="mcp-oauth-label">Auth required:</span>
+          <a
+            href={s.pending_oauth_url}
+            target="_blank"
+            rel="noreferrer"
+            className="mcp-oauth-link"
+          >
+            {s.name} &rarr; sign in
+          </a>
+        </div>
+      ))}
       <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
         <span className={`mcp-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
         <span className="mcp-panel-summary">

@@ -195,3 +195,30 @@
   color: var(--text-muted);
   font-style: italic;
 }
+
+.mcp-oauth-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--color-warning-bg, rgba(255, 193, 7, 0.12));
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.mcp-oauth-label {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.mcp-oauth-link {
+  color: var(--color-warning, #f5a623);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-oauth-link:hover {
+  text-decoration: underline;
+}

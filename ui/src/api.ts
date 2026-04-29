@@ -285,6 +285,7 @@ export interface McpServerStatus {
   tool_count: number;
   tools: string[];
   enabled: boolean;
+  pending_oauth_url?: string;
 }
 
 export interface McpReloadResult {
