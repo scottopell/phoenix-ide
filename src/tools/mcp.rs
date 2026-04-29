@@ -107,11 +107,19 @@ impl McpServer {
                     match reader.read_line(&mut line).await {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
-                            tracing::debug!(
-                                server = %server_name,
-                                "MCP stderr: {}",
-                                line.trim_end()
-                            );
+                            let trimmed = line.trim_end();
+                            // OAuth prompts and error messages need to be visible.
+                            if trimmed.contains("http://") || trimmed.contains("https://") {
+                                tracing::warn!(
+                                    server = %server_name,
+                                    "MCP stderr: {trimmed}"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    server = %server_name,
+                                    "MCP stderr: {trimmed}"
+                                );
+                            }
                         }
                     }
                 }
