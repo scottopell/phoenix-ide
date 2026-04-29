@@ -42,7 +42,7 @@ use a mid-tier model balanced for cost and accuracy.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ❌ Not Started | Headline benefit; satisfied jointly by REQ-CHN-002 through REQ-CHN-006 |
+| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ❌ Not Started | Headline benefit; satisfied by REQ-CHN-004 (Q&A backend) atop REQ-CHN-002 (chain identity) |
 | **REQ-CHN-002:** Continuation Chains Surface as First-Class Entities | ❌ Not Started | Sidebar nesting + chain identity; derived from `continued_in_conv_id` |
 | **REQ-CHN-003:** Chain Page as a Navigable Place | ❌ Not Started | New route `/chains/:rootConvId`; deep-linkable |
 | **REQ-CHN-004:** Ask the Chain, Get a Streamed Answer | ❌ Not Started | Mid-tier model; reuses SSE token-stream infrastructure |

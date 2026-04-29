@@ -24,8 +24,8 @@ ancestor in the `continued_in_conv_id` chain.
 `conversations.continued_in_conv_id` admits at most one successor per
 conversation, enforced schema-side by the column being scalar and
 application-side by `Database::continue_conversation`'s idempotent
-`AlreadyContinued` outcome (`src/db.rs`). Chains are linear; v1 has
-no branching.
+`AlreadyContinued` outcome (`src/db.rs`). Chains are linear; the
+design relies on this invariant.
 
 **Forward walk via recursive CTE.** Loading members from root in a
 single query:
@@ -186,13 +186,26 @@ Sonnet-class as of this writing). The model identifier is set at the
 Q&A call site; there is no per-chain or per-user override.
 
 **Streaming.** The Q&A response stream uses Phoenix's existing SSE
-token-streaming infrastructure (`specs/sse_wire/`). Streams are routed
-over a chain-scoped channel keyed by the chain's `root_conv_id`, with
-each token event carrying the per-question `chain_qa.id` as a request
-discriminator. This allows multiple subscribers (e.g., the same chain
-page open in two tabs) to demultiplex concurrent Q&As — a subscriber
-that submitted question A does not render tokens from a sibling-tab's
-question B.
+token-streaming infrastructure (`specs/sse_wire/`). Phoenix's existing
+broadcasters are conversation-scoped (one per `Conversation` runtime,
+see `src/runtime.rs`); chain Q&A introduces a new chain-scoped
+broadcaster keyed by the chain's `root_conv_id`. Each token event
+carries the per-question `chain_qa.id` as a request discriminator so
+multiple subscribers (e.g., the same chain page open in two tabs) can
+demultiplex concurrent Q&As — a subscriber that submitted question A
+does not render tokens from a sibling-tab's question B.
+
+**Chain broadcaster lifecycle.** The chain broadcaster is owned by a
+chain-runtime registry (analogous to the existing conversation-runtime
+registry) keyed by `root_conv_id`. It is created lazily on the first
+Q&A submission for a chain and torn down when (a) the last subscriber
+disconnects and there is no in-flight stream, or (b) the chain root is
+hard-deleted. Tab disconnects decrement the subscriber count; when it
+reaches zero with no in-flight stream the broadcaster is dropped.
+In-flight streams keep the broadcaster alive past zero subscribers
+until the stream reaches a terminal status (`completed` / `failed`),
+so a tab close mid-stream does not orphan the model invocation —
+subsequent reads pick up the persisted answer from `chain_qa`.
 
 **Loading UX (REQ-CHN-004).** Two visual states:
 
@@ -213,7 +226,7 @@ New table `chain_qa`:
 | `model` | TEXT NOT NULL | Model identifier used for the answer |
 | `status` | TEXT NOT NULL | One of `in_flight`, `completed`, `failed`, `abandoned` |
 | `snapshot_member_count` | INTEGER NOT NULL | Number of chain members at question submission time |
-| `snapshot_total_messages` | INTEGER NOT NULL | Sum of `message_count` across all chain members at question submission time |
+| `snapshot_total_messages` | INTEGER NOT NULL | Total message count across all chain members at question submission time (computed at submit; see Snapshot computation below) |
 | `created_at` | DATETIME NOT NULL | UTC; set when the question was submitted |
 | `completed_at` | DATETIME NULL | UTC; set when status transitions to `completed` |
 
@@ -255,20 +268,42 @@ UI states for rows that are dead.
 | `failed` | Question + failure indicator + "Re-ask?" affordance; partial answer rendered if `answer` is non-NULL |
 | `abandoned` | Question + "Did not complete — re-ask?" affordance |
 
-**Snapshot computation.** When a question is submitted, the backend
-walks the chain's members forward (recursive CTE on
-`continued_in_conv_id`), counts members and sums each member's
-`message_count`, and writes both integers into the row before invoking
-the model. On chain page load, the UI compares each Q&A row's snapshot
-integers against the current chain state and surfaces the difference
-as the inline staleness tag (REQ-CHN-005). Two integers replace what
-would otherwise be a JSON snapshot — same user-visible signal, no
-parallel representation of conversation graph state, no per-member
-walk on render.
+**Snapshot computation.** Per-conversation message count in Phoenix is
+**not a stored column** — `Conversation::message_count` is computed at
+load time via a correlated subquery (`(SELECT COUNT(*) FROM messages m
+WHERE m.conversation_id = c.id)`, see `src/db.rs`). When a question is
+submitted, the backend (a) walks the chain's members forward via the
+recursive CTE on `continued_in_conv_id`, (b) loads each member as a
+`Conversation` (which carries its query-time `message_count`), and
+(c) sums the counts in application code: `member_count =
+chain_members.len()`, `total_messages = chain_members.iter().map(|c|
+c.message_count).sum()`. Both integers are written into the row
+before invoking the model. On chain page load, the UI compares each
+Q&A row's snapshot integers against the current chain state (computed
+the same way) and surfaces the difference as the inline staleness tag
+(REQ-CHN-005). Two integers replace what would otherwise be a JSON
+snapshot — same user-visible signal, no parallel representation of
+conversation graph state.
 
-**Cascade behavior.** When the chain root conversation is hard-deleted,
-its Q&A history is removed via the foreign-key cascade. The history
-has no value separated from the source conversations.
+**Lifecycle and cascade behavior.**
+
+- **Hard delete of chain root.** When the chain root is hard-deleted
+  (`Database::delete_conversation`), `chain_qa` rows are removed via
+  the foreign-key cascade. The history has no value separated from
+  the source conversations.
+- **Archive of chain root.** Phoenix's user-facing default is *archive*
+  (`UPDATE conversations SET archived = 1`), not hard delete. Archived
+  chain roots **retain** their `chain_qa` rows; the UI hides the chain
+  from sidebar grouping (sidebar already filters `archived = 0`) and
+  the chain page route returns 404 for archived roots, but the rows
+  remain so unarchive restores Q&A history along with the chain.
+- **Mid-chain hard deletion.** Phoenix's existing schema places no
+  `ON DELETE` clause on `conversations.continued_in_conv_id`
+  (`src/db/migrations.rs`), so the FK defaults to `NO ACTION` —
+  hard-deleting any non-leaf member fails because its predecessor's
+  pointer still references it. This is a pre-existing Phoenix
+  invariant, not a chains-spec concern; chain Q&A history is
+  unaffected because nothing it relies on is broken.
 
 ## Out-of-Scope Properties
 
