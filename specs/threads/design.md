@@ -7,18 +7,18 @@ Threads are a *derived navigation primitive* over two existing graph edges:
 `conversations.seed_parent_id` (kickstart edges, REQ-SEED-003). A thread is
 a tree shape: a continuation chain forms the **main line**, and any
 conversation whose chain root has a seed pointer into the thread's main
-line forms a **branch**. No new fields are added to the `conversations`
+line forms a **offshoot**. No new fields are added to the `conversations`
 table; no `threads` table is introduced. Persistence is limited to a new
 `thread_qa` table for Q&A history.
 
 The Q&A surface is a single per-thread persistent UI history, with stateless
 per-question invocations of a mid-tier model. Q&A scope is **all thread
-members** — main line and branches alike — so questions like "where did
+members** — main line and offshoots alike — so questions like "where did
 we leave off?" see the full picture of work the user has done under this
 thread. Kickstart reuses the seeded-conversations mechanism
 (`specs/seeded-conversations/`) — kickstart is a special case of seeding
 where the draft prompt source is a Q&A answer and the new conversation
-becomes a branch member of the source thread.
+becomes an offshoot member of the source thread.
 
 ## Thread Identity and Membership (REQ-THR-002)
 
@@ -34,21 +34,21 @@ schema-side by the column being scalar and application-side by
 (`src/db.rs`). The main line of a thread is the linear continuation chain
 rooted at the thread's root.
 
-**Branch shape.** Kickstart edges (`seed_parent_id` set on the new
+**Offshoot shape.** Kickstart edges (`seed_parent_id` set on the new
 conversation, pointing to the source thread's root) admit zero-to-many
 successors per source root: a single thread root can sprout multiple
-branches. Each branch is itself a continuation chain — its branch root
+offshoots. Each offshoot is itself a continuation chain — its offshoot root
 is a conversation whose `seed_parent_id` points into a thread's main line,
-and the branch's chain extends forward via continuation edges as usual.
+and the offshoot's chain extends forward via continuation edges as usual.
 
 **Membership rule.** A conversation `C` is a member of thread `T` iff
 either:
 
 1. `C`'s chain root equals `T` (i.e., `C` is on `T`'s main line), OR
-2. `C`'s chain root has `seed_parent_id == T` (i.e., `C` is on a branch
+2. `C`'s chain root has `seed_parent_id == T` (i.e., `C` is on an offshoot
    sub-chain rooted at a kickstart from `T`).
 
-This is "follow the seed pointer exactly once" — branches of branches
+This is "follow the seed pointer exactly once" — offshoots of offshoots
 (nested kickstarts where one kickstart's chain root has a `seed_parent_id`
 pointing to another kickstart's chain) are deliberately not flattened
 into the topmost thread; they belong to whichever thread their immediate
@@ -70,14 +70,14 @@ SELECT id, depth FROM chain ORDER BY depth;
 ```
 
 ```sql
--- Step 2: branch roots (conversations with seed_parent_id = thread root)
+-- Step 2: offshoot roots (conversations with seed_parent_id = thread root)
 SELECT id FROM conversations WHERE seed_parent_id = ?;
 ```
 
-For each branch root returned by step 2, the same forward CTE in step 1 is
-executed against that branch root to load the branch's continuation chain.
-For typical thread depths (single-digit branches, single-digit chain
-length per branch) this is a small bounded number of CTE invocations.
+For each offshoot root returned by step 2, the same forward CTE in step 1 is
+executed against that offshoot root to load the offshoot's continuation chain.
+For typical thread depths (single-digit offshoots, single-digit chain
+length per offshoot) this is a small bounded number of CTE invocations.
 
 **Backward walk** (any member → its thread root) follows continuation back
 to a chain root, then if that chain root has a `seed_parent_id`, it
@@ -85,7 +85,7 @@ returns that seed parent as the thread root; otherwise it returns the
 chain root itself.
 
 A conversation is a thread member iff the thread it belongs to has
-total membership (main line + branches) of size ≥ 2. Single isolated
+total membership (main line + offshoots) of size ≥ 2. Single isolated
 conversations with no continuation successors and no kickstarts pointing
 to them are not threads.
 
@@ -103,40 +103,62 @@ in-between sit between them. Sidebar grouping therefore performs
 2. Conversations belonging to the same thread are extracted from the flat
    recency list into a single collapsible block.
 3. Each thread block is positioned at the recency rank of its
-   most-recent member (main line or branch — whichever has the latest
+   most-recent member (main line or offshoot — whichever has the latest
    `updated_at`), so a thread with any recent activity rides at the top.
 4. Within the thread block, members are rendered hierarchically:
    - **Main line** members listed first in chain order (root → latest)
-   - **Branches** listed below the main line. Each branch is rendered as
-     a sub-tree (branch root + its continuation chain), indented under
-     the thread block. Multiple branches are listed in the order their
-     branch roots were created.
+   - **Offshoots** listed below the main line. Each offshoot is rendered as
+     a sub-tree (offshoot root + its continuation chain), indented under
+     the thread block. Multiple offshoots are listed in the order their
+     offshoot roots were created.
 5. Standalone conversations remain interleaved by recency between thread
    blocks.
 
 Members within the block are ordered by structural position (main line
-then branches), independent of their individual `updated_at` values, so
+then offshoots), independent of their individual `updated_at` values, so
 the topology of the thread is legible at a glance.
 
 Thread display name is the root conversation's title. Each thread block
 defaults to expanded; expand/collapse state is not persisted across
 navigations.
 
-## Thread Page (REQ-THR-003, REQ-THR-005)
+## Thread Page (REQ-THR-003, REQ-THR-005, REQ-THR-009)
 
 Route: `/threads/:rootConvId`. The route is deep-linkable, supports browser
 back/forward, and survives refresh.
+
+**Page header.** The header surfaces the two header-level first-class
+actions from the thread (the third, Kickstart, is per-answer and lives
+inside the Q&A panel):
+
+- **Resume** (REQ-THR-009) — a primary button labeled "Resume <member
+  title>" where <member title> is the title of the thread's most
+  recently active member (highest `updated_at` across main line and all
+  offshoots). Clicking navigates to that member's conversation detail
+  page in ready-to-work state (input focused, history loaded).
+- **Snapshot indicator** — a passive header element showing the
+  thread's current total member count and the timestamp of the most
+  recently active member. This is the anchor against which Q&A
+  snapshot-staleness (REQ-THR-005) is computed.
+
+The Q&A input is always visible in the right column, so "Ask" is not
+a header-level button — focus is one click away on the input itself.
 
 **Layout (two-column):**
 
 - **Left:** member conversations rendered hierarchically:
   - The **main line** at the top, as cards in chain order (root → latest).
     Each card shows title, position label (root / continuation / latest),
-    date, and message count.
-  - **Branches** below the main line. Each branch is a sub-tree: a branch
-    root card (labeled "kickstarted from <Q&A excerpt>") followed by its
-    own continuation chain cards indented underneath.
-  Clicking any card navigates to that conversation's detail page.
+    date, and message count. The card for the most-recently-active member
+    of the entire thread is visually emphasized (e.g., highlighted border
+    or an "active" badge) so the Resume target is obvious before the
+    user even reads the header button.
+  - **Offshoots** below the main line. Each offshoot is a sub-tree: an
+    offshoot root card (labeled "kickstarted from <Q&A excerpt>") followed
+    by its own continuation chain cards indented underneath.
+  Clicking any member card navigates to that conversation's detail page
+  in the same ready-to-work state as the Resume action — REQ-THR-009 makes
+  no distinction between Resume-via-header-button and Resume-via-card-click.
 - **Right:** Q&A panel. Input box anchored at the bottom of the panel.
   Q&A history fills the area above the input, in chronological order
   (oldest at the top of the scroll region, most recent immediately above
@@ -144,6 +166,23 @@ back/forward, and survives refresh.
   the input, flowing downward toward the input as tokens arrive — older
   Q&A above is not displaced. Each Q&A entry shows the question, the
   answer, and a Kickstart button.
+
+  **Q&A entry independence (REQ-THR-006).** Each Q&A entry is rendered
+  as a self-contained card — clear border, vertical gap from siblings,
+  no visual ligatures between entries (no thread/reply lines, no avatar
+  continuity, no "indenting" follow-ups). This is a deliberate visual
+  signal that questions are answered independently against the thread's
+  content rather than as a continuous conversation. The input box is
+  always empty after submission; it does not preserve drafts across
+  submissions and does not "thread" into the previous answer.
+
+  **Q&A snapshot indicator (REQ-THR-005).** Each Q&A card displays a
+  subtle inline tag indicating the thread state at answer time when it
+  differs from current state — e.g., "answered when thread had 3
+  conversations (now 5)" or "answered when offshoot #51 had 4 messages
+  (now 9)". The tag is computed from a snapshot recorded on the
+  `thread_qa` row at answer time (see Q&A Persistence) compared against
+  the thread's current member set and per-member message counts.
 
 ## Q&A Backend (REQ-THR-001, REQ-THR-004, REQ-THR-006)
 
@@ -161,37 +200,69 @@ is answered against the canonical thread content, not against the model's
 own prior answers.
 
 **Context bundling.** The bundled context covers **all thread members** —
-the main line and every branch sub-chain. Each member contributes one
+the main line and every offshoot sub-chain. Each member contributes one
 context block, classified by whether it has been continued:
 
 | Member kind | Context source |
 |---|---|
-| **Non-leaf** (continued into a successor; applies to non-final main-line members and non-final branch-chain members alike) | The trailing `MessageType::Continuation` message at the end of the member itself, persisted by `Effect::persist_continuation_message` during the `AwaitingContinuation → ContextExhausted` transition (`src/state_machine/transition.rs`). Its payload describes the work done in that member. |
-| **Leaf** (not continued; the last member of the main line and the last member of each branch sub-chain are all leaves) | Transcript sent directly when the leaf has ≤ 20 messages and approximate token count ≤ 4000; otherwise an on-demand summary generated by the same mid-tier model in a pre-step before the main answer call. |
+| **Non-leaf** (continued into a successor; applies to non-final main-line members and non-final offshoot-chain members alike) | The trailing `MessageType::Continuation` message at the end of the member itself, persisted by `Effect::persist_continuation_message` during the `AwaitingContinuation → ContextExhausted` transition (`src/state_machine/transition.rs`). Its payload describes the work done in that member. |
+| **Leaf** (not continued; the last member of the main line and the last member of each offshoot sub-chain are all leaves) | Transcript sent directly when the leaf has ≤ 20 messages and approximate token count ≤ 4000; otherwise an on-demand summary generated by the same mid-tier model in a pre-step before the main answer call. |
 
-A thread with one main line of length `m` and `b` branches with chain
+A thread with one main line of length `m` and `b` offshoots with chain
 lengths `c₁, c₂, …, c_b` has `1 + b` leaves (one main-line leaf, one
-per branch) and `(m - 1) + Σ(cᵢ - 1)` non-leaf members. Cost grows
+per offshoot) and `(m - 1) + Σ(cᵢ - 1)` non-leaf members. Cost grows
 linearly with member count, but each member contributes a bounded chunk.
 The bundled context is labeled per-member with a structural tag
-(e.g., `[main:#42]`, `[branch:#51]`, `[branch:#51→#52]`) so the model
-can distinguish main-line work from branch work when the question
+(e.g., `[main:#42]`, `[offshoot:#51]`, `[offshoot:#51→#52]`) so the model
+can distinguish main-line work from offshoot work when the question
 benefits from that distinction.
 
 The leaf-summary thresholds are pinned to single shared values across
 all Q&A invocations to avoid behavior drift between identical questions.
 
-**Leaf-summary cache.** When any leaf requires summarization, the result
-is cached in-memory keyed by `(leaf_conv_id, leaf.message_count)`.
-Subsequent Q&A invocations on the same thread reuse cached summaries
-unless a leaf has received new messages (message count increment
-invalidates that leaf's entry). The cache is per-leaf, so adding a new
-branch only triggers summarization for that branch's leaf — main-line
-leaf and existing branches stay cached. The cache is process-local; on
-server restart it is empty and the first Q&A regenerates it.
+**Leaf-summary persistence.** When any leaf requires summarization, the
+result is persisted to a new `thread_leaf_summary` table rather than held
+in process memory:
 
-**Model.** Claude Sonnet 4.6. The model identifier is set at the Q&A call
-site; there is no per-thread or per-user override.
+| Column | Type | Notes |
+|---|---|---|
+| `leaf_conv_id` | TEXT NOT NULL | The leaf conversation; `REFERENCES conversations(id) ON DELETE CASCADE` |
+| `message_count_at_summary` | INTEGER NOT NULL | The leaf's `message_count` at the moment this summary was generated |
+| `summary` | TEXT NOT NULL | The summary content |
+| `model` | TEXT NOT NULL | Model identifier used to generate this summary |
+| `created_at` | DATETIME NOT NULL | UTC; set when the summary was generated |
+
+Primary key: `(leaf_conv_id, message_count_at_summary)`.
+
+**Lookup.** Before summarizing a leaf, the Q&A backend queries
+`SELECT summary FROM thread_leaf_summary WHERE leaf_conv_id = ? AND
+message_count_at_summary = ?` using the leaf's current `message_count`.
+A hit serves the persisted summary directly with no model call. A miss
+triggers summarization and INSERTs the new row.
+
+**Staleness model.** The compound primary key encodes staleness
+implicitly: a summary is fresh iff its `message_count_at_summary` matches
+the leaf's current `message_count`. When the leaf grows by new messages,
+the previous row remains as audit history (a record of what context the
+model saw at past Q&A times) but no longer matches lookups; a new row is
+generated and inserted on the next Q&A invocation that needs it. Old
+rows are not GC'd in v1 — they are small, and retaining them gives a
+useful audit trail for debugging Q&A answers in retrospect.
+
+**Cascade.** When a leaf conversation is hard-deleted, its summaries are
+removed via the foreign-key cascade.
+
+**Restart behavior.** Because summaries are persisted, server restart
+does not invalidate them — the first Q&A after restart picks up existing
+fresh rows rather than regenerating them, as long as the leaf hasn't
+grown in the interim.
+
+**Model.** A mid-tier model balanced for cost and accuracy (Claude
+Sonnet-class as of this writing). The model identifier is set at the
+Q&A call site; there is no per-thread or per-user override. The
+`thread_leaf_summary.model` column records which model produced each
+persisted summary so future model upgrades can either reuse or
+regenerate as appropriate.
 
 **Streaming.** The Q&A response stream uses the existing SSE token-streaming
 infrastructure (`specs/sse_wire/`). Streams are routed over a thread-scoped
@@ -220,9 +291,19 @@ New table `thread_qa`:
 | `model` | TEXT NOT NULL | Model identifier used for the answer |
 | `created_at` | DATETIME NOT NULL | UTC; set when the question is submitted |
 | `completed_at` | DATETIME NULL | UTC; set when the answer stream completes successfully |
+| `thread_snapshot` | TEXT NOT NULL | JSON-encoded snapshot of `[{conv_id, message_count}, …]` for every member of the thread at answer time; used to compute the staleness indicator (REQ-THR-005) on subsequent reads |
 
 Index: `CREATE INDEX idx_thread_qa_root ON thread_qa(root_conv_id, created_at)`
 so the per-thread lookup query is index-served.
+
+**Snapshot computation.** When a question is submitted, the backend
+walks the thread's members (forward CTE on the main line, plus
+seed-pointer query for offshoot roots and their forward CTEs) and
+records each member's id and current `message_count` into
+`thread_snapshot` before invoking the model. On subsequent thread page
+loads, the UI compares each Q&A's `thread_snapshot` against the
+current member set and per-member message counts, surfacing the
+diff as the inline staleness tag described in the Thread Page section.
 
 **Persistence point.** The row is INSERTed at question submission time with
 `answer = NULL` and `completed_at = NULL`. On stream completion, `answer`
@@ -257,19 +338,19 @@ the source Q&A and thread:
 | `seed_label` | `"Q&A: <question excerpt>"` (truncated to a display-appropriate length) |
 
 The new conversation is created with no `continued_in_conv_id` predecessor
-on any thread member, satisfying the chain-vs-branch distinction in
-REQ-THR-008. **It is a branch member of the source thread**: the
+on any thread member, satisfying the chain-vs-offshoot distinction in
+REQ-THR-008. **It is an offshoot member of the source thread**: the
 membership rule (chain root has `seed_parent_id == thread root`) places
-it on a branch sub-chain rooted at the new conversation. The source
-thread's forward walk picks up the new conversation via the branch-root
+it on an offshoot sub-chain rooted at the new conversation. The source
+thread's forward walk picks up the new conversation via the offshoot-root
 query (`SELECT id FROM conversations WHERE seed_parent_id = ?`), the
 source thread's member list and sidebar block include it, and the Q&A
 context bundling pulls in its content alongside the main line.
 
 If the kickstarted conversation is itself later continued via the
 existing "continue in new conversation" flow, those continuations extend
-the same branch sub-chain (visible as further indentation under that
-branch in the source thread's UI). They remain part of the source
+the same offshoot sub-chain (visible as further indentation under that
+offshoot in the source thread's UI). They remain part of the source
 thread, not a new thread.
 
 Lineage display on the kickstarted conversation's own detail page is
@@ -279,7 +360,7 @@ view (continuation breadcrumbs are tagged "continued from"; kickstart
 breadcrumbs are tagged "kickstarted from thread"). The breadcrumb
 complements the source thread's member-list affordance — it lets the
 user navigate from a single member detail page back to the thread, while
-the source thread's member list lets them see the branch in context
+the source thread's member list lets them see the offshoot in context
 alongside its siblings.
 
 ## Out-of-Scope Properties

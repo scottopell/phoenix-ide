@@ -16,9 +16,9 @@ Days or weeks later I want to recall something specific from that chain
 I want to navigate to the chain as a unit (a *thread*), ask it a question,
 and get a focused answer. Sometimes that answer makes me want to start a
 new conversation taking the topic in a *slightly different direction* —
-not a continuation of the chain (the prior stream is done), but a *branch*
+not a continuation of the chain (the prior stream is done), but a *offshoot*
 of the same thread that inherits the recap as starting context. The
-branch is part of the thread (visible in the thread's member list and
+offshoot is part of the thread (visible in the thread's member list and
 sidebar block) but is structurally distinct from the main continuation
 line.
 
@@ -54,7 +54,7 @@ WHEN a user wants to recall information from a thread (a group of
 related conversations linked by continuation, kickstart, or both)
 THE SYSTEM SHALL provide an interaction surface that returns an answer
 derived from the content of every member of that thread, including
-both main-line members and branch members
+both main-line members and offshoot members
 AND SHALL NOT require the user to extend any of those conversations or
 to re-supply their content as input
 
@@ -62,7 +62,7 @@ to re-supply their content as input
 full token cost twice — once to do the work originally, and again to
 retrieve from it. The "every member" clause prevents a partial-recall
 failure mode: if Q&A only saw the main line, a user asking "where did
-we leave off?" on a thread whose latest meaningful work was on a branch
+we leave off?" on a thread whose latest meaningful work was on an offshoot
 would get an incomplete or misleading answer.
 
 ---
@@ -78,11 +78,11 @@ thread's root conversation)
 
 THE SYSTEM SHALL distinguish two kinds of thread members:
 the **main line** (the continuation chain rooted at the thread's root
-conversation) and **branches** (kickstart-derived sub-chains rooted at
+conversation) and **offshoots** (kickstart-derived sub-chains rooted at
 conversations whose seed lineage points to the thread's root)
 
 WHEN a conversation has not been continued, was not itself a
-continuation, and is not a kickstart-derived branch root
+continuation, and is not a kickstart-derived offshoot root
 THE SYSTEM SHALL render it as a standalone (non-thread) navigation entry
 
 **Rationale:** Thread membership emerges automatically from how the
@@ -145,12 +145,21 @@ THE SYSTEM SHALL render the input box anchored at the bottom of the Q&A
 panel, with Q&A history scrolling above it in chronological order such
 that the most recent Q&A sits immediately above the input
 
+WHEN a stored Q&A answer was generated against an earlier snapshot of
+the thread (the thread has gained new members or existing members have
+gained messages since the answer was produced)
+THE SYSTEM SHALL visually indicate the answer's snapshot staleness so
+the user can tell at a glance whether re-asking would likely yield a
+materially different answer
+
 **Rationale:** Users return to threads. Without persistence, they lose
 answers they paid to generate and have no record of what they have
 already asked. The bottom-anchored input with chronological history
 matches the messaging pattern users already know (Slack, iMessage) —
 streaming flows downward into a stable visible region while the input
-stays put.
+stays put. Snapshot-staleness indication prevents acting on stale
+recall: a "where did we leave off?" answer captured before the latest
+conversation was added would be misleading without this signal.
 
 ---
 
@@ -188,44 +197,83 @@ THE SYSTEM SHALL NOT auto-submit any pre-populated content — the user
 must explicitly send
 
 **Rationale:** Kickstart is the bridge from "I asked" to "now I act."
-The no-auto-send rule preserves user agency, consistent with how
-seeded conversations already work in Phoenix.
+The no-auto-send rule preserves user agency and is consistent with
+REQ-SEED-001 (seeded conversations require explicit user submission
+of any pre-filled draft).
 
 ---
 
-### REQ-THR-008: Kickstart Adds a Branch to the Thread, Not a Continuation
+### REQ-THR-008: Kickstart Adds an Offshoot to the Thread, Not a Continuation
 
 WHEN a kickstarted conversation is created from a thread Q&A
 THE SYSTEM SHALL include the new conversation in the source thread as
-a **branch member** — it appears in the source thread's member list and
+a **offshoot member** — it appears in the source thread's member list and
 sidebar block, distinct from the main continuation line
 AND SHALL NOT add it to the source thread's continuation chain (its
 relationship to the thread is via seed lineage, not via
 `continued_in_conv_id`)
 
-WHEN a branch member is itself continued via "continue in new
+WHEN an offshoot member is itself continued via "continue in new
 conversation"
 THE SYSTEM SHALL include the resulting continuation as part of the
-same source thread (rendered as a sub-chain extending that branch),
+same source thread (rendered as a sub-chain extending that offshoot),
 not as a separate thread
 
-THE SYSTEM SHALL render the branch hierarchy on the thread page and in
-the sidebar so the main line and branches are visually distinguished
+THE SYSTEM SHALL render the offshoot hierarchy on the thread page and in
+the sidebar so the main line and offshoots are visually distinguished
 
 **Rationale:** The user has explicitly distinguished two actions:
 "continue where we left off" (the existing continuation flow, which
 extends the main line) and "the topic is still active but the prior
 stream is done — take a new direction" (kickstart, which adds a
-branch). Both belong to the same thread of related work, but they have
+offshoot). Both belong to the same thread of related work, but they have
 different structural roles: the main line is the canonical narrative
-of the thread, branches are divergent sub-explorations. Treating
-branches as members rather than as separate orphaned conversations
+of the thread, offshoots are divergent sub-explorations. Treating
+offshoots as members rather than as separate orphaned conversations
 matches how the user thinks about ownership of their own work — they
-kickstarted from this thread, so this thread "owns" the branch.
+kickstarted from this thread, so this thread "owns" the offshoot.
 
 The continuation chain remains a clean primitive (no kickstart
 conversations in it), so the existing continuation flow and Q&A
 context bundling for the main line are unaffected.
+
+---
+
+### REQ-THR-009: Resume the Latest Active Conversation in a Thread
+
+WHEN the user navigates to a thread page
+THE SYSTEM SHALL prominently display an action to navigate directly to
+the thread's most recently active member — the member (main line or
+offshoot) with the latest `updated_at` across all members
+
+WHEN the user activates this action
+THE SYSTEM SHALL navigate to that member's conversation detail page
+in a state ready for the user to continue working: the message input
+focused, the conversation history loaded, and the conversation in a
+state that accepts new user messages
+
+THE SYSTEM SHALL also let the user resume on a non-latest member by
+clicking that member's card on the thread page, with the same
+ready-to-work landing state on the destination
+
+**Rationale:** A core value of the Threads concept is eliminating the
+cognitive overhead of "hunting for the last conversation in a
+sequence." The user has explicitly named this as one of three
+first-class actions on a thread, alongside Q&A (recall something from
+past work, REQ-THR-001/004) and Kickstart (new direction in same
+topic, REQ-THR-007/008). Without a prominent Resume action the user
+opens a thread and still has to visually scan for the latest active
+member — particularly under tree membership where the latest activity
+could be on the main line or any offshoot. Surfacing it as a one-click
+action makes resume-where-I-left-off as fast as the other two flows.
+
+The three first-class verbs on a thread page:
+
+| Action | When the user wants to | Requirement |
+|---|---|---|
+| Resume | continue working in the same direction | REQ-THR-009 |
+| Ask | recall something from past work | REQ-THR-001 / REQ-THR-004 |
+| Kickstart | take a new direction in the same topic | REQ-THR-007 / REQ-THR-008 |
 
 ---
 
@@ -235,7 +283,7 @@ context bundling for the main line are unaffected.
   to manually add an unrelated conversation as a member of an existing
   thread (or remove a member from one). v1 derives thread membership
   strictly from the conversation graph: continuation edges produce main
-  line members, seed-pointer edges (kickstart) produce branch members.
+  line members, seed-pointer edges (kickstart) produce offshoot members.
   Kickstart is a system-generated membership action with a single
   well-defined edge type, not arbitrary user editing — it does not
   violate this exclusion.
