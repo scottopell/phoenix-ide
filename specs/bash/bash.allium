@@ -1,0 +1,921 @@
+-- allium: 3
+-- bash.allium
+--
+-- Bash Tool: Behavioural Specification
+--
+-- Scope: pipe-backed shell command execution with job-handle persistence.
+-- Includes: spawn lifecycle, wait_seconds semantics, peek/wait/kill handle
+--           operations, ring buffer, tombstone demotion on exit,
+--           Phoenix-restart tombstones, per-conversation handle cap, command
+--           safety checks (delegated to bash_check).
+-- Excludes:
+--   - Tmux integration / TTY-backed processes (specs/tmux-integration/)
+--   - Browser tool, patch tool, etc. (each in its own spec)
+--   - Conversation lifecycle (specs/bedrock/)
+--   - Display-simplification rules for the UI rendering layer (REQ-BASH-015
+--     lives in design.md as a UI surface concern)
+--   - Landlock kernel mechanics (REQ-BASH-012/013 covered in design.md;
+--     here only the requires-clause for "Explore mode" gate is referenced)
+--
+-- Requirement traceability: REQ-BASH-001 through REQ-BASH-015
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The agent calling the bash tool. Identity is the conversation it runs in;
+-- handle ownership is conversation-scoped, so an agent in conv A cannot
+-- operate on a handle owned by conv B. This is enforced structurally by
+-- looking up handles in conversation-keyed registries.
+actor LlmAgent {
+    identified_by: bedrock/Conversation
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The OS process spawned via fork/exec. Holds stdin=null, stdout/stderr piped.
+-- Phoenix is its parent; it dies via SIGHUP cascade if Phoenix's process
+-- group dies (REQ-BASH-007).
+external entity ChildProcess {
+    pid: Integer
+    pgid: Integer
+}
+
+-- The persistent SQLite store used for tombstone shadow records. The bash
+-- tool writes/reads here at handle creation and on Phoenix startup;
+-- otherwise the in-memory live registry is the source of truth.
+external entity SqliteTombstoneStore {
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A single line in the ring buffer or tombstone. The offset is monotonically
+-- increasing since spawn; line index 0 is the first line emitted by the
+-- process. Lines never have their offsets reused; eviction advances the
+-- ring's start_offset but offsets are never reassigned.
+value RingLine {
+    offset: Integer       -- monotonic line index since spawn (>= 0)
+    bytes:  String        -- raw line content; lossy UTF-8 conversion at the
+                          -- API boundary preserves any binary payload as
+                          -- replacement-character runs
+}
+
+-- A peek/wait/spawn response carries this read window over the lines field.
+-- start_offset and end_offset bound the lines that were returned; the agent
+-- can use end_offset as the next call's `since` value to stream incrementally.
+value ReadWindow {
+    start_offset:      Integer    -- offset of first line returned
+    end_offset:        Integer    -- one past offset of last line returned
+    truncated_before:  Boolean    -- true when content older than start_offset
+                                  -- existed but is no longer available
+    lines:             List<RingLine>
+}
+
+-- Read-mode arguments the agent may supply on peek/wait. lines and since are
+-- mutually exclusive at the schema layer (REQ-BASH-004); when both are
+-- supplied at runtime, PeekArgsMutuallyExclusive governs.
+value ReadArgs {
+    lines: Integer?
+    since: Integer?
+}
+
+-- Live handle entry surfaced in cap-rejection responses. Mirrors the schema
+-- the agent sees in the handle_cap_reached error envelope.
+value LiveHandleEntry {
+    handle:      String
+    cmd:         String
+    age_seconds: Integer
+    status:      HandleStatus
+}
+
+-- Information returned to the caller when a process has finished. exit_code
+-- may be None when the kernel reaped the process via signal with no status
+-- code, or when the handle is in lost_in_restart.
+value ExitInformation {
+    exit_code:   Integer?
+    duration_ms: Integer
+    final_cause: FinalCause
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Handle lifecycle. running is initial; the three terminal states correspond
+-- to the FinalCause field on Tombstone.
+enum HandleStatus {
+    running
+    | exited
+    | killed
+    | lost_in_restart
+}
+
+-- Cause of a handle's transition to a terminal state. Lines up with
+-- HandleStatus terminal values.
+enum FinalCause {
+    exited
+    | killed
+    | lost_in_restart
+}
+
+-- Kill signal that the agent may request. TERM is graceful; KILL is
+-- immediate. After TERM is sent and the process does not exit within
+-- KILL_GRACE_SECONDS, Phoenix auto-escalates to KILL.
+enum KillSignal {
+    TERM | KILL
+}
+
+-- Operation kinds for the tool surface. Used in mutual-exclusion enforcement
+-- (REQ-BASH-010): exactly one per call.
+enum OperationKind {
+    spawn | peek | wait | kill
+}
+
+-- Outcome of a wait window race. Used as a response-shape variant; the
+-- handle's actual lifecycle status is governed by HandleStatus.
+enum WaitOutcome {
+    completed     -- ProcessExited fired before wait window elapsed
+    | timed_out   -- wait window elapsed before ProcessExited
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A bash handle is the durable identity of one spawned command. While the
+-- process is running, the handle owns a live ring buffer in memory. After
+-- the process exits, the live ring is demoted to a tombstone, the in-memory
+-- ring buffer is freed, and the handle is materialised as a Tombstone
+-- entity with the same handle_id.
+entity Handle {
+    -- Conversation that owns the handle. Cross-conversation lookups MUST
+    -- return handle_not_found.
+    conversation: bedrock/Conversation
+
+    -- Stable identifier within a conversation. Format is implementation
+    -- detail (sequential "b-1", "b-2", ... is fine); Allium contract is
+    -- only that the pair (conversation, handle_id) is unique.
+    handle_id: String
+
+    -- The command string as the agent supplied it. Stored verbatim for
+    -- error reporting, the cap-reached response, and the tombstone.
+    cmd: String
+
+    -- Lifecycle state.
+    status: HandleStatus
+
+    transitions status {
+        running -> exited
+        running -> killed
+        running -> lost_in_restart
+        terminal: exited, killed, lost_in_restart
+    }
+
+    -- Spawn-time fields.
+    started_at:       Timestamp
+    pid:              Integer    when status = running
+    pgid:             Integer    when status = running
+
+    -- Live ring buffer. Bytes-bounded; populated only while status = running.
+    -- ring_lines is the in-memory list of RingLine; ring_bytes_used tracks
+    -- the byte total. next_line_offset is the offset that the next emitted
+    -- line will receive (monotonic, never rewinds).
+    ring_lines:       List<RingLine>    when status = running
+    ring_bytes_used:  Integer           when status = running
+    next_line_offset: Integer           when status = running
+
+    -- Tombstone fields. Populated on transition out of running. final_tail
+    -- holds the last TOMBSTONE_TAIL_LINES lines (or fewer); for
+    -- lost_in_restart this is whatever was last persisted to SQLite.
+    final_tail:           List<RingLine>    when status != running
+    final_cause:          FinalCause        when status != running
+    exit_code:            Integer?          when status != running
+        -- None for killed handles, lost_in_restart, or exited if the kernel
+        -- did not produce a code (signal-killed). Do not substitute 0.
+    duration_ms:          Integer           when status != running
+    finished_at:          Timestamp         when status != running
+    next_offset_at_exit:  Integer           when status != running
+        -- The value next_line_offset held at the moment of demotion.
+        -- truncated_before in the response is true iff a since= argument
+        -- references an offset < (next_offset_at_exit - count(final_tail)).
+    shutdown_marker_ts:   Timestamp?        when status = lost_in_restart
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    default_wait_seconds: Integer = 30
+    -- Default value for wait_seconds when the agent omits it.
+
+    max_wait_seconds: Integer = 900
+    -- Upper bound. wait_seconds > this is rejected.
+
+    ring_buffer_bytes: Integer = 4194304
+    -- 4 MB per-handle live ring buffer.
+
+    live_handle_cap: Integer = 8
+    -- Per-conversation cap on handles with status = running.
+
+    kill_grace_seconds: Integer = 5
+    -- After SIGTERM is sent via HandleKilledByAgent, wait this long for the
+    -- process to exit. If still running, escalate to SIGKILL.
+
+    tombstone_tail_lines: Integer = 2000
+    -- Lines retained in final_tail after demotion. The live ring may have
+    -- evicted older content; final_tail is the suffix of what was retained.
+
+    default_peek_lines: Integer = 200
+    -- Lines returned by peek when neither lines= nor since= is supplied.
+}
+
+------------------------------------------------------------
+-- Rules — spawn
+------------------------------------------------------------
+
+-- REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011: a successful spawn.
+-- Creates the Handle entity in status=running and persists the SQLite shadow
+-- record. The wait-window race is modelled by the response-shaping rules
+-- (SpawnExitsWithinWait, SpawnExceedsWait).
+rule HandleSpawned {
+    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+
+    requires: count(Handle{conversation: conversation, status: running})
+              < config.live_handle_cap
+    requires: 0 <= wait_seconds
+    requires: wait_seconds <= config.max_wait_seconds
+    requires: bash_check_passes(cmd)
+        -- REQ-BASH-011: command safety check delegated to bash_check.
+
+    let h_id = next_handle_id(conversation)
+
+    ensures: Handle.created(
+        conversation:     conversation,
+        handle_id:        h_id,
+        cmd:              cmd,
+        status:           running,
+        started_at:       now(),
+        ring_bytes_used:  0,
+        next_line_offset: 0
+    )
+    ensures: ChildProcessSpawned(conversation, h_id, cmd)
+    ensures: TombstoneShadowPersisted(conversation, h_id, running)
+        -- REQ-BASH-007: SQLite shadow record written before the agent
+        -- receives the response, so a Phoenix crash between spawn and
+        -- response leaves a detectable record that startup reconciliation
+        -- can relabel as lost_in_restart.
+
+    @guidance
+        -- Spawn sequence (in src/tools/bash.rs):
+        --   1. Validate inputs (mutual exclusion in REQ-BASH-010, range checks).
+        --   2. Run bash_check::check(cmd). On reject, return command_safety_rejected
+        --      WITHOUT spawning; HandleSpawnRejectedBySafety governs.
+        --   3. Check live cap. On reject, return handle_cap_reached with the
+        --      live-handles list; HandleSpawnRejectedByCap governs.
+        --   4. Allocate handle_id (next sequential within conversation).
+        --   5. Persist tombstone shadow record (status=running) BEFORE spawning,
+        --      so a crash between spawn and shadow leaves a clean record.
+        --      A successful shadow write followed by spawn failure rolls back
+        --      the shadow record (HandleSpawnFailedRollback).
+        --   6. Spawn child via Command::new("bash").args(["-c", cmd]) with
+        --      pre_exec(setpgid(0,0)) so the child becomes its own process
+        --      group leader. stdout and stderr piped, stdin null. Working
+        --      dir from ctx.working_dir.
+        --   7. Spawn two reader tasks (stdout, stderr) feeding the same ring
+        --      under a mutex. Each task ingests bytes, splits on '\n', and
+        --      appends RingLine entries with monotonically increasing
+        --      offsets. RingLineEvicted handles overflow.
+        --   8. Spawn the wait-for-exit task. On exit, run
+        --      HandleProcessExited and update the SQLite shadow record.
+        --   9. The agent's response is shaped by SpawnExitsWithinWait or
+        --      SpawnExceedsWait, depending on which event fires first.
+}
+
+-- REQ-BASH-005: spawn rejected because the conversation is at its cap.
+-- No handle is created and no shadow record is written.
+rule HandleSpawnRejectedByCap {
+    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+
+    requires: count(Handle{conversation: conversation, status: running})
+              >= config.live_handle_cap
+
+    ensures: AgentReceivesError(
+        error: "handle_cap_reached",
+        cap: config.live_handle_cap,
+        live_handles: live_handle_summary(conversation),
+        hint: "kill or wait on a handle before spawning more, or use the tmux tool for long-runners"
+    )
+}
+
+-- REQ-BASH-011: spawn rejected because bash_check found a dangerous pattern.
+-- No handle is created, no shadow record, no spawn attempted.
+rule HandleSpawnRejectedBySafety {
+    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+
+    requires: not bash_check_passes(cmd)
+
+    let reason = bash_check_reason(cmd)
+
+    ensures: AgentReceivesError(
+        error: "command_safety_rejected",
+        reason: reason
+    )
+}
+
+-- REQ-BASH-002: spawn argument out of range.
+rule HandleSpawnRejectedByRange {
+    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+
+    requires: wait_seconds < 0 or wait_seconds > config.max_wait_seconds
+
+    ensures: AgentReceivesError(
+        error: "wait_seconds_out_of_range",
+        max_wait_seconds: config.max_wait_seconds
+    )
+}
+
+------------------------------------------------------------
+-- Rules — spawn response shape
+------------------------------------------------------------
+
+-- REQ-BASH-002: process exited within the wait window. Response carries
+-- exit_code and the (now demoted) final_tail. HandleProcessExited fires
+-- alongside this rule and performs the demotion.
+rule SpawnExitsWithinWait {
+    when: SpawnWaitOutcome(handle, completed)
+
+    requires: handle.status = exited or handle.status = killed
+        -- HandleProcessExited has run; the handle is already terminal by
+        -- the time the agent's response is shaped.
+
+    ensures: AgentReceivesSpawnResponse(
+        status:      handle.status,
+        handle_id:   handle.handle_id,
+        exit_code:   handle.exit_code,
+        duration_ms: handle.duration_ms,
+        window:      tombstone_window(handle, default_read_args())
+    )
+}
+
+-- REQ-BASH-002: wait window elapsed before exit. Handle stays running; the
+-- agent receives the still_running variant with the same handle_id it can
+-- use later for peek / wait / kill.
+rule SpawnExceedsWait {
+    when: SpawnWaitOutcome(handle, timed_out)
+
+    requires: handle.status = running
+
+    ensures: AgentReceivesSpawnResponse(
+        status:    "still_running",
+        handle_id: handle.handle_id,
+        waited_ms: spawn_wait_seconds(handle) * 1000,
+        window:    live_window(handle, default_read_args())
+    )
+}
+
+------------------------------------------------------------
+-- Rules — process lifecycle
+------------------------------------------------------------
+
+-- REQ-BASH-006: process exit demotes the live ring to a tombstone. Single
+-- atomic transition: ring_lines becomes structurally absent (status guard);
+-- final_tail and the other tombstone fields become present.
+rule HandleProcessExited {
+    when: ChildProcessExited(handle, exit_info)
+
+    requires: handle.status = running
+    requires: exit_info.final_cause = exited
+
+    ensures: handle.status = exited
+    ensures: handle.final_cause = exited
+    ensures: handle.exit_code = exit_info.exit_code
+    ensures: handle.duration_ms = elapsed_ms(handle.started_at, now())
+    ensures: handle.finished_at = now()
+    ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
+    ensures: handle.next_offset_at_exit = handle.next_line_offset
+    ensures: TombstoneShadowUpdated(
+        handle:        handle,
+        status:        exited,
+        exit_code:     exit_info.exit_code,
+        final_tail:    handle.final_tail
+    )
+
+    @guidance
+        -- The wait-for-exit task observes the process via tokio's
+        -- Child::wait(). After waitpid() returns, this rule fires:
+        --   1. Snapshot the live ring's tail (last TOMBSTONE_TAIL_LINES).
+        --   2. Populate tombstone fields under the handle's mutex.
+        --   3. Update the SQLite shadow record in one transaction.
+        --   4. Pulse the handle's exit Notify so any in-flight wait/spawn
+        --      response shapers observe the terminal state.
+        -- There is no observable state where status = exited but final_tail
+        -- is unset; ArcSwap-backed state transitions both fields together.
+}
+
+-- REQ-BASH-006: process killed by Phoenix (either via HandleKilledByAgent's
+-- signal escalation or by the conversation hard-delete cascade). Same
+-- structural shape as HandleProcessExited but final_cause = killed.
+rule HandleProcessKilled {
+    when: ChildProcessExited(handle, exit_info)
+
+    requires: handle.status = running
+    requires: exit_info.final_cause = killed
+
+    ensures: handle.status = killed
+    ensures: handle.final_cause = killed
+    ensures: handle.exit_code = exit_info.exit_code
+    ensures: handle.duration_ms = elapsed_ms(handle.started_at, now())
+    ensures: handle.finished_at = now()
+    ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
+    ensures: handle.next_offset_at_exit = handle.next_line_offset
+    ensures: TombstoneShadowUpdated(
+        handle:        handle,
+        status:        killed,
+        exit_code:     exit_info.exit_code,
+        final_tail:    handle.final_tail
+    )
+}
+
+-- REQ-BASH-004: ring buffer accumulates a line emitted by the child. Eviction
+-- runs whenever ring_bytes_used exceeds the cap.
+rule RingLineAppended {
+    when: ChildProcessEmitsLine(handle, line_bytes)
+
+    requires: handle.status = running
+
+    let line = RingLine{
+        offset: handle.next_line_offset,
+        bytes:  line_bytes
+    }
+
+    ensures: handle.ring_lines = append(handle.ring_lines, line)
+    ensures: handle.next_line_offset = handle.next_line_offset + 1
+    ensures: handle.ring_bytes_used = handle.ring_bytes_used + len(line_bytes)
+
+    @guidance
+        -- Eviction is governed by RingLineEvicted; it runs in the same
+        -- handler pass as RingLineAppended whenever ring_bytes_used exceeds
+        -- the cap. A single emitted line larger than the cap takes the
+        -- entire buffer; the eviction loop drops everything older but
+        -- accepts transient ring_bytes_used > config.ring_buffer_bytes
+        -- until the next line arrives. truncated_before is set on the next
+        -- response either way.
+}
+
+-- REQ-BASH-004: oldest line evicted because ring_bytes_used exceeded the
+-- byte cap. Triggered repeatedly until the buffer is under the cap.
+rule RingLineEvicted {
+    when: RingBufferOverflow(handle)
+
+    requires: handle.status = running
+    requires: handle.ring_bytes_used > config.ring_buffer_bytes
+    requires: count(handle.ring_lines) > 1
+        -- Refuse to evict the only remaining line; an oversize sole line is
+        -- left in place per the @guidance on RingLineAppended.
+
+    let oldest = first_line(handle.ring_lines)
+
+    ensures: handle.ring_lines = drop_first(handle.ring_lines)
+    ensures: handle.ring_bytes_used = handle.ring_bytes_used - len(oldest.bytes)
+}
+
+------------------------------------------------------------
+-- Rules — peek
+------------------------------------------------------------
+
+-- REQ-BASH-003: peek a live handle. Returns the current ring contents per
+-- the read window args.
+rule HandlePeekedLive {
+    when: AgentCallsBashPeek(conversation, handle_id, args)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status = running
+    requires: not (args.lines != null and args.since != null)
+
+    ensures: AgentReceivesPeekResponse(
+        status:    "running",
+        handle_id: h.handle_id,
+        tombstone: false,
+        window:    live_window(h, args)
+    )
+}
+
+-- REQ-BASH-003, REQ-BASH-006: peek a tombstoned handle (exited or killed).
+-- Same response shape but served from final_tail with tombstone=true.
+rule HandlePeekedTombstoned {
+    when: AgentCallsBashPeek(conversation, handle_id, args)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status != running
+    requires: h.status != lost_in_restart
+    requires: not (args.lines != null and args.since != null)
+
+    ensures: AgentReceivesPeekResponse(
+        status:    h.status,
+        handle_id: h.handle_id,
+        exit_code: h.exit_code,
+        tombstone: true,
+        window:    tombstone_window(h, args)
+    )
+}
+
+-- REQ-BASH-007: peek a handle whose process was killed by Phoenix shutdown.
+-- The shutdown_marker_ts is the timestamp the agent sees so it can reason
+-- about when the loss occurred.
+rule HandlePeekedLostInRestart {
+    when: AgentCallsBashPeek(conversation, handle_id, args)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status = lost_in_restart
+    requires: not (args.lines != null and args.since != null)
+
+    ensures: AgentReceivesPeekResponse(
+        status:             "lost_in_restart",
+        handle_id:          h.handle_id,
+        shutdown_marker_ts: h.shutdown_marker_ts,
+        tombstone:          true,
+        window:             tombstone_window(h, args)
+    )
+}
+
+-- REQ-BASH-004: lines and since cannot both be supplied.
+rule HandlePeekArgsMutuallyExclusive {
+    when: AgentCallsBashPeek(conversation, handle_id, args)
+
+    requires: args.lines != null
+    requires: args.since != null
+
+    ensures: AgentReceivesError(
+        error: "peek_args_mutually_exclusive"
+    )
+}
+
+-- REQ-BASH-003, REQ-BASH-014: handle id not found in this conversation.
+-- Cross-conversation handle ids must produce the same error so the existence
+-- of foreign handles is not leaked.
+rule HandlePeekNotFound {
+    when: AgentCallsBashPeek(conversation, handle_id, args)
+
+    requires: not exists Handle{conversation: conversation, handle_id: handle_id}
+
+    ensures: AgentReceivesError(
+        error:     "handle_not_found",
+        handle_id: handle_id
+    )
+}
+
+------------------------------------------------------------
+-- Rules — wait
+------------------------------------------------------------
+
+-- REQ-BASH-003: wait on a live handle that exits within the new wait window.
+rule HandleWaitedExits {
+    when: WaitOutcomeOn(handle, completed)
+
+    requires: handle.status = exited or handle.status = killed
+        -- HandleProcessExited / HandleProcessKilled has run before the wait
+        -- response is shaped.
+
+    ensures: AgentReceivesWaitResponse(
+        status:      handle.status,
+        handle_id:   handle.handle_id,
+        exit_code:   handle.exit_code,
+        duration_ms: handle.duration_ms,
+        tombstone:   true,
+        window:      tombstone_window(handle, wait_args(handle))
+    )
+}
+
+-- REQ-BASH-003: wait window elapsed before the live handle's process exited.
+-- The SAME handle_id is returned (no proliferation).
+rule HandleWaitedTimedOut {
+    when: WaitOutcomeOn(handle, timed_out)
+
+    requires: handle.status = running
+
+    ensures: AgentReceivesWaitResponse(
+        status:    "still_running",
+        handle_id: handle.handle_id,
+        waited_ms: wait_seconds_for(handle) * 1000,
+        tombstone: false,
+        window:    live_window(handle, wait_args(handle))
+    )
+}
+
+-- REQ-BASH-003: wait on an already-terminal handle returns immediately with
+-- the tombstone view; no blocking, no signal sent.
+rule HandleWaitedAlreadyTerminal {
+    when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status != running
+    requires: not (args.lines != null and args.since != null)
+
+    ensures: AgentReceivesWaitResponse(
+        status:           h.status,
+        handle_id:        h.handle_id,
+        exit_code:        h.exit_code,
+        duration_ms:      h.duration_ms,
+        tombstone:        true,
+        already_terminal: true,
+        window:           tombstone_window(h, args)
+    )
+}
+
+-- REQ-BASH-014: wait on a foreign or unknown handle id.
+rule HandleWaitNotFound {
+    when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
+
+    requires: not exists Handle{conversation: conversation, handle_id: handle_id}
+
+    ensures: AgentReceivesError(
+        error:     "handle_not_found",
+        handle_id: handle_id
+    )
+}
+
+------------------------------------------------------------
+-- Rules — kill
+------------------------------------------------------------
+
+-- REQ-BASH-003: agent requests kill on a running handle. Sends the agent's
+-- chosen signal to the process group; auto-escalates to KILL after the
+-- grace period if the process does not exit. The actual demotion to a
+-- tombstone is governed by HandleProcessKilled.
+rule HandleKilledByAgent {
+    when: AgentCallsBashKill(conversation, handle_id, signal)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status = running
+
+    ensures: SignalSentToGroup(h, signal)
+    ensures: KillEscalationScheduled(h, signal, config.kill_grace_seconds)
+
+    @guidance
+        -- Sequence after this rule fires:
+        --   1. Send signal to the process group: kill(-h.pgid, signal).
+        --   2. Wait up to KILL_GRACE_SECONDS for ChildProcessExited.
+        --   3. If still running and signal was TERM, send SIGKILL to the
+        --      process group and wait for ChildProcessExited (kernel
+        --      guarantees SIGKILL is uncatchable; this should be ms-scale).
+        --      Mark signal_escalated = KILL.
+        --   4. Once HandleProcessKilled fires, the response shaper reads
+        --      the now-tombstoned handle and constructs the response.
+        --   5. Respond with status: killed, signal_sent, signal_escalated,
+        --      duration_ms, exit_code (if any), and the read window over
+        --      final_tail.
+        --
+        -- If the handle is already terminal at agent-call time,
+        -- HandleKillOnAlreadyTerminal governs.
+}
+
+-- REQ-BASH-003: kill on already-terminal handle is a no-op response shaped
+-- like a tombstone peek.
+rule HandleKillOnAlreadyTerminal {
+    when: AgentCallsBashKill(conversation, handle_id, signal)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status != running
+
+    ensures: AgentReceivesKillResponse(
+        status:           h.status,
+        handle_id:        h.handle_id,
+        exit_code:        h.exit_code,
+        duration_ms:      h.duration_ms,
+        already_terminal: true,
+        tombstone:        true,
+        window:           tombstone_window(h, default_read_args())
+    )
+}
+
+-- REQ-BASH-014: kill on a foreign or unknown handle id.
+rule HandleKillNotFound {
+    when: AgentCallsBashKill(conversation, handle_id, signal)
+
+    requires: not exists Handle{conversation: conversation, handle_id: handle_id}
+
+    ensures: AgentReceivesError(
+        error:     "handle_not_found",
+        handle_id: handle_id
+    )
+}
+
+------------------------------------------------------------
+-- Rules — conversation hard-delete cascade
+------------------------------------------------------------
+
+-- REQ-BASH-006: conversation hard-delete kills any live handles and removes
+-- all tombstones (live or terminal) for that conversation.
+rule HandlesRemovedByConversationDelete {
+    when: ConversationHardDeleted(conversation)
+
+    requires: exists Handle{conversation: conversation}
+
+    ensures: KillSignalSentForAllLiveHandles(conversation)
+        -- Composite: for every Handle h with conversation = conversation
+        -- and status = running, send SIGKILL to h.pgid (no grace, no
+        -- agent-visible response).
+    ensures: not exists Handle{conversation: conversation}
+        -- Entities removed in the same transaction as the conversation row.
+    ensures: TombstoneShadowDeletedForConversation(conversation)
+        -- DELETE FROM bash_tombstones WHERE conversation_id = conversation.id
+
+    @guidance
+        -- The conversation-delete path runs synchronously in the deletion
+        -- transaction. Live processes are killed immediately (SIGKILL, no
+        -- grace, since no agent is left to observe a graceful close).
+        -- SQLite shadow records are deleted in the same transaction so the
+        -- next Phoenix startup does not relabel them as lost_in_restart.
+}
+
+------------------------------------------------------------
+-- Rules — Phoenix restart reconciliation
+------------------------------------------------------------
+
+-- REQ-BASH-007: at Phoenix startup, any tombstone shadow record still in
+-- status=running indicates a process that was running when Phoenix went
+-- down (graceful shutdown raced or process crashed before final state was
+-- written). The OS killed the children via SIGHUP cascade; mark them
+-- lost_in_restart so subsequent peek/wait/kill calls return a structured
+-- response with shutdown_marker_ts.
+rule PhoenixStartupReconciliation {
+    when: PhoenixStartupCompleted()
+
+    ensures: TombstoneShadowsRelabeledLostInRestart()
+        -- Composite: UPDATE bash_tombstones SET status='lost_in_restart',
+        -- final_cause='lost_in_restart', shutdown_marker_ts=<best-known>
+        -- WHERE status='running'. <best-known> is the previous_shutdown_ts
+        -- if recorded, else the current startup_ts.
+
+    @guidance
+        -- The in-memory live registry starts empty. Subsequent peek/wait/
+        -- kill on one of these handles loads the lost_in_restart record
+        -- from SQLite via shadow_lookup() and materialises a Handle
+        -- entity in status=lost_in_restart on demand. final_tail is what
+        -- was last persisted (may be empty if no terminal-state update
+        -- ever ran).
+}
+
+------------------------------------------------------------
+-- Rules — schema enforcement
+------------------------------------------------------------
+
+-- REQ-BASH-010: exactly one of cmd / peek / wait / kill must be provided.
+rule OperationKindMutuallyExclusive {
+    when: AgentCallsBashRaw(conversation, args)
+
+    requires: provided_op_count(args) != 1
+
+    ensures: AgentReceivesError(
+        error:    "mutually_exclusive_modes",
+        provided: provided_op_keys(args)
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-BASH-005
+invariant LiveHandleCapBound {
+    for c in bedrock/Conversation:
+        count(Handle{conversation: c, status: running}) <= config.live_handle_cap
+}
+
+-- REQ-BASH-014
+invariant HandleConversationScoped {
+    for h in Handle:
+        h.conversation != null
+        -- conversation is fixed at Handle.created time; the entity has no
+        -- transition that changes it.
+}
+
+-- REQ-BASH-006
+invariant LineOffsetMonotonic {
+    for h in Handle:
+        h.next_line_offset >= 0
+        -- A monotonic counter; never rewinds. Specific cross-line ordering
+        -- is enforced by RingLineAppended assigning offsets sequentially
+        -- and RingLineEvicted dropping only the oldest.
+}
+
+-- REQ-BASH-007
+invariant LostInRestartIsTerminal {
+    for h in Handle where h.status = lost_in_restart:
+        h.final_cause = lost_in_restart
+}
+
+-- REQ-BASH-006
+invariant ExitCodeOnlyWhenTerminal {
+    for h in Handle:
+        h.status = running implies h.final_cause = null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AgentBashAccess {
+    facing agent: LlmAgent
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        Handle.handle_id
+        Handle.cmd
+        Handle.status
+        Handle.exit_code
+        Handle.duration_ms
+        Handle.final_cause
+        Handle.shutdown_marker_ts
+
+    provides:
+        AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+            when bash_check_passes(cmd)
+            and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
+            and count(Handle{conversation: conversation, status: running})
+                < config.live_handle_cap
+
+        AgentCallsBashPeek(conversation, handle_id, args)
+            when exists Handle{conversation: conversation, handle_id: handle_id}
+
+        AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
+            when exists Handle{conversation: conversation, handle_id: handle_id}
+            and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
+
+        AgentCallsBashKill(conversation, handle_id, signal)
+            when exists Handle{conversation: conversation, handle_id: handle_id}
+
+    @guarantee HandleOwnership
+        -- Every handle returned to the agent is owned by the agent's
+        -- conversation. The agent cannot inspect, peek, wait on, or kill
+        -- handles owned by other conversations even if it learns their
+        -- handle_id strings: the lookup is always conversation-keyed and
+        -- HandlePeekNotFound / HandleWaitNotFound / HandleKillNotFound
+        -- treat foreign handles as nonexistent.
+
+    @guarantee NoSilentEviction
+        -- A handle handed to the agent will remain peekable for the
+        -- lifetime of its conversation, modulo Phoenix restart (which
+        -- relabels it as lost_in_restart, still peekable, with
+        -- shutdown_marker_ts). The agent will never be told a handle is
+        -- gone without an explicit cause it can reason about.
+}
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred BashHandleStdinSupport
+    -- Some non-interactive workflows benefit from sending input bytes to a
+    -- still-running process. The current model does not expose stdin; the
+    -- agent should use the tmux tool when it needs to send input. Revisit
+    -- if a non-interactive use case demonstrates need.
+
+deferred BashHandleResourceMetrics
+    -- CPU time, max RSS, page faults could be returned alongside
+    -- exit_code/duration_ms. Useful for the agent to reason about the
+    -- cost of long-running commands. Out of scope for v1.
+
+deferred BashHandleOutputDiskSpill
+    -- For runs that legitimately produce > 4MB of output, spilling the
+    -- ring overflow to disk and exposing the file path in responses
+    -- (analogous to specs/terminal/'s truncated-output disk writes) would
+    -- let the agent recover full output. Not v1; rely on truncated_before
+    -- signalling for now.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+-- No open questions remain. All decisions resolved during the elicitation
+-- conversation dated April 2026:
+--   - Renamed `timeout` → `wait_seconds`; old `timeout` deprecated as
+--     alias for one or two releases. (Pit of success against the "kill"
+--     connotation.)
+--   - Hard live-handle cap with structured failure (no LRU eviction).
+--   - Demote-on-exit + tombstone retained until conversation hard-delete.
+--   - Phoenix-restart tombstones via SQLite shadow records labeled
+--     lost_in_restart; in-memory registry empty after restart.
+--   - Caller-controlled offsets (lines or since), mutually exclusive,
+--     truncated_before flag explicit on every response.
+--   - Same handle returned on wait re-timeout (no handle proliferation).
+--   - kill auto-escalates TERM → KILL after KILL_GRACE_SECONDS, response
+--     surfaces signal_sent and signal_escalated.
+--   - Handle id format is implementation detail (sequential per
+--     conversation, e.g. "b-1"); Allium contract is "unique within a
+--     conversation."
