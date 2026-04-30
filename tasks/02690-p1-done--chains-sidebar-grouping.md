@@ -1,7 +1,7 @@
 ---
 created: 2026-04-29
 priority: p1
-status: ready
+status: done
 artifact: ui/src/components/Sidebar.tsx
 ---
 
