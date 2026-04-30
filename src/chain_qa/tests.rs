@@ -241,7 +241,7 @@ async fn submit_question_persists_and_completes() {
     let qa = ChainQa::new(db.clone(), registry);
 
     let qa_id = qa
-        .submit_question("chq-a", "what happened in this chain?")
+        .submit_question_blocking("chq-a", "what happened in this chain?")
         .await
         .unwrap();
 
@@ -293,4 +293,282 @@ async fn submit_question_rejects_non_root_member() {
 
     let err = qa.submit_question("nrr-mid", "anything").await.unwrap_err();
     matches!(err, ChainQaError::NotAChainRoot(_));
+}
+
+// --- Streaming integration (Phase 3) --------------------------------------
+
+use crate::chain_runtime::ChainSseEvent;
+
+/// Streaming test LLM: emits a fixed sequence of token deltas via the
+/// streaming channel, then returns an assembled response identical to the
+/// concatenated deltas.
+#[derive(Debug)]
+struct StreamingLlm {
+    deltas: Vec<String>,
+}
+
+impl StreamingLlm {
+    fn new(deltas: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            deltas: deltas.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    fn assembled(&self) -> String {
+        self.deltas.concat()
+    }
+}
+
+#[async_trait]
+impl LlmService for StreamingLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text(self.assembled())],
+            end_turn: true,
+            usage: Usage::default(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        for delta in &self.deltas {
+            let _ = chunk_tx.send(TokenChunk::Text(delta.clone()));
+            // Yield so the forwarder task gets a chance to drain the
+            // channel before the next chunk arrives — keeps test ordering
+            // deterministic without depending on broadcast capacity.
+            tokio::task::yield_now().await;
+        }
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text(self.assembled())],
+            end_turn: true,
+            usage: Usage::default(),
+        })
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+/// Failing streaming LLM: emits one chunk before returning an error.
+#[derive(Debug)]
+struct FailingStreamingLlm;
+
+#[async_trait]
+impl LlmService for FailingStreamingLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        Err(LlmError::auth("boom"))
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = chunk_tx.send(TokenChunk::Text("partial-".to_string()));
+        tokio::task::yield_now().await;
+        Err(LlmError::auth("simulated stream failure"))
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+/// Drain `n` events from the broadcast receiver. Treats `Lagged` as a hard
+/// failure so a misbehaving test fixture doesn't silently mask a missing
+/// event.
+async fn drain_n(rx: &mut broadcast::Receiver<ChainSseEvent>, n: usize) -> Vec<ChainSseEvent> {
+    let mut events = Vec::with_capacity(n);
+    for _ in 0..n {
+        let recv = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for chain event");
+        match recv {
+            Ok(ev) => events.push(ev),
+            Err(broadcast::error::RecvError::Closed) => panic!("broadcaster closed early"),
+            Err(broadcast::error::RecvError::Lagged(_)) => panic!("subscriber lagged"),
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn submit_question_streams_tokens_and_persists_completed_row() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["st-a", "st-b"]).await;
+    add_continuation_summary(&db, "st-a", "summary A").await;
+    add_user_message(&db, "st-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["Hel", "lo, ", "world!"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry);
+
+    let runtime = qa.runtime_registry().get_or_create("st-a").await;
+    let (mut rx, _guard) = runtime.subscribe();
+
+    let qa_id = qa.submit_question_blocking("st-a", "what?").await.unwrap();
+
+    // Three Token + one Completed = four events.
+    let events = drain_n(&mut rx, 4).await;
+
+    // First three are Token in order, all carrying our qa_id.
+    let mut deltas: Vec<String> = Vec::new();
+    for ev in &events[..3] {
+        match ev {
+            ChainSseEvent::Token { chain_qa_id, delta } => {
+                assert_eq!(chain_qa_id, &qa_id);
+                deltas.push(delta.clone());
+            }
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+    assert_eq!(deltas, vec!["Hel", "lo, ", "world!"]);
+
+    // Fourth is Completed with the assembled answer.
+    match &events[3] {
+        ChainSseEvent::Completed {
+            chain_qa_id,
+            full_answer,
+        } => {
+            assert_eq!(chain_qa_id, &qa_id);
+            assert_eq!(full_answer, "Hello, world!");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // Persisted row reflects status=Completed with the assembled answer.
+    let history = qa.list_history("st-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(history[0].answer.as_deref(), Some("Hello, world!"));
+}
+
+#[tokio::test]
+async fn submit_question_streams_failure_event_and_persists_partial() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["sf-a", "sf-b"]).await;
+    add_continuation_summary(&db, "sf-a", "summary A").await;
+    add_user_message(&db, "sf-b", 0, "leaf").await;
+
+    let llm: Arc<FailingStreamingLlm> = Arc::new(FailingStreamingLlm);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry);
+
+    let runtime = qa.runtime_registry().get_or_create("sf-a").await;
+    let (mut rx, _guard) = runtime.subscribe();
+
+    let qa_id = qa.submit_question_blocking("sf-a", "what?").await.unwrap();
+
+    // Token + Failed.
+    let events = drain_n(&mut rx, 2).await;
+    match &events[0] {
+        ChainSseEvent::Token { chain_qa_id, delta } => {
+            assert_eq!(chain_qa_id, &qa_id);
+            assert_eq!(delta, "partial-");
+        }
+        other => panic!("expected Token, got {other:?}"),
+    }
+    match &events[1] {
+        ChainSseEvent::Failed {
+            chain_qa_id,
+            error: _,
+            partial_answer,
+        } => {
+            assert_eq!(chain_qa_id, &qa_id);
+            assert_eq!(partial_answer.as_deref(), Some("partial-"));
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    let history = qa.list_history("sf-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].status, ChainQaStatus::Failed);
+    assert_eq!(history[0].answer.as_deref(), Some("partial-"));
+}
+
+#[tokio::test]
+async fn submit_question_returns_qa_id_before_stream_completes() {
+    // Submission shape: submit_question returns ChainQaId immediately after
+    // INSERT in_flight. The persisted row exists synchronously even though
+    // the streaming model invocation happens in a spawned task.
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["sy-a", "sy-b"]).await;
+    add_continuation_summary(&db, "sy-a", "summary").await;
+    add_user_message(&db, "sy-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["x"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry);
+
+    let qa_id = qa.submit_question("sy-a", "?").await.unwrap();
+
+    // The row exists in the DB (status may be in_flight or completed
+    // depending on timing — the contract is "exists before submit returns").
+    let history = qa.list_history("sy-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+}
+
+#[tokio::test]
+async fn tab_close_mid_stream_does_not_orphan_invocation() {
+    // Subscriber drops mid-stream; the chain runtime stays alive (in-flight
+    // count is still 1), the model invocation completes, and the row is
+    // updated to Completed. A subscriber that connects late reads the
+    // canonical answer from `list_chain_qa` even though it missed the
+    // token events.
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["tc-a", "tc-b"]).await;
+    add_continuation_summary(&db, "tc-a", "summary").await;
+    add_user_message(&db, "tc-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["one ", "two ", "three"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry);
+
+    // Subscriber connects, then drops before the stream starts.
+    let runtime = qa.runtime_registry().get_or_create("tc-a").await;
+    {
+        let (_rx, _guard) = runtime.subscribe();
+        // _rx and _guard go out of scope here, dropping the subscription
+        // before the model call runs.
+    }
+    assert_eq!(runtime.subscriber_count(), 0);
+
+    let qa_id = qa.submit_question_blocking("tc-a", "?").await.unwrap();
+
+    // Persisted row is the canonical state for any late reader.
+    let history = qa.list_history("tc-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(history[0].answer.as_deref(), Some("one two three"));
+}
+
+#[tokio::test]
+async fn chain_runtime_dropped_from_registry_after_qa_completes_with_no_subscribers() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["dr-a", "dr-b"]).await;
+    add_continuation_summary(&db, "dr-a", "summary").await;
+    add_user_message(&db, "dr-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["x"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry);
+
+    qa.submit_question_blocking("dr-a", "?").await.unwrap();
+
+    // After the (synchronous) blocking submit, the in-flight guard has
+    // been dropped and there are no subscribers — the registry should
+    // have released the runtime.
+    assert!(
+        !qa.runtime_registry().contains("dr-a").await,
+        "registry should drop idle runtimes after Q&A finalize",
+    );
 }

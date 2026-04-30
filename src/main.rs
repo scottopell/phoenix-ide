@@ -5,6 +5,7 @@
 
 mod api;
 mod chain_qa;
+mod chain_runtime;
 mod db;
 pub(crate) mod git_ops;
 mod llm;

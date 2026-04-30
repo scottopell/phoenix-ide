@@ -10,6 +10,7 @@
 // `api.ts`) — that path resolves to this barrel file.
 
 export type { SseWireEvent } from './SseWireEvent';
+export type { ChainSseWireEvent } from './ChainSseWireEvent';
 export type { EnrichedMessage } from './EnrichedMessage';
 export type { MessageType } from './MessageType';
 export type { SseBreadcrumb } from './SseBreadcrumb';
@@ -18,6 +19,7 @@ export type { UserFacingError } from './UserFacingError';
 export type { UserFacingErrorKind } from './UserFacingErrorKind';
 
 import type { SseWireEvent } from './SseWireEvent';
+import type { ChainSseWireEvent } from './ChainSseWireEvent';
 
 // Per-variant data shapes, extracted from the SseWireEvent discriminated
 // union by its `type` tag. The wire event type tag and the shape on the
@@ -47,3 +49,21 @@ export type SseConversationUpdateData = Omit<
   'type'
 >;
 export type SseErrorData = Omit<Extract<SseWireEvent, { type: 'error' }>, 'type'>;
+
+// Chain Q&A wire-event data shapes (Phoenix Chains v1). Same Extract +
+// Omit<…, 'type'> pattern as the conversation-scoped SSE events above.
+// Phase 4 will wire matching valibot schemas with `satisfies
+// v.GenericSchema<unknown, ChainQa*Data>` so any Rust-side change tcs as a
+// schema mismatch.
+export type ChainQaTokenData = Omit<
+  Extract<ChainSseWireEvent, { type: 'chain_qa_token' }>,
+  'type'
+>;
+export type ChainQaCompletedData = Omit<
+  Extract<ChainSseWireEvent, { type: 'chain_qa_completed' }>,
+  'type'
+>;
+export type ChainQaFailedData = Omit<
+  Extract<ChainSseWireEvent, { type: 'chain_qa_failed' }>,
+  'type'
+>;

@@ -16,15 +16,17 @@
 // Phase 1 (`#[allow(dead_code)] // Callers added in Phase 2`).
 #![allow(dead_code)]
 
+use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
 use crate::db::{
     ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageType, NewChainQa,
 };
 use crate::llm::{
     ContentBlock, LlmError, LlmMessage, LlmRequest, LlmService, MessageRole, ModelRegistry,
-    SystemContent,
+    SystemContent, TokenChunk,
 };
 use chrono::Utc;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 /// Maximum leaf message count for direct (un-summarized) inclusion (REQ-CHN-006).
 ///
@@ -187,42 +189,129 @@ impl From<LlmError> for ChainQaError {
 /// doubles as the SSE-stream demux key in Phase 3.
 pub type ChainQaId = String;
 
-/// Chain Q&A entry point. Owns no per-chain state in Phase 2; it is a
-/// thin façade over the database, model registry, and bundling helpers.
-/// Phase 3 will introduce a per-chain runtime for streaming, but the
-/// public submission shape stays the same.
+/// Chain Q&A entry point.
+///
+/// Phase 3: holds a reference to the [`ChainRuntimeRegistry`] so each
+/// submission can publish streaming token events through the chain-scoped
+/// broadcaster. The public submission shape (`submit_question` returns the
+/// `chain_qa_id` synchronously, then streaming + DB finalize run in the
+/// background) mirrors how Phoenix's per-conversation runtime returns a
+/// handle synchronously and runs the executor in a spawned task.
+#[derive(Clone)]
 pub struct ChainQa {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    runtime_registry: ChainRuntimeRegistry,
 }
 
 impl ChainQa {
     pub fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
-        Self { db, llm_registry }
+        Self {
+            db,
+            llm_registry,
+            runtime_registry: ChainRuntimeRegistry::new(),
+        }
     }
 
-    /// Submit a question on the chain rooted at `root_id`. Phase 2 runs the
-    /// answer invocation synchronously (Phase 3 swaps in streaming).
+    /// Construct with an externally-owned chain runtime registry. Production
+    /// code shares one registry across the API + handler layer so SSE
+    /// subscribers and Q&A submissions go through the same broadcasters.
+    pub fn with_registry(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        runtime_registry: ChainRuntimeRegistry,
+    ) -> Self {
+        Self {
+            db,
+            llm_registry,
+            runtime_registry,
+        }
+    }
+
+    /// Read-side: registry handle so HTTP/SSE handlers can subscribe to the
+    /// same broadcasters this service publishes onto.
+    pub fn runtime_registry(&self) -> &ChainRuntimeRegistry {
+        &self.runtime_registry
+    }
+
+    /// Submit a question on the chain rooted at `root_id`. Phase 3 returns
+    /// the `chain_qa_id` synchronously — once the `chain_qa` row is
+    /// inserted in `in_flight` — and runs the streaming model invocation
+    /// plus DB finalize in a detached `tokio::spawn`'d task.
     ///
-    /// Returns the `chain_qa_id` of the persisted row — Phase 3 will use it
-    /// to demux SSE token events between concurrent subscribers.
+    /// The returned id doubles as the SSE-stream demux key on the chain
+    /// broadcaster; subscribers filter events whose `chain_qa_id` matches.
     ///
-    /// The flow is split into helpers that Phase 3 will reuse:
+    /// Internal flow:
     /// 1. [`Self::prepare_invocation`] — validate, load members, snapshot,
     ///    bundle context, INSERT the `in_flight` row.
-    /// 2. [`Self::run_answer_invocation`] — make the model call. Phase 3
-    ///    rewrites this to call `complete_streaming` and dispatch tokens
-    ///    onto the chain broadcaster, but the surrounding flow is unchanged.
-    /// 3. [`Self::finalize`] — UPDATE the row to `completed` or `failed`.
+    /// 2. Spawn a background task that:
+    ///    - increments the chain runtime's in-flight count (pinning the
+    ///      broadcaster alive past zero subscribers);
+    ///    - calls [`Self::run_answer_invocation`] which streams
+    ///      `ChainSseEvent::Token` events as the model produces them;
+    ///    - calls [`Self::finalize`] to UPDATE the row to
+    ///      `completed`/`failed` and publishes the matching terminal
+    ///      `ChainSseEvent`.
     pub async fn submit_question(
         &self,
         root_id: &str,
         question: &str,
     ) -> Result<ChainQaId, ChainQaError> {
         let prep = self.prepare_invocation(root_id, question).await?;
+        let qa_id_for_caller = prep.row_id.clone();
+        let qa_id_for_task = prep.row_id.clone();
+
+        // Pin the chain runtime alive for the streaming window: the in-flight
+        // guard must be acquired before submit_question returns so a fast
+        // subscriber can't trip release_if_idle between insert and the
+        // spawned task starting.
+        let runtime = self.runtime_registry.get_or_create(root_id).await;
+        let in_flight_guard = runtime.begin_qa();
+
+        let this = self.clone();
+        let runtime_for_task = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            let invocation_result = this.run_answer_invocation(&prep, &runtime_for_task).await;
+            this.finalize(&qa_id_for_task, invocation_result, &runtime_for_task)
+                .await;
+            drop(in_flight_guard);
+            // Best-effort tidy: if subscribers and in-flight are both zero
+            // now, the runtime can leave the registry. A fresh subscriber
+            // arriving after this point goes through `get_or_create` and
+            // builds a new runtime — the persisted row in `chain_qa` is
+            // canonical for any reader who missed the live stream.
+            this.runtime_registry
+                .release_if_idle(runtime_for_task.root_conv_id())
+                .await;
+        });
+
+        Ok(qa_id_for_caller)
+    }
+
+    /// Test/foreground-driven variant: runs the streaming invocation and
+    /// finalize in the current task instead of spawning. Used by
+    /// integration tests that need deterministic completion before
+    /// asserting on the persisted row.
+    #[cfg(test)]
+    pub async fn submit_question_blocking(
+        &self,
+        root_id: &str,
+        question: &str,
+    ) -> Result<ChainQaId, ChainQaError> {
+        let prep = self.prepare_invocation(root_id, question).await?;
         let qa_id = prep.row_id.clone();
-        let invocation_result = self.run_answer_invocation(&prep).await;
-        self.finalize(&qa_id, invocation_result).await?;
+
+        let runtime = self.runtime_registry.get_or_create(root_id).await;
+        let in_flight_guard = runtime.begin_qa();
+
+        let invocation_result = self.run_answer_invocation(&prep, &runtime).await;
+        self.finalize(&qa_id, invocation_result, &runtime).await;
+        drop(in_flight_guard);
+        self.runtime_registry
+            .release_if_idle(runtime.root_conv_id())
+            .await;
+
         Ok(qa_id)
     }
 
@@ -289,35 +378,141 @@ impl ChainQa {
 
     /// Phase 2 of the submission flow — the model invocation.
     ///
-    /// Phase 3 replaces this body with a streaming path; the surrounding
-    /// `prepare_invocation` and `finalize` calls do not change. Errors here
-    /// flow through `finalize` and become `status = failed`.
+    /// Phase 3 streams tokens through `runtime` as they arrive: each text
+    /// chunk emitted by the LLM is republished as a
+    /// [`ChainSseEvent::Token`] tagged with `prep.row_id` so multi-tab
+    /// subscribers can demultiplex concurrent Q&As (REQ-CHN-006). The
+    /// returned tuple carries the assembled answer plus whatever was
+    /// observed via the chunk channel before the model call returned —
+    /// useful as the `partial_answer` on failure.
+    ///
+    /// The non-streaming `complete()` fallback is preserved by
+    /// `LlmService::complete_streaming`'s default impl, so providers that
+    /// haven't implemented streaming still produce a single (non-empty)
+    /// answer block.
     async fn run_answer_invocation(
         &self,
         prep: &PreparedInvocation,
-    ) -> Result<String, ChainQaError> {
+        runtime: &Arc<ChainRuntime>,
+    ) -> Result<String, RunInvocationError> {
         let request = build_answer_request(&prep.bundled, &prep.question);
-        let response = prep.service.complete(&request).await?;
-        Ok(response.text())
+
+        // Channel between the LLM provider and the chain broadcaster. The
+        // provider sends `TokenChunk::Text` deltas; we forward each one to
+        // the chain broadcaster and accumulate a partial answer in case the
+        // provider errors mid-stream.
+        let (chunk_tx, mut chunk_rx) = broadcast::channel::<TokenChunk>(256);
+
+        let qa_id = prep.row_id.clone();
+        let runtime_handle = Arc::clone(runtime);
+
+        // Forwarder task: drains chunks until the broadcast sender is dropped
+        // (which happens when the model call returns and the local `chunk_tx`
+        // goes out of scope below). Accumulates the partial answer in the
+        // task's result so finalize/failed can carry it.
+        let forwarder = tokio::spawn(async move {
+            let mut partial = String::new();
+            loop {
+                match chunk_rx.recv().await {
+                    Ok(TokenChunk::Text(delta)) => {
+                        partial.push_str(&delta);
+                        runtime_handle.publish(ChainSseEvent::Token {
+                            chain_qa_id: qa_id.clone(),
+                            delta,
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // The forwarder cannot keep up with the provider —
+                        // shouldn't happen at our 256 capacity, but log so
+                        // a stuck buffer is visible.
+                        tracing::warn!(
+                            qa_id = %qa_id,
+                            lagged_by = n,
+                            "chain Q&A token forwarder lagged",
+                        );
+                    }
+                }
+            }
+            partial
+        });
+
+        let response = prep.service.complete_streaming(&request, &chunk_tx).await;
+        // Drop the producer-side sender so the forwarder's recv() returns
+        // `Closed` and the task completes. Holding chunk_tx past this point
+        // would leave the forwarder hanging.
+        drop(chunk_tx);
+        let partial_answer = forwarder.await.unwrap_or_default();
+
+        match response {
+            Ok(resp) => {
+                // The provider's assembled `text()` is canonical for the
+                // persisted answer. Streamed deltas may have decomposed
+                // identically, but providers are free to return a single
+                // text block independent of stream order; preferring the
+                // assembled response keeps `chain_qa.answer` byte-aligned
+                // with what `complete()` would have returned.
+                Ok(resp.text())
+            }
+            Err(e) => Err(RunInvocationError {
+                error: ChainQaError::from(e),
+                partial_answer: if partial_answer.is_empty() {
+                    None
+                } else {
+                    Some(partial_answer)
+                },
+            }),
+        }
     }
 
     /// Phase 3 of the submission flow — terminal status transition.
+    ///
+    /// Updates the persisted `chain_qa` row to `completed` / `failed` and
+    /// publishes the matching terminal event on the chain broadcaster so
+    /// live subscribers can clear their streaming UI state.
+    ///
+    /// Errors from the DB UPDATE are logged but not surfaced — the row's
+    /// next reader (via `list_chain_qa`) is the canonical state source, and
+    /// the spawn'd task path has no caller waiting on its result.
     async fn finalize(
         &self,
         qa_id: &str,
-        result: Result<String, ChainQaError>,
-    ) -> Result<(), ChainQaError> {
+        result: Result<String, RunInvocationError>,
+        runtime: &Arc<ChainRuntime>,
+    ) {
         match result {
             Ok(answer) => {
-                self.db
-                    .complete_chain_qa(qa_id, &answer, Utc::now())
-                    .await?;
-                Ok(())
+                if let Err(e) = self.db.complete_chain_qa(qa_id, &answer, Utc::now()).await {
+                    tracing::error!(
+                        qa_id = %qa_id, error = %e,
+                        "chain Q&A complete UPDATE failed; row will be swept on restart",
+                    );
+                }
+                runtime.publish(ChainSseEvent::Completed {
+                    chain_qa_id: qa_id.to_string(),
+                    full_answer: answer,
+                });
             }
-            Err(e) => {
-                tracing::warn!(qa_id = %qa_id, error = %e, "chain Q&A invocation failed");
-                self.db.fail_chain_qa(qa_id, None).await?;
-                Err(e)
+            Err(RunInvocationError {
+                error,
+                partial_answer,
+            }) => {
+                tracing::warn!(qa_id = %qa_id, error = %error, "chain Q&A invocation failed");
+                if let Err(e) = self
+                    .db
+                    .fail_chain_qa(qa_id, partial_answer.as_deref())
+                    .await
+                {
+                    tracing::error!(
+                        qa_id = %qa_id, error = %e,
+                        "chain Q&A fail UPDATE failed; row will be swept on restart",
+                    );
+                }
+                runtime.publish(ChainSseEvent::Failed {
+                    chain_qa_id: qa_id.to_string(),
+                    error: error.to_string(),
+                    partial_answer,
+                });
             }
         }
     }
@@ -329,8 +524,9 @@ impl ChainQa {
 }
 
 /// Per-submission state passed from `prepare_invocation` to
-/// `run_answer_invocation` and `finalize`. Phase 3 will extend this with a
-/// broadcaster handle but the existing fields stay the same.
+/// `run_answer_invocation` and `finalize`. The broadcaster handle is held by
+/// `submit_question` directly (not threaded through here) so the in-flight
+/// guard's lifetime is anchored to the spawned task scope.
 struct PreparedInvocation {
     row_id: ChainQaId,
     question: String,
@@ -338,6 +534,14 @@ struct PreparedInvocation {
     service: Arc<dyn LlmService>,
     #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa
     model_id: String,
+}
+
+/// Internal error wrapper that pairs a [`ChainQaError`] with whatever
+/// partial answer streamed before the failure (so `finalize` can persist
+/// the partial into `chain_qa.answer` per REQ-CHN-005).
+struct RunInvocationError {
+    error: ChainQaError,
+    partial_answer: Option<String>,
 }
 
 /// Build the answer-time `LlmRequest` from a bundled context and a question.

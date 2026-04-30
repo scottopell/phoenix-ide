@@ -52,6 +52,7 @@ use serde::Serialize;
 use serde_json::Value;
 use ts_rs::TS;
 
+use crate::chain_runtime::ChainSseEvent;
 use crate::db::{Message, MessageType, UsageData};
 use crate::runtime::{
     user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation,
@@ -390,9 +391,144 @@ impl From<SseEvent> for SseWireEvent {
     }
 }
 
+/// Wire-format chain Q&A events (Phoenix Chains v1, REQ-CHN-004).
+///
+/// Distinct from [`SseWireEvent`] because chain broadcasters carry their
+/// own demux discriminator (`chain_qa_id`) rather than a per-conversation
+/// monotonic `sequence_id`. Each variant maps 1:1 to a
+/// [`ChainSseEvent`] case; the conversion lives in `From<ChainSseEvent>`
+/// below. The SSE `event:` label is the variant's `snake_case` tag.
+#[allow(dead_code, clippy::enum_variant_names)] // Phase 4 wires API handlers; ChainQa* prefix mirrors the wire tag domain.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export, export_to = "../ui/src/generated/")]
+pub enum ChainSseWireEvent {
+    /// Streaming token chunk for an in-flight Q&A. Subscribers filter on
+    /// `chain_qa_id` to demultiplex concurrent questions on the same chain
+    /// (REQ-CHN-006: a sibling tab's question must not render into mine).
+    ChainQaToken { chain_qa_id: String, delta: String },
+    /// Stream completed cleanly. `full_answer` matches what was just
+    /// persisted to `chain_qa.answer`; subsequent reads via
+    /// `list_chain_qa` would return the same string.
+    ChainQaCompleted {
+        chain_qa_id: String,
+        full_answer: String,
+    },
+    /// Stream ended in error. `partial_answer` carries whatever tokens
+    /// streamed before the failure (may be `None` when no token was emitted
+    /// before the error).
+    ChainQaFailed {
+        chain_qa_id: String,
+        error: String,
+        partial_answer: Option<String>,
+    },
+}
+
+impl ChainSseWireEvent {
+    /// SSE `event:` label for this variant.
+    #[allow(dead_code)] // Phase 4 wires API handlers that consume this on the wire.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::ChainQaToken { .. } => "chain_qa_token",
+            Self::ChainQaCompleted { .. } => "chain_qa_completed",
+            Self::ChainQaFailed { .. } => "chain_qa_failed",
+        }
+    }
+}
+
+impl From<ChainSseEvent> for ChainSseWireEvent {
+    fn from(event: ChainSseEvent) -> Self {
+        match event {
+            ChainSseEvent::Token { chain_qa_id, delta } => {
+                Self::ChainQaToken { chain_qa_id, delta }
+            }
+            ChainSseEvent::Completed {
+                chain_qa_id,
+                full_answer,
+            } => Self::ChainQaCompleted {
+                chain_qa_id,
+                full_answer,
+            },
+            ChainSseEvent::Failed {
+                chain_qa_id,
+                error,
+                partial_answer,
+            } => Self::ChainQaFailed {
+                chain_qa_id,
+                error,
+                partial_answer,
+            },
+        }
+    }
+}
+
 // Codegen note: types annotated with `#[ts(export)]` above are emitted to
 // `ui/src/generated/` automatically whenever `cargo test` is run — no
 // explicit test is needed (ts-rs v12 has built-in test-time export
 // plumbing). `./dev.py check` runs `cargo test` followed by
 // `git diff --exit-code ui/src/generated/` so a developer who edits a
 // Rust type here without running tests will see the check fail.
+
+#[cfg(test)]
+mod chain_wire_tests {
+    use super::*;
+
+    /// Wire round-trip parity for `ChainQaToken`: the typed wire variant
+    /// serializes to the JSON shape the UI's valibot schema will validate
+    /// against (`type: "chain_qa_token"`, `snake_case` fields).
+    #[test]
+    fn chain_qa_token_serializes_with_expected_tag_and_fields() {
+        let wire: ChainSseWireEvent = ChainSseEvent::Token {
+            chain_qa_id: "qa-1".to_string(),
+            delta: "Hello".to_string(),
+        }
+        .into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["type"], "chain_qa_token");
+        assert_eq!(json["chain_qa_id"], "qa-1");
+        assert_eq!(json["delta"], "Hello");
+        assert_eq!(wire.event_type(), "chain_qa_token");
+    }
+
+    #[test]
+    fn chain_qa_completed_carries_full_answer() {
+        let wire: ChainSseWireEvent = ChainSseEvent::Completed {
+            chain_qa_id: "qa-2".to_string(),
+            full_answer: "the assembled answer".to_string(),
+        }
+        .into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["type"], "chain_qa_completed");
+        assert_eq!(json["chain_qa_id"], "qa-2");
+        assert_eq!(json["full_answer"], "the assembled answer");
+        assert_eq!(wire.event_type(), "chain_qa_completed");
+    }
+
+    #[test]
+    fn chain_qa_failed_carries_error_and_partial() {
+        let wire: ChainSseWireEvent = ChainSseEvent::Failed {
+            chain_qa_id: "qa-3".to_string(),
+            error: "boom".to_string(),
+            partial_answer: Some("hel".to_string()),
+        }
+        .into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["type"], "chain_qa_failed");
+        assert_eq!(json["chain_qa_id"], "qa-3");
+        assert_eq!(json["error"], "boom");
+        assert_eq!(json["partial_answer"], "hel");
+        assert_eq!(wire.event_type(), "chain_qa_failed");
+    }
+
+    #[test]
+    fn chain_qa_failed_with_null_partial_serializes_as_null() {
+        let wire: ChainSseWireEvent = ChainSseEvent::Failed {
+            chain_qa_id: "qa-4".to_string(),
+            error: "nope".to_string(),
+            partial_answer: None,
+        }
+        .into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json["partial_answer"].is_null());
+    }
+}
