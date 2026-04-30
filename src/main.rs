@@ -4,6 +4,7 @@
 //! interacting with LLM agents.
 
 mod api;
+mod chain_qa;
 mod db;
 pub(crate) mod git_ops;
 mod llm;
@@ -93,6 +94,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reconcile worktrees: revert Work conversations whose worktree is missing
     reconcile_worktrees(&db).await;
+
+    // REQ-CHN-005 startup sweep: any chain_qa row left in_flight from a
+    // previous process has no live stream behind it; flip it to abandoned
+    // so the UI shows a re-ask affordance instead of an indefinite spinner.
+    match db.sweep_in_flight_chain_qa().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            count = n,
+            "Swept stale in_flight chain_qa rows to abandoned"
+        ),
+        Err(e) => tracing::warn!(error = %e, "chain_qa startup sweep failed"),
+    }
 
     // Initialize LLM registry with model discovery
     let llm_config = LlmConfig::from_env();

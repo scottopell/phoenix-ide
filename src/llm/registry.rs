@@ -598,6 +598,42 @@ impl ModelRegistry {
         !self.services.is_empty()
     }
 
+    /// Build a registry with a single `claude-sonnet-4-6` slot wired to
+    /// `service`. Test-only: bypasses `LlmConfig` and credential plumbing so
+    /// integration-flavoured tests in non-llm modules (chain Q&A) can drive
+    /// the public registry surface against a mock service.
+    #[cfg(test)]
+    pub fn for_test_with_sonnet(service: Arc<dyn LlmService>) -> Self {
+        let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
+        services.insert("claude-sonnet-4-6".to_string(), service);
+        Self {
+            services,
+            specs: HashMap::new(),
+            default_model: "claude-sonnet-4-6".to_string(),
+            gateway_status: GatewayStatus::NotConfigured,
+        }
+    }
+
+    /// Get a mid-tier "Sonnet-class" model balanced for cost vs accuracy.
+    ///
+    /// Used by chain Q&A (REQ-CHN-006) where the same model identifier is
+    /// pinned across all questions on the same chain so quality and latency
+    /// don't drift. Returns the (`model_id`, service) pair so the caller
+    /// can persist the identifier into `chain_qa.model`.
+    ///
+    /// Preference order: claude-sonnet-4-6 → claude-sonnet-4-6-1m →
+    /// gpt-5.5 → registry default. Returns None only when the registry has
+    /// no models at all.
+    pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
+        const PREFERRED: &[&str] = &["claude-sonnet-4-6", "claude-sonnet-4-6-1m", "gpt-5.5"];
+        for id in PREFERRED {
+            if let Some(service) = self.get(id) {
+                return Some(((*id).to_string(), service));
+            }
+        }
+        self.default().map(|s| (self.default_model.clone(), s))
+    }
+
     /// Get a cheap/fast model for auxiliary tasks like title generation.
     /// Prefers: claude-haiku-4-5 > gpt-5.4-mini > any available model
     pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {

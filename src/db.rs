@@ -830,6 +830,127 @@ impl Database {
         Ok(row)
     }
 
+    /// Set or clear the `chain_name` on a conversation (REQ-CHN-007).
+    ///
+    /// Phase 2 owns the column write; the API layer (Phase 4) is responsible
+    /// for validating that `root_conv_id` is actually a chain root before
+    /// calling this. Writing to a non-root row is structurally permitted but
+    /// has no UI effect (`parse_conversation_row` only reads `chain_name`
+    /// from the root).
+    #[allow(dead_code)] // Wired via API handlers in Phase 4 (task 02690)
+    pub async fn set_chain_name(&self, root_conv_id: &str, name: Option<&str>) -> DbResult<()> {
+        let result = sqlx::query("UPDATE conversations SET chain_name = ?1 WHERE id = ?2")
+            .bind(name)
+            .bind(root_conv_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(root_conv_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Insert a freshly-submitted Q&A row in the `in_flight` state (REQ-CHN-005).
+    ///
+    /// `answer` and `completed_at` are NULL at insertion. The row is
+    /// transitioned via [`Database::complete_chain_qa`] or
+    /// [`Database::fail_chain_qa`] when the stream resolves.
+    #[allow(dead_code)] // Wired through `chain_qa::ChainQa::submit_question` (Phase 2/3)
+    pub async fn insert_chain_qa(&self, row: NewChainQa) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO chain_qa (
+                id, root_conv_id, question, answer, model, status,
+                snapshot_member_count, snapshot_total_messages,
+                created_at, completed_at
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, NULL)",
+        )
+        .bind(&row.id)
+        .bind(&row.root_conv_id)
+        .bind(&row.question)
+        .bind(&row.model)
+        .bind(ChainQaStatus::InFlight.as_str())
+        .bind(row.snapshot_member_count)
+        .bind(row.snapshot_total_messages)
+        .bind(row.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a Q&A row complete with the final answer (REQ-CHN-005).
+    #[allow(dead_code)] // Wired through `chain_qa::ChainQa::submit_question` (Phase 2/3)
+    pub async fn complete_chain_qa(
+        &self,
+        id: &str,
+        answer: &str,
+        completed_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let result = sqlx::query(
+            "UPDATE chain_qa
+             SET answer = ?1, status = ?2, completed_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(answer)
+        .bind(ChainQaStatus::Completed.as_str())
+        .bind(completed_at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Mark a Q&A row failed; `partial_answer` is preserved when present
+    /// (REQ-CHN-005 — failed rows render with whatever tokens streamed).
+    #[allow(dead_code)] // Wired through `chain_qa::ChainQa::submit_question` (Phase 2/3)
+    pub async fn fail_chain_qa(&self, id: &str, partial_answer: Option<&str>) -> DbResult<()> {
+        let result = sqlx::query("UPDATE chain_qa SET answer = ?1, status = ?2 WHERE id = ?3")
+            .bind(partial_answer)
+            .bind(ChainQaStatus::Failed.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// List Q&A rows for a chain in chronological order (REQ-CHN-005).
+    #[allow(dead_code)] // Wired through `chain_qa::ChainQa::list_history` and Phase 4 API handlers
+    pub async fn list_chain_qa(&self, root_conv_id: &str) -> DbResult<Vec<ChainQaRow>> {
+        let rows = sqlx::query(
+            "SELECT id, root_conv_id, question, answer, model, status,
+                    snapshot_member_count, snapshot_total_messages,
+                    created_at, completed_at
+             FROM chain_qa
+             WHERE root_conv_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(root_conv_id)
+        .try_map(parse_chain_qa_row)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Transition every `in_flight` row to `abandoned` (startup sweep).
+    ///
+    /// Returns the number of rows transitioned. Called once at server start
+    /// (REQ-CHN-005) — any row still `in_flight` after a process exit has
+    /// no live stream behind it and would otherwise render as an
+    /// indefinite "still working…" placeholder.
+    pub async fn sweep_in_flight_chain_qa(&self) -> DbResult<usize> {
+        let result = sqlx::query("UPDATE chain_qa SET status = ?1 WHERE status = ?2")
+            .bind(ChainQaStatus::Abandoned.as_str())
+            .bind(ChainQaStatus::InFlight.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
+    }
+
     /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
     pub async fn update_conversation_model(&self, id: &str, model: &str) -> DbResult<()> {
         let now = Utc::now();
@@ -1459,6 +1580,32 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         seed_label,
         continued_in_conv_id,
         chain_name,
+    })
+}
+
+/// Parse a `chain_qa` row from the database (REQ-CHN-005).
+///
+/// Unknown `status` values are surfaced as typed errors rather than silently
+/// coerced — `ChainQaStatus::from_db_str` is the single source of truth for
+/// the column's allowed alphabet.
+#[allow(clippy::needless_pass_by_value, dead_code)] // dead_code: caller is `list_chain_qa`, itself dead-allowed until Phase 4
+fn parse_chain_qa_row(row: SqliteRow) -> Result<ChainQaRow, sqlx::Error> {
+    let status_str: String = row.try_get("status")?;
+    let status = ChainQaStatus::from_db_str(&status_str).ok_or_else(|| {
+        sqlx::Error::Decode(format!("unknown chain_qa.status value: {status_str:?}").into())
+    })?;
+    let completed_at: Option<String> = row.try_get("completed_at")?;
+    Ok(ChainQaRow {
+        id: row.try_get("id")?,
+        root_conv_id: row.try_get("root_conv_id")?,
+        question: row.try_get("question")?,
+        answer: row.try_get("answer")?,
+        model: row.try_get("model")?,
+        status,
+        snapshot_member_count: row.try_get("snapshot_member_count")?,
+        snapshot_total_messages: row.try_get("snapshot_total_messages")?,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        completed_at: completed_at.as_deref().map(parse_datetime),
     })
 }
 
@@ -2527,5 +2674,184 @@ mod tests {
 
         let root = db.chain_root_of("ghost").await.unwrap();
         assert_eq!(root, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Phoenix Chains v1 (task 02687): chain_qa CRUD + startup sweep
+    // ------------------------------------------------------------------
+
+    use chrono::TimeZone;
+
+    fn fresh_new_chain_qa(id: &str, root: &str) -> NewChainQa {
+        NewChainQa {
+            id: id.to_string(),
+            root_conv_id: root.to_string(),
+            question: "what happened in this chain?".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            snapshot_member_count: 3,
+            snapshot_total_messages: 17,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// REQ-CHN-005: `insert_chain_qa` round-trips all columns and starts `in_flight`.
+    #[tokio::test]
+    async fn test_insert_chain_qa_round_trips() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["qa-a", "qa-b"]).await;
+        db.insert_chain_qa(fresh_new_chain_qa("qa-1", "qa-a"))
+            .await
+            .unwrap();
+
+        let history = db.list_chain_qa("qa-a").await.unwrap();
+        assert_eq!(history.len(), 1);
+        let row = &history[0];
+        assert_eq!(row.id, "qa-1");
+        assert_eq!(row.root_conv_id, "qa-a");
+        assert_eq!(row.question, "what happened in this chain?");
+        assert_eq!(row.answer, None);
+        assert_eq!(row.model, "claude-sonnet-4-6");
+        assert_eq!(row.status, ChainQaStatus::InFlight);
+        assert_eq!(row.snapshot_member_count, 3);
+        assert_eq!(row.snapshot_total_messages, 17);
+        assert!(row.completed_at.is_none());
+    }
+
+    /// REQ-CHN-005: `complete_chain_qa` sets answer + `completed_at` + status.
+    #[tokio::test]
+    async fn test_complete_chain_qa_transitions_row() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["qac-a", "qac-b"]).await;
+        db.insert_chain_qa(fresh_new_chain_qa("qac-1", "qac-a"))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        db.complete_chain_qa("qac-1", "the final answer", now)
+            .await
+            .unwrap();
+
+        let row = &db.list_chain_qa("qac-a").await.unwrap()[0];
+        assert_eq!(row.status, ChainQaStatus::Completed);
+        assert_eq!(row.answer.as_deref(), Some("the final answer"));
+        assert!(row.completed_at.is_some());
+    }
+
+    /// REQ-CHN-005: `fail_chain_qa` preserves the question and an optional partial.
+    #[tokio::test]
+    async fn test_fail_chain_qa_preserves_question_and_partial() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["qaf-a", "qaf-b"]).await;
+        db.insert_chain_qa(fresh_new_chain_qa("qaf-1", "qaf-a"))
+            .await
+            .unwrap();
+
+        db.fail_chain_qa("qaf-1", Some("partial token stream"))
+            .await
+            .unwrap();
+        let row = &db.list_chain_qa("qaf-a").await.unwrap()[0];
+        assert_eq!(row.status, ChainQaStatus::Failed);
+        assert_eq!(row.answer.as_deref(), Some("partial token stream"));
+        assert!(row.completed_at.is_none());
+
+        // None partial works too — no partial answer to preserve.
+        db.insert_chain_qa(fresh_new_chain_qa("qaf-2", "qaf-a"))
+            .await
+            .unwrap();
+        db.fail_chain_qa("qaf-2", None).await.unwrap();
+        let history = db.list_chain_qa("qaf-a").await.unwrap();
+        let row2 = history.iter().find(|r| r.id == "qaf-2").unwrap();
+        assert_eq!(row2.status, ChainQaStatus::Failed);
+        assert_eq!(row2.answer, None);
+    }
+
+    /// REQ-CHN-005: `list_chain_qa` returns rows in chronological order.
+    #[tokio::test]
+    async fn test_list_chain_qa_orders_chronologically() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["qal-a", "qal-b"]).await;
+
+        let mut row1 = fresh_new_chain_qa("qal-1", "qal-a");
+        row1.created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut row2 = fresh_new_chain_qa("qal-2", "qal-a");
+        row2.created_at = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        let mut row3 = fresh_new_chain_qa("qal-3", "qal-a");
+        row3.created_at = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+
+        // Insert out-of-order on purpose.
+        db.insert_chain_qa(row3).await.unwrap();
+        db.insert_chain_qa(row1).await.unwrap();
+        db.insert_chain_qa(row2).await.unwrap();
+
+        let ids: Vec<String> = db
+            .list_chain_qa("qal-a")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["qal-1", "qal-2", "qal-3"]);
+    }
+
+    /// REQ-CHN-005: `sweep_in_flight_chain_qa` flips ONLY `in_flight` rows.
+    #[tokio::test]
+    async fn test_sweep_in_flight_chain_qa_targets_in_flight_only() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["qas-a", "qas-b"]).await;
+
+        // Three rows: completed, failed, and in_flight.
+        db.insert_chain_qa(fresh_new_chain_qa("qas-c", "qas-a"))
+            .await
+            .unwrap();
+        db.complete_chain_qa("qas-c", "done", Utc::now())
+            .await
+            .unwrap();
+
+        db.insert_chain_qa(fresh_new_chain_qa("qas-f", "qas-a"))
+            .await
+            .unwrap();
+        db.fail_chain_qa("qas-f", None).await.unwrap();
+
+        db.insert_chain_qa(fresh_new_chain_qa("qas-i", "qas-a"))
+            .await
+            .unwrap();
+
+        let n = db.sweep_in_flight_chain_qa().await.unwrap();
+        assert_eq!(n, 1, "only the in_flight row should be touched");
+
+        let rows = db.list_chain_qa("qas-a").await.unwrap();
+        let by_id = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id("qas-c").status, ChainQaStatus::Completed);
+        assert_eq!(by_id("qas-f").status, ChainQaStatus::Failed);
+        assert_eq!(by_id("qas-i").status, ChainQaStatus::Abandoned);
+    }
+
+    /// REQ-CHN-007: `set_chain_name` round-trips (set, change, clear).
+    #[tokio::test]
+    async fn test_set_chain_name_round_trips() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("scn-root", "slug-scn", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        db.set_chain_name("scn-root", Some("auth refactor"))
+            .await
+            .unwrap();
+        let conv = db.get_conversation("scn-root").await.unwrap();
+        assert_eq!(conv.chain_name, Some("auth refactor".to_string()));
+
+        db.set_chain_name("scn-root", Some("auth-refactor-v2"))
+            .await
+            .unwrap();
+        let conv = db.get_conversation("scn-root").await.unwrap();
+        assert_eq!(conv.chain_name, Some("auth-refactor-v2".to_string()));
+
+        db.set_chain_name("scn-root", None).await.unwrap();
+        let conv = db.get_conversation("scn-root").await.unwrap();
+        assert_eq!(conv.chain_name, None);
+
+        // Missing conversation surfaces as a typed error, not silent no-op.
+        let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
+        matches!(err, DbError::ConversationNotFound(_));
     }
 }
