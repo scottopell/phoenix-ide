@@ -880,9 +880,10 @@ mod tests {
         assert_eq!(rec.exit_code, Some(0));
     }
 
-    /// TearDown exit: the relay returns `Stopped(TearDown)` so the handler
+    /// `TearDown` exit: the relay returns `Stopped(TearDown)` so the handler
     /// can branch into full shell teardown (REQ-TERM-012).
     #[tokio::test]
+    #[allow(clippy::similar_names)]
     async fn teardown_exit_returns_teardown_reason() {
         let (_shell_end, pty_end) = tokio::io::duplex(4096);
         let tracker = make_tracker();
@@ -917,6 +918,7 @@ mod tests {
     /// Emulates the reclaim path: relay 1 exits via Detach, relay 2 starts
     /// fresh on the same tracker and captures another command.
     #[tokio::test]
+    #[allow(clippy::similar_names)]
     async fn second_relay_continues_over_same_tracker() {
         use crate::terminal::test_helpers::full_command;
 
@@ -995,7 +997,7 @@ mod tests {
         );
     }
 
-    /// PtyEof regression: if the shell exits while a stop signal is also
+    /// `PtyEof` regression: if the shell exits while a stop signal is also
     /// arriving, the exit reason must still be `PtyEof` so the handler runs
     /// full teardown. The reader detects EOF first and wins the race.
     #[tokio::test]

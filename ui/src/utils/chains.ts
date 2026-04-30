@@ -154,7 +154,7 @@ export function groupConversationsForSidebar(
     let cursor: string | null | undefined = rootId;
     const seen = new Set<string>();
     while (cursor && byId.has(cursor) && !seen.has(cursor)) {
-      const m = byId.get(cursor)!;
+      const m: Conversation = byId.get(cursor)!;
       ordered.push(m);
       seen.add(cursor);
       cursor = m.continued_in_conv_id ?? null;

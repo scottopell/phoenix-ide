@@ -450,7 +450,7 @@ mod tests {
 
     /// Read-only tools (`read_file`, `search`, `keyword_search`, `read_image`,
     /// `think`) must be present in every registry. Drift here caused the
-    /// original "Unknown tool: read_file" infinite loop in Direct mode — the
+    /// original "Unknown tool: `read_file`" infinite loop in Direct mode — the
     /// mock provider emitted a `read_file` call that the registry didn't
     /// recognise, which fed back into the LLM unbounded.
     ///

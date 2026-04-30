@@ -364,11 +364,11 @@ async fn reconcile_worktrees(db: &Database) {
 ///
 /// Exercises the three shapes of a Work conversation with a missing on-disk
 /// worktree directory:
-///   a) state = ContextExhausted -> skipped, mode preserved
-///   b) continued_in_conv_id = Some -> skipped, mode preserved
+///   a) state = `ContextExhausted` -> skipped, mode preserved
+///   b) `continued_in_conv_id` = Some -> skipped, mode preserved
 ///   c) neither (a) nor (b), genuine orphan -> demoted to Explore
 ///
-/// These run against an on-disk SQLite DB (tempdir) so the project/
+/// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
 #[cfg(test)]
 mod reconcile_worktrees_tests {
@@ -403,7 +403,7 @@ mod reconcile_worktrees_tests {
         (tmp, root)
     }
 
-    /// Build a Work-mode ConvMode pointing at `{repo_root}/.phoenix/worktrees/{conv_id}`.
+    /// Build a Work-mode `ConvMode` pointing at `{repo_root}/.phoenix/worktrees/{conv_id}`.
     /// The worktree directory does NOT have to exist (the caller decides whether
     /// to `git worktree add` it; for these tests we leave it missing to hit the
     /// "orphan" branch).
@@ -436,7 +436,7 @@ mod reconcile_worktrees_tests {
         db::Database::open_in_memory().await.unwrap()
     }
 
-    /// Helper: insert a Work conversation with the given ConvMode, then
+    /// Helper: insert a Work conversation with the given `ConvMode`, then
     /// return its id. Caller tweaks `state` / `continued_in_conv_id` after.
     async fn seed_work_conv(
         db: &db::Database,
@@ -463,8 +463,8 @@ mod reconcile_worktrees_tests {
         .unwrap();
     }
 
-    /// Case (a): parent reached ContextExhausted. Worktree directory is
-    /// missing on disk but the row's state is ContextExhausted — reconcile
+    /// Case (a): parent reached `ContextExhausted`. Worktree directory is
+    /// missing on disk but the row's state is `ContextExhausted` — reconcile
     /// must SKIP it. Mode stays Work, cwd stays the worktree path.
     #[tokio::test]
     async fn skips_context_exhausted_conv_with_missing_worktree() {

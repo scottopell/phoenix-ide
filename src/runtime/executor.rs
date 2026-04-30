@@ -3039,6 +3039,7 @@ mod context_exhausted_preserves_worktree_tests {
         !String::from_utf8_lossy(&o.stdout).trim().is_empty()
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_runtime(
         storage: Arc<InMemoryStorage>,
         conv_id: &str,
@@ -3050,6 +3051,7 @@ mod context_exhausted_preserves_worktree_tests {
         build_runtime_with_state(storage, conv_id, working_dir, ConvState::Idle)
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_runtime_with_state(
         storage: Arc<InMemoryStorage>,
         conv_id: &str,
@@ -3089,12 +3091,12 @@ mod context_exhausted_preserves_worktree_tests {
     ) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-                Ok(Ok(SseEvent::StateChange {
-                    state: ConvState::ContextExhausted { .. },
-                    ..
-                })) => return true,
-                _ => {}
+            if let Ok(Ok(SseEvent::StateChange {
+                state: ConvState::ContextExhausted { .. },
+                ..
+            })) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                return true;
             }
         }
         false

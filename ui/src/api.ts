@@ -836,7 +836,10 @@ export function subscribeToChainStream(
       try {
         const raw: unknown = JSON.parse((msg as MessageEvent).data);
         const parsed = v.parse(schema, raw);
-        onEvent({ type: eventName, ...parsed } as ChainSseEventData);
+        // Runtime shape is guaranteed by valibot; the discriminated union of
+        // ChainSseEventData requires each `type` variant to match its data
+        // shape, which TS can't infer through the generic `handle` wrapper.
+        onEvent({ type: eventName, ...parsed } as unknown as ChainSseEventData);
       } catch (err) {
         if (onError) onError(err);
       }

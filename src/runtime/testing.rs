@@ -318,13 +318,13 @@ impl InMemoryStorage {
         }
     }
 
-    /// Seed the conv_mode for a conversation (used by tests that need to
+    /// Seed the `conv_mode` for a conversation (used by tests that need to
     /// exercise mode-aware effect handlers like `NotifyContextExhausted`).
     pub fn set_mode(&self, conv_id: &str, mode: crate::db::ConvMode) {
         self.modes.lock().unwrap().insert(conv_id.to_string(), mode);
     }
 
-    /// Read back the stored conv_mode (test-only).
+    /// Read back the stored `conv_mode` (test-only).
     pub fn get_mode(&self, conv_id: &str) -> Option<crate::db::ConvMode> {
         self.modes.lock().unwrap().get(conv_id).cloned()
     }
@@ -1938,27 +1938,27 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut idx = 0usize;
             while tokio::time::Instant::now() < deadline && !seen_agent_done {
-                match tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv()).await {
-                    Ok(Ok(evt)) => {
-                        match &evt {
-                            SseEvent::Token { .. } => {
-                                last_token_idx = Some(idx);
-                            }
-                            SseEvent::Message { message } => {
-                                if matches!(message.message_type, MessageType::Agent)
-                                    && first_agent_msg_idx.is_none()
-                                {
-                                    first_agent_msg_idx = Some(idx);
-                                }
-                            }
-                            SseEvent::AgentDone { .. } => {
-                                seen_agent_done = true;
-                            }
-                            _ => {}
+                if let Ok(Ok(evt)) =
+                    tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv()).await
+                {
+                    match &evt {
+                        SseEvent::Token { .. } => {
+                            last_token_idx = Some(idx);
                         }
-                        idx += 1;
+                        SseEvent::Message { message } => {
+                            if matches!(message.message_type, MessageType::Agent)
+                                && first_agent_msg_idx.is_none()
+                            {
+                                first_agent_msg_idx = Some(idx);
+                            }
+                        }
+                        SseEvent::AgentDone { .. } => {
+                            seen_agent_done = true;
+                        }
+                        _ => {}
                     }
-                    Ok(Err(_)) | Err(_) => { /* keep polling until deadline */ }
+                    idx += 1;
+                } else { /* keep polling until deadline */
                 }
             }
 

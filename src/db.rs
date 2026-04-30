@@ -2079,7 +2079,7 @@ mod tests {
                 &format!("{id}-msg-1"),
                 id,
                 &MessageContent::agent(vec![ContentBlock::tool_use(
-                    &format!("{id}-tool"),
+                    format!("{id}-tool"),
                     "bash",
                     serde_json::json!({"command": "ls"}),
                 )]),
@@ -2244,8 +2244,8 @@ mod tests {
     // are preserved for inheritance by the continuation.
     // ============================================================
 
-    /// Helper: create a parent conversation with the given ConvMode, force-set its
-    /// state to ContextExhausted, and return the refreshed record.
+    /// Helper: create a parent conversation with the given `ConvMode`, force-set its
+    /// state to `ContextExhausted`, and return the refreshed record.
     async fn setup_exhausted_parent(
         db: &Database,
         id: &str,
@@ -2294,7 +2294,7 @@ mod tests {
         }
     }
 
-    /// Work -> Work: worktree fields and task_id all transfer; parent's
+    /// Work -> Work: worktree fields and `task_id` all transfer; parent's
     /// `continued_in_conv_id` points at the new conv.
     #[tokio::test]
     async fn test_continue_conversation_work_to_work() {
@@ -2346,7 +2346,7 @@ mod tests {
         assert_eq!(refreshed_parent.continued_in_conv_id, Some(new_conv.id));
     }
 
-    /// Branch -> Branch: branch_name/worktree_path/base_branch transfer; no task_id.
+    /// Branch -> Branch: `branch_name/worktree_path/base_branch` transfer; no `task_id`.
     #[tokio::test]
     async fn test_continue_conversation_branch_to_branch() {
         let db = Database::open_in_memory().await.unwrap();
@@ -2394,8 +2394,8 @@ mod tests {
     }
 
     /// Explore -> Explore: mode is cloned (Explore has no worktree fields on
-    /// the ConvMode variant — REQ-PROJ-028's on-first-message worktree isn't
-    /// encoded in ConvMode::Explore, so this is just cwd + mode inheritance).
+    /// the `ConvMode` variant — REQ-PROJ-028's on-first-message worktree isn't
+    /// encoded in `ConvMode::Explore`, so this is just cwd + mode inheritance).
     #[tokio::test]
     async fn test_continue_conversation_explore_to_explore() {
         let db = Database::open_in_memory().await.unwrap();
@@ -2491,7 +2491,7 @@ mod tests {
         );
     }
 
-    /// Parent not in ContextExhausted state: transaction does not run;
+    /// Parent not in `ContextExhausted` state: transaction does not run;
     /// parent state is unchanged.
     #[tokio::test]
     async fn test_continue_conversation_rejects_idle_parent() {
@@ -2531,7 +2531,7 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
-    /// Parent id does not exist: returns DbError::ConversationNotFound so the
+    /// Parent id does not exist: returns `DbError::ConversationNotFound` so the
     /// HTTP handler can map to 404.
     #[tokio::test]
     async fn test_continue_conversation_parent_not_found() {

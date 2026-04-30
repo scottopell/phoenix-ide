@@ -525,7 +525,7 @@ mod reclaim_tests {
         (exit, frames_rx)
     }
 
-    /// Acceptance: two sequential connections for the same conv_id — the
+    /// Acceptance: two sequential connections for the same `conv_id` — the
     /// second reclaims. Both commands end up in the same tracker.
     #[tokio::test]
     async fn two_sequential_connections_reclaim_same_handle() {

@@ -184,7 +184,7 @@ mod tests {
         // Rust Debug dump.
         assert!(!user.flat_message().contains("UserCancel"));
         assert!(!user.flat_message().contains("Idle"));
-        assert!(!user.flat_message().contains("{"));
+        assert!(!user.flat_message().contains('{'));
         assert_eq!(user.kind, UserFacingErrorKind::Internal);
 
         // But the error's own Display format — used for logs and

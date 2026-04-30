@@ -2932,8 +2932,7 @@ mod tests {
         assert!(
             decline_message
                 .as_deref()
-                .map(|t| t.contains("declined"))
-                .unwrap_or(false),
+                .is_some_and(|t| t.contains("declined")),
             "Decline must persist a user-role message telling the agent to proceed, got {decline_message:?}"
         );
 
@@ -2988,10 +2987,10 @@ mod tests {
     }
 
     /// Race scenario: SSE-stream connect triggers `should_auto_continue`,
-    /// state moves Idle -> LlmRequesting before the client receives the
+    /// state moves Idle -> `LlmRequesting` before the client receives the
     /// state change. User clicks "trigger continuation" against the stale
     /// Idle UI. The state machine must absorb the event, not surface it as
-    /// an InvalidTransition error to the user.
+    /// an `InvalidTransition` error to the user.
     #[test]
     fn user_trigger_continuation_in_llm_requesting_is_absorbed() {
         let result = transition(

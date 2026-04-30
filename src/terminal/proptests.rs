@@ -37,7 +37,7 @@ fn arb_conv_id() -> impl Strategy<Value = String> {
 /// Uses /dev/null as a stand-in fd since these tests never do PTY I/O.
 fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
     use crate::terminal::command_tracker::CommandTracker;
-    use crate::terminal::session::ShellIntegrationStatus;
+    use crate::terminal::session::{ShellIntegrationStatus, StopReason};
     use std::fs::OpenOptions;
     use std::os::unix::io::{FromRawFd, IntoRawFd};
 
@@ -46,11 +46,11 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
         .write(true)
         .open("/dev/null")
         .expect("open /dev/null");
+
     let raw = f.into_raw_fd();
     // SAFETY: we own the fd, transferring to OwnedFd.
     let owned_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) };
 
-    use crate::terminal::session::StopReason;
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
 
     super::session::TerminalHandle {
@@ -937,7 +937,7 @@ mod command_tracker_proptest {
 ///
 /// Invariants checked:
 ///   - `CommandRecordRingBufferBound`: count <= 5 at all times
-///   - `CommandLifecycleFieldsCoherent`: completed records have duration_ms > 0
+///   - `CommandLifecycleFieldsCoherent`: completed records have `duration_ms` > 0
 ///   - `OneExecutingCommandAtATime`: at most one capture active (structural; redundant
 ///     field removed, so this is now enforced by the type)
 ///   - Ring buffer ordering: newest record matches most recently completed `RunCommand`
@@ -948,7 +948,7 @@ mod command_tracker_op_proptest {
     use crate::terminal::command_tracker::CommandTracker;
     use crate::terminal::test_helpers::TerminalStream;
 
-    /// A first-class operation on the CommandTracker state machine.
+    /// A first-class operation on the `CommandTracker` state machine.
     #[derive(Debug, Clone)]
     enum TrackerOp {
         /// Complete command: C + output + D. The happy path.

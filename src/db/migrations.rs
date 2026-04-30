@@ -214,7 +214,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Create the conversations table with conv_mode and state columns
+    /// Create the conversations table with `conv_mode` and state columns
     /// (minimal schema needed for migration tests).
     async fn setup_conversations_table(pool: &SqlitePool) {
         sqlx::raw_sql(

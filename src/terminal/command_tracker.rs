@@ -129,6 +129,7 @@ impl CommandTracker {
 
     /// Whether a capture is currently in progress (between C and D).
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn is_capturing(&self) -> bool {
         self.current_capture.is_some()
     }
