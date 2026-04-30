@@ -260,47 +260,58 @@ pub(crate) async fn abandon_task(
             return None;
         }
 
-        // Commit log of unmerged work
-        let commit_log = run_git(
-            &wt,
-            &["log", "--oneline", &format!("{base_branch_clone}..HEAD")],
-        )
-        .unwrap_or_default();
+        // File-level diff of committed work vs the common ancestor with
+        // the base branch (triple-dot). This reflects exactly what files
+        // the branch changed, independent of commit-history noise — e.g.
+        // task-file commits replayed during rebase whose effects are
+        // already in base produce no diff content here.
+        let committed_diff =
+            run_git(&wt, &["diff", &format!("{base_branch_clone}...HEAD")]).unwrap_or_default();
 
-        // Stage untracked files as intent-to-add so they appear in the diff.
-        // Agent-created files are typically untracked (patch tool doesn't git-add).
+        // Stage untracked files as intent-to-add so they appear in the
+        // working-tree diff. Agent-created files are typically untracked
+        // (patch tool doesn't git-add).
         let _ = run_git(&wt, &["add", "-N", "."]);
 
-        // Full diff (uncommitted + newly created files)
-        let diff = run_git(&wt, &["diff", "HEAD"]).unwrap_or_default();
+        // Working-tree diff (uncommitted + newly created files).
+        let uncommitted_diff = run_git(&wt, &["diff", "HEAD"]).unwrap_or_default();
 
-        if commit_log.is_empty() && diff.is_empty() {
+        if committed_diff.is_empty() && uncommitted_diff.is_empty() {
             return None;
         }
 
         let mut snapshot = String::from("## Abandoned work snapshot\n");
 
-        if !commit_log.is_empty() {
-            snapshot.push_str("\n### Unmerged commits\n```\n");
-            snapshot.push_str(&commit_log);
-            snapshot.push_str("\n```\n");
-        }
-
-        if !diff.is_empty() {
-            snapshot.push_str("\n### Uncommitted changes\n```diff\n");
-            if diff.len() > MAX_DIFF_BYTES {
-                // Truncate at a valid UTF-8 char boundary
-                let end = diff.floor_char_boundary(MAX_DIFF_BYTES);
-                snapshot.push_str(diff.get(..end).unwrap_or(&diff));
+        let append_section = |out: &mut String, header: &str, body: &str| {
+            out.push_str(header);
+            if body.len() > MAX_DIFF_BYTES {
+                let end = body.floor_char_boundary(MAX_DIFF_BYTES);
+                out.push_str(body.get(..end).unwrap_or(body));
                 let _ = write!(
-                    snapshot,
+                    out,
                     "\n\n[truncated -- diff was {}KiB, showing first 100KiB]",
-                    diff.len() / 1024
+                    body.len() / 1024
                 );
             } else {
-                snapshot.push_str(&diff);
+                out.push_str(body);
             }
-            snapshot.push_str("\n```\n");
+            out.push_str("\n```\n");
+        };
+
+        if !committed_diff.is_empty() {
+            append_section(
+                &mut snapshot,
+                &format!("\n### Committed changes (vs `{base_branch_clone}`)\n```diff\n"),
+                &committed_diff,
+            );
+        }
+
+        if !uncommitted_diff.is_empty() {
+            append_section(
+                &mut snapshot,
+                "\n### Uncommitted changes\n```diff\n",
+                &uncommitted_diff,
+            );
         }
 
         Some(snapshot)
