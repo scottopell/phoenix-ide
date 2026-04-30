@@ -385,6 +385,12 @@ def start_phoenix(port: int, release: bool = True):
     env_file = _load_env_file(env)
     if env_file:
         print(f"  Loaded env from {env_file}")
+    # Dev-only overrides on top of the prod env. Lets dev disable
+    # PHOENIX_PASSWORD (or override anything else) without polluting the
+    # prod env file used by `./dev.py prod deploy`.
+    dev_env_file = _load_env_file(env, ".phoenix-ide.dev.env")
+    if dev_env_file:
+        print(f"  Loaded dev overrides from {dev_env_file}")
     # Auto-detect gateway only if .phoenix-ide.env didn't provide LLM config
     if not env.get("LLM_API_KEY_HELPER") and not env.get("LLM_GATEWAY"):
         if gateway := get_llm_gateway():
@@ -1259,13 +1265,16 @@ def native_prod_deploy(version: str | None = None):
             sys.exit(1)
 
 
-def _load_env_file(env: dict[str, str]) -> str | None:
-    """Load .phoenix-ide.env from project root into env dict. Returns path if loaded.
+def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
+    """Load an env file from project root into env dict. Returns path if loaded.
 
     Simple KEY=VALUE format, one per line. Lines starting with # are comments.
     Literal \\n in values is unescaped to real newlines (for LLM_CUSTOM_HEADERS).
+    A KEY with an empty value (`KEY=`) is loaded as an empty string and overrides
+    any prior setting -- this is how dev overrides clear a value (e.g., disabling
+    PHOENIX_PASSWORD by setting it to empty in the dev file).
     """
-    env_file = ROOT / ".phoenix-ide.env"
+    env_file = ROOT / filename
     if not env_file.exists():
         return None
     with open(env_file) as f:
@@ -1273,8 +1282,8 @@ def _load_env_file(env: dict[str, str]) -> str | None:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            key, _, value = line.partition("=")
-            if key and value:
+            key, sep, value = line.partition("=")
+            if key and sep:
                 env[key.strip()] = value.strip().replace("\\n", "\n")
     return str(env_file)
 

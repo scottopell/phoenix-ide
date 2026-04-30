@@ -27,3 +27,4 @@ scripts/install.sh
 
 # UI audit screenshots — captured locally, not for git history
 ui-audit/screenshots/
+.phoenix-ide.dev.env
