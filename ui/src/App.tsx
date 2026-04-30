@@ -21,6 +21,9 @@ const ConversationPage = lazy(() =>
 const NewConversationPage = lazy(() =>
   import('./pages/NewConversationPage').then((m) => ({ default: m.NewConversationPage })),
 );
+const ChainPage = lazy(() =>
+  import('./pages/ChainPage').then((m) => ({ default: m.ChainPage })),
+);
 const LoginPage = lazy(() =>
   import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })),
 );
@@ -39,6 +42,14 @@ function RouteFallback() {
 function KeyedConversationPage() {
   const { slug } = useParams<{ slug: string }>();
   return <ConversationPage key={slug} />;
+}
+
+// Same idea for the chain page: a fresh component instance per root id so
+// the in-flight Q&A buffer, EventSource, and inline-edit state never bleed
+// across navigations between two chains.
+function KeyedChainPage() {
+  const { rootConvId } = useParams<{ rootConvId: string }>();
+  return <ChainPage key={rootConvId} />;
 }
 
 type AuthState =
@@ -70,6 +81,7 @@ function AppRoutes() {
                 <Route path="/" element={<ConversationListPage />} />
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/c/:slug" element={<KeyedConversationPage />} />
+                <Route path="/chains/:rootConvId" element={<KeyedChainPage />} />
               </Routes>
             </DesktopLayout>
           } />

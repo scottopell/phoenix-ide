@@ -7914,3 +7914,441 @@ html * {
 .terminal-panel-xterm .xterm-viewport {
   overflow-y: auto !important;
 }
+
+/* ----- Chain page (REQ-CHN-003 / 004 / 005 / 006 / 007) ------------------- */
+
+.chain-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.chain-page--loading,
+.chain-page--empty {
+  align-items: center;
+  justify-content: center;
+}
+
+.chain-page-empty {
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--text-muted);
+  max-width: 480px;
+}
+
+.chain-page-empty h2 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 8px;
+}
+
+.chain-page-empty p {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Header — name (inline-editable) + meta line. */
+.chain-page-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+.chain-page-name {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  font-size: 18px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: text;
+  text-align: left;
+  font-family: inherit;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background-color 200ms ease, border-color 200ms ease;
+}
+
+.chain-page-name:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+}
+
+.chain-page-name-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--accent-blue);
+  color: var(--text-primary);
+  font-size: 18px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: inherit;
+  outline: none;
+  flex: 0 1 320px;
+  min-width: 200px;
+}
+
+.chain-page-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Two-column body — members on the left, Q&A on the right. */
+.chain-page-body {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) 1fr;
+  gap: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .chain-page-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+}
+
+/* Members column — cards in chain order, Latest emphasized. */
+.chain-members {
+  border-right: 1px solid var(--border-color);
+  padding: 12px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+}
+
+.chain-members-heading {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin: 0 0 10px 4px;
+}
+
+.chain-members-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chain-member {
+  margin: 0;
+}
+
+.chain-member-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text-primary);
+  transition: border-color 200ms ease, background-color 200ms ease;
+}
+
+.chain-member-card:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-blue);
+}
+
+.chain-member-card:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.chain-member--latest .chain-member-card {
+  border-color: var(--accent-blue);
+  box-shadow: inset 3px 0 0 var(--accent-blue);
+}
+
+.chain-member-row1 {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.chain-member-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.chain-member-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
+  border-radius: 8px;
+  padding: 1px 6px;
+}
+
+.chain-member-row2 {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.chain-member-position {
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 600;
+}
+
+.chain-member-sep {
+  opacity: 0.5;
+}
+
+/* Q&A column — bottom-anchored input, history scrolling above (REQ-CHN-005). */
+.chain-qa {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-primary);
+}
+
+.chain-qa-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px 20px;
+  min-height: 0;
+}
+
+.chain-qa-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 32px 0;
+  text-align: center;
+}
+
+.chain-qa-empty-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.chain-qa-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  /* REQ-CHN-006: visual independence — vertical gap between cards, no
+   * thread/reply ligatures. */
+  gap: 16px;
+}
+
+.chain-qa-card {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chain-qa-card--in_flight {
+  border-color: var(--accent-blue);
+}
+
+.chain-qa-card--failed {
+  border-color: var(--accent-red);
+}
+
+.chain-qa-question {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.chain-qa-question-prefix {
+  flex-shrink: 0;
+  font-weight: 700;
+  color: var(--accent-blue);
+}
+
+.chain-qa-question-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chain-qa-answer {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chain-qa-answer--placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.chain-qa-answer--streaming .chain-qa-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent-blue);
+  animation: chain-qa-cursor-blink 1s steps(2) infinite;
+}
+
+@keyframes chain-qa-cursor-blink {
+  to { opacity: 0; }
+}
+
+.chain-qa-answer--skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chain-qa-skeleton-line {
+  display: block;
+  height: 10px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-tertiary) 0%,
+    color-mix(in srgb, var(--bg-tertiary) 50%, var(--text-muted) 50%) 50%,
+    var(--bg-tertiary) 100%
+  );
+  background-size: 200% 100%;
+  animation: chain-qa-skeleton 1.4s ease-in-out infinite;
+}
+
+.chain-qa-skeleton-line--short {
+  width: 60%;
+}
+
+@keyframes chain-qa-skeleton {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.chain-qa-answer--failed,
+.chain-qa-answer--abandoned {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chain-qa-partial {
+  color: var(--text-muted);
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chain-qa-failure {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.chain-qa-failure-label {
+  color: var(--accent-red);
+  font-weight: 600;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--accent-blue);
+  cursor: pointer;
+  padding: 0;
+  font-size: inherit;
+  font-family: inherit;
+  text-decoration: underline;
+}
+
+.btn-link:hover {
+  text-decoration: none;
+}
+
+.chain-qa-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.chain-qa-stale {
+  font-style: italic;
+}
+
+.chain-qa-sse-lost {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+  border-top: 1px solid var(--border-color);
+}
+
+.chain-qa-form {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px 14px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+.chain-qa-input {
+  flex: 1;
+  resize: vertical;
+  min-height: 44px;
+  max-height: 200px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  outline: none;
+  transition: border-color 150ms ease;
+}
+
+.chain-qa-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.chain-qa-submit {
+  align-self: flex-end;
+}
+
