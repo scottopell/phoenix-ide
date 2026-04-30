@@ -137,9 +137,12 @@ describe('groupConversationsForSidebar', () => {
     }
   });
 
-  it('chain-order independence from updated_at: a root with later updated_at than the leaf still renders root-first', () => {
-    // Pathological but defensible case: someone reopened the root recently.
-    // Chain order in the sidebar must remain root -> leaf.
+  it('Latest skips the root even when the root has the most recent updated_at (matches backend rule)', () => {
+    // Real-world case: editing the chain name bumps the root's updated_at
+    // via the API's UPDATE on conversations.chain_name. If "Latest" used a
+    // pure max(updated_at), the root would incorrectly become Latest after
+    // a rename. The backend ChainView (src/api/chains.rs) explicitly picks
+    // a non-root member; the sidebar must match.
     const root = makeConv('r', '2024-12-01T00:00:00Z', { continued_in_conv_id: 'l' });
     const leaf = makeConv('l', '2024-06-01T00:00:00Z');
 
@@ -151,7 +154,24 @@ describe('groupConversationsForSidebar', () => {
     expect(grouped[0]?.kind).toBe('chain');
     if (grouped[0]?.kind === 'chain') {
       expect(grouped[0].members.map(m => m.id)).toEqual(['r', 'l']);
-      expect(grouped[0].latestMemberId).toBe('r'); // recency winner
+      expect(grouped[0].latestMemberId).toBe('l'); // leaf, not root
+    }
+  });
+
+  it('Latest picks the non-root member with max updated_at across multi-offshoot chains', () => {
+    // 3-member chain a -> b -> c. Root a has the most recent updated_at
+    // (e.g. from a chain_name edit), but among non-root members b is more
+    // recent than c. Latest must be b, not a.
+    const a = makeConv('a', '2024-12-01T00:00:00Z', { continued_in_conv_id: 'b' });
+    const b = makeConv('b', '2024-06-01T00:00:00Z', { continued_in_conv_id: 'c' });
+    const c = makeConv('c', '2024-03-01T00:00:00Z');
+    const recencySorted = [a, b, c];
+    const grouped = groupConversationsForSidebar(recencySorted, computeChainRoots(recencySorted));
+
+    expect(grouped.length).toBe(1);
+    if (grouped[0]?.kind === 'chain') {
+      expect(grouped[0].members.map(m => m.id)).toEqual(['a', 'b', 'c']);
+      expect(grouped[0].latestMemberId).toBe('b');
     }
   });
 

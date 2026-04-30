@@ -180,9 +180,17 @@ export function groupConversationsForSidebar(
       if (members.length === 0) continue;
       const rootConv = members[0]!;
       const displayName = rootConv.chain_name ?? rootConv.slug;
-      // Latest member = max updated_at across the chain.
-      let latest = members[0]!;
-      for (const m of members) {
+      // Latest member = the non-root member with the largest updated_at,
+      // matching the backend `ChainView` rule (see src/api/chains.rs). The
+      // root is excluded because edits to root metadata (e.g. setting
+      // chain_name) bump its updated_at without representing real work; if
+      // the root were eligible it would incorrectly become "latest" after
+      // a rename. Members are ordered root-first by chain order, so
+      // members[0] is always the root and members[1..] are non-root.
+      // A chain has length ≥ 2 (REQ-CHN-002), so members[1] always exists.
+      let latest = members[1]!;
+      for (let i = 2; i < members.length; i++) {
+        const m = members[i]!;
         if (m.updated_at > latest.updated_at) latest = m;
       }
       out.push({
