@@ -20,6 +20,8 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   api,
   subscribeToChainStream,
@@ -28,6 +30,10 @@ import {
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
+
+// Markdown plugin set, hoisted so the array identity is stable across
+// renders (matches the pattern in StreamingMessage.tsx).
+const REMARK_PLUGINS = [remarkGfm];
 import { formatShortDateTime } from '../utils';
 
 /** Live, not-yet-persisted Q&A entry. We keep these in component state and
@@ -624,7 +630,11 @@ function renderAnswerByStatus(
 ): JSX.Element {
   if (row.status === 'completed') {
     return (
-      <div className="chain-qa-answer">{row.answer ?? ''}</div>
+      <div className="chain-qa-answer chain-qa-markdown">
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+          {row.answer ?? ''}
+        </ReactMarkdown>
+      </div>
     );
   }
   if (row.status === 'in_flight') {
@@ -642,7 +652,11 @@ function renderAnswerByStatus(
     return (
       <div className="chain-qa-answer chain-qa-answer--failed">
         {row.answer && row.answer.length > 0 ? (
-          <div className="chain-qa-partial">{row.answer}</div>
+          <div className="chain-qa-partial chain-qa-markdown">
+            <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+              {row.answer}
+            </ReactMarkdown>
+          </div>
         ) : null}
         <div className="chain-qa-failure">
           <span className="chain-qa-failure-label">Failed</span>
@@ -689,7 +703,11 @@ function ChainQaInflightCard({ entry, onReask }: ChainQaInflightCardProps) {
       {entry.error ? (
         <div className="chain-qa-answer chain-qa-answer--failed">
           {entry.answer.length > 0 && (
-            <div className="chain-qa-partial">{entry.answer}</div>
+            <div className="chain-qa-partial chain-qa-markdown">
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+                {entry.answer}
+              </ReactMarkdown>
+            </div>
           )}
           <div className="chain-qa-failure">
             <span className="chain-qa-failure-label">Failed: {entry.error}</span>
@@ -709,8 +727,13 @@ function ChainQaInflightCard({ entry, onReask }: ChainQaInflightCardProps) {
           <span className="chain-qa-skeleton-line chain-qa-skeleton-line--short" />
         </div>
       ) : (
-        <div className="chain-qa-answer chain-qa-answer--streaming" aria-live="polite">
-          {entry.answer}
+        <div
+          className="chain-qa-answer chain-qa-answer--streaming chain-qa-markdown"
+          aria-live="polite"
+        >
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+            {entry.answer}
+          </ReactMarkdown>
           <span className="chain-qa-cursor" aria-hidden="true">▍</span>
         </div>
       )}
