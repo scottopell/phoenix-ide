@@ -29,7 +29,11 @@ import {
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
   SseErrorDataSchema,
+  ChainQaTokenSchema,
+  ChainQaCompletedSchema,
+  ChainQaFailedSchema,
 } from './sseSchemas';
+import * as v from 'valibot';
 
 function makeEvent(data: unknown): Event {
   // parseEvent casts Event -> MessageEvent and reads `.data`. happy-dom ships
@@ -602,5 +606,80 @@ describe('message_type picklist tripwire', () => {
     const actualSet = new Set<string>(MESSAGE_TYPE_OPTIONS);
 
     expect(actualSet).toEqual(expectedSet);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phoenix Chains v1: chain Q&A SSE schemas (REQ-CHN-004 / 005).
+//
+// These exercise the runtime validators added in Phase 4 — distinct from
+// the conversation-scoped events because chain broadcasters carry a
+// per-question demux discriminator (`chain_qa_id`) instead of the
+// per-conversation `sequence_id`.
+// ---------------------------------------------------------------------------
+
+describe('chain Q&A SSE schemas', () => {
+  it('accepts a well-formed chain_qa_token payload', () => {
+    const result = v.safeParse(ChainQaTokenSchema, {
+      chain_qa_id: 'qa-1',
+      delta: 'hello',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output.chain_qa_id).toBe('qa-1');
+      expect(result.output.delta).toBe('hello');
+    }
+  });
+
+  it('rejects chain_qa_token missing chain_qa_id', () => {
+    const result = v.safeParse(ChainQaTokenSchema, { delta: 'hello' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a well-formed chain_qa_completed payload', () => {
+    const result = v.safeParse(ChainQaCompletedSchema, {
+      chain_qa_id: 'qa-2',
+      full_answer: 'the answer',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output.full_answer).toBe('the answer');
+    }
+  });
+
+  it('accepts chain_qa_failed with null partial_answer', () => {
+    const result = v.safeParse(ChainQaFailedSchema, {
+      chain_qa_id: 'qa-3',
+      error: 'boom',
+      partial_answer: null,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output.partial_answer).toBeNull();
+    }
+  });
+
+  it('accepts chain_qa_failed with a string partial_answer', () => {
+    const result = v.safeParse(ChainQaFailedSchema, {
+      chain_qa_id: 'qa-4',
+      error: 'oops',
+      partial_answer: 'partial',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output.partial_answer).toBe('partial');
+    }
+  });
+
+  it('rejects chain_qa_failed without partial_answer key', () => {
+    // partial_answer is `Option<String>` Rust-side which serializes as
+    // `null` when None (the wire is explicit, not absent). The schema
+    // requires the key to be present so a missing key surfaces as a
+    // validation error rather than silently coercing to null.
+    const result = v.safeParse(ChainQaFailedSchema, {
+      chain_qa_id: 'qa-5',
+      error: 'no partial key',
+    });
+    expect(result.success).toBe(false);
   });
 });

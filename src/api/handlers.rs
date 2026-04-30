@@ -3,6 +3,7 @@
 //! REQ-API-001 through REQ-API-010
 
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
+use super::chains::{get_chain, set_chain_name, stream_chain, submit_chain_question};
 use super::git_handlers::list_git_branches;
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
@@ -116,6 +117,14 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Slug resolution (REQ-API-007)
         .route("/api/conversations/by-slug/:slug", get(get_by_slug))
+        // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
+        .route("/api/chains/:rootId", get(get_chain))
+        .route("/api/chains/:rootId/qa", post(submit_chain_question))
+        .route(
+            "/api/chains/:rootId/name",
+            axum::routing::patch(set_chain_name),
+        )
+        .route("/api/chains/:rootId/stream", get(stream_chain))
         // Directory browser (REQ-API-008)
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
@@ -2835,6 +2844,7 @@ async fn shared_sse_stream(
 // Error Handling
 // ============================================================
 
+#[derive(Debug)]
 pub(super) enum AppError {
     BadRequest(String),
     NotFound(String),

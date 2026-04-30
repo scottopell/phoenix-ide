@@ -35,7 +35,9 @@
 //! conflate two unrelated total-orderings; a fresh broadcaster sharpens the
 //! semantic boundary.
 
-#![allow(dead_code)] // Phase 3: registry surface; Phase 4 wires API handlers.
+// Phase 4 wires the registry into `AppState` and the chains API handlers; a
+// few diagnostic accessors below remain test-only and are individually
+// allow-listed.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,6 +78,7 @@ pub enum ChainSseEvent {
 
 impl ChainSseEvent {
     /// `chain_qa_id` discriminator the subscriber filters on.
+    #[allow(dead_code)] // Used by tests; exported for any future consumer that demuxes events directly.
     pub fn chain_qa_id(&self) -> &str {
         match self {
             Self::Token { chain_qa_id, .. }
@@ -217,6 +220,7 @@ impl ChainRuntimeRegistry {
 
     /// Look up an existing runtime without creating one. Returns `None` when
     /// no runtime is registered for the chain.
+    #[allow(dead_code)] // Diagnostic / test-only — handlers always go through `get_or_create`.
     pub async fn get(&self, root_conv_id: &str) -> Option<Arc<ChainRuntime>> {
         self.inner.lock().await.get(root_conv_id).cloned()
     }
@@ -244,11 +248,13 @@ impl ChainRuntimeRegistry {
     }
 
     /// Number of registered runtimes (test-only diagnostic).
+    #[allow(dead_code)] // Test diagnostics.
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
     }
 
     /// Whether `root_conv_id` has a registered runtime (test-only).
+    #[allow(dead_code)] // Test diagnostics.
     pub async fn contains(&self, root_conv_id: &str) -> bool {
         self.inner.lock().await.contains_key(root_conv_id)
     }

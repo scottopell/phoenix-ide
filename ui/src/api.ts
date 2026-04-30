@@ -18,7 +18,31 @@ export type {
   SseConversationBecameTerminalData,
   SseErrorData,
   SseBreadcrumb,
+  ChainQaTokenData,
+  ChainQaCompletedData,
+  ChainQaFailedData,
 } from './sseSchemas';
+
+// Phoenix Chains v1 — generated wire shapes (Rust-derived via ts-rs).
+// Re-exported here so chain-page components can import the chain page
+// snapshot type and per-row Q&A history shape from a single import path.
+import type { ChainView as ChainViewType } from './generated/ChainView';
+import type { SubmitChainQaResponse as SubmitChainQaResponseType } from './generated/SubmitChainQaResponse';
+import * as v from 'valibot';
+import {
+  ChainQaTokenSchema,
+  ChainQaCompletedSchema,
+  ChainQaFailedSchema,
+  type ChainQaTokenData,
+  type ChainQaCompletedData,
+  type ChainQaFailedData,
+} from './sseSchemas';
+export type { ChainView } from './generated/ChainView';
+export type { ChainMemberSummary } from './generated/ChainMemberSummary';
+export type { ChainPosition } from './generated/ChainPosition';
+export type { ChainQaRow } from './generated/ChainQaRow';
+export type { ChainQaStatus } from './generated/ChainQaStatus';
+export type { SubmitChainQaResponse } from './generated/SubmitChainQaResponse';
 
 export interface Conversation {
   id: string;
@@ -710,4 +734,116 @@ export const api = {
     return resp.json();
   },
 
+  // -----------------------------------------------------------------
+  // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
+  //
+  // The four endpoints below mirror `src/api/chains.rs`. Response
+  // shapes come straight from the Rust-generated ts-rs types
+  // (`ChainView`, `SubmitChainQaResponse`); SSE events are validated
+  // by the chain Q&A schemas in `./sseSchemas`.
+  // -----------------------------------------------------------------
+
+  /** GET /api/chains/:rootId — full chain snapshot for the chain page. */
+  async getChain(rootId: string): Promise<ChainViewType> {
+    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}`);
+    if (resp.status === 404) throw new Error('Chain not found');
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to load chain');
+    }
+    return resp.json();
+  },
+
+  /** POST /api/chains/:rootId/qa — submit a question. Returns synchronously
+   *  with the `chain_qa_id`; tokens stream over the SSE endpoint and the
+   *  persisted answer is fetched from `getChain` when complete. */
+  async submitChainQuestion(
+    rootId: string,
+    question: string,
+  ): Promise<SubmitChainQaResponseType> {
+    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/qa`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    if (resp.status === 404) throw new Error('Chain not found');
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to submit question');
+    }
+    return resp.json();
+  },
+
+  /** PATCH /api/chains/:rootId/name — set or clear the user-overridden
+   *  chain name. Pass `null` to clear; the server falls back to the chain
+   *  root's title for `display_name`. Returns the refreshed `ChainView`. */
+  async setChainName(
+    rootId: string,
+    name: string | null,
+  ): Promise<ChainViewType> {
+    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/name`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (resp.status === 404) throw new Error('Chain not found');
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to set chain name');
+    }
+    return resp.json();
+  },
+
 };
+
+// ---------------------------------------------------------------------------
+// Chain SSE subscription
+// ---------------------------------------------------------------------------
+
+/** Discriminated union of chain Q&A events delivered over SSE. The `type`
+ *  field matches the SSE `event:` label so consumers can dispatch on it
+ *  without re-deriving the discriminator from the payload. */
+export type ChainSseEventData =
+  | ({ type: 'chain_qa_token' } & ChainQaTokenData)
+  | ({ type: 'chain_qa_completed' } & ChainQaCompletedData)
+  | ({ type: 'chain_qa_failed' } & ChainQaFailedData);
+
+/** Subscribe to a chain's Q&A token stream. Returns an EventSource so the
+ *  caller can `close()` it on unmount. Events that fail schema validation
+ *  are reported via `onError` and dropped — the Rust-generated type is the
+ *  source of truth, so a validation failure means a wire-format drift the
+ *  server should be loud about (matches the conversation-SSE convention).
+ *
+ *  Multiple concurrent Q&As demux on `chain_qa_id`; the caller filters
+ *  events to its own question id. */
+export function subscribeToChainStream(
+  rootId: string,
+  onEvent: (event: ChainSseEventData) => void,
+  onError?: (err: unknown) => void,
+): EventSource {
+  const source = new EventSource(`/api/chains/${encodeURIComponent(rootId)}/stream`);
+
+  const handle = <T,>(
+    eventName: 'chain_qa_token' | 'chain_qa_completed' | 'chain_qa_failed',
+    schema: v.GenericSchema<unknown, T>,
+  ) => {
+    source.addEventListener(eventName, (msg) => {
+      try {
+        const raw: unknown = JSON.parse((msg as MessageEvent).data);
+        const parsed = v.parse(schema, raw);
+        onEvent({ type: eventName, ...parsed } as ChainSseEventData);
+      } catch (err) {
+        if (onError) onError(err);
+      }
+    });
+  };
+
+  handle('chain_qa_token', ChainQaTokenSchema);
+  handle('chain_qa_completed', ChainQaCompletedSchema);
+  handle('chain_qa_failed', ChainQaFailedSchema);
+
+  if (onError) {
+    source.addEventListener('error', (err) => onError(err));
+  }
+  return source;
+}

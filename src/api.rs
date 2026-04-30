@@ -4,6 +4,7 @@
 
 mod assets;
 pub mod auth;
+mod chains;
 mod git_handlers;
 mod handlers;
 mod lifecycle_handlers;
@@ -15,6 +16,7 @@ pub use handlers::create_router;
 #[allow(unused_imports)] // Public API re-exports
 pub use types::*;
 
+use crate::chain_qa::ChainQa;
 use crate::db::Database;
 use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
@@ -37,6 +39,10 @@ pub struct AppState {
     pub password: Option<String>,
     /// Active PTY terminal sessions keyed by conversation ID (REQ-TERM-003).
     pub terminals: ActiveTerminals,
+    /// Chain Q&A backend (REQ-CHN-001/004/005). Owns the
+    /// [`crate::chain_runtime::ChainRuntimeRegistry`] that the chains API
+    /// handlers subscribe to and publish onto.
+    pub chain_qa: ChainQa,
 }
 
 impl AppState {
@@ -58,6 +64,12 @@ impl AppState {
         ));
         runtime.start_sub_agent_handler().await;
         let terminals = runtime.terminals.clone();
+        // Chain Q&A is constructed last so it can share the same `Database`
+        // and `ModelRegistry` handles. Its internal `ChainRuntimeRegistry`
+        // is owned by this `ChainQa` value — chain SSE handlers reach into
+        // it via `state.chain_qa.runtime_registry()` so subscribers and
+        // publishers go through one registry.
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
         Self {
             runtime,
             llm_registry,
@@ -67,6 +79,7 @@ impl AppState {
             credential_helper,
             password,
             terminals,
+            chain_qa,
         }
     }
 }

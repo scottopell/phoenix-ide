@@ -9,12 +9,10 @@
 //! persistence helpers in this module are shaped so that swap is a
 //! reuse-and-rewrap, not a rewrite — see [`ChainQa::run_answer_invocation`].
 
-// Phase 2 ships the backend in isolation; Phase 3 wires it into runtime
-// streaming and Phase 4 surfaces it via API handlers. Until then, the public
-// surface is exercised only by the in-module tests, which clippy reads as
-// "never used in non-test code". Same idiom as the chain DB methods in
-// Phase 1 (`#[allow(dead_code)] // Callers added in Phase 2`).
-#![allow(dead_code)]
+// Phase 4 wires this module into AppState via the chains API handlers; the
+// per-item `#[allow(dead_code)]` annotations remaining below cover surface
+// that's still test-only (e.g. `submit_question_blocking`) or reserved for
+// near-future callers.
 
 use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
 use crate::db::{
@@ -74,6 +72,7 @@ pub struct BundledContext {
     pub blocks: Vec<MemberContextBlock>,
     /// `model_id` used for any leaf-summary pre-step (None if the leaf was
     /// taken directly). Threaded through for diagnostics; not persisted.
+    #[allow(dead_code)] // Diagnostic surface; consumed by tests asserting summarization fired.
     pub leaf_summary_model: Option<String>,
 }
 
@@ -216,6 +215,7 @@ impl ChainQa {
     /// Construct with an externally-owned chain runtime registry. Production
     /// code shares one registry across the API + handler layer so SSE
     /// subscribers and Q&A submissions go through the same broadcasters.
+    #[allow(dead_code)] // Reserved for callers that need a registry shared across multiple ChainQa values.
     pub fn with_registry(
         db: Database,
         llm_registry: Arc<ModelRegistry>,

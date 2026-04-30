@@ -37,6 +37,9 @@ import type {
   SseConversationUpdateData as WireConversationUpdateData,
   SseErrorData as WireErrorData,
   SseBreadcrumb as GeneratedSseBreadcrumb,
+  ChainQaTokenData as WireChainQaTokenData,
+  ChainQaCompletedData as WireChainQaCompletedData,
+  ChainQaFailedData as WireChainQaFailedData,
 } from './generated/sse';
 
 // ---------------------------------------------------------------------------
@@ -259,6 +262,44 @@ export const SseErrorDataSchema = v.looseObject({
   message: v.string(),
   error: v.unknown(),
 }) satisfies v.GenericSchema<unknown, WireErrorData>;
+
+// ---------------------------------------------------------------------------
+// Chain Q&A wire-event schemas (Phoenix Chains v1, REQ-CHN-004 / 005).
+//
+// Distinct from the conversation-scoped events above because chain
+// broadcasters carry a per-question demux discriminator (`chain_qa_id`)
+// instead of the per-conversation monotonic `sequence_id`. Schemas use the
+// same `satisfies v.GenericSchema<unknown, T>` annotation pattern so a
+// Rust-side change to `ChainSseWireEvent` lights up here as a tsc error
+// against the generated TS type.
+// ---------------------------------------------------------------------------
+
+/** Streaming token chunk for an in-flight chain Q&A. */
+export const ChainQaTokenSchema = v.looseObject({
+  chain_qa_id: v.string(),
+  delta: v.string(),
+}) satisfies v.GenericSchema<unknown, WireChainQaTokenData>;
+
+/** Stream completed cleanly. `full_answer` matches what was just persisted
+ *  to `chain_qa.answer`; subsequent reads via the GET endpoint return the
+ *  same string. */
+export const ChainQaCompletedSchema = v.looseObject({
+  chain_qa_id: v.string(),
+  full_answer: v.string(),
+}) satisfies v.GenericSchema<unknown, WireChainQaCompletedData>;
+
+/** Stream ended in error before producing a full answer. `partial_answer`
+ *  carries whatever tokens streamed before the failure (may be `null` when
+ *  no token was emitted). */
+export const ChainQaFailedSchema = v.looseObject({
+  chain_qa_id: v.string(),
+  error: v.string(),
+  partial_answer: v.nullable(v.string()),
+}) satisfies v.GenericSchema<unknown, WireChainQaFailedData>;
+
+export type ChainQaTokenData = v.InferOutput<typeof ChainQaTokenSchema>;
+export type ChainQaCompletedData = v.InferOutput<typeof ChainQaCompletedSchema>;
+export type ChainQaFailedData = v.InferOutput<typeof ChainQaFailedSchema>;
 
 // The `Sse*Data` types callers import are the schemas' `InferOutput`s —
 // i.e. what the validator produces after transforming wire data into UI
