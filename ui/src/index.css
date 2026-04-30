@@ -8075,9 +8075,14 @@ html * {
   opacity: 0.6;
 }
 
+/* The LATEST emphasis must signal "this is the most-recently-active
+ * member" without looking like a "selected"/"active" affordance --
+ * the chain page does NOT have a notion of selecting a member; Q&A
+ * always operates over the whole chain. So keep the LATEST badge as
+ * the primary signal and use only a subtle background tint on the
+ * card, no accent border. */
 .chain-member--latest .chain-member-card {
-  border-color: var(--accent-blue);
-  box-shadow: inset 3px 0 0 var(--accent-blue);
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.025));
 }
 
 .chain-member-row1 {
@@ -8153,6 +8158,22 @@ html * {
   margin-top: 6px;
   font-size: 12px;
   opacity: 0.8;
+}
+
+.chain-qa-list-heading {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 0 4px 0;
+}
+
+.chain-qa-list-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0 0 14px 0;
+  font-style: italic;
 }
 
 .chain-qa-list {

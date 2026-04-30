@@ -533,27 +533,34 @@ function ChainQaColumn({
           <div className="chain-qa-empty">
             <p>No questions yet.</p>
             <p className="chain-qa-empty-hint">
-              Ask the chain anything — answers see the full content of every
-              conversation in this chain.
+              This is a scratchpad for asking the chain anything. Each
+              question is answered fresh against the full chain — they
+              don't build on each other.
             </p>
           </div>
         ) : (
-          <ul className="chain-qa-list">
-            {persisted.map((row) => (
-              <li key={row.id}>
-                <ChainQaCard
-                  row={row}
-                  chain={chain}
-                  onReask={onReask}
-                />
-              </li>
-            ))}
-            {inflight.map((entry) => (
-              <li key={entry.chainQaId}>
-                <ChainQaInflightCard entry={entry} onReask={onReask} />
-              </li>
-            ))}
-          </ul>
+          <>
+            <h3 className="chain-qa-list-heading">Past questions</h3>
+            <p className="chain-qa-list-hint">
+              Each question stands alone — answers don't carry forward.
+            </p>
+            <ul className="chain-qa-list">
+              {persisted.map((row) => (
+                <li key={row.id}>
+                  <ChainQaCard
+                    row={row}
+                    chain={chain}
+                    onReask={onReask}
+                  />
+                </li>
+              ))}
+              {inflight.map((entry) => (
+                <li key={entry.chainQaId}>
+                  <ChainQaInflightCard entry={entry} onReask={onReask} />
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </div>
       {sseLost && (
