@@ -1,21 +1,29 @@
 // Chain page (REQ-CHN-003 / 004 / 005 / 006 / 007).
 //
-// Two-column layout: members on the left, Q&A panel (history + bottom-anchored
-// input) on the right. SSE subscription is opened on mount and closed on
+// Two-column layout: members on the left, Q&A panel (a vertical scratchpad of
+// pair cards) on the right. SSE subscription is opened on mount and closed on
 // unmount; tokens are demuxed by `chain_qa_id` so a sibling tab's question on
 // the same chain does not bleed into this tab's render.
 //
+// Layout (REQ-CHN-005). The Q&A panel is a top-down list of "pair cards." The
+// active pair card sits at index 0 — its Q row is an autofocused textarea, its
+// A row is a placeholder. On submit, the just-submitted pair drops into the
+// list at index 1 (newest in-flight just below the active card) and the active
+// card refocuses for the next question. Persisted pairs render in reverse
+// chronological order below in-flight pairs.
+//
 // Optimistic-update pattern: the user submits a question, we eagerly render an
-// in-flight ChainQaRow with `answer = ''`, and SSE token events append to its
+// in-flight pair card with `answer = ''`, and SSE token events append to its
 // answer in component state. On `chain_qa_completed` / `chain_qa_failed` we
 // re-fetch the chain to pick up the canonical persisted row (which also bumps
 // `current_member_count` / `current_total_messages` if the chain advanced
 // while the question was streaming).
 //
 // REQ-CHN-006 visual independence: each Q&A entry renders as a self-contained
-// card with no chat-style ligatures (no thread/reply lines, no avatar
-// continuity, no indenting follow-ups). The `ChainQaCard` keeps that promise
-// structurally — siblings are flat list items separated by a vertical gap.
+// pair card with explicit `Q:` and `A:` rows — no chat-style ligatures, no
+// thread/reply lines. The active card has the same shape as past pairs (just
+// unfilled), which structurally communicates that the next question creates a
+// new pair rather than continuing a thread.
 
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
@@ -60,9 +68,19 @@ export function ChainPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [inflight, setInflight] = useState<Record<string, InflightQa>>({});
+  // Submission order for in-flight entries. We display newest-first, so we
+  // walk this list in reverse on render. (Object key order on `inflight`
+  // alone is not a reliable ordering source — Record iteration order is not
+  // a guarantee we want to rely on for UI ordering.)
+  const [inflightOrder, setInflightOrder] = useState<string[]>([]);
   const [draft, setDraft] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [sseLost, setSseLost] = useState(false);
+
+  // Imperative handle to the active pair's textarea so we can refocus it
+  // immediately after submit (the user agreed they should be able to type the
+  // next question without waiting for the answer).
+  const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Keep a ref so SSE callbacks can append tokens without re-subscribing.
   const inflightRef = useRef(inflight);
@@ -139,6 +157,7 @@ export function ChainPage() {
           delete next[evt.chain_qa_id];
           return next;
         });
+        setInflightOrder((prev) => prev.filter((id) => id !== evt.chain_qa_id));
         // Refetch so the persisted ChainQaRow replaces the optimistic entry.
         // Even for sibling-tab questions, refetching is the simplest way to
         // surface their newly-persisted answer.
@@ -167,6 +186,9 @@ export function ChainPage() {
             delete next[evt.chain_qa_id];
             return next;
           });
+          setInflightOrder((prev) =>
+            prev.filter((id) => id !== evt.chain_qa_id),
+          );
         });
       }
     };
@@ -202,7 +224,15 @@ export function ChainPage() {
             error: null,
           },
         }));
+        setInflightOrder((prev) => [...prev, chain_qa_id]);
         setDraft('');
+        // Refocus the active textarea so the user can immediately type the
+        // next question. We're reusing the same DOM node; it just got cleared.
+        // Defer to a microtask so React has a chance to flush the value reset
+        // before we steal focus back.
+        queueMicrotask(() => {
+          activeTextareaRef.current?.focus();
+        });
       } catch (err) {
         // Surface the error to the user via a transient banner but keep the
         // draft so they can retry without retyping.
@@ -220,21 +250,28 @@ export function ChainPage() {
     void submit(draft);
   };
 
+  /** Re-ask: populate the active textarea with the original question and
+   *  focus it. Do NOT auto-submit — REQ-CHN-007's editing pattern preserves
+   *  user agency, and consistency with that precedent matters here. */
   const handleReask = (question: string) => {
     setDraft(question);
-    void submit(question);
+    queueMicrotask(() => {
+      activeTextareaRef.current?.focus();
+    });
   };
 
-  // Sort persisted rows by created_at ascending; in-flight entries are appended
-  // after them in submission order. The "most recent immediately above the
-  // input" rule (REQ-CHN-005) falls out of this ordering plus the bottom-
-  // anchored layout.
+  // Persisted rows in chronological order (oldest first). We reverse on render
+  // so the newest persisted card sits just below in-flight cards. In-flight
+  // entries also render newest-first; both kinds of cards stack below the
+  // active card at index 0.
   const renderableQas = useMemo(() => {
     const persisted: ChainQaRow[] = chain?.qa_history.slice() ?? [];
     persisted.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
-    const inflightList = Object.values(inflight);
+    const inflightList: InflightQa[] = inflightOrder
+      .map((id) => inflight[id])
+      .filter((entry): entry is InflightQa => entry !== undefined);
     return { persisted, inflightList };
-  }, [chain, inflight]);
+  }, [chain, inflight, inflightOrder]);
 
   // Loading state — show a lightweight placeholder. Errors take over the
   // whole page (404 → empty state, generic error → error message + retry).
@@ -308,6 +345,7 @@ export function ChainPage() {
           sseLost={sseLost}
           onSubmit={handleSubmit}
           onReask={handleReask}
+          activeTextareaRef={activeTextareaRef}
           onRetryConnection={() => {
             // Force the SSE effect to re-run by re-fetching first; the
             // EventSource itself will already be auto-reconnecting under the
@@ -482,7 +520,7 @@ function positionLabel(p: ChainMemberSummary['position']): string {
 }
 
 // ---------------------------------------------------------------------------
-// Q&A column
+// Q&A column — scratchpad of pair cards
 // ---------------------------------------------------------------------------
 
 interface ChainQaColumnProps {
@@ -495,6 +533,7 @@ interface ChainQaColumnProps {
   sseLost: boolean;
   onSubmit: (e: FormEvent<HTMLFormElement>) => void;
   onReask: (question: string) => void;
+  activeTextareaRef: React.RefObject<HTMLTextAreaElement>;
   onRetryConnection: () => void;
 }
 
@@ -508,60 +547,43 @@ function ChainQaColumn({
   sseLost,
   onSubmit,
   onReask,
+  activeTextareaRef,
   onRetryConnection,
 }: ChainQaColumnProps) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  // Autoscroll on new content so the most-recent Q&A or live token sits near
-  // the input. We don't fight the user if they've scrolled up — only stick to
-  // the bottom when we're already there.
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-    if (nearBottom) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [persisted, inflight]);
-
-  const isEmpty = persisted.length === 0 && inflight.length === 0;
-
   return (
     <section className="chain-qa" aria-label="Chain questions and answers">
-      <div className="chain-qa-scroll" ref={scrollRef}>
-        {isEmpty ? (
-          <div className="chain-qa-empty">
-            <p>No questions yet.</p>
-            <p className="chain-qa-empty-hint">
-              This is a scratchpad for asking the chain anything. Each
-              question is answered fresh against the full chain — they
-              don't build on each other.
-            </p>
-          </div>
-        ) : (
-          <>
-            <h3 className="chain-qa-list-heading">Past questions</h3>
-            <p className="chain-qa-list-hint">
-              Each question stands alone — answers don't carry forward.
-            </p>
-            <ul className="chain-qa-list">
-              {persisted.map((row) => (
-                <li key={row.id}>
-                  <ChainQaCard
-                    row={row}
-                    chain={chain}
-                    onReask={onReask}
-                  />
-                </li>
-              ))}
-              {inflight.map((entry) => (
-                <li key={entry.chainQaId}>
-                  <ChainQaInflightCard entry={entry} onReask={onReask} />
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
+      <div className="chain-qa-scroll">
+        <ul className="chain-qa-list">
+          <li>
+            <ChainQaPairCard
+              variant="active"
+              draft={draft}
+              setDraft={setDraft}
+              submitting={submitting}
+              onSubmit={onSubmit}
+              activeTextareaRef={activeTextareaRef}
+            />
+          </li>
+          {[...inflight].reverse().map((entry) => (
+            <li key={entry.chainQaId}>
+              <ChainQaPairCard
+                variant={entry.error ? 'inflight-failed' : 'inflight-streaming'}
+                inflightEntry={entry}
+                onReask={onReask}
+              />
+            </li>
+          ))}
+          {[...persisted].reverse().map((row) => (
+            <li key={row.id}>
+              <ChainQaPairCard
+                variant="persisted"
+                row={row}
+                chain={chain}
+                onReask={onReask}
+              />
+            </li>
+          ))}
+        </ul>
       </div>
       {sseLost && (
         <div className="chain-qa-sse-lost" role="status">
@@ -571,58 +593,212 @@ function ChainQaColumn({
           </button>
         </div>
       )}
-      <form className="chain-qa-form" onSubmit={onSubmit}>
-        <textarea
-          className="chain-qa-input"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              if (draft.trim().length > 0 && !submitting) {
-                // Pretend the form submitted — keeps the single submit path.
-                onSubmit({
-                  preventDefault: () => {},
-                } as unknown as FormEvent<HTMLFormElement>);
-              }
-            }
-          }}
-          placeholder="Ask the chain a question…"
-          rows={2}
-          disabled={submitting}
-          aria-label="Question"
-        />
-        <button
-          type="submit"
-          className="btn-primary chain-qa-submit"
-          disabled={submitting || draft.trim().length === 0}
-        >
-          {submitting ? 'Sending…' : 'Ask'}
-        </button>
-      </form>
     </section>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Q&A cards (per-status rendering, REQ-CHN-005)
+// Pair card — one component, multiple visual variants (REQ-CHN-005, -006)
 // ---------------------------------------------------------------------------
+//
+// A pair card always renders two labeled rows: `Q:` and `A:`. The variants
+// differ only in what fills those rows.
+//
+//   active             — Q row = autofocused textarea + Ask button
+//                        A row = "waiting for question" placeholder
+//   inflight-streaming — Q row = static text
+//                        A row = streaming markdown + blinking cursor
+//   inflight-failed    — Q row = static text
+//                        A row = partial markdown + "Failed: <error>" + Re-ask
+//   persisted          — Q row = static text
+//                        A row = depends on row.status:
+//                          completed — markdown answer + staleness tag
+//                          in_flight — sibling-tab "Still working…" placeholder
+//                          failed    — partial markdown + "Failed" + Re-ask
+//                          abandoned — "Did not complete" + Re-ask
 
-interface ChainQaCardProps {
-  row: ChainQaRow;
-  chain: ChainView;
-  onReask: (question: string) => void;
+type PairVariant =
+  | 'active'
+  | 'inflight-streaming'
+  | 'inflight-failed'
+  | 'persisted';
+
+interface ChainQaPairCardProps {
+  variant: PairVariant;
+  // active variant
+  draft?: string;
+  setDraft?: (s: string) => void;
+  submitting?: boolean;
+  onSubmit?: (e: FormEvent<HTMLFormElement>) => void;
+  activeTextareaRef?: React.RefObject<HTMLTextAreaElement>;
+  // inflight variants
+  inflightEntry?: InflightQa;
+  // persisted variant
+  row?: ChainQaRow;
+  chain?: ChainView;
+  // shared (inflight-failed, persisted)
+  onReask?: (question: string) => void;
 }
 
-function ChainQaCard({ row, chain, onReask }: ChainQaCardProps) {
+function ChainQaPairCard(props: ChainQaPairCardProps) {
+  if (props.variant === 'active') {
+    return <ActivePairCard {...props} />;
+  }
+  if (props.variant === 'inflight-streaming' || props.variant === 'inflight-failed') {
+    return <InflightPairCard {...props} />;
+  }
+  return <PersistedPairCard {...props} />;
+}
+
+function ActivePairCard({
+  draft = '',
+  setDraft = () => {},
+  submitting = false,
+  onSubmit = () => {},
+  activeTextareaRef,
+}: ChainQaPairCardProps) {
+  // Autofocus on mount. The ref is also used by the parent to refocus after
+  // submit (which doesn't unmount this component — same node, just cleared).
+  useEffect(() => {
+    activeTextareaRef?.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const canSubmit = draft.trim().length > 0 && !submitting;
+
+  return (
+    <article className="chain-qa-pair chain-qa-pair--active">
+      <form className="chain-qa-pair-form" onSubmit={onSubmit}>
+        <div className="chain-qa-pair-row">
+          <span className="chain-qa-pair-label">Q:</span>
+          <div className="chain-qa-pair-content">
+            <textarea
+              ref={activeTextareaRef}
+              className="chain-qa-input"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  if (canSubmit) {
+                    // Single submit path — mirror the form submit.
+                    onSubmit({
+                      preventDefault: () => {},
+                    } as unknown as FormEvent<HTMLFormElement>);
+                  }
+                }
+              }}
+              placeholder="Ask the chain a question…"
+              rows={2}
+              disabled={submitting}
+              aria-label="Question"
+            />
+          </div>
+        </div>
+        <div className="chain-qa-pair-row">
+          <span className="chain-qa-pair-label">A:</span>
+          <div className="chain-qa-pair-content chain-qa-pair-content--placeholder">
+            <em>waiting for question</em>
+          </div>
+        </div>
+        <div className="chain-qa-pair-actions">
+          <button
+            type="submit"
+            className="btn-primary chain-qa-ask"
+            disabled={!canSubmit}
+          >
+            {submitting ? 'Sending…' : 'Ask'}
+          </button>
+        </div>
+      </form>
+    </article>
+  );
+}
+
+function InflightPairCard({ inflightEntry, onReask }: ChainQaPairCardProps) {
+  if (!inflightEntry) return null;
+  const isFailed = inflightEntry.error !== null;
+  const className = isFailed
+    ? 'chain-qa-pair chain-qa-pair--failed'
+    : 'chain-qa-pair chain-qa-pair--streaming';
+  return (
+    <article className={className}>
+      <div className="chain-qa-pair-row">
+        <span className="chain-qa-pair-label">Q:</span>
+        <div className="chain-qa-pair-content chain-qa-pair-question">
+          {inflightEntry.question}
+        </div>
+      </div>
+      <div className="chain-qa-pair-row">
+        <span className="chain-qa-pair-label">A:</span>
+        <div className="chain-qa-pair-content">
+          {isFailed ? (
+            <div className="chain-qa-answer chain-qa-answer--failed">
+              {inflightEntry.answer.length > 0 && (
+                <div className="chain-qa-partial chain-qa-markdown">
+                  <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+                    {inflightEntry.answer}
+                  </ReactMarkdown>
+                </div>
+              )}
+              <div className="chain-qa-failure">
+                <span className="chain-qa-failure-label">
+                  Failed: {inflightEntry.error}
+                </span>
+                <button
+                  type="button"
+                  className="btn-link"
+                  onClick={() => onReask?.(inflightEntry.question)}
+                >
+                  Re-ask
+                </button>
+              </div>
+            </div>
+          ) : inflightEntry.preToken ? (
+            <div
+              className="chain-qa-answer chain-qa-answer--skeleton"
+              aria-live="polite"
+            >
+              <span className="chain-qa-skeleton-line" />
+              <span className="chain-qa-skeleton-line" />
+              <span className="chain-qa-skeleton-line chain-qa-skeleton-line--short" />
+            </div>
+          ) : (
+            <div
+              className="chain-qa-answer chain-qa-answer--streaming chain-qa-markdown"
+              aria-live="polite"
+            >
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+                {inflightEntry.answer}
+              </ReactMarkdown>
+              <span className="chain-qa-cursor" aria-hidden="true">
+                ▍
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function PersistedPairCard({ row, chain, onReask }: ChainQaPairCardProps) {
+  if (!row || !chain) return null;
   const stale = stalenessLabel(row, chain);
   return (
-    <article className={`chain-qa-card chain-qa-card--${row.status}`}>
-      <div className="chain-qa-question">
-        <span className="chain-qa-question-prefix">Q.</span>
-        <span className="chain-qa-question-text">{row.question}</span>
+    <article className={`chain-qa-pair chain-qa-pair--${row.status}`}>
+      <div className="chain-qa-pair-row">
+        <span className="chain-qa-pair-label">Q:</span>
+        <div className="chain-qa-pair-content chain-qa-pair-question">
+          {row.question}
+        </div>
       </div>
-      {renderAnswerByStatus(row, onReask)}
+      <div className="chain-qa-pair-row">
+        <span className="chain-qa-pair-label">A:</span>
+        <div className="chain-qa-pair-content">
+          {renderPersistedAnswer(row, onReask)}
+        </div>
+      </div>
       <div className="chain-qa-meta">
         <time dateTime={row.created_at}>{formatShortDateTime(row.created_at)}</time>
         {stale && <span className="chain-qa-stale">{stale}</span>}
@@ -631,9 +807,9 @@ function ChainQaCard({ row, chain, onReask }: ChainQaCardProps) {
   );
 }
 
-function renderAnswerByStatus(
+function renderPersistedAnswer(
   row: ChainQaRow,
-  onReask: (q: string) => void,
+  onReask: ((q: string) => void) | undefined,
 ): JSX.Element {
   if (row.status === 'completed') {
     return (
@@ -646,9 +822,8 @@ function renderAnswerByStatus(
   }
   if (row.status === 'in_flight') {
     // Sibling-tab streaming case (REQ-CHN-005 "still working…" placeholder).
-    // Our own in-flight Q&As are rendered via ChainQaInflightCard, not this
-    // function — so reaching here means another subscriber is currently
-    // generating this row.
+    // Our own in-flight Q&As render via InflightPairCard, not this function —
+    // so reaching here means another subscriber is currently generating this.
     return (
       <div className="chain-qa-answer chain-qa-answer--placeholder">
         <em>Still working…</em>
@@ -670,7 +845,7 @@ function renderAnswerByStatus(
           <button
             type="button"
             className="btn-link"
-            onClick={() => onReask(row.question)}
+            onClick={() => onReask?.(row.question)}
           >
             Re-ask
           </button>
@@ -686,65 +861,12 @@ function renderAnswerByStatus(
         <button
           type="button"
           className="btn-link"
-          onClick={() => onReask(row.question)}
+          onClick={() => onReask?.(row.question)}
         >
           Re-ask
         </button>
       </div>
     </div>
-  );
-}
-
-interface ChainQaInflightCardProps {
-  entry: InflightQa;
-  onReask: (q: string) => void;
-}
-
-function ChainQaInflightCard({ entry, onReask }: ChainQaInflightCardProps) {
-  return (
-    <article className="chain-qa-card chain-qa-card--in_flight">
-      <div className="chain-qa-question">
-        <span className="chain-qa-question-prefix">Q.</span>
-        <span className="chain-qa-question-text">{entry.question}</span>
-      </div>
-      {entry.error ? (
-        <div className="chain-qa-answer chain-qa-answer--failed">
-          {entry.answer.length > 0 && (
-            <div className="chain-qa-partial chain-qa-markdown">
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
-                {entry.answer}
-              </ReactMarkdown>
-            </div>
-          )}
-          <div className="chain-qa-failure">
-            <span className="chain-qa-failure-label">Failed: {entry.error}</span>
-            <button
-              type="button"
-              className="btn-link"
-              onClick={() => onReask(entry.question)}
-            >
-              Re-ask
-            </button>
-          </div>
-        </div>
-      ) : entry.preToken ? (
-        <div className="chain-qa-answer chain-qa-answer--skeleton" aria-live="polite">
-          <span className="chain-qa-skeleton-line" />
-          <span className="chain-qa-skeleton-line" />
-          <span className="chain-qa-skeleton-line chain-qa-skeleton-line--short" />
-        </div>
-      ) : (
-        <div
-          className="chain-qa-answer chain-qa-answer--streaming chain-qa-markdown"
-          aria-live="polite"
-        >
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
-            {entry.answer}
-          </ReactMarkdown>
-          <span className="chain-qa-cursor" aria-hidden="true">▍</span>
-        </div>
-      )}
-    </article>
   );
 }
 

@@ -130,9 +130,14 @@ WHEN a user has previously asked questions on a chain
 THE SYSTEM SHALL display the prior questions and answers when the
 chain page is reopened
 
-THE SYSTEM SHALL render the input box anchored at the bottom of the
-Q&A panel, with Q&A history scrolling above it in chronological order
-such that the most recent Q&A sits immediately above the input
+THE SYSTEM SHALL render the Q&A panel as a vertical list of pair cards
+where each pair card displays an explicit `Q:` row and `A:` row. There
+SHALL always be exactly one **active pair card** at the top of the
+panel whose `Q:` row is an empty, autofocused textarea and whose `A:`
+row is a "waiting for question" placeholder. Persisted and currently
+streaming pairs SHALL render below the active card in reverse
+chronological order, with the most recent pair immediately below the
+active card.
 
 WHEN a stored Q&A answer was generated against an earlier snapshot of
 the chain (members or per-member message counts have changed since the
@@ -148,12 +153,16 @@ the user sees their question wasn't lost and can re-ask if desired
 
 **Rationale:** Users return to chains. Without persistence they lose
 answers they paid to generate and have no record of what they have
-already asked. Bottom-anchored input with chronological history matches
-the messaging pattern users already know (Slack, iMessage). Snapshot
-staleness prevents acting on stale recall — "where did we leave off?"
-captured before the latest conversation was added would mislead
-without this signal. Surfacing failed/incomplete Q&A preserves the
-user's question text rather than losing it on stream failure.
+already asked. Pair cards reinforce REQ-CHN-006's independence
+guarantee structurally — each Q&A is a self-contained object, and the
+active card is visibly the same shape as past pairs (just unfilled), so
+the user understands their next question creates a new pair rather than
+continuing a thread. Reverse-chronological ordering keeps the freshest
+context next to the active card without requiring the user to scroll.
+Snapshot staleness prevents acting on stale recall — "where did we
+leave off?" captured before the latest conversation was added would
+mislead without this signal. Surfacing failed/incomplete Q&A preserves
+the user's question text rather than losing it on stream failure.
 
 ---
 

@@ -8147,35 +8147,6 @@ html * {
   min-height: 0;
 }
 
-.chain-qa-empty {
-  color: var(--text-muted);
-  font-size: 13px;
-  padding: 32px 0;
-  text-align: center;
-}
-
-.chain-qa-empty-hint {
-  margin-top: 6px;
-  font-size: 12px;
-  opacity: 0.8;
-}
-
-.chain-qa-list-heading {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  margin: 0 0 4px 0;
-}
-
-.chain-qa-list-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin: 0 0 14px 0;
-  font-style: italic;
-}
-
 .chain-qa-list {
   list-style: none;
   margin: 0;
@@ -8184,10 +8155,14 @@ html * {
   flex-direction: column;
   /* REQ-CHN-006: visual independence — vertical gap between cards, no
    * thread/reply ligatures. */
-  gap: 16px;
+  gap: 14px;
 }
 
-.chain-qa-card {
+/* Pair card frame. Each pair (active or persisted) is a self-contained
+ * record with two labeled rows (Q: and A:). REQ-CHN-006 visual
+ * independence falls out of the explicit Q/A label gutter and the
+ * vertical gap between pairs. */
+.chain-qa-pair {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-secondary);
@@ -8197,30 +8172,64 @@ html * {
   gap: 8px;
 }
 
-.chain-qa-card--in_flight {
+/* The active pair sits at the top of the list. A subtle background tint
+ * marks it as "this is where you write" without introducing a heavy
+ * border or a chat-style outline that would imply threading. */
+.chain-qa-pair--active {
+  background: color-mix(in srgb, var(--accent-blue) 6%, var(--bg-secondary));
+}
+
+.chain-qa-pair--streaming {
   border-color: var(--accent-blue);
 }
 
-.chain-qa-card--failed {
+.chain-qa-pair--failed {
   border-color: var(--accent-red);
 }
 
-.chain-qa-question {
+.chain-qa-pair-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chain-qa-pair-row {
   display: flex;
   gap: 8px;
+  align-items: flex-start;
   font-size: 13px;
   color: var(--text-primary);
 }
 
-.chain-qa-question-prefix {
+.chain-qa-pair-label {
   flex-shrink: 0;
   font-weight: 700;
   color: var(--accent-blue);
+  /* Fixed-ish gutter so Q: / A: labels align across pair cards. */
+  width: 18px;
+  line-height: 1.55;
 }
 
-.chain-qa-question-text {
+.chain-qa-pair-content {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.chain-qa-pair-question {
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.55;
+}
+
+.chain-qa-pair-content--placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+  line-height: 1.55;
+}
+
+.chain-qa-pair-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .chain-qa-answer {
@@ -8397,17 +8406,10 @@ html * {
   border-top: 1px solid var(--border-color);
 }
 
-.chain-qa-form {
-  display: flex;
-  gap: 8px;
-  padding: 10px 16px 14px;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-secondary);
-  flex-shrink: 0;
-}
-
+/* The textarea inside the active pair card. Same shape as the previous
+ * bottom-anchored input — the only change is its position in the layout. */
 .chain-qa-input {
-  flex: 1;
+  width: 100%;
   resize: vertical;
   min-height: 44px;
   max-height: 200px;
@@ -8421,13 +8423,14 @@ html * {
   line-height: 1.5;
   outline: none;
   transition: border-color 150ms ease;
+  box-sizing: border-box;
 }
 
 .chain-qa-input:focus {
   border-color: var(--accent-blue);
 }
 
-.chain-qa-submit {
-  align-self: flex-end;
+.chain-qa-ask {
+  /* Ask button sits in the .chain-qa-pair-actions row aligned end. */
 }
 

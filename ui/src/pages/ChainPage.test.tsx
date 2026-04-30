@@ -3,7 +3,11 @@
 // Coverage targets, mapped to spec:
 //   - Members render in chain order, Latest is emphasized
 //   - Q&A history renders with status-correct UI (completed / failed / abandoned)
-//   - Submit flow: optimistic in-flight entry → token append → completed → refetch
+//     in a single pair-card render, including Re-ask affordances
+//   - Submit flow: optimistic in-flight pair drops in below the active pair,
+//     streams tokens, transitions on completed
+//   - Submit clears the active textarea and refocuses it (so the user can
+//     immediately type the next question)
 //   - Inline name edit: click → edit → Enter commits via mocked PATCH; Esc cancels
 //   - Snapshot staleness tag renders when current counts differ from snapshot
 //   - 404 branch renders the empty state without crashing
@@ -174,21 +178,22 @@ describe('ChainPage — members column', () => {
 });
 
 describe('ChainPage — Q&A history rendering', () => {
-  it('renders persisted Q&A entries with status-correct UI', async () => {
+  it('renders persisted Q&A pairs in reverse-chronological order below the active pair', async () => {
     const { api } = await import('../api');
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       makeChain({
         qa_history: [
-          makeQa('q-completed'),
-          makeQa('q-failed', {
-            status: 'failed',
-            answer: 'partial!',
-            completed_at: null,
+          makeQa('q-old', {
+            question: 'oldest question',
+            created_at: '2026-04-27T10:00:00Z',
           }),
-          makeQa('q-abandoned', {
-            status: 'abandoned',
-            answer: null,
-            completed_at: null,
+          makeQa('q-mid', {
+            question: 'middle question',
+            created_at: '2026-04-28T10:00:00Z',
+          }),
+          makeQa('q-new', {
+            question: 'newest question',
+            created_at: '2026-04-29T10:00:00Z',
           }),
         ],
       }),
@@ -197,20 +202,21 @@ describe('ChainPage — Q&A history rendering', () => {
     renderAt(ROOT_ID);
 
     await waitFor(() => {
-      expect(screen.getByText('A q-completed')).toBeInTheDocument();
+      expect(screen.getByText('newest question')).toBeInTheDocument();
     });
-    // Failed status: shows partial answer + "Failed" label + Re-ask button
-    expect(screen.getByText('partial!')).toBeInTheDocument();
-    expect(screen.getByText('Failed')).toBeInTheDocument();
-    // Abandoned status: shows "Did not complete" + Re-ask button
-    expect(screen.getByText('Did not complete')).toBeInTheDocument();
-    // Two Re-ask buttons (failed + abandoned)
-    expect(screen.getAllByRole('button', { name: 'Re-ask' })).toHaveLength(2);
+    // The list contains the active pair at index 0, then persisted pairs in
+    // reverse-chronological order: newest first, oldest last.
+    const items = document.querySelectorAll('.chain-qa-list > li');
+    expect(items.length).toBe(4);
+    expect(items[0]?.querySelector('textarea')).not.toBeNull();
+    expect(items[1]?.textContent).toContain('newest question');
+    expect(items[2]?.textContent).toContain('middle question');
+    expect(items[3]?.textContent).toContain('oldest question');
   });
 });
 
 describe('ChainPage — submit + stream', () => {
-  it('shows the optimistic in-flight entry, streams tokens, then transitions on completed', async () => {
+  it('drops the in-flight pair just below the active pair, streams tokens, then transitions on completed', async () => {
     const { api } = await import('../api');
     const initial = makeChain();
     const afterSubmit = makeChain({
@@ -239,18 +245,25 @@ describe('ChainPage — submit + stream', () => {
       expect(screen.getByText('Title m1')).toBeInTheDocument();
     });
 
-    // Type into the textarea and submit the form.
+    // Type into the active pair's textarea and submit.
     const textarea = screen.getByRole('textbox', { name: 'Question' });
     fireEvent.change(textarea, { target: { value: 'What did we land?' } });
     const submitBtn = screen.getByRole('button', { name: /Ask|Sending/ });
     fireEvent.click(submitBtn);
 
-    // Optimistic in-flight: question is already on screen with skeleton.
+    // Optimistic in-flight: question is on screen, and its pair card sits
+    // at index 1 of the .chain-qa-list (active pair is index 0).
     await waitFor(() => {
       expect(screen.getByText('What did we land?')).toBeInTheDocument();
     });
+    const items = document.querySelectorAll('.chain-qa-list > li');
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    // Index 0 is the active pair (contains the textarea).
+    expect(items[0]?.querySelector('textarea')).not.toBeNull();
+    // Index 1 is the just-submitted in-flight pair.
+    expect(items[1]?.textContent).toContain('What did we land?');
 
-    // Stream a token via the captured SSE handle.
+    // Stream tokens via the captured SSE handle.
     expect(sseHandles).toHaveLength(1);
     act(() => {
       sseHandles[0]!.emit({
@@ -286,6 +299,111 @@ describe('ChainPage — submit + stream', () => {
     await waitFor(() => {
       expect(screen.getByText(/we landed X then Y/)).toBeInTheDocument();
     });
+    // After completion: the persisted pair sits at index 1 (just below
+    // active), order in the panel did not move.
+    const after = document.querySelectorAll('.chain-qa-list > li');
+    expect(after[0]?.querySelector('textarea')).not.toBeNull();
+    expect(after[1]?.textContent).toContain('we landed X then Y');
+  });
+
+  it('clears the active textarea and refocuses it after submit', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain());
+    (api.submitChainQuestion as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      { chain_qa_id: 'qa-focus' },
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByRole('textbox', {
+      name: 'Question',
+    }) as HTMLTextAreaElement;
+    // The textarea should already be autofocused on mount.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(textarea);
+    });
+
+    fireEvent.change(textarea, { target: { value: 'first question' } });
+    fireEvent.click(screen.getByRole('button', { name: /Ask|Sending/ }));
+
+    // After submit: textarea cleared, focused, and the in-flight pair is
+    // visible at index 1 of the list.
+    await waitFor(() => {
+      expect(textarea.value).toBe('');
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(textarea);
+    });
+    expect(screen.getByText('first question')).toBeInTheDocument();
+  });
+});
+
+describe('ChainPage — pair-card state matrix', () => {
+  it('renders completed, failed, and abandoned pairs with the right re-ask affordances', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({
+        qa_history: [
+          makeQa('q-completed', {
+            question: 'completed question',
+            answer: 'completed answer',
+          }),
+          makeQa('q-failed', {
+            question: 'failed question',
+            status: 'failed',
+            answer: 'partial answer',
+            completed_at: null,
+          }),
+          makeQa('q-abandoned', {
+            question: 'abandoned question',
+            status: 'abandoned',
+            answer: null,
+            completed_at: null,
+          }),
+        ],
+      }),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByText('completed answer')).toBeInTheDocument();
+    });
+
+    // All three persisted pairs render. The active pair is index 0.
+    const items = document.querySelectorAll('.chain-qa-list > li');
+    expect(items.length).toBe(4);
+    expect(items[0]?.querySelector('textarea')).not.toBeNull();
+
+    // Failed: shows partial + Failed label + Re-ask button.
+    expect(screen.getByText('partial answer')).toBeInTheDocument();
+    expect(screen.getByText('Failed')).toBeInTheDocument();
+    // Abandoned: shows "Did not complete" + Re-ask button.
+    expect(screen.getByText('Did not complete')).toBeInTheDocument();
+    // Two Re-ask buttons (failed + abandoned).
+    const reaskButtons = screen.getAllByRole('button', { name: 'Re-ask' });
+    expect(reaskButtons).toHaveLength(2);
+
+    // Re-ask on a failed/abandoned pair populates the active textarea with
+    // the original question and keeps focus there. (No auto-submit — user
+    // agency, REQ-CHN-007 precedent.) Click the second Re-ask button (which
+    // belongs to the failed pair — pairs render in reverse-chronological
+    // order so the abandoned pair, last in the qa_history input, appears
+    // first in DOM order).
+    const submitMock = api.submitChainQuestion as ReturnType<typeof vi.fn>;
+    submitMock.mockReset();
+    fireEvent.click(reaskButtons[1]!);
+    const textarea = screen.getByRole('textbox', {
+      name: 'Question',
+    }) as HTMLTextAreaElement;
+    await waitFor(() => {
+      expect(textarea.value).toBe('failed question');
+    });
+    expect(submitMock).not.toHaveBeenCalled();
   });
 });
 

@@ -91,21 +91,32 @@ the current name); Enter or blur commits via an API call that updates
   resume-style work. Clicking any member card navigates to that
   conversation's detail page in a state ready for the user to continue
   working (input focused, history loaded).
-- **Right:** Q&A panel. Input box anchored at the bottom of the panel.
-  Q&A history fills the area above the input, in chronological order
-  (oldest at the top of the scroll region, most recent immediately
-  above the input). Streaming answers render in place into the slot
-  just above the input, flowing downward toward the input as tokens
-  arrive — older Q&A above is not displaced.
+- **Right:** Q&A panel rendered as a vertical scratchpad of pair
+  cards. Each pair card has two labeled rows — `Q:` and `A:`. Index 0
+  is always an **active pair card**: `Q:` is an autofocused textarea
+  with an Ask button; `A:` is a "waiting for question" placeholder.
+  Below the active card, in-flight pairs (this tab's just-submitted
+  questions, currently streaming) and persisted pairs render in
+  reverse chronological order — the most recent pair sits just below
+  the active card; the oldest pair is at the bottom. On submit, the
+  just-submitted pair drops in at index 1 (newest in-flight just below
+  active), the active textarea is cleared, and focus returns to the
+  active textarea so the user can immediately type the next question
+  without waiting for the answer. Multiple concurrent in-flight pairs
+  are valid; each demuxes its own tokens by `chain_qa_id`. Pair cards
+  do not move when their state transitions (streaming → completed /
+  failed / abandoned); they stay where they were inserted.
 
-  **Q&A entry independence (REQ-CHN-006).** Each Q&A entry renders as
-  a self-contained card — clear border, vertical gap from siblings,
-  no visual ligatures (no thread/reply lines, no avatar continuity,
-  no indenting follow-ups). This is a deliberate visual signal that
-  questions are answered independently against the chain's content
-  rather than as a continuous conversation. The input box is always
-  empty after submission; it does not preserve drafts and does not
-  "thread" into the previous answer.
+  **Q&A entry independence (REQ-CHN-006).** Pair cards are explicitly
+  the visual pattern that satisfies REQ-CHN-006: each pair is a
+  self-contained record with explicit Q/A label gutter, clear border,
+  and a vertical gap from siblings — no visual ligatures (no
+  thread/reply lines, no avatar continuity, no indenting follow-ups).
+  The active card has the same shape as past pairs (just unfilled),
+  which structurally communicates that the next question creates a
+  new pair rather than continuing a thread. The active textarea is
+  always empty after submission; it does not preserve drafts and does
+  not "thread" into the previous answer.
 
   **Q&A snapshot indicator (REQ-CHN-005).** Each Q&A card displays a
   subtle inline tag indicating chain state at answer time when it
