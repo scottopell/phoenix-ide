@@ -34,6 +34,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_turn_usage_table",
         sql: MIGRATION_004,
     },
+    Migration {
+        version: 5,
+        name: "add_chain_name_and_chain_qa",
+        sql: MIGRATION_005,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -108,6 +113,33 @@ CREATE INDEX IF NOT EXISTS idx_turn_usage_root ON turn_usage(root_conversation_i
 /// runtime in Phase 1 — later phases wire it into the continuation handoff.
 const MIGRATION_003: &str = r"
 ALTER TABLE conversations ADD COLUMN continued_in_conv_id TEXT REFERENCES conversations(id);
+";
+
+/// Phoenix Chains v1 (task 02686): chain identity/name + Q&A history.
+///
+/// Adds nullable `chain_name` to `conversations` (REQ-CHN-007: user-editable
+/// chain name persisted on the chain root) and creates `chain_qa` for the
+/// per-chain Q&A history (REQ-CHN-005). `status` is application-side enforced
+/// across `in_flight | completed | failed | abandoned`; the FK cascade on
+/// `root_conv_id` matches the design's hard-delete semantics. Index on
+/// `(root_conv_id, created_at)` serves the per-chain history query.
+const MIGRATION_005: &str = r"
+ALTER TABLE conversations ADD COLUMN chain_name TEXT;
+
+CREATE TABLE IF NOT EXISTS chain_qa (
+    id TEXT PRIMARY KEY,
+    root_conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    question TEXT NOT NULL,
+    answer TEXT,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL,
+    snapshot_member_count INTEGER NOT NULL,
+    snapshot_total_messages INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    completed_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_qa_root ON chain_qa(root_conv_id, created_at);
 ";
 
 /// Run all pending migrations against the database.
@@ -208,7 +240,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 4);
+        assert_eq!(first, 5);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -389,6 +421,86 @@ mod tests {
         assert!(
             continued.is_none(),
             "Existing rows should backfill NULL, got: {continued:?}"
+        );
+    }
+
+    /// Migration 005 (task 02686, REQ-CHN-005/007): adds `chain_name` to
+    /// `conversations` and creates the `chain_qa` table with its index.
+    /// Existing rows backfill `chain_name` to NULL.
+    #[tokio::test]
+    async fn migration_005_adds_chain_name_and_chain_qa() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+             VALUES ('c-pre', '{\"mode\":\"Explore\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "chain_name"),
+            "Expected chain_name column after migration 005, got: {columns:?}"
+        );
+
+        let row = sqlx::query("SELECT chain_name FROM conversations WHERE id = 'c-pre'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let chain_name: Option<String> = row.get("chain_name");
+        assert!(
+            chain_name.is_none(),
+            "Existing rows should backfill chain_name to NULL, got: {chain_name:?}"
+        );
+
+        // chain_qa table exists with the expected columns
+        let qa_columns: Vec<String> = sqlx::query("PRAGMA table_info(chain_qa)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        for expected in [
+            "id",
+            "root_conv_id",
+            "question",
+            "answer",
+            "model",
+            "status",
+            "snapshot_member_count",
+            "snapshot_total_messages",
+            "created_at",
+            "completed_at",
+        ] {
+            assert!(
+                qa_columns.iter().any(|c| c == expected),
+                "Expected chain_qa column {expected:?}, got: {qa_columns:?}"
+            );
+        }
+
+        // Index on (root_conv_id, created_at) exists
+        let indexes: Vec<String> = sqlx::query("PRAGMA index_list(chain_qa)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            indexes.iter().any(|n| n == "idx_chain_qa_root"),
+            "Expected idx_chain_qa_root index, got: {indexes:?}"
         );
     }
 }

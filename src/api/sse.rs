@@ -256,6 +256,7 @@ mod tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
+            chain_name: None,
         }
     }
 

@@ -457,6 +457,8 @@ impl Database {
             seed_label: seed_label.map(String::from),
             // REQ-BED-030: fresh conversations have not been continued.
             continued_in_conv_id: None,
+            // REQ-CHN-007: fresh conversations have no user-set chain name.
+            chain_name: None,
         })
     }
 
@@ -466,7 +468,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -486,7 +488,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -506,7 +508,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -525,7 +527,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -759,8 +761,73 @@ impl Database {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
+            // Continuations are not chain roots — chain_name lives on the
+            // root only (REQ-CHN-007).
+            chain_name: None,
         };
         Ok(ContinueOutcome::Created(new_conversation))
+    }
+
+    /// Walk the continuation chain forward from `root_id` and return member
+    /// conversation IDs in chain order (root first, leaf last). REQ-CHN-002.
+    ///
+    /// Returns:
+    ///   - `[root_id]` when `root_id` exists with no continuation;
+    ///   - `[root_id, …, leaf_id]` for a multi-member chain;
+    ///   - empty vec when `root_id` doesn't exist.
+    ///
+    /// Implementation uses a recursive CTE on `continued_in_conv_id`. The
+    /// `continued_in_conv_id` column is a single scalar pointer per row, so
+    /// the chain is structurally linear; this method does not need to defend
+    /// against fan-out.
+    #[allow(dead_code)] // Callers added in Phase 2 (chain Q&A backend)
+    pub async fn chain_members_forward(&self, root_id: &str) -> DbResult<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "WITH RECURSIVE chain(id, next_id, depth) AS (
+                SELECT id, continued_in_conv_id, 0
+                FROM conversations
+                WHERE id = ?1
+                UNION ALL
+                SELECT c.id, c.continued_in_conv_id, chain.depth + 1
+                FROM conversations c
+                JOIN chain ON c.id = chain.next_id
+            )
+            SELECT id FROM chain ORDER BY depth",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Walk the continuation chain backward from `conv_id` to its root and
+    /// return the root's id. REQ-CHN-002.
+    ///
+    /// Returns:
+    ///   - `Some(root_id)` for any chain member (including a chain of length
+    ///     one — `Some(conv_id)` when `conv_id` itself is the root);
+    ///   - `None` when `conv_id` doesn't exist.
+    ///
+    /// Walks the inverse edge `WHERE p.continued_in_conv_id = current.id`
+    /// until no predecessor exists.
+    #[allow(dead_code)] // Callers added in Phase 2 (chain Q&A backend)
+    pub async fn chain_root_of(&self, conv_id: &str) -> DbResult<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "WITH RECURSIVE chain(id, depth) AS (
+                SELECT id, 0
+                FROM conversations
+                WHERE id = ?1
+                UNION ALL
+                SELECT p.id, chain.depth + 1
+                FROM conversations p
+                JOIN chain ON p.continued_in_conv_id = chain.id
+            )
+            SELECT id FROM chain ORDER BY depth DESC LIMIT 1",
+        )
+        .bind(conv_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
@@ -785,7 +852,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -1365,6 +1432,9 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let continued_in_conv_id: Option<String> = row
         .try_get::<Option<String>, _>("continued_in_conv_id")
         .unwrap_or(None);
+    let chain_name: Option<String> = row
+        .try_get::<Option<String>, _>("chain_name")
+        .unwrap_or(None);
 
     Ok(Conversation {
         id,
@@ -1388,6 +1458,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         seed_parent_id,
         seed_label,
         continued_in_conv_id,
+        chain_name,
     })
 }
 
@@ -2323,5 +2394,138 @@ mod tests {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "no-such-conv"),
             other => panic!("expected ConversationNotFound, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phoenix Chains v1 (task 02686): chain_name + chain walk methods
+    // ------------------------------------------------------------------
+
+    /// Build a 3-member linear continuation chain `a -> b -> c` and return
+    /// the ids in chain order. Uses raw SQL to bypass `continue_conversation`'s
+    /// gating on `ContextExhausted` parents — the walk methods are invariant
+    /// to how the edges were written.
+    async fn build_linear_chain(db: &Database, ids: &[&str]) {
+        for id in ids {
+            db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        for pair in ids.windows(2) {
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(pair[1])
+                .bind(pair[0])
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// REQ-CHN-007: a `chain_name` set on the root round-trips through
+    /// INSERT (raw UPDATE) and SELECT, and the unset case stays NULL.
+    #[tokio::test]
+    async fn test_chain_name_round_trips() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let unset = db
+            .create_conversation("conv-unset", "slug-unset", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(unset.chain_name, None);
+
+        let fetched_unset = db.get_conversation("conv-unset").await.unwrap();
+        assert_eq!(fetched_unset.chain_name, None);
+
+        db.create_conversation("conv-named", "slug-named", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET chain_name = ?1 WHERE id = ?2")
+            .bind("auth refactor")
+            .bind("conv-named")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let fetched_named = db.get_conversation("conv-named").await.unwrap();
+        assert_eq!(fetched_named.chain_name, Some("auth refactor".to_string()));
+
+        // List queries also project the column.
+        let listed = db.list_conversations().await.unwrap();
+        let named = listed.iter().find(|c| c.id == "conv-named").unwrap();
+        assert_eq!(named.chain_name, Some("auth refactor".to_string()));
+    }
+
+    /// REQ-CHN-002: `chain_members_forward` returns members in chain order
+    /// for a 3-member linear chain.
+    #[tokio::test]
+    async fn test_chain_members_forward_three_member_linear() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["a", "b", "c"]).await;
+
+        let members = db.chain_members_forward("a").await.unwrap();
+        assert_eq!(
+            members,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    /// REQ-CHN-002: a single conversation with no continuation returns just itself.
+    #[tokio::test]
+    async fn test_chain_members_forward_single_member() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("solo", "slug-solo", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let members = db.chain_members_forward("solo").await.unwrap();
+        assert_eq!(members, vec!["solo".to_string()]);
+    }
+
+    /// REQ-CHN-002: a non-existent root yields an empty vec, not an error —
+    /// callers (Phase 2 Q&A) use this to short-circuit when the chain root
+    /// has been hard-deleted.
+    #[tokio::test]
+    async fn test_chain_members_forward_nonexistent_root() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let members = db.chain_members_forward("ghost").await.unwrap();
+        assert!(
+            members.is_empty(),
+            "nonexistent root should yield empty vec, got: {members:?}"
+        );
+    }
+
+    /// REQ-CHN-002: `chain_root_of` walks back from the leaf to the root.
+    #[tokio::test]
+    async fn test_chain_root_of_leaf_returns_root() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["root-x", "mid-x", "leaf-x"]).await;
+
+        let root = db.chain_root_of("leaf-x").await.unwrap();
+        assert_eq!(root, Some("root-x".to_string()));
+
+        // Mid-chain walks back to the same root.
+        let from_mid = db.chain_root_of("mid-x").await.unwrap();
+        assert_eq!(from_mid, Some("root-x".to_string()));
+    }
+
+    /// REQ-CHN-002: `chain_root_of` on a root returns the same id.
+    #[tokio::test]
+    async fn test_chain_root_of_root_returns_self() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("only-root", "slug-only-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let root = db.chain_root_of("only-root").await.unwrap();
+        assert_eq!(root, Some("only-root".to_string()));
+    }
+
+    /// REQ-CHN-002: `chain_root_of` on a nonexistent id yields None.
+    #[tokio::test]
+    async fn test_chain_root_of_nonexistent_returns_none() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let root = db.chain_root_of("ghost").await.unwrap();
+        assert_eq!(root, None);
     }
 }
