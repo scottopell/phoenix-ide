@@ -15,11 +15,17 @@ use tokio_util::sync::CancellationToken;
 /// Check if Chrome is available or obtainable.
 ///
 /// With the `_fetcher-rustls-tokio` feature, `BrowserSession::new()` will
-/// auto-download Chromium when no system browser is found. Always returns
-/// true so the fetcher gets exercised. Tests will fail with a clear error
-/// if download is truly impossible (no network).
+/// auto-download Chromium when no system browser is found. The fetcher's
+/// CDN is unreachable in some restricted envs (cloud sandboxes, corp
+/// networks), where the download fails noisily mid-suite. `dev.py check`
+/// probes for a usable Chrome at startup and sets `PHOENIX_SKIP_BROWSER_TESTS=1`
+/// when neither a local binary nor the fetcher endpoint is reachable; this
+/// function honours that signal so the suite stays green in those envs.
 fn chrome_available() -> bool {
-    true
+    !matches!(
+        std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+        Ok("1") | Ok("true"),
+    )
 }
 
 /// Skip macro for tests that require Chrome
