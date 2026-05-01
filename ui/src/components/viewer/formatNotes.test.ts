@@ -109,6 +109,49 @@ describe('formatNotesForSend', () => {
     expect(out).toMatch(/`x{200}…`/);
   });
 
+  it('uses a longer backtick delimiter when source line contains backticks', () => {
+    // `array.length` and `` `keyword` `` are common in code reviews;
+    // the wrapper must pick a fence longer than any inner backtick
+    // run so the resulting markdown is unambiguous.
+    const out = formatNotesForSend([
+      note({
+        anchor: { kind: 'file', filePath: 'a.ts', lineNumber: 5 },
+        lineContent: 'const x = `template ${y}`;',
+        body: 'note',
+      }),
+    ]);
+    // Inner content has runs of 1 backtick at most; fence should be 2.
+    expect(out).toContain('``const x = `template ${y}`;``');
+  });
+
+  it('pads with a space when source line starts or ends with a backtick', () => {
+    const out = formatNotesForSend([
+      note({
+        anchor: { kind: 'file', filePath: 'a.ts', lineNumber: 1 },
+        lineContent: '`leading',
+        body: 'note',
+      }),
+    ]);
+    // CommonMark: opening fence must be followed by a space when the
+    // content starts with a backtick (otherwise the delimiter merges
+    // with the content).
+    expect(out).toContain('`` `leading ``');
+  });
+
+  it('handles very long backtick runs by escalating the fence length', () => {
+    const longRun = '```'; // run of 3 backticks inside the line
+    const out = formatNotesForSend([
+      note({
+        anchor: { kind: 'file', filePath: 'a.ts', lineNumber: 1 },
+        lineContent: `before ${longRun} after`,
+        body: 'note',
+      }),
+    ]);
+    // Fence must be at least 4 backticks long (one more than the
+    // longest inner run).
+    expect(out).toContain('````before ``` after````');
+  });
+
   it('escapes embedded newlines in the note body via indentation', () => {
     const out = formatNotesForSend([
       note({

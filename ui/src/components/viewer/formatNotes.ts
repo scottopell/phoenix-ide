@@ -71,7 +71,36 @@ export function formatNotesForSend(notes: ReviewNote[]): string | null {
 
 function formatLineEntry(label: string, lineContent: string, body: string): string {
   const quoted = lineContent.length > 200 ? `${lineContent.slice(0, 200)}…` : lineContent;
-  return `- **${label}**: \`${quoted}\`\n  ${body.replace(/\n/g, '\n  ')}`;
+  return `- **${label}**: ${wrapInCodeSpan(quoted)}\n  ${body.replace(/\n/g, '\n  ')}`;
+}
+
+/**
+ * Wrap a string of source code in a markdown inline code span, picking
+ * a backtick delimiter longer than any backtick run in the content so
+ * the result is always valid CommonMark even if the line itself
+ * contains backticks (e.g. `` `array.length` ``). Per the CommonMark
+ * spec, the content must also be padded with a space when it begins or
+ * ends with a backtick or whitespace.
+ */
+function wrapInCodeSpan(content: string): string {
+  // Find the longest run of consecutive backticks in `content`; the
+  // delimiter must be longer.
+  let longest = 0;
+  let cur = 0;
+  for (const ch of content) {
+    if (ch === '`') {
+      cur += 1;
+      if (cur > longest) longest = cur;
+    } else {
+      cur = 0;
+    }
+  }
+  const fence = '`'.repeat(longest + 1);
+  // CommonMark: if content starts or ends with a backtick, pad with a
+  // space so the delimiter doesn't merge with the content.
+  const needsPad = content.startsWith('`') || content.endsWith('`');
+  const padded = needsPad ? ` ${content} ` : content;
+  return `${fence}${padded}${fence}`;
 }
 
 function formatFileEntry(body: string): string {
