@@ -3,6 +3,15 @@ import type { ReactNode } from 'react';
 import { generateUUID } from '../utils/uuid';
 
 /**
+ * Which sub-section of the diff viewer a note was anchored in.
+ * `diffPos` (the line index inside the unified diff text) restarts at
+ * 0 for each section, so the section discriminator is required to
+ * disambiguate notes — without it, position 5 in committed and
+ * position 5 in uncommitted would collide on lookup.
+ */
+export type DiffSection = 'committed' | 'uncommitted';
+
+/**
  * Anchor identifying where a review note attaches.
  *
  * `kind: 'file'` — note on a single file's line, addressed by absolute path
@@ -12,22 +21,28 @@ import { generateUUID } from '../utils/uuid';
  * extracted from the most recent `diff --git` header. `newLine` is the
  * post-change line number if computable; absent for `-` (deletion-only),
  * binary files, and file-level notes. `diffPos` is the line index within
- * the unified diff text — stable across UI re-renders, used as the
- * primary identity key.
+ * the unified diff text — stable across UI re-renders. `section`
+ * disambiguates the per-section position namespace.
  *
  * `kind: 'diff-file'` — file-level diff note (no line anchor; the user
- * is commenting on the whole file change).
+ * is commenting on the whole file change). Also section-scoped.
  */
 export type NoteAnchor =
   | { kind: 'file'; filePath: string; lineNumber: number }
   | {
       kind: 'diff';
+      section: DiffSection;
       filePath: string;
       newLine?: number | undefined;
       oldLine?: number | undefined;
       diffPos: number;
     }
-  | { kind: 'diff-file'; filePath: string; diffPos: number };
+  | {
+      kind: 'diff-file';
+      section: DiffSection;
+      filePath: string;
+      diffPos: number;
+    };
 
 export interface ReviewNote {
   id: string;

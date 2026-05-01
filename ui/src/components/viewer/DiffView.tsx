@@ -11,7 +11,11 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { MessageSquarePlus } from 'lucide-react';
 import { useReviewNotes } from '../../contexts/ReviewNotesContext';
-import type { NoteAnchor, ReviewNote } from '../../contexts/ReviewNotesContext';
+import type {
+  DiffSection,
+  NoteAnchor,
+  ReviewNote,
+} from '../../contexts/ReviewNotesContext';
 import { useLongPress } from '../../hooks/useLongPress';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { ViewerShell } from './ViewerShell';
@@ -27,8 +31,12 @@ export interface DiffViewProps {
   commitLog: string;
   committedDiff: string;
   committedTruncatedKib?: number | undefined;
+  /** When true, `committedTruncatedKib` is a lower bound — render the
+   *  truncation indicator with a "≥" prefix. */
+  committedSaturated?: boolean | undefined;
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
+  uncommittedSaturated?: boolean | undefined;
   onClose: () => void;
   /** Drop the formatted review-notes pile into the chat input. Same
    *  signature as ProseReader's onSendNotes. */
@@ -38,18 +46,28 @@ export interface DiffViewProps {
 }
 
 type AnnotateTarget =
-  | { kind: 'line'; segment: DiffSegment; line: DiffLine }
-  | { kind: 'file'; segment: DiffSegment; diffPos: number };
+  | { kind: 'line'; section: DiffSection; segment: DiffSegment; line: DiffLine }
+  | { kind: 'file'; section: DiffSection; segment: DiffSegment; diffPos: number };
 
 interface SectionDef {
   /** Header rendered above this section's diff. */
   title: string;
-  /** Stable id for note `diffPos` namespace — combined with the
-   *  position-in-text so notes from the committed diff don't collide
-   *  with notes from the uncommitted diff. */
-  id: 'committed' | 'uncommitted';
+  /** Section discriminator — also flows onto note anchors so the
+   *  per-section diffPos namespaces don't collide (a note at position 5
+   *  in committed must look up a different ref/highlight than a note at
+   *  position 5 in uncommitted). */
+  id: DiffSection;
   body: string;
   truncatedKib?: number | undefined;
+  /** When true, `truncatedKib` is a lower bound — render with "≥". */
+  saturated?: boolean | undefined;
+}
+
+/** Compose a unique key from the section discriminator + the per-section
+ *  diff position. Used by `lineRefs`, `noteSet`, and the highlight
+ *  state so committed/uncommitted positions never collide. */
+function diffKey(section: DiffSection, diffPos: number): string {
+  return `${section}:${diffPos}`;
 }
 
 export function DiffView({
@@ -58,8 +76,10 @@ export function DiffView({
   commitLog,
   committedDiff,
   committedTruncatedKib,
+  committedSaturated,
   uncommittedDiff,
   uncommittedTruncatedKib,
+  uncommittedSaturated,
   onClose,
   onSendNotes,
   inline,
@@ -69,8 +89,10 @@ export function DiffView({
 
   const [annotating, setAnnotating] = useState<AnnotateTarget | null>(null);
   const [showPanel, setShowPanel] = useState(false);
-  const [highlightedDiffPos, setHighlightedDiffPos] = useState<number | null>(null);
-  const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
+  const [highlightedKey, setHighlightedKey] = useState<string | null>(null);
+  // Keyed by `${section}:${diffPos}` so committed and uncommitted
+  // positions occupy disjoint namespaces.
+  const lineRefs = useRef<Map<string, HTMLElement>>(new Map());
 
   // Two parsed sections — committed and uncommitted. Each segment-list
   // is parsed independently. We compose a stable diffPos namespace by
@@ -82,28 +104,37 @@ export function DiffView({
         title: `Committed changes (vs ${comparator})`,
         body: committedDiff,
         truncatedKib: committedTruncatedKib,
+        saturated: committedSaturated,
       },
       {
         id: 'uncommitted',
         title: 'Uncommitted changes',
         body: uncommittedDiff,
         truncatedKib: uncommittedTruncatedKib,
+        saturated: uncommittedSaturated,
       },
     ],
-    [comparator, committedDiff, committedTruncatedKib, uncommittedDiff, uncommittedTruncatedKib],
+    [
+      comparator,
+      committedDiff,
+      committedTruncatedKib,
+      committedSaturated,
+      uncommittedDiff,
+      uncommittedTruncatedKib,
+      uncommittedSaturated,
+    ],
   );
 
   // Clear highlight after animation
   useEffect(() => {
-    if (highlightedDiffPos !== null) {
-      const timer = setTimeout(() => setHighlightedDiffPos(null), 2000);
+    if (highlightedKey !== null) {
+      const timer = setTimeout(() => setHighlightedKey(null), 2000);
       return () => clearTimeout(timer);
     }
     return undefined;
-  }, [highlightedDiffPos]);
+  }, [highlightedKey]);
 
   const diffNotes = useMemo(() => reviewNotes.notesForDiff(), [reviewNotes]);
-  const totalNotes = reviewNotes.notes.length;
 
   const handleSubmitNote = useCallback(
     (body: string) => {
@@ -113,6 +144,7 @@ export function DiffView({
       if (annotating.kind === 'line') {
         anchor = {
           kind: 'diff',
+          section: annotating.section,
           filePath: annotating.segment.filePath,
           newLine: annotating.line.newLine,
           oldLine: annotating.line.oldLine,
@@ -122,6 +154,7 @@ export function DiffView({
       } else {
         anchor = {
           kind: 'diff-file',
+          section: annotating.section,
           filePath: annotating.segment.filePath,
           diffPos: annotating.diffPos,
         };
@@ -144,10 +177,11 @@ export function DiffView({
 
   const handleJumpTo = useCallback((note: ReviewNote) => {
     if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
-    const el = lineRefs.current.get(note.anchor.diffPos);
+    const key = diffKey(note.anchor.section, note.anchor.diffPos);
+    const el = lineRefs.current.get(key);
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      setHighlightedDiffPos(note.anchor.diffPos);
+      setHighlightedKey(key);
     }
     setShowPanel(false);
   }, []);
@@ -165,14 +199,18 @@ export function DiffView({
           Diff vs <code>{comparator}</code>
         </span>
       }
-      noteCount={totalNotes}
+      noteCount={diffNotes.length}
       onToggleNotes={() => setShowPanel((v) => !v)}
       onSend={handleSend}
       onClose={onClose}
       panel={
         showPanel ? (
+          // Panel scope = THIS viewer's notes. Cross-viewer notes
+          // (file-anchored) live in the same global pile but only
+          // surface in their own viewer's panel — Send All still
+          // drops the entire pile so the user doesn't lose them.
           <NotesPanel
-            notes={reviewNotes.notes}
+            notes={diffNotes}
             onJumpTo={handleJumpTo}
             onRemove={reviewNotes.removeNote}
             onClearAll={() => { reviewNotes.clear(); setShowPanel(false); }}
@@ -208,20 +246,28 @@ export function DiffView({
                   key={s.id}
                   section={s}
                   onAnnotateLine={(segment, line) =>
-                    setAnnotating({ kind: 'line', segment, line })
+                    setAnnotating({ kind: 'line', section: s.id, segment, line })
                   }
                   onAnnotateFile={(segment, diffPos) =>
-                    setAnnotating({ kind: 'file', segment, diffPos })
+                    setAnnotating({ kind: 'file', section: s.id, segment, diffPos })
                   }
-                  highlightedDiffPos={highlightedDiffPos}
-                  noteDiffPositions={diffNotes.flatMap((n) =>
-                    n.anchor.kind === 'diff' || n.anchor.kind === 'diff-file'
-                      ? [n.anchor.diffPos]
-                      : [],
-                  )}
+                  highlightedKey={highlightedKey}
+                  // Section-scoped: filter diff notes to only those
+                  // anchored in THIS section before computing the
+                  // "has note" set, so the per-line indicator dots
+                  // don't bleed across sections.
+                  noteKeys={diffNotes.flatMap((n) => {
+                    if (n.anchor.kind === 'diff' || n.anchor.kind === 'diff-file') {
+                      if (n.anchor.section === s.id) {
+                        return [diffKey(s.id, n.anchor.diffPos)];
+                      }
+                    }
+                    return [];
+                  })}
                   registerLineRef={(diffPos, el) => {
-                    if (el) lineRefs.current.set(diffPos, el);
-                    else lineRefs.current.delete(diffPos);
+                    const key = diffKey(s.id, diffPos);
+                    if (el) lineRefs.current.set(key, el);
+                    else lineRefs.current.delete(key);
                   }}
                 />
               ) : null,
@@ -254,8 +300,13 @@ interface DiffSectionProps {
   section: SectionDef;
   onAnnotateLine: (segment: DiffSegment, line: DiffLine) => void;
   onAnnotateFile: (segment: DiffSegment, diffPos: number) => void;
-  highlightedDiffPos: number | null;
-  noteDiffPositions: number[];
+  /** Composite key (`${section}:${diffPos}`) of the currently
+   *  highlighted line, or null. Section-scoped so committed/uncommitted
+   *  positions don't collide. */
+  highlightedKey: string | null;
+  /** Composite keys of lines that have a note attached, scoped to
+   *  THIS section. */
+  noteKeys: string[];
   registerLineRef: (diffPos: number, el: HTMLElement | null) => void;
 }
 
@@ -263,12 +314,12 @@ function DiffSection({
   section,
   onAnnotateLine,
   onAnnotateFile,
-  highlightedDiffPos,
-  noteDiffPositions,
+  highlightedKey,
+  noteKeys,
   registerLineRef,
 }: DiffSectionProps) {
   const segments = useMemo(() => parseUnifiedDiff(section.body), [section.body]);
-  const noteSet = useMemo(() => new Set(noteDiffPositions), [noteDiffPositions]);
+  const noteSet = useMemo(() => new Set(noteKeys), [noteKeys]);
 
   return (
     <section className="diff-section">
@@ -276,7 +327,7 @@ function DiffSection({
         {section.title}
         {section.truncatedKib !== undefined && (
           <span className="diff-section-truncated">
-            (truncated; {section.truncatedKib} KiB total)
+            (truncated; {section.saturated ? '≥' : ''}{section.truncatedKib} KiB total)
           </span>
         )}
       </h3>
@@ -287,6 +338,7 @@ function DiffSection({
             // line is the file-level annotate target.
             const isFileHeader =
               line.kind === 'file-header' && line.text.startsWith('diff --git');
+            const key = diffKey(section.id, line.diffPos);
             return (
               <DiffLineRow
                 key={`${segIdx}-${line.diffPos}`}
@@ -295,8 +347,8 @@ function DiffSection({
                 isFileHeader={isFileHeader}
                 onAnnotateLine={onAnnotateLine}
                 onAnnotateFile={onAnnotateFile}
-                highlighted={highlightedDiffPos === line.diffPos}
-                hasNote={noteSet.has(line.diffPos)}
+                highlighted={highlightedKey === key}
+                hasNote={noteSet.has(key)}
                 registerRef={(el) => registerLineRef(line.diffPos, el)}
               />
             );

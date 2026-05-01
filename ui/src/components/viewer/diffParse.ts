@@ -39,12 +39,14 @@ export interface DiffSegment {
   /** Old-file path when different from `filePath` (renames). Undefined
    *  for adds, modifies, and deletes. */
   oldPath?: string;
-  /** True for `Binary files differ` segments. The lines array will be
-   *  empty in that case but the file-header lines are still attached
-   *  via the parent diff text. */
+  /** True for `Binary files ... differ` segments. `lines` will still
+   *  contain the file-header entries (including the `Binary files`
+   *  marker line itself) so the renderer can show them — there's just
+   *  no add/del/context content to walk. */
   binary: boolean;
   /** All lines belonging to this file segment (file-header,
-   *  hunk-header, add, del, context, no-newline) in source order. */
+   *  hunk-header, add, del, context, no-newline) in source order.
+   *  For binary segments this is just the file-header rows. */
   lines: DiffLine[];
 }
 

@@ -6,6 +6,30 @@
 
 use std::path::Path;
 
+/// Walks back from `end` until the byte slice `bytes[..end]` is on a
+/// valid UTF-8 character boundary. Used by `run_git_capped` so the
+/// truncated buffer is always parseable as UTF-8 (any incomplete
+/// multi-byte sequence at the cut point gets dropped, not patched
+/// with U+FFFD).
+///
+/// The walk is bounded at 4 bytes (max UTF-8 sequence length) so the
+/// worst case is constant work regardless of buffer size.
+fn utf8_floor_boundary(bytes: &[u8], end: usize) -> usize {
+    let end = end.min(bytes.len());
+    let mut cut = end;
+    // At most 4 byte rewinds; UTF-8 sequences are 1-4 bytes long.
+    for _ in 0..4 {
+        if std::str::from_utf8(&bytes[..cut]).is_ok() {
+            return cut;
+        }
+        if cut == 0 {
+            return 0;
+        }
+        cut -= 1;
+    }
+    cut
+}
+
 /// Outcome of a size-limited git stdout capture (see `run_git_capped`).
 pub(crate) struct CappedStdout {
     /// Truncated stdout — at most `max_bytes` long, cut on a UTF-8
@@ -185,14 +209,13 @@ pub(crate) fn run_git_capped(
         return Err(format!("git {} failed: {stderr}", args.join(" ")));
     }
 
-    // Truncate at a UTF-8 char boundary so the result is valid UTF-8.
-    let stdout_string = String::from_utf8_lossy(&buf).into_owned();
-    let truncated = if stdout_string.len() > max_bytes {
-        let end = stdout_string.floor_char_boundary(max_bytes);
-        stdout_string.get(..end).unwrap_or("").to_string()
-    } else {
-        stdout_string
-    };
+    // Truncate the raw byte buffer at a valid UTF-8 boundary BEFORE
+    // converting. Doing it the other way around (lossy → string →
+    // floor_char_boundary) would let `from_utf8_lossy` insert U+FFFD
+    // for an incomplete trailing multi-byte sequence and silently
+    // change the byte length, producing more truncation than asked.
+    let cut = utf8_floor_boundary(&buf, buf.len().min(max_bytes));
+    let truncated = String::from_utf8_lossy(&buf[..cut]).into_owned();
 
     Ok(CappedStdout {
         stdout: truncated,

@@ -3708,16 +3708,9 @@ html * {
  * Prose Reader Component (REQ-PF-005 through REQ-PF-013)
  * ============================================================ */
 
-.prose-reader-overlay,
-.viewer-shell--overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--bg-primary);
-  z-index: 1000;
-  display: flex;
-  flex-direction: column;
-  height: 100dvh;
-}
+/* `.prose-reader-overlay` is gone — superseded by `.viewer-shell--overlay`
+ * defined in the "Shared viewer primitives" block. The old class had no
+ * remaining consumers in the JSX after the ProseReader refactor. */
 
 .prose-reader-header {
   display: flex;

@@ -768,8 +768,10 @@ function ConversationPageContent() {
               commitLog={dv.commit_log}
               committedDiff={dv.committed_diff}
               committedTruncatedKib={dv.committed_truncated_kib}
+              committedSaturated={dv.committed_saturated}
               uncommittedDiff={dv.uncommitted_diff}
               uncommittedTruncatedKib={dv.uncommitted_truncated_kib}
+              uncommittedSaturated={dv.uncommitted_saturated}
               onClose={handleCloseDiff}
               onSendNotes={handleSendNotes}
               inline
@@ -1187,8 +1189,10 @@ function ConversationPageContent() {
             commitLog={diffViewer.payload.commit_log}
             committedDiff={diffViewer.payload.committed_diff}
             committedTruncatedKib={diffViewer.payload.committed_truncated_kib}
+            committedSaturated={diffViewer.payload.committed_saturated}
             uncommittedDiff={diffViewer.payload.uncommitted_diff}
             uncommittedTruncatedKib={diffViewer.payload.uncommitted_truncated_kib}
+            uncommittedSaturated={diffViewer.payload.uncommitted_saturated}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
           />
@@ -1211,8 +1215,10 @@ function ConversationPageContent() {
                   commitLog={splitPaneDiff.commit_log}
                   committedDiff={splitPaneDiff.committed_diff}
                   committedTruncatedKib={splitPaneDiff.committed_truncated_kib}
+                  committedSaturated={splitPaneDiff.committed_saturated}
                   uncommittedDiff={splitPaneDiff.uncommitted_diff}
                   uncommittedTruncatedKib={splitPaneDiff.uncommitted_truncated_kib}
+                  uncommittedSaturated={splitPaneDiff.uncommitted_saturated}
                   onClose={handleCloseDiff}
                   onSendNotes={handleSendNotes}
                   inline

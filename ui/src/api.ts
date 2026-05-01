@@ -633,8 +633,13 @@ export const api = {
     commit_log: string;
     committed_diff: string;
     committed_truncated_kib?: number;
+    /** When true, committed_truncated_kib is a lower bound — UI should
+     *  prefix the size with "≥". Set when the streaming reader hit its
+     *  hard limit and killed the git child without seeing EOF. */
+    committed_saturated?: boolean;
     uncommitted_diff: string;
     uncommitted_truncated_kib?: number;
+    uncommitted_saturated?: boolean;
   }> {
     const resp = await fetch(`/api/conversations/${conversationId}/diff`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch diff'); }
