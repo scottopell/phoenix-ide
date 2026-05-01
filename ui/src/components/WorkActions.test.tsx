@@ -16,16 +16,21 @@ import {
   useDiffViewerState,
 } from '../contexts/ViewerStateContext';
 import type { DiffViewerPayload } from '../contexts/ViewerStateContext';
+import { FileExplorerProvider } from './FileExplorer';
 
-// All tests need both providers since the View-Diff click publishes its
-// payload into DiffViewerStateContext, and the diff viewer (when
-// rendered by ConversationPage in production) reads from
-// ReviewNotesContext.
+// All three providers are needed: FileExplorerProvider for the
+// useFileExplorer().closeFile call WorkActions makes during the
+// single-slot enforcement, ReviewNotesProvider for the diff viewer's
+// notes pile (when rendered by ConversationPage in production), and
+// DiffViewerStateProvider so the View-Diff click can publish its
+// payload.
 const renderWithProviders = (ui: ReactElement) =>
   render(
-    <ReviewNotesProvider>
-      <DiffViewerStateProvider>{ui}</DiffViewerStateProvider>
-    </ReviewNotesProvider>,
+    <FileExplorerProvider>
+      <ReviewNotesProvider>
+        <DiffViewerStateProvider>{ui}</DiffViewerStateProvider>
+      </ReviewNotesProvider>
+    </FileExplorerProvider>,
   );
 
 /** Test helper: subscribes to DiffViewerStateContext and forwards every

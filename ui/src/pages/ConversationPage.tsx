@@ -115,18 +115,19 @@ function ConversationPageContent() {
   // inline beside chat at ≥1280px (task 08654 follow-on).
   const diffViewer = useDiffViewerState();
   // Single-slot model: opening one viewer closes the other so the user
-  // never sees both fighting for the split pane.
-  const closeFile = fileExplorer.closeFile;
+  // never sees both fighting for the split pane. When both are set,
+  // file wins (most-recent-action — fileExplorer.openFile is what
+  // triggered this collision since the user just clicked a file). The
+  // alternate ordering (user clicks View Diff while file is open)
+  // closes the file via fileExplorer.closeFile in the click handler
+  // chain elsewhere; this effect catches the file-clicks-while-diff-open
+  // case the click handlers don't reach.
   const closeDiff = diffViewer.close;
   useEffect(() => {
     if (fileExplorer.proseReaderState && diffViewer.payload) {
-      // Whoever was set most recently wins; the previously-open one is
-      // cleared. State updates are synchronous from React's POV in
-      // child render, so this effect catches the conflict on the next
-      // tick and resolves it deterministically (diff > file priority).
-      closeFile();
+      closeDiff();
     }
-  }, [fileExplorer.proseReaderState, diffViewer.payload, closeFile]);
+  }, [fileExplorer.proseReaderState, diffViewer.payload, closeDiff]);
   // Close handlers also clear the OTHER viewer to be safe (for cases
   // where state machines briefly hold both during transitions).
   const handleCloseDiff = useCallback(() => closeDiff(), [closeDiff]);

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
 import { useDiffViewerState } from '../contexts/ViewerStateContext';
+import { useFileExplorer } from '../hooks/useFileExplorer';
 
 type FetchState =
   | { status: 'idle' }
@@ -39,6 +40,7 @@ export function WorkActions({
   // a full-screen overlay on narrow desktop).
   const [diffFetch, setDiffFetch] = useState<FetchState>({ status: 'idle' });
   const diffViewer = useDiffViewerState();
+  const fileExplorer = useFileExplorer();
 
   // Clear stale errors when the agent runs (phaseType leaves idle then returns)
   useEffect(() => {
@@ -66,6 +68,11 @@ export function WorkActions({
           setDiffFetch({ status: 'loading' });
           try {
             const resp = await api.getConversationDiff(conversationId);
+            // Single-slot: ensure the file viewer (if any) closes so
+            // the diff takes the split pane / overlay slot. The
+            // ConversationPage effect handles the reverse case
+            // (file click while diff is open).
+            fileExplorer.closeFile();
             diffViewer.open(resp);
             setDiffFetch({ status: 'idle' });
           } catch (err) {
