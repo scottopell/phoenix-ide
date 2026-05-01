@@ -51,6 +51,8 @@ const TerminalPanel = lazy(() =>
   import('../components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
 );
 
+import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+
 const TERMINAL_COLLAPSED_PX = 32;
 
 const AlertTriangle = () => (
@@ -74,6 +76,14 @@ const ChevronRightSmall = () => (
 );
 
 export function ConversationPage() {
+  return (
+    <ReviewNotesProvider>
+      <ConversationPageContent />
+    </ReviewNotesProvider>
+  );
+}
+
+function ConversationPageContent() {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
 
