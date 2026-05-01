@@ -1,5 +1,20 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
+import { DiffViewer } from './DiffViewer';
+
+type DiffState =
+  | { status: 'closed' }
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | {
+      status: 'open';
+      comparator: string;
+      commit_log: string;
+      committed_diff: string;
+      committed_truncated_kib?: number;
+      uncommitted_diff: string;
+      uncommitted_truncated_kib?: number;
+    };
 
 interface WorkActionsProps {
   conversationId: string;
@@ -27,6 +42,7 @@ export function WorkActions({
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
+  const [diff, setDiff] = useState<DiffState>({ status: 'closed' });
 
   // Clear stale errors when the agent runs (phaseType leaves idle then returns)
   useEffect(() => {
@@ -46,6 +62,25 @@ export function WorkActions({
   return (
     <div className="work-actions-bar">
       <span className="work-actions-label">Done?</span>
+      <button
+        className="work-actions-btn work-actions-view-diff"
+        disabled={diff.status === 'loading'}
+        data-testid="view-diff-button"
+        onClick={async () => {
+          setDiff({ status: 'loading' });
+          try {
+            const resp = await api.getConversationDiff(conversationId);
+            setDiff({ status: 'open', ...resp });
+          } catch (err) {
+            setDiff({
+              status: 'error',
+              message: err instanceof Error ? err.message : 'Failed to load diff',
+            });
+          }
+        }}
+      >
+        {diff.status === 'loading' ? 'Loading...' : 'View Diff'}
+      </button>
       <button
         className="work-actions-btn work-actions-complete"
         disabled={isLoading || hasContinuation}
@@ -96,6 +131,21 @@ export function WorkActions({
       )}
       {error && (
         <div className="work-actions-error">{error}</div>
+      )}
+      {diff.status === 'error' && (
+        <div className="work-actions-error">{diff.message}</div>
+      )}
+      {diff.status === 'open' && (
+        <DiffViewer
+          open
+          comparator={diff.comparator}
+          commitLog={diff.commit_log}
+          committedDiff={diff.committed_diff}
+          committedTruncatedKib={diff.committed_truncated_kib}
+          uncommittedDiff={diff.uncommitted_diff}
+          uncommittedTruncatedKib={diff.uncommitted_truncated_kib}
+          onClose={() => setDiff({ status: 'closed' })}
+        />
       )}
     </div>
   );

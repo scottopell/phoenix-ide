@@ -432,6 +432,34 @@ pub struct GitBranchesResponse {
     pub default_branch: Option<String>,
 }
 
+/// Response for `GET /api/conversations/:id/diff` — what the worktree
+/// has done relative to its base. Used by the Work-mode "View diff"
+/// action so users can review changes before deciding to merge or
+/// abandon. Each diff section is capped at 256KiB; when the raw output
+/// exceeded the cap, the `committed_truncated_kib` /
+/// `uncommitted_truncated_kib` fields hold the original size in KiB so
+/// the UI can label the truncation.
+#[derive(Debug, Serialize)]
+pub struct ConversationDiffResponse {
+    /// The ref used as the comparator — e.g. `"origin/main"` when the
+    /// remote-tracking ref exists, or bare `"main"` for local-only repos.
+    pub comparator: String,
+    /// `git log --oneline <comparator>..HEAD` — commits on the branch
+    /// not yet in the comparator. Subject lines only; uncapped (commit
+    /// titles are tiny).
+    pub commit_log: String,
+    /// `git diff <comparator>...HEAD` — committed work, file-level diff
+    /// to the common ancestor.
+    pub committed_diff: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_truncated_kib: Option<u32>,
+    /// `git diff HEAD` after `git add -N .` — uncommitted working-tree
+    /// changes, including untracked files surfaced via intent-to-add.
+    pub uncommitted_diff: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncommitted_truncated_kib: Option<u32>,
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

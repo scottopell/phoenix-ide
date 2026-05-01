@@ -4,7 +4,7 @@
 
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::chains::{get_chain, set_chain_name, stream_chain, submit_chain_question};
-use super::git_handlers::list_git_branches;
+use super::git_handlers::{get_conversation_diff, list_git_branches};
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
 };
@@ -158,6 +158,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/upgrade-model",
             post(upgrade_conversation_model),
         )
+        // Per-conversation worktree diff (Work/Branch-mode "View diff" action)
+        .route("/api/conversations/:id/diff", get(get_conversation_diff))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
         // Environment info

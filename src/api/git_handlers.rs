@@ -1,12 +1,16 @@
-//! Git-related HTTP handlers: branch listing, search, conflict detection.
+//! Git-related HTTP handlers: branch listing, search, conflict detection,
+//! per-conversation diff snapshots.
 
 use super::handlers::AppError;
-use super::types::{GitBranchEntry, GitBranchesQuery, GitBranchesResponse};
+use super::types::{
+    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
+};
 use super::AppState;
-use crate::git_ops::run_git;
+use crate::db::ConvMode;
+use crate::git_ops::{capture_branch_diff, run_git};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     Json,
 };
 use std::path::PathBuf;
@@ -321,4 +325,131 @@ fn ls_remote_cached(cwd: &std::path::Path) -> Result<Vec<String>, AppError> {
     }
 
     Ok(refs)
+}
+
+/// `GET /api/conversations/:id/diff` — committed and uncommitted changes
+/// in the conversation's worktree, vs the base branch. Read-only; used by
+/// the Work/Branch-mode "View diff" action so users can review before
+/// deciding to merge or abandon.
+///
+/// Requires the conversation to be in Work or Branch mode (anything else
+/// has no worktree to diff). Any conversation state is acceptable —
+/// inspection during streaming is fine and useful.
+///
+/// Each diff section is capped at 256KiB; truncation metadata is returned
+/// alongside so the UI can show a "(truncated, X KiB total)" hint.
+pub(crate) async fn get_conversation_diff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationDiffResponse>, AppError> {
+    const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let (worktree_path, base_branch) = match &conv.conv_mode {
+        ConvMode::Work {
+            worktree_path,
+            base_branch,
+            ..
+        }
+        | ConvMode::Branch {
+            worktree_path,
+            base_branch,
+            ..
+        } => (worktree_path.to_string(), base_branch.to_string()),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no worktree to diff)".to_string(),
+            ));
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let wt = PathBuf::from(&worktree_path);
+        if !wt.exists() {
+            return Err(AppError::NotFound(format!(
+                "Worktree no longer exists: {worktree_path}"
+            )));
+        }
+
+        let captured = capture_branch_diff(&wt, &base_branch);
+
+        let (committed_diff, committed_truncated_kib) =
+            truncate_diff(&captured.committed_diff, MAX_DIFF_BYTES);
+        let (uncommitted_diff, uncommitted_truncated_kib) =
+            truncate_diff(&captured.uncommitted_diff, MAX_DIFF_BYTES);
+
+        Ok(ConversationDiffResponse {
+            comparator: captured.comparator,
+            commit_log: captured.commit_log,
+            committed_diff,
+            committed_truncated_kib,
+            uncommitted_diff,
+            uncommitted_truncated_kib,
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
+/// Truncate `body` at `max_bytes`, returning the (possibly truncated) text
+/// and the original size in KiB if truncation occurred. The truncation
+/// happens at a UTF-8 character boundary so the returned string remains
+/// valid UTF-8.
+fn truncate_diff(body: &str, max_bytes: usize) -> (String, Option<u32>) {
+    if body.len() <= max_bytes {
+        return (body.to_string(), None);
+    }
+    let end = body.floor_char_boundary(max_bytes);
+    let truncated = body.get(..end).unwrap_or(body).to_string();
+    // u32 is enough for ~4TiB diffs; saturating cast handles the
+    // pathological case where the diff is somehow larger.
+    let original_kib = u32::try_from(body.len() / 1024).unwrap_or(u32::MAX);
+    (truncated, Some(original_kib))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_diff_passthrough_when_under_cap() {
+        let (out, kib) = truncate_diff("short", 1024);
+        assert_eq!(out, "short");
+        assert_eq!(kib, None);
+    }
+
+    #[test]
+    fn truncate_diff_at_exact_cap_is_passthrough() {
+        let body = "x".repeat(100);
+        let (out, kib) = truncate_diff(&body, 100);
+        assert_eq!(out.len(), 100);
+        assert_eq!(kib, None);
+    }
+
+    #[test]
+    fn truncate_diff_over_cap_reports_kib() {
+        let body = "x".repeat(3072); // 3 KiB
+        let (out, kib) = truncate_diff(&body, 1024);
+        assert!(out.len() <= 1024);
+        assert_eq!(kib, Some(3));
+    }
+
+    #[test]
+    fn truncate_diff_respects_utf8_boundary() {
+        // Multi-byte char straddles the cap boundary.
+        let body = "abc\u{1F600}def"; // emoji is 4 bytes
+        let (out, kib) = truncate_diff(body, 4);
+        // floor_char_boundary on byte 4 should retreat to byte 3 (before
+        // the emoji), not split it.
+        assert_eq!(out, "abc");
+        // 11 bytes / 1024 = 0
+        assert_eq!(kib, Some(0));
+    }
 }

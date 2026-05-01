@@ -6,7 +6,7 @@ use super::types::{
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
-use crate::git_ops::{effective_base_ref, run_git};
+use crate::git_ops::{capture_branch_diff, run_git};
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
@@ -260,27 +260,9 @@ pub(crate) async fn abandon_task(
             return None;
         }
 
-        // File-level diff of committed work vs the common ancestor with
-        // the base branch (triple-dot). This reflects exactly what files
-        // the branch changed, independent of commit-history noise — e.g.
-        // task-file commits replayed during rebase whose effects are
-        // already in base produce no diff content here. `effective_base_ref`
-        // prefers `origin/<base>` (kept fresh by the periodic fetch) over
-        // the local ref (only refreshed at lifecycle events) — see task
-        // 13001 for the unification rationale.
-        let comparator = effective_base_ref(&wt, &base_branch_clone);
-        let committed_diff =
-            run_git(&wt, &["diff", &format!("{comparator}...HEAD")]).unwrap_or_default();
+        let captured = capture_branch_diff(&wt, &base_branch_clone);
 
-        // Stage untracked files as intent-to-add so they appear in the
-        // working-tree diff. Agent-created files are typically untracked
-        // (patch tool doesn't git-add).
-        let _ = run_git(&wt, &["add", "-N", "."]);
-
-        // Working-tree diff (uncommitted + newly created files).
-        let uncommitted_diff = run_git(&wt, &["diff", "HEAD"]).unwrap_or_default();
-
-        if committed_diff.is_empty() && uncommitted_diff.is_empty() {
+        if captured.committed_diff.is_empty() && captured.uncommitted_diff.is_empty() {
             return None;
         }
 
@@ -302,19 +284,22 @@ pub(crate) async fn abandon_task(
             out.push_str("\n```\n");
         };
 
-        if !committed_diff.is_empty() {
+        if !captured.committed_diff.is_empty() {
             append_section(
                 &mut snapshot,
-                &format!("\n### Committed changes (vs `{base_branch_clone}`)\n```diff\n"),
-                &committed_diff,
+                &format!(
+                    "\n### Committed changes (vs `{}`)\n```diff\n",
+                    captured.comparator
+                ),
+                &captured.committed_diff,
             );
         }
 
-        if !uncommitted_diff.is_empty() {
+        if !captured.uncommitted_diff.is_empty() {
             append_section(
                 &mut snapshot,
                 "\n### Uncommitted changes\n```diff\n",
-                &uncommitted_diff,
+                &captured.uncommitted_diff,
             );
         }
 
