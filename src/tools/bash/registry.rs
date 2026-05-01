@@ -3,9 +3,9 @@
 //! REQ-BASH-005 (per-conversation cap), REQ-BASH-006 (in-memory tombstones,
 //! no `SQLite` shadow store), REQ-BASH-014 (per-conversation registry).
 //!
-//! Some methods (e.g. `remove`, `with_caps`, ring/handle cap accessors)
-//! are surface that task 02694 (`BashTool` dispatch) and task 02696
-//! (hard-delete cascade) consume; until then they read as dead.
+//! `remove`, `remove_conversation`, etc. are surface for the future
+//! hard-delete cascade integration (task 02696); silence the per-method
+//! lint until that lands.
 #![allow(dead_code)]
 //!
 //! Lifetime: registries live in process memory only. A Phoenix restart

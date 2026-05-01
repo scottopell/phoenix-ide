@@ -5,12 +5,9 @@
 //! writes pass, and the `ExitWatchPanicGuard` that publishes a sentinel
 //! on waiter-task panic.
 //!
-//! Some accessors below (e.g. `KillSignal::as_libc`, `Tombstone`'s
-//! `final_tail` / `next_offset_at_exit` / `finished_at`) are surface
-//! that task 02694 (`BashTool` dispatch) consumes; until then they read
-//! as dead. The fields are structural — they exist precisely because
-//! the spec says they must — so we silence the foundation-only dead-
-//! code warnings rather than restructure prematurely.
+//! Some accessors here are surface for the future hard-delete cascade
+//! (task 02696) and the wire/UI migration (task 02697); silence the
+//! per-method dead-code lint until those land.
 #![allow(dead_code)]
 //!
 //! Lock ordering (per `bash.allium` @guidance on `HandleProcessExited`

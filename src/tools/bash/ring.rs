@@ -2,9 +2,10 @@
 //!
 //! REQ-BASH-004: Ring Buffer and Read Semantics.
 //!
-//! Read accessors (`bytes_cap`, `is_empty`, etc.) are exercised by task
-//! 02694's `BashTool` peek/wait response shapers; they read as dead in
-//! foundation-only builds.
+//! Some read accessors (`bytes_cap`, `is_empty`, etc.) are exercised by
+//! tests but unused by the current operations dispatch; future wire-format
+//! exposure (task 02697) will consume them. Silence the per-method lint
+//! until then.
 #![allow(dead_code)]
 //!
 //! Incoming bytes are split on `\n` into [`RingLine`]s, each carrying a

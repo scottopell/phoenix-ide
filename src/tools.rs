@@ -124,12 +124,8 @@ pub struct ToolContext {
     /// Per-process bash handle registry (access via `bash_handles()` method).
     /// Owns the per-conversation handle tables, ring buffers, tombstones,
     /// and live-handle cap enforcement (REQ-BASH-005, REQ-BASH-006,
-    /// REQ-BASH-014).
-    ///
-    /// Read by `bash_handles()` / `bash_handle_registry()` — task 02694's
-    /// `BashTool` dispatch is the consumer. Foundation-only builds will
-    /// see this as unread.
-    #[allow(dead_code)]
+    /// REQ-BASH-014). Reached by tools through `bash_handles()` /
+    /// `bash_handle_registry()`.
     bash_handles: Arc<BashHandleRegistry>,
 
     /// LLM registry for tools that need model access
@@ -184,7 +180,6 @@ impl ToolContext {
     /// reshaping every callsite.
     ///
     /// REQ-BASH-014: Stateless Tool with Per-Conversation Handle Registry.
-    #[allow(dead_code)] // Consumed by task 02694's BashTool dispatch.
     pub async fn bash_handles(
         &self,
     ) -> Result<Arc<RwLock<BashConversationHandles>>, BashHandleError> {
@@ -193,7 +188,6 @@ impl ToolContext {
 
     /// Direct access to the registry (used by the hard-delete cascade
     /// integration in task 02696, and by the shutdown kill-tree pass).
-    #[allow(dead_code)] // Consumed by tasks 02694 / 02696.
     pub fn bash_handle_registry(&self) -> &Arc<BashHandleRegistry> {
         &self.bash_handles
     }
