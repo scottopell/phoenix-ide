@@ -1,20 +1,11 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { DiffViewer } from './DiffViewer';
+import { useDiffViewerState } from '../contexts/ViewerStateContext';
 
-type DiffState =
-  | { status: 'closed' }
+type FetchState =
+  | { status: 'idle' }
   | { status: 'loading' }
-  | { status: 'error'; message: string }
-  | {
-      status: 'open';
-      comparator: string;
-      commit_log: string;
-      committed_diff: string;
-      committed_truncated_kib?: number;
-      uncommitted_diff: string;
-      uncommitted_truncated_kib?: number;
-    };
+  | { status: 'error'; message: string };
 
 interface WorkActionsProps {
   conversationId: string;
@@ -31,9 +22,6 @@ interface WorkActionsProps {
   continuedInConvId: string | null | undefined;
   /** Send a user message to the conversation (for "ask agent to fix" flows) */
   onSendMessage?: (text: string) => void;
-  /** Append a formatted review-notes blob to the chat draft so the user
-   *  can edit before sending. Used by the diff viewer's notes pile. */
-  onAppendDraft?: (text: string) => void;
 }
 
 export function WorkActions({
@@ -41,12 +29,16 @@ export function WorkActions({
   convModeLabel,
   phaseType,
   continuedInConvId,
-  onAppendDraft,
 }: WorkActionsProps) {
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
-  const [diff, setDiff] = useState<DiffState>({ status: 'closed' });
+  // Loading/error UI state for the GET diff fetch lives here; the
+  // resolved payload is published into DiffViewerStateContext so
+  // ConversationPage can mount the viewer in the split pane (or as
+  // a full-screen overlay on narrow desktop).
+  const [diffFetch, setDiffFetch] = useState<FetchState>({ status: 'idle' });
+  const diffViewer = useDiffViewerState();
 
   // Clear stale errors when the agent runs (phaseType leaves idle then returns)
   useEffect(() => {
@@ -68,22 +60,23 @@ export function WorkActions({
       <span className="work-actions-label">Done?</span>
       <button
         className="work-actions-btn work-actions-view-diff"
-        disabled={diff.status === 'loading'}
+        disabled={diffFetch.status === 'loading'}
         data-testid="view-diff-button"
         onClick={async () => {
-          setDiff({ status: 'loading' });
+          setDiffFetch({ status: 'loading' });
           try {
             const resp = await api.getConversationDiff(conversationId);
-            setDiff({ status: 'open', ...resp });
+            diffViewer.open(resp);
+            setDiffFetch({ status: 'idle' });
           } catch (err) {
-            setDiff({
+            setDiffFetch({
               status: 'error',
               message: err instanceof Error ? err.message : 'Failed to load diff',
             });
           }
         }}
       >
-        {diff.status === 'loading' ? 'Loading...' : 'View Diff'}
+        {diffFetch.status === 'loading' ? 'Loading...' : 'View Diff'}
       </button>
       <button
         className="work-actions-btn work-actions-complete"
@@ -136,27 +129,8 @@ export function WorkActions({
       {error && (
         <div className="work-actions-error">{error}</div>
       )}
-      {diff.status === 'error' && (
-        <div className="work-actions-error">{diff.message}</div>
-      )}
-      {diff.status === 'open' && (
-        <DiffViewer
-          open
-          comparator={diff.comparator}
-          commitLog={diff.commit_log}
-          committedDiff={diff.committed_diff}
-          committedTruncatedKib={diff.committed_truncated_kib}
-          uncommittedDiff={diff.uncommitted_diff}
-          uncommittedTruncatedKib={diff.uncommitted_truncated_kib}
-          onClose={() => setDiff({ status: 'closed' })}
-          onSendNotes={(notes) => {
-            // Drop the formatted review-notes pile into the chat draft.
-            // Same plumbing ProseReader uses (handleSendNotes in
-            // ConversationPage). Closing the viewer is the user's call —
-            // we don't auto-close on send.
-            onAppendDraft?.(notes);
-          }}
-        />
+      {diffFetch.status === 'error' && (
+        <div className="work-actions-error">{diffFetch.message}</div>
       )}
     </div>
   );

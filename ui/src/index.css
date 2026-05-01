@@ -8685,26 +8685,41 @@ html * {
  * return branch).
  * ============================================================ */
 
+/* Reserve right-side space for the absolute-positioned viewer pane.
+ * The pane width is read from the CSS var `--viewer-pane-width`
+ * (set inline by ConversationPage from useResizablePane). Padding-
+ * right keeps the existing chat/terminal flex column unchanged so
+ * the terminal split-pane (which is a sibling of .conversation-column
+ * inside #app, not nested under it) keeps working. */
 #app.app-split-pane {
-  display: flex;
-  flex-direction: row;
-  align-items: stretch;
-  height: 100%;
-  min-height: 0;
-}
-
-#app.app-split-pane > .conversation-column {
-  flex: 1;
-  min-width: 0;
-  height: 100%;
+  position: relative;
+  padding-right: var(--viewer-pane-width, 600px);
 }
 
 .conversation-viewer-pane {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--viewer-pane-width, 600px);
   display: flex;
   flex-direction: column;
-  height: 100%;
-  min-height: 0;
   border-left: 1px solid var(--border-color);
   background: var(--bg-primary);
   overflow: hidden;
+  z-index: 5;
 }
+
+/* Vertical pane divider for the viewer split — sits at the
+ * boundary between chat and viewer panes. */
+.viewer-pane-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: var(--viewer-pane-width, 600px);
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 6;
+}
+.viewer-pane-divider:hover { background: var(--border-color); }

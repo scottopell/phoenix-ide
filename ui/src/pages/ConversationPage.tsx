@@ -38,6 +38,9 @@ import { useResizablePane } from '../hooks';
 const ProseReader = lazy(() =>
   import('../components/ProseReader').then((m) => ({ default: m.ProseReader })),
 );
+const DiffView = lazy(() =>
+  import('../components/viewer/DiffView').then((m) => ({ default: m.DiffView })),
+);
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
@@ -52,6 +55,10 @@ const TerminalPanel = lazy(() =>
 );
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+import {
+  DiffViewerStateProvider,
+  useDiffViewerState,
+} from '../contexts/ViewerStateContext';
 
 const TERMINAL_COLLAPSED_PX = 32;
 
@@ -78,7 +85,9 @@ const ChevronRightSmall = () => (
 export function ConversationPage() {
   return (
     <ReviewNotesProvider>
-      <ConversationPageContent />
+      <DiffViewerStateProvider>
+        <ConversationPageContent />
+      </DiffViewerStateProvider>
     </ReviewNotesProvider>
   );
 }
@@ -102,6 +111,25 @@ function ConversationPageContent() {
 
   // File explorer context (shared with desktop panel)
   const fileExplorer = useFileExplorer();
+  // Diff viewer slot — lifted out of WorkActions so the diff can mount
+  // inline beside chat at ≥1280px (task 08654 follow-on).
+  const diffViewer = useDiffViewerState();
+  // Single-slot model: opening one viewer closes the other so the user
+  // never sees both fighting for the split pane.
+  const closeFile = fileExplorer.closeFile;
+  const closeDiff = diffViewer.close;
+  useEffect(() => {
+    if (fileExplorer.proseReaderState && diffViewer.payload) {
+      // Whoever was set most recently wins; the previously-open one is
+      // cleared. State updates are synchronous from React's POV in
+      // child render, so this effect catches the conflict on the next
+      // tick and resolves it deterministically (diff > file priority).
+      closeFile();
+    }
+  }, [fileExplorer.proseReaderState, diffViewer.payload, closeFile]);
+  // Close handlers also clear the OTHER viewer to be safe (for cases
+  // where state machines briefly hold both during transitions).
+  const handleCloseDiff = useCallback(() => closeDiff(), [closeDiff]);
   const [isDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
   // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
   // Below this we keep the existing full-screen overlay UX; above, the
@@ -706,25 +734,49 @@ function ConversationPageContent() {
     );
   }
 
-  // Narrow desktop (1025-1279px): prose reader replaces conversation
-  // content as a full-screen pane. Wide desktop (≥1280px) renders it as
-  // a split-pane sibling inside the main return below (task 08654).
-  if (isDesktop && !isWideDesktop && fileExplorer.proseReaderState) {
-    const prs = fileExplorer.proseReaderState;
-    return (
-      <div id="app">
-        <Suspense fallback={null}>
-          <ProseReader
-            filePath={prs.path}
-            rootDir={prs.rootDir}
-            onClose={handleCloseProseReader}
-            onSendNotes={handleSendNotes}
-            patchContext={prs.patchContext ?? undefined}
-            inline
-          />
-        </Suspense>
-      </div>
-    );
+  // Narrow desktop (1025-1279px): the active viewer (prose reader OR
+  // diff viewer) replaces conversation content as a full-screen pane.
+  // Wide desktop (≥1280px) renders it as a split-pane sibling inside
+  // the main return below (task 08654).
+  if (isDesktop && !isWideDesktop) {
+    if (fileExplorer.proseReaderState) {
+      const prs = fileExplorer.proseReaderState;
+      return (
+        <div id="app">
+          <Suspense fallback={null}>
+            <ProseReader
+              filePath={prs.path}
+              rootDir={prs.rootDir}
+              onClose={handleCloseProseReader}
+              onSendNotes={handleSendNotes}
+              patchContext={prs.patchContext ?? undefined}
+              inline
+            />
+          </Suspense>
+        </div>
+      );
+    }
+    if (diffViewer.payload) {
+      const dv = diffViewer.payload;
+      return (
+        <div id="app">
+          <Suspense fallback={null}>
+            <DiffView
+              open
+              comparator={dv.comparator}
+              commitLog={dv.commit_log}
+              committedDiff={dv.committed_diff}
+              committedTruncatedKib={dv.committed_truncated_kib}
+              uncommittedDiff={dv.uncommitted_diff}
+              uncommittedTruncatedKib={dv.uncommitted_truncated_kib}
+              onClose={handleCloseDiff}
+              onSendNotes={handleSendNotes}
+              inline
+            />
+          </Suspense>
+        </div>
+      );
+    }
   }
 
   const convStateForChildren = atom.phase;
@@ -761,15 +813,25 @@ function ConversationPageContent() {
     </div>
   ) : null;
 
-  // Split-pane prose reader: rendered inside `#app` as a sibling of
-  // .conversation-column when wide-desktop and a file is open. CSS in
-  // .app-split-pane (index.css) flexes the children horizontally.
-  const showSplitPaneReader =
-    isDesktop && isWideDesktop && !!fileExplorer.proseReaderState;
+  // Split-pane viewer: rendered inside `#app` as a sibling of
+  // .conversation-column when wide-desktop and a viewer (file OR diff)
+  // is open. CSS in .app-split-pane (index.css) flexes children
+  // horizontally.
   const splitPanePrs = fileExplorer.proseReaderState;
+  const splitPaneDiff = diffViewer.payload;
+  const showSplitPaneViewer =
+    isDesktop && isWideDesktop && (splitPanePrs !== null || splitPaneDiff !== null);
 
   return (
-    <div id="app" className={showSplitPaneReader ? 'app-split-pane' : undefined}>
+    <div
+      id="app"
+      className={showSplitPaneViewer ? 'app-split-pane' : undefined}
+      style={
+        showSplitPaneViewer
+          ? ({ ['--viewer-pane-width' as string]: `${viewerPane.collapsed ? 0 : viewerPane.size}px` } as React.CSSProperties)
+          : undefined
+      }
+    >
       <div className="conversation-column">
       {seedBreadcrumb}
       <MessageList
@@ -988,7 +1050,6 @@ function ConversationPageContent() {
             baseBranch={conversation.base_branch}
             continuedInConvId={conversation.continued_in_conv_id}
             onSendMessage={(text) => handleSend(text, [])}
-            onAppendDraft={handleSendNotes}
           />
         )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
@@ -1114,27 +1175,57 @@ function ConversationPageContent() {
           />
         </Suspense>
       )}
-      {showSplitPaneReader && splitPanePrs && (
+      {/* Diff overlay: rendered as a full-screen overlay whenever the
+          diff viewer is open AND the split pane isn't (mobile, narrow
+          desktop, or any future case where the split is unavailable). */}
+      {diffViewer.payload && !showSplitPaneViewer && (
+        <Suspense fallback={null}>
+          <DiffView
+            open
+            comparator={diffViewer.payload.comparator}
+            commitLog={diffViewer.payload.commit_log}
+            committedDiff={diffViewer.payload.committed_diff}
+            committedTruncatedKib={diffViewer.payload.committed_truncated_kib}
+            uncommittedDiff={diffViewer.payload.uncommitted_diff}
+            uncommittedTruncatedKib={diffViewer.payload.uncommitted_truncated_kib}
+            onClose={handleCloseDiff}
+            onSendNotes={handleSendNotes}
+          />
+        </Suspense>
+      )}
+      {showSplitPaneViewer && (
         <>
-          <PaneDivider
-            orientation="vertical"
-            title="Drag to resize the file viewer • Double-click to collapse"
+          <div
+            className="viewer-pane-divider"
+            title="Drag to resize the viewer pane • Double-click to collapse"
             onPointerDown={(e) => viewerPane.startDrag(e, 'x')}
             onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
           />
-          <div
-            className="conversation-viewer-pane"
-            style={{ width: viewerPane.collapsed ? 0 : viewerPane.size, flexShrink: 0 }}
-          >
+          <div className="conversation-viewer-pane">
             <Suspense fallback={null}>
-              <ProseReader
-                filePath={splitPanePrs.path}
-                rootDir={splitPanePrs.rootDir}
-                onClose={handleCloseProseReader}
-                onSendNotes={handleSendNotes}
-                patchContext={splitPanePrs.patchContext ?? undefined}
-                inline
-              />
+              {splitPaneDiff ? (
+                <DiffView
+                  open
+                  comparator={splitPaneDiff.comparator}
+                  commitLog={splitPaneDiff.commit_log}
+                  committedDiff={splitPaneDiff.committed_diff}
+                  committedTruncatedKib={splitPaneDiff.committed_truncated_kib}
+                  uncommittedDiff={splitPaneDiff.uncommitted_diff}
+                  uncommittedTruncatedKib={splitPaneDiff.uncommitted_truncated_kib}
+                  onClose={handleCloseDiff}
+                  onSendNotes={handleSendNotes}
+                  inline
+                />
+              ) : splitPanePrs ? (
+                <ProseReader
+                  filePath={splitPanePrs.path}
+                  rootDir={splitPanePrs.rootDir}
+                  onClose={handleCloseProseReader}
+                  onSendNotes={handleSendNotes}
+                  patchContext={splitPanePrs.patchContext ?? undefined}
+                  inline
+                />
+              ) : null}
             </Suspense>
           </div>
         </>
