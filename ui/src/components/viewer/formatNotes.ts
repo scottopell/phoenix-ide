@@ -14,9 +14,11 @@ import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 export function formatNotesForSend(notes: ReviewNote[]): string | null {
   if (notes.length === 0) return null;
 
-  // Group by display section. File anchors group by filePath; diff
-  // anchors collapse into a single "Diff" section regardless of the
-  // file they touch — they're all part of the same diff view.
+  // Group by display section. Both file and diff anchors group per
+  // file path so the recipient can read each file's review block as a
+  // unit. Diff sections are titled "Diff: \`<path>\`" so the reader
+  // can tell file-viewer notes from diff-viewer notes on the same
+  // path.
   type Section = { title: string; entries: string[] };
   const sections: Section[] = [];
   const byKey = new Map<string, Section>();

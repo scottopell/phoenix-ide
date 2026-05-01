@@ -387,12 +387,14 @@ pub(crate) async fn get_conversation_diff(
                 captured.committed_total_bytes,
                 captured.committed_saturated,
             ),
+            committed_saturated: captured.committed_saturated,
             committed_diff: captured.committed_diff,
             uncommitted_truncated_kib: truncated_kib(
                 &captured.uncommitted_diff,
                 captured.uncommitted_total_bytes,
                 captured.uncommitted_saturated,
             ),
+            uncommitted_saturated: captured.uncommitted_saturated,
             uncommitted_diff: captured.uncommitted_diff,
         })
     })

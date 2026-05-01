@@ -71,8 +71,9 @@ export function ViewerShell({
   confirm,
 }: ViewerShellProps) {
   // Esc closes (deferring to caller — they may guard with a confirm).
-  // Capture phase + stopPropagation so this shell catches Esc before
-  // outer focus-scope handlers steal it.
+  // Registered in capture phase with stopPropagation so this shell
+  // catches Esc before outer focus-scope handlers can swallow it. The
+  // matching removeEventListener must use the same `capture` flag.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
@@ -81,8 +82,8 @@ export function ViewerShell({
       e.stopPropagation();
       onClose();
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [onClose, dialog, confirm]);
 
   return (

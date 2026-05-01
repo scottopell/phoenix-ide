@@ -31,6 +31,12 @@ export function useLongPress<T>(
 
   const start = useCallback(
     (e: React.TouchEvent | React.MouseEvent, payload: T) => {
+      // Clear any previous pending timer before scheduling a new one. A
+      // stray prior `start` (e.g. multi-touch, browser-synthesised
+      // mousedown after touchstart) would otherwise leave its timer
+      // armed and fire `onLongPress` unexpectedly. Always cancel first.
+      cancel();
+
       const touch = 'touches' in e ? e.touches[0] : undefined;
       const pos = touch
         ? { x: touch.clientX, y: touch.clientY }

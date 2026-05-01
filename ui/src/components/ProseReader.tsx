@@ -390,7 +390,12 @@ export function ProseReader({
   }, [content, fileType, patchContext?.modifiedLines, highlightedLine, handleAnnotate, syntaxStyle]);
 
   const fileName = filePath.split('/').pop() || filePath;
-  const totalNotes = reviewNotes.notes.length;
+  // Panel + badge scope = THIS file's notes. Cross-viewer notes
+  // (other files, the diff) live in the same global pile and surface
+  // in their own viewer's panel; Send All still drops the entire pile
+  // so the user doesn't lose them. Per Copilot review feedback (2026-05-01):
+  // the panel previously showed all notes but `handleJumpTo` only worked
+  // for this-file anchors, so cross-viewer entries were no-op clicks.
 
   const headerExtras = fileType === 'html' ? (
     <>
@@ -420,7 +425,7 @@ export function ProseReader({
       title={fileName}
       titleTooltip={absolutePath}
       headerExtras={headerExtras}
-      noteCount={totalNotes}
+      noteCount={fileNotes.length}
       onToggleNotes={() => setShowPanel((v) => !v)}
       onSend={handleSend}
       banner={
@@ -435,7 +440,7 @@ export function ProseReader({
       panel={
         showPanel ? (
           <NotesPanel
-            notes={reviewNotes.notes}
+            notes={fileNotes}
             onJumpTo={handleJumpTo}
             onRemove={reviewNotes.removeNote}
             onClearAll={() => { reviewNotes.clear(); setShowPanel(false); }}

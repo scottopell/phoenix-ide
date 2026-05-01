@@ -16,8 +16,10 @@ interface DiffViewerProps {
   commitLog: string;
   committedDiff: string;
   committedTruncatedKib?: number | undefined;
+  committedSaturated?: boolean | undefined;
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
+  uncommittedSaturated?: boolean | undefined;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
 }

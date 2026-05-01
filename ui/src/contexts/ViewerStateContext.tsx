@@ -10,8 +10,12 @@ export interface DiffViewerPayload {
   commit_log: string;
   committed_diff: string;
   committed_truncated_kib?: number;
+  /** When true, committed_truncated_kib is a lower bound — UI renders
+   *  with "≥" prefix. */
+  committed_saturated?: boolean;
   uncommitted_diff: string;
   uncommitted_truncated_kib?: number;
+  uncommitted_saturated?: boolean;
 }
 
 interface DiffViewerStateValue {

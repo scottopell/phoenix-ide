@@ -436,9 +436,11 @@ pub struct GitBranchesResponse {
 /// has done relative to its base. Used by the Work-mode "View diff"
 /// action so users can review changes before deciding to merge or
 /// abandon. Each diff section is capped at 256KiB; when the raw output
-/// exceeded the cap, the `committed_truncated_kib` /
-/// `uncommitted_truncated_kib` fields hold the original size in KiB so
-/// the UI can label the truncation.
+/// exceeded the cap, the `*_truncated_kib` fields hold the total size
+/// in KiB so the UI can label the truncation. The `*_saturated` flags
+/// indicate whether the streaming reader hit its hard limit and stopped
+/// counting — when `true`, `*_truncated_kib` is a LOWER BOUND, not the
+/// exact size, and consumers should render it as e.g. "≥X KiB".
 #[derive(Debug, Serialize)]
 pub struct ConversationDiffResponse {
     /// The ref used as the comparator — e.g. `"origin/main"` when the
@@ -451,13 +453,24 @@ pub struct ConversationDiffResponse {
     /// `git diff <comparator>...HEAD` — committed work, file-level diff
     /// to the common ancestor.
     pub committed_diff: String,
+    /// Total stdout size in KiB when the diff was truncated; `None` when
+    /// it fit under the cap. When `committed_saturated` is `true`, this
+    /// is a lower bound — render as "≥X KiB total" in the UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_truncated_kib: Option<u32>,
+    /// `true` when the streaming reader hit its hard limit (8× the
+    /// visible cap) and stopped counting. `committed_truncated_kib` is
+    /// then a lower bound, not the exact total.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub committed_saturated: bool,
     /// `git diff HEAD` after `git add -N .` — uncommitted working-tree
     /// changes, including untracked files surfaced via intent-to-add.
     pub uncommitted_diff: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncommitted_truncated_kib: Option<u32>,
+    /// Like `committed_saturated` but for the uncommitted-diff section.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uncommitted_saturated: bool,
 }
 
 /// Error response
