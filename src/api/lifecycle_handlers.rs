@@ -248,7 +248,9 @@ pub(crate) async fn abandon_task(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let repo_root = PathBuf::from(&project.canonical_path);
 
-    // 2a. Capture diff snapshot from worktree BEFORE deleting it (blocking)
+    // 2a. Capture diff snapshot from worktree BEFORE deleting it (blocking).
+    // The 100 KiB cap is enforced by capture_branch_diff via streaming
+    // reads — git stdout never fully materialises in memory.
     let worktree_path_clone = worktree_path.clone();
     let base_branch_clone = base_branch.clone();
     let diff_snapshot: Option<String> = tokio::task::spawn_blocking(move || {
@@ -260,7 +262,7 @@ pub(crate) async fn abandon_task(
             return None;
         }
 
-        let captured = capture_branch_diff(&wt, &base_branch_clone);
+        let captured = capture_branch_diff(&wt, &base_branch_clone, MAX_DIFF_BYTES);
 
         if captured.committed_diff.is_empty() && captured.uncommitted_diff.is_empty() {
             return None;
@@ -268,21 +270,22 @@ pub(crate) async fn abandon_task(
 
         let mut snapshot = String::from("## Abandoned work snapshot\n");
 
-        let append_section = |out: &mut String, header: &str, body: &str| {
-            out.push_str(header);
-            if body.len() > MAX_DIFF_BYTES {
-                let end = body.floor_char_boundary(MAX_DIFF_BYTES);
-                out.push_str(body.get(..end).unwrap_or(body));
-                let _ = write!(
-                    out,
-                    "\n\n[truncated -- diff was {}KiB, showing first 100KiB]",
-                    body.len() / 1024
-                );
-            } else {
+        let append_section =
+            |out: &mut String, header: &str, body: &str, total_bytes: u64, saturated: bool| {
+                out.push_str(header);
                 out.push_str(body);
-            }
-            out.push_str("\n```\n");
-        };
+                let body_len_u64 = body.len() as u64;
+                if body_len_u64 < total_bytes || saturated {
+                    let kib = total_bytes / 1024;
+                    let lower_bound = if saturated { "≥" } else { "" };
+                    let _ = write!(
+                        out,
+                        "\n\n[truncated -- diff was {lower_bound}{kib}KiB, showing first {}KiB]",
+                        body.len() / 1024
+                    );
+                }
+                out.push_str("\n```\n");
+            };
 
         if !captured.committed_diff.is_empty() {
             append_section(
@@ -292,6 +295,8 @@ pub(crate) async fn abandon_task(
                     captured.comparator
                 ),
                 &captured.committed_diff,
+                captured.committed_total_bytes,
+                captured.committed_saturated,
             );
         }
 
@@ -300,6 +305,8 @@ pub(crate) async fn abandon_task(
                 &mut snapshot,
                 "\n### Uncommitted changes\n```diff\n",
                 &captured.uncommitted_diff,
+                captured.uncommitted_total_bytes,
+                captured.uncommitted_saturated,
             );
         }
 
