@@ -6848,65 +6848,13 @@ html * {
  * Diff Viewer (Work-mode "View Diff" modal)
  * ============================================================ */
 
-.diff-viewer-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  z-index: 1001;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-}
-
-.diff-viewer-panel {
-  background: var(--bg-primary);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  width: min(1200px, 100%);
-  max-height: 100%;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
-}
-
-.diff-viewer-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border-color);
-  background: var(--bg-secondary);
-  border-radius: 8px 8px 0 0;
-}
-
-.diff-viewer-title {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--text-primary);
-}
-
-.diff-viewer-title code {
-  background: var(--bg-primary);
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 13px;
-}
-
-.diff-viewer-close {
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-size: 16px;
-  padding: 4px 8px;
-  border-radius: 4px;
-}
-
-.diff-viewer-close:hover {
-  background: var(--bg-primary);
-  color: var(--text-primary);
-}
+/* Dead-CSS sweep: `.diff-viewer-overlay`, `.diff-viewer-panel`,
+ * `.diff-viewer-header`, `.diff-viewer-title` (+ ` code`), and
+ * `.diff-viewer-close` were the chrome of the old standalone DiffViewer
+ * modal. After the viewer refactor (commits 12-15) DiffView is rendered
+ * via `<ViewerShell>` and uses `.viewer-shell-*` classes instead. The
+ * two classes still consumed by DiffView (`.diff-viewer-body`,
+ * `.diff-viewer-empty`) remain below. */
 
 .diff-viewer-body {
   flex: 1;
@@ -6971,7 +6919,9 @@ html * {
   color: var(--accent-red, #ef4444);
 }
 
-.diff-hunk {
+/* `diff-${line.kind}` produces `diff-hunk-header` for hunk headers
+ * (e.g. `@@ -10,5 +10,7 @@`); the selector must match. */
+.diff-hunk-header {
   color: var(--text-muted);
   background: var(--bg-primary);
 }
@@ -8631,7 +8581,11 @@ html * {
 .viewer-shell-send-btn { display: flex; align-items: center; justify-content: center; padding: 4px 10px; border-radius: 4px; border: 1px solid var(--accent-green, #22c55e); background: color-mix(in srgb, var(--accent-green, #22c55e) 10%, transparent); color: var(--accent-green, #22c55e); cursor: pointer; }
 .viewer-shell-send-btn:hover { background: color-mix(in srgb, var(--accent-green, #22c55e) 18%, transparent); }
 .viewer-shell-banner { padding: 8px 16px; background: color-mix(in srgb, var(--accent-yellow, #eab308) 10%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow, #eab308) 25%, transparent); font-size: 12px; color: var(--text-secondary); }
-.viewer-shell-body { flex: 1; overflow: auto; min-height: 0; position: relative; }
+/* Body must be a flex column so child viewers (.prose-reader-content,
+ * .diff-viewer-body, .prose-reader-html-preview) can use `flex: 1` to
+ * fill available height. Without `display: flex` the children's flex
+ * properties have no effect and the HTML preview iframe collapses. */
+.viewer-shell-body { flex: 1; overflow: auto; min-height: 0; position: relative; display: flex; flex-direction: column; }
 
 /* NotesPanel — sidebar over the viewer body */
 .notes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(360px, 100%); background: var(--bg-primary); border-left: 1px solid var(--border-color); display: flex; flex-direction: column; z-index: 10; box-shadow: -4px 0 12px rgba(0, 0, 0, 0.12); }

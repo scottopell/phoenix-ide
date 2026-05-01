@@ -380,6 +380,11 @@ impl Drop for TempPath {
 /// (e.g. `git rev-parse --git-dir` fails or the copy errors), the
 /// uncommitted-diff capture falls back to a plain `git diff HEAD` that
 /// skips untracked files rather than mutating.
+///
+/// `commit_log` is bounded at `MAX_COMMITS_IN_LOG` so long-lived branches
+/// don't blow up the response with thousands of subject lines.
+const MAX_COMMITS_IN_LOG: u32 = 200;
+
 pub(crate) fn capture_branch_diff(
     worktree: &Path,
     base_branch: &str,
@@ -391,9 +396,17 @@ pub(crate) fn capture_branch_diff(
     // bigger than this" without burning unbounded CPU on monster diffs.
     let hard_limit = (max_section_bytes as u64).saturating_mul(8);
 
+    // Bound the commit list (see MAX_COMMITS_IN_LOG above) so long-
+    // lived branches don't blow up the wire response.
     let commit_log = run_git(
         worktree,
-        &["log", "--oneline", &format!("{comparator}..HEAD")],
+        &[
+            "log",
+            "--oneline",
+            "--max-count",
+            &MAX_COMMITS_IN_LOG.to_string(),
+            &format!("{comparator}..HEAD"),
+        ],
     )
     .unwrap_or_default();
 
