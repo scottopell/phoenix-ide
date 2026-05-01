@@ -18,6 +18,7 @@ mod subagent;
 mod terminal_command_history;
 mod terminal_last_command;
 mod think;
+pub mod tmux;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
@@ -39,6 +40,7 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
+pub use tmux::{TmuxError, TmuxRegistry, TmuxServer, TmuxTool};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -134,10 +136,18 @@ pub struct ToolContext {
     /// Active PTY terminal sessions — used by the terminal-command tools
     /// (`terminal_last_command`, `terminal_command_history`).
     pub terminals: crate::terminal::ActiveTerminals,
+
+    /// Per-process tmux server registry (access via `tmux()` method).
+    /// Owns the per-conversation tmux server entries (`Arc<RwLock<TmuxServer>>`)
+    /// and resolves the deterministic socket path
+    /// (`~/.phoenix-ide/tmux-sockets/conv-<id>.sock`). REQ-TMUX-001 /
+    /// REQ-TMUX-013.
+    tmux_registry: Arc<TmuxRegistry>,
 }
 
 impl ToolContext {
     /// Create a new tool context
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cancel: CancellationToken,
         conversation_id: String,
@@ -146,6 +156,7 @@ impl ToolContext {
         bash_handles: Arc<BashHandleRegistry>,
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
     ) -> Self {
         Self {
             cancel,
@@ -155,6 +166,7 @@ impl ToolContext {
             bash_handles,
             llm_registry,
             terminals,
+            tmux_registry,
         }
     }
 
@@ -195,6 +207,29 @@ impl ToolContext {
     /// Get the LLM registry
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
         &self.llm_registry
+    }
+
+    /// Resolve the conversation's tmux server, lazily spawning it on
+    /// first use and reusing it on subsequent calls. Returns the same
+    /// `Arc<RwLock<TmuxServer>>` across repeated calls in one
+    /// conversation; concurrent first-use callers share a single spawn
+    /// (the registry's per-conversation write lock serialises them).
+    ///
+    /// Errors:
+    /// - [`TmuxError::BinaryUnavailable`] when `which("tmux")` failed at
+    ///   registry init.
+    /// - Other variants when the probe / spawn / mkdir steps fail.
+    ///
+    /// REQ-TMUX-013.
+    pub async fn tmux(&self) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
+        self.tmux_registry.ensure_live(&self.conversation_id).await
+    }
+
+    /// Direct access to the registry (used by the hard-delete cascade
+    /// integration in task 02696 and by the terminal attach path).
+    #[allow(dead_code)] // Wired up in task 02696.
+    pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
+        &self.tmux_registry
     }
 }
 
@@ -265,8 +300,18 @@ fn read_only_tools() -> Vec<Arc<dyn Tool>> {
 /// Shell and file-mutating tools.
 /// Present in Direct, Work, sandboxed Explore, and Work sub-agents. Absent
 /// from Explore-no-sandbox and Explore sub-agents (which only read).
+///
+/// `TmuxTool` is registered alongside bash because it serves the same
+/// "run a command in this conversation" purpose with a complementary
+/// persistence model (REQ-TMUX-003 / REQ-TMUX-009). When the tmux
+/// binary is unavailable the tool's first invocation returns
+/// `tmux_binary_unavailable` rather than failing at registration.
 fn write_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(BashTool), Arc::new(PatchTool::default())]
+    vec![
+        Arc::new(BashTool),
+        Arc::new(PatchTool::default()),
+        Arc::new(TmuxTool),
+    ]
 }
 
 /// Headless-browser tools. Available in every conversation mode.
@@ -357,6 +402,7 @@ impl ToolRegistry {
     pub fn for_subagent_explore() -> Self {
         let mut tools = read_only_tools();
         tools.push(Arc::new(BashTool));
+        tools.push(Arc::new(TmuxTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
         Self { tools }
@@ -541,6 +587,7 @@ mod tests {
         let direct = names(&ToolRegistry::direct());
         assert!(direct.contains("bash"));
         assert!(direct.contains("patch"));
+        assert!(direct.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
         }
@@ -554,18 +601,20 @@ mod tests {
         let work = names(&ToolRegistry::explore_with_sandbox());
         assert!(work.contains("bash"));
         assert!(work.contains("patch"));
+        assert!(work.contains("tmux"));
         assert!(work.contains("propose_task"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(work.contains(*tool), "Work missing {tool}");
         }
 
-        // Explore (no sandbox): read-only + propose_task, no bash/patch,
+        // Explore (no sandbox): read-only + propose_task, no bash/patch/tmux,
         // no terminal (the agent only sees what's in the repo here).
         let explore = names(&ToolRegistry::explore_no_sandbox());
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("patch"));
+        assert!(!explore.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !explore.contains(*tool),
@@ -573,10 +622,11 @@ mod tests {
             );
         }
 
-        // Sub-agent Explore: read-only + bash + submit. No patch, no spawn,
+        // Sub-agent Explore: read-only + bash + tmux + submit. No patch, no spawn,
         // no ask_user, no propose_task, no parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore());
         assert!(sub_explore.contains("bash"));
+        assert!(sub_explore.contains("tmux"));
         assert!(sub_explore.contains("submit_result"));
         assert!(sub_explore.contains("submit_error"));
         assert!(!sub_explore.contains("patch"));
@@ -594,6 +644,7 @@ mod tests {
         let sub_work = names(&ToolRegistry::for_subagent_work());
         assert!(sub_work.contains("bash"));
         assert!(sub_work.contains("patch"));
+        assert!(sub_work.contains("tmux"));
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));

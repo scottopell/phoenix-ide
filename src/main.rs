@@ -132,6 +132,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let platform = crate::platform::PlatformCapability::detect();
     tracing::info!(?platform, "Platform capability detected");
 
+    // REQ-TMUX-003 / REQ-TMUX-004: log tmux binary availability so
+    // operators can correlate "in-app terminal runs $SHELL not tmux"
+    // with the host PATH at startup. The registry inside RuntimeManager
+    // re-runs the same probe and caches it; this is purely an
+    // operational breadcrumb.
+    if which::which("tmux").is_ok() {
+        tracing::info!("tmux binary detected on PATH; in-app terminals will attach to per-conversation tmux sessions");
+    } else {
+        tracing::info!(
+            "tmux binary not found on PATH; in-app terminals will spawn $SHELL directly"
+        );
+    }
+
     // Create MCP manager and start background server discovery (non-blocking).
     // Servers connect in parallel; tools become available as each finishes.
     let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new());

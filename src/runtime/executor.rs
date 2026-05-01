@@ -78,6 +78,8 @@ where
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
     bash_handles: Arc<crate::tools::BashHandleRegistry>,
+    /// Tmux server registry for `ToolContext` (REQ-TMUX-013).
+    tmux_registry: Arc<crate::tools::TmuxRegistry>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
@@ -145,6 +147,7 @@ where
         tool_executor: T,
         browser_sessions: Arc<BrowserSessionManager>,
         bash_handles: Arc<crate::tools::BashHandleRegistry>,
+        tmux_registry: Arc<crate::tools::TmuxRegistry>,
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
         event_rx: mpsc::Receiver<Event>,
@@ -165,6 +168,7 @@ where
             tool_executor: Arc::new(tool_executor),
             browser_sessions,
             bash_handles,
+            tmux_registry,
             llm_registry,
             terminals,
             event_rx,
@@ -1522,6 +1526,7 @@ where
             self.bash_handles.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
+            self.tmux_registry.clone(),
         );
 
         let conv_id = self.context.conversation_id.clone();
@@ -3136,6 +3141,7 @@ mod context_exhausted_preserves_worktree_tests {
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             event_rx,
