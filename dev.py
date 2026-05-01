@@ -889,15 +889,40 @@ def cmd_check():
     # Probe for Chrome before running the Rust lane. The browser-tool tests
     # rely on chromiumoxide's auto-fetcher to download Chromium when no
     # local binary is present, and the fetcher's CDN is unreachable in
-    # restricted envs (cloud sandboxes, corp networks). When no usable
-    # Chrome is on PATH, set PHOENIX_SKIP_BROWSER_TESTS so the Rust suite
-    # skips browser tests cleanly via the require_chrome!() macro instead
-    # of failing each test with an "Invalid browser version" panic.
-    import shutil as _shutil
-    _chrome_bins = ["google-chrome", "chromium", "chromium-browser", "chrome", "google-chrome-stable"]
-    if not any(_shutil.which(b) for b in _chrome_bins):
-        os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
-        print("  i  no Chrome on PATH — browser tests will be skipped (PHOENIX_SKIP_BROWSER_TESTS=1)")
+    # restricted envs (cloud sandboxes, corp networks). Honour an externally-
+    # set PHOENIX_SKIP_BROWSER_TESTS verbatim. Otherwise: only auto-skip when
+    # BOTH (a) no Chrome binary is on PATH AND (b) the fetcher's CDN is
+    # unreachable — so normal dev/CI envs without preinstalled Chrome still
+    # exercise the fetcher path that the comment in chrome_available()
+    # describes.
+    if "PHOENIX_SKIP_BROWSER_TESTS" not in os.environ:
+        import shutil as _shutil
+        _chrome_bins = ["google-chrome", "chromium", "chromium-browser", "chrome", "google-chrome-stable"]
+        _has_local_chrome = any(_shutil.which(b) for b in _chrome_bins)
+        if not _has_local_chrome:
+            # Quick probe of the chromiumoxide fetcher endpoint
+            # (googlechromelabs.github.io hosts the version manifest the
+            # fetcher uses). 1.5s budget is enough for a healthy network
+            # and short enough to not slow `check` when offline.
+            import urllib.request as _ureq
+            import urllib.error as _uerr
+            _fetcher_reachable = False
+            try:
+                _ureq.urlopen(
+                    "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json",
+                    timeout=1.5,
+                )
+                _fetcher_reachable = True
+            except _uerr.HTTPError:
+                # Any HTTP response means we reached the host.
+                _fetcher_reachable = True
+            except Exception:
+                _fetcher_reachable = False
+            if not _fetcher_reachable:
+                os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
+                print("  i  no Chrome on PATH and fetcher CDN unreachable — browser tests will be skipped (PHOENIX_SKIP_BROWSER_TESTS=1)")
+            else:
+                print("  i  no Chrome on PATH — browser tests will rely on chromiumoxide's auto-fetcher; set PHOENIX_SKIP_BROWSER_TESTS=1 to skip if the download fails")
 
     # Probe for working commit signing. Some envs configure a custom
     # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
