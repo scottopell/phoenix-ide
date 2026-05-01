@@ -271,12 +271,13 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     expect(onConversationClick.mock.calls[0]![0].id).toBe('cr');
   });
 
-  it('non-sidebar mode does not group conversations into chain blocks', () => {
-    // The full conversations page renders the flat list as before.
+  it('non-sidebar mode also groups conversations into chain blocks', () => {
+    // Chain grouping is not restricted to sidebar mode — the full-page list
+    // groups chains identically (REQ-CHN-002, task 02698).
     const root = makeConv('cr', 'r', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'cl',
-      chain_name: 'should-not-appear-as-header',
+      chain_name: 'auth refactor',
     });
     const leaf = makeConv('cl', 'l', { updated_at: '2024-02-01T00:00:00Z' });
 
@@ -290,8 +291,10 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
       </MemoryRouter>
     );
 
-    expect(container.querySelector('.conv-chain-block')).toBeNull();
-    expect(container.querySelectorAll('.conv-item').length).toBe(2);
+    // Chain block is rendered; members show position labels (#1, #2) not raw slugs.
+    expect(container.querySelector('.conv-chain-block')).not.toBeNull();
+    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('auth refactor');
+    expect(container.querySelectorAll('.conv-item-slug-pos').length).toBe(2);
   });
 });
 

@@ -542,14 +542,19 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
             return json.loads(r.read())
 
     def _wait_done(conv_id: str, timeout: float = 15.0) -> str:
-        """Poll until the conversation leaves 'working' state; return final state type."""
+        """Poll until the conversation is no longer actively running.
+
+        Uses `display_state` (the simplified enum the API always sends)
+        rather than the raw `state.type` field, because `display_state`
+        maps all in-flight variants (llm_requesting, tool_executing, …)
+        to the single value "working".
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                state = _get(f"/conversations/{conv_id}")["conversation"]["state"]
-                stype = state.get("type") if isinstance(state, dict) else str(state)
-                if stype != "working":
-                    return stype
+                conv = _get(f"/conversations/{conv_id}")["conversation"]
+                if conv.get("display_state") != "working":
+                    return str(conv.get("display_state", "unknown"))
             except Exception:
                 pass
             time.sleep(0.3)
@@ -603,6 +608,9 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
         print("✗ Cannot reach Phoenix — is the server running? (./dev.py up)", file=sys.stderr)
         sys.exit(1)
 
+    # Idempotency: if any active conversations exist, skip. Archived-only DBs
+    # are treated as empty for seed purposes — the seed creates active convs
+    # and running it again on an archived-only DB is harmless.
     if existing:
         if not quiet_if_populated:
             print(f"✓ Dev DB already populated ({len(existing)} conversations) — skipping seed.")
@@ -618,7 +626,7 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
         _new_conv(text)
 
     # -- Direct mode: 3-member chain -----------------------------------------
-    print("  [2/4] Direct chain (3 members)")
+    print("  [2/4] Direct chains (3-member + 2-member)")
     id1 = _new_conv(_SEED_CHAIN_3_TEXT)
     _exhaust(id1)
     id2 = _continue(id1)
@@ -627,15 +635,14 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
     _continue(id2)
 
     # -- Direct mode: 2-member chain -----------------------------------------
-    print("  [2/4] Direct chain (2 members)")
     id_a = _new_conv(_SEED_CHAIN_2_TEXT)
     _exhaust(id_a)
     _continue(id_a)
 
     # -- Explore mode (managed / read-only) ----------------------------------
-    # ROOT is a git repo; seed_label lets us create with empty text so no
-    # message is queued and no worktree creation is triggered on first-message.
-    # Two convs make a minimal chain to show Explore mode chains in the list.
+    # ROOT is a git repo; sends a real message with mode="managed" so the
+    # mock model runs and the conversation appears with realistic metadata.
+    # Two convs make a minimal Explore chain visible in the list.
     print("  [3/4] Explore mode (managed)")
     try:
         eid1 = _new_conv(_SEED_EXPLORE_TEXT, mode="managed")
@@ -660,7 +667,6 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
         _new_conv(_SEED_BRANCH_TEXT, mode="branch", base_branch=_demo_branch)
     except Exception as exc:  # noqa: BLE001
         print(f"  (Branch seed skipped \u2014 {exc})")
-        print(f"  (Branch seed skipped — {exc})")
 
     print("✓ Seed complete.")
 
