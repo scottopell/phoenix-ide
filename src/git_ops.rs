@@ -735,6 +735,65 @@ mod tests {
     }
 
     #[test]
+    fn utf8_floor_boundary_passthrough_for_ascii() {
+        let buf = b"abcdefgh";
+        assert_eq!(utf8_floor_boundary(buf, 5), 5);
+        assert_eq!(utf8_floor_boundary(buf, 0), 0);
+        assert_eq!(utf8_floor_boundary(buf, buf.len()), buf.len());
+    }
+
+    #[test]
+    fn utf8_floor_boundary_clamps_past_end() {
+        let buf = b"abc";
+        assert_eq!(utf8_floor_boundary(buf, 100), 3);
+    }
+
+    #[test]
+    fn utf8_floor_boundary_retreats_before_partial_multibyte() {
+        // 'é' is 0xC3 0xA9 (2 bytes). "aé" = [0x61, 0xC3, 0xA9].
+        // Cutting at byte 2 splits the é mid-sequence; helper retreats
+        // to byte 1 so the prefix is valid UTF-8.
+        let buf = "aé".as_bytes();
+        assert_eq!(buf, &[0x61, 0xC3, 0xA9]);
+        assert_eq!(utf8_floor_boundary(buf, 2), 1);
+        // Cutting at byte 3 (full sequence) is fine.
+        assert_eq!(utf8_floor_boundary(buf, 3), 3);
+    }
+
+    #[test]
+    fn utf8_floor_boundary_handles_4_byte_sequences() {
+        // 😀 (U+1F600) is 4 bytes: F0 9F 98 80
+        let buf = "x😀y".as_bytes();
+        // x = 0x78. After 'x' is byte 1.
+        // 😀 occupies bytes 1..5. y starts at byte 5.
+        assert_eq!(utf8_floor_boundary(buf, 1), 1); // before emoji
+        assert_eq!(utf8_floor_boundary(buf, 2), 1); // mid-emoji byte 1 → retreat
+        assert_eq!(utf8_floor_boundary(buf, 3), 1); // mid-emoji byte 2 → retreat
+        assert_eq!(utf8_floor_boundary(buf, 4), 1); // mid-emoji byte 3 → retreat
+        assert_eq!(utf8_floor_boundary(buf, 5), 5); // after emoji
+                                                    // The retreat is bounded — only walks back at most 4 bytes for
+                                                    // the longest possible UTF-8 sequence.
+    }
+
+    #[test]
+    fn utf8_floor_boundary_result_is_always_valid_utf8() {
+        // Property check: for any cut point on a UTF-8 string's byte
+        // representation, the helper returns an offset where bytes[..offset]
+        // is valid UTF-8.
+        let texts = ["hello", "café", "😀😃😄", "mixed: x→y", "", "a"];
+        for text in texts {
+            let buf = text.as_bytes();
+            for end in 0..=buf.len() + 2 {
+                let cut = utf8_floor_boundary(buf, end);
+                assert!(
+                    std::str::from_utf8(&buf[..cut]).is_ok(),
+                    "bytes[..{cut}] of {text:?} should be valid UTF-8 (end={end})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn capture_branch_diff_does_not_mutate_real_index() {
         // Regression for review: capture_branch_diff used to run `git add -N .`
         // directly, mutating the worktree index. This test creates an

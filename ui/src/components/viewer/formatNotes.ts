@@ -14,11 +14,12 @@ import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 export function formatNotesForSend(notes: ReviewNote[]): string | null {
   if (notes.length === 0) return null;
 
-  // Group by display section. Both file and diff anchors group per
-  // file path so the recipient can read each file's review block as a
-  // unit. Diff sections are titled "Diff: \`<path>\`" so the reader
-  // can tell file-viewer notes from diff-viewer notes on the same
-  // path.
+  // Group by display section. File anchors group per file path. Diff
+  // anchors group per (filePath, section) so the recipient can tell a
+  // committed-section note from an uncommitted-section note on the
+  // same file at the same line number — the two share a `diffPos`
+  // namespace per section and a single label like "New line 1" would
+  // otherwise be ambiguous.
   type Section = { title: string; entries: string[] };
   const sections: Section[] = [];
   const byKey = new Map<string, Section>();
@@ -38,7 +39,11 @@ export function formatNotesForSend(notes: ReviewNote[]): string | null {
       const s = sectionFor(`file:${n.anchor.filePath}`, `\`${n.anchor.filePath}\``);
       s.entries.push(formatLineEntry(`Line ${n.anchor.lineNumber}`, n.lineContent, n.body));
     } else if (n.anchor.kind === 'diff') {
-      const s = sectionFor(`diff:${n.anchor.filePath}`, `Diff: \`${n.anchor.filePath}\``);
+      const sectionLabel = n.anchor.section === 'committed' ? 'committed' : 'uncommitted';
+      const s = sectionFor(
+        `diff:${sectionLabel}:${n.anchor.filePath}`,
+        `Diff (${sectionLabel}): \`${n.anchor.filePath}\``,
+      );
       const label =
         n.anchor.newLine !== undefined
           ? `New line ${n.anchor.newLine}`
@@ -48,7 +53,11 @@ export function formatNotesForSend(notes: ReviewNote[]): string | null {
       s.entries.push(formatLineEntry(label, n.lineContent, n.body));
     } else {
       // diff-file (file-level diff note)
-      const s = sectionFor(`diff:${n.anchor.filePath}`, `Diff: \`${n.anchor.filePath}\``);
+      const sectionLabel = n.anchor.section === 'committed' ? 'committed' : 'uncommitted';
+      const s = sectionFor(
+        `diff:${sectionLabel}:${n.anchor.filePath}`,
+        `Diff (${sectionLabel}): \`${n.anchor.filePath}\``,
+      );
       s.entries.push(formatFileEntry(n.body));
     }
   }
