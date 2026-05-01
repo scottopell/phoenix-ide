@@ -712,38 +712,33 @@ async fn run_waiter(handle: Arc<Handle>, mut child: tokio::process::Child) {
 
 #[cfg(unix)]
 fn exit_status_to_cause(status: std::process::ExitStatus) -> FinalCause {
+    // Two paths surface a signaled termination under plain `bash -c <cmd>`:
+    //   1. WIFSIGNALED on bash itself — the wrapper was directly signaled.
+    //      `ExitStatus::signal()` returns the signal number.
+    //   2. 128+signum exit code — bash exited normally and reported that
+    //      its child died by signal via the conventional code. The kernel
+    //      did NOT mark the bash wait as WIFSIGNALED, so `signal()` is
+    //      None; the signal number is in `(code - 128)`.
+    //
+    // Per REQ-BASH-006 and bash.allium:117 ("Signal information is
+    // preserved on the `killed` state via the optional `signal_number`
+    // field"), both paths map to FinalCause::Killed. The agent sees a
+    // consistent "killed" semantic regardless of which wait path tripped.
     if let Some(sig) = status.signal() {
-        // The bash wrapper was replaced by `exec <cmd>`, so a signal here
-        // means the user command received the signal directly.
         FinalCause::Killed {
             exit_code: status.code(),
             signal_number: Some(sig),
         }
     } else if let Some(code) = status.code() {
-        // Bash convention: exit code in [128, 192) is "killed by signal
-        // (code-128)". This rarely fires under our `exec <cmd>` wrapping
-        // (signals reach the user code directly), but if a non-exec'd
-        // descendant trips it, recover the signal number for log
-        // readability — the cause is still `Exited` because the kernel
-        // returned a status code rather than reporting WIFSIGNALED.
-        let signal_number = if (128..192).contains(&code) {
-            Some(code - 128)
+        if (128..192).contains(&code) {
+            FinalCause::Killed {
+                exit_code: Some(code),
+                signal_number: Some(code - 128),
+            }
         } else {
-            None
-        };
-        // signal_number is included on the Tombstone (it's a struct field
-        // computed inside transition_to_terminal from FinalCause); but
-        // FinalCause::Exited doesn't carry signal_number directly. The
-        // foundation's transition_to_terminal only reads signal_number
-        // from FinalCause::Killed. Per design.md "Waiter task" code: a
-        // 128+signum exit is reported as FinalCause::Exited with the
-        // signal in `signal_number` only when WIFSIGNALED was true.
-        // For the conventional code path we report Exited with no signal
-        // number — the convention is informational only and does not
-        // change the agent-visible status.
-        let _ = signal_number;
-        FinalCause::Exited {
-            exit_code: Some(code),
+            FinalCause::Exited {
+                exit_code: Some(code),
+            }
         }
     } else {
         FinalCause::Exited { exit_code: None }

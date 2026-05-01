@@ -474,6 +474,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inner_process_signal_surfaces_via_128_plus_signum_convention() {
+        // REQ-BASH-006: when bash itself stays alive and only its child
+        // gets signal-killed, bash exits NORMALLY with code 128+signum
+        // reporting the child's signal. `Child::wait()` returns
+        // `ExitStatus::code() == Some(137)` and `signal() == None` — the
+        // kernel did NOT mark the bash wait as WIFSIGNALED. Phoenix maps
+        // this case to `FinalCause::Killed { signal_number: 9, exit_code: 137 }`
+        // so the agent sees a consistent "killed" semantic regardless of
+        // which path (direct WIFSIGNALED vs. relayed-via-exit-code) tripped.
+        //
+        // The compound `&& echo ok` form keeps bash from tail-call-exec'ing
+        // into sleep (so bash stays alive as the parent), and short-circuits
+        // when sleep is signaled, so bash propagates sleep's 137 status
+        // rather than echo's 0.
+        let tool = BashTool;
+        let registry = Arc::new(BashHandleRegistry::new());
+        let c = ctx_with_registry(registry);
+
+        // Use an unusual sleep duration so the inner sleep's argv (`sleep N`)
+        // is unique on the host and matchable via `pkill -xf` without
+        // collateral. Bash's argv is `bash -c sleep N && echo ok`, which
+        // does NOT match `sleep N` exactly under -x.
+        let unique_duration = "8128";
+        let cmd = format!("sleep {unique_duration} && echo ok");
+        let spawn = tool
+            .run(json!({"cmd": &cmd, "wait_seconds": 0}), c.clone())
+            .await;
+        let v = parse_response(&spawn);
+        let handle = v["handle"].as_str().unwrap().to_string();
+
+        // Wait for the inner sleep to be visible in the process table.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // SIGKILL only the inner sleep — pkill -xf with full-argv exact
+        // match. Bash's argv won't match (it has more words), so bash
+        // stays alive and observes its child dying.
+        let pkill = std::process::Command::new("pkill")
+            .args(["-KILL", "-xf", &format!("sleep {unique_duration}")])
+            .status()
+            .expect("pkill should be available");
+        assert!(
+            pkill.success() || pkill.code() == Some(0) || pkill.code() == Some(1),
+            "pkill exited with {pkill:?}"
+        );
+
+        // Wait on the handle — bash sees sleep die signaled, short-circuits
+        // the `&&`, and exits with code 137 (= 128 + SIGKILL). Phoenix
+        // remaps to FinalCause::Killed with signal_number=9, exit_code=137.
+        let result = tool
+            .run(json!({"wait": handle.clone(), "wait_seconds": 5}), c)
+            .await;
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "tombstoned", "got: {v}");
+        assert_eq!(v["final_cause"], "killed", "got: {v}");
+        assert_eq!(v["signal_number"], 9, "got: {v}");
+        assert_eq!(v["exit_code"], 137, "got: {v}");
+    }
+
+    #[tokio::test]
     async fn cap_rejection_returns_structured_live_handles_list() {
         let tool = BashTool;
         // 2-handle cap.

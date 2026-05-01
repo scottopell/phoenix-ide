@@ -22,7 +22,7 @@ in-memory only — they do not survive Phoenix restart.
 {
   "type": "object",
   "properties": {
-    "cmd":  { "type": "string",  "description": "Shell command to execute via bash -c (spawn). Will be wrapped as `bash -c \"exec <cmd>\"` so the bash process replaces itself with the user command and exit signals propagate cleanly." },
+    "cmd":  { "type": "string",  "description": "Shell command to execute via bash -c (spawn). The bash wrapper stays alive as the parent of the user command; on exit the bash wrapper relays the user command's signal info through ExitStatus (`WIFSIGNALED` directly, or via the 128+signum exit-code convention when bash itself was not signaled — see REQ-BASH-006)." },
     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 900,
                       "description": "How long this single tool call blocks before handing back a handle (default 30). This is NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use kill=<handle> to actually terminate." },
 
@@ -420,20 +420,26 @@ async fn wait_for_exit(child: tokio::process::Child, handle: Arc<Handle>) {
     let exit_status = child.wait().await;
     let (final_cause, exit_code, signal_number) = match &exit_status {
         Ok(s) => {
-            // We spawn user commands as `bash -c "exec <cmd>"` so the bash
-            // process replaces itself with the user code; ExitStatus then
-            // reflects the user code's exit, not bash's. WIFSIGNALED gives
-            // us the signal number directly; otherwise bash's 128+signum
-            // convention also lets us recover signal info from the exit code.
+            // We spawn user commands as plain `bash -c <cmd>` (no exec
+            // wrapping — exec breaks compound commands like `cd && cmd`).
+            // The bash wrapper stays alive as the parent of the user
+            // command and relays signal info on its own exit:
+            //   - WIFSIGNALED on bash itself: the bash process took a
+            //     signal directly (e.g., external kill of the wrapper),
+            //     surfaced via `ExitStatus::signal()`.
+            //   - 128+signum convention: the user command was signaled,
+            //     bash exited normally with code 128+signum reporting it.
+            //     Phoenix maps both paths to FinalCause::Killed so the
+            //     agent sees a consistent "killed" semantic regardless of
+            //     which path the kernel took (REQ-BASH-006).
             if let Some(sig) = s.signal() {
-                (FinalCause::Killed, None, Some(sig))
+                (FinalCause::Killed, s.code(), Some(sig))
             } else if let Some(code) = s.code() {
-                let sig = if code > 128 && code < 128 + 64 {
-                    Some(code - 128)
+                if (128..192).contains(&code) {
+                    (FinalCause::Killed, Some(code), Some(code - 128))
                 } else {
-                    None
-                };
-                (FinalCause::Exited, Some(code), sig)
+                    (FinalCause::Exited, Some(code), None)
+                }
             } else {
                 (FinalCause::Exited, None, None)
             }
@@ -820,9 +826,12 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
   itself conveys the already-terminal case; no separate flag).
 - External `kill -9` from outside Phoenix → handle reaches `status:
   "tombstoned"`, `final_cause: "killed"`, `signal_number: 9`. (Note:
-  with the `bash -c "exec ..."` spawn pattern, the bash wrapper is
-  replaced by the user command, so external signals reach the user
-  command directly and surface in `Child::wait()`'s `ExitStatus::signal()`.)
+  with plain `bash -c <cmd>`, two paths produce this outcome — bash
+  itself was signaled (`ExitStatus::signal() == Some(9)`), or the user
+  command was signaled and bash relayed it via exit code 137
+  (`ExitStatus::code() == Some(137)`, no `signal()`). Phoenix maps both
+  to `FinalCause::Killed` so the response is identical, with the 128+N
+  convention recovered into `signal_number` per REQ-BASH-006.)
 - Late-arriving exit after `kill_pending_kernel`: handle transitions
   `kill_pending_kernel → killed` (or `→ exited`); subsequent peek/wait/
   kill observes the now-tombstoned state via `status: "tombstoned"`.
