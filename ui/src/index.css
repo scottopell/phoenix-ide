@@ -911,6 +911,16 @@ body {
 .tool-block-status {
   margin-left: auto;
   font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tool-block-duration {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  opacity: 0.75;
+  letter-spacing: 0.01em;
 }
 
 .tool-block-status.success {

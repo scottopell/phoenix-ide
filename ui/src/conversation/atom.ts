@@ -25,6 +25,11 @@ export interface ConversationAtom {
   connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
+  /** `Date.now()` when the current `tool_executing` phase began. Reset on
+   *  each new tool (a single agent turn may execute many tools sequentially).
+   *  `null` when not in `tool_executing`. Used by StateBar to render a live
+   *  elapsed-time counter. */
+  toolExecutingStartedAt: number | null;
 }
 
 export interface InitPayload {
@@ -106,6 +111,7 @@ export function createInitialAtom(): ConversationAtom {
     connectionState: 'connecting',
     streamingBuffer: null,
     uiError: null,
+    toolExecutingStartedAt: null,
   };
 }
 
@@ -294,6 +300,7 @@ export function conversationReducer(
         lastSequenceId: newLastSeq,
         streamingBuffer: null,
         uiError: null,
+        toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
       };
     }
 
@@ -366,11 +373,16 @@ export function conversationReducer(
           newCrumb,
           action.sequenceId
         );
+        // Track when we enter tool_executing — reset on each new tool so the
+        // live elapsed counter in StateBar always reflects the current tool.
+        const toolExecutingStartedAt =
+          action.phase.type === 'tool_executing' ? Date.now() : null;
         return {
           ...a,
           phase: action.phase,
           breadcrumbs,
           breadcrumbSequenceIds,
+          toolExecutingStartedAt,
         };
       });
     }

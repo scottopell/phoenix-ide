@@ -992,6 +992,7 @@ export function ConversationPage() {
         onRetryNow={connectionInfo.retryNow}
         onTriggerContinuation={handleTriggerContinuation}
         onUpgradeModel={handleUpgradeModel}
+        toolExecutingStartedAt={atom.toolExecutingStartedAt}
       />
       </div>
 

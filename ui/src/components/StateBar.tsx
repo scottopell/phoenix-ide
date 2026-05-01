@@ -27,6 +27,10 @@ interface StateBarProps {
   onTriggerContinuation?: () => void;
   /** Callback invoked when the user selects a different model for this conversation */
   onUpgradeModel?: (newModelId: string) => void;
+  /** `Date.now()` timestamp when the current tool_executing phase began.
+   *  Used to render a live elapsed-time counter ("running bash ... 4s").
+   *  `null` or `undefined` when not in tool_executing. */
+  toolExecutingStartedAt?: number | null;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
@@ -73,6 +77,17 @@ function getProjectName(conversation: Conversation): string | null {
   return parts[parts.length - 1] || null;
 }
 
+/** Format elapsed seconds as a compact duration string.
+ *  < 60s  -> "4s"
+ *  >= 60s -> "1m 4s" (seconds part omitted when 0: "2m")
+ */
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+}
+
 export function StateBar({
   conversation,
   convState,
@@ -85,6 +100,7 @@ export function StateBar({
   onRetryNow,
   onTriggerContinuation,
   onUpgradeModel,
+  toolExecutingStartedAt,
 }: StateBarProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
@@ -93,6 +109,21 @@ export function StateBar({
   const [mobileExpanded, setMobileExpanded] = useState(false);
   const pickerRef = useRef<HTMLSpanElement>(null);
 
+  // Live elapsed-time counter for tool_executing state.
+  // Ticks every second; cleared immediately when leaving tool_executing.
+  const [toolElapsedSeconds, setToolElapsedSeconds] = useState(0);
+  useEffect(() => {
+    if (convState.type !== 'tool_executing' || !toolExecutingStartedAt) {
+      setToolElapsedSeconds(0);
+      return;
+    }
+    // Compute immediately (avoids 1s lag on first render after transition)
+    setToolElapsedSeconds(Math.floor((Date.now() - toolExecutingStartedAt) / 1000));
+    const interval = window.setInterval(() => {
+      setToolElapsedSeconds(Math.floor((Date.now() - toolExecutingStartedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [convState.type, toolExecutingStartedAt]);
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 768px)');
     const handler = (e: MediaQueryListEvent) => {
@@ -191,7 +222,11 @@ export function StateBar({
           case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
           case 'awaiting_recovery':
             dotClass += ' working';
-            stateText = getStateDescription(convState);
+            if (convState.type === 'tool_executing' && toolElapsedSeconds > 0) {
+              stateText = `${getStateDescription(convState)} ... ${formatElapsed(toolElapsedSeconds)}`;
+            } else {
+              stateText = getStateDescription(convState);
+            }
             break;
           default: convState satisfies never;
         }
