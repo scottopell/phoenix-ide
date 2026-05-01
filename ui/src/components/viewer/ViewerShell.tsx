@@ -6,6 +6,9 @@ export type ViewerMode = 'overlay' | 'inline';
 
 interface ViewerShellProps {
   mode: ViewerMode;
+  /** ARIA label for the dialog/region — used by screen readers and
+   *  test queries (e.g. `getByRole('dialog', { name: 'Worktree diff' })`). */
+  ariaLabel: string;
   /** Header title — file name, "Diff vs <base>", etc. */
   title: ReactNode;
   /** Tooltip on the title (e.g. absolute path). */
@@ -53,6 +56,7 @@ interface ViewerShellProps {
  */
 export function ViewerShell({
   mode,
+  ariaLabel,
   title,
   titleTooltip,
   headerExtras,
@@ -82,7 +86,12 @@ export function ViewerShell({
   }, [onClose, dialog, confirm]);
 
   return (
-    <div className={mode === 'overlay' ? 'viewer-shell viewer-shell--overlay' : 'viewer-shell viewer-shell--inline'}>
+    <div
+      className={mode === 'overlay' ? 'viewer-shell viewer-shell--overlay' : 'viewer-shell viewer-shell--inline'}
+      role={mode === 'overlay' ? 'dialog' : 'region'}
+      aria-label={ariaLabel}
+      aria-modal={mode === 'overlay' ? true : undefined}
+    >
       <div className="viewer-shell-header">
         <button
           className="viewer-shell-btn"

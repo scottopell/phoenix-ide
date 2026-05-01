@@ -8,6 +8,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { WorkActions } from './WorkActions';
+import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+import type { ReactElement } from 'react';
+
+// All tests need the review-notes provider since the diff viewer (lazily
+// mounted on View Diff click) reads from it. Wrap renders in this helper
+// instead of repeating the provider at every callsite.
+const renderWithProvider = (ui: ReactElement) =>
+  render(<ReviewNotesProvider>{ui}</ReviewNotesProvider>);
 
 vi.mock('../api', () => ({
   api: {
@@ -23,7 +31,7 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   });
 
   it('disables Abandon and Mark-as-Merged when continuedInConvId is set', async () => {
-    render(
+    renderWithProvider(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Work"
@@ -49,7 +57,7 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   it('enables Abandon and Mark-as-Merged when continuedInConvId is null', async () => {
     const { api } = await import('../api');
 
-    render(
+    renderWithProvider(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Work"
@@ -88,7 +96,7 @@ describe('WorkActions — View Diff (task 08641)', () => {
       uncommitted_diff: '',
     });
 
-    render(
+    renderWithProvider(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Branch"
@@ -111,7 +119,10 @@ describe('WorkActions — View Diff (task 08641)', () => {
     await waitFor(() => {
       expect(screen.getByRole('dialog', { name: /worktree diff/i })).toBeInTheDocument();
     });
-    expect(screen.getByText(/origin\/main/)).toBeInTheDocument();
+    // `origin/main` appears in both the title and the "Committed changes
+    // (vs origin/main)" section header — getAllByText avoids the
+    // single-match assertion failure.
+    expect(screen.getAllByText(/origin\/main/).length).toBeGreaterThan(0);
     expect(screen.getByText(/abcdef0 feat: thing/)).toBeInTheDocument();
   });
 
@@ -121,7 +132,7 @@ describe('WorkActions — View Diff (task 08641)', () => {
       new Error('Worktree no longer exists: /tmp/wt'),
     );
 
-    render(
+    renderWithProvider(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Work"
@@ -145,7 +156,7 @@ describe('WorkActions — View Diff (task 08641)', () => {
   });
 
   it('does not render the View Diff button in Direct mode', async () => {
-    render(
+    renderWithProvider(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Direct"
