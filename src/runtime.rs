@@ -22,7 +22,7 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
-use crate::tools::{BrowserSessionManager, ToolRegistry};
+use crate::tools::{BashHandleRegistry, BrowserSessionManager, ToolRegistry};
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -61,6 +61,10 @@ pub struct RuntimeManager {
     llm_registry: Arc<ModelRegistry>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
+    /// Per-process bash handle registry. Shared by every conversation's
+    /// `ToolContext`; each conversation gets its own `ConversationHandles`
+    /// table inside (REQ-BASH-014).
+    bash_handles: Arc<BashHandleRegistry>,
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
@@ -396,6 +400,7 @@ impl RuntimeManager {
             llm_registry,
             platform,
             browser_sessions: Arc::new(BrowserSessionManager::default()),
+            bash_handles: Arc::new(BashHandleRegistry::new()),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
@@ -415,6 +420,12 @@ impl RuntimeManager {
     /// Get the browser session manager
     pub fn browser_sessions(&self) -> &Arc<BrowserSessionManager> {
         &self.browser_sessions
+    }
+
+    /// Get the bash handle registry (REQ-BASH-007 shutdown kill-tree,
+    /// REQ-BASH-006 hard-delete cascade).
+    pub fn bash_handles(&self) -> &Arc<BashHandleRegistry> {
+        &self.bash_handles
     }
 
     /// Get the spawn channel sender (cloned for each runtime)
@@ -599,6 +610,7 @@ impl RuntimeManager {
             llm_client,
             tool_executor,
             self.browser_sessions.clone(),
+            self.bash_handles.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
             event_rx,
@@ -821,6 +833,7 @@ impl RuntimeManager {
             llm_client,
             tool_executor,
             self.browser_sessions.clone(),
+            self.bash_handles.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
             event_rx,

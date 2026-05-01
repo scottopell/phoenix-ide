@@ -8,6 +8,21 @@
 //! REQ-BASH-006: Error Reporting
 //! REQ-BASH-007: Subprocess Termination on Cancellation
 
+// Foundation submodules for the handle-based bash model (task 02693).
+// The current `BashTool` impl in this file is the legacy kill-on-timeout
+// implementation; task 02694 rewrites it to dispatch over the foundation
+// types below. Re-exports are kept narrow to what `crate::tools` already
+// exposes (BashHandleError, BashHandleRegistry, ConversationHandles); the
+// rest of the foundation API is reached via `crate::tools::bash::handle::*`,
+// `::ring::*`, etc.
+pub mod handle;
+pub mod reaper;
+pub mod registry;
+pub mod ring;
+
+pub use reaper::{install_reaper, shutdown_kill_tree};
+pub use registry::{BashHandleError, BashHandleRegistry, ConversationHandles};
+
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -304,6 +319,7 @@ mod tests {
             "test-conv".to_string(),
             temp_dir(),
             Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
         )
@@ -315,6 +331,7 @@ mod tests {
             "test-conv".to_string(),
             temp_dir(),
             Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
         )

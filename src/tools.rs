@@ -3,7 +3,7 @@
 //! REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 
 mod ask_user_question;
-mod bash;
+pub mod bash;
 pub mod bash_check;
 pub mod browser;
 mod keyword_search;
@@ -20,7 +20,9 @@ mod terminal_last_command;
 mod think;
 
 pub use ask_user_question::AskUserQuestionTool;
-pub use bash::BashTool;
+pub use bash::{
+    BashHandleError, BashHandleRegistry, BashTool, ConversationHandles as BashConversationHandles,
+};
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
     BrowserKeyPressTool, BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
@@ -119,6 +121,17 @@ pub struct ToolContext {
     /// Browser session manager (access via `browser()` method)
     browser_sessions: Arc<BrowserSessionManager>,
 
+    /// Per-process bash handle registry (access via `bash_handles()` method).
+    /// Owns the per-conversation handle tables, ring buffers, tombstones,
+    /// and live-handle cap enforcement (REQ-BASH-005, REQ-BASH-006,
+    /// REQ-BASH-014).
+    ///
+    /// Read by `bash_handles()` / `bash_handle_registry()` — task 02694's
+    /// `BashTool` dispatch is the consumer. Foundation-only builds will
+    /// see this as unread.
+    #[allow(dead_code)]
+    bash_handles: Arc<BashHandleRegistry>,
+
     /// LLM registry for tools that need model access
     llm_registry: Arc<ModelRegistry>,
 
@@ -134,6 +147,7 @@ impl ToolContext {
         conversation_id: String,
         working_dir: PathBuf,
         browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
     ) -> Self {
@@ -142,6 +156,7 @@ impl ToolContext {
             conversation_id,
             working_dir,
             browser_sessions,
+            bash_handles,
             llm_registry,
             terminals,
         }
@@ -157,6 +172,30 @@ impl ToolContext {
         self.browser_sessions
             .get_session(&self.conversation_id)
             .await
+    }
+
+    /// Get the per-conversation bash handle table.
+    ///
+    /// Lazily creates the conversation entry on first call; subsequent
+    /// calls in the same conversation return the same `Arc<RwLock<...>>`.
+    /// Returns a `Result` for shape-parity with [`Self::browser`] —
+    /// `get_or_create` is currently infallible, but the surface accepts
+    /// future failure modes (e.g. registry resource exhaustion) without
+    /// reshaping every callsite.
+    ///
+    /// REQ-BASH-014: Stateless Tool with Per-Conversation Handle Registry.
+    #[allow(dead_code)] // Consumed by task 02694's BashTool dispatch.
+    pub async fn bash_handles(
+        &self,
+    ) -> Result<Arc<RwLock<BashConversationHandles>>, BashHandleError> {
+        Ok(self.bash_handles.get_or_create(&self.conversation_id).await)
+    }
+
+    /// Direct access to the registry (used by the hard-delete cascade
+    /// integration in task 02696, and by the shutdown kill-tree pass).
+    #[allow(dead_code)] // Consumed by tasks 02694 / 02696.
+    pub fn bash_handle_registry(&self) -> &Arc<BashHandleRegistry> {
+        &self.bash_handles
     }
 
     /// Get the LLM registry

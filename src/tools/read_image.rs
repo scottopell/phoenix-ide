@@ -163,6 +163,7 @@ mod tests {
             "test-conv".to_string(),
             working_dir,
             Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
         )

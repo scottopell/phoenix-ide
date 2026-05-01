@@ -54,6 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     hot_restart::record_start_time();
 
+    // REQ-BASH-007: install the child subreaper so descendants whose
+    // parent dies (double-forks, setsid daemons) reparent to Phoenix
+    // rather than init. Must run before any tool spawns a child.
+    crate::tools::bash::install_reaper();
+
     // Log startup context: binary path, version, and whether this looks like a deploy
     let exe_path =
         std::env::current_exe().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string());
@@ -206,6 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
         .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
 
+    // Hold an Arc to the bash handle registry so the shutdown kill-tree
+    // pass (REQ-BASH-007) can reach it after `state` moves into the router.
+    let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
+
     let app = create_router(state)
         .layer(trace_layer)
         .layer(cors)
@@ -225,6 +234,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server
         .with_graceful_shutdown(hot_restart::shutdown_signal())
         .await?;
+
+    // REQ-BASH-007: after the server stops accepting requests, walk the
+    // live bash handle table and SIGKILL every process group as a final
+    // cleanup pass before we relinquish control to the OS. Bounded by
+    // SHUTDOWN_KILL_GRACE_SECONDS so a stuck D-state child cannot delay
+    // shutdown indefinitely.
+    crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
 
     // After graceful shutdown, check if we should hot restart
     // (This does not return if hot restart is performed)
