@@ -377,20 +377,23 @@ pub(crate) async fn get_conversation_diff(
             )));
         }
 
-        let captured = capture_branch_diff(&wt, &base_branch);
-
-        let (committed_diff, committed_truncated_kib) =
-            truncate_diff(&captured.committed_diff, MAX_DIFF_BYTES);
-        let (uncommitted_diff, uncommitted_truncated_kib) =
-            truncate_diff(&captured.uncommitted_diff, MAX_DIFF_BYTES);
+        let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
 
         Ok(ConversationDiffResponse {
             comparator: captured.comparator,
             commit_log: captured.commit_log,
-            committed_diff,
-            committed_truncated_kib,
-            uncommitted_diff,
-            uncommitted_truncated_kib,
+            committed_truncated_kib: truncated_kib(
+                &captured.committed_diff,
+                captured.committed_total_bytes,
+                captured.committed_saturated,
+            ),
+            committed_diff: captured.committed_diff,
+            uncommitted_truncated_kib: truncated_kib(
+                &captured.uncommitted_diff,
+                captured.uncommitted_total_bytes,
+                captured.uncommitted_saturated,
+            ),
+            uncommitted_diff: captured.uncommitted_diff,
         })
     })
     .await
@@ -398,20 +401,15 @@ pub(crate) async fn get_conversation_diff(
     .map(Json)
 }
 
-/// Truncate `body` at `max_bytes`, returning the (possibly truncated) text
-/// and the original size in KiB if truncation occurred. The truncation
-/// happens at a UTF-8 character boundary so the returned string remains
-/// valid UTF-8.
-fn truncate_diff(body: &str, max_bytes: usize) -> (String, Option<u32>) {
-    if body.len() <= max_bytes {
-        return (body.to_string(), None);
+/// Convert the streamed-capture metadata into the wire `Option<u32>`:
+/// `None` when the diff fit under the cap, otherwise the total stdout
+/// size in KiB. When `saturated` is true the returned value is a lower
+/// bound (we hit the hard read limit and stopped counting).
+fn truncated_kib(stdout: &str, total_bytes: u64, saturated: bool) -> Option<u32> {
+    if !saturated && total_bytes <= stdout.len() as u64 {
+        return None;
     }
-    let end = body.floor_char_boundary(max_bytes);
-    let truncated = body.get(..end).unwrap_or(body).to_string();
-    // u32 is enough for ~4TiB diffs; saturating cast handles the
-    // pathological case where the diff is somehow larger.
-    let original_kib = u32::try_from(body.len() / 1024).unwrap_or(u32::MAX);
-    (truncated, Some(original_kib))
+    Some(u32::try_from(total_bytes / 1024).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -419,37 +417,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_diff_passthrough_when_under_cap() {
-        let (out, kib) = truncate_diff("short", 1024);
-        assert_eq!(out, "short");
-        assert_eq!(kib, None);
+    fn truncated_kib_passthrough_when_under_cap() {
+        // 5-byte stdout, 5 total bytes, not saturated → None.
+        assert_eq!(truncated_kib("short", 5, false), None);
     }
 
     #[test]
-    fn truncate_diff_at_exact_cap_is_passthrough() {
+    fn truncated_kib_at_exact_cap_is_passthrough() {
         let body = "x".repeat(100);
-        let (out, kib) = truncate_diff(&body, 100);
-        assert_eq!(out.len(), 100);
-        assert_eq!(kib, None);
+        assert_eq!(truncated_kib(&body, 100, false), None);
     }
 
     #[test]
-    fn truncate_diff_over_cap_reports_kib() {
-        let body = "x".repeat(3072); // 3 KiB
-        let (out, kib) = truncate_diff(&body, 1024);
-        assert!(out.len() <= 1024);
-        assert_eq!(kib, Some(3));
+    fn truncated_kib_over_cap_reports_kib() {
+        // 1 KiB visible, 3 KiB total, not saturated → Some(3).
+        let body = "x".repeat(1024);
+        assert_eq!(truncated_kib(&body, 3072, false), Some(3));
     }
 
     #[test]
-    fn truncate_diff_respects_utf8_boundary() {
-        // Multi-byte char straddles the cap boundary.
-        let body = "abc\u{1F600}def"; // emoji is 4 bytes
-        let (out, kib) = truncate_diff(body, 4);
-        // floor_char_boundary on byte 4 should retreat to byte 3 (before
-        // the emoji), not split it.
-        assert_eq!(out, "abc");
-        // 11 bytes / 1024 = 0
-        assert_eq!(kib, Some(0));
+    fn truncated_kib_saturated_returns_lower_bound() {
+        // Saturated always reports the (lower-bound) total even if it
+        // happens to equal stdout.len() — caller must show "≥X KiB" UI.
+        assert_eq!(truncated_kib("x", 8 * 1024, true), Some(8));
     }
 }

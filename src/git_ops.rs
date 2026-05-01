@@ -6,6 +6,22 @@
 
 use std::path::Path;
 
+/// Outcome of a size-limited git stdout capture (see `run_git_capped`).
+pub(crate) struct CappedStdout {
+    /// Truncated stdout — at most `max_bytes` long, cut on a UTF-8
+    /// character boundary.
+    pub stdout: String,
+    /// Total stdout bytes seen. Exact when `saturated == false`; a lower
+    /// bound when `saturated == true` (we hit the hard read limit and
+    /// killed the child).
+    pub total_bytes: u64,
+    /// True when the streaming reader hit its hard limit and stopped
+    /// counting before the child finished. Diffs that can produce more
+    /// than `hard_limit` bytes will set this; the truncation indicator
+    /// in the UI should treat `total_bytes` as a lower bound.
+    pub saturated: bool,
+}
+
 /// Unified error type for git operations.
 #[derive(Debug)]
 pub(crate) enum GitOpError {
@@ -70,6 +86,119 @@ pub(crate) fn run_git_with_env(
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(format!("git {} failed: {stderr}", args.join(" ")))
     }
+}
+
+/// Run `git` and stream stdout, keeping at most `max_bytes` in memory.
+/// Continues counting up to `hard_limit_bytes` so callers can report
+/// "X KiB total" for the truncation indicator; if the child still has
+/// more output past `hard_limit_bytes`, the stream is killed and the
+/// returned `total_bytes` is a lower bound (`saturated = true`).
+///
+/// The point of this helper is to keep peak memory bounded for the
+/// per-conversation diff endpoint, which can be invoked repeatedly from
+/// the UI on worktrees with arbitrarily large diffs. Without it,
+/// `Command::output()` materialises the entire stdout buffer before any
+/// truncation runs.
+///
+/// `max_bytes == 0` returns an empty string but still drains/counts the
+/// stream up to the hard limit.
+pub(crate) fn run_git_capped(
+    cwd: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    max_bytes: usize,
+    hard_limit_bytes: u64,
+) -> Result<CappedStdout, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(*k, *v);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn git {}: {e}", args.join(" ")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git child had no stdout".to_string())?;
+
+    let initial_capacity = max_bytes.min(64 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
+    let mut total_bytes: u64 = 0;
+    let mut saturated = false;
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let n = match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {} read failed: {e}", args.join(" ")));
+            }
+        };
+        // Append to the in-memory buffer up to `max_bytes`. Anything past
+        // the cap is discarded immediately; we only count it.
+        if buf.len() < max_bytes {
+            let take = (max_bytes - buf.len()).min(n);
+            buf.extend_from_slice(&chunk[..take]);
+        }
+        total_bytes = total_bytes.saturating_add(n as u64);
+        if total_bytes > hard_limit_bytes {
+            saturated = true;
+            let _ = child.kill();
+            // Drain any remaining buffered bytes from the OS pipe so the
+            // child can exit cleanly; cap the drain at a small bound.
+            let mut drained = 0u64;
+            while drained < 64 * 1024 {
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(m) => drained += m as u64,
+                }
+            }
+            break;
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("git {} wait failed: {e}", args.join(" ")))?;
+
+    if !status.success() && !saturated {
+        // Git failed (and we didn't kill it). Capture stderr for the
+        // error message — small + bounded so a full read is fine.
+        let mut stderr_bytes = Vec::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_end(&mut stderr_bytes);
+        }
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        return Err(format!("git {} failed: {stderr}", args.join(" ")));
+    }
+
+    // Truncate at a UTF-8 char boundary so the result is valid UTF-8.
+    let stdout_string = String::from_utf8_lossy(&buf).into_owned();
+    let truncated = if stdout_string.len() > max_bytes {
+        let end = stdout_string.floor_char_boundary(max_bytes);
+        stdout_string.get(..end).unwrap_or("").to_string()
+    } else {
+        stdout_string
+    };
+
+    Ok(CappedStdout {
+        stdout: truncated,
+        total_bytes,
+        saturated,
+    })
 }
 
 /// Fetch a single branch from origin and ensure a local ref exists.
@@ -174,23 +303,33 @@ pub(crate) fn effective_base_ref(cwd: &Path, base_branch: &str) -> String {
 ///
 /// Used by both the abandon snapshot and the conversation diff endpoint.
 /// All fields are best-effort — empty strings when the underlying git
-/// command fails (e.g. worktree gone, branch gone). Callers decide how to
-/// truncate; this helper returns full output.
+/// command fails (e.g. worktree gone, branch gone).
+///
+/// Diff fields are captured via `run_git_capped`, which streams stdout
+/// and stops appending to memory after `max_section_bytes` while
+/// continuing to count up to the hard limit. The `*_total_bytes` and
+/// `*_saturated` fields let callers render an accurate truncation
+/// indicator without re-running git.
 pub(crate) struct CapturedDiff {
     /// The ref used as the comparator (`"origin/<base>"` or bare `"<base>"`).
     pub comparator: String,
     /// `git log --oneline <comparator>..HEAD` — commits on the branch that
-    /// are not yet in the comparator. Subject lines only.
+    /// are not yet in the comparator. Subject lines only; not capped
+    /// (commit titles are tiny).
     pub commit_log: String,
-    /// `git diff <comparator>...HEAD` (triple-dot) — file-level diff of
-    /// committed work vs the common ancestor. Immune to commit-history
-    /// noise from rebases that replay already-merged commits.
+    /// `git diff <comparator>...HEAD` (triple-dot), capped at
+    /// `max_section_bytes`.
     pub committed_diff: String,
+    /// Total stdout size of the committed-diff stream. Exact unless
+    /// `committed_saturated == true` (see `CappedStdout`).
+    pub committed_total_bytes: u64,
+    pub committed_saturated: bool,
     /// `git diff HEAD` capturing working-tree changes (staged + unstaged +
-    /// untracked). Untracked files are surfaced via `git add -N .` against
-    /// a `GIT_INDEX_FILE` temp index so the worktree's real index is never
-    /// mutated.
+    /// untracked, surfaced via a `GIT_INDEX_FILE` temp index so the real
+    /// index is never mutated). Capped at `max_section_bytes`.
     pub uncommitted_diff: String,
+    pub uncommitted_total_bytes: u64,
+    pub uncommitted_saturated: bool,
 }
 
 /// RAII guard that removes a temp file on drop. Used by `capture_branch_diff`
@@ -206,16 +345,28 @@ impl Drop for TempPath {
 /// Capture committed and uncommitted state of `worktree` relative to
 /// `base_branch`. See `CapturedDiff` for field semantics.
 ///
-/// The uncommitted-diff capture surfaces untracked files via `git add -N`,
-/// which mutates the index. To keep this helper read-only — important for
-/// the GET diff endpoint that may be hit repeatedly while the user works —
-/// the mutation runs against a `GIT_INDEX_FILE` temp index copied from the
-/// worktree's real one. Real index is never touched. If the temp index
-/// cannot be set up (e.g. `git rev-parse --git-dir` fails or the copy
-/// errors), the uncommitted-diff capture falls back to a plain `git diff
-/// HEAD` that skips untracked files rather than mutating.
-pub(crate) fn capture_branch_diff(worktree: &Path, base_branch: &str) -> CapturedDiff {
+/// `max_section_bytes` caps each diff section in memory; the streaming
+/// reader continues to count past the cap up to a hard limit
+/// (`max_section_bytes * 8`) so the response can include an accurate
+/// "X KiB total" truncation indicator. Beyond the hard limit the count
+/// becomes a lower bound (see `CappedStdout::saturated`).
+///
+/// The uncommitted-diff capture surfaces untracked files via `git add -N`
+/// against a `GIT_INDEX_FILE` temp index copied from the worktree's real
+/// one. Real index is never touched. If the temp index cannot be set up
+/// (e.g. `git rev-parse --git-dir` fails or the copy errors), the
+/// uncommitted-diff capture falls back to a plain `git diff HEAD` that
+/// skips untracked files rather than mutating.
+pub(crate) fn capture_branch_diff(
+    worktree: &Path,
+    base_branch: &str,
+    max_section_bytes: usize,
+) -> CapturedDiff {
     let comparator = effective_base_ref(worktree, base_branch);
+    // Hard limit on bytes streamed before we kill the child process. 8x
+    // the visible cap is a comfortable margin for "we know the diff is
+    // bigger than this" without burning unbounded CPU on monster diffs.
+    let hard_limit = (max_section_bytes as u64).saturating_mul(8);
 
     let commit_log = run_git(
         worktree,
@@ -223,20 +374,40 @@ pub(crate) fn capture_branch_diff(worktree: &Path, base_branch: &str) -> Capture
     )
     .unwrap_or_default();
 
-    let committed_diff =
-        run_git(worktree, &["diff", &format!("{comparator}...HEAD")]).unwrap_or_default();
+    let committed = run_git_capped(
+        worktree,
+        &["diff", &format!("{comparator}...HEAD")],
+        &[],
+        max_section_bytes,
+        hard_limit,
+    )
+    .unwrap_or(CappedStdout {
+        stdout: String::new(),
+        total_bytes: 0,
+        saturated: false,
+    });
 
-    let uncommitted_diff = capture_uncommitted_diff(worktree);
+    let uncommitted = capture_uncommitted_diff(worktree, max_section_bytes, hard_limit);
 
     CapturedDiff {
         comparator,
         commit_log,
-        committed_diff,
-        uncommitted_diff,
+        committed_diff: committed.stdout,
+        committed_total_bytes: committed.total_bytes,
+        committed_saturated: committed.saturated,
+        uncommitted_diff: uncommitted.stdout,
+        uncommitted_total_bytes: uncommitted.total_bytes,
+        uncommitted_saturated: uncommitted.saturated,
     }
 }
 
-fn capture_uncommitted_diff(worktree: &Path) -> String {
+fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) -> CappedStdout {
+    let empty = || CappedStdout {
+        stdout: String::new(),
+        total_bytes: 0,
+        saturated: false,
+    };
+
     // Try to set up an isolated index. If anything fails, fall back to a
     // tracked-only diff — never mutate the real index.
     let Some(temp) = prepare_temp_index(worktree) else {
@@ -244,7 +415,8 @@ fn capture_uncommitted_diff(worktree: &Path) -> String {
             worktree = %worktree.display(),
             "could not isolate git index — falling back to tracked-only uncommitted diff"
         );
-        return run_git(worktree, &["diff", "HEAD"]).unwrap_or_default();
+        return run_git_capped(worktree, &["diff", "HEAD"], &[], max_bytes, hard_limit)
+            .unwrap_or_else(|_| empty());
     };
 
     let temp_path_str = temp.0.to_string_lossy().into_owned();
@@ -253,7 +425,8 @@ fn capture_uncommitted_diff(worktree: &Path) -> String {
     // Stage untracked files in the temp index so they surface in the diff.
     // Errors here are non-fatal — diff just won't include the untracked.
     let _ = run_git_with_env(worktree, &["add", "-N", "."], &env);
-    run_git_with_env(worktree, &["diff", "HEAD"], &env).unwrap_or_default()
+    run_git_capped(worktree, &["diff", "HEAD"], &env, max_bytes, hard_limit)
+        .unwrap_or_else(|_| empty())
 }
 
 /// Find the worktree's git index, copy it to a unique temp path, and
@@ -489,6 +662,56 @@ mod tests {
     }
 
     #[test]
+    fn run_git_capped_passthrough_when_under_cap() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // `git status --porcelain` on a fresh repo is empty stdout.
+        let out =
+            run_git_capped(tmp.path(), &["status", "--porcelain"], &[], 1024, 8 * 1024).unwrap();
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.total_bytes, 0);
+        assert!(!out.saturated);
+    }
+
+    #[test]
+    fn run_git_capped_truncates_at_max_bytes_and_counts_total() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // Stage a 4 KiB blob so `git diff --cached` produces a sizable
+        // stdout. Cap reads at 256 bytes; stream should keep counting.
+        let payload = "abcdefghijklmnop\n".repeat(256); // 4352 bytes
+        std::fs::write(tmp.path().join("big.txt"), &payload).unwrap();
+        run_git(tmp.path(), &["add", "big.txt"]).unwrap();
+
+        let out = run_git_capped(tmp.path(), &["diff", "--cached"], &[], 256, 64 * 1024).unwrap();
+        assert!(out.stdout.len() <= 256, "stdout should be capped");
+        assert!(
+            out.total_bytes > 256,
+            "total_bytes should reflect the full stream",
+        );
+        assert!(!out.saturated, "should not saturate under hard limit");
+    }
+
+    #[test]
+    fn run_git_capped_saturates_past_hard_limit() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // Make the staged blob bigger than the hard limit.
+        let payload = "x".repeat(8 * 1024); // 8 KiB raw → diff is bigger
+        std::fs::write(tmp.path().join("huge.txt"), &payload).unwrap();
+        run_git(tmp.path(), &["add", "huge.txt"]).unwrap();
+
+        // Cap memory at 128 bytes, hard limit at 1 KiB. Expect saturation.
+        let out = run_git_capped(tmp.path(), &["diff", "--cached"], &[], 128, 1024).unwrap();
+        assert!(out.stdout.len() <= 128);
+        assert!(
+            out.saturated,
+            "should saturate when stream exceeds hard limit"
+        );
+        assert!(out.total_bytes >= 1024);
+    }
+
+    #[test]
     fn capture_branch_diff_does_not_mutate_real_index() {
         // Regression for review: capture_branch_diff used to run `git add -N .`
         // directly, mutating the worktree index. This test creates an
@@ -515,7 +738,7 @@ mod tests {
             None
         };
 
-        let captured = capture_branch_diff(tmp.path(), "main");
+        let captured = capture_branch_diff(tmp.path(), "main", 100 * 1024);
         // Sanity: the untracked file showed up in the diff (so add -N
         // actually ran against the temp index).
         assert!(
