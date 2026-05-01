@@ -69,6 +69,11 @@ globset = "0.4"
 # Regex for search tool
 regex = "1"
 
+# Markdown event-stream parser. Used to mask code regions during inline-
+# reference tokenization so `@`/`/` sigils inside fenced/inline/indented
+# code blocks don't get expanded as file or skill references.
+pulldown-cmark = { version = "0.13", default-features = false }
+
 # Browser automation
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime", "_fetcher-rustls-tokio"] }
 brush-parser = "0.3.0"
