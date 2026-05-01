@@ -300,3 +300,17 @@ invariant NonReferenceNeverBlocks {
     for ref in InlineReferences where ref.intent = not_a_reference:
         not ExpansionBlocked(ref)
 }
+
+-- Sigils that fall inside a markdown code region (fenced code block,
+-- indented code block, or inline backtick span) are never tokenized as
+-- references. A user pasting a stack trace or example code containing
+-- `@src/main.rs` inside a fence sends the literal text to the LLM rather
+-- than triggering file expansion (or a FileNotFound error if the path is
+-- stale). Implementation: `masked_code_ranges` in `src/message_expander.rs`,
+-- consumed by `tokenize_references`.
+invariant NoExpansionInsideCode {
+    for p in sigil_positions(text):
+        p in markdown_code_region(text)
+            implies not exists ref in tokenize_references(text):
+                ref.span.start = p
+}

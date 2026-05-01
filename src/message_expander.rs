@@ -82,13 +82,81 @@ struct InlineReference {
     span: std::ops::Range<usize>,
 }
 
+/// Sorted, non-overlapping byte ranges covering markdown code regions in
+/// `text` — fenced code blocks, indented code blocks, and inline code spans.
+/// Used by the tokenizer to skip sigils that fall inside code, so a user
+/// pasting a stack trace with `@src/main.rs:42` inside a fence doesn't
+/// trigger file expansion.
+///
+/// Unclosed fences: `pulldown-cmark` auto-closes at EOF, which here means
+/// the masked range extends to the end of `text` — conservative by design
+/// (any `@` after an unterminated triple-backtick fence is treated as code,
+/// not prose).
+fn masked_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut block_start: Option<usize> = None;
+
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Code(_) => ranges.push(range),
+            Event::Start(Tag::CodeBlock(_)) => {
+                if block_start.is_none() {
+                    block_start = Some(range.start);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(start) = block_start.take() {
+                    ranges.push(start..range.end);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        if let Some(last) = merged.last_mut() {
+            if r.start <= last.end {
+                last.end = last.end.max(r.end);
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    merged
+}
+
+/// Returns `true` if byte position `pos` falls inside any of the
+/// (sorted, non-overlapping) `ranges`. O(log n).
+fn position_in_ranges(pos: usize, ranges: &[std::ops::Range<usize>]) -> bool {
+    ranges
+        .binary_search_by(|r| {
+            if pos < r.start {
+                std::cmp::Ordering::Greater
+            } else if pos >= r.end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
 /// Scan `text` for inline references. A reference is a sigil character followed by
 /// a non-empty token (runs until whitespace or end of string).
 ///
 /// The sigil must be at the start of the text or preceded by whitespace.
 /// This prevents matching email addresses (`user@domain`), embedded paths
 /// (`foo/bar` when `/` is a sigil), etc.
+///
+/// Sigils inside markdown code regions (fenced, indented, inline backticks)
+/// are skipped — see `masked_code_ranges`. Invariant: `NoExpansionInsideCode`
+/// in `specs/inline-references/inline-references.allium`.
 fn tokenize_references(text: &str, sigils: &[char]) -> Vec<InlineReference> {
+    let masked = masked_code_ranges(text);
     let mut refs = Vec::new();
 
     for (i, ch) in text.char_indices() {
@@ -105,6 +173,10 @@ fn tokenize_references(text: &str, sigils: &[char]) -> Vec<InlineReference> {
             if !prev_char.is_whitespace() {
                 continue;
             }
+        }
+
+        if position_in_ranges(i, &masked) {
+            continue;
         }
 
         // Collect the token after the sigil.
@@ -343,6 +415,142 @@ mod tests {
         let refs = tokenize_references("check this:\n@src/main.rs", &['@']);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].token, "src/main.rs");
+    }
+
+    // -------------------------------------------------------------------------
+    // tokenize_references — markdown code masking (NoExpansionInsideCode)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_masked_code_ranges_empty_string() {
+        assert!(masked_code_ranges("").is_empty());
+    }
+
+    #[test]
+    fn test_masked_code_ranges_no_code() {
+        assert!(masked_code_ranges("plain prose with no code at all").is_empty());
+    }
+
+    #[test]
+    fn test_masked_code_ranges_inline_backticks() {
+        let text = "see `@foo.rs` here";
+        let ranges = masked_code_ranges(text);
+        assert_eq!(ranges.len(), 1);
+        // Range covers the inline-code span (backtick-bounded). Just assert
+        // the @ sigil falls inside it; pulldown-cmark may or may not include
+        // the backticks themselves.
+        let at_pos = text.find('@').unwrap();
+        assert!(position_in_ranges(at_pos, &ranges));
+    }
+
+    #[test]
+    fn test_masked_code_ranges_fenced_block() {
+        let text = "look:\n```\npanic at @src/main.rs:42\n```\nthanks";
+        let ranges = masked_code_ranges(text);
+        assert_eq!(ranges.len(), 1);
+        let at_pos = text.find('@').unwrap();
+        assert!(position_in_ranges(at_pos, &ranges));
+        // Sigil after the closing fence is NOT in the masked range.
+        let trailing_at_pos = text.find("thanks").unwrap();
+        assert!(!position_in_ranges(trailing_at_pos, &ranges));
+    }
+
+    #[test]
+    fn test_masked_code_ranges_indented_block() {
+        // Four-space indent triggers an indented code block. Need a blank line
+        // before for pulldown-cmark to recognize it.
+        let text = "Here is code:\n\n    @src/main.rs is broken\n\ndone";
+        let ranges = masked_code_ranges(text);
+        assert!(!ranges.is_empty(), "indented block should produce a range");
+        let at_pos = text.find('@').unwrap();
+        assert!(position_in_ranges(at_pos, &ranges));
+    }
+
+    #[test]
+    fn test_tokenize_skips_sigil_in_fenced_block() {
+        let text = "trace:\n```\n@src/main.rs:42\n```";
+        let refs = tokenize_references(text, &['@']);
+        assert!(
+            refs.is_empty(),
+            "@ inside fenced block should not tokenize: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_tokenize_skips_sigil_in_inline_code() {
+        // Already works by accident via the whitespace-boundary rule (the
+        // char before @ is a backtick, not whitespace), but masking now
+        // covers it explicitly. This is regression coverage.
+        let text = "use `@foo.rs` here";
+        let refs = tokenize_references(text, &['@']);
+        assert!(refs.is_empty(), "@ inside inline code should not tokenize");
+    }
+
+    #[test]
+    fn test_tokenize_skips_sigil_in_indented_block() {
+        let text = "trace:\n\n    @src/main.rs:42\n\ndone";
+        let refs = tokenize_references(text, &['@']);
+        assert!(
+            refs.is_empty(),
+            "@ inside indented code should not tokenize: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_tokenize_sigil_after_code_block_still_expands() {
+        let text = "```\n@inside.rs\n```\n@after.rs is real";
+        let refs = tokenize_references(text, &['@']);
+        assert_eq!(refs.len(), 1, "only the @after.rs should tokenize");
+        assert_eq!(refs[0].token, "after.rs");
+    }
+
+    #[test]
+    fn test_tokenize_sigil_before_code_block_still_expands() {
+        let text = "@before.rs is real\n```\n@inside.rs\n```";
+        let refs = tokenize_references(text, &['@']);
+        assert_eq!(refs.len(), 1, "only the @before.rs should tokenize");
+        assert_eq!(refs[0].token, "before.rs");
+    }
+
+    #[test]
+    fn test_tokenize_mixed_inside_and_outside_code() {
+        let text = "see @real.rs first\n```\n@fake.rs\n```\nand @final.rs";
+        let refs = tokenize_references(text, &['@']);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].token, "real.rs");
+        assert_eq!(refs[1].token, "final.rs");
+    }
+
+    #[test]
+    fn test_tokenize_unclosed_fence_masks_to_eof() {
+        // pulldown-cmark auto-closes unclosed fences at EOF — every sigil
+        // after the opener is masked. Conservative; safer than letting the
+        // parser misinterpret what the user "really meant."
+        let text = "starting code:\n```\n@trace.rs:42\nmore @other.rs after";
+        let refs = tokenize_references(text, &['@']);
+        assert!(
+            refs.is_empty(),
+            "everything after unclosed fence should be masked: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_tokenize_no_code_no_change_in_behavior() {
+        // Regression: masking must not affect tokenization of plain prose.
+        let text = "look at @src/main.rs and @lib/foo.ts";
+        let refs = tokenize_references(text, &['@']);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].token, "src/main.rs");
+        assert_eq!(refs[1].token, "lib/foo.ts");
+    }
+
+    #[test]
+    fn test_tokenize_skill_in_fenced_block_skipped() {
+        // Same masking applies to / sigil. Skill resolver fails gently for
+        // unknown names anyway, but masking prevents the lookup entirely.
+        let text = "logs:\n```\n/build failed\n```";
+        let refs = tokenize_references(text, &['/']);
+        assert!(refs.is_empty());
     }
 
     // -------------------------------------------------------------------------

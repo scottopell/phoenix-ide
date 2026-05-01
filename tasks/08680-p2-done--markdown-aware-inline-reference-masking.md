@@ -1,7 +1,7 @@
 ---
 created: 2026-04-23
 priority: p2
-status: ready
+status: done
 artifact: src/message_expander.rs
 ---
 
