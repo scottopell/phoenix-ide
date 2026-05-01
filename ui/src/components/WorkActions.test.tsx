@@ -7,15 +7,37 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { useEffect } from 'react';
+import type { ReactElement } from 'react';
 import { WorkActions } from './WorkActions';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
-import type { ReactElement } from 'react';
+import {
+  DiffViewerStateProvider,
+  useDiffViewerState,
+} from '../contexts/ViewerStateContext';
+import type { DiffViewerPayload } from '../contexts/ViewerStateContext';
 
-// All tests need the review-notes provider since the diff viewer (lazily
-// mounted on View Diff click) reads from it. Wrap renders in this helper
-// instead of repeating the provider at every callsite.
-const renderWithProvider = (ui: ReactElement) =>
-  render(<ReviewNotesProvider>{ui}</ReviewNotesProvider>);
+// All tests need both providers since the View-Diff click publishes its
+// payload into DiffViewerStateContext, and the diff viewer (when
+// rendered by ConversationPage in production) reads from
+// ReviewNotesContext.
+const renderWithProviders = (ui: ReactElement) =>
+  render(
+    <ReviewNotesProvider>
+      <DiffViewerStateProvider>{ui}</DiffViewerStateProvider>
+    </ReviewNotesProvider>,
+  );
+
+/** Test helper: subscribes to DiffViewerStateContext and forwards every
+ *  payload to the provided callback so tests can assert on what the
+ *  WorkActions push. */
+function CapturePayload({ onPayload }: { onPayload: (p: DiffViewerPayload | null) => void }) {
+  const { payload } = useDiffViewerState();
+  useEffect(() => {
+    onPayload(payload);
+  }, [payload, onPayload]);
+  return null;
+}
 
 vi.mock('../api', () => ({
   api: {
@@ -31,7 +53,7 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   });
 
   it('disables Abandon and Mark-as-Merged when continuedInConvId is set', async () => {
-    renderWithProvider(
+    renderWithProviders(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Work"
@@ -57,7 +79,7 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   it('enables Abandon and Mark-as-Merged when continuedInConvId is null', async () => {
     const { api } = await import('../api');
 
-    renderWithProvider(
+    renderWithProviders(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Work"
@@ -82,12 +104,12 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   });
 });
 
-describe('WorkActions — View Diff (task 08641)', () => {
+describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('fetches the diff and opens the modal on success', async () => {
+  it('fetches the diff and publishes the payload to DiffViewerStateContext', async () => {
     const { api } = await import('../api');
     (api.getConversationDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
       comparator: 'origin/main',
@@ -96,51 +118,60 @@ describe('WorkActions — View Diff (task 08641)', () => {
       uncommitted_diff: '',
     });
 
-    renderWithProvider(
-      <WorkActions
-        conversationId="conv-1"
-        convModeLabel="Branch"
-        phaseType="idle"
-        branchName="feat/x"
-        baseBranch="main"
-        continuedInConvId={null}
-      />
+    let captured: DiffViewerPayload | null = null;
+    renderWithProviders(
+      <>
+        <WorkActions
+          conversationId="conv-1"
+          convModeLabel="Branch"
+          phaseType="idle"
+          branchName="feat/x"
+          baseBranch="main"
+          continuedInConvId={null}
+        />
+        <CapturePayload onPayload={(p) => { captured = p; }} />
+      </>,
     );
 
-    const viewDiff = screen.getByTestId('view-diff-button');
-    fireEvent.click(viewDiff);
+    fireEvent.click(screen.getByTestId('view-diff-button'));
 
     await waitFor(() => {
       expect(api.getConversationDiff).toHaveBeenCalledWith('conv-1');
     });
-
-    // Modal mounts a dialog with comparator in the title and the commit
-    // log + committed diff in body.
     await waitFor(() => {
-      expect(screen.getByRole('dialog', { name: /worktree diff/i })).toBeInTheDocument();
+      expect(captured).not.toBeNull();
     });
-    // `origin/main` appears in both the title and the "Committed changes
-    // (vs origin/main)" section header — getAllByText avoids the
-    // single-match assertion failure.
-    expect(screen.getAllByText(/origin\/main/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/abcdef0 feat: thing/)).toBeInTheDocument();
+    // Once the fetch resolves, the loading label should clear back to "View Diff"
+    // — the dialog itself is mounted by ConversationPage in production, not
+    // here, so we don't assert on its DOM.
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId('view-diff-button') as HTMLButtonElement).textContent,
+      ).toMatch(/view diff/i);
+    });
+    expect(captured!.comparator).toBe('origin/main');
+    expect(captured!.commit_log).toBe('abcdef0 feat: thing');
   });
 
-  it('shows the server error message when the fetch fails', async () => {
+  it('shows the server error message when the fetch fails and does NOT publish a payload', async () => {
     const { api } = await import('../api');
     (api.getConversationDiff as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error('Worktree no longer exists: /tmp/wt'),
     );
 
-    renderWithProvider(
-      <WorkActions
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        branchName="feat/x"
-        baseBranch="main"
-        continuedInConvId={null}
-      />
+    let captured: DiffViewerPayload | null = null;
+    renderWithProviders(
+      <>
+        <WorkActions
+          conversationId="conv-1"
+          convModeLabel="Work"
+          phaseType="idle"
+          branchName="feat/x"
+          baseBranch="main"
+          continuedInConvId={null}
+        />
+        <CapturePayload onPayload={(p) => { captured = p; }} />
+      </>,
     );
 
     fireEvent.click(screen.getByTestId('view-diff-button'));
@@ -148,15 +179,15 @@ describe('WorkActions — View Diff (task 08641)', () => {
     await waitFor(() => {
       expect(screen.getByText(/worktree no longer exists/i)).toBeInTheDocument();
     });
-    // Modal must NOT be open when the fetch errored.
-    expect(screen.queryByRole('dialog', { name: /worktree diff/i })).not.toBeInTheDocument();
+    // No payload published.
+    expect(captured).toBeNull();
     // Button label returns to "View Diff" so the user can retry.
     const viewDiff = screen.getByTestId('view-diff-button') as HTMLButtonElement;
     expect(viewDiff.textContent).toMatch(/view diff/i);
   });
 
   it('does not render the View Diff button in Direct mode', async () => {
-    renderWithProvider(
+    renderWithProviders(
       <WorkActions
         conversationId="conv-1"
         convModeLabel="Direct"
