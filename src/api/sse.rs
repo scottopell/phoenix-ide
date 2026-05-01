@@ -208,6 +208,14 @@ mod tests {
                 "message": error.flat_message(),
                 "error": error,
             }),
+            SseEvent::ConversationHardDeleted {
+                sequence_id,
+                conversation_id,
+            } => json!({
+                "type": "conversation_hard_deleted",
+                "sequence_id": sequence_id,
+                "conversation_id": conversation_id,
+            }),
         }
     }
 
@@ -524,6 +532,15 @@ mod tests {
         let event = SseEvent::Error {
             sequence_id: 20,
             error: UserFacingError::internal(),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_conversation_hard_deleted() {
+        let event = SseEvent::ConversationHardDeleted {
+            sequence_id: 21,
+            conversation_id: "conv-1".to_string(),
         };
         assert_parity(&event);
     }

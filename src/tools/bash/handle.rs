@@ -405,6 +405,30 @@ impl Handle {
             HandleState::Tombstoned(_) => None,
         }
     }
+
+    /// Return the live `LiveData`'s native pid if the handle is currently
+    /// live. Used by the hard-delete cascade's structured report — the
+    /// pid is informational (the kill targets the pgid) but operators
+    /// reading the WARN log want both numbers.
+    pub async fn live_pid(&self) -> Option<u32> {
+        match self.state.read().await.as_ref() {
+            HandleState::Live(live) => Some(live.pid),
+            HandleState::Tombstoned(_) => None,
+        }
+    }
+
+    /// True iff the handle is currently in `kill_pending_kernel` — a kill
+    /// was recorded but the process has not yet exited. Used by the
+    /// hard-delete cascade to populate `kill_pending_kernel_pids` in the
+    /// orphan-orientation log fields.
+    pub async fn is_kill_pending_kernel(&self) -> bool {
+        let state = self.state.read().await;
+        if !matches!(state.as_ref(), HandleState::Live(_)) {
+            return false;
+        }
+        drop(state);
+        self.kill_attempt.read().await.is_some()
+    }
 }
 
 /// Drop guard that publishes `ExitState::WaiterPanicked` if the waiter

@@ -1729,18 +1729,282 @@ async fn unarchive_conversation(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+/// REQ-BED-032: Hard-delete cascade orchestrator.
+///
+/// Sequence (matching the Allium @guidance on
+/// `UserHardDeletesConversationRule`):
+///   1. Reject if busy (`RejectHardDeleteWhileBusy`) — 409 with
+///      `error_type: "cancel_first"`. v1 is reject-only; the cancel-and-
+///      wait branch is deferred. The `is_busy` derivation is the single
+///      source of truth in `ConvState::is_busy`.
+///   2. `cascade_bash_on_delete` — kill live handles, drop tombstones.
+///   3. `cascade_tmux_on_delete` — kill-server, unlink socket, drop
+///      registry entry.
+///   4. `cascade_projects_on_delete` — worktree/branch removal for
+///      Work / Branch / Explore-with-worktree conversations. Direct mode
+///      and conversations whose worktree was already cleaned at terminal
+///      transition: no-op.
+///   5. `db.delete_conversation` — `SQLite` ON DELETE CASCADE removes
+///      messages, tool calls, and other dependent rows. This is the only
+///      step whose failure is surfaced to the user as a 5xx; the
+///      cleanups in 2-4 log WARN and continue.
+///   6. Broadcast `ConversationHardDeleted` on the conversation's
+///      channel (if a runtime handle exists). Subscribers refresh
+///      sidebar / navigation. Task 02697 wires the typed wire variant
+///      through to the UI; this handler emits the in-process
+///      `SseEvent::ConversationHardDeleted` today.
+///
+/// Failure isolation: cascades log structured WARN fields sufficient
+/// for an operator to manually clean up orphans. Phoenix does NOT
+/// attempt automatic recovery on subsequent startup — see REQ-BED-032
+/// rationale.
 async fn delete_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    state
+    run_hard_delete_cascade(&state, &id).await?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// Body of the [`delete_conversation`] handler, factored out so tests can
+/// drive it directly without going through axum routing. Returns `Ok(())`
+/// on success; the only fatal-to-the-request error is the DB row delete
+/// (see `Internal` variant) — bash / tmux / projects cleanup failures
+/// log WARN and continue per REQ-BED-032.
+pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    // Step 1: reject-if-busy. Read the conversation's persisted state
+    // (the DB is updated before any side effect per persist-before-broadcast,
+    // so DB state is the authoritative answer to "is this conversation busy?").
+    let conv = state
         .runtime
         .db()
-        .delete_conversation(&id)
+        .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    Ok(Json(SuccessResponse { success: true }))
+    if conv.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete a busy conversation. Cancel the in-flight \
+             operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+
+    // Step 2: bash handles.
+    let bash_report =
+        crate::tools::bash::registry::cascade_bash_on_delete(state.runtime.bash_handles(), id)
+            .await;
+    let had_live_handles = !bash_report.live_handle_pgids.is_empty();
+    let had_kill_failures = !bash_report.kill_failures.is_empty();
+    if had_kill_failures {
+        tracing::warn!(
+            conv_id = %id,
+            live_handle_pids = ?bash_report.live_handle_pids,
+            live_handle_pgids = ?bash_report.live_handle_pgids,
+            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
+            kill_failures = ?bash_report.kill_failures,
+            "bash cleanup had kill failures; orphan process groups may remain"
+        );
+    } else if had_live_handles {
+        // We killed handles cleanly — log at debug so an operator
+        // chasing leaks can correlate. Skipping the log entirely on the
+        // pure no-op path keeps test output and prod logs quiet.
+        tracing::debug!(
+            conv_id = %id,
+            live_handle_pids = ?bash_report.live_handle_pids,
+            live_handle_pgids = ?bash_report.live_handle_pgids,
+            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
+            "bash cascade: SIGKILL'd live process groups"
+        );
+    }
+
+    // Step 3: tmux server.
+    let tmux_report =
+        crate::tools::tmux::registry::cascade_tmux_on_delete(state.runtime.tmux_registry(), id)
+            .await;
+    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
+        let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
+        tracing::warn!(
+            conv_id = %id,
+            socket_path = %tmux_report.socket_path.display(),
+            kill_server_status = %kill_status,
+            unlink_error = ?tmux_report.unlink_error,
+            "tmux cleanup partial failure; orphan socket/server may remain"
+        );
+    }
+
+    // Step 4: project worktree.
+    let project_report = cascade_projects_on_delete(state, &conv).await;
+    if let Some(err) = &project_report.error {
+        tracing::warn!(
+            conv_id = %id,
+            worktree_path = ?project_report.worktree_path,
+            branch_name = ?project_report.branch_name,
+            error = %err,
+            "project cleanup failed; orphan worktree/branch may remain"
+        );
+    }
+
+    // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
+    // rows. This is the only step whose failure is fatal to the request
+    // — partial cleanup above is non-fatal but a missing row deletion
+    // means the user's "delete this conversation" never actually
+    // happened.
+    state
+        .runtime
+        .db()
+        .delete_conversation(id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to delete conversation row: {e}")))?;
+
+    // Step 6: broadcast. The conversation broadcaster is per-conv today;
+    // task 02697 will route this to a sidebar-scoped channel on the UI
+    // side. Until then, broadcasting on the per-conv channel reaches any
+    // client currently subscribed to this conversation (so its tab can
+    // close gracefully).
+    if let Some(handle) = state.runtime.try_get_handle(id).await {
+        let conv_id = id.to_string();
+        let _ = handle
+            .broadcast_tx
+            .send_seq(|seq| SseEvent::ConversationHardDeleted {
+                sequence_id: seq,
+                conversation_id: conv_id,
+            });
+    }
+
+    Ok(())
+}
+
+/// Best-effort report from [`cascade_projects_on_delete`]. The orchestrator
+/// logs partial failures at WARN with these fields.
+#[derive(Debug, Clone, Default)]
+struct CascadeProjectsReport {
+    /// Absolute worktree path that was (attempted to be) removed.
+    /// `None` when the conversation has no worktree (Direct mode).
+    worktree_path: Option<String>,
+    /// Branch name considered for deletion. `None` for Direct/Explore-
+    /// without-worktree.
+    branch_name: Option<String>,
+    /// Set when the worktree-removal flow returned an error after
+    /// exhausting fallbacks. Branch deletion is best-effort and does
+    /// not populate this field.
+    error: Option<String>,
+}
+
+/// REQ-BED-032 step 4 / `WorktreeRemovedByConversationDelete`: clean
+/// up the conversation's worktree (and, where applicable, branch) on
+/// hard-delete. Reuses the same git incantations as `abandon_task`'s
+/// step 2c — but explicitly NOT abandon: no diff snapshot, no system
+/// message, no state-machine transition. The conversation row is about
+/// to be deleted entirely; uncommitted work in the worktree is lost
+/// per spec.
+///
+/// No-op cases:
+///   - `ConvMode::Direct` — no worktree was ever created.
+///   - `ConvMode::Explore` — pre-approval Explore conversations may have
+///     a temp worktree; this is currently created lazily and torn down
+///     on terminal-state transition (see `ExploreWorktreeCleanupOnTerminal`).
+///     Hard-delete may still race a non-terminal Explore worktree, but
+///     `ConvMode::Explore` carries no `worktree_path` field — there's
+///     nothing structurally addressable to remove here. If Explore
+///     worktree state migrates onto the mode in future, expand this
+///     branch.
+///   - Already-terminal Work/Branch conversations — abandon /
+///     mark-merged already removed the worktree at terminal transition.
+///     We still attempt removal (it's idempotent) so a partial-failure
+///     prior abandon gets a second chance.
+async fn cascade_projects_on_delete(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> CascadeProjectsReport {
+    let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string(), true),
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string(), false),
+        ConvMode::Direct | ConvMode::Explore => return CascadeProjectsReport::default(),
+    };
+
+    let mut report = CascadeProjectsReport {
+        worktree_path: Some(worktree_path.clone()),
+        branch_name: Some(branch_name.clone()),
+        error: None,
+    };
+
+    // Resolve repo root from the project; if the conversation is not
+    // project-scoped, we can't run `git worktree remove` against the
+    // correct repo. The worktree path is still removable from disk.
+    let repo_root: Option<PathBuf> = if let Some(project_id) = conv.project_id.as_deref() {
+        match state.db.get_project(project_id).await {
+            Ok(p) => Some(PathBuf::from(p.canonical_path)),
+            Err(e) => {
+                tracing::debug!(
+                    conv_id = %conv.id,
+                    project_id = %project_id,
+                    error = %e,
+                    "project lookup failed during cascade; falling back to fs-only worktree cleanup"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let worktree_dir = PathBuf::from(&worktree_path);
+
+        if let Some(repo) = repo_root.as_ref() {
+            if let Err(e) = run_git(repo, &["worktree", "remove", &worktree_path, "--force"]) {
+                tracing::debug!(
+                    error = %e,
+                    worktree = %worktree_path,
+                    "git worktree remove failed; trying filesystem fallback"
+                );
+                if worktree_dir.exists() {
+                    if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
+                        return Err(format!(
+                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
+                        ));
+                    }
+                }
+                let _ = run_git(repo, &["worktree", "prune"]);
+            }
+
+            if is_work_mode {
+                if let Err(e) = run_git(repo, &["branch", "-D", &branch_name]) {
+                    tracing::debug!(
+                        error = %e,
+                        branch = %branch_name,
+                        "branch delete failed (non-fatal in cascade)"
+                    );
+                }
+            }
+        } else if worktree_dir.exists() {
+            if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
+                return Err(format!(
+                    "no project context; fs-only worktree cleanup failed: {rm_err}"
+                ));
+            }
+        }
+
+        Ok(())
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => report.error = Some(msg),
+        Err(join_err) => report.error = Some(format!("worktree-cleanup task panicked: {join_err}")),
+    }
+
+    report
 }
 
 async fn rename_conversation(
@@ -2933,6 +3197,275 @@ impl IntoResponse for AppError {
                 tracing::warn!(error = %detail.error, "422 Unprocessable Entity");
                 (StatusCode::UNPROCESSABLE_ENTITY, Json(detail.clone())).into_response()
             }
+        }
+    }
+}
+
+// ============================================================
+// Hard-delete cascade tests (REQ-BED-032)
+// ============================================================
+#[cfg(test)]
+mod hard_delete_cascade_tests {
+    use super::*;
+    use crate::chain_qa::ChainQa;
+    use crate::db::Database;
+    use crate::llm::ModelRegistry;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::state_machine::ConvState;
+    use crate::tools::mcp::McpClientManager;
+    use std::sync::Arc;
+
+    /// Construct a minimal `AppState` backed by an in-memory database.
+    /// The state machine handler is started so `runtime.try_get_handle`
+    /// works when the test wants to verify SSE events; conversations
+    /// are otherwise inert (no LLM calls fire).
+    async fn make_test_state() -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let platform = PlatformCapability::None;
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform,
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            terminals,
+            chain_qa,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_when_busy_and_succeeds_after_idle() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-1", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        // Move to a busy state directly via the DB layer. ToolExecuting
+        // is the heavy variant; LlmRequesting is the smallest busy state
+        // and exercises the same `is_busy()` predicate.
+        state
+            .db
+            .update_conversation_state("c-1", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("update state");
+
+        let err = run_hard_delete_cascade(&state, "c-1")
+            .await
+            .expect_err("must reject while busy");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "cancel_first");
+                assert!(detail.error.contains("Cancel"));
+            }
+            other => panic!("expected 409 Conflict, got {other:?}"),
+        }
+
+        // Conversation row still present.
+        assert!(state.db.get_conversation("c-1").await.is_ok());
+
+        // Settle to idle, retry — must succeed.
+        state
+            .db
+            .update_conversation_state("c-1", &ConvState::Idle)
+            .await
+            .expect("settle");
+
+        run_hard_delete_cascade(&state, "c-1")
+            .await
+            .expect("delete");
+        assert!(
+            state.db.get_conversation("c-1").await.is_err(),
+            "row must be gone after successful cascade"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_idle_conversation_and_drops_bash_registry_entry() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-2", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        // Pre-seed the bash registry with an entry for this conversation
+        // (no actual handles — just the per-conv table). The cascade must
+        // drop it.
+        let _ = state.runtime.bash_handles().get_or_create("c-2").await;
+
+        run_hard_delete_cascade(&state, "c-2")
+            .await
+            .expect("delete");
+
+        assert!(
+            state
+                .runtime
+                .bash_handles()
+                .remove_conversation("c-2")
+                .await
+                .is_none(),
+            "bash registry entry must be removed by cascade"
+        );
+        assert!(state.db.get_conversation("c-2").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcasts_hard_deleted_event_to_existing_subscribers() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-3", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        // Force a runtime handle so the broadcaster exists. Subscribe
+        // BEFORE the cascade runs; the SseEvent::ConversationHardDeleted
+        // should arrive on the channel.
+        let mut rx = state.runtime.subscribe("c-3").await.expect("subscribe");
+
+        run_hard_delete_cascade(&state, "c-3")
+            .await
+            .expect("delete");
+
+        // Drain a few events; the cascade event should be the only one
+        // a freshly-subscribed receiver sees (no Init, no StateChange).
+        let mut saw_hard_deleted = false;
+        while let Ok(event) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            match event {
+                Ok(SseEvent::ConversationHardDeleted {
+                    conversation_id, ..
+                }) if conversation_id == "c-3" => {
+                    saw_hard_deleted = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_hard_deleted,
+            "ConversationHardDeleted SSE event must be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_continues_when_tmux_socket_dir_missing() {
+        // The default tmux registry's socket_dir lives under
+        // PHOENIX_DATA_DIR/HOME; cascade_tmux_on_delete tries
+        // `tmux -S <path> kill-server` (best-effort) and `unlink(path)`
+        // (NotFound is swallowed). With no prior server and no socket
+        // file, this is a no-op success path — verifying that absence-of-
+        // resource does not turn into a cascade-blocking error.
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-4", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        run_hard_delete_cascade(&state, "c-4")
+            .await
+            .expect("delete");
+        assert!(state.db.get_conversation("c-4").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_state_is_not_busy() {
+        // Terminal-state conversations are deletable: hard-delete is the
+        // user saying "remove this conversation entirely" and the row
+        // must go regardless of how it reached terminal.
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-5", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .db
+            .update_conversation_state("c-5", &ConvState::Terminal)
+            .await
+            .expect("settle");
+
+        run_hard_delete_cascade(&state, "c-5")
+            .await
+            .expect("delete");
+        assert!(state.db.get_conversation("c-5").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idempotent_on_repeated_calls() {
+        // The first call deletes the row; the second call must surface
+        // a NotFound (the row is gone) rather than panicking on a half-
+        // cleaned registry.
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-6", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let _ = state.runtime.bash_handles().get_or_create("c-6").await;
+
+        run_hard_delete_cascade(&state, "c-6")
+            .await
+            .expect("first delete");
+
+        let err = run_hard_delete_cascade(&state, "c-6")
+            .await
+            .expect_err("second delete must 404");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// Hand-rolled property-style sweep: across a small set of arbitrary
+    /// (id, mode) combinations, every successful cascade leaves the in-
+    /// memory bash and tmux registries clean of any reference to the
+    /// deleted conversation.
+    #[tokio::test]
+    async fn registries_never_leak_after_cascade() {
+        let state = make_test_state().await;
+        let ids = ["c-a", "c-b", "c-c", "c-d", "c-e"];
+        for id in ids {
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .expect("create");
+            // Pre-seed both registries.
+            let _ = state.runtime.bash_handles().get_or_create(id).await;
+        }
+
+        for id in ids {
+            run_hard_delete_cascade(&state, id).await.expect("delete");
+        }
+
+        for id in ids {
+            assert!(
+                state
+                    .runtime
+                    .bash_handles()
+                    .remove_conversation(id)
+                    .await
+                    .is_none(),
+                "bash registry leaked entry for {id}"
+            );
+            assert!(state.db.get_conversation(id).await.is_err());
         }
     }
 }

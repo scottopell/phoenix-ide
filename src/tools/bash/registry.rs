@@ -3,11 +3,6 @@
 //! REQ-BASH-005 (per-conversation cap), REQ-BASH-006 (in-memory tombstones,
 //! no `SQLite` shadow store), REQ-BASH-014 (per-conversation registry).
 //!
-//! `remove`, `remove_conversation`, etc. are surface for the future
-//! hard-delete cascade integration (task 02696); silence the per-method
-//! lint until that lands.
-#![allow(dead_code)]
-//!
 //! Lifetime: registries live in process memory only. A Phoenix restart
 //! drops them and any handles they hold; agents see `handle_not_found` on
 //! a previously-known handle (matching the spec's "handles do NOT survive
@@ -137,8 +132,11 @@ impl ConversationHandles {
         handle
     }
 
-    /// Remove a handle entirely (live or tombstoned). Used by the
-    /// hard-delete cascade.
+    /// Remove a handle entirely (live or tombstoned). Granular complement
+    /// to `BashHandleRegistry::remove_conversation`; not currently used
+    /// by the hard-delete cascade (which removes the whole conversation
+    /// table) but kept on the API surface for surgical removal flows.
+    #[allow(dead_code)]
     pub fn remove(&mut self, id: &HandleId) -> Option<Arc<Handle>> {
         self.handles.remove(id)
     }
@@ -261,6 +259,110 @@ impl BashHandleRegistry {
     #[cfg(test)]
     pub async fn conversation_count(&self) -> usize {
         self.inner.read().await.len()
+    }
+}
+
+/// Best-effort cascade outcome for the hard-delete orchestrator
+/// (REQ-BASH-006). Failure surfaces as a structured record the
+/// orchestrator logs at WARN; nothing here is fatal — the conversation
+/// row is removed regardless. The orchestrator already knows the
+/// `conv_id` (it's the path parameter), so it is not duplicated here.
+#[derive(Debug, Clone, Default)]
+pub struct CascadeBashReport {
+    /// pids that were live at snapshot time (informational; kills target
+    /// the pgid). One per live handle.
+    pub live_handle_pids: Vec<i32>,
+    /// pgids that were live at snapshot time and received a SIGKILL.
+    pub live_handle_pgids: Vec<i32>,
+    /// Subset of live pgids whose handle was in `kill_pending_kernel`
+    /// status when the cascade ran (a prior kill had not been observed
+    /// to land yet). Surfaced separately because these are the most
+    /// likely D-state offenders for an operator chasing orphans.
+    pub kill_pending_kernel_pids: Vec<i32>,
+    /// Per-pgid kill failures (`kill(2)` returned non-zero). Successful
+    /// kills and `ESRCH` (process already gone) do not appear here.
+    pub kill_failures: Vec<(i32, String)>,
+}
+
+/// Run the bash side of the hard-delete cascade for `conversation_id`
+/// (REQ-BASH-006). Atomically:
+///
+///   1. Removes the conversation's handle table from the registry — any
+///      subsequent tool call for this conversation will see "no handle
+///      table" and produce `handle_not_found`, which is the correct
+///      behaviour for a deleted conversation.
+///   2. Snapshots live pgid / pid / `kill_pending_kernel` state across the
+///      removed handles.
+///   3. Sends `SIGKILL` to each live process group via
+///      `kill(-pgid, SIGKILL)` (catches immediate descendants per
+///      REQ-BASH-007's setpgid contract).
+///
+/// The Allium `HandlesRemovedByConversationDelete` rule's post-condition
+/// (`not exists Handle{conversation: c}`) is satisfied by step 1 alone:
+/// the live handles drop with the registry entry. Step 3 satisfies the
+/// `KillSignalSentForAllLiveHandles` ensures clause; failures populate
+/// `kill_failures` for the orchestrator's WARN log but are not fatal —
+/// the spec's policy is "log and continue" (REQ-BED-032).
+///
+/// SIGKILL rather than SIGTERM: hard-delete deletes the conversation
+/// outright, so no agent is left to observe a graceful close. Same
+/// rationale as `shutdown_kill_tree` in [`super::reaper`].
+pub async fn cascade_bash_on_delete(
+    registry: &Arc<BashHandleRegistry>,
+    conversation_id: &str,
+) -> CascadeBashReport {
+    let mut report = CascadeBashReport::default();
+
+    let Some(entry) = registry.remove_conversation(conversation_id).await else {
+        return report;
+    };
+
+    let convs = entry.read().await;
+    for h in convs.all() {
+        let Some(group_id) = h.live_pgid().await else {
+            continue;
+        };
+        let process_id = h.live_pid().await;
+        let kill_pending = h.is_kill_pending_kernel().await;
+        record_handle_in_report(&mut report, group_id, process_id, kill_pending);
+
+        #[cfg(unix)]
+        {
+            // SAFETY: kill(2) with negative pid signals the process group;
+            // no memory implications. ESRCH (group already gone) is
+            // expected and is not surfaced as an error.
+            let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    report.kill_failures.push((group_id, err.to_string()));
+                }
+            }
+        }
+    }
+
+    report
+}
+
+/// Record one handle's pgid/pid/kill-pending state into the cascade
+/// report. Factored out of [`cascade_bash_on_delete`] so the cast-width
+/// allow attributes don't pollute the loop body. pgid/pid are spec
+/// names from `bash.allium`'s `Handle` entity.
+#[allow(clippy::cast_possible_wrap, clippy::similar_names)]
+fn record_handle_in_report(
+    report: &mut CascadeBashReport,
+    pgid: i32,
+    pid: Option<u32>,
+    kill_pending: bool,
+) {
+    report.live_handle_pgids.push(pgid);
+    if let Some(p) = pid {
+        report.live_handle_pids.push(p as i32);
+    }
+    if kill_pending {
+        if let Some(p) = pid {
+            report.kill_pending_kernel_pids.push(p as i32);
+        }
     }
 }
 
@@ -430,5 +532,145 @@ mod tests {
         assert!(registry.remove_conversation("conv-1").await.is_some());
         assert_eq!(registry.conversation_count().await, 0);
         assert!(registry.remove_conversation("conv-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cascade_bash_on_delete_no_entry_is_clean() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let report = cascade_bash_on_delete(&registry, "never-existed").await;
+        assert!(report.kill_failures.is_empty());
+        assert!(report.live_handle_pgids.is_empty());
+        assert!(report.live_handle_pids.is_empty());
+        assert!(report.kill_pending_kernel_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cascade_bash_on_delete_tombstoned_only_is_clean() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let convs = registry.get_or_create("conv-1").await;
+        let h = {
+            let mut g = convs.write().await;
+            g.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES))
+        };
+        // Demote so there are no live handles to kill.
+        h.transition_to_terminal(
+            FinalCause::Exited { exit_code: Some(0) },
+            std::time::Duration::from_millis(1),
+            crate::tools::bash::handle::TOMBSTONE_TAIL_LINES,
+        )
+        .await;
+
+        let report = cascade_bash_on_delete(&registry, "conv-1").await;
+        assert!(report.kill_failures.is_empty());
+        assert!(report.live_handle_pgids.is_empty());
+        // Registry entry is gone after cascade.
+        assert_eq!(registry.conversation_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cascade_bash_on_delete_records_live_pgids_and_drops_entry() {
+        // The fake handle uses pgid 12345 (a process group that almost
+        // certainly does not exist on the test host). `kill(-12345, …)`
+        // will return ESRCH, which the cascade swallows — so this test
+        // verifies the bookkeeping side: the pgid is recorded in the
+        // report and the registry entry is removed.
+        let registry = Arc::new(BashHandleRegistry::new());
+        let convs = registry.get_or_create("conv-1").await;
+        {
+            let mut g = convs.write().await;
+            g.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
+            g.insert(make_handle("conv-1", "b-2", RING_BUFFER_BYTES));
+        }
+
+        let report = cascade_bash_on_delete(&registry, "conv-1").await;
+        assert_eq!(report.live_handle_pgids.len(), 2);
+        assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
+        assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
+        assert_eq!(registry.conversation_count().await, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::similar_names)] // pgid/pid mirror spec field names
+    async fn cascade_bash_on_delete_actually_kills_a_real_subprocess() {
+        // Spawn a real `sleep` in its own process group, register a
+        // matching Handle, and verify the cascade SIGKILLs it. We then
+        // `wait()` on the child (which reaps the zombie) and assert the
+        // exit status reflects a SIGKILL termination — the process
+        // outliving the cascade would have it still in `Running` state
+        // and `try_wait()` would return Ok(None).
+        use std::os::unix::process::CommandExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+        use tokio::time::{sleep, Duration};
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("60");
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                // Become own process group leader so kill(-pgid, …) hits
+                // exactly this child (REQ-BASH-007 setpgid contract).
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        // The child is its own process group leader, so the group id
+        // equals the pid. Cast width is a `u32` -> `i32` conversion;
+        // pids small enough to be valid here never overflow `i32`.
+        #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
+        let pgid = pid as i32;
+
+        // Verify the process is alive before the cascade runs.
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "subprocess must be running before cascade"
+        );
+
+        let registry = Arc::new(BashHandleRegistry::new());
+        let convs = registry.get_or_create("conv-real").await;
+        {
+            let mut g = convs.write().await;
+            let h = Handle::new_live(
+                "conv-real".to_string(),
+                HandleId::new("b-1"),
+                "sleep 60".to_string(),
+                pgid,
+                pid,
+                RING_BUFFER_BYTES,
+            );
+            g.insert(h);
+        }
+
+        let report = cascade_bash_on_delete(&registry, "conv-real").await;
+        assert!(report.live_handle_pgids.contains(&pgid));
+        assert!(report.kill_failures.is_empty());
+        assert_eq!(registry.conversation_count().await, 0);
+
+        // Wait briefly for the kernel to deliver SIGKILL, then reap the
+        // child. The exit status's `signal()` should be `Some(SIGKILL)`.
+        for _ in 0..20 {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                assert_eq!(
+                    status.signal(),
+                    Some(libc::SIGKILL),
+                    "subprocess must have been terminated by SIGKILL"
+                );
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        // Best-effort cleanup if the kernel never delivered.
+        unsafe {
+            let _ = libc::kill(pgid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        panic!("subprocess survived cascade SIGKILL within 1s");
     }
 }

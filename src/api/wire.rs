@@ -278,6 +278,14 @@ pub enum SseWireEvent {
         #[ts(type = "unknown")]
         error: UserFacingError,
     },
+    /// REQ-BED-032 step 6: a conversation has just been hard-deleted (its
+    /// row is gone from `SQLite`, all per-conversation resources cleaned
+    /// up). UI consumers refresh sidebar / navigation in response. Emitted
+    /// once per hard-delete, after every cascade step.
+    ConversationHardDeleted {
+        sequence_id: i64,
+        conversation_id: String,
+    },
 }
 
 impl SseWireEvent {
@@ -294,6 +302,7 @@ impl SseWireEvent {
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
             SseWireEvent::ConversationUpdate { .. } => "conversation_update",
             SseWireEvent::Error { .. } => "error",
+            SseWireEvent::ConversationHardDeleted { .. } => "conversation_hard_deleted",
         }
     }
 }
@@ -391,6 +400,13 @@ impl From<SseEvent> for SseWireEvent {
                     error,
                 }
             }
+            SseEvent::ConversationHardDeleted {
+                sequence_id,
+                conversation_id,
+            } => SseWireEvent::ConversationHardDeleted {
+                sequence_id,
+                conversation_id,
+            },
         }
     }
 }

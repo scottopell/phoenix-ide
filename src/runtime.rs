@@ -388,6 +388,16 @@ pub enum SseEvent {
         sequence_id: i64,
         error: user_facing_error::UserFacingError,
     },
+    /// REQ-BED-032 step 6: emitted exactly once after a hard-delete cascade
+    /// completes. UI consumers (sidebar, navigation) use it to refresh
+    /// views. The `conversation_id` field is redundant with the broadcaster
+    /// scope today (the per-conversation channel implies the id) but is
+    /// carried explicitly so a future user-scope broadcaster can
+    /// disambiguate without changing the wire shape.
+    ConversationHardDeleted {
+        sequence_id: i64,
+        conversation_id: String,
+    },
 }
 
 impl RuntimeManager {
@@ -947,6 +957,22 @@ impl RuntimeManager {
     ) -> Result<broadcast::Receiver<SseEvent>, String> {
         let handle = self.get_or_create(conversation_id).await?;
         Ok(handle.broadcast_tx.subscribe())
+    }
+
+    /// Peek at the runtime handle for a conversation without starting one.
+    /// Returns `None` if no runtime is currently registered for `conversation_id`.
+    ///
+    /// REQ-BED-032: the hard-delete cascade uses this to broadcast the
+    /// `ConversationHardDeleted` event onto the existing per-conversation
+    /// channel — if any. Spinning up a runtime for a conversation that's
+    /// about to be deleted would be wasted work (the executor would
+    /// observe the row gone seconds later).
+    pub async fn try_get_handle(&self, conversation_id: &str) -> Option<ConversationHandle> {
+        let runtimes = self.runtimes.read().await;
+        runtimes.get(conversation_id).map(|h| ConversationHandle {
+            event_tx: h.event_tx.clone(),
+            broadcast_tx: h.broadcast_tx.clone(),
+        })
     }
 
     /// Determine the resume state for a conversation.
