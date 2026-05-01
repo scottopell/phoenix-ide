@@ -43,5 +43,6 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-029:** Conversation Terminal State on Task Resolution | ❌ Not Started | Work conversations go to Terminal on complete or abandon; replaces REQ-BED-016 |
 | **REQ-BED-030:** Context Continuation Inherits Parent Environment | ✅ Complete | Task 24696. Worktree ownership transfers via `continued_in_conv_id` pointer; mode mapping W→W/B→B/E→E/D→D; idempotent `POST /api/conversations/:id/continue`. Obsoletes task 08678 |
 | **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ✅ Complete | Task 24696. Auto-cleanup removed; `reconcile_worktrees` skips context-exhausted + continued rows; abandon/mark-as-merged gated on `continued_in_conv_id = NULL`; typed `continuation_id` on 409 response |
+| **REQ-BED-032:** Conversation Hard-Delete Cascade | ❌ Not Started | New. `ConversationHardDeleted` lifecycle event for `specs/bash/` REQ-BASH-006 + `specs/tmux-integration/` REQ-TMUX-007 to subscribe to. Replaces the current one-line `delete_conversation` handler in `src/api/handlers.rs` with a cascade orchestrator. Subscribers run before row delete; best-effort cleanup with logged failures |
 
-**Progress:** 23 of 31 complete (3 deprecated, not counted)
+**Progress:** 23 of 32 complete (3 deprecated, not counted)

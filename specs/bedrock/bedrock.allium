@@ -894,6 +894,62 @@ rule ConversationReachedTerminalState {
         -- about parent conversations.
 }
 
+-- REQ-BED-032: User hard-deletes a conversation. Emits the lifecycle
+-- announcement that downstream specs subscribe to (specs/bash/,
+-- specs/tmux-integration/, specs/projects/). Subscribers complete their
+-- cleanup before the conversation row is removed from persistence;
+-- failures are logged but do not block the row deletion.
+rule UserHardDeletesConversationRule {
+    when: UserHardDeletesConversation(conversation)
+
+    requires: not conversation.is_busy
+        -- Mirrors specs/projects/ ConfirmAbandon: hard-delete during a
+        -- live tool execution would race the tool's own cleanup. The
+        -- API layer is responsible for issuing cancellation first or
+        -- rejecting with a "cancel first" response.
+
+    ensures: ConversationHardDeleted(conversation)
+        -- Lifecycle announcement. Subscribers:
+        --   specs/bash/                  REQ-BASH-006
+        --   specs/tmux-integration/      REQ-TMUX-007
+        --   specs/projects/              (worktree/branch cleanup)
+    ensures: ConversationRowRemoved(conversation)
+
+    @guidance
+        -- Handler sequence:
+        --   1. Cancellation pre-step: if conversation is busy, the API
+        --      layer issues cancel and waits for idle, or rejects with
+        --      a "cancel first" response. The not-busy requires above
+        --      is the post-cancel contract.
+        --   2. Emit ConversationHardDeleted(conversation). Subscribers
+        --      run synchronously:
+        --        - bash: kill live handles, drop in-memory tombstones
+        --        - tmux: kill-server, unlink socket, drop registry entry
+        --        - projects: worktree/branch cleanup if applicable (a
+        --          non-terminal conversation may still have a worktree;
+        --          terminal conversations have already had their
+        --          worktrees handled per REQ-PROJ-028)
+        --      Each subscriber's failure is logged at WARN; the cascade
+        --      continues regardless. Orphans are reaped by the existing
+        --      reconciliation passes (worktree reconcile on server
+        --      restart; tmux stale-socket detection on next operation
+        --      against that conversation id, although hard-delete makes
+        --      that path unreachable for the deleted conversation).
+        --   3. Delete the conversation row from persistence. SQLite ON
+        --      DELETE CASCADE removes messages, tool calls, and other
+        --      dependent rows.
+        --   4. Return success to the user.
+        --
+        -- Allium ensures clauses are concurrent assertions about the
+        -- post-state, not a temporal sequence; the subscribers-before-
+        -- row-delete ordering is implementation guidance. Both ensures
+        -- hold once the handler returns.
+        --
+        -- Soft-state changes (archive, close-tab) do NOT trigger this
+        -- rule. Tmux servers and bash handles deliberately survive
+        -- archive (specs/tmux-integration/ REQ-TMUX-008).
+}
+
 -- REQ-BED-017: Mode change injects synthetic message
 rule ModeChangeNotification {
     when: ModeTransitioned(conversation, from, to)

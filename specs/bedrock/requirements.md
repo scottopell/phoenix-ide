@@ -650,3 +650,77 @@ conversation is the continuation; operating on the parent would be
 ambiguous about which conversation the action affects.
 
 **Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, REQ-PROJ-026
+
+---
+
+### REQ-BED-032: Conversation Hard-Delete Cascade
+
+WHEN the user initiates a hard-delete on a conversation
+THE SYSTEM SHALL emit a `ConversationHardDeleted(conversation)` lifecycle
+announcement event
+AND each downstream subscriber SHALL run its cleanup synchronously within
+the hard-delete handler
+AND the conversation row SHALL be removed from persistence after all
+subscribers have completed (success or logged failure)
+
+THE following downstream specs subscribe to `ConversationHardDeleted`:
+- `specs/bash/` REQ-BASH-006: kills any live bash handles for the
+  conversation and drops in-memory tombstones
+- `specs/tmux-integration/` REQ-TMUX-007: runs `tmux kill-server` against
+  the conversation's socket, unlinks the socket file, removes the
+  registry entry
+- `specs/projects/` (future cleanup hook): worktree/branch cleanup for
+  hard-delete on a non-terminal conversation. For conversations already
+  in a terminal state with worktrees still present, the existing
+  terminal-state worktree cleanup paths (REQ-PROJ-028) apply; hard-
+  delete only fires when the user explicitly removes the conversation
+  record.
+
+WHEN the conversation is busy (the agent is mid-tool, mid-LLM-request, or
+in any non-idle core_status)
+THE SYSTEM SHALL reject the hard-delete with a clear "cancel first"
+response
+OR the calling layer SHALL issue cancellation before invoking
+hard-delete; either path is acceptable as long as a hard-delete never
+races a live tool execution
+
+WHEN a subscriber's cleanup fails (subprocess error, file system error,
+registry-state inconsistency)
+THE SYSTEM SHALL log the failure at WARN level
+AND continue the cascade — failing subscribers SHALL NOT block the
+conversation row deletion
+AND orphans (e.g., a leftover tmux server, an orphaned worktree) SHALL
+be addressed by a separate reconciliation pass (the same reconciliation
+machinery that already runs on server restart for worktrees)
+
+THE SYSTEM SHALL distinguish hard-delete from soft-state changes
+(archive, close-tab, etc.) — soft-state changes do NOT emit
+`ConversationHardDeleted`. Long-lived per-conversation resources (tmux
+servers, bash handles) survive soft-state changes deliberately
+(REQ-TMUX-008 makes this explicit on the tmux side).
+
+THE `ConversationHardDeleted` event SHALL be a one-shot announcement:
+emitted exactly once per hard-delete operation, with the conversation
+entity payload that subscribers can read to derive any state they need
+(working_dir, mode, etc.) before the row is removed.
+
+**Rationale:** Bash handles live in-process; tmux servers and project
+worktrees live outside Phoenix. Without an explicit cascade, deleting a
+conversation leaves these resources orphaned: the OS-visible processes
+keep running, socket files accumulate in `~/.phoenix-ide/tmux-sockets/`,
+worktrees stay on disk. A central announcement event lets each spec own
+its own cleanup behaviour without bedrock needing to know about the
+implementation details. The "subscribers first, row last" ordering means
+subscribers can still query the conversation entity if they need to
+(e.g., to read its working_dir for a cleanup script). Best-effort
+cleanup with logged failures matches the established pattern from
+REQ-PROJ-010 ("Abandon always succeeds from the user's perspective");
+catastrophic cleanup would block deletion behind problems the user
+cannot resolve from the UI.
+
+The not-busy precondition mirrors REQ-PROJ-010 / `ConfirmAbandon` in
+`specs/projects/`. Hard-delete during a live tool execution would race
+the tool's own cleanup code; canceling first is the deterministic order.
+
+**Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
+(`specs/tmux-integration/`)

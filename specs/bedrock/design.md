@@ -502,6 +502,81 @@ through `handle_outcome()`.
 
 ---
 
+## Conversation Hard-Delete Cascade (REQ-BED-032)
+
+Hard-delete is distinct from abandon. Abandon is a Work-mode-specific
+terminal action that closes a task and leaves the conversation visible in
+the sidebar (in `Terminal` state) for history. Hard-delete is the user
+saying "remove this conversation entirely" — the row leaves the database,
+nothing remains in the UI, and any per-conversation resources held outside
+the database (bash handles, tmux servers, worktrees) must be cleaned up.
+
+### Cascade Orchestrator
+
+The current `delete_conversation` handler in `src/api/handlers.rs` is a
+one-line `db.delete_conversation(&id)` call with no cascade. REQ-BED-032
+replaces this with an orchestrator that:
+
+1. **Cancellation pre-step.** If the conversation is busy (any non-`Idle`
+   `core_status`), the orchestrator either issues `Cancel` and waits for
+   the executor to settle on `Idle`, or returns 409 with a "cancel first"
+   message. Either path is acceptable; the contract is "no hard-delete
+   races a live tool execution."
+
+2. **Emit `ConversationHardDeleted(conversation)`.** Subscribers run
+   synchronously in this single handler's execution:
+
+   | Subscriber | Cleanup |
+   |---|---|
+   | `specs/bash/` REQ-BASH-006 | Kill live handles in the conversation's `BashHandleRegistry` entry; drop in-memory tombstones |
+   | `specs/tmux-integration/` REQ-TMUX-007 | Run `tmux -S <conv-sock> kill-server`; unlink the socket file; drop the registry entry |
+   | `specs/projects/` | Worktree/branch cleanup if applicable. For terminal conversations whose worktrees have already been handled (REQ-PROJ-028), this step is a no-op |
+
+   Each subscriber's failure is logged at WARN level. The cascade does not
+   abort on subscriber failure — the user clicked delete, and a stuck
+   subscriber should not strand the row. Orphans (a tmux server that
+   refused to die, a worktree that couldn't be removed) are picked up by
+   the existing reconciliation passes.
+
+3. **Delete the conversation row.** SQLite ON DELETE CASCADE removes
+   messages, tool calls, and other dependent rows. The row deletion is
+   what makes the conversation disappear from sidebars and queries.
+
+### Lifecycle Event Layer
+
+The orchestrator dispatches via the same lifecycle-announcement pattern
+already used for `ConversationBecameTerminal` (terminal-state entry). A
+single `ConversationHardDeleted(conversation)` event payload carries the
+conversation entity; subscribers read whatever fields they need
+(`working_dir`, `mode`, `id`) before the row is removed. Subscribers must
+not retain references to the conversation entity after their handler
+returns — by the time control returns to the orchestrator's row-delete
+step, the entity is logically about to vanish.
+
+### Why This Is a Bedrock Concern
+
+bash, tmux, and projects each have their own cleanup logic, but the
+*ordering* and the *contract* (subscribers run before row delete; failures
+log; the row delete is the final user-visible signal) belong to bedrock —
+the conversation lifecycle is bedrock's domain. Without a central
+announcement pattern, every spec that wants to subscribe would have to
+reach into the API handler and add bespoke calls, and the ordering would
+diverge.
+
+The `ConversationHardDeleted` event mirrors `ConversationBecameTerminal`
+both in shape and in subscription discipline. Downstream specs subscribe
+in their own files; bedrock just emits.
+
+### Soft-State Distinction
+
+Soft-state changes — archive, close-tab, conversation-tab-blur — do
+**not** trigger this cascade. Long-lived per-conversation resources are
+designed to survive these (REQ-TMUX-008 makes this explicit; REQ-BASH-006
+implicitly preserves tombstones across soft state). Hard-delete is the
+only event that asks subscribers to clean up.
+
+---
+
 ## Sub-Agent Result Submission (REQ-BED-008, REQ-BED-009)
 
 Sub-agents have a special tool to submit their final result:
