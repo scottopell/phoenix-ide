@@ -1,7 +1,7 @@
 ---
 created: 2026-05-01
 priority: p1
-status: ready
+status: done
 artifact: ui/src/sseSchemas.ts
 ---
 
