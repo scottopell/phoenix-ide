@@ -1551,11 +1551,13 @@ where
             } else {
                 use crate::db::ToolContentImage;
                 if let Some(out) = output {
+                    let duration_ms =
+                        u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     tracing::info!(
                         conv_id = %conv_id,
                         tool = %tool_name,
                         id = %tool_use_id,
-                        duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        duration_ms,
                         success = out.success,
                         "Tool completed"
                     );
@@ -1583,6 +1585,7 @@ where
                     ToolExecOutcome::Completed(ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         outcome,
+                        duration_ms: Some(duration_ms),
                     })
                 } else {
                     tracing::warn!(
@@ -1643,6 +1646,8 @@ where
                     );
                     let tool_msg_id = tool_result_message_id(&result.tool_use_id);
                     let tool_seq = self.broadcast_tx.next_seq();
+                    let merged_display =
+                        merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     let tool_msg = self
                         .storage
                         .add_message_with_seq(
@@ -1650,7 +1655,7 @@ where
                             &self.context.conversation_id,
                             tool_seq,
                             &tool_content,
-                            result.display_data(),
+                            merged_display.as_ref(),
                             None,
                         )
                         .await?;
@@ -2234,6 +2239,33 @@ fn strip_all_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
 /// Anthropic's API rejects requests where `tool_use` blocks reference unavailable tools.
 ///
 /// The DB history is not modified -- this operates on the in-memory message Vec only.
+/// Merge a `duration_ms` value into an existing `display_data` JSON blob.
+///
+/// If `duration_ms` is `None`, returns a clone of the existing data unchanged.
+/// If `display_data` is `None`, returns `{ "duration_ms": ms }` when a
+/// duration is present. If both are `Some`, inserts `duration_ms` into the
+/// existing object without overwriting any tool-specific fields.
+fn merge_duration_into_display_data(
+    existing: Option<&serde_json::Value>,
+    duration_ms: Option<u64>,
+) -> Option<serde_json::Value> {
+    match (existing, duration_ms) {
+        (None, None) => None,
+        (Some(v), None) => Some(v.clone()),
+        (None, Some(ms)) => Some(serde_json::json!({ "duration_ms": ms })),
+        (Some(v), Some(ms)) => {
+            let mut merged = v.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "duration_ms".to_string(),
+                    serde_json::Value::Number(ms.into()),
+                );
+            }
+            Some(merged)
+        }
+    }
+}
+
 fn strip_unavailable_tool_blocks(
     messages: Vec<LlmMessage>,
     available_tools: &std::collections::HashSet<&str>,

@@ -51,8 +51,21 @@ const ChevronUpIcon = () => (
   </svg>
 );
 
-// Stable plugin array — avoids creating a new array reference on every render
+// Stable plugin array -- avoids creating a new array reference on every render
 const REMARK_PLUGINS = [remarkGfm];
+
+/** Format a tool execution duration for display in the tool block header.
+ *  < 60s   -> "4s" or "3.2s" (one decimal for < 10s)
+ *  >= 60s  -> "1m 4s" (seconds omitted when 0: "2m")
+ */
+function formatToolDuration(ms: number): string {
+  const s = ms / 1000;
+  if (s < 10) return `${s.toFixed(1)}s`;
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+}
 
 // ============================================================================
 // Helper functions
@@ -554,6 +567,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
     resultContent = result.content as ToolResultContent;
   }
 
+  // Duration from display_data.duration_ms (set by Rust executor after tool completes)
+  const durationMs: number | undefined = (() => {
+    const dd = result?.display_data as Record<string, unknown> | undefined;
+    const v = dd?.['duration_ms'];
+    return typeof v === 'number' ? v : undefined;
+  })();
+
   const rawResultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
   const isError = resultContent?.is_error || !!resultContent?.error;
   
@@ -635,6 +655,9 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
         {hasOutput && (
           <span className={`tool-block-status ${isError ? 'error' : 'success'}`}>
             {isError ? <XIcon /> : <CheckIcon />}
+            {durationMs !== undefined && (
+              <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>
+            )}
           </span>
         )}
       </div>

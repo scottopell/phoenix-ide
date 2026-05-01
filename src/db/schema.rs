@@ -516,6 +516,13 @@ pub enum ToolOutcome {
 pub struct ToolResult {
     pub tool_use_id: String,
     pub outcome: ToolOutcome,
+    /// Wall-clock duration of the tool execution in milliseconds.
+    /// `None` for tool results that were not produced by `dispatch_tool_execution`
+    /// (e.g. sub-agent summaries, `spawn_agents` placeholders).
+    /// Stored here so the executor can inject it into the persisted message's
+    /// `display_data` without a separate wire event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl ToolResult {
@@ -527,6 +534,7 @@ impl ToolResult {
                 display_data: None,
                 images: vec![],
             },
+            duration_ms: None,
         }
     }
 
@@ -538,6 +546,7 @@ impl ToolResult {
                 display_data: None,
                 images: vec![],
             },
+            duration_ms: None,
         }
     }
 
@@ -547,6 +556,7 @@ impl ToolResult {
             outcome: ToolOutcome::Cancelled {
                 message: message.to_string(),
             },
+            duration_ms: None,
         }
     }
 
@@ -564,6 +574,7 @@ impl ToolResult {
                 display_data,
                 images: vec![],
             },
+            duration_ms: None,
         }
     }
 
