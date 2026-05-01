@@ -21,7 +21,8 @@ use super::types::{
 use super::AppState;
 use crate::db::{ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType};
 use crate::git_ops::{
-    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict, GitOpError,
+    check_branch_conflict, create_worktree, effective_base_ref, materialize_branch, run_git,
+    BranchConflict, GitOpError,
 };
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
@@ -208,12 +209,17 @@ pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
 
 /// Count how many commits `base_branch` is ahead of `task_branch` in `repo_root`.
 ///
+/// Compares against `origin/<base>` when the remote-tracking ref exists
+/// (kept fresh by the periodic fetch loop in `stream_conversation`),
+/// falling back to bare `<base>` for local-only repos. See task 13001.
+///
 /// Shells out to `git rev-list --count`. Returns 0 on any error (missing branch,
 /// git not available, parse failure). This is a best-effort indicator.
 ///
 /// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
 fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
-    let range = format!("{task_branch}..{base_branch}");
+    let comparator = effective_base_ref(repo_root, base_branch);
+    let range = format!("{task_branch}..{comparator}");
     match run_git(repo_root, &["rev-list", "--count", &range]) {
         Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
         Err(e) => {
@@ -230,11 +236,15 @@ fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &
 }
 
 /// How many commits the task branch is ahead of the base branch.
+///
+/// Same `origin/<base>` preference as `commits_behind`; see task 13001.
+///
 /// Shells out to `git rev-list --count`. Returns 0 on any error.
 ///
 /// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
 fn commits_ahead(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
-    let range = format!("{base_branch}..{task_branch}");
+    let comparator = effective_base_ref(repo_root, base_branch);
+    let range = format!("{comparator}..{task_branch}");
     match run_git(repo_root, &["rev-list", "--count", &range]) {
         Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
         Err(e) => {
