@@ -659,52 +659,74 @@ impl Database {
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
-        // UUIDs are ASCII; a `[..8]` char boundary always aligns. We still
-        // guard with `get(..8)` to keep clippy's string-slice lint happy.
-        let new_id_prefix = new_id.get(..8).unwrap_or(new_id.as_str());
-        // Always include the new conversation's id prefix in the slug so
-        // each call is unique-by-construction. Two concurrent same-parent
-        // calls can otherwise both observe the slug as available, both
-        // INSERT, and one hit a UNIQUE constraint failure *before* the
-        // TOCTOU `continued_in_conv_id IS NULL` UPDATE has a chance to
-        // arbitrate idempotency. Including the per-call UUID prefix
-        // eliminates that race entirely.
-        let actual_slug = parent.slug.as_deref().map_or_else(
-            || format!("continued-{new_id_prefix}"),
-            |s| format!("{s}-continued-{new_id_prefix}"),
-        );
+
+        // Sequential slug: walk to chain root, count existing members, then
+        // assign `{root_slug}-{N}` where N = member_count + 1 (e.g. root-only
+        // chain → first continuation is #2). Concurrent continuations are
+        // handled by the UNIQUE-violation retry loop below (mirroring
+        // `create_conversation`); `rows_affected() == 0` on the UPDATE remains
+        // the definitive TOCTOU guard.
+        let root_id = self
+            .chain_root_of(parent_id)
+            .await?
+            .unwrap_or_else(|| parent_id.to_string());
+        let root = self.get_conversation(&root_id).await?;
+        let chain_len = self.chain_members_forward(&root_id).await?.len();
+        let root_slug = root.slug.as_deref().unwrap_or("conversation");
+        let base_n = chain_len + 1;
+        let mut candidate_slug = format!("{root_slug}-{base_n}");
+        let mut slug_offset: usize = 0;
 
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let conv_mode_json = serde_json::to_string(&parent.conv_mode).unwrap();
 
-        let title_str = schema::title_from_slug(&actual_slug);
-
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(
-            "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id)
-             VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
-        )
-        .bind(&new_id)
-        .bind(&actual_slug)
-        .bind(&title_str)
-        .bind(&parent.cwd)
-        .bind(&idle_state)
-        .bind(&now_str)
-        .bind(parent.model.as_deref())
-        .bind(parent.project_id.as_deref())
-        .bind(&conv_mode_json)
-        .bind(parent.desired_base_branch.as_deref())
-        // Continuations do not inherit the parent's seed fields — those are
-        // decorative UI metadata for a different concept (REQ-SEED-003/004).
-        .bind::<Option<&str>>(None)
-        .bind::<Option<&str>>(None)
-        .execute(&mut *tx)
-        .await?;
+        // Retry on slug collision (UNIQUE constraint, SQLite error 2067).
+        // Collisions are rare: concurrent continuations racing for the same
+        // sequential number, or an unrelated conversation sharing the name.
+        let actual_slug = loop {
+            let title_for_insert = schema::title_from_slug(&candidate_slug);
+            let result = sqlx::query(
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+            )
+            .bind(&new_id)
+            .bind(&candidate_slug)
+            .bind(&title_for_insert)
+            .bind(&parent.cwd)
+            .bind(&idle_state)
+            .bind(&now_str)
+            .bind(parent.model.as_deref())
+            .bind(parent.project_id.as_deref())
+            .bind(&conv_mode_json)
+            .bind(parent.desired_base_branch.as_deref())
+            // Continuations do not inherit the parent's seed fields — those are
+            // decorative UI metadata for a different concept (REQ-SEED-003/004).
+            .bind::<Option<&str>>(None)
+            .bind::<Option<&str>>(None)
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(_) => break candidate_slug,
+                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                    slug_offset += 1;
+                    candidate_slug = if slug_offset <= 20 {
+                        format!("{root_slug}-{}", base_n + slug_offset)
+                    } else {
+                        // Safety valve: fall back to UUID suffix.
+                        let uid = uuid::Uuid::new_v4().to_string();
+                        format!("{root_slug}-{}-{}", base_n, uid.get(..8).unwrap_or(&uid))
+                    };
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        };
 
         // Guard against TOCTOU: only clear-parent continues succeed. This
         // WHERE clause is the concurrent-continuation check — if another
@@ -741,6 +763,7 @@ impl Database {
 
         tx.commit().await?;
 
+        let title_str = schema::title_from_slug(&actual_slug);
         let new_conversation = Conversation {
             id: new_id,
             slug: Some(actual_slug),
@@ -780,7 +803,6 @@ impl Database {
     /// `continued_in_conv_id` column is a single scalar pointer per row, so
     /// the chain is structurally linear; this method does not need to defend
     /// against fan-out.
-    #[allow(dead_code)] // Callers added in Phase 2 (chain Q&A backend)
     pub async fn chain_members_forward(&self, root_id: &str) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, next_id, depth) AS (
@@ -810,7 +832,6 @@ impl Database {
     ///
     /// Walks the inverse edge `WHERE p.continued_in_conv_id = current.id`
     /// until no predecessor exists.
-    #[allow(dead_code)] // Callers added in Phase 2 (chain Q&A backend)
     pub async fn chain_root_of(&self, conv_id: &str) -> DbResult<Option<String>> {
         let row = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, depth) AS (
@@ -2541,6 +2562,46 @@ mod tests {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "no-such-conv"),
             other => panic!("expected ConversationNotFound, got {other:?}"),
         }
+    }
+
+    /// Sequential slugs: first continuation is `{root}-2`, multi-level chains
+    /// use the root slug (not the parent slug) so names don't compound.
+    #[tokio::test]
+    async fn test_continue_conversation_sequential_slugs() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Root conversation: slug = "my-task"
+        setup_exhausted_parent(&db, "root", "my-task", "/tmp", &ConvMode::Direct).await;
+
+        // First continuation: should be "my-task-2"
+        let first = match db.continue_conversation("root").await.unwrap() {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert_eq!(
+            first.slug.as_deref(),
+            Some("my-task-2"),
+            "first continuation slug must be {{root_slug}}-2"
+        );
+
+        // Exhaust and continue from first continuation.
+        let exhausted = ConvState::ContextExhausted {
+            summary: "summary".to_string(),
+        };
+        db.update_conversation_state(&first.id, &exhausted)
+            .await
+            .unwrap();
+
+        // Second continuation: should be "my-task-3" (root slug, not parent slug)
+        let second = match db.continue_conversation(&first.id).await.unwrap() {
+            ContinueOutcome::Created(c) => c,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert_eq!(
+            second.slug.as_deref(),
+            Some("my-task-3"),
+            "second continuation slug must be {{root_slug}}-3, not the parent slug appended"
+        );
     }
 
     // ------------------------------------------------------------------
