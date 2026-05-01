@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolContext, ToolOutput};
+use crate::api::wire::{TmuxErrorResponse, TmuxToolResponse};
 use invoke::{
     truncate_pair, TMUX_OUTPUT_MAX_BYTES, TMUX_TOOL_DEFAULT_WAIT_SECONDS,
     TMUX_TOOL_MAX_WAIT_SECONDS,
@@ -301,23 +302,25 @@ fn structured_response(
     stderr: &str,
     truncated: bool,
 ) -> ToolOutput {
-    let value = json!({
-        "status": status,
-        "exit_code": exit_code,
-        "duration_ms": duration_ms,
-        "stdout": stdout,
-        "stderr": stderr,
-        "truncated": truncated,
-    });
+    let typed = TmuxToolResponse {
+        status: status.to_string(),
+        exit_code,
+        duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
+        stdout: stdout.to_string(),
+        stderr: stderr.to_string(),
+        truncated,
+    };
+    let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
     ToolOutput::success(serialized).with_display(value)
 }
 
 fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
-    let value = json!({
-        "error": error_id,
-        "message": message,
-    });
+    let typed = TmuxErrorResponse {
+        error: error_id.to_string(),
+        message: message.to_string(),
+    };
+    let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
     ToolOutput::error(serialized).with_display(value)
 }

@@ -655,4 +655,61 @@ mod tests {
             );
         }
     }
+
+    /// REQ-BASH-010 / task 02697: the bash tool's input schema must reach
+    /// every registry that exposes bash, including sub-agent registries,
+    /// with the new `oneOf` operation-key structure (`cmd|peek|wait|kill`)
+    /// and the deprecated `mode` enum kept as a backward-compat alias.
+    #[test]
+    fn bash_input_schema_flows_through_to_subagent_registries() {
+        for (label, registry) in [
+            ("direct", ToolRegistry::direct()),
+            ("subagent_explore", ToolRegistry::for_subagent_explore()),
+            ("subagent_work", ToolRegistry::for_subagent_work()),
+        ] {
+            let bash = registry
+                .find_tool("bash")
+                .unwrap_or_else(|| panic!("{label} registry missing bash"));
+            let schema = bash.input_schema();
+            let one_of = schema
+                .get("oneOf")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("{label} bash schema missing oneOf"));
+            assert_eq!(
+                one_of.len(),
+                4,
+                "{label} bash schema oneOf should have 4 branches (cmd/peek/wait/kill)"
+            );
+            // Walk the oneOf branches; collect the `required` keys that
+            // appear so we can verify the four operation modes are
+            // structurally distinct.
+            let required_keys: BTreeSet<String> = one_of
+                .iter()
+                .filter_map(|branch| {
+                    branch
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                })
+                .collect();
+            for key in &["cmd", "peek", "wait", "kill"] {
+                assert!(
+                    required_keys.contains(*key),
+                    "{label}: bash schema oneOf missing branch requiring `{key}`"
+                );
+            }
+            let properties = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap();
+            assert!(properties.contains_key("wait_seconds"));
+            assert!(properties.contains_key("signal"));
+            assert!(properties.contains_key("lines"));
+            assert!(properties.contains_key("since"));
+            // Deprecation alias still surfaces.
+            assert!(properties.contains_key("mode"));
+        }
+    }
 }

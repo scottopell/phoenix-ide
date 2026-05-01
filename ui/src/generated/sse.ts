@@ -18,6 +18,21 @@ export type { UsageData } from './UsageData';
 export type { UserFacingError } from './UserFacingError';
 export type { UserFacingErrorKind } from './UserFacingErrorKind';
 
+// Bash and tmux tool response wire types (task 02697).
+export type { BashResponse } from './BashResponse';
+export type { BashRunningPayload } from './BashRunningPayload';
+export type { BashStillRunningPayload } from './BashStillRunningPayload';
+export type { BashKillPendingKernelPayload } from './BashKillPendingKernelPayload';
+export type { BashTombstonedPayload } from './BashTombstonedPayload';
+export type { BashSpawnTombstonePayload } from './BashSpawnTombstonePayload';
+export type { BashWaiterPanickedPayload } from './BashWaiterPanickedPayload';
+export type { BashRingWindow } from './BashRingWindow';
+export type { BashRingLine } from './BashRingLine';
+export type { BashErrorResponse } from './BashErrorResponse';
+export type { BashLiveHandleSummary } from './BashLiveHandleSummary';
+export type { TmuxToolResponse } from './TmuxToolResponse';
+export type { TmuxErrorResponse } from './TmuxErrorResponse';
+
 import type { SseWireEvent } from './SseWireEvent';
 import type { ChainSseWireEvent } from './ChainSseWireEvent';
 
@@ -49,6 +64,10 @@ export type SseConversationUpdateData = Omit<
   'type'
 >;
 export type SseErrorData = Omit<Extract<SseWireEvent, { type: 'error' }>, 'type'>;
+export type SseConversationHardDeletedData = Omit<
+  Extract<SseWireEvent, { type: 'conversation_hard_deleted' }>,
+  'type'
+>;
 
 // Chain Q&A wire-event data shapes (Phoenix Chains v1). Same Extract +
 // Omit<…, 'type'> pattern as the conversation-scoped SSE events above.

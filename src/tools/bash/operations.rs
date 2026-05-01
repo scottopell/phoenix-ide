@@ -30,6 +30,11 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, ConversationHandles, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
+use crate::api::wire::{
+    BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
+    BashRingLine, BashRingWindow, BashRunningPayload, BashSpawnTombstonePayload,
+    BashStillRunningPayload, BashTombstonedPayload, BashWaiterPanickedPayload,
+};
 use crate::tools::{ToolContext, ToolOutput};
 
 // ---------------------------------------------------------------------------
@@ -159,94 +164,83 @@ pub enum BashError {
 
 impl BashError {
     fn into_tool_output(self) -> ToolOutput {
-        let value = match self {
-            BashError::HandleNotFound { handle_id } => json!({
-                "error": "handle_not_found",
-                "error_message": format!("handle {handle_id} not found in this conversation"),
-                "handle_id": handle_id,
-                "hint": HANDLE_NOT_FOUND_HINT,
-            }),
+        let typed: BashErrorResponse = match self {
+            BashError::HandleNotFound { handle_id } => BashErrorResponse::HandleNotFound {
+                error_message: format!("handle {handle_id} not found in this conversation"),
+                handle_id,
+                hint: HANDLE_NOT_FOUND_HINT.to_string(),
+            },
             BashError::HandleCapReached(BashHandleError::HandleCapReached {
                 cap,
                 live_handles,
             }) => {
-                let live: Vec<Value> = live_handles
+                let live: Vec<BashLiveHandleSummary> = live_handles
                     .iter()
-                    .map(|s: &LiveHandleSummary| {
-                        json!({
-                            "handle": s.handle.as_str(),
-                            "cmd": s.cmd,
-                            "age_seconds": s.age_seconds,
-                            "status": "running",
-                        })
+                    .map(|s: &LiveHandleSummary| BashLiveHandleSummary {
+                        handle: s.handle.as_str().to_string(),
+                        cmd: s.cmd.clone(),
+                        age_seconds: s.age_seconds,
+                        status: "running".to_string(),
                     })
                     .collect();
-                json!({
-                    "error": "handle_cap_reached",
-                    "error_message": format!(
+                BashErrorResponse::HandleCapReached {
+                    error_message: format!(
                         "this conversation has reached the cap of {cap} live bash handles"
                     ),
-                    "cap": cap,
-                    "live_handles": live,
-                    "hint": CAP_HINT,
-                })
+                    cap,
+                    live_handles: live,
+                    hint: CAP_HINT.to_string(),
+                }
             }
-            BashError::WaitSecondsOutOfRange { provided, max } => json!({
-                "error": "wait_seconds_out_of_range",
-                "error_message": format!(
-                    "wait_seconds={provided} is out of range [0, {max}]; long-running operations \
-                     should yield a handle and resume via wait calls"
-                ),
-                "provided": provided,
-                "max_wait_seconds": max,
-            }),
-            BashError::PeekArgsMutuallyExclusive => json!({
-                "error": "peek_args_mutually_exclusive",
-                "error_message": "specify exactly one of lines or since",
-            }),
-            BashError::CommandSafetyRejected { reason } => json!({
-                "error": "command_safety_rejected",
-                "error_message": reason.clone(),
-                "reason": reason,
-            }),
-            BashError::SpawnFailed { error_message } => json!({
-                "error": "spawn_failed",
-                "error_message": error_message,
-            }),
+            BashError::WaitSecondsOutOfRange { provided, max } => {
+                BashErrorResponse::WaitSecondsOutOfRange {
+                    error_message: format!(
+                        "wait_seconds={provided} is out of range [0, {max}]; long-running \
+                         operations should yield a handle and resume via wait calls"
+                    ),
+                    provided,
+                    max_wait_seconds: max,
+                }
+            }
+            BashError::PeekArgsMutuallyExclusive => BashErrorResponse::PeekArgsMutuallyExclusive {
+                error_message: "specify exactly one of lines or since".to_string(),
+            },
+            BashError::CommandSafetyRejected { reason } => {
+                BashErrorResponse::CommandSafetyRejected {
+                    error_message: reason.clone(),
+                    reason,
+                }
+            }
+            BashError::SpawnFailed { error_message } => {
+                BashErrorResponse::SpawnFailed { error_message }
+            }
             BashError::MutuallyExclusiveModes {
                 message,
                 conflicting_args,
                 recommended_action,
                 extra,
             } => {
-                let mut obj = serde_json::Map::new();
-                obj.insert(
-                    "error".into(),
-                    Value::String("mutually_exclusive_modes".into()),
-                );
-                obj.insert("error_message".into(), Value::String(message));
-                obj.insert(
-                    "conflicting_args".into(),
-                    Value::Array(
-                        conflicting_args
-                            .into_iter()
-                            .map(|s| Value::String(s.into()))
-                            .collect(),
-                    ),
-                );
-                obj.insert(
-                    "recommended_action".into(),
-                    Value::String(recommended_action),
-                );
-                if let Some(Value::Object(extras)) = extra {
+                let typed_err = BashErrorResponse::MutuallyExclusiveModes {
+                    error_message: message,
+                    conflicting_args: conflicting_args.into_iter().map(String::from).collect(),
+                    recommended_action,
+                };
+                // Merge the dual-pass `extra` onto the typed envelope at
+                // the JSON layer (the typed struct intentionally doesn't
+                // model these — see the `MutuallyExclusiveModes` doc on
+                // `BashErrorResponse`).
+                let mut value = serde_json::to_value(&typed_err).unwrap_or(Value::Null);
+                if let (Value::Object(obj), Some(Value::Object(extras))) = (&mut value, extra) {
                     for (k, v) in extras {
                         obj.insert(k, v);
                     }
                 }
-                Value::Object(obj)
+                let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
+                return ToolOutput::error(serialized).with_display(value);
             }
         };
 
+        let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
         let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
         ToolOutput::error(serialized).with_display(value)
     }
@@ -992,111 +986,149 @@ async fn shape_handle_response(
     cmd_override: Option<&str>,
 ) -> ToolOutput {
     let state = handle.state().await;
-    let mut obj = serde_json::Map::new();
-
-    // status field per REQ-BASH-002/003/006.
     let cmd = cmd_override.unwrap_or(handle.cmd.as_str()).to_string();
+    let display = display_label(handle, kind);
+    let signal_sent_top: Option<String> = match kind {
+        ResponseKind::Kill {
+            signal_sent: Some(sig),
+            ..
+        } => Some(sig.as_str().into()),
+        _ => None,
+    };
 
-    match state.as_ref() {
+    let typed: BashResponse = match state.as_ref() {
         HandleState::Live(live) => {
-            // Determine kill_pending_kernel vs running by inspecting kill_attempt.
             let kill_attempt = handle.kill_attempt().await;
             let is_kill_pending_kernel = kill_attempt.is_some();
-            let status = match kind {
-                ResponseKind::Kill { pending, .. } => {
-                    if pending {
-                        "kill_pending_kernel"
-                    } else {
-                        // Kill response saw exit (pending=false) and yet
-                        // state is still Live? Shouldn't happen because
-                        // the waiter would have demoted; fall back to
-                        // still_running.
-                        "still_running"
-                    }
-                }
-                ResponseKind::Peek | ResponseKind::Wait if is_kill_pending_kernel => {
-                    "kill_pending_kernel"
-                }
-                ResponseKind::Peek => "running",
-                ResponseKind::Wait => "still_running",
-            };
-            obj.insert("status".into(), Value::String(status.into()));
-            obj.insert("handle".into(), Value::String(handle.handle_id.to_string()));
-            obj.insert("cmd".into(), Value::String(cmd));
-
             let ring = live.ring.lock().await;
             let view = read_window_from_ring(&ring, read_args);
-            insert_window(&mut obj, &view);
+            let window = window_to_typed(&view);
+            drop(ring);
 
-            if let Some(attempt) = kill_attempt {
-                obj.insert(
-                    "kill_signal_sent".into(),
-                    Value::String(attempt.signal_sent.as_str().into()),
-                );
-                obj.insert(
-                    "kill_attempted_at".into(),
-                    Value::String(format_systime(attempt.attempted_at)),
-                );
+            let (kill_signal_str, kill_attempted_str) = match &kill_attempt {
+                Some(a) => (
+                    Some(a.signal_sent.as_str().to_string()),
+                    Some(format_systime(a.attempted_at)),
+                ),
+                None => (None, None),
+            };
+
+            match kind {
+                // Pending kill: kill response timer expired without an exit.
+                ResponseKind::Kill { pending: true, .. } => {
+                    BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+                        handle: handle.handle_id.to_string(),
+                        cmd,
+                        window,
+                        kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
+                        kill_attempted_at: kill_attempted_str
+                            .unwrap_or_else(|| format_systime(SystemTime::now())),
+                        display,
+                        signal_sent: signal_sent_top.unwrap_or_else(|| "TERM".into()),
+                    })
+                }
+                // Kill resolved (pending=false) but state is still Live —
+                // race we don't expect (waiter should have demoted). Fall
+                // back to still_running shape with the in-flight kill
+                // metadata, matching the prior JSON behaviour.
+                ResponseKind::Kill { pending: false, .. } => {
+                    BashResponse::StillRunning(BashStillRunningPayload {
+                        handle: handle.handle_id.to_string(),
+                        cmd,
+                        waited_ms: 0,
+                        window,
+                        kill_signal_sent: kill_signal_str,
+                        kill_attempted_at: kill_attempted_str,
+                        deprecation_notice: deprecation_notice.map(String::from),
+                    })
+                }
+                ResponseKind::Peek if is_kill_pending_kernel => {
+                    BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+                        handle: handle.handle_id.to_string(),
+                        cmd,
+                        window,
+                        kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
+                        kill_attempted_at: kill_attempted_str
+                            .unwrap_or_else(|| format_systime(SystemTime::now())),
+                        display,
+                        // No `signal_sent` echo on peek.
+                        signal_sent: String::new(),
+                    })
+                }
+                ResponseKind::Wait if is_kill_pending_kernel => {
+                    // The legacy code emitted status="kill_pending_kernel"
+                    // here (no display field with the typed kill payload).
+                    // To preserve the prior JSON shape — which carried the
+                    // full Running shape (with display) — we use the
+                    // KillPendingKernel typed payload but *without* an
+                    // embedded `signal_sent` field by emitting an empty
+                    // string. The downstream consumers branch on `status`,
+                    // which is the reliable discriminator.
+                    BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+                        handle: handle.handle_id.to_string(),
+                        cmd,
+                        window,
+                        kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
+                        kill_attempted_at: kill_attempted_str
+                            .unwrap_or_else(|| format_systime(SystemTime::now())),
+                        display,
+                        signal_sent: String::new(),
+                    })
+                }
+                ResponseKind::Peek => BashResponse::Running(BashRunningPayload {
+                    handle: handle.handle_id.to_string(),
+                    cmd,
+                    window,
+                    kill_signal_sent: kill_signal_str,
+                    kill_attempted_at: kill_attempted_str,
+                    display,
+                    signal_sent: signal_sent_top,
+                    deprecation_notice: deprecation_notice.map(String::from),
+                }),
+                ResponseKind::Wait => BashResponse::StillRunning(BashStillRunningPayload {
+                    handle: handle.handle_id.to_string(),
+                    cmd,
+                    waited_ms: 0,
+                    window,
+                    kill_signal_sent: kill_signal_str,
+                    kill_attempted_at: kill_attempted_str,
+                    deprecation_notice: deprecation_notice.map(String::from),
+                }),
             }
         }
         HandleState::Tombstoned(t) => {
-            obj.insert("status".into(), Value::String("tombstoned".into()));
-            obj.insert("handle".into(), Value::String(handle.handle_id.to_string()));
-            obj.insert("cmd".into(), Value::String(cmd));
-            obj.insert(
-                "final_cause".into(),
-                Value::String(final_cause_str(&t.final_cause).into()),
-            );
-            if let Some(code) = t.exit_code {
-                obj.insert("exit_code".into(), Value::Number(code.into()));
-            } else {
-                obj.insert("exit_code".into(), Value::Null);
-            }
-            if let Some(sig) = t.signal_number {
-                obj.insert("signal_number".into(), Value::Number(sig.into()));
-            }
-            obj.insert("duration_ms".into(), Value::Number(t.duration_ms.into()));
-            obj.insert(
-                "finished_at".into(),
-                Value::String(format_systime(t.finished_at)),
-            );
-            if let Some(sig) = t.kill_signal_sent {
-                obj.insert(
-                    "kill_signal_sent".into(),
-                    Value::String(sig.as_str().into()),
-                );
-            }
-            if let Some(at) = t.kill_attempted_at {
-                obj.insert(
-                    "kill_attempted_at".into(),
-                    Value::String(format_systime(at)),
-                );
-            }
             let view = read_window_from_tombstone(t, read_args);
-            insert_window(&mut obj, &view);
+            let window = window_to_typed(&view);
+            BashResponse::Tombstoned(BashTombstonedPayload {
+                handle: handle.handle_id.to_string(),
+                cmd,
+                final_cause: final_cause_str(&t.final_cause).to_string(),
+                exit_code: t.exit_code,
+                signal_number: t.signal_number,
+                duration_ms: t.duration_ms,
+                finished_at: format_systime(t.finished_at),
+                kill_signal_sent: t.kill_signal_sent.map(|s| s.as_str().to_string()),
+                kill_attempted_at: t.kill_attempted_at.map(format_systime),
+                window,
+                display,
+                signal_sent: signal_sent_top,
+                deprecation_notice: deprecation_notice.map(String::from),
+            })
+        }
+    };
+
+    let mut value = serde_json::to_value(&typed).unwrap_or(Value::Null);
+    // The `peek (kill_pending_kernel)` and `wait (kill_pending_kernel)`
+    // branches above produce a typed payload with `signal_sent: ""` —
+    // strip the empty echo to match the legacy wire shape (peek/wait do
+    // not echo a signal_sent on the response).
+    if let Value::Object(obj) = &mut value {
+        if let Some(Value::String(s)) = obj.get("signal_sent") {
+            if s.is_empty() {
+                obj.remove("signal_sent");
+            }
         }
     }
-
-    // kind-specific fields.
-    if let ResponseKind::Kill {
-        signal_sent: Some(sig),
-        ..
-    } = kind
-    {
-        obj.insert("signal_sent".into(), Value::String(sig.as_str().into()));
-    }
-
-    if let Some(notice) = deprecation_notice {
-        obj.insert(
-            "deprecation_notice".into(),
-            Value::String(notice.to_string()),
-        );
-    }
-
-    // Display label per REQ-BASH-015 for non-spawn ops.
-    obj.insert("display".into(), Value::String(display_label(handle, kind)));
-
-    let value = Value::Object(obj);
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
     ToolOutput::success(serialized).with_display(value)
 }
@@ -1112,42 +1144,80 @@ async fn still_running_response(
 ) -> ToolOutput {
     let state = handle.state().await;
     let kill_attempt = handle.kill_attempt().await;
-    let mut obj = serde_json::Map::new();
-    let status = if kill_attempt.is_some() {
-        "kill_pending_kernel"
-    } else {
-        "still_running"
-    };
-    obj.insert("status".into(), Value::String(status.into()));
-    obj.insert("handle".into(), Value::String(handle.handle_id.to_string()));
-    obj.insert("cmd".into(), Value::String(cmd.to_string()));
     let waited_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-    obj.insert("waited_ms".into(), Value::Number(waited_ms.into()));
 
-    if let HandleState::Live(live) = state.as_ref() {
+    let window = if let HandleState::Live(live) = state.as_ref() {
         let ring = live.ring.lock().await;
         let view = read_window_from_ring(&ring, read_args);
-        insert_window(&mut obj, &view);
-    }
+        window_to_typed(&view)
+    } else {
+        BashRingWindow {
+            start_offset: 0,
+            end_offset: 0,
+            truncated_before: false,
+            lines: vec![],
+        }
+    };
 
-    if let Some(attempt) = kill_attempt {
-        obj.insert(
-            "kill_signal_sent".into(),
-            Value::String(attempt.signal_sent.as_str().into()),
-        );
-        obj.insert(
-            "kill_attempted_at".into(),
-            Value::String(format_systime(attempt.attempted_at)),
-        );
-    }
-    if let Some(notice) = deprecation_notice {
-        obj.insert(
-            "deprecation_notice".into(),
-            Value::String(notice.to_string()),
-        );
-    }
+    let kill_signal_str = kill_attempt
+        .as_ref()
+        .map(|a| a.signal_sent.as_str().to_string());
+    let kill_attempted_str = kill_attempt
+        .as_ref()
+        .map(|a| format_systime(a.attempted_at));
 
-    let value = Value::Object(obj);
+    // If a kill is in flight, surface as kill_pending_kernel (REQ-BASH-003).
+    let typed = if kill_attempt.is_some() {
+        BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+            handle: handle.handle_id.to_string(),
+            cmd: cmd.to_string(),
+            window,
+            kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
+            kill_attempted_at: kill_attempted_str
+                .unwrap_or_else(|| format_systime(SystemTime::now())),
+            // No display label on spawn/wait still_running paths.
+            display: String::new(),
+            // No signal_sent echo: this is a passive wait, not a kill call.
+            signal_sent: String::new(),
+        })
+    } else {
+        BashResponse::StillRunning(BashStillRunningPayload {
+            handle: handle.handle_id.to_string(),
+            cmd: cmd.to_string(),
+            waited_ms,
+            window,
+            kill_signal_sent: kill_signal_str,
+            kill_attempted_at: kill_attempted_str,
+            deprecation_notice: deprecation_notice.map(String::from),
+        })
+    };
+
+    let mut value = serde_json::to_value(&typed).unwrap_or(Value::Null);
+    if let Value::Object(obj) = &mut value {
+        // Strip the empty `display` and `signal_sent` placeholders we set
+        // for the kill_pending_kernel path here so the wire shape matches
+        // the legacy still_running JSON (no display, no signal_sent on the
+        // passive-wait code path).
+        if let Some(Value::String(s)) = obj.get("display") {
+            if s.is_empty() {
+                obj.remove("display");
+            }
+        }
+        if let Some(Value::String(s)) = obj.get("signal_sent") {
+            if s.is_empty() {
+                obj.remove("signal_sent");
+            }
+        }
+        // Add waited_ms for the kill_pending_kernel still-running variant
+        // emitted from this code path; the typed payload omits it because
+        // KillPendingKernel doesn't carry it as a structural field, but
+        // the legacy wire kept it for parity with still_running shape.
+        if obj.get("status").and_then(Value::as_str) == Some("kill_pending_kernel")
+            && !obj.contains_key("waited_ms")
+        {
+            obj.insert("waited_ms".into(), Value::Number(waited_ms.into()));
+        }
+    }
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
     ToolOutput::success(serialized).with_display(value)
 }
@@ -1165,79 +1235,70 @@ async fn terminal_or_panic_response(
     let state = handle.state().await;
     match state.as_ref() {
         HandleState::Tombstoned(t) => {
-            // For spawn responses, REQ-BASH-002 says use status = "exited" |
-            // "killed" verbatim (NOT "tombstoned"). For wait/peek, the
-            // bash.allium rule says return "tombstoned".
-            let mut obj = serde_json::Map::new();
-            let status = if spawn_path {
+            let cmd = cmd_override.unwrap_or(handle.cmd.as_str()).to_string();
+            let view = read_window_from_tombstone(t, read_args);
+            let window = window_to_typed(&view);
+
+            let typed = if spawn_path {
+                let payload = BashSpawnTombstonePayload {
+                    handle: handle.handle_id.to_string(),
+                    cmd,
+                    final_cause: final_cause_str(&t.final_cause).to_string(),
+                    exit_code: t.exit_code,
+                    signal_number: t.signal_number,
+                    duration_ms: t.duration_ms,
+                    finished_at: format_systime(t.finished_at),
+                    kill_signal_sent: t.kill_signal_sent.map(|s| s.as_str().to_string()),
+                    kill_attempted_at: t.kill_attempted_at.map(format_systime),
+                    window,
+                    deprecation_notice: deprecation_notice.map(String::from),
+                };
                 match &t.final_cause {
-                    FinalCause::Exited { .. } => "exited",
-                    FinalCause::Killed { .. } => "killed",
+                    FinalCause::Exited { .. } => BashResponse::Exited(payload),
+                    FinalCause::Killed { .. } => BashResponse::Killed(payload),
                 }
             } else {
-                "tombstoned"
+                BashResponse::Tombstoned(BashTombstonedPayload {
+                    handle: handle.handle_id.to_string(),
+                    cmd,
+                    final_cause: final_cause_str(&t.final_cause).to_string(),
+                    exit_code: t.exit_code,
+                    signal_number: t.signal_number,
+                    duration_ms: t.duration_ms,
+                    finished_at: format_systime(t.finished_at),
+                    kill_signal_sent: t.kill_signal_sent.map(|s| s.as_str().to_string()),
+                    kill_attempted_at: t.kill_attempted_at.map(format_systime),
+                    window,
+                    // wait/peek path: no synthesized display label here
+                    // (callers that want the label go through
+                    // `shape_handle_response`).
+                    display: String::new(),
+                    signal_sent: None,
+                    deprecation_notice: deprecation_notice.map(String::from),
+                })
             };
-            obj.insert("status".into(), Value::String(status.into()));
-            obj.insert("handle".into(), Value::String(handle.handle_id.to_string()));
-            let cmd = cmd_override.unwrap_or(handle.cmd.as_str()).to_string();
-            obj.insert("cmd".into(), Value::String(cmd));
-            obj.insert(
-                "final_cause".into(),
-                Value::String(final_cause_str(&t.final_cause).into()),
-            );
-            if let Some(code) = t.exit_code {
-                obj.insert("exit_code".into(), Value::Number(code.into()));
-            } else {
-                obj.insert("exit_code".into(), Value::Null);
+
+            let mut value = serde_json::to_value(&typed).unwrap_or(Value::Null);
+            if let Value::Object(obj) = &mut value {
+                if let Some(Value::String(s)) = obj.get("display") {
+                    if s.is_empty() {
+                        obj.remove("display");
+                    }
+                }
             }
-            if let Some(sig) = t.signal_number {
-                obj.insert("signal_number".into(), Value::Number(sig.into()));
-            }
-            obj.insert("duration_ms".into(), Value::Number(t.duration_ms.into()));
-            obj.insert(
-                "finished_at".into(),
-                Value::String(format_systime(t.finished_at)),
-            );
-            if let Some(sig) = t.kill_signal_sent {
-                obj.insert(
-                    "kill_signal_sent".into(),
-                    Value::String(sig.as_str().into()),
-                );
-            }
-            if let Some(at) = t.kill_attempted_at {
-                obj.insert(
-                    "kill_attempted_at".into(),
-                    Value::String(format_systime(at)),
-                );
-            }
-            let view = read_window_from_tombstone(t, read_args);
-            insert_window(&mut obj, &view);
-            if let Some(notice) = deprecation_notice {
-                obj.insert(
-                    "deprecation_notice".into(),
-                    Value::String(notice.to_string()),
-                );
-            }
-            let value = Value::Object(obj);
             let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
             ToolOutput::success(serialized).with_display(value)
         }
         HandleState::Live(_live) => {
             // Live but exit observer fired? Likely waiter panic sentinel.
-            let mut obj = serde_json::Map::new();
-            obj.insert("status".into(), Value::String("waiter_panicked".into()));
-            obj.insert("handle".into(), Value::String(handle.handle_id.to_string()));
-            obj.insert(
-                "cmd".into(),
-                Value::String(cmd_override.unwrap_or(handle.cmd.as_str()).to_string()),
-            );
-            obj.insert(
-                "error_message".into(),
-                Value::String(
-                    "the waiter task for this handle panicked; the process state is unknown".into(),
-                ),
-            );
-            let value = Value::Object(obj);
+            let typed = BashResponse::WaiterPanicked(BashWaiterPanickedPayload {
+                handle: handle.handle_id.to_string(),
+                cmd: cmd_override.unwrap_or(handle.cmd.as_str()).to_string(),
+                error_message:
+                    "the waiter task for this handle panicked; the process state is unknown"
+                        .to_string(),
+            });
+            let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
             let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
             ToolOutput::error(serialized).with_display(value)
         }
@@ -1299,28 +1360,20 @@ fn read_window_from_tombstone(tomb: &super::handle::Tombstone, args: &ReadArgs) 
     }
 }
 
-fn insert_window(obj: &mut serde_json::Map<String, Value>, view: &WindowView) {
-    obj.insert(
-        "start_offset".into(),
-        Value::Number(view.start_offset.into()),
-    );
-    obj.insert("end_offset".into(), Value::Number(view.end_offset.into()));
-    obj.insert(
-        "truncated_before".into(),
-        Value::Bool(view.truncated_before),
-    );
-    let lines: Vec<Value> = view
-        .lines
-        .iter()
-        .map(|l| {
-            let text = String::from_utf8_lossy(&l.bytes).into_owned();
-            json!({
-                "offset": l.offset,
-                "bytes": text,
+fn window_to_typed(view: &WindowView) -> BashRingWindow {
+    BashRingWindow {
+        start_offset: view.start_offset,
+        end_offset: view.end_offset,
+        truncated_before: view.truncated_before,
+        lines: view
+            .lines
+            .iter()
+            .map(|l| BashRingLine {
+                offset: l.offset,
+                bytes: String::from_utf8_lossy(&l.bytes).into_owned(),
             })
-        })
-        .collect();
-    obj.insert("lines".into(), Value::Array(lines));
+            .collect(),
+    }
 }
 
 fn final_cause_str(cause: &FinalCause) -> &'static str {

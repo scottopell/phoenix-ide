@@ -10,7 +10,7 @@ mod handlers;
 mod lifecycle_handlers;
 mod sse;
 mod types;
-mod wire;
+pub(crate) mod wire;
 
 pub use handlers::create_router;
 #[allow(unused_imports)] // Public API re-exports
