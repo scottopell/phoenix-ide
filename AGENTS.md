@@ -107,10 +107,11 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 **Always use `./dev.py`** — it configures LLM gateway automatically.
 
 ```bash
-./dev.py up          # Build and start Phoenix + Vite
+./dev.py up          # Build and start Phoenix + Vite (auto-seeds DB if empty)
 ./dev.py down        # Stop all servers
 ./dev.py restart     # Rebuild Rust, restart Phoenix (Vite keeps running)
 ./dev.py status      # Check what's running
+./dev.py seed        # Populate dev DB with representative conversations (idempotent)
 ./dev.py check       # clippy + fmt + tests + task validation
 ```
 

@@ -461,7 +461,7 @@ def start_vite(port: int, phoenix_port: int):
 # Commands
 # =============================================================================
 
-def cmd_up(phoenix_port: int | None = None, vite_port: int | None = None):
+def cmd_up(phoenix_port: int | None = None, vite_port: int | None = None, no_seed: bool = False):
     """Build and start Phoenix + Vite dev servers."""
     default_phoenix, default_vite = get_default_ports()
     phoenix_port = phoenix_port or default_phoenix
@@ -478,6 +478,191 @@ def cmd_up(phoenix_port: int | None = None, vite_port: int | None = None):
     print(f"Ready! UI: http://localhost:{vite_port}")
     print(f"        API: http://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
+
+    if not no_seed:
+        print()
+        cmd_seed(phoenix_port=phoenix_port, quiet_if_populated=True)
+
+
+# ---------------------------------------------------------------------------
+# Seed
+# ---------------------------------------------------------------------------
+#
+# Representative conversations for UI development and QA. Covers:
+#   - Direct mode (no git required): standalones + multi-level chains
+#   - Explore mode (managed, read-only): uses ROOT as cwd (a git repo)
+#   - Branch mode (existing branch worktree): uses ROOT + 'main' branch
+#   - Work mode: NOT seeded — only reachable via propose_plan → user approval
+#     (human-in-the-loop by design; cannot be faked without real git commit).
+#
+# The seed is idempotent: if any conversations exist the operation is a no-op.
+# `./dev.py up` calls it automatically after startup; `./dev.py seed` runs it
+# on demand (useful after `./dev.py restart` or on a pre-populated worktree).
+
+_SEED_DIRECT_STANDALONES = [
+    "Review the recent changes to the authentication middleware and identify any security concerns",
+    "Update the README with installation instructions for the new Docker-based dev setup",
+    "Investigate why the integration test test_user_login is flaky in CI — fails ~30% of runs",
+]
+
+_SEED_CHAIN_3_TEXT = (
+    "Refactor the database connection pool — current impl leaks connections under sustained load"
+)
+_SEED_CHAIN_2_TEXT = "Debug memory leak in the background worker service"
+_SEED_EXPLORE_TEXT = "Analyze the project structure and summarise the key architectural components"
+_SEED_BRANCH_TEXT  = "Review and tidy the open PR branch — fix lint warnings and update tests"
+
+
+def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) -> None:
+    """Populate the dev DB with representative conversations for UI/QA testing."""
+    import urllib.request
+    import urllib.error
+    import uuid as _uuid
+
+    default_phoenix, _ = get_default_ports()
+    port = phoenix_port or default_phoenix
+    api  = f"http://localhost:{port}/api"
+    db   = get_db_path()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _get(path: str) -> dict:
+        with urllib.request.urlopen(f"{api}{path}", timeout=5) as r:
+            return json.loads(r.read())
+
+    def _post(path: str, body: dict | None = None) -> dict:
+        data = json.dumps(body).encode() if body else b"{}"
+        req  = urllib.request.Request(
+            f"{api}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    def _wait_done(conv_id: str, timeout: float = 15.0) -> str:
+        """Poll until the conversation leaves 'working' state; return final state type."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                state = _get(f"/conversations/{conv_id}")["conversation"]["state"]
+                stype = state.get("type") if isinstance(state, dict) else str(state)
+                if stype != "working":
+                    return stype
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return "timeout"
+
+    def _new_conv(
+        text: str,
+        *,
+        mode: str | None = None,
+        base_branch: str | None = None,
+        cwd: str | None = None,
+        seed_label: str | None = None,
+    ) -> str:
+        """POST /api/conversations/new, wait for mock completion, return conv id."""
+        body: dict = {
+            "cwd":        cwd or str(ROOT),
+            "model":      "mock",
+            "text":       text,
+            "message_id": str(_uuid.uuid4()),
+        }
+        if mode:        body["mode"]         = mode
+        if base_branch: body["base_branch"]  = base_branch
+        if seed_label:  body["seed_label"]   = seed_label
+        resp    = _post("/conversations/new", body)
+        conv_id = resp["conversation"]["id"]
+        if text:  # empty-text seeded convs never enter 'working'
+            _wait_done(conv_id)
+        return conv_id
+
+    def _exhaust(conv_id: str) -> None:
+        """Force ContextExhausted state via Python sqlite3 — no API for this by design."""
+        import sqlite3 as _sqlite3
+        summary = "Context limit reached after extended session"
+        state   = json.dumps({"type": "context_exhausted", "summary": summary})
+        with _sqlite3.connect(str(db), timeout=10) as conn:
+            conn.execute(
+                "UPDATE conversations SET state = ? WHERE id = ?",
+                (state, conv_id),
+            )
+            conn.commit()
+
+    def _continue(conv_id: str) -> str:
+        """POST /api/conversations/{id}/continue, return new conv id."""
+        return _post(f"/conversations/{conv_id}/continue")["conversation_id"]
+
+    # --------------------------------------------------------- idempotency check
+
+    try:
+        existing = _get("/conversations")["conversations"]
+    except Exception:
+        print("✗ Cannot reach Phoenix — is the server running? (./dev.py up)", file=sys.stderr)
+        sys.exit(1)
+
+    if existing:
+        if not quiet_if_populated:
+            print(f"✓ Dev DB already populated ({len(existing)} conversations) — skipping seed.")
+        return
+
+    # ---------------------------------------------------------------- seed data
+
+    print("Seeding dev DB with representative conversations...")
+
+    # -- Direct mode: three standalone conversations -------------------------
+    print("  [1/4] Direct standalones")
+    for text in _SEED_DIRECT_STANDALONES:
+        _new_conv(text)
+
+    # -- Direct mode: 3-member chain -----------------------------------------
+    print("  [2/4] Direct chain (3 members)")
+    id1 = _new_conv(_SEED_CHAIN_3_TEXT)
+    _exhaust(id1)
+    id2 = _continue(id1)
+    _wait_done(id2)
+    _exhaust(id2)
+    _continue(id2)
+
+    # -- Direct mode: 2-member chain -----------------------------------------
+    print("  [2/4] Direct chain (2 members)")
+    id_a = _new_conv(_SEED_CHAIN_2_TEXT)
+    _exhaust(id_a)
+    _continue(id_a)
+
+    # -- Explore mode (managed / read-only) ----------------------------------
+    # ROOT is a git repo; seed_label lets us create with empty text so no
+    # message is queued and no worktree creation is triggered on first-message.
+    # Two convs make a minimal chain to show Explore mode chains in the list.
+    print("  [3/4] Explore mode (managed)")
+    try:
+        eid1 = _new_conv(_SEED_EXPLORE_TEXT, mode="managed")
+        _exhaust(eid1)
+        _continue(eid1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (Explore seed skipped — {exc})")
+
+    # -- Branch mode (existing branch, immediate worktree) -------------------
+    # ROOT is a git repo (a linked worktree of the main checkout). Branch mode
+    # needs a branch that isn't currently checked out anywhere. We create a
+    # lightweight demo branch pointing at HEAD — just a git ref write, no
+    # commit, no signing required. `--force` refreshes it on re-seed.
+    print("  [4/4] Branch mode")
+    try:
+        _demo_branch = "seed-branch-demo"
+        subprocess.run(
+            ["git", "-C", str(ROOT), "branch", "--force", _demo_branch, "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        _new_conv(_SEED_BRANCH_TEXT, mode="branch", base_branch=_demo_branch)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (Branch seed skipped \u2014 {exc})")
+        print(f"  (Branch seed skipped — {exc})")
+
+    print("✓ Seed complete.")
 
 
 def cmd_down():
@@ -2133,6 +2318,7 @@ def main():
     up_parser = sub.add_parser("up", help="Build and start servers")
     up_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
     up_parser.add_argument("--vite-port", type=int, default=None, help="Vite port (default: auto from worktree hash)")
+    up_parser.add_argument("--no-seed", action="store_true", default=False, help="Skip auto-seeding the dev DB on startup")
 
     # down
     sub.add_parser("down", help="Stop all servers")
@@ -2149,6 +2335,10 @@ def main():
 
     # codegen
     sub.add_parser("codegen", help="Regenerate ui/src/generated/ from Rust types (task 02677)")
+
+    # seed
+    seed_parser = sub.add_parser("seed", help="Populate dev DB with representative conversations (idempotent)")
+    seed_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto)")
 
     # prod
     prod_parser = sub.add_parser("prod", help="Production deployment")
@@ -2182,7 +2372,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "up":
-        cmd_up(phoenix_port=args.port, vite_port=args.vite_port)
+        cmd_up(phoenix_port=args.port, vite_port=args.vite_port, no_seed=args.no_seed)
     elif args.command == "down":
         cmd_down()
     elif args.command == "restart":
@@ -2194,6 +2384,8 @@ def main():
     elif args.command == "codegen":
         if not cmd_codegen():
             sys.exit(1)
+    elif args.command == "seed":
+        cmd_seed(phoenix_port=args.port)
     elif args.command == "prod":
         if args.prod_command == "build":
             cmd_prod_build(args.version)
