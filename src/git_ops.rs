@@ -137,21 +137,68 @@ pub(crate) fn materialize_branch(cwd: &Path, branch_name: &str) -> Result<(), Gi
 /// Returns `"origin/<base>"` when the remote-tracking ref exists, falling
 /// back to bare `"<base>"` for local-only repos with no remote.
 ///
-/// Diff comparisons in this codebase (e.g. abandon snapshot, commits-ahead/
-/// behind, future task-diff endpoint) historically used bare `<base>`. The
-/// local ref is only fast-forwarded at lifecycle events (task approval,
-/// worktree creation, branch checkout) via `materialize_branch`; the
-/// periodic 1-minute fetch loop in `stream_conversation` keeps `origin/<base>`
-/// fresh but does NOT re-materialize the local ref. So bare `<base>` drifts
-/// stale for any task that lives across upstream advances. Routing all
-/// diff-comparison call sites through this helper makes them prefer the
-/// already-fresh remote-tracking ref.
+/// Diff comparisons in this codebase (abandon snapshot, commits-ahead/behind,
+/// the conversation diff endpoint) historically used bare `<base>`. The local
+/// ref is only fast-forwarded at lifecycle events via `materialize_branch`;
+/// the periodic 1-minute fetch loop in `stream_conversation` keeps
+/// `origin/<base>` fresh but does NOT re-materialize the local ref. So bare
+/// `<base>` drifts stale for any task that lives across upstream advances.
+/// Routing all diff-comparison call sites through this helper makes them
+/// prefer the already-fresh remote-tracking ref.
 pub(crate) fn effective_base_ref(cwd: &Path, base_branch: &str) -> String {
     let remote = format!("origin/{base_branch}");
     if run_git(cwd, &["rev-parse", "--verify", &remote]).is_ok() {
         remote
     } else {
         base_branch.to_string()
+    }
+}
+
+/// Capture of "what this branch has done relative to its base."
+///
+/// Used by both the abandon snapshot and the conversation diff endpoint.
+/// All fields are best-effort — empty strings when the underlying git
+/// command fails (e.g. worktree gone, branch gone). Callers decide how to
+/// truncate; this helper returns full output.
+pub(crate) struct CapturedDiff {
+    /// The ref used as the comparator (`"origin/<base>"` or bare `"<base>"`).
+    pub comparator: String,
+    /// `git log --oneline <comparator>..HEAD` — commits on the branch that
+    /// are not yet in the comparator. Subject lines only.
+    pub commit_log: String,
+    /// `git diff <comparator>...HEAD` (triple-dot) — file-level diff of
+    /// committed work vs the common ancestor. Immune to commit-history
+    /// noise from rebases that replay already-merged commits.
+    pub committed_diff: String,
+    /// `git diff HEAD` after `git add -N .` — working-tree changes
+    /// (staged + unstaged + untracked, surfaced as intent-to-add).
+    pub uncommitted_diff: String,
+}
+
+/// Capture committed and uncommitted state of `worktree` relative to
+/// `base_branch`. See `CapturedDiff` for field semantics.
+pub(crate) fn capture_branch_diff(worktree: &Path, base_branch: &str) -> CapturedDiff {
+    let comparator = effective_base_ref(worktree, base_branch);
+
+    let commit_log = run_git(
+        worktree,
+        &["log", "--oneline", &format!("{comparator}..HEAD")],
+    )
+    .unwrap_or_default();
+
+    let committed_diff =
+        run_git(worktree, &["diff", &format!("{comparator}...HEAD")]).unwrap_or_default();
+
+    // Stage untracked files as intent-to-add so they surface in the
+    // working-tree diff. Agent-created files are typically untracked.
+    let _ = run_git(worktree, &["add", "-N", "."]);
+    let uncommitted_diff = run_git(worktree, &["diff", "HEAD"]).unwrap_or_default();
+
+    CapturedDiff {
+        comparator,
+        commit_log,
+        committed_diff,
+        uncommitted_diff,
     }
 }
 

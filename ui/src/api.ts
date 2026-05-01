@@ -623,6 +623,24 @@ export const api = {
     return resp.json();
   },
 
+  /** GET /api/conversations/:id/diff — committed and uncommitted changes
+   *  in a Work/Branch-mode worktree, vs `origin/<base>` (preferred) or
+   *  bare `<base>` for local-only repos. Used by the WorkActions
+   *  "View diff" action. Diff sections are capped at 256KiB server-side;
+   *  truncation_kib fields hold the original size when truncation hit. */
+  async getConversationDiff(conversationId: string): Promise<{
+    comparator: string;
+    commit_log: string;
+    committed_diff: string;
+    committed_truncated_kib?: number;
+    uncommitted_diff: string;
+    uncommitted_truncated_kib?: number;
+  }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/diff`);
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch diff'); }
+    return resp.json();
+  },
+
   /** POST /api/conversations/:id/continue — context-exhausted handoff.
    *
    *  The endpoint is idempotent: if the parent already has a continuation,
