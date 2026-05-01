@@ -656,71 +656,90 @@ ambiguous about which conversation the action affects.
 ### REQ-BED-032: Conversation Hard-Delete Cascade
 
 WHEN the user initiates a hard-delete on a conversation
-THE SYSTEM SHALL emit a `ConversationHardDeleted(conversation)` lifecycle
-announcement event
-AND each downstream subscriber SHALL run its cleanup synchronously within
-the hard-delete handler
-AND the conversation row SHALL be removed from persistence after all
-subscribers have completed (success or logged failure)
+THE SYSTEM SHALL run the hard-delete handler, which performs the
+following sequence of direct calls in order:
+1. Cancel-or-reject if busy (REQ-BED-032 below)
+2. `cascade_bash_on_delete(conversation)` — kills live bash handles for
+   the conversation and drops in-memory tombstones (REQ-BASH-006)
+3. `cascade_tmux_on_delete(conversation)` — runs `tmux kill-server`
+   against the conversation's socket, unlinks the socket file, removes
+   the registry entry (REQ-TMUX-007)
+4. `cascade_projects_on_delete(conversation)` — worktree/branch cleanup
+   for hard-delete on a non-terminal conversation
+   (REQ-PROJ-`<future>`: see specs/projects/ subscriber rule)
+5. `db.delete_conversation(conversation_id)` — SQLite ON DELETE CASCADE
+   removes messages, tool calls, and other dependent rows
+6. Broadcast a `ConversationHardDeleted` SSE wire event for UI consumers
+   (sidebar refresh, etc.)
 
-THE following downstream specs subscribe to `ConversationHardDeleted`:
-- `specs/bash/` REQ-BASH-006: kills any live bash handles for the
-  conversation and drops in-memory tombstones
-- `specs/tmux-integration/` REQ-TMUX-007: runs `tmux kill-server` against
-  the conversation's socket, unlinks the socket file, removes the
-  registry entry
-- `specs/projects/` (future cleanup hook): worktree/branch cleanup for
-  hard-delete on a non-terminal conversation. For conversations already
-  in a terminal state with worktrees still present, the existing
-  terminal-state worktree cleanup paths (REQ-PROJ-028) apply; hard-
-  delete only fires when the user explicitly removes the conversation
-  record.
+THE handler SHALL invoke each cascade step on its own; there is no
+event bus, no subscriber registration, and no dynamic dispatch. The
+"subscribers first, row last" ordering is a property of the call sequence
+in the handler. Each cascade function reads whatever conversation state
+it needs (working_dir, mode, etc.) before the row delete in step 5.
 
-WHEN the conversation is busy (the agent is mid-tool, mid-LLM-request, or
-in any non-idle core_status)
-THE SYSTEM SHALL reject the hard-delete with a clear "cancel first"
-response
-OR the calling layer SHALL issue cancellation before invoking
-hard-delete; either path is acceptable as long as a hard-delete never
-races a live tool execution
+WHEN the conversation is busy (the agent is in any `core_status` that
+makes `is_busy` true)
+THE SYSTEM SHALL either:
+(a) reject the hard-delete request with a structured "cancel first"
+    response (HTTP 409 or equivalent), OR
+(b) issue cancellation, wait for the conversation to settle to
+    `core_status = idle`, then proceed with the cascade
+The choice is an API-layer policy decision; the contract is that a
+hard-delete cascade NEVER fires while the conversation is busy.
 
-WHEN a subscriber's cleanup fails (subprocess error, file system error,
+WHEN a cascade step fails (subprocess error, file system error,
 registry-state inconsistency)
-THE SYSTEM SHALL log the failure at WARN level
-AND continue the cascade — failing subscribers SHALL NOT block the
-conversation row deletion
-AND orphans (e.g., a leftover tmux server, an orphaned worktree) SHALL
-be addressed by a separate reconciliation pass (the same reconciliation
-machinery that already runs on server restart for worktrees)
+THE SYSTEM SHALL log the failure at WARN level with structured fields
+sufficient for an operator to manually clean up — at minimum the
+process group ids of any surviving processes and the absolute paths
+of any surviving sockets or worktrees
+AND continue to the next cascade step — failing steps SHALL NOT block
+the conversation row deletion
+AND THE SYSTEM SHALL NOT attempt automatic recovery on a subsequent
+Phoenix startup. Orphans created by failed cleanup are the operator's
+problem; reconciliation machinery for hard-delete orphans is
+deliberately out of scope for v1.
 
 THE SYSTEM SHALL distinguish hard-delete from soft-state changes
-(archive, close-tab, etc.) — soft-state changes do NOT emit
-`ConversationHardDeleted`. Long-lived per-conversation resources (tmux
-servers, bash handles) survive soft-state changes deliberately
-(REQ-TMUX-008 makes this explicit on the tmux side).
+(archive, close-tab, etc.) — soft-state changes do NOT trigger the
+cascade. Long-lived per-conversation resources (tmux servers, bash
+handles) survive soft-state changes deliberately (REQ-TMUX-008 makes
+this explicit on the tmux side).
 
-THE `ConversationHardDeleted` event SHALL be a one-shot announcement:
-emitted exactly once per hard-delete operation, with the conversation
-entity payload that subscribers can read to derive any state they need
-(working_dir, mode, etc.) before the row is removed.
+THE `ConversationHardDeleted` SSE wire event (step 6) SHALL be emitted
+exactly once per hard-delete operation, after all cascade steps have
+completed. UI consumers use it to refresh sidebar, navigation, and
+related views. It is NOT a subscriber-dispatch hook for cleanup logic;
+cleanup runs synchronously inside the handler.
 
 **Rationale:** Bash handles live in-process; tmux servers and project
 worktrees live outside Phoenix. Without an explicit cascade, deleting a
 conversation leaves these resources orphaned: the OS-visible processes
 keep running, socket files accumulate in `~/.phoenix-ide/tmux-sockets/`,
-worktrees stay on disk. A central announcement event lets each spec own
-its own cleanup behaviour without bedrock needing to know about the
-implementation details. The "subscribers first, row last" ordering means
-subscribers can still query the conversation entity if they need to
-(e.g., to read its working_dir for a cleanup script). Best-effort
-cleanup with logged failures matches the established pattern from
-REQ-PROJ-010 ("Abandon always succeeds from the user's perspective");
-catastrophic cleanup would block deletion behind problems the user
-cannot resolve from the UI.
+worktrees stay on disk. A direct-call orchestrator in the hard-delete
+handler is the simplest shape that satisfies the cleanup contract — a
+lifecycle-event/subscriber-bus pattern was considered and rejected as
+overengineering for three known callsites in one binary, with no third-
+party subscribers and no plugin system planned. Spec elegance traded
+for an event-bus abstraction Phoenix doesn't otherwise have.
+
+The not-attempting-recovery decision is deliberate. Cascade failures
+should be rare on healthy systems (kill-tree is well-behaved when the
+kernel is responsive; `tmux kill-server` rarely hangs). When they do
+occur, the failure cause (frozen mount, hung tmux server, file system
+error) is also what would prevent automatic recovery from succeeding —
+adding a startup orphan-walker would carry complexity without
+materially improving reliability. Operators who do encounter orphans
+have the WARN-level structured logs to act on.
 
 The not-busy precondition mirrors REQ-PROJ-010 / `ConfirmAbandon` in
 `specs/projects/`. Hard-delete during a live tool execution would race
 the tool's own cleanup code; canceling first is the deterministic order.
+The permissive choice between (a) reject and (b) cancel-first leaves
+that policy to the API layer; the bedrock contract is the not-busy
+postcondition before cascade fires.
 
 **Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
-(`specs/tmux-integration/`)
+(`specs/tmux-integration/`), REQ-PROJ-`<new subscriber>`
+(`specs/projects/`).

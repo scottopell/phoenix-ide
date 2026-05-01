@@ -68,7 +68,14 @@ Use this tool — not bash — for processes that:
 
 Use bash for one-shot non-interactive commands.
 
-Note: Persistence is across Phoenix restart only, not system reboot. After a
+Note: this tool's response shape differs from the bash tool. Bash returns
+status/handle/exit_code/lines; this tool returns
+status/exit_code/duration_ms/stdout/stderr/truncated. stdout and stderr
+are kept SEPARATE here because tmux subcommands emit structured CLI
+output where the distinction matters (capture-pane to stdout, warnings
+to stderr).
+
+Persistence is across Phoenix restart only, not system reboot. After a
 host reboot, this server's state is lost; the next operation creates a
 fresh server.
 ```
@@ -199,6 +206,7 @@ async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
             "-S", &socket_path.to_string_lossy(),
             "new-session", "-d", "-s", "main",
         ])
+        .env_remove("TMUX")  // see "TMUX env handling" below
         .status()
         .await?;
     if !status.success() {
@@ -207,6 +215,17 @@ async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
     Ok(())
 }
 ```
+
+### TMUX env handling
+
+Phoenix MUST `env_remove("TMUX")` on every tmux subprocess invocation
+(spawn_session, the tool dispatch, and the in-app terminal's `tmux
+attach` exec). If the user launches Phoenix from inside an outer tmux
+session, the inherited `TMUX` env var causes the inner tmux to refuse
+to nest by default ("sessions should be nested with care; unset $TMUX
+to force"). Stripping `TMUX` from the subprocess environment removes
+the nesting check; Phoenix's own `-S` socket isolation is what keeps
+the conversation's server distinct from the outer one.
 
 The probe-and-act sequence runs at every operation; it is cheap (one
 short-lived process spawn) and the only reliable way to detect both
@@ -250,6 +269,7 @@ impl Tool for TmuxTool {
 
         let mut cmd = tokio::process::Command::new("tmux");
         cmd.args(&full_args)
+           .env_remove("TMUX")  // avoid outer-tmux nesting refusal
            .stdin(Stdio::null())
            .stdout(Stdio::piped())
            .stderr(Stdio::piped());

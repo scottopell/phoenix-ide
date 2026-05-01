@@ -894,60 +894,78 @@ rule ConversationReachedTerminalState {
         -- about parent conversations.
 }
 
--- REQ-BED-032: User hard-deletes a conversation. Emits the lifecycle
--- announcement that downstream specs subscribe to (specs/bash/,
--- specs/tmux-integration/, specs/projects/). Subscribers complete their
--- cleanup before the conversation row is removed from persistence;
--- failures are logged but do not block the row deletion.
+-- REQ-BED-032: User hard-deletes a conversation when the conversation is
+-- not busy. Cascade cleanup runs as direct function calls in the handler;
+-- the SSE wire event ConversationHardDeleted is emitted last for UI
+-- consumers. There is no event-bus / subscriber-registration pattern.
 rule UserHardDeletesConversationRule {
     when: UserHardDeletesConversation(conversation)
 
     requires: not conversation.is_busy
-        -- Mirrors specs/projects/ ConfirmAbandon: hard-delete during a
-        -- live tool execution would race the tool's own cleanup. The
-        -- API layer is responsible for issuing cancellation first or
-        -- rejecting with a "cancel first" response.
 
-    ensures: ConversationHardDeleted(conversation)
-        -- Lifecycle announcement. Subscribers:
-        --   specs/bash/                  REQ-BASH-006
-        --   specs/tmux-integration/      REQ-TMUX-007
-        --   specs/projects/              (worktree/branch cleanup)
+    ensures: BashHandlesCleanedUp(conversation)
+        -- Direct call: cascade_bash_on_delete (REQ-BASH-006).
+    ensures: TmuxServerCleanedUp(conversation)
+        -- Direct call: cascade_tmux_on_delete (REQ-TMUX-007).
+    ensures: ProjectWorktreeCleanedUp(conversation)
+        -- Direct call: cascade_projects_on_delete
+        -- (specs/projects/ subscriber rule).
     ensures: ConversationRowRemoved(conversation)
+        -- Direct call: db.delete_conversation. SQLite ON DELETE CASCADE
+        -- removes messages, tool calls, and other dependent rows.
+    ensures: ConversationHardDeleted(conversation)
+        -- SSE wire event for UI consumers (sidebar refresh, etc.).
+        -- Emitted AFTER row removal; not a cleanup-dispatch hook.
 
     @guidance
-        -- Handler sequence:
-        --   1. Cancellation pre-step: if conversation is busy, the API
-        --      layer issues cancel and waits for idle, or rejects with
-        --      a "cancel first" response. The not-busy requires above
-        --      is the post-cancel contract.
-        --   2. Emit ConversationHardDeleted(conversation). Subscribers
-        --      run synchronously:
-        --        - bash: kill live handles, drop in-memory tombstones
-        --        - tmux: kill-server, unlink socket, drop registry entry
-        --        - projects: worktree/branch cleanup if applicable (a
-        --          non-terminal conversation may still have a worktree;
-        --          terminal conversations have already had their
-        --          worktrees handled per REQ-PROJ-028)
-        --      Each subscriber's failure is logged at WARN; the cascade
-        --      continues regardless. Orphans are reaped by the existing
-        --      reconciliation passes (worktree reconcile on server
-        --      restart; tmux stale-socket detection on next operation
-        --      against that conversation id, although hard-delete makes
-        --      that path unreachable for the deleted conversation).
-        --   3. Delete the conversation row from persistence. SQLite ON
-        --      DELETE CASCADE removes messages, tool calls, and other
-        --      dependent rows.
-        --   4. Return success to the user.
+        -- Handler sequence (in src/api/handlers.rs::delete_conversation):
+        --   1. Cancellation pre-step: if conversation is busy, either
+        --      reject with "cancel first" (RejectHardDeleteWhileBusy
+        --      governs) or issue cancellation and wait for idle. The
+        --      requires: not conversation.is_busy above is the post-
+        --      cancel contract that this rule's effects are predicated
+        --      on.
+        --   2. cascade_bash_on_delete — kill live handles, drop tombstones.
+        --   3. cascade_tmux_on_delete — kill-server, unlink socket, drop
+        --      registry entry.
+        --   4. cascade_projects_on_delete — worktree/branch cleanup if
+        --      applicable (non-terminal conversations may still have
+        --      worktrees; terminal conversations had theirs handled per
+        --      REQ-PROJ-028).
+        --   5. db.delete_conversation(conv_id) — SQLite ON DELETE CASCADE.
+        --   6. Broadcast ConversationHardDeleted SSE wire event.
+        --   7. Return success to the user.
+        --
+        -- Each cascade step (2-4) logs failures at WARN with structured
+        -- fields sufficient for manual cleanup (pids, socket paths,
+        -- worktree paths) and continues. Phoenix does NOT attempt
+        -- automatic recovery on subsequent startup; orphans created by
+        -- failed cleanup are the operator's problem (deliberate v1 scope
+        -- decision — see REQ-BED-032 rationale).
         --
         -- Allium ensures clauses are concurrent assertions about the
-        -- post-state, not a temporal sequence; the subscribers-before-
-        -- row-delete ordering is implementation guidance. Both ensures
-        -- hold once the handler returns.
+        -- post-state, not a temporal sequence. The handler implementation
+        -- in @guidance specifies the actual order. Allium's role here is
+        -- to assert "after the handler returns, all of these effects
+        -- have happened." A property test that runs the handler and
+        -- checks the post-state suffices.
         --
         -- Soft-state changes (archive, close-tab) do NOT trigger this
         -- rule. Tmux servers and bash handles deliberately survive
         -- archive (specs/tmux-integration/ REQ-TMUX-008).
+}
+
+-- REQ-BED-032: Reject the hard-delete request when the conversation is
+-- busy. Mirrors RejectMessageWhileBusy at REQ-BED-002; the API layer can
+-- choose between this rejection branch or a cancel-and-retry branch
+-- (which feeds back into UserHardDeletesConversationRule above once the
+-- conversation reaches idle).
+rule RejectHardDeleteWhileBusy {
+    when: UserHardDeletesConversation(conversation)
+
+    requires: conversation.is_busy
+
+    ensures: HardDeleteRejected(conversation, reason: cancel_first)
 }
 
 -- REQ-BED-017: Mode change injects synthetic message

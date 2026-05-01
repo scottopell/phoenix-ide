@@ -22,9 +22,9 @@ in-memory only — they do not survive Phoenix restart.
 {
   "type": "object",
   "properties": {
-    "cmd":  { "type": "string",  "description": "Shell command to execute via bash -c (spawn)" },
+    "cmd":  { "type": "string",  "description": "Shell command to execute via bash -c (spawn). Will be wrapped as `bash -c \"exec <cmd>\"` so the bash process replaces itself with the user command and exit signals propagate cleanly." },
     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 900,
-                      "description": "How long to block for the foreground answer (default 30). NOT a kill timeout." },
+                      "description": "How long this single tool call blocks before handing back a handle (default 30). This is NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use kill=<handle> to actually terminate." },
 
     "peek": { "type": "string", "description": "Handle id to peek" },
     "wait": { "type": "string", "description": "Handle id to wait on" },
@@ -52,7 +52,9 @@ in-memory only — they do not survive Phoenix restart.
 The `oneOf` clause makes mutual exclusion structural at the schema level;
 runtime check (`OperationKindMutuallyExclusive` in `bash.allium`) is a belt
 for backends that don't validate `oneOf`. Dual-pass `mode + wait_seconds` is
-rejected at runtime via `mode_and_wait_seconds_conflict`.
+rejected at runtime via `mutually_exclusive_modes` with
+`conflicting_args: ["mode", "wait_seconds"]` and a `recommended_action`
+field directing the agent to drop the deprecated `mode` parameter.
 
 ### Operation Modes
 
@@ -73,9 +75,14 @@ rejected at runtime via `mode_and_wait_seconds_conflict`.
 | `background` | 0 |
 
 When `mode` is supplied alongside `wait_seconds`, the call fails with
-`mode_and_wait_seconds_conflict` rather than silently picking one. When
-`mode` is supplied alone, the response includes a `_deprecation` field
-stating the removal version explicitly.
+`mutually_exclusive_modes` (with `conflicting_args` and
+`recommended_action`) rather than silently picking one. When
+`mode` is supplied alone, the response includes a `deprecation_notice`
+field stating the removal version explicitly. The field name is
+deliberately not underscore-prefixed (no `_deprecation`): leading-
+underscore is widely read by LLMs as "metadata; ignore," which is
+the opposite of the signal we want — the agent should attend to
+this field and migrate.
 
 ### Description Template (REQ-BASH-009, REQ-BASH-010)
 
@@ -97,26 +104,37 @@ Modes (exactly one per call):
 
   peek=<handle>    Return the current ring buffer state for a handle.
                    Use lines=N for the last N lines, or since=K for lines
-                   after offset K. tombstone=true in the response means
-                   the handle's process has finished.
+                   after offset K. status="tombstoned" in the response
+                   means the handle's process has finished — the
+                   final_cause field tells you how (exited normally, or
+                   killed by signal). status="kill_pending_kernel" means
+                   the kill signal you sent was delivered but the process
+                   is in uninterruptible kernel sleep — peek again later;
+                   sending kill again with the same signal does NOT
+                   compound (signals don't queue that way), but you can
+                   escalate by sending kill with signal=KILL.
 
   wait=<handle>    Block up to wait_seconds for an existing handle to exit.
                    If wait_seconds elapses first, the SAME handle is
                    returned with status="still_running" — never accumulate
-                   handles by repeated waits.
+                   handles by repeated waits. If the handle has already
+                   finished, returns immediately with status="tombstoned".
 
   kill=<handle>    Terminate a handle. Default signal is TERM; signal=KILL
                    for immediate. The signal is sent EXACTLY ONCE; this
                    tool does not auto-escalate TERM to KILL after a grace
-                   period. If your TERM doesn't take, call kill again with
-                   signal=KILL. If the response is status="kill_pending_kernel"
-                   the signal was delivered but the process is in
-                   uninterruptible kernel sleep (frozen mount, kernel bug);
-                   peek/wait again later to observe the eventual exit.
+                   period. If your TERM doesn't take effect within
+                   ~30 seconds, the response is status="kill_pending_kernel"
+                   and you decide whether to escalate by calling kill
+                   again with signal=KILL. (Don't retry with signal=TERM:
+                   the kernel doesn't queue duplicate signals; the original
+                   TERM is still pending and a second TERM is a no-op.)
 
-For commands that need a TTY, interactive input, or that should survive
-Phoenix restarts, use the tmux tool instead. Handles from this tool are
-in-memory only and do not survive Phoenix restart.
+If you peek a handle and get error="handle_not_found", it likely means
+Phoenix restarted between when you spawned the process and now — bash
+handles do NOT survive Phoenix process restart. For processes that need
+to survive Phoenix restart, that need a TTY, that need stdin, or that
+are interactive REPLs, use the tmux tool instead.
 
 IMPORTANT: Keep commands concise. The cmd input must be < 60k tokens.
 For complex scripts, write them to a file first and execute the file.
@@ -287,7 +305,7 @@ work; `watch` was picked because in-flight wait responses use
 ```
 agent → BashTool::run(input, ctx)
         ├─ parse + validate input (oneOf, mode-vs-wait_seconds conflict, ranges)
-        ├─ if mode supplied (and wait_seconds absent): map to wait_seconds + set _deprecation
+        ├─ if mode supplied (and wait_seconds absent): map to wait_seconds + set deprecation_notice
         ├─ if not spawn: dispatch to peek/wait/kill handlers
         │
         └─ spawn path:
@@ -395,38 +413,97 @@ final line regardless of trailing newline.
 
 ```rust
 async fn wait_for_exit(child: tokio::process::Child, handle: Arc<Handle>) {
-    let exit_status = child.wait().await;
-    let final_cause = match &exit_status {
-        Ok(s) if s.code().is_some() => FinalCause::Exited,
-        Ok(s) if s.signal().is_some() => FinalCause::Signaled,
-        Ok(_) => FinalCause::Killed,
-        Err(_) => FinalCause::Exited,
-    };
-    let exit_code = exit_status.ok().and_then(|s| s.code());
+    // Panic guard: if anything below panics, publish a sentinel to the
+    // exit watch so wait/spawn callers don't hang forever.
+    let panic_guard = ExitWatchPanicGuard::new(handle.clone());
 
-    let tombstone = handle.demote_to_tombstone(final_cause, exit_code).await;
-    let _ = handle.exit_signal.send(Some(ExitState::from(tombstone)));
+    let exit_status = child.wait().await;
+    let (final_cause, exit_code, signal_number) = match &exit_status {
+        Ok(s) => {
+            // We spawn user commands as `bash -c "exec <cmd>"` so the bash
+            // process replaces itself with the user code; ExitStatus then
+            // reflects the user code's exit, not bash's. WIFSIGNALED gives
+            // us the signal number directly; otherwise bash's 128+signum
+            // convention also lets us recover signal info from the exit code.
+            if let Some(sig) = s.signal() {
+                (FinalCause::Killed, None, Some(sig))
+            } else if let Some(code) = s.code() {
+                let sig = if code > 128 && code < 128 + 64 {
+                    Some(code - 128)
+                } else {
+                    None
+                };
+                (FinalCause::Exited, Some(code), sig)
+            } else {
+                (FinalCause::Exited, None, None)
+            }
+        }
+        Err(_) => (FinalCause::Exited, None, None),
+    };
+
+    handle
+        .transition_to_terminal(final_cause, exit_code, signal_number)
+        .await;
+    let _ = handle.exit_signal.send(Some(ExitState::from_terminal(&handle).await));
+    panic_guard.disarm();
+}
+
+struct ExitWatchPanicGuard {
+    handle: Option<Arc<Handle>>,
+}
+
+impl ExitWatchPanicGuard {
+    fn new(handle: Arc<Handle>) -> Self { Self { handle: Some(handle) } }
+    fn disarm(mut self) { self.handle = None; }
+}
+
+impl Drop for ExitWatchPanicGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Waiter task panicked; publish a sentinel so any wait() calls
+            // unblock with an explicit error rather than hanging forever.
+            let _ = handle.exit_signal.send(Some(ExitState::WaiterPanicked));
+            tracing::error!(handle_id = %handle.handle_id,
+                            "bash waiter task panicked; handle marked WaiterPanicked");
+        }
+    }
 }
 ```
 
-`demote_to_tombstone` acquires the handle's `RwLock<Arc<HandleState>>` for
-write, snapshots the live ring's tail (last `TOMBSTONE_TAIL_LINES`),
-constructs the `Tombstone`, swaps state from `Live` → `Tombstoned`, and
-returns. After the swap, the live ring is dropped and its memory freed.
+`transition_to_terminal` is the **single helper** through which all
+HandleState writes pass — both the waiter task (this code) and the kill
+response timer's `mark_kill_pending_kernel` (in the kill flow below) go
+through it. The helper acquires the `RwLock<Arc<HandleState>>` for
+write, reads current state, and:
 
-The `final_cause` discrimination:
-- `Exited`: the kernel returned a status code (whether 0 or non-zero).
-- `Signaled`: the process was terminated by a signal Phoenix did not send
-  (oom-killer, external `kill -9`). Distinguished because the agent may
-  want to know.
-- `Killed`: Phoenix sent the signal (via the kill operation or the
-  shutdown kill-tree). Recorded by the kill path before the wait
-  completes; the waiter sees the signal-exit and reads the recorded
-  `Killed` cause.
-- `KillPendingKernel`: set transiently by the kill response when the
-  process didn't exit within `KILL_RESPONSE_TIMEOUT_SECONDS`. The waiter
-  task survives this state; if the process eventually exits, the cause
-  is overwritten to `Killed`.
+- If current state is already terminal (`exited` or `killed`), it is a
+  no-op (the waiter already won the race against the timer; the timer's
+  late kill_pending_kernel write is dropped).
+- If current state is `running` or `kill_pending_kernel` and the
+  caller is the waiter, it snapshots the live ring's tail (last
+  `TOMBSTONE_TAIL_LINES`), constructs the `Tombstone`, and swaps
+  state from `Live` to `Tombstoned`. After the swap, the live ring is
+  dropped and its memory freed.
+- If current state is `running` and the caller is the kill response
+  timer, it transitions to `kill_pending_kernel` and records the
+  attempt timestamp + signal sent.
+
+Funneling all writes through one helper closes the late-exit-vs-
+timer race the panel surfaced. Without it, the timer could regress a
+terminal state back to `kill_pending_kernel`, losing the exit_code
+and final_tail.
+
+### Watch-channel rule
+
+Each `wait` / `spawn` call MUST clone a fresh receiver from
+`handle.exit_observer` at call time and use that single receiver in
+its `tokio::select!`. **Never reuse a receiver across calls** —
+`watch::Receiver::changed()` only fires on transitions; if a receiver
+already saw the terminal value, a second `changed().await` on it
+hangs forever. The tombstone fast-path in `wait()` (return immediately
+if state is already terminal) avoids this in the current design, but
+a future refactor that removes the fast-path would surface the
+footgun. Document this explicitly in test plans.
 
 ## Peek (REQ-BASH-003, REQ-BASH-004)
 
@@ -512,10 +589,10 @@ async fn kill(&self, handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> 
     let live = match handle.state.read().await.as_ref() {
         HandleState::Live(live) => live.clone(),
         HandleState::Tombstoned(_) => {
-            // already terminal — no signal sent
-            return self.shape_response(handle, ReadArgs::default())
-                .await
-                .with_already_terminal(true);
+            // Already terminal — return tombstoned response shape.
+            // status: "tombstoned" itself conveys the no-signal-sent
+            // case; no `already_terminal` flag needed.
+            return self.shape_tombstoned_response(handle, ReadArgs::default()).await;
         }
     };
 
@@ -578,11 +655,10 @@ the tmux server kill (`specs/tmux-integration/`) and any other per-
 conversation cleanup. There is no SQLite shadow store to clean up;
 in-memory tombstones are dropped along with the registry entry.
 
-> **Bedrock dependency:** the hard-delete cascade requires bedrock to
-> emit a `ConversationHardDeleted` event (or expose the cascade
-> orchestrator). At the time of this revision, bedrock has neither
-> directly. The cascade integration is gated on adding that hook. Track
-> as a separate spec dependency in the bedrock spec.
+> **Bedrock dependency:** the hard-delete cascade integration is wired
+> through `cascade_bash_on_delete`, called directly from the bedrock
+> hard-delete handler per REQ-BED-032. No event-bus / subscriber pattern
+> is involved.
 
 ## Error Envelope (REQ-BASH-008)
 
@@ -597,8 +673,10 @@ in-memory tombstones are dropped along with the registry entry.
 All error identifiers (per REQ-BASH-008): `handle_not_found`,
 `handle_cap_reached`, `wait_seconds_out_of_range`,
 `peek_args_mutually_exclusive`, `command_safety_rejected`,
-`spawn_failed`, `mutually_exclusive_modes`,
-`mode_and_wait_seconds_conflict`.
+`spawn_failed`, `mutually_exclusive_modes`. The dual-pass case
+(`mode` + `wait_seconds`) is folded into `mutually_exclusive_modes`
+with structured `conflicting_args` and `recommended_action` fields
+rather than carrying its own stable id.
 
 Error-specific fields (representative subset):
 
@@ -627,19 +705,37 @@ Error-specific fields (representative subset):
   "error_message": "specify exactly one of lines or since"
 }
 
-// mode_and_wait_seconds_conflict
+// mutually_exclusive_modes — operation-key conflict (cmd + peek, etc.)
 {
-  "error": "mode_and_wait_seconds_conflict",
-  "error_message": "mode is deprecated; do not pass mode and wait_seconds together",
+  "error": "mutually_exclusive_modes",
+  "error_message": "exactly one of cmd, peek, wait, kill must be provided",
+  "conflicting_args": ["cmd", "peek"],
+  "recommended_action": "remove one of the operation keys"
+}
+
+// mutually_exclusive_modes — mode/wait_seconds dual-pass
+{
+  "error": "mutually_exclusive_modes",
+  "error_message": "the deprecated 'mode' parameter cannot be used with 'wait_seconds'; pass wait_seconds alone",
+  "conflicting_args": ["mode", "wait_seconds"],
+  "recommended_action": "remove the deprecated 'mode' parameter; pass 'wait_seconds' alone",
   "mode": "background",
   "wait_seconds": 30
+}
+
+// handle_not_found — with hint about Phoenix restart
+{
+  "error": "handle_not_found",
+  "error_message": "handle b-7 not found in this conversation",
+  "handle_id": "b-7",
+  "hint": "if Phoenix restarted since this handle was created, the handle was lost — bash handles do not survive Phoenix restart. For processes that should survive Phoenix restart, use the tmux tool."
 }
 ```
 
 A successful tool call where the *command* failed (non-zero exit) is **not**
-an error envelope. It is a normal response with `status: "exited"` and the
-non-zero `exit_code`. The agent distinguishes by checking for the `error`
-key versus the `status` key.
+an error envelope. It is a normal response with `status: "tombstoned"`,
+`final_cause: "exited"`, and the non-zero `exit_code`. The agent
+distinguishes by checking for the `error` key versus the `status` key.
 
 ## Output Capture and Display (REQ-BASH-015)
 
@@ -713,15 +809,23 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
 - Spawn → wait_seconds elapses → `status: "still_running"` with handle.
 - Repeated `wait` on same handle returns same handle id on each re-timeout.
-- `kill` with TERM → process exits within timeout → `status: "killed"`,
-  `signal_sent: "TERM"`, no auto-escalation.
+- `kill` with TERM → process exits within timeout → `status: "tombstoned"`,
+  `final_cause: "killed"`, `signal_sent: "TERM"`, `signal_number: 15`,
+  no auto-escalation.
 - `kill` with TERM → process does NOT exit within
   `KILL_RESPONSE_TIMEOUT_SECONDS` → `status: "kill_pending_kernel"`,
-  `signal_sent: "TERM"`. Subsequent `kill` with `signal: KILL` escalates
-  explicitly.
-- `kill` on already-exited handle → `already_terminal: true`, no signal sent.
+  `kill_signal_sent: "TERM"`. Subsequent `kill` with `signal: KILL`
+  escalates explicitly.
+- `kill` on already-exited handle → `status: "tombstoned"` (the status
+  itself conveys the already-terminal case; no separate flag).
 - External `kill -9` from outside Phoenix → handle reaches `status:
-  "signaled"` (not `killed`).
+  "tombstoned"`, `final_cause: "killed"`, `signal_number: 9`. (Note:
+  with the `bash -c "exec ..."` spawn pattern, the bash wrapper is
+  replaced by the user command, so external signals reach the user
+  command directly and surface in `Child::wait()`'s `ExitStatus::signal()`.)
+- Late-arriving exit after `kill_pending_kernel`: handle transitions
+  `kill_pending_kernel → killed` (or `→ exited`); subsequent peek/wait/
+  kill observes the now-tombstoned state via `status: "tombstoned"`.
 - Hard-delete a conversation with live handles → processes killed,
   in-memory entries gone.
 - Phoenix shutdown with live handles → kill-tree pass SIGKILLs all groups;

@@ -97,10 +97,25 @@ alone was insufficient signal.
 
 WHEN agent calls `bash(peek=<handle>, ...)`
 THE SYSTEM SHALL return the current state of the handle, including:
-- `status` (`running` | `exited` | `killed` | `signaled` | `kill_pending_kernel`)
-- `exit_code` (when status is `exited`; null otherwise)
+- `status`:
+  - `"running"` — process is alive, no kill signal sent
+  - `"still_running"` — used only on spawn/wait responses when the
+    wait window elapsed; not a peek response
+  - `"kill_pending_kernel"` — Phoenix sent a kill signal but the
+    response timer expired before exit (D-state hang). The process is
+    still alive.
+  - `"tombstoned"` — process has finished; the response is served from
+    a tombstone record. Carries `final_cause` and (when applicable)
+    `exit_code` and `signal_number`.
+- `final_cause` (only when `status = "tombstoned"`): `"exited"` |
+  `"killed"`. Tells the agent how the handle reached its terminal state.
+- `exit_code` (when status is `tombstoned` and `final_cause = "exited"`,
+  or when an exit code is otherwise available; null when the process
+  was killed by signal with no status code)
+- `signal_number` (optional; when status is `tombstoned` and a signal
+  is known to have terminated the process — either Phoenix-sent or
+  external such as oom-killer): the signal number for log readability
 - ring buffer contents per the offset/lines parameters (REQ-BASH-004)
-- `tombstone: true` when the response is served from a tombstone record
 
 WHEN agent calls `bash(wait=<handle>, wait_seconds=N)`
 THE SYSTEM SHALL block up to N seconds for the handle's process to exit
@@ -228,21 +243,30 @@ WHEN a handle's process exits (any cause: success, non-zero, signal)
 THE SYSTEM SHALL demote the live ring to an *in-memory tombstone* record
 containing:
 - `handle_id`, `cmd`
-- `exit_code` (or signal information)
-- `duration_ms`
+- `exit_code` (when the kernel returned a status code; null when killed
+  by signal with no code)
+- `signal_number` (optional; when a signal terminated the process, this
+  is the signal number — derived from `ExitStatus::signal()` when
+  `WIFSIGNALED`, or from `(exit_code - 128)` when `bash -c` reports a
+  conventional 128+signum exit code)
+- `duration_ms`, `exited_at`
 - `final_tail`: the last `TOMBSTONE_TAIL_LINES` (default 2000) lines
-- `final_cause`: `exited` | `killed` | `signaled` | `kill_pending_kernel`
-- `exited_at`
+- `final_cause`: `"exited"` | `"killed"`
 AND release the live ring buffer memory
-AND mark `status: "exited"` (kernel returned an exit code), `"killed"` (Phoenix
-sent the kill signal), `"signaled"` (process terminated by an external signal,
-e.g. oom-killer), or `"kill_pending_kernel"` (Phoenix sent the kill signal but
-the process has not yet exited within the response window)
+AND set the persisted handle status to `exited` (kernel returned an
+exit code) or `killed` (process terminated by signal — whether
+Phoenix-sent or external such as oom-killer)
 
 WHEN agent calls `peek` or `wait` on a tombstoned handle
-THE SYSTEM SHALL serve the response from the tombstone with `tombstone: true`
-AND return `final_tail` per the same read modifiers as the live ring (REQ-BASH-004),
-limited to the tombstoned lines
+THE SYSTEM SHALL serve the response with `status: "tombstoned"` and the
+`final_cause` field carrying the underlying terminal cause
+AND return `final_tail` per the same read modifiers as the live ring
+(REQ-BASH-004), limited to the tombstoned lines
+
+WHEN agent calls `kill` on a handle that is already terminal
+THE SYSTEM SHALL respond with the same `status: "tombstoned"` shape as
+peek/wait — no `already_terminal` flag is needed because the
+`tombstoned` status conveys it
 
 WHEN a conversation is hard-deleted
 THE SYSTEM SHALL kill any of that conversation's processes whose handles are
@@ -273,11 +297,17 @@ unbounded growth across restarts because the live-handle cap doesn't apply to
 tombstones). Bare `handle_not_found` is exactly what agents already handle
 gracefully.
 
-The four terminal status variants (`exited`, `killed`, `signaled`,
-`kill_pending_kernel`) cover the cases that a single `killed` would conflate:
-external signals (oom-killer, external `kill -9`) reach the process even when
-Phoenix didn't request them; D-state hangs after kill must be reported because
-the kill response cannot wait forever.
+The persisted status variants (`exited`, `killed`, `kill_pending_kernel`)
+plus the response-shape `tombstoned` cover the cases the prior draft
+spread across five values. The earlier `signaled` status was dropped:
+under `bash -c "<user_cmd>"` the bash wrapper exits normally with code
+128+signum when the user_cmd is signal-killed, so `Child::wait()`'s
+`ExitStatus::signal()` returned None and `signaled` never fired for
+its documented case (oom-killer killing the user code). Signal
+information is preserved on the `killed` state via the optional
+`signal_number` field. D-state hangs after kill remain explicitly
+modelled as `kill_pending_kernel` because the kill response cannot
+wait forever.
 
 ---
 
@@ -333,15 +363,22 @@ THE SYSTEM SHALL return a structured error with:
 - `error`: stable string identifier (one of `handle_not_found`,
   `handle_cap_reached`, `wait_seconds_out_of_range`,
   `peek_args_mutually_exclusive`, `command_safety_rejected`,
-  `spawn_failed`, `mutually_exclusive_modes`,
-  `mode_and_wait_seconds_conflict`)
+  `spawn_failed`, `mutually_exclusive_modes`)
 - `error_message`: human-readable description suitable for the LLM
-- additional structured fields specific to the error (e.g., `live_handles` for
-  cap, `reason` for safety rejection)
+- additional structured fields specific to the error (e.g., `live_handles`
+  for cap, `reason` for safety rejection, `conflicting_args` for
+  mutually-exclusive cases)
 
 THE SYSTEM SHALL distinguish "command produced an error exit code" from "tool
 call could not complete" — the former is a normal tool result with status
 "exited"; the latter uses the structured error envelope.
+
+WHEN agent calls `bash(peek=<handle>)` on a handle that predates the
+current Phoenix process (typical case: Phoenix restarted between spawn
+and peek)
+THE SYSTEM SHALL return `error: "handle_not_found"` with a hint
+field directing the agent to use the `tmux` tool for processes that
+should survive Phoenix restart
 
 **Rationale:** Two distinct concepts that must not be confused: command-level
 failure (the command ran and exited non-zero — useful information for the
@@ -349,9 +386,17 @@ agent) versus tool-level failure (the call could not be processed). Stable
 error identifiers let agents and the eventual error-recovery surfaces match on
 codes rather than parsing prose.
 
-The `mode_and_wait_seconds_conflict` identifier covers the dual-pass case where
-the agent supplies both the deprecated `mode` and the canonical `wait_seconds`
-on the same call (REQ-BASH-010).
+The dual-pass case where the agent supplies both the deprecated `mode`
+and the canonical `wait_seconds` on the same call (REQ-BASH-010) is
+folded into `mutually_exclusive_modes` with structured `conflicting_args`
+and `recommended_action` fields, rather than carrying its own error code.
+The agent's recovery (drop one of the conflicting args) is the same
+shape as the operation-key conflict, so a single stable id with
+structured details keeps the surface tight.
+
+The `handle_not_found`-with-tmux-hint pattern keeps the two-tier
+persistence model visible to the agent at exactly the moment confusion
+is most likely (a previously-known handle is suddenly absent).
 
 ---
 
@@ -395,14 +440,15 @@ THE SYSTEM SHALL provide the bash tool schema with these properties:
   notice in the response.
 
 WHEN both `mode` and `wait_seconds` are supplied on the same call
-THE SYSTEM SHALL reject the call with `error:
-"mode_and_wait_seconds_conflict"` and surface the conflicting values
+THE SYSTEM SHALL reject the call with `error: "mutually_exclusive_modes"`,
+`conflicting_args: ["mode", "wait_seconds"]`, and a `recommended_action`
+field directing the agent to remove the deprecated `mode` parameter
 THE SYSTEM SHALL NOT silently pick one — the precedence rule must be explicit.
 
 THE SYSTEM SHALL enforce: exactly one of `{cmd, peek, wait, kill}` per call.
 WHEN zero or more than one is provided
-THE SYSTEM SHALL reject with `error: "mutually_exclusive_modes"` and list the
-provided keys.
+THE SYSTEM SHALL reject with `error: "mutually_exclusive_modes"` and a
+`conflicting_args` field listing the provided keys.
 
 THE SYSTEM SHALL include the conversation's working directory in the tool
 description, as the prior revision did.
@@ -414,11 +460,15 @@ phrasing.
 
 **Rationale:** The schema tells the agent what shapes of call are legal. The
 mutual-exclusion check turns the tool surface into a disjoint set of operations
-rather than a free-form bag of fields. The dual-pass rejection
-(`mode_and_wait_seconds_conflict`) was added in revision 2 after a panel review
-flagged that the original draft silently picked one value and that older model
-snapshots routinely pass both "to be safe" — opposite intents (`background` =
-wait_seconds 0 vs `wait_seconds: 30` = wait 30s) would be silently resolved.
+rather than a free-form bag of fields. The dual-pass rejection (folded into
+`mutually_exclusive_modes` with `conflicting_args: ["mode", "wait_seconds"]`)
+was added in revision 2 after a panel review flagged that the original draft
+silently picked one value and that older model snapshots routinely pass both
+"to be safe" — opposite intents (`background` = wait_seconds 0 vs
+`wait_seconds: 30` = wait 30s) would be silently resolved. Folding into a
+single error code (rather than introducing a separate
+`mode_and_wait_seconds_conflict`) keeps stable-id surface tight; the
+`recommended_action` field carries the directional guidance.
 
 The committed removal version (second Phoenix release) replaces the prior
 "future release" phrasing, which the spEARS audit flagged as the exact prose

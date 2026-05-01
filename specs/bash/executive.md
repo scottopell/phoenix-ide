@@ -86,29 +86,34 @@ and display simplification logic; rewrite items require new code.
 
 ## Bedrock Dependency
 
-The hard-delete cascade in REQ-BASH-006 requires bedrock to emit a
-`ConversationHardDeleted` event (or expose a cascade-orchestrator hook) that
-this spec — and `specs/tmux-integration/`, `specs/projects/` — can subscribe
-to. At the time of this revision, bedrock has neither directly. The cascade
-integration is gated on bedrock adding that hook.
+REQ-BASH-006's hard-delete cascade is wired through
+`cascade_bash_on_delete`, called directly from the bedrock hard-delete
+handler per REQ-BED-032. The cascade orchestrator runs as a sequence of
+direct function calls; there is no event-bus / subscriber-registration
+pattern. Implementing this requires REQ-BED-032 to be in place — which
+it is, as part of the same spec set under review.
 
 ## Behavioural Specification
 
 The corresponding Allium spec is `specs/bash/bash.allium`. It models:
 
-- `Handle` entity with `running` → `exited | killed | signaled |
-  kill_pending_kernel` transitions, plus the `kill_pending_kernel → killed`
-  late-arriving exit path.
-- `still_running` and `exited` as response variants on the wait window
-  (transitions, not states).
+- `Handle` entity with `running` → `exited | killed | kill_pending_kernel`
+  transitions, plus the `kill_pending_kernel → exited|killed` late-
+  arriving exit paths.
+- Response shape: `status: "tombstoned"` for any peek/wait/kill on a
+  finished handle, with `final_cause` carrying the underlying terminal
+  cause; `status: "still_running"` for spawn/wait responses where the
+  wait window elapsed; `status: "kill_pending_kernel"` for handles
+  whose process didn't exit within the kill response window.
 - Reaper rules: `PhoenixSetsSubreaperOnStartup` and
   `PhoenixKillsLiveHandlesOnShutdown` cover the new
   `PR_SET_CHILD_SUBREAPER` / kill-tree machinery.
 - Invariants: per-conversation live-handle cap, conversation-scoped handle
-  ownership, monotonic line offsets, signal-killed handles have null
-  exit_code.
+  ownership, monotonic line offsets, kill_pending_kernel implies the
+  process is alive (pid/pgid available for re-signalling).
 - Surface `AgentBashAccess` with structural conversation scoping and
-  guarantees `HandleOwnership`, `NoSilentEviction`, and `NoAutoEscalation`.
+  guarantees `HandleOwnership`, `NoSilentEviction`, and
+  `NoAutoEscalation`.
 
 The deferred entry `BashHandleCrossRestartPersistence` documents the
 explicit decision to drop the SQLite shadow store and `lost_in_restart`

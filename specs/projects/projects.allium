@@ -619,6 +619,59 @@ rule ConfirmAbandon {
 }
 
 -- ===========================================================
+-- 5a. WORKTREE CLEANUP ON CONVERSATION HARD-DELETE
+--     (REQ-BED-032)
+-- ===========================================================
+
+-- REQ-BED-032 subscriber: when the user hard-deletes a conversation,
+-- the bedrock cascade calls cascade_projects_on_delete which executes
+-- this rule's effect. Fires only for conversations with a worktree
+-- (Explore/Work/Branch modes); Direct-mode conversations have no
+-- worktree and this rule is a no-op for them.
+--
+-- Distinct from ExploreWorktreeCleanupOnTerminal (5b): that rule fires
+-- on terminal-state transition (e.g., context-exhausted with no
+-- continuation, or task-resolution); this rule fires on user-initiated
+-- hard-delete of the conversation record. Hard-delete can target a
+-- non-terminal conversation, so this rule covers the case the prior
+-- terminal-cleanup rules don't.
+rule WorktreeRemovedByConversationDelete {
+    when: ConversationHardDeleted(conversation)
+
+    requires: exists Worktree{conversation: conversation}
+
+    let worktree = Worktree{conversation: conversation}
+
+    ensures: not exists worktree
+    ensures:
+        if conversation.mode = work:
+            -- Managed (Work mode): Phoenix created the branch; delete it.
+            BranchDeleted(worktree.branch_name)
+        -- Branch mode: keep the branch (it's the user's PR branch).
+        -- Explore mode: branch is the temp pending-task branch; delete.
+        -- (TaskApprovalExecuted promotes Explore's temp branch to a
+        -- task branch; pre-approval the branch is disposable.)
+
+    @guidance
+        -- Sequence (matches ConfirmAbandon's worktree-removal flow):
+        --   1. `git worktree remove <path> --force`
+        --      On failure: rm -rf <path> + git worktree prune
+        --   2. If managed (Work mode): git branch -D <branch> (non-fatal)
+        --   3. If Explore (pre-approval): git branch -D <branch> (non-fatal)
+        --   4. If Branch mode: keep the branch entirely
+        --
+        -- Failure of any step is logged at WARN with structured fields
+        -- (worktree_path, branch_name, conv_id) per REQ-BED-032's no-
+        -- recovery policy. The orchestrator continues to the next
+        -- cascade step.
+        --
+        -- Diff snapshot capture (the implementation detail of
+        -- ConfirmAbandon) is NOT performed for hard-delete: the user
+        -- chose to hard-delete the conversation, not abandon a task.
+        -- Uncommitted work in the worktree is permanently lost.
+}
+
+-- ===========================================================
 -- 5b. WORKTREE CLEANUP ON TERMINAL TRANSITION
 --     (REQ-PROJ-028, REQ-PROJ-025, REQ-BED-021)
 -- ===========================================================

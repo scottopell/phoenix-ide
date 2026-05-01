@@ -261,19 +261,22 @@ rule ServerProbedLive {
 -- Rules — tmux agent tool
 ------------------------------------------------------------
 
--- REQ-TMUX-003: agent's tmux tool call dispatched to the live server.
+-- REQ-TMUX-003: agent's tmux tool call. Emits TmuxOperationRequested
+-- which the lifecycle rules (ServerSpawnedLazily / ServerSpawnedAfterStale
+-- / ServerProbedLive) react to before the subprocess fires. Once the
+-- server is live, the tool subprocess runs.
 rule TmuxToolCalled {
     when: AgentCallsTmuxTool(conversation, args, wait_seconds)
 
     requires: tmux_binary_available()
     requires: 0 < wait_seconds
     requires: wait_seconds <= config.tmux_tool_max_wait_seconds
-    requires: exists TmuxServer{conversation: conversation, status: live}
 
-    let server = TmuxServer{conversation: conversation, status: live}
-
-    ensures: TmuxSubprocessSpawned(server.socket_path, args, wait_seconds)
-    ensures: TmuxToolResponseShaped(conversation, server.socket_path, args)
+    ensures: TmuxOperationRequested(conversation)
+        -- Triggers the lifecycle rules; one of them ensures status=live
+        -- by the time TmuxSubprocessSpawned fires below.
+    ensures: TmuxSubprocessSpawned(socket_path_for(conversation), args, wait_seconds)
+    ensures: TmuxToolResponseShaped(conversation, socket_path_for(conversation), args)
 
     @guidance
         -- Phoenix prepends `-S <sock>` before `args`. Tmux's CLI parser
@@ -358,12 +361,14 @@ rule TmuxToolBinaryUnavailable {
 ------------------------------------------------------------
 
 -- REQ-TMUX-004: in-app terminal opened, tmux available — PTY runs `tmux
--- attach` rather than $SHELL.
+-- attach` rather than $SHELL. Emits TmuxOperationRequested so the
+-- lifecycle rules ensure the server is live before attach.
 rule UserOpensTerminalWithTmuxAvailable {
     when: UserOpensTerminal(conversation)
 
     requires: tmux_binary_available()
 
+    ensures: TmuxOperationRequested(conversation)
     ensures: TerminalPtyExecutesTmuxAttach(conversation, config.tmux_default_session)
 
     @guidance
@@ -424,15 +429,15 @@ rule ServerKilledByConversationDelete {
         -- failure.
 }
 
--- REQ-TMUX-008: soft state changes (archive, close-tab, etc.) do not
--- terminate the tmux server.
-rule ConversationSoftStateNoOp {
-    when: ConversationSoftStateChanged(conversation)
-
-    requires: exists TmuxServer{conversation: conversation, status: live}
-
-    ensures: ConversationSoftStateLoggedTmuxRetained(conversation)
-}
+-- REQ-TMUX-008 (soft-state preservation contract): expressed as a
+-- non-rule in this spec — there is no `ConversationSoftStateChanged`
+-- event in bedrock, and modeling soft state as a no-op rule that
+-- listens to a non-existent event was previously a dangling reference.
+-- The contract that "tmux servers survive archive/close-tab" is
+-- enforced structurally by the absence of any rule that destroys a
+-- TmuxServer except ServerKilledByConversationDelete (which fires on
+-- ConversationHardDeleted only). The requirements text REQ-TMUX-008
+-- documents the intent for human readers.
 
 ------------------------------------------------------------
 -- Invariants

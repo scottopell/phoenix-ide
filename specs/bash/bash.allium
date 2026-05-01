@@ -105,25 +105,32 @@ value ExitInformation {
 -- Enumerations
 ------------------------------------------------------------
 
--- Handle lifecycle. running is initial; the four terminal states correspond
--- to the FinalCause field on the tombstone.
+-- Handle lifecycle. running is initial; the three terminal states are
+-- exited, killed, and kill_pending_kernel.
+--
+-- The `signaled` status from the prior revision was dropped: under
+-- `bash -c "<user_cmd>"` the bash wrapper exits normally with code
+-- 128+signum when the user_cmd is signal-killed, so Child::wait()'s
+-- ExitStatus::signal() returns None and the case the prior `signaled`
+-- variant was meant to capture (oom-killer killing the user code) was
+-- never actually reached. Signal information is preserved on the
+-- `killed` state via the optional `signal_number` field below.
 enum HandleStatus {
     running
     | exited
     | killed
-    | signaled
     | kill_pending_kernel
 }
 
--- Cause of a handle's transition to a terminal state. Distinguishes Phoenix-
--- initiated kill (`killed`) from external signal (`signaled`, e.g. oom-killer
--- or an external `kill -9`) and from the D-state-hang case where Phoenix sent
--- the signal but the kernel has not delivered exit yet
--- (`kill_pending_kernel`).
+-- Cause of a handle's transition to a terminal state. Aligns with
+-- HandleStatus. `killed` covers both Phoenix-initiated kill and any
+-- terminating signal (oom-killer, external kill, etc.) that the kernel
+-- reports via ExitStatus; `signal_number` on the Handle entity carries
+-- the specific signal for log-readability when applicable.
+-- `kill_pending_kernel` is the not-yet-fully-terminal D-state case.
 enum FinalCause {
     exited
     | killed
-    | signaled
     | kill_pending_kernel
 }
 
@@ -182,32 +189,51 @@ entity Handle {
     transitions status {
         running -> exited
         running -> killed
-        running -> signaled
         running -> kill_pending_kernel
+        kill_pending_kernel -> exited
+            -- Late-arriving exit after the kill response timer expired
+            -- and the process eventually returned a status code.
         kill_pending_kernel -> killed
-            -- Late-arriving exit notification after Phoenix gave up waiting.
-        terminal: exited, killed, signaled
+            -- Late-arriving exit after the kill response timer expired
+            -- and the process was reaped via signal.
+        terminal: exited, killed
+        -- kill_pending_kernel is NOT terminal: the wait task survives
+        -- the response window and may still observe an exit; only after
+        -- exit does the handle reach exited or killed.
     }
 
-    -- Spawn-time fields.
+    -- Spawn-time fields. pid/pgid are present whenever the OS process is
+    -- alive — that includes kill_pending_kernel, because the process is
+    -- by definition still running in that state. The cascade rule and
+    -- HandleKilledOnKillPendingKernel both need pgid to send signals.
     started_at:       Timestamp
-    pid:              Integer    when status = running
-    pgid:             Integer    when status = running
+    pid:              Integer    when status in { running, kill_pending_kernel }
+    pgid:             Integer    when status in { running, kill_pending_kernel }
 
-    -- Live ring buffer. Bytes-bounded; populated only while status = running
-    -- or kill_pending_kernel (the process is still alive after KILL signal).
-    ring_lines:       List<RingLine>    when status = running
-    ring_bytes_used:  Integer           when status = running
-    next_line_offset: Integer           when status = running
+    -- Live ring buffer. Bytes-bounded; populated while the process is
+    -- alive (running and kill_pending_kernel) — readers continue to
+    -- accumulate output until the process actually exits.
+    ring_lines:       List<RingLine>    when status in { running, kill_pending_kernel }
+    ring_bytes_used:  Integer           when status in { running, kill_pending_kernel }
+    next_line_offset: Integer           when status in { running, kill_pending_kernel }
 
-    -- Tombstone fields. Populated on transition to a fully terminal state.
-    -- final_tail holds the last TOMBSTONE_TAIL_LINES lines (or fewer).
-    final_tail:           List<RingLine>    when status != running
-    final_cause:          FinalCause        when status != running
-    exit_code:            Integer?          when status != running
-    duration_ms:          Integer           when status != running
-    finished_at:          Timestamp         when status != running
-    next_offset_at_exit:  Integer           when status != running
+    -- Tombstone fields. Populated on transition to a fully terminal state
+    -- (exited or killed). final_tail holds the last TOMBSTONE_TAIL_LINES
+    -- lines (or fewer).
+    final_tail:           List<RingLine>    when status in { exited, killed }
+    final_cause:          FinalCause        when status in { exited, killed }
+    exit_code:            Integer?          when status in { exited, killed }
+        -- None when the process was killed by signal with no status code.
+        -- Do not substitute 0.
+    signal_number:        Integer?          when status = killed
+        -- The signal that terminated the process, when known. Derived from
+        -- ExitStatus::signal() when WIFSIGNALED, or from (exit_code - 128)
+        -- when bash -c reports 128+signum. Optional; present for log-
+        -- readability and to let agents distinguish signal-killed from
+        -- normal kill when reasoning about retry.
+    duration_ms:          Integer           when status in { exited, killed }
+    finished_at:          Timestamp         when status in { exited, killed }
+    next_offset_at_exit:  Integer           when status in { exited, killed }
         -- The value next_line_offset held at the moment of demotion.
         -- truncated_before in the response is true iff a since= argument
         -- references an offset < (next_offset_at_exit - count(final_tail)).
@@ -393,19 +419,24 @@ rule HandleSpawnRejectedByRange {
 -- Rules — spawn response shape
 ------------------------------------------------------------
 
--- REQ-BASH-002: process exited within the wait window.
+-- REQ-BASH-002: process exited within the wait window. The response uses
+-- the live status verbatim (exited / killed) rather than tombstoned —
+-- the agent's spawn call returned successfully and saw the process
+-- finish, so it's not "looking up a finished handle later," it's
+-- "this handle just finished." Distinguishes from a later peek that
+-- would see status: "tombstoned" (REQ-BASH-006 / REQ-BASH-003).
 rule SpawnExitsWithinWait {
     when: SpawnWaitOutcome(handle, completed)
 
-    requires: handle.status = exited or handle.status = killed
-              or handle.status = signaled
+    requires: handle.status in { exited, killed }
 
     ensures: AgentReceivesSpawnResponse(
-        status:      handle.status,
-        handle_id:   handle.handle_id,
-        exit_code:   handle.exit_code,
-        duration_ms: handle.duration_ms,
-        window:      tombstone_window(handle, default_read_args())
+        status:        handle.status,
+        handle_id:     handle.handle_id,
+        exit_code:     handle.exit_code,
+        signal_number: handle.signal_number,
+        duration_ms:   handle.duration_ms,
+        window:        tombstone_window(handle, default_read_args())
     )
 }
 
@@ -429,17 +460,23 @@ rule SpawnExceedsWait {
 ------------------------------------------------------------
 
 -- REQ-BASH-006: process exited with a kernel-supplied status code (the
--- normal exit path: bash returned, the program returned, etc.). Demote the
--- live ring to an in-memory tombstone.
+-- normal exit path: bash returned, the program returned, etc.). Demote
+-- the live ring to an in-memory tombstone. Accepts either `running` or
+-- `kill_pending_kernel` as the source state — the second case is the
+-- late-arriving exit after the kill response timer expired.
 rule HandleProcessExited {
     when: ChildProcessExited(handle, exit_info)
 
-    requires: handle.status = running
+    requires: handle.status in { running, kill_pending_kernel }
     requires: exit_info.final_cause = exited
 
     ensures: handle.status = exited
     ensures: handle.final_cause = exited
     ensures: handle.exit_code = exit_info.exit_code
+    ensures: handle.signal_number = signal_number_from_exit_code(exit_info.exit_code)
+        -- When bash -c reports 128+signum, the wrapper's exit_code lets
+        -- us recover the signal that killed the user command. When the
+        -- exit was a normal non-signal exit, this is null.
     ensures: handle.duration_ms = elapsed_ms(handle.started_at, now())
     ensures: handle.finished_at = now()
     ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
@@ -452,41 +489,38 @@ rule HandleProcessExited {
         --   2. Populate tombstone fields under the handle's RwLock.
         --   3. Pulse the watch::channel exit signal so any in-flight
         --      wait/spawn response shapers observe the terminal state.
-        -- There is no observable state where status = exited but final_tail
-        -- is unset; the RwLock-backed state transitions both fields
-        -- together within a single write.
+        -- There is no observable state where status = exited but
+        -- final_tail is unset; the RwLock<Arc<HandleState>> swap
+        -- transitions both fields together within a single write.
+        --
+        -- Lock ordering: the kill path (HandleKilledByAgent and
+        -- HandleKilledOnKillPendingKernel) and this rule both write the
+        -- HandleState. Implementations MUST go through a single helper
+        -- that holds the write lock, snapshots cause/metadata, and
+        -- decides Live-update vs Tombstone-merge atomically. A late
+        -- exit racing a `mark_kill_pending_kernel` write must not
+        -- overwrite a terminal state — the helper checks current state
+        -- and refuses to regress from terminal back to
+        -- kill_pending_kernel.
 }
 
--- REQ-BASH-006: process killed by Phoenix in response to an agent kill call,
--- or the Phoenix shutdown kill-tree.
+-- REQ-BASH-006: process killed by signal — either Phoenix-initiated
+-- (kill call or shutdown kill-tree) or external (oom-killer, external
+-- `kill -9`, etc.). Phoenix does not distinguish in v1 because the
+-- agent has no different control flow for the two; the optional
+-- `signal_number` field carries the specific signal for log readability.
 rule HandleProcessKilled {
     when: ChildProcessExited(handle, exit_info)
 
-    requires: handle.status = running or handle.status = kill_pending_kernel
+    requires: handle.status in { running, kill_pending_kernel }
     requires: exit_info.final_cause = killed
 
     ensures: handle.status = killed
     ensures: handle.final_cause = killed
     ensures: handle.exit_code = exit_info.exit_code
-    ensures: handle.duration_ms = elapsed_ms(handle.started_at, now())
-    ensures: handle.finished_at = now()
-    ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
-    ensures: handle.next_offset_at_exit = handle.next_line_offset
-}
-
--- REQ-BASH-006: process terminated by an external signal Phoenix did not
--- send (oom-killer, an external `kill -9` from the user's shell, etc.).
--- Distinguished from `killed` so the agent can reason about the cause.
-rule HandleProcessSignaled {
-    when: ChildProcessExited(handle, exit_info)
-
-    requires: handle.status = running
-    requires: exit_info.final_cause = signaled
-
-    ensures: handle.status = signaled
-    ensures: handle.final_cause = signaled
-    ensures: handle.exit_code = null
-        -- A signal-killed process has no exit code; do not substitute 0.
+        -- Typically null (signal-killed); do not substitute 0.
+    ensures: handle.signal_number = exit_info.signal_number
+        -- The signal number from ExitStatus::signal() when WIFSIGNALED.
     ensures: handle.duration_ms = elapsed_ms(handle.started_at, now())
     ensures: handle.finished_at = now()
     ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
@@ -545,21 +579,49 @@ rule HandlePeekedLive {
     )
 }
 
--- REQ-BASH-003, REQ-BASH-006: peek a tombstoned handle (any terminal state).
+-- REQ-BASH-003, REQ-BASH-006: peek a handle whose process has exited
+-- (terminal state). The response uses status: "tombstoned" with the
+-- underlying terminal cause carried in `final_cause`. This collapses
+-- the prior two-axis representation (status enum × tombstone bool)
+-- into a single status axis the agent must read anyway, eliminating
+-- the "miss the bool" failure mode.
 rule HandlePeekedTombstoned {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
     requires: exists Handle{conversation: conversation, handle_id: handle_id}
     let h = Handle{conversation: conversation, handle_id: handle_id}
-    requires: h.status != running
+    requires: h.status in { exited, killed }
     requires: not (args.lines != null and args.since != null)
 
     ensures: AgentReceivesPeekResponse(
-        status:    h.status,
-        handle_id: h.handle_id,
-        exit_code: h.exit_code,
-        tombstone: true,
-        window:    tombstone_window(h, args)
+        status:        "tombstoned",
+        handle_id:     h.handle_id,
+        final_cause:   h.final_cause,
+        exit_code:     h.exit_code,
+        signal_number: h.signal_number,
+        window:        tombstone_window(h, args)
+    )
+}
+
+-- REQ-BASH-003: peek a kill_pending_kernel handle. The process is still
+-- alive but Phoenix's kill response timer expired. Live ring is still
+-- accumulating output; respond with the live status, not a tombstoned
+-- one. Distinct rule because kill_pending_kernel is not in
+-- { running, exited, killed }; covered separately.
+rule HandlePeekedPendingKernel {
+    when: AgentCallsBashPeek(conversation, handle_id, args)
+
+    requires: exists Handle{conversation: conversation, handle_id: handle_id}
+    let h = Handle{conversation: conversation, handle_id: handle_id}
+    requires: h.status = kill_pending_kernel
+    requires: not (args.lines != null and args.since != null)
+
+    ensures: AgentReceivesPeekResponse(
+        status:            "kill_pending_kernel",
+        handle_id:         h.handle_id,
+        kill_signal_sent:  h.kill_signal_sent,
+        kill_attempted_at: h.kill_attempted_at,
+        window:            live_window(h, args)
     )
 }
 
@@ -591,55 +653,62 @@ rule HandlePeekNotFound {
 -- Rules — wait
 ------------------------------------------------------------
 
--- REQ-BASH-003: wait on a live handle that exits within the new wait window.
+-- REQ-BASH-003: wait on a live handle that exits within the new wait
+-- window. Response uses status: "tombstoned" with final_cause — same
+-- shape as a tombstoned peek. The agent learns the handle is done from
+-- a single status field.
 rule HandleWaitedExits {
     when: WaitOutcomeOn(handle, completed)
 
-    requires: handle.status = exited or handle.status = killed
-              or handle.status = signaled
+    requires: handle.status in { exited, killed }
 
     ensures: AgentReceivesWaitResponse(
-        status:      handle.status,
-        handle_id:   handle.handle_id,
-        exit_code:   handle.exit_code,
-        duration_ms: handle.duration_ms,
-        tombstone:   true,
-        window:      tombstone_window(handle, wait_args(handle))
+        status:        "tombstoned",
+        handle_id:     handle.handle_id,
+        final_cause:   handle.final_cause,
+        exit_code:     handle.exit_code,
+        signal_number: handle.signal_number,
+        duration_ms:   handle.duration_ms,
+        window:        tombstone_window(handle, wait_args(handle))
     )
 }
 
--- REQ-BASH-003: wait window elapsed before the live handle's process exited.
+-- REQ-BASH-003: wait window elapsed before the live handle's process
+-- exited. Returns the SAME handle_id (no proliferation across
+-- re-waits). Live status is "running" or "kill_pending_kernel"
+-- depending on whether a prior kill was attempted.
 rule HandleWaitedTimedOut {
     when: WaitOutcomeOn(handle, timed_out)
 
-    requires: handle.status = running
+    requires: handle.status in { running, kill_pending_kernel }
 
     ensures: AgentReceivesWaitResponse(
         status:    "still_running",
         handle_id: handle.handle_id,
         waited_ms: wait_seconds_for(handle) * 1000,
-        tombstone: false,
         window:    live_window(handle, wait_args(handle))
     )
 }
 
--- REQ-BASH-003: wait on an already-terminal handle returns immediately.
+-- REQ-BASH-003: wait on an already-terminal handle returns immediately
+-- with the tombstoned response shape. No `already_terminal` flag —
+-- status: "tombstoned" already conveys it.
 rule HandleWaitedAlreadyTerminal {
     when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
 
     requires: exists Handle{conversation: conversation, handle_id: handle_id}
     let h = Handle{conversation: conversation, handle_id: handle_id}
-    requires: h.status != running
+    requires: h.status in { exited, killed }
     requires: not (args.lines != null and args.since != null)
 
     ensures: AgentReceivesWaitResponse(
-        status:           h.status,
-        handle_id:        h.handle_id,
-        exit_code:        h.exit_code,
-        duration_ms:      h.duration_ms,
-        tombstone:        true,
-        already_terminal: true,
-        window:           tombstone_window(h, args)
+        status:        "tombstoned",
+        handle_id:     h.handle_id,
+        final_cause:   h.final_cause,
+        exit_code:     h.exit_code,
+        signal_number: h.signal_number,
+        duration_ms:   h.duration_ms,
+        window:        tombstone_window(h, args)
     )
 }
 
@@ -691,28 +760,33 @@ rule HandleKilledByAgent {
         -- signal=KILL.
 }
 
--- REQ-BASH-003: kill response — process exited within the response window.
+-- REQ-BASH-003: kill response — process exited within the response
+-- window. HandleProcessKilled or HandleProcessExited has already
+-- demoted the handle.
 rule HandleKillExitedInTime {
     when: KillResponseOutcome(handle, process_exited)
 
-    requires: handle.status = killed or handle.status = signaled
-        -- HandleProcessKilled / HandleProcessSignaled fired before the
-        -- response timer elapsed.
+    requires: handle.status in { exited, killed }
 
     ensures: AgentReceivesKillResponse(
-        status:        handle.status,
+        status:        "tombstoned",
         handle_id:     handle.handle_id,
+        final_cause:   handle.final_cause,
         exit_code:     handle.exit_code,
+        signal_number: handle.signal_number,
         duration_ms:   handle.duration_ms,
         signal_sent:   kill_signal_for(handle),
-        tombstone:     true,
         window:        tombstone_window(handle, default_read_args())
     )
 }
 
--- REQ-BASH-003: kill response — KILL_RESPONSE_TIMEOUT elapsed before the
--- process exited (typical cause: D-state on a frozen mount or other
--- kernel-uninterruptible sleep).
+-- REQ-BASH-003: kill response — KILL_RESPONSE_TIMEOUT elapsed before
+-- the process exited (typical cause: D-state on a frozen mount or
+-- other kernel-uninterruptible sleep). The handle transitions to
+-- kill_pending_kernel and the response carries the same status. Lock
+-- ordering: see @guidance — the state mutation MUST go through a
+-- single helper that holds the write lock and refuses to regress
+-- from a terminal state if the waiter task already won the race.
 rule HandleKillPendingKernel {
     when: KillResponseOutcome(handle, pending_kernel)
 
@@ -722,40 +796,57 @@ rule HandleKillPendingKernel {
     ensures: handle.kill_attempted_at = now()
     ensures: handle.kill_signal_sent = signal_sent_for(handle)
     ensures: AgentReceivesKillResponse(
-        status:       "kill_pending_kernel",
-        handle_id:    handle.handle_id,
-        signal_sent:  handle.kill_signal_sent,
-        waited_ms:    config.kill_response_timeout_seconds * 1000,
-        tombstone:    false,
-        window:       live_window(handle, default_read_args())
+        status:            "kill_pending_kernel",
+        handle_id:         handle.handle_id,
+        kill_signal_sent:  handle.kill_signal_sent,
+        kill_attempted_at: handle.kill_attempted_at,
+        waited_ms:         config.kill_response_timeout_seconds * 1000,
+        window:            live_window(handle, default_read_args())
     )
 
     @guidance
-        -- The wait-for-exit task stays alive after this response returns.
-        -- If the process eventually exits (kernel finally delivers SIGKILL,
-        -- the frozen mount comes back, etc.), HandleProcessKilled fires
-        -- with handle.status = kill_pending_kernel as the precondition,
-        -- demoting to status = killed. A subsequent agent peek/wait/kill
-        -- observes the now-terminal state.
+        -- The wait-for-exit task stays alive after this response
+        -- returns. If the process eventually exits (kernel finally
+        -- delivers SIGKILL, the frozen mount comes back, etc.),
+        -- HandleProcessKilled or HandleProcessExited fires with
+        -- handle.status = kill_pending_kernel as a permitted
+        -- precondition, demoting to status = killed or exited
+        -- respectively.
+        --
+        -- Lock ordering rule: this rule's `ensures handle.status =
+        -- kill_pending_kernel` and the waiter task's
+        -- `HandleProcessExited`/`HandleProcessKilled` ensures both
+        -- write the HandleState. The implementation MUST funnel both
+        -- writes through a single helper that:
+        --   1. Acquires the handle's RwLock<Arc<HandleState>> for write
+        --   2. Reads the current state
+        --   3. If currently terminal (exited/killed), refuses to
+        --      regress to kill_pending_kernel — drops the timer-side
+        --      write on the floor (the waiter already won the race).
+        --   4. If currently running, applies the state change.
+        -- Otherwise a late exit racing the response-timer expiry can
+        -- regress a terminal handle to kill_pending_kernel and lose
+        -- exit_code / final_tail.
 }
 
--- REQ-BASH-003: kill on already-terminal handle is a no-op response.
+-- REQ-BASH-003: kill on already-terminal handle is a no-op response
+-- shaped like a tombstoned peek. No `already_terminal` flag — the
+-- "tombstoned" status conveys it.
 rule HandleKillOnAlreadyTerminal {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
     requires: exists Handle{conversation: conversation, handle_id: handle_id}
     let h = Handle{conversation: conversation, handle_id: handle_id}
-    requires: h.status != running
-    requires: h.status != kill_pending_kernel
+    requires: h.status in { exited, killed }
 
     ensures: AgentReceivesKillResponse(
-        status:           h.status,
-        handle_id:        h.handle_id,
-        exit_code:        h.exit_code,
-        duration_ms:      h.duration_ms,
-        already_terminal: true,
-        tombstone:        true,
-        window:           tombstone_window(h, default_read_args())
+        status:        "tombstoned",
+        handle_id:     h.handle_id,
+        final_cause:   h.final_cause,
+        exit_code:     h.exit_code,
+        signal_number: h.signal_number,
+        duration_ms:   h.duration_ms,
+        window:        tombstone_window(h, default_read_args())
     )
 }
 
@@ -827,6 +918,9 @@ rule OperationKindMutuallyExclusive {
 
 -- REQ-BASH-010: mode and wait_seconds cannot both be supplied. The
 -- deprecated mode alias is honored only when wait_seconds is absent.
+-- Reuses `mutually_exclusive_modes` rather than introducing a distinct
+-- error code; the structured `conflicting_args` field tells the agent
+-- which keys conflict and the message recommends dropping `mode`.
 rule ModeAndWaitSecondsConflict {
     when: AgentCallsBashRaw(conversation, args)
 
@@ -834,9 +928,11 @@ rule ModeAndWaitSecondsConflict {
     requires: wait_seconds_supplied(args)
 
     ensures: AgentReceivesError(
-        error:        "mode_and_wait_seconds_conflict",
-        mode:         mode_value(args),
-        wait_seconds: wait_seconds_value(args)
+        error:              "mutually_exclusive_modes",
+        conflicting_args:   { "mode", "wait_seconds" },
+        recommended_action: "remove the deprecated 'mode' parameter; pass 'wait_seconds' alone",
+        mode:               mode_value(args),
+        wait_seconds:       wait_seconds_value(args)
     )
 }
 
@@ -868,11 +964,16 @@ invariant ExitCodeOnlyWhenTerminal {
         h.status = running implies h.final_cause = null
 }
 
--- REQ-BASH-003
-invariant SignaledHasNullExitCode {
-    for h in Handle where h.status = signaled:
-        h.exit_code = null
-        -- Signal-killed processes have no exit code; do not substitute 0.
+-- REQ-BASH-006
+invariant KillPendingKernelImpliesAlive {
+    for h in Handle where h.status = kill_pending_kernel:
+        h.pid != null
+        -- A kill_pending_kernel handle's process is by definition still
+        -- running (the kill response timer expired without observing
+        -- exit). pid/pgid are present per the entity field guards;
+        -- this invariant makes it explicit so the cascade rule and
+        -- HandleKilledOnKillPendingKernel can rely on pgid being
+        -- available.
 }
 
 ------------------------------------------------------------

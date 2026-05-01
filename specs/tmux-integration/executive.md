@@ -77,19 +77,21 @@ mechanism is mostly plumbing.
    capture, timeout/cancel handling, response shaping. Integration test
    covering `new-window`, `capture-pane`, `send-keys`, `kill-window` end-
    to-end.
-4. **Hard-delete cascade** — wire into bedrock's hard-delete handler
-   alongside the bash handle cascade. *Depends on bedrock adding a
-   `ConversationHardDeleted` event / cascade orchestrator hook.*
+4. **Hard-delete cascade** — wire `cascade_tmux_on_delete` into the
+   bedrock hard-delete handler per REQ-BED-032, alongside the bash handle
+   cascade and projects worktree cleanup. Direct function call; no
+   event-bus / subscriber pattern.
 5. **Terminal attach branching** — `build_pty_exec_argv` switches between
    `tmux attach` and `$SHELL -i`. Single-attach constraint preserved.
 
 ## Bedrock Dependency
 
-The hard-delete cascade requires bedrock to emit a
-`ConversationHardDeleted` event (or expose a cascade-orchestrator hook)
-that this spec — and `specs/bash/`, `specs/projects/` — can subscribe
-to. At the time of this revision, bedrock has neither directly. The
-cascade integration is gated on adding that hook.
+REQ-TMUX-007's hard-delete cascade is wired through
+`cascade_tmux_on_delete`, called directly from the bedrock hard-delete
+handler per REQ-BED-032. The cascade orchestrator runs as a sequence of
+direct function calls; there is no event-bus / subscriber-registration
+pattern. Both REQ-BED-032 and this spec are part of the same review;
+implementation is unblocked.
 
 ## Status Summary
 
@@ -144,6 +146,7 @@ conversation dated April 2026 and confirmed by the panel review (see the
 - `specs/terminal/`: REQ-TERM-003's single-terminal-per-conversation
   constraint applies on both the tmux-attach and direct-PTY paths; this
   spec does not require any edit to the terminal spec.
-- `specs/bedrock/`: hard-delete cascade gains a tmux step alongside bash
-  and project cascades, gated on bedrock adding a
-  `ConversationHardDeleted` event. No new bedrock states.
+- `specs/bedrock/`: REQ-BED-032 owns the cascade orchestrator that calls
+  `cascade_tmux_on_delete` (this spec), `cascade_bash_on_delete`
+  (specs/bash/), and `cascade_projects_on_delete` (specs/projects/) in
+  order. No new bedrock states.
