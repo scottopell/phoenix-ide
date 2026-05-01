@@ -14,6 +14,7 @@ import {
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
   SseErrorDataSchema,
+  SseConversationHardDeletedDataSchema,
 } from '../sseSchemas';
 import {
   ConnectionState,
@@ -336,6 +337,26 @@ export function useConnection({
               sequenceId: res.data.sequence_id,
               delta: res.data.text,
             });
+          });
+
+          // REQ-BED-032 step 6: hard-delete cascade emits this on the
+          // per-conversation channel after the row is gone. Notify the
+          // sidebar (cross-tab) by dispatching a window event so the
+          // DesktopLayout can refresh its conversation list immediately
+          // — without waiting for the 5s polling tick.
+          es.addEventListener('conversation_hard_deleted', (e) => {
+            const res = parseEvent(
+              SseConversationHardDeletedDataSchema,
+              e,
+              'conversation_hard_deleted',
+              dispatchRef.current,
+            );
+            if (!res.ok) return;
+            window.dispatchEvent(
+              new CustomEvent('phoenix:conversation-hard-deleted', {
+                detail: { conversationId: res.data.conversation_id },
+              }),
+            );
           });
 
           es.addEventListener('error', (e) => {

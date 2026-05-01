@@ -36,10 +36,15 @@ import type {
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
   SseErrorData as WireErrorData,
+  SseConversationHardDeletedData as WireConversationHardDeletedData,
   SseBreadcrumb as GeneratedSseBreadcrumb,
   ChainQaTokenData as WireChainQaTokenData,
   ChainQaCompletedData as WireChainQaCompletedData,
   ChainQaFailedData as WireChainQaFailedData,
+  BashResponse as WireBashResponse,
+  BashErrorResponse as WireBashErrorResponse,
+  TmuxToolResponse as WireTmuxToolResponse,
+  TmuxErrorResponse as WireTmuxErrorResponse,
 } from './generated/sse';
 
 // ---------------------------------------------------------------------------
@@ -264,6 +269,17 @@ export const SseErrorDataSchema = v.looseObject({
   error: v.unknown(),
 }) satisfies v.GenericSchema<unknown, WireErrorData>;
 
+/** `conversation_hard_deleted`: REQ-BED-032 step 6. Conversation row is gone
+ *  from SQLite; all per-conversation resources (bash handles, tmux server,
+ *  worktree) have been cleaned up. UI subscribers refresh sidebar /
+ *  navigation. The cascade today emits this on the per-conversation
+ *  channel only; sidebar listeners that aren't on the deleted conversation
+ *  rely on the `DesktopLayout` 5s polling to pick up the deletion. */
+export const SseConversationHardDeletedDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  conversation_id: v.string(),
+}) satisfies v.GenericSchema<unknown, WireConversationHardDeletedData>;
+
 // ---------------------------------------------------------------------------
 // Chain Q&A wire-event schemas (Phoenix Chains v1, REQ-CHN-004 / 005).
 //
@@ -319,3 +335,193 @@ export type SseConversationBecameTerminalData = v.InferOutput<
   typeof SseConversationBecameTerminalDataSchema
 >;
 export type SseErrorData = v.InferOutput<typeof SseErrorDataSchema>;
+export type SseConversationHardDeletedData = v.InferOutput<
+  typeof SseConversationHardDeletedDataSchema
+>;
+
+// ---------------------------------------------------------------------------
+// Bash and tmux tool response schemas (task 02697).
+//
+// These validate the JSON the tool emits as `tool_result` content (carried
+// inside an enriched message's `content` / `display_data` payload). Each
+// schema is annotated `satisfies v.GenericSchema<unknown, T>` against the
+// Rust-generated wire type so a Rust-side change surfaces as a tsc error
+// here.
+//
+// Object schemas remain `looseObject` — the backend may add forward-compat
+// fields (e.g. additional kill metadata); rejecting unknown keys would
+// turn every additive Rust change into a runtime crash.
+// ---------------------------------------------------------------------------
+
+const BashRingLineSchema = v.looseObject({
+  offset: v.number(),
+  bytes: v.string(),
+});
+
+const BashRingWindowFieldsSchema = {
+  start_offset: v.number(),
+  end_offset: v.number(),
+  truncated_before: v.boolean(),
+  lines: v.array(BashRingLineSchema),
+} as const;
+
+const BashRunningPayloadSchema = v.looseObject({
+  status: v.literal('running'),
+  handle: v.string(),
+  cmd: v.string(),
+  display: v.string(),
+  kill_signal_sent: v.exactOptional(v.nullable(v.string())),
+  kill_attempted_at: v.exactOptional(v.nullable(v.string())),
+  signal_sent: v.exactOptional(v.nullable(v.string())),
+  deprecation_notice: v.exactOptional(v.nullable(v.string())),
+  ...BashRingWindowFieldsSchema,
+});
+
+const BashStillRunningPayloadSchema = v.looseObject({
+  status: v.literal('still_running'),
+  handle: v.string(),
+  cmd: v.string(),
+  waited_ms: v.number(),
+  kill_signal_sent: v.exactOptional(v.nullable(v.string())),
+  kill_attempted_at: v.exactOptional(v.nullable(v.string())),
+  deprecation_notice: v.exactOptional(v.nullable(v.string())),
+  ...BashRingWindowFieldsSchema,
+});
+
+const BashKillPendingKernelPayloadSchema = v.looseObject({
+  status: v.literal('kill_pending_kernel'),
+  handle: v.string(),
+  cmd: v.string(),
+  kill_signal_sent: v.string(),
+  kill_attempted_at: v.string(),
+  display: v.string(),
+  signal_sent: v.string(),
+  ...BashRingWindowFieldsSchema,
+});
+
+const BashTombstonedPayloadSchema = v.looseObject({
+  status: v.literal('tombstoned'),
+  handle: v.string(),
+  cmd: v.string(),
+  final_cause: v.string(),
+  exit_code: v.nullable(v.number()),
+  signal_number: v.exactOptional(v.nullable(v.number())),
+  duration_ms: v.number(),
+  finished_at: v.string(),
+  kill_signal_sent: v.exactOptional(v.nullable(v.string())),
+  kill_attempted_at: v.exactOptional(v.nullable(v.string())),
+  display: v.string(),
+  signal_sent: v.exactOptional(v.nullable(v.string())),
+  deprecation_notice: v.exactOptional(v.nullable(v.string())),
+  ...BashRingWindowFieldsSchema,
+});
+
+const BashSpawnTombstonePayloadSchema = (status: 'exited' | 'killed') =>
+  v.looseObject({
+    status: v.literal(status),
+    handle: v.string(),
+    cmd: v.string(),
+    final_cause: v.string(),
+    exit_code: v.nullable(v.number()),
+    signal_number: v.exactOptional(v.nullable(v.number())),
+    duration_ms: v.number(),
+    finished_at: v.string(),
+    kill_signal_sent: v.exactOptional(v.nullable(v.string())),
+    kill_attempted_at: v.exactOptional(v.nullable(v.string())),
+    deprecation_notice: v.exactOptional(v.nullable(v.string())),
+    ...BashRingWindowFieldsSchema,
+  });
+
+const BashWaiterPanickedPayloadSchema = v.looseObject({
+  status: v.literal('waiter_panicked'),
+  handle: v.string(),
+  cmd: v.string(),
+  error_message: v.string(),
+});
+
+/** Discriminated bash response. Branches by the `status` tag (REQ-BASH-002 /
+ *  REQ-BASH-003 / REQ-BASH-006). Drift from the Rust wire type surfaces as a
+ *  tsc error against the `satisfies` annotation. */
+export const BashResponseSchema = v.variant('status', [
+  BashRunningPayloadSchema,
+  BashStillRunningPayloadSchema,
+  BashKillPendingKernelPayloadSchema,
+  BashTombstonedPayloadSchema,
+  BashSpawnTombstonePayloadSchema('exited'),
+  BashSpawnTombstonePayloadSchema('killed'),
+  BashWaiterPanickedPayloadSchema,
+]) satisfies v.GenericSchema<unknown, WireBashResponse>;
+
+const BashLiveHandleSummarySchema = v.looseObject({
+  handle: v.string(),
+  cmd: v.string(),
+  age_seconds: v.number(),
+  status: v.string(),
+});
+
+/** Bash error envelope (REQ-BASH-008). The dual-pass `mutually_exclusive_modes`
+ *  case carries `mode` / `wait_seconds` extras flattened onto the envelope at
+ *  runtime — the schema is loose so they pass through. */
+export const BashErrorResponseSchema = v.variant('error', [
+  v.looseObject({
+    error: v.literal('handle_not_found'),
+    error_message: v.string(),
+    handle_id: v.string(),
+    hint: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('handle_cap_reached'),
+    error_message: v.string(),
+    cap: v.number(),
+    live_handles: v.array(BashLiveHandleSummarySchema),
+    hint: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('wait_seconds_out_of_range'),
+    error_message: v.string(),
+    provided: v.number(),
+    max_wait_seconds: v.number(),
+  }),
+  v.looseObject({
+    error: v.literal('peek_args_mutually_exclusive'),
+    error_message: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('command_safety_rejected'),
+    error_message: v.string(),
+    reason: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('spawn_failed'),
+    error_message: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('mutually_exclusive_modes'),
+    error_message: v.string(),
+    conflicting_args: v.array(v.string()),
+    recommended_action: v.string(),
+  }),
+]) satisfies v.GenericSchema<unknown, WireBashErrorResponse>;
+
+/** Tmux tool successful response (REQ-TMUX-012). stdout / stderr are kept
+ *  separate (different from bash's combined ring buffer) because tmux
+ *  subcommands emit structured CLI output where the distinction matters. */
+export const TmuxToolResponseSchema = v.looseObject({
+  status: v.string(),
+  exit_code: v.nullable(v.number()),
+  duration_ms: v.number(),
+  stdout: v.string(),
+  stderr: v.string(),
+  truncated: v.boolean(),
+}) satisfies v.GenericSchema<unknown, WireTmuxToolResponse>;
+
+/** Tmux tool error envelope (matches `error_envelope` in `src/tools/tmux.rs`). */
+export const TmuxErrorResponseSchema = v.looseObject({
+  error: v.string(),
+  message: v.string(),
+}) satisfies v.GenericSchema<unknown, WireTmuxErrorResponse>;
+
+export type BashResponseData = v.InferOutput<typeof BashResponseSchema>;
+export type BashErrorResponseData = v.InferOutput<typeof BashErrorResponseSchema>;
+export type TmuxToolResponseData = v.InferOutput<typeof TmuxToolResponseSchema>;
+export type TmuxErrorResponseData = v.InferOutput<typeof TmuxErrorResponseSchema>;

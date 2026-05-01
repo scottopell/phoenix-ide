@@ -115,10 +115,36 @@ function cleanThoughts(raw: string): string {
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
   switch (name) {
     case 'bash': {
-      const cmd = String(input['command'] || '');
-      // Use server-provided display string if available (has cd prefix stripped)
-      const displayCmd = displayOverride || cmd;
-      return { display: `$ ${displayCmd}`, isMultiline: cmd.includes('\n') };
+      // Spawn: `cmd` is the new field; older messages used `command` (the
+      // bash tool still accepts both — task 02694's `RawBashInput::command`
+      // alias). Handle operations (peek/wait/kill) synthesize a label per
+      // REQ-BASH-015 so the user sees something meaningful instead of "$".
+      const cmd = String(input['cmd'] || input['command'] || '');
+      if (cmd) {
+        const displayCmd = displayOverride || cmd;
+        return { display: `$ ${displayCmd}`, isMultiline: cmd.includes('\n') };
+      }
+      const peek = input['peek'];
+      if (typeof peek === 'string') {
+        return { display: `peek ${peek}`, isMultiline: false };
+      }
+      const wait = input['wait'];
+      if (typeof wait === 'string') {
+        const waitSeconds = input['wait_seconds'];
+        const suffix = typeof waitSeconds === 'number' ? ` (up to ${waitSeconds}s)` : '';
+        return { display: `wait ${wait}${suffix}`, isMultiline: false };
+      }
+      const kill = input['kill'];
+      if (typeof kill === 'string') {
+        const signal = typeof input['signal'] === 'string' ? String(input['signal']) : 'TERM';
+        return { display: `kill ${kill} (${signal})`, isMultiline: false };
+      }
+      return { display: '$ <bash>', isMultiline: false };
+    }
+    case 'tmux': {
+      const args = (input['args'] as unknown[] | undefined) ?? [];
+      const argList = args.map((a) => String(a)).join(' ');
+      return { display: `tmux ${argList}`, isMultiline: false };
     }
     case 'think': {
       const thoughts = cleanThoughts(String(input['thoughts'] || ''));
@@ -555,6 +581,188 @@ function parseImageResult(text: string): { media_type: string; data: string } | 
   return null;
 }
 
+// Permissive JSON parse used for typed tool results (bash, tmux). Returns
+// the parsed object or null when the content is plain text. Anything that
+// isn't an object (string / number / bool) returns null — we only care
+// about the structured response shape.
+function tryParseJson(text: string): Record<string, unknown> | null {
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Not JSON — typically a plain-text legacy bash output.
+  }
+  return null;
+}
+
+// REQ-BASH-002 / REQ-BASH-003 / REQ-BASH-006: render the typed bash tool
+// response. Renders a status pill, optional kill-pending badge, the line
+// tail, and the (unprefixed) `deprecation_notice` if present so the agent
+// and the user notice it.
+function BashResponseView({ response }: { response: Record<string, unknown> }) {
+  // Error envelope branch (REQ-BASH-008): `error` field present.
+  if (typeof response['error'] === 'string') {
+    return <BashErrorView response={response} />;
+  }
+  const status = String(response['status'] ?? '');
+  const handle = typeof response['handle'] === 'string' ? response['handle'] : null;
+  const finalCause = typeof response['final_cause'] === 'string' ? response['final_cause'] : null;
+  const exitCode = response['exit_code'];
+  const signalNumber = response['signal_number'];
+  const signalSent = typeof response['signal_sent'] === 'string' ? response['signal_sent'] : null;
+  const killSignalSent =
+    typeof response['kill_signal_sent'] === 'string' ? response['kill_signal_sent'] : null;
+  const waitedMs = typeof response['waited_ms'] === 'number' ? response['waited_ms'] : null;
+  const durationMs = typeof response['duration_ms'] === 'number' ? response['duration_ms'] : null;
+  const truncatedBefore = response['truncated_before'] === true;
+  const deprecationNotice =
+    typeof response['deprecation_notice'] === 'string' ? response['deprecation_notice'] : null;
+  const lines = Array.isArray(response['lines'])
+    ? (response['lines'] as Array<{ offset?: number; bytes?: string }>)
+    : [];
+
+  const isLive = status === 'running' || status === 'still_running';
+  const isKillPending = status === 'kill_pending_kernel';
+  const isExited = status === 'exited';
+  const isKilled = status === 'killed';
+  const isTombstone = status === 'tombstoned';
+
+  const text = lines.map((l) => l.bytes ?? '').join('\n');
+
+  return (
+    <div className="bash-response">
+      <div className="bash-response-header">
+        <span className={`bash-status bash-status-${status.replace(/_/g, '-')}`}>
+          {status === 'running'
+            ? 'running'
+            : status === 'still_running'
+              ? 'still running'
+              : status === 'kill_pending_kernel'
+                ? 'kill pending (kernel)'
+                : status === 'tombstoned'
+                  ? `tombstoned${finalCause ? ` · ${finalCause}` : ''}`
+                  : status === 'exited'
+                    ? 'exited'
+                    : status === 'killed'
+                      ? 'killed'
+                      : status}
+        </span>
+        {handle && <span className="bash-handle">{handle}</span>}
+        {(isExited || isTombstone) && exitCode !== undefined && exitCode !== null && (
+          <span className="bash-exit-code">exit code {String(exitCode)}</span>
+        )}
+        {(isKilled || isTombstone) && typeof signalNumber === 'number' && (
+          <span className="bash-signal-number">signal {String(signalNumber)}</span>
+        )}
+        {killSignalSent && (
+          <span className="bash-kill-signal">kill: {killSignalSent}</span>
+        )}
+        {signalSent && signalSent !== killSignalSent && (
+          <span className="bash-signal-sent">signal_sent: {signalSent}</span>
+        )}
+        {waitedMs !== null && (
+          <span className="bash-duration">waited {Math.round(waitedMs)} ms</span>
+        )}
+        {durationMs !== null && (
+          <span className="bash-duration">duration {Math.round(durationMs)} ms</span>
+        )}
+      </div>
+      {(isLive || isKillPending) && handle && (
+        <div className="bash-running-actions">
+          <button
+            type="button"
+            className="bash-peek-button"
+            onClick={() => {
+              window.dispatchEvent(
+                new CustomEvent('phoenix:insert-draft', {
+                  detail: { text: `peek bash handle ${handle}` },
+                }),
+              );
+            }}
+            title="Insert a draft message asking the agent to peek this handle"
+          >
+            peek {handle}
+          </button>
+        </div>
+      )}
+      {truncatedBefore && (
+        <div className="bash-truncated-notice">[output truncated before this view]</div>
+      )}
+      {text && <pre className="bash-lines">{text}</pre>}
+      {deprecationNotice && (
+        <div className="bash-deprecation-notice">
+          <strong>deprecated:</strong> {deprecationNotice}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BashErrorView({ response }: { response: Record<string, unknown> }) {
+  const error = String(response['error'] ?? '');
+  const message = typeof response['error_message'] === 'string' ? response['error_message'] : '';
+  const hint = typeof response['hint'] === 'string' ? response['hint'] : null;
+  return (
+    <div className="bash-response bash-response-error">
+      <div className="bash-response-header">
+        <span className="bash-status bash-status-error">error: {error}</span>
+      </div>
+      {message && <div className="bash-error-message">{message}</div>}
+      {hint && <div className="bash-error-hint">{hint}</div>}
+    </div>
+  );
+}
+
+// REQ-TMUX-012: render the typed tmux tool response. stdout / stderr are
+// kept separate (the bash tool's combined ring is different).
+function TmuxResponseView({ response }: { response: Record<string, unknown> }) {
+  if (typeof response['error'] === 'string') {
+    const error = String(response['error']);
+    const message = typeof response['message'] === 'string' ? response['message'] : '';
+    return (
+      <div className="tmux-response tmux-response-error">
+        <span className="tmux-status tmux-status-error">error: {error}</span>
+        {message && <div className="tmux-error-message">{message}</div>}
+      </div>
+    );
+  }
+  const status = String(response['status'] ?? '');
+  const exitCode = response['exit_code'];
+  const durationMs = typeof response['duration_ms'] === 'number' ? response['duration_ms'] : null;
+  const stdout = typeof response['stdout'] === 'string' ? response['stdout'] : '';
+  const stderr = typeof response['stderr'] === 'string' ? response['stderr'] : '';
+  const truncated = response['truncated'] === true;
+  return (
+    <div className="tmux-response">
+      <div className="tmux-response-header">
+        <span className={`tmux-status tmux-status-${status}`}>{status}</span>
+        {exitCode !== undefined && exitCode !== null && (
+          <span className="tmux-exit-code">exit code {String(exitCode)}</span>
+        )}
+        {durationMs !== null && (
+          <span className="tmux-duration">{Math.round(durationMs)} ms</span>
+        )}
+      </div>
+      {stdout && (
+        <div className="tmux-stream">
+          <div className="tmux-stream-label">stdout</div>
+          <pre className="tmux-stream-content">{stdout}</pre>
+        </div>
+      )}
+      {stderr && (
+        <div className="tmux-stream tmux-stream-stderr">
+          <div className="tmux-stream-label">stderr</div>
+          <pre className="tmux-stream-content">{stderr}</pre>
+        </div>
+      )}
+      {truncated && <div className="tmux-truncated-notice">[output truncated]</div>}
+    </div>
+  );
+}
+
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
 function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
@@ -585,7 +793,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
 
   const rawResultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
   const isError = resultContent?.is_error || !!resultContent?.error;
-  
+
+  // For bash/tmux, the tool result is a structured JSON envelope (REQ-BASH-002 /
+  // REQ-TMUX-012). Decode it once so the renderer below can branch on
+  // status / running state / deprecation notice rather than show the raw JSON.
+  const bashResponse = name === 'bash' ? tryParseJson(rawResultText) : null;
+  const tmuxResponse = name === 'tmux' ? tryParseJson(rawResultText) : null;
+
   // For patch tool, use the diff from display_data instead of the generic success message
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
   const resultText = patchDiff || rawResultText;
@@ -644,7 +858,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
   const isSubAgentResult = !!(result?.display_data && isSubAgentSummaryData(result.display_data));
 
   // Get the raw input for copying (not the formatted display)
-  const rawInput = name === 'bash' ? String(input['command'] || '') :
+  const rawInput = name === 'bash' ? String(input['cmd'] || input['command'] || input['peek'] || input['wait'] || input['kill'] || '') :
                    name === 'think' ? String(input['thoughts'] || '') :
                    name === 'read_file' ? String(input['path'] || '') :
                    name === 'ask_user_question' ? String(((input['questions'] as Array<{ question?: string }> | undefined)?.[0]?.question) || '') :
@@ -689,6 +903,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
                 className="message-image"
               />
             </div>
+          ) : bashResponse ? (
+            <BashResponseView response={bashResponse} />
+          ) : tmuxResponse ? (
+            <TmuxResponseView response={tmuxResponse} />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">
