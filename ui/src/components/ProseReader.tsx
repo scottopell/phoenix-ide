@@ -416,6 +416,7 @@ export function ProseReader({
   return (
     <ViewerShell
       mode={inline ? 'inline' : 'overlay'}
+      ariaLabel={`File viewer: ${fileName}`}
       title={fileName}
       titleTooltip={absolutePath}
       headerExtras={headerExtras}

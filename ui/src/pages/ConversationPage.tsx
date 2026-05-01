@@ -960,6 +960,7 @@ function ConversationPageContent() {
             baseBranch={conversation.base_branch}
             continuedInConvId={conversation.continued_in_conv_id}
             onSendMessage={(text) => handleSend(text, [])}
+            onAppendDraft={handleSendNotes}
           />
         )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (

@@ -31,6 +31,9 @@ interface WorkActionsProps {
   continuedInConvId: string | null | undefined;
   /** Send a user message to the conversation (for "ask agent to fix" flows) */
   onSendMessage?: (text: string) => void;
+  /** Append a formatted review-notes blob to the chat draft so the user
+   *  can edit before sending. Used by the diff viewer's notes pile. */
+  onAppendDraft?: (text: string) => void;
 }
 
 export function WorkActions({
@@ -38,6 +41,7 @@ export function WorkActions({
   convModeLabel,
   phaseType,
   continuedInConvId,
+  onAppendDraft,
 }: WorkActionsProps) {
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
@@ -145,6 +149,13 @@ export function WorkActions({
           uncommittedDiff={diff.uncommitted_diff}
           uncommittedTruncatedKib={diff.uncommitted_truncated_kib}
           onClose={() => setDiff({ status: 'closed' })}
+          onSendNotes={(notes) => {
+            // Drop the formatted review-notes pile into the chat draft.
+            // Same plumbing ProseReader uses (handleSendNotes in
+            // ConversationPage). Closing the viewer is the user's call —
+            // we don't auto-close on send.
+            onAppendDraft?.(notes);
+          }}
         />
       )}
     </div>
