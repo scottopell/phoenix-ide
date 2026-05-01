@@ -40,12 +40,28 @@ impl From<GitOpError> for String {
 /// All git operations use a dedicated bot identity and disable commit signing
 /// to avoid depending on the user's SSH agent (which breaks in workspaces/tmux).
 pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
+    run_git_with_env(cwd, args, &[])
+}
+
+/// Like [`run_git`], but layers `extra_env` on top of the signing-disabled
+/// defaults. Used by [`capture_branch_diff`] to redirect index writes via
+/// `GIT_INDEX_FILE` so a read-only diff capture doesn't mutate the worktree's
+/// real index.
+pub(crate) fn run_git_with_env(
+    cwd: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_VALUE_0", "false");
+    for (k, v) in extra_env {
+        cmd.env(*k, *v);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
     if output.status.success() {
@@ -170,13 +186,34 @@ pub(crate) struct CapturedDiff {
     /// committed work vs the common ancestor. Immune to commit-history
     /// noise from rebases that replay already-merged commits.
     pub committed_diff: String,
-    /// `git diff HEAD` after `git add -N .` — working-tree changes
-    /// (staged + unstaged + untracked, surfaced as intent-to-add).
+    /// `git diff HEAD` capturing working-tree changes (staged + unstaged +
+    /// untracked). Untracked files are surfaced via `git add -N .` against
+    /// a `GIT_INDEX_FILE` temp index so the worktree's real index is never
+    /// mutated.
     pub uncommitted_diff: String,
+}
+
+/// RAII guard that removes a temp file on drop. Used by `capture_branch_diff`
+/// to ensure the `GIT_INDEX_FILE` temp index is cleaned up even on panic.
+struct TempPath(std::path::PathBuf);
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Capture committed and uncommitted state of `worktree` relative to
 /// `base_branch`. See `CapturedDiff` for field semantics.
+///
+/// The uncommitted-diff capture surfaces untracked files via `git add -N`,
+/// which mutates the index. To keep this helper read-only — important for
+/// the GET diff endpoint that may be hit repeatedly while the user works —
+/// the mutation runs against a `GIT_INDEX_FILE` temp index copied from the
+/// worktree's real one. Real index is never touched. If the temp index
+/// cannot be set up (e.g. `git rev-parse --git-dir` fails or the copy
+/// errors), the uncommitted-diff capture falls back to a plain `git diff
+/// HEAD` that skips untracked files rather than mutating.
 pub(crate) fn capture_branch_diff(worktree: &Path, base_branch: &str) -> CapturedDiff {
     let comparator = effective_base_ref(worktree, base_branch);
 
@@ -189,10 +226,7 @@ pub(crate) fn capture_branch_diff(worktree: &Path, base_branch: &str) -> Capture
     let committed_diff =
         run_git(worktree, &["diff", &format!("{comparator}...HEAD")]).unwrap_or_default();
 
-    // Stage untracked files as intent-to-add so they surface in the
-    // working-tree diff. Agent-created files are typically untracked.
-    let _ = run_git(worktree, &["add", "-N", "."]);
-    let uncommitted_diff = run_git(worktree, &["diff", "HEAD"]).unwrap_or_default();
+    let uncommitted_diff = capture_uncommitted_diff(worktree);
 
     CapturedDiff {
         comparator,
@@ -200,6 +234,53 @@ pub(crate) fn capture_branch_diff(worktree: &Path, base_branch: &str) -> Capture
         committed_diff,
         uncommitted_diff,
     }
+}
+
+fn capture_uncommitted_diff(worktree: &Path) -> String {
+    // Try to set up an isolated index. If anything fails, fall back to a
+    // tracked-only diff — never mutate the real index.
+    let Some(temp) = prepare_temp_index(worktree) else {
+        tracing::debug!(
+            worktree = %worktree.display(),
+            "could not isolate git index — falling back to tracked-only uncommitted diff"
+        );
+        return run_git(worktree, &["diff", "HEAD"]).unwrap_or_default();
+    };
+
+    let temp_path_str = temp.0.to_string_lossy().into_owned();
+    let env = [("GIT_INDEX_FILE", temp_path_str.as_str())];
+
+    // Stage untracked files in the temp index so they surface in the diff.
+    // Errors here are non-fatal — diff just won't include the untracked.
+    let _ = run_git_with_env(worktree, &["add", "-N", "."], &env);
+    run_git_with_env(worktree, &["diff", "HEAD"], &env).unwrap_or_default()
+}
+
+/// Find the worktree's git index, copy it to a unique temp path, and
+/// return a guard that cleans up the copy on drop. Returns `None` if any
+/// step fails.
+fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
+    let git_dir = run_git(worktree, &["rev-parse", "--git-dir"]).ok()?;
+    // `git rev-parse --git-dir` returns a path that may be relative to
+    // `worktree`. Resolve it.
+    let git_dir = {
+        let p = std::path::Path::new(git_dir.trim());
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            worktree.join(p)
+        }
+    };
+    let real_index = git_dir.join("index");
+    let temp = std::env::temp_dir().join(format!("phoenix-git-index-{}", uuid::Uuid::new_v4()));
+    if real_index.exists() {
+        std::fs::copy(&real_index, &temp).ok()?;
+    } else {
+        // No existing index (rare — fresh worktree). Touch an empty file
+        // so GIT_INDEX_FILE has something to point at; git will populate.
+        std::fs::write(&temp, []).ok()?;
+    }
+    Some(TempPath(temp))
 }
 
 /// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
@@ -405,6 +486,50 @@ mod tests {
         run_git(clone.path(), &["config", "user.name", "probe"]).unwrap();
 
         assert_eq!(effective_base_ref(clone.path(), "main"), "origin/main");
+    }
+
+    #[test]
+    fn capture_branch_diff_does_not_mutate_real_index() {
+        // Regression for review: capture_branch_diff used to run `git add -N .`
+        // directly, mutating the worktree index. This test creates an
+        // untracked file, runs the capture, and asserts the real index is
+        // byte-for-byte unchanged.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // Create an untracked file in the worktree.
+        std::fs::write(tmp.path().join("untracked.txt"), "hello\n").unwrap();
+
+        let git_dir = run_git(tmp.path(), &["rev-parse", "--git-dir"]).unwrap();
+        let git_dir = {
+            let p = std::path::Path::new(git_dir.trim());
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                tmp.path().join(p)
+            }
+        };
+        let index_path = git_dir.join("index");
+        let before = if index_path.exists() {
+            std::fs::read(&index_path).ok()
+        } else {
+            None
+        };
+
+        let captured = capture_branch_diff(tmp.path(), "main");
+        // Sanity: the untracked file showed up in the diff (so add -N
+        // actually ran against the temp index).
+        assert!(
+            captured.uncommitted_diff.contains("untracked.txt"),
+            "expected untracked file to surface in diff: {}",
+            captured.uncommitted_diff
+        );
+
+        let after = if index_path.exists() {
+            std::fs::read(&index_path).ok()
+        } else {
+            None
+        };
+        assert_eq!(before, after, "real .git/index must not be mutated");
     }
 
     #[test]

@@ -112,13 +112,16 @@ function DiffSection({ title, body, kind, truncatedKib }: DiffSectionProps) {
           </span>
         )}
       </h3>
-      <pre className={`diff-pre diff-pre-${kind}`}>
+      {/* `<div>` children inside `<pre>` is invalid HTML — browsers may
+          implicitly close the `<pre>` and break whitespace/layout. Use a
+          regular div with white-space:pre (set in CSS) instead. */}
+      <div className={`diff-pre diff-pre-${kind}`} role="region" aria-label={title}>
         {lines.map((line, i) => (
           <div key={i} className={kind === 'diff' ? lineClass(line) : 'diff-line'}>
             {line || ' '}
           </div>
         ))}
-      </pre>
+      </div>
     </section>
   );
 }
