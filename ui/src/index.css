@@ -5819,8 +5819,36 @@ html * {
   margin-bottom: 1px;
 }
 
-.sidebar-mode .conv-item-chain-latest .conv-item-slug {
+/* Bold latest member in both sidebar and full-page mode */
+.conv-item-chain-latest .conv-item-slug {
   font-weight: 600;
+}
+
+/* Full-page (non-sidebar) chain block sizing — match surrounding list density.
+ * Sidebar uses 13px/10px micro-scale; full-page needs to feel at home among
+ * standard conv-item rows. */
+#conversation-list:not(.sidebar-mode) .conv-chain-name {
+  font-size: 15px;
+}
+
+#conversation-list:not(.sidebar-mode) .conv-chain-header {
+  padding: 8px 10px 8px 6px;
+}
+
+#conversation-list:not(.sidebar-mode) .conv-chain-members {
+  padding-left: 20px;
+}
+
+#conversation-list:not(.sidebar-mode) .conv-chain-count {
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+/* Position label (#1, #2, #3) shown instead of raw slug inside chain blocks */
+.conv-item-slug-pos {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: 0.9em;
 }
 
 .conv-chain-latest-badge {

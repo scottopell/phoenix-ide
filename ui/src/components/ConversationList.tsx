@@ -66,15 +66,14 @@ export function ConversationList({
 
   const displayList = showArchived ? archivedConversations : conversations;
 
-  // Chain grouping is sidebar-mode + active-list-only. Archived list and
-  // the standalone (non-sidebar) view stay flat — per REQ-CHN-002, archived
-  // conversations are out of chain navigation scope (sidebar already
-  // filters `archived = 0` on the server side).
+  // Chain grouping applies to the active list in both sidebar and full-page
+  // mode. Archived list stays flat — REQ-CHN-002 scopes chain navigation to
+  // active conversations (the server already filters `archived = 0`).
   const groupedItems: SidebarItem[] | null = useMemo(() => {
-    if (!sidebarMode || showArchived) return null;
+    if (showArchived) return null;
     const roots = computeChainRoots(displayList);
     return groupConversationsForSidebar(displayList, roots);
-  }, [sidebarMode, showArchived, displayList]);
+  }, [showArchived, displayList]);
 
   // Keyboard navigation traverses the flat list of conversations as
   // displayed. For chain blocks the order is members-in-chain-order
@@ -121,9 +120,9 @@ export function ConversationList({
   // sidebar mode and for every row in non-sidebar mode.
   const renderConvRow = (
     conv: Conversation,
-    options: { isChainMember?: boolean; isChainLatest?: boolean } = {},
+    options: { isChainMember?: boolean; isChainLatest?: boolean; chainIndex?: number } = {},
   ) => {
-    const { isChainMember, isChainLatest } = options;
+    const { isChainMember, isChainLatest, chainIndex } = options;
     const classes = [
       'conv-item',
       expandedId === conv.id ? 'expanded' : '',
@@ -158,7 +157,13 @@ export function ConversationList({
                 }
               })()}
             />
-            {conv.slug}
+            {chainIndex !== undefined ? (
+              <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
+                #{chainIndex + 1}
+              </span>
+            ) : (
+              conv.slug
+            )}
             {isChainLatest && (
               <span className="conv-chain-latest-badge" title="Latest in chain — click to continue">
                 latest
@@ -306,10 +311,11 @@ export function ConversationList({
         </div>
         {!collapsed && (
           <ul className="conv-chain-members">
-            {item.members.map(m =>
+            {item.members.map((m, idx) =>
               renderConvRow(m, {
                 isChainMember: true,
                 isChainLatest: m.id === item.latestMemberId,
+                chainIndex: idx,
               }),
             )}
           </ul>
