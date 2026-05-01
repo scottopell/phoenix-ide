@@ -6,7 +6,7 @@ use super::types::{
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
-use crate::git_ops::run_git;
+use crate::git_ops::{effective_base_ref, run_git};
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
@@ -264,9 +264,13 @@ pub(crate) async fn abandon_task(
         // the base branch (triple-dot). This reflects exactly what files
         // the branch changed, independent of commit-history noise — e.g.
         // task-file commits replayed during rebase whose effects are
-        // already in base produce no diff content here.
+        // already in base produce no diff content here. `effective_base_ref`
+        // prefers `origin/<base>` (kept fresh by the periodic fetch) over
+        // the local ref (only refreshed at lifecycle events) — see task
+        // 13001 for the unification rationale.
+        let comparator = effective_base_ref(&wt, &base_branch_clone);
         let committed_diff =
-            run_git(&wt, &["diff", &format!("{base_branch_clone}...HEAD")]).unwrap_or_default();
+            run_git(&wt, &["diff", &format!("{comparator}...HEAD")]).unwrap_or_default();
 
         // Stage untracked files as intent-to-add so they appear in the
         // working-tree diff. Agent-created files are typically untracked

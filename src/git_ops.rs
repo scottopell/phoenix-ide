@@ -132,6 +132,29 @@ pub(crate) fn materialize_branch(cwd: &Path, branch_name: &str) -> Result<(), Gi
     Ok(())
 }
 
+/// Resolve `base_branch` to the freshest available comparator ref.
+///
+/// Returns `"origin/<base>"` when the remote-tracking ref exists, falling
+/// back to bare `"<base>"` for local-only repos with no remote.
+///
+/// Diff comparisons in this codebase (e.g. abandon snapshot, commits-ahead/
+/// behind, future task-diff endpoint) historically used bare `<base>`. The
+/// local ref is only fast-forwarded at lifecycle events (task approval,
+/// worktree creation, branch checkout) via `materialize_branch`; the
+/// periodic 1-minute fetch loop in `stream_conversation` keeps `origin/<base>`
+/// fresh but does NOT re-materialize the local ref. So bare `<base>` drifts
+/// stale for any task that lives across upstream advances. Routing all
+/// diff-comparison call sites through this helper makes them prefer the
+/// already-fresh remote-tracking ref.
+pub(crate) fn effective_base_ref(cwd: &Path, base_branch: &str) -> String {
+    let remote = format!("origin/{base_branch}");
+    if run_git(cwd, &["rev-parse", "--verify", &remote]).is_ok() {
+        remote
+    } else {
+        base_branch.to_string()
+    }
+}
+
 /// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 ///
 /// If `create_branch` is `Some((new_branch, start_point))`, creates a new branch
@@ -291,4 +314,72 @@ pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Initialize an empty repo with a single commit on `main`.
+    fn init_repo(dir: &Path) {
+        run_git(dir, &["init", "--quiet", "--initial-branch=main"]).unwrap();
+        run_git(dir, &["config", "user.email", "probe@test"]).unwrap();
+        run_git(dir, &["config", "user.name", "probe"]).unwrap();
+        run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
+    }
+
+    #[test]
+    fn effective_base_ref_falls_back_to_local_when_no_remote() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // No `origin` remote exists, so the helper must return the bare ref.
+        assert_eq!(effective_base_ref(tmp.path(), "main"), "main");
+    }
+
+    #[test]
+    fn effective_base_ref_prefers_origin_when_available() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+
+        let clone = TempDir::new().unwrap();
+        // `git clone` fully populates origin/* refs.
+        run_git(
+            std::env::current_dir().unwrap().as_path(),
+            &[
+                "clone",
+                "--quiet",
+                upstream.path().to_str().unwrap(),
+                clone.path().to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        run_git(clone.path(), &["config", "user.email", "probe@test"]).unwrap();
+        run_git(clone.path(), &["config", "user.name", "probe"]).unwrap();
+
+        assert_eq!(effective_base_ref(clone.path(), "main"), "origin/main");
+    }
+
+    #[test]
+    fn effective_base_ref_falls_back_when_named_branch_not_at_origin() {
+        // Origin exists for some branches but not the requested one.
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+
+        let clone = TempDir::new().unwrap();
+        run_git(
+            std::env::current_dir().unwrap().as_path(),
+            &[
+                "clone",
+                "--quiet",
+                upstream.path().to_str().unwrap(),
+                clone.path().to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        // origin/main exists; origin/feature does not. A local `feature`
+        // branch with no upstream should fall back to bare.
+        run_git(clone.path(), &["branch", "feature"]).unwrap();
+        assert_eq!(effective_base_ref(clone.path(), "feature"), "feature");
+    }
 }
