@@ -5,7 +5,7 @@
 The tmux integration is two cooperating pieces:
 
 1. The agent-facing `tmux` tool — a pass-through that prepends
-   `-L <conv-sock>` and forwards the rest of the args to the tmux binary.
+   `-S <conv-sock>` and forwards the rest of the args to the tmux binary.
 2. The terminal feature's tmux-attach behaviour — when the tmux binary is
    available, the in-app terminal's PTY runs `tmux attach` against the
    conversation's socket instead of the user's `$SHELL` directly.
@@ -15,7 +15,7 @@ resolution, lazy spawn, stale-socket detection, and the conversation-hard-
 delete cascade. The registry is reachable via `ToolContext.tmux()` for the
 agent tool and consumed directly by the terminal session-spawn path.
 
-## Tool Surface (REQ-TMUX-003, REQ-TMUX-010, REQ-TMUX-013)
+## Tool Surface (REQ-TMUX-003, REQ-TMUX-009, REQ-TMUX-012)
 
 ### JSON Schema
 
@@ -46,6 +46,8 @@ is available; provide the subcommand + flags as `args`.
 This conversation's tmux server is isolated from every other conversation
 and from any tmux server you may have running on the host: the socket path
 is fixed by Phoenix and cannot be overridden by passing -L or -S in args.
+If you do pass them, tmux will reject the duplicate server-selection flag
+with a usage error.
 
 Common subcommands:
   new-window -d -n NAME COMMAND     spawn a new window running COMMAND
@@ -67,8 +69,8 @@ Use this tool — not bash — for processes that:
 Use bash for one-shot non-interactive commands.
 
 Note: Persistence is across Phoenix restart only, not system reboot. After a
-host reboot, this server's state is lost; you'll see a "[phoenix] previous
-tmux session lost at <ts>" breadcrumb in the next terminal you open.
+host reboot, this server's state is lost; the next operation creates a
+fresh server.
 ```
 
 ### Response Shape
@@ -91,7 +93,7 @@ emit structured CLI output where the distinction matters.
 
 ```rust
 pub struct TmuxRegistry {
-    inner: Arc<DashMap<ConversationId, Arc<TmuxServer>>>,
+    inner: Arc<DashMap<ConversationId, Arc<RwLock<TmuxServer>>>>,
     socket_dir: PathBuf,    // ~/.phoenix-ide/tmux-sockets/
     binary_available: bool, // discovered once at startup
 }
@@ -99,19 +101,23 @@ pub struct TmuxRegistry {
 pub struct TmuxServer {
     conversation_id: ConversationId,
     socket_path: PathBuf,
-    state: ArcSwap<ServerState>,
+    state: ServerState,
 }
 
 pub enum ServerState {
     NotProbed,          // initial, before any operation
-    Live { stale_breadcrumb_pending: bool },
+    Live,
     Gone,               // post-hard-delete; entry is dropped from registry
 }
 ```
 
-`ArcSwap` lets in-flight readers (e.g., terminal session deciding to attach
-versus spawn) observe atomic state transitions without holding the registry
-lock.
+`RwLock<TmuxServer>` rather than `ArcSwap`: matches the established
+pattern from `specs/bash/` (`RwLock<ConversationHandles>`) and from the
+existing browser session manager. `ArcSwap` was proposed in an earlier
+draft, but the panel review flagged that it's a novel concurrency
+primitive (not used elsewhere in the codebase), its hazard-pointer model
+has surprising `Drop`-ordering behavior, and contention here is bounded
+(probe + spawn run at most once per operation).
 
 ### Socket Path Resolution
 
@@ -126,7 +132,7 @@ Conversation IDs are filename-safe (per bedrock contracts); no escaping
 needed. The socket directory is created on registry initialisation with
 permissions 0700.
 
-### Probe (REQ-TMUX-006, REQ-TMUX-007)
+### Probe (REQ-TMUX-005, REQ-TMUX-006)
 
 ```rust
 pub enum ProbeResult {
@@ -140,7 +146,7 @@ async fn probe(socket_path: &Path) -> ProbeResult {
         return ProbeResult::NoSocket;
     }
     let status = tokio::process::Command::new("tmux")
-        .args(["-L", socket_path_label(socket_path), "ls"])
+        .args(["-S", &socket_path.to_string_lossy(), "ls"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -152,58 +158,47 @@ async fn probe(socket_path: &Path) -> ProbeResult {
 }
 ```
 
-`socket_path_label` extracts the basename without `.sock` for use as the
-`-L` argument: `tmux -L conv-42 ls` (tmux's `-L` takes a label, not a full
-path; it joins the label against `$TMUX_TMPDIR` or `/tmp/tmux-<uid>`).
-
-> **Implementation note — socket path vs label:** Tmux's `-L` is a *label*,
-> not a path. By default it resolves under `/tmp/tmux-<uid>/` (or
-> `$TMUX_TMPDIR` if set). To pin sockets at
-> `~/.phoenix-ide/tmux-sockets/`, Phoenix sets `TMUX_TMPDIR=
-> ~/.phoenix-ide/tmux-sockets/` in the environment of every tmux invocation
-> and uses simple labels like `conv-42`. The on-disk socket path becomes
-> `~/.phoenix-ide/tmux-sockets/conv-42`. (Confirm during implementation: if
-> `TMUX_TMPDIR` semantics fight with this layout, the alternative is to
-> use `-S <absolute-path>` instead, accepting that the agent's stray `-L`
-> arguments would then conflict with `-S` rather than getting overridden.
-> The Allium spec language permits either; this design picks `-L` +
-> `TMUX_TMPDIR` as the cleaner front-running.)
+`-S` takes an absolute path, not a label, so there's no `TMUX_TMPDIR`
+interaction to worry about. The path the agent sees in `tmux ls` output
+is literally the file Phoenix manages.
 
 ### Ensure Server Live (composite operation)
 
 ```rust
-async fn ensure_live(&self, conv: &ConversationId) -> Result<Arc<TmuxServer>, TmuxError> {
-    let server = self.inner.entry(conv.clone())
-        .or_insert_with(|| Arc::new(TmuxServer::new(conv, &self.socket_dir)))
+async fn ensure_live(&self, conv: &ConversationId) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
+    let server_arc = self.inner.entry(conv.clone())
+        .or_insert_with(|| Arc::new(RwLock::new(TmuxServer::new(conv, &self.socket_dir))))
         .clone();
 
-    let probe_result = probe(&server.socket_path).await;
-    match (server.state.load().as_ref(), probe_result) {
-        (_, ProbeResult::Live) => {
-            // Probe confirms; mark live (no breadcrumb if it was already live).
-            let breadcrumb_pending = matches!(server.state.load().as_ref(),
-                                              ServerState::Live { stale_breadcrumb_pending: true });
-            server.state.store(Arc::new(ServerState::Live { stale_breadcrumb_pending: breadcrumb_pending }));
-            Ok(server)
+    let probe_result = probe(&server_arc.read().await.socket_path).await;
+    let mut server = server_arc.write().await;
+    match probe_result {
+        ProbeResult::Live => {
+            server.state = ServerState::Live;
         }
-        (_, ProbeResult::NoSocket) => {
+        ProbeResult::NoSocket => {
             spawn_session(&server.socket_path).await?;
-            server.state.store(Arc::new(ServerState::Live { stale_breadcrumb_pending: false }));
-            Ok(server)
+            server.state = ServerState::Live;
         }
-        (_, ProbeResult::DeadSocket) => {
+        ProbeResult::DeadSocket => {
+            // System reboot recovery: socket file lingers but server is gone.
+            // Silent recreate — no breadcrumb (the original draft's
+            // send-keys breadcrumb was unsafe).
             tokio::fs::remove_file(&server.socket_path).await.ok();
             spawn_session(&server.socket_path).await?;
-            server.state.store(Arc::new(ServerState::Live { stale_breadcrumb_pending: true }));
-            Ok(server)
+            server.state = ServerState::Live;
         }
     }
+    drop(server);
+    Ok(server_arc)
 }
 
 async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
     let status = tokio::process::Command::new("tmux")
-        .env("TMUX_TMPDIR", socket_path.parent().unwrap())
-        .args(["-L", socket_label(socket_path), "new-session", "-d", "-s", "main"])
+        .args([
+            "-S", &socket_path.to_string_lossy(),
+            "new-session", "-d", "-s", "main",
+        ])
         .status()
         .await?;
     if !status.success() {
@@ -215,10 +210,10 @@ async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
 
 The probe-and-act sequence runs at every operation; it is cheap (one
 short-lived process spawn) and the only reliable way to detect both
-post-Phoenix-restart (probe → live, no in-memory entry) and post-system-
-reboot (probe → dead_socket).
+post-Phoenix-restart (probe → live, no in-memory entry needed) and
+post-system-reboot (probe → dead_socket, recreate).
 
-## Tool Dispatch (REQ-TMUX-003, REQ-TMUX-011)
+## Tool Dispatch (REQ-TMUX-003, REQ-TMUX-010)
 
 ```rust
 pub struct TmuxTool;
@@ -230,27 +225,31 @@ impl Tool for TmuxTool {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let input: TmuxInput = serde_json::from_value(input)?;
 
-        let registry = ctx.tmux();
+        let registry_arc = ctx.tmux().await?;
+        let registry = registry_arc.read().await;
         if !registry.binary_available() {
             return ToolOutput::error("tmux_binary_unavailable",
                 "the tmux binary is not installed on this host");
         }
+        drop(registry);
 
-        let server = match registry.ensure_live(&ctx.conversation_id).await {
+        let server_arc = match TmuxRegistry::ensure_live_via(&ctx, &ctx.conversation_id).await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error("tmux_server_unavailable", e.to_string()),
         };
+        let server = server_arc.read().await;
+        let socket_path = server.socket_path.clone();
+        drop(server);
 
-        let wait_seconds = input.wait_seconds.unwrap_or(TMUX_TOOL_TIMEOUT_SECONDS);
+        let wait_seconds = input.wait_seconds.unwrap_or(TMUX_TOOL_DEFAULT_WAIT_SECONDS);
         let mut full_args: Vec<String> = vec![
-            "-L".into(),
-            socket_label(&server.socket_path).into(),
+            "-S".into(),
+            socket_path.to_string_lossy().into_owned(),
         ];
         full_args.extend(input.args);
 
         let mut cmd = tokio::process::Command::new("tmux");
-        cmd.env("TMUX_TMPDIR", server.socket_path.parent().unwrap())
-           .args(&full_args)
+        cmd.args(&full_args)
            .stdin(Stdio::null())
            .stdout(Stdio::piped())
            .stderr(Stdio::piped());
@@ -261,7 +260,7 @@ impl Tool for TmuxTool {
             Err(e) => return ToolOutput::error("tmux_spawn_failed", e.to_string()),
         };
 
-        let res = tokio::select! {
+        tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
                 kill_child(&child).await;
@@ -273,7 +272,7 @@ impl Tool for TmuxTool {
             }
             _ = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
                 kill_child(&child).await;
-                let (so, se, truncated) = capture_truncated(&mut child).await;
+                let (so, se, truncated) = capture_truncated(child).await;
                 ToolOutput::structured("tmux", json!({
                     "status": "timed_out", "exit_code": null,
                     "duration_ms": (wait_seconds * 1000) as u64,
@@ -290,8 +289,7 @@ impl Tool for TmuxTool {
                     "stdout": so, "stderr": se, "truncated": truncated,
                 }))
             }
-        };
-        res
+        }
     }
 }
 ```
@@ -300,7 +298,7 @@ impl Tool for TmuxTool {
 applying middle-truncation to whichever stream is over budget (or both if
 both contribute).
 
-## Terminal Attach Path (REQ-TMUX-004, REQ-TMUX-005)
+## Terminal Attach Path (REQ-TMUX-004)
 
 The terminal session-spawn path in `src/terminal/spawn.rs` consults the
 registry before deciding what to exec inside the PTY:
@@ -309,13 +307,13 @@ registry before deciding what to exec inside the PTY:
 async fn build_pty_exec_argv(ctx: &TerminalSpawnContext) -> Vec<CString> {
     let registry = &ctx.tmux_registry;
     if registry.binary_available() {
-        let server = registry.ensure_live(&ctx.conversation_id).await
+        let server_arc = registry.ensure_live(&ctx.conversation_id).await
             .expect("tmux ensure_live in terminal spawn path");
-        // attach with literal CR after to flush any pending breadcrumb send-keys
+        let server = server_arc.read().await;
         vec![
             CString::new("tmux").unwrap(),
-            CString::new("-L").unwrap(),
-            CString::new(socket_label(&server.socket_path)).unwrap(),
+            CString::new("-S").unwrap(),
+            CString::new(server.socket_path.to_string_lossy().into_owned()).unwrap(),
             CString::new("attach").unwrap(),
             CString::new("-t").unwrap(),
             CString::new("main").unwrap(),
@@ -332,80 +330,46 @@ async fn build_pty_exec_argv(ctx: &TerminalSpawnContext) -> Vec<CString> {
 The PTY spawn flow (fork, setsid, TIOCSCTTY, dup2, execvp) is identical
 between the two cases; only the argv differs.
 
-### Breadcrumb Rendering (REQ-TMUX-007)
+The existing single-terminal-per-conversation constraint from
+`specs/terminal/` REQ-TERM-003 applies on both paths. Multi-attach via
+tmux's native protocol is deferred (see the `TmuxMultiAttach` deferred
+entry in `tmux-integration.allium`).
 
-After `ensure_live` returns with `stale_breadcrumb_pending = true`, the
-terminal-spawn path injects a breadcrumb before issuing attach:
+### No Stale-Recovery Breadcrumb
 
-```rust
-async fn maybe_render_breadcrumb(server: &TmuxServer) -> Result<(), TmuxError> {
-    let mut state_arc = server.state.load_full();
-    let pending = matches!(state_arc.as_ref(),
-                           ServerState::Live { stale_breadcrumb_pending: true });
-    if !pending { return Ok(()); }
+The earlier draft of this design rendered a one-line breadcrumb (`[phoenix]
+previous tmux session lost at <ts>`) into the recovered pane after
+stale-socket detection. The panel review surfaced that the proposed
+mechanism (`tmux send-keys -l "<text>"`) writes to the slave PTY's stdin —
+not to a display layer — so the breadcrumb would be interpreted as input
+by whatever process happened to be running in the pane: typed into vim,
+into a REPL, into a custom shell with command aliases.
 
-    let line = format!("[phoenix] previous tmux session lost at {}",
-                       human_ts(SystemTime::now()));
-    // Write into the main pane via send-keys -l (literal, not interpreted).
-    let mut cmd = tokio::process::Command::new("tmux");
-    cmd.env("TMUX_TMPDIR", server.socket_path.parent().unwrap())
-       .args(["-L", socket_label(&server.socket_path),
-              "send-keys", "-t", "main", "-l", &line])
-       .status().await?;
+Silent unlink-and-recreate is the safe v1 behaviour. The user discovers
+the loss the next time they look at their windows; the pre-reboot pane
+state is gone the same way it would be for any process killed by the
+kernel reboot. If we later want to surface the loss, the right surface is
+`tmux display-message` (status bar) or an audit-log-style entry, not
+pane-input injection. This is captured as `TmuxStaleRecoveryNotification`
+in the deferred section.
 
-    // CR after, so the breadcrumb is on its own line and the pane scrolls.
-    let mut cmd = tokio::process::Command::new("tmux");
-    cmd.env("TMUX_TMPDIR", server.socket_path.parent().unwrap())
-       .args(["-L", socket_label(&server.socket_path),
-              "send-keys", "-t", "main", "Enter"])
-       .status().await?;
-
-    server.state.store(Arc::new(ServerState::Live { stale_breadcrumb_pending: false }));
-    Ok(())
-}
-```
-
-The breadcrumb is a once-per-recovery event. After it's written into the
-pane, every subsequent attach (multi-attach scenarios) sees it as part of
-pane history.
-
-### Multi-Attach (REQ-TMUX-005)
-
-The terminal spec's "exactly one terminal per conversation" constraint
-applies only to the direct-PTY fallback. On the tmux path, each new
-terminal connection spawns its own PTY child running `tmux attach`; tmux's
-multi-client protocol handles synchronisation. The terminal session
-registry must distinguish the two cases:
-
-```rust
-pub struct TerminalRegistry {
-    sessions: HashMap<ConversationId, TerminalSessionGroup>,
-}
-
-pub enum TerminalSessionGroup {
-    DirectPty { single: TerminalHandle },     // existing model
-    TmuxAttach { clients: Vec<TerminalHandle> },  // multi-attach
-}
-```
-
-On attach request, the tmux-path branch always succeeds (no 409).
-DuplicateConnectionReclaimsSession (terminal/REQ-TERM-003) governs the
-direct-PTY case unchanged.
-
-## Hard-Delete Cascade (REQ-TMUX-008)
+## Hard-Delete Cascade (REQ-TMUX-007)
 
 Wired into the bedrock conversation-hard-delete handler:
 
 ```rust
 async fn cascade_tmux_on_delete(registry: &TmuxRegistry, conv: &ConversationId) {
-    let Some(server) = registry.inner.remove(conv).map(|(_, v)| v) else {
+    let Some((_, server_arc)) = registry.inner.remove(conv) else {
         return; // no entry — nothing to do
     };
+    let server = server_arc.read().await;
+    let socket_path = server.socket_path.clone();
+    drop(server);
+
     let _ = tokio::process::Command::new("tmux")
-        .env("TMUX_TMPDIR", server.socket_path.parent().unwrap())
-        .args(["-L", socket_label(&server.socket_path), "kill-server"])
+        .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
         .status().await;
-    let _ = tokio::fs::remove_file(&server.socket_path).await;
+    let _ = tokio::fs::remove_file(&socket_path).await;
 }
 ```
 
@@ -415,10 +379,16 @@ server was already dead is the desired state. A failed `remove_file`
 because the file was already absent is the desired state. Logging at
 `debug` for each suppressed error is fine.
 
-This runs alongside the bash handle cascade (`specs/bash/` REQ-BASH-006) in
-the same hard-delete transaction.
+This runs alongside the bash handle cascade (`specs/bash/` REQ-BASH-006)
+in the same hard-delete handler.
 
-## ToolContext Extension (REQ-TMUX-014)
+> **Bedrock dependency:** the cascade requires bedrock to emit a
+> `ConversationHardDeleted` event (or expose a cascade-orchestrator
+> hook) that this spec — and `specs/bash/`, `specs/projects/` — can
+> subscribe to. At the time of this revision, bedrock has neither
+> directly. The cascade integration is gated on adding that hook.
+
+## ToolContext Extension (REQ-TMUX-013)
 
 ```rust
 #[derive(Clone)]
@@ -432,14 +402,21 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    pub fn tmux(&self) -> &TmuxRegistry {
-        &self.tmux_registry
+    pub async fn tmux(&self) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
+        self.tmux_registry.ensure_live(&self.conversation_id).await
     }
 }
 ```
 
-The terminal spawn path receives the same registry directly via the
-terminal session's spawn context.
+The accessor signature (`async + Result + Arc<RwLock<...>>`) matches the
+existing `ctx.browser()` and the `ctx.bash_handles()` defined in
+`specs/bash/`. All three per-conversation tool registries share one
+shape.
+
+The terminal spawn path uses `registry.ensure_live` directly rather than
+`ctx.tmux()` because the terminal spawn context isn't a `ToolContext`
+(it carries different state); both call sites bottom out in
+`TmuxRegistry::ensure_live`.
 
 ## Binary Availability Detection
 
@@ -470,7 +447,6 @@ fn truncate_pair(stdout: Vec<u8>, stderr: Vec<u8>) -> (String, String, bool) {
         );
     }
 
-    // Allocate the budget proportionally; truncate each stream's middle.
     let budget_each = TMUX_OUTPUT_MAX_BYTES / 2;
     let so = truncate_middle(stdout, budget_each);
     let se = truncate_middle(stderr, TMUX_OUTPUT_MAX_BYTES - so.len());
@@ -497,10 +473,8 @@ fn truncate_middle(bytes: Vec<u8>, max_bytes: usize) -> String {
 ## Testing Strategy
 
 ### Unit tests
-- Socket path resolution for various conversation ID shapes (UUIDs, slugs,
-  numeric).
+- Socket path resolution for various conversation ID shapes.
 - `truncate_pair` budget allocation under various stdout/stderr ratios.
-- `socket_label` extraction from an absolute path.
 - ServerState transitions on each ProbeResult variant.
 
 ### Integration tests
@@ -510,21 +484,21 @@ fn truncate_middle(bytes: Vec<u8>, max_bytes: usize) -> String {
   no spawn.
 - Operation with stale socket file (unlink the live server's `.sock` while
   it's running, then re-issue): probe → dead_socket, file unlinked, fresh
-  server, breadcrumb pending. Check breadcrumb appears in the next attach.
+  server, no breadcrumb in the recovered pane.
 - Conversation hard-delete: kill-server runs, file unlinked, registry entry
   gone. Subsequent probes return NoSocket.
 - Tool call passes args correctly: `tmux(["new-window", "-d", "-n", "x",
   "sleep", "1"])` produces a window named `x`.
-- Tool call with `-L` in agent args: the agent's `-L` is ignored (Phoenix's
-  -L wins by argument order); window operations still target the right
-  server.
+- Tool call with `-L` or `-S` in agent args: tmux rejects with usage error;
+  Phoenix surfaces it via the response.
 - Cancellation via ToolContext.cancel mid-call: subprocess killed,
   status="cancelled" returned.
 - Output truncation when subprocess emits >128KB.
-- Terminal attach path with tmux available: PTY exec is `tmux attach`;
-  multi-attach succeeds.
-- Terminal attach path without tmux: PTY exec is `$SHELL -i`; second
-  attach is rejected per existing terminal-spec behaviour.
+- Terminal attach path with tmux available: PTY exec is `tmux attach`.
+- Terminal attach path without tmux: PTY exec is `$SHELL -i`.
+- Single-attach constraint preserved on the tmux path: a second open-
+  terminal request is rejected per the existing terminal spec's
+  behaviour.
 
 ### Property tests
 - For any ConversationId, `socket_path_for(socket_dir, id)` is a unique
@@ -536,19 +510,19 @@ fn truncate_middle(bytes: Vec<u8>, max_bytes: usize) -> String {
 
 ## Migration
 
-The terminal spec gains REQ-TERM-015 and REQ-TERM-016 (cross-referenced
-to this spec); the existing 14 terminal requirements are unchanged in
-behaviour but the "exactly one terminal per conversation" wording is
-weakened to "exactly one direct-PTY terminal" so multi-attach on the tmux
-path is consistent with the spec.
+The terminal spec's existing 22 requirements are unchanged in behaviour;
+the new tmux-attach path is layered on top via the spawn-path branching
+in `src/terminal/spawn.rs`. The single-attach constraint
+(REQ-TERM-003) is preserved on both paths — multi-attach is deferred and
+does not require any change to the existing terminal spec.
 
 The bash spec's REQ-BASH-009 description text gets a sentence pointing at
 the `tmux` tool for TTY/persistence/interactive needs.
 
-The bedrock hard-delete cascade gains a new step: in addition to the
-existing tear-downs, run `cascade_tmux_on_delete` for the deleted
-conversation. The cascade ordering is: kill bash handles → kill tmux
-server → remove conversation row.
+The bedrock state machine gains the cascade hook (the
+`ConversationHardDeleted` event called out as a dependency above).
+Without it, the hard-delete cascade for tmux (and bash, and projects)
+cannot be wired up.
 
 The `ts_rs` codegen will pick up the new tool's response type
 (`TmuxToolResponse`) once it derives `TS`. Run `./dev.py codegen`; update
@@ -564,9 +538,11 @@ src/tools/
 ├── tmux/
 │   ├── registry.rs     # TmuxRegistry, TmuxServer, ensure_live, hard-delete cascade
 │   ├── probe.rs        # probe(), ProbeResult
-│   ├── invoke.rs       # subprocess spawn, capture, truncation
-│   └── breadcrumb.rs   # stale-recovery breadcrumb rendering
+│   └── invoke.rs       # subprocess spawn, capture, truncation
 src/terminal/
 ├── spawn.rs            # build_pty_exec_argv branches on tmux availability
 └── ...
 ```
+
+The project's clippy convention requires `foo.rs + foo/` rather than
+`foo/mod.rs`; the layout above complies.

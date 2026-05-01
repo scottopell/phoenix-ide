@@ -23,6 +23,11 @@ or kill the process. The tool itself remains pipe-backed and non-interactive —
 PTY needs and "I want this to survive Phoenix restart" needs are served by the
 separate `tmux` tool (see `specs/tmux-integration/`).
 
+**Persistence boundary:** handles are in-memory only. They survive arbitrarily
+long within a single Phoenix process, but a Phoenix restart drops them — the
+agent will see `handle_not_found` on a previously-known handle. Persistence
+across Phoenix restart is what `tmux` is for.
+
 ## Requirements
 
 ### REQ-BASH-001: Command Execution
@@ -69,13 +74,22 @@ WHEN `wait_seconds` exceeds `MAX_WAIT_SECONDS` (default 900)
 THE SYSTEM SHALL reject the call with `error: "wait_seconds_out_of_range"`
 AND state the bound in the error
 
+THE tool description SHALL state explicitly that `wait_seconds` is **NOT** a
+process-kill timeout: the process is **never** killed when `wait_seconds`
+elapses; it keeps running and the agent receives a handle. This negation is
+load-bearing — language models trained on POSIX `timeout(1)` and similar APIs
+default to the kill-on-timeout intuition; affirmative descriptions get
+pattern-matched into that prior, and explicit negations override it.
+
 **Rationale:** The renamed parameter (`wait_seconds`, replacing `timeout`)
 removes the "kill" connotation that the old name carried. The hard distinction
 between `status: "exited"` and `status: "still_running"` makes the
 "timed-out-but-process-still-running" case unmistakable to the agent — pit of
 success on the read side. The `MAX_WAIT_SECONDS` cap exists so the agent cannot
 inadvertently park a request for hours: long-running operations should yield a
-handle and resume via `wait` calls.
+handle and resume via `wait` calls. The explicit-negation rule in the tool
+description was added in revision 2 after a panel review found that the rename
+alone was insufficient signal.
 
 ---
 
@@ -83,7 +97,7 @@ handle and resume via `wait` calls.
 
 WHEN agent calls `bash(peek=<handle>, ...)`
 THE SYSTEM SHALL return the current state of the handle, including:
-- `status` (`running` | `exited` | `killed` | `lost_in_restart`)
+- `status` (`running` | `exited` | `killed` | `signaled` | `kill_pending_kernel`)
 - `exit_code` (when status is `exited`; null otherwise)
 - ring buffer contents per the offset/lines parameters (REQ-BASH-004)
 - `tombstone: true` when the response is served from a tombstone record
@@ -96,21 +110,48 @@ AND on re-timeout, return the *same* handle (not a new one)
 
 WHEN agent calls `bash(kill=<handle>, signal=<TERM|KILL>)`
 THE SYSTEM SHALL send the specified signal (default `TERM`) to the process group
-AND wait up to `KILL_GRACE_SECONDS` (default 5) for the process to exit
-AND if the process has not exited after grace, escalate to `SIGKILL`
-AND surface `signal_sent`, `signal_escalated` (when applicable), and final state
-in the response
+AND wait up to `KILL_RESPONSE_TIMEOUT_SECONDS` (default 30) for the process to
+exit
+AND return the response shape with the final state and `signal_sent`
+
+WHEN the process does not exit within `KILL_RESPONSE_TIMEOUT_SECONDS` after the
+signal is sent (typical cause: `D`-state on a frozen mount or kernel-level
+uninterruptible sleep)
+THE SYSTEM SHALL return `status: "kill_pending_kernel"` with `signal_sent`,
+`waited_ms`, and the ring buffer tail
+AND leave the kill task in the registry so a subsequent kill / wait / peek can
+observe the eventual exit
+
+WHEN agent calls `kill` with `signal=TERM` and the process is one the agent
+expects to require graceful shutdown (e.g., a database with WAL flush)
+AND TERM does not take effect within the agent's chosen response window
+THE agent SHALL call `kill` again with `signal=KILL` to escalate explicitly
 
 WHEN agent calls peek/wait/kill on a handle that does not exist in the live
-table or tombstone store
+table or in the in-memory tombstone store
 THE SYSTEM SHALL return `error: "handle_not_found"`
 
+THE SYSTEM SHALL NOT auto-escalate from TERM to KILL. A kill call sends exactly
+the requested signal once. Agents that want escalation must request it
+explicitly with a second call.
+
 **Rationale:** Three operations cover the lifecycle of a backgrounded handle.
-The `kill` auto-escalation removes a footgun where `TERM` doesn't take and the
-agent is left wondering whether to call again with `KILL` — the tool handles
-the dance and reports what it did. Returning the same handle on `wait`
-re-timeout (rather than minting a new one) is the pit-of-success choice: the
-agent never accumulates handles across re-waits.
+Auto-escalation TERM → KILL was removed in revision 2: a model trained on POSIX
+sends `signal: TERM` because it specifically wants the process to clean up
+gracefully (flush logs, close DB connections, write final state); silently
+upgrading to KILL after a fixed grace period defeats the agent's intent and
+routinely corrupts services with legitimately long shutdown paths (Postgres,
+Elasticsearch, anything with a WAL flush). The agent already has the primitives
+to escalate explicitly; making it explicit keeps the agent in control.
+
+The `kill_pending_kernel` status covers the kernel-uninterruptible-sleep case
+(SIGKILL is uncatchable but does not guarantee exit when the process is in
+`D`-state on a frozen mount). The kill response returns rather than hanging
+forever; subsequent calls can observe the eventual transition.
+
+Returning the same handle on `wait` re-timeout (rather than minting a new one)
+is the pit-of-success choice: the agent never accumulates handles across
+re-waits.
 
 ---
 
@@ -169,7 +210,7 @@ THE SYSTEM SHALL reject the call with:
 - `hint`: text directing the agent to kill or wait on a handle, or use the
   `tmux` tool for long-runners
 
-WHEN a handle transitions out of `running` (exit, kill, restart)
+WHEN a handle transitions out of `running` (exit, kill, signal)
 THE SYSTEM SHALL decrement the live count
 AND a subsequent spawn from the same conversation MAY succeed if it brings the
 live count under the cap
@@ -184,14 +225,19 @@ handles tells the agent exactly what to do.
 ### REQ-BASH-006: Tombstones and Process Exit
 
 WHEN a handle's process exits (any cause: success, non-zero, signal)
-THE SYSTEM SHALL demote the live ring to a *tombstone* record containing:
-- `handle_id`, `cmd`, `conversation_id`
+THE SYSTEM SHALL demote the live ring to an *in-memory tombstone* record
+containing:
+- `handle_id`, `cmd`
 - `exit_code` (or signal information)
 - `duration_ms`
 - `final_tail`: the last `TOMBSTONE_TAIL_LINES` (default 2000) lines
+- `final_cause`: `exited` | `killed` | `signaled` | `kill_pending_kernel`
 - `exited_at`
 AND release the live ring buffer memory
-AND mark `status: "exited"` (or `"killed"` if Phoenix sent the kill signal)
+AND mark `status: "exited"` (kernel returned an exit code), `"killed"` (Phoenix
+sent the kill signal), `"signaled"` (process terminated by an external signal,
+e.g. oom-killer), or `"kill_pending_kernel"` (Phoenix sent the kill signal but
+the process has not yet exited within the response window)
 
 WHEN agent calls `peek` or `wait` on a tombstoned handle
 THE SYSTEM SHALL serve the response from the tombstone with `tombstone: true`
@@ -203,43 +249,74 @@ THE SYSTEM SHALL kill any of that conversation's processes whose handles are
 still `running`
 AND remove all tombstone records for that conversation
 
+WHEN Phoenix shuts down (gracefully or via crash)
+THE SYSTEM SHALL kill all live processes via the reaper machinery
+(REQ-BASH-007)
+AND make no attempt to persist tombstones across the restart
+
+THE in-memory tombstone store SHALL NOT be backed by SQLite. Tombstones live
+only as long as the Phoenix process. A subsequent agent peek on a handle that
+predates the current Phoenix process returns `handle_not_found` — the agent
+re-spawns, or the agent should have used the `tmux` tool if it needed
+persistence across restart.
+
 **Rationale:** Demoting the ring to a final-tail tombstone bounds memory while
 preserving "any handle the agent was given remains peekable for the lifetime
-of the conversation." Tombstones are kilobytes; live rings are megabytes.
-Hard-delete is the only event that loses a tombstone — matching the
-tmux-integration spec, where `tmux -L <sock> kill-server` runs at the same
-moment.
+of the Phoenix process." Tombstones are kilobytes; live rings are megabytes.
+Hard-delete is the only event that loses a tombstone within a Phoenix
+lifetime.
+
+The "no SQLite shadow store" decision was made in revision 2: the structured
+`lost_in_restart` response that v1 originally proposed was not worth the
+complexity (a 7-column table per handle, reconciliation logic at startup, and
+unbounded growth across restarts because the live-handle cap doesn't apply to
+tombstones). Bare `handle_not_found` is exactly what agents already handle
+gracefully.
+
+The four terminal status variants (`exited`, `killed`, `signaled`,
+`kill_pending_kernel`) cover the cases that a single `killed` would conflate:
+external signals (oom-killer, external `kill -9`) reach the process even when
+Phoenix didn't request them; D-state hangs after kill must be reported because
+the kill response cannot wait forever.
 
 ---
 
-### REQ-BASH-007: Phoenix Restart Tombstones
-
-WHEN a handle is created (process spawn)
-THE SYSTEM SHALL persist a tombstone shadow record to SQLite with `status:
-"running"`, `handle_id`, `cmd`, `conversation_id`, `started_at`
-
-WHEN a handle transitions to `exited` or `killed`
-THE SYSTEM SHALL update the SQLite shadow record with the final state, exit
-information, and `final_tail`
+### REQ-BASH-007: Child Process Reaper
 
 WHEN Phoenix starts up
-THE SYSTEM SHALL read SQLite shadow records
-AND for any record still marked `status: "running"` (Phoenix did not write a
-final state — graceful shutdown raced or process crashed), update the record
-to `status: "lost_in_restart"` with `shutdown_marker_ts: <previous shutdown
-timestamp if known, else startup_ts>`
-AND start with an empty in-memory live handle table
+THE SYSTEM SHALL call `prctl(PR_SET_CHILD_SUBREAPER, 1)` (Linux 3.4+) at the
+process level so that any descendant whose parent dies before reaping it is
+reparented to Phoenix rather than init
+AND log a warning at startup if the call is unavailable on the host platform
 
-WHEN agent peeks a handle whose record is `status: "lost_in_restart"`
-THE SYSTEM SHALL return `status: "lost_in_restart"` with `shutdown_marker_ts`
-and the last known `final_tail` if any was captured before shutdown
+WHEN a bash handle spawns a child
+THE SYSTEM SHALL set the child as a process group leader via `pre_exec(setpgid(0, 0))`
+AND the kill path SHALL signal the entire process group via `kill(-pgid, signal)`
+to catch immediate descendants
 
-**Rationale:** Pit of success applied to errors: the agent sees
-`lost_in_restart` (with a timestamp) instead of bare `handle_not_found`, so
-it can reason about *why* the handle is gone. Crash-safe: even if Phoenix is
-SIGKILLed, the next startup will detect the orphaned `running` records and
-relabel them. The OS itself kills the children via SIGHUP cascade when
-Phoenix's process group dies.
+WHEN Phoenix is shutting down (graceful or abnormal-but-handler-runnable)
+THE SYSTEM SHALL walk the live handle table and send `SIGKILL` to each
+handle's process group as a final cleanup pass before exit
+AND wait briefly (up to `SHUTDOWN_KILL_GRACE_SECONDS`, default 2) for those
+groups to exit before relinquishing control to the OS
+
+THE SYSTEM SHALL NOT rely on parent-death cascades (SIGHUP-on-parent-exit) for
+child cleanup. SIGHUP delivers on controlling-terminal hangup, not on parent
+process death; Phoenix is not a session leader for these children, so SIGHUP
+cascade is not a reliable mechanism.
+
+**Rationale:** This requirement was added in revision 2 after a UNIX
+correctness review. The earlier draft assumed `setpgid(0,0)` + kernel SIGHUP
+would cascade and clean up descendants when Phoenix died. That assumption is
+wrong on Linux: SIGHUP is a TTY-hangup signal, not a parent-death signal, and
+Phoenix is not a controlling-terminal session leader. Without
+`PR_SET_CHILD_SUBREAPER`, double-forked daemons (`(cmd &) &`, `nohup`, programs
+that call `setsid`) and any descendant that resets its own pgid will outlive
+Phoenix and leak. With the subreaper bit set, escapees reparent to Phoenix
+rather than init, and the shutdown kill-tree pass cleans them up before exit.
+
+`SIGKILL` at shutdown rather than `SIGTERM` because Phoenix is exiting anyway —
+no point waiting on graceful shutdown handlers when the parent is leaving.
 
 ---
 
@@ -256,7 +333,8 @@ THE SYSTEM SHALL return a structured error with:
 - `error`: stable string identifier (one of `handle_not_found`,
   `handle_cap_reached`, `wait_seconds_out_of_range`,
   `peek_args_mutually_exclusive`, `command_safety_rejected`,
-  `spawn_failed`, `mutually_exclusive_modes`)
+  `spawn_failed`, `mutually_exclusive_modes`,
+  `mode_and_wait_seconds_conflict`)
 - `error_message`: human-readable description suitable for the LLM
 - additional structured fields specific to the error (e.g., `live_handles` for
   cap, `reason` for safety rejection)
@@ -271,6 +349,10 @@ agent) versus tool-level failure (the call could not be processed). Stable
 error identifiers let agents and the eventual error-recovery surfaces match on
 codes rather than parsing prose.
 
+The `mode_and_wait_seconds_conflict` identifier covers the dual-pass case where
+the agent supplies both the deprecated `mode` and the canonical `wait_seconds`
+on the same call (REQ-BASH-010).
+
 ---
 
 ### REQ-BASH-009: No TTY Attached
@@ -278,8 +360,8 @@ codes rather than parsing prose.
 WHEN bash tool spawns a command
 THE SYSTEM SHALL run the command without a TTY
 AND set stdin to `null`
-AND establish the child as a process group leader (for clean kill on the whole
-group)
+AND establish the child as a process group leader (REQ-BASH-007) for clean
+kill on the whole group
 
 THE SYSTEM SHALL describe in its tool documentation that interactive programs,
 TTY-detecting programs (e.g., ones that change behavior under `isatty(stdout)`),
@@ -310,7 +392,12 @@ THE SYSTEM SHALL provide the bash tool schema with these properties:
   offset K. Mutually exclusive with `lines`.
 - `mode` (optional, deprecated): backward-compatible alias for `wait_seconds`
   values: `default` → 30, `slow` → 900, `background` → 0. Logs a deprecation
-  notice in the response. Removed in a future release.
+  notice in the response.
+
+WHEN both `mode` and `wait_seconds` are supplied on the same call
+THE SYSTEM SHALL reject the call with `error:
+"mode_and_wait_seconds_conflict"` and surface the conflicting values
+THE SYSTEM SHALL NOT silently pick one — the precedence rule must be explicit.
 
 THE SYSTEM SHALL enforce: exactly one of `{cmd, peek, wait, kill}` per call.
 WHEN zero or more than one is provided
@@ -320,10 +407,22 @@ provided keys.
 THE SYSTEM SHALL include the conversation's working directory in the tool
 description, as the prior revision did.
 
+THE `mode` parameter is deprecated and SHALL be removed in the second
+Phoenix release after this revision lands. The deprecation notice SHALL state
+this explicitly so callers can migrate; "future release" is not acceptable
+phrasing.
+
 **Rationale:** The schema tells the agent what shapes of call are legal. The
 mutual-exclusion check turns the tool surface into a disjoint set of operations
-rather than a free-form bag of fields. The deprecation alias buys one or two
-releases for callers that still pass `mode`.
+rather than a free-form bag of fields. The dual-pass rejection
+(`mode_and_wait_seconds_conflict`) was added in revision 2 after a panel review
+flagged that the original draft silently picked one value and that older model
+snapshots routinely pass both "to be safe" — opposite intents (`background` =
+wait_seconds 0 vs `wait_seconds: 30` = wait 30s) would be silently resolved.
+
+The committed removal version (second Phoenix release) replaces the prior
+"future release" phrasing, which the spEARS audit flagged as the exact prose
+hand-wave the audit was meant to catch.
 
 ---
 
@@ -420,8 +519,10 @@ WHEN bash tool is invoked
 THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
 AND derive working directory from `ToolContext.working_dir`
 AND use `ToolContext.cancel` for cancellation handling
-AND access the bash handle registry via `ctx.bash_handles()` (analogous to the
-existing `ctx.browser()` pattern for browser sessions)
+AND access the bash handle registry via `ctx.bash_handles()`, which SHALL
+return `Result<Arc<RwLock<ConversationHandles>>, BashHandleError>` matching
+the existing `ctx.browser()` accessor's `async + Result + Arc<RwLock<...>>`
+shape
 
 WHEN bash tool is constructed
 THE SYSTEM SHALL NOT store per-conversation state on the tool itself
@@ -434,9 +535,11 @@ is the response if a handle ID from one conversation is presented in another.
 **Rationale:** The bash tool itself remains stateless — instance reusable,
 context flows through `ToolContext`. The handle table is a shared service
 (like the browser session manager), reached through the context, scoped to the
-conversation. This preserves the "no stale state on the tool" property while
-acknowledging that handles are inherently per-conversation state managed
-elsewhere.
+conversation. The accessor signature was aligned in revision 2 with the
+existing `browser()` shape so all per-conversation tool registries share one
+pattern (`async fn foo(&self) -> Result<Arc<RwLock<T>>, FooError>`); the
+earlier draft proposed an idiosyncratic lifetime-bound `BashHandleScope<'_>`
+that does not compose with `ToolContext: Clone`.
 
 ---
 
@@ -484,7 +587,8 @@ operations so the UI has a sensible display for non-spawn calls.
 | `MAX_WAIT_SECONDS` | 900 | Upper bound on `wait_seconds` per call |
 | `RING_BUFFER_BYTES` | 4 MB | Per-handle live ring buffer size |
 | `LIVE_HANDLE_CAP` | 8 | Per-conversation cap on `running` handles |
-| `KILL_GRACE_SECONDS` | 5 | Grace period after `TERM` before escalating to `KILL` |
-| `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in tombstone after exit |
+| `KILL_RESPONSE_TIMEOUT_SECONDS` | 30 | After signal sent, wait this long for exit before returning `kill_pending_kernel` |
+| `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
+| `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |
 | `DEFAULT_PEEK_LINES` | 200 | Lines returned when peek has no read modifier |
 | `DEFAULT_WAIT_SECONDS` | 30 | Default `wait_seconds` when omitted |

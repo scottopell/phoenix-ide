@@ -7,11 +7,12 @@ process. The execution model is unchanged at the kernel level (fork → exec
 → pipes); what changes from prior revisions is everything around it: output
 goes into a per-handle ring buffer, the agent's call returns when its wait
 window elapses (not when the process is killed), and a handle keeps the
-process addressable for `peek` / `wait` / `kill` for the rest of the
-conversation's lifetime.
+process addressable for `peek` / `wait` / `kill` for the rest of the Phoenix
+process lifetime.
 
 Tmux-backed processes (TTY, persistence across Phoenix restart) are out of
-scope here; see `specs/tmux-integration/`.
+scope here; see `specs/tmux-integration/`. Handles in this spec are
+in-memory only — they do not survive Phoenix restart.
 
 ## Tool Surface (REQ-BASH-002, REQ-BASH-003, REQ-BASH-010)
 
@@ -23,21 +24,21 @@ scope here; see `specs/tmux-integration/`.
   "properties": {
     "cmd":  { "type": "string",  "description": "Shell command to execute via bash -c (spawn)" },
     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 900,
-                      "description": "How long to block for the foreground answer (default 30)" },
+                      "description": "How long to block for the foreground answer (default 30). NOT a kill timeout." },
 
     "peek": { "type": "string", "description": "Handle id to peek" },
     "wait": { "type": "string", "description": "Handle id to wait on" },
     "kill": { "type": "string", "description": "Handle id to kill" },
 
     "signal": { "type": "string", "enum": ["TERM", "KILL"],
-                "description": "Signal to send (kill only); default TERM" },
+                "description": "Signal to send (kill only); default TERM. Sent exactly once; no auto-escalation." },
     "lines":  { "type": "integer", "minimum": 1,
                 "description": "Tail mode: return last N lines" },
     "since":  { "type": "integer", "minimum": 0,
                 "description": "Incremental mode: return lines from offset K" },
 
     "mode": { "type": "string", "enum": ["default", "slow", "background"],
-              "description": "DEPRECATED — alias for wait_seconds; will be removed" }
+              "description": "DEPRECATED — alias for wait_seconds; removed in the second Phoenix release after this revision lands." }
   },
   "oneOf": [
     { "required": ["cmd"]  },
@@ -50,7 +51,8 @@ scope here; see `specs/tmux-integration/`.
 
 The `oneOf` clause makes mutual exclusion structural at the schema level;
 runtime check (`OperationKindMutuallyExclusive` in `bash.allium`) is a belt
-for backends that don't validate `oneOf`.
+for backends that don't validate `oneOf`. Dual-pass `mode + wait_seconds` is
+rejected at runtime via `mode_and_wait_seconds_conflict`.
 
 ### Operation Modes
 
@@ -61,7 +63,8 @@ for backends that don't validate `oneOf`.
 | `wait` | wait | `wait_seconds` | `lines` xor `since` |
 | `kill` | kill | — | `signal` (default TERM) |
 
-`mode` (deprecated) is honoured only on spawn calls. Mapping:
+`mode` (deprecated) is honored only on spawn calls and only when
+`wait_seconds` is absent. Mapping when accepted:
 
 | `mode` value | Equivalent `wait_seconds` |
 |---|---|
@@ -69,8 +72,10 @@ for backends that don't validate `oneOf`.
 | `slow` | 900 |
 | `background` | 0 |
 
-When `mode` is supplied, the response includes a `_deprecation` field:
-`"the 'mode' parameter is deprecated; use 'wait_seconds' instead"`.
+When `mode` is supplied alongside `wait_seconds`, the call fails with
+`mode_and_wait_seconds_conflict` rather than silently picking one. When
+`mode` is supplied alone, the response includes a `_deprecation` field
+stating the removal version explicitly.
 
 ### Description Template (REQ-BASH-009, REQ-BASH-010)
 
@@ -79,21 +84,39 @@ Executes shell commands via bash -c, capturing combined stdout/stderr.
 Bash state changes (working dir, variables, aliases) don't persist between calls.
 
 Modes (exactly one per call):
-  cmd=<string>     spawn a new command. Combine with wait_seconds (default 30):
-                   how long to wait for the foreground answer. If the command
-                   exits in time, you receive the exit code and final output.
-                   If it doesn't, you receive a handle and the process keeps
-                   running — peek, wait, or kill it later.
-  peek=<handle>    return the current ring buffer state for a handle.
+
+  cmd=<string>     Spawn a new command. wait_seconds (default 30) is NOT a
+                   timeout — the process is NEVER killed when wait_seconds
+                   elapses. wait_seconds only controls how long this single
+                   tool call blocks before handing you back a handle so you
+                   can do other work. The process keeps running in the
+                   background until it exits naturally or you call
+                   kill=<handle>. A response with status="still_running"
+                   means the process is alive and will stay alive — peek
+                   it later, wait on it, or kill it explicitly.
+
+  peek=<handle>    Return the current ring buffer state for a handle.
                    Use lines=N for the last N lines, or since=K for lines
-                   after offset K.
-  wait=<handle>    block up to wait_seconds for an existing handle to exit.
-  kill=<handle>    terminate a handle. Default signal is TERM; signal=KILL for
-                   immediate. After KILL_GRACE_SECONDS of TERM not taking,
-                   automatic escalation to KILL.
+                   after offset K. tombstone=true in the response means
+                   the handle's process has finished.
+
+  wait=<handle>    Block up to wait_seconds for an existing handle to exit.
+                   If wait_seconds elapses first, the SAME handle is
+                   returned with status="still_running" — never accumulate
+                   handles by repeated waits.
+
+  kill=<handle>    Terminate a handle. Default signal is TERM; signal=KILL
+                   for immediate. The signal is sent EXACTLY ONCE; this
+                   tool does not auto-escalate TERM to KILL after a grace
+                   period. If your TERM doesn't take, call kill again with
+                   signal=KILL. If the response is status="kill_pending_kernel"
+                   the signal was delivered but the process is in
+                   uninterruptible kernel sleep (frozen mount, kernel bug);
+                   peek/wait again later to observe the eventual exit.
 
 For commands that need a TTY, interactive input, or that should survive
-Phoenix restarts, use the tmux tool instead.
+Phoenix restarts, use the tmux tool instead. Handles from this tool are
+in-memory only and do not survive Phoenix restart.
 
 IMPORTANT: Keep commands concise. The cmd input must be < 60k tokens.
 For complex scripts, write them to a file first and execute the file.
@@ -101,10 +124,14 @@ For complex scripts, write them to a file first and execute the file.
 <pwd>{working_directory}</pwd>
 ```
 
+The negation-based framing (`NOT a timeout` … `is NEVER killed` … `EXACTLY
+ONCE` … `does not auto-escalate`) is load-bearing. Affirmative descriptions
+get pattern-matched into the POSIX `timeout(1)` / `kill PID` priors;
+explicit negations override those priors.
+
 ## ToolContext Extension (REQ-BASH-014)
 
-The `ToolContext` already exposes `browser()` for browser session access. Add
-an analogous accessor for the bash handle registry:
+The `ToolContext` already exposes `browser()` returning `Result<Arc<RwLock<BrowserSession>>, BrowserError>`. The bash handle accessor matches that shape:
 
 ```rust
 #[derive(Clone)]
@@ -117,43 +144,115 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    pub fn bash_handles(&self) -> BashHandleScope<'_> {
-        BashHandleScope::new(&self.bash_handles, &self.conversation_id)
+    pub async fn bash_handles(&self) -> Result<Arc<RwLock<ConversationHandles>>, BashHandleError> {
+        self.bash_handles.get_or_create(&self.conversation_id).await
     }
 }
 ```
 
-`BashHandleScope` is a thin helper that:
-- Uses `conversation_id` as a structural key for every operation, making
-  cross-conversation lookups impossible to express (REQ-BASH-014).
-- Holds whatever locking / sharing strategy the registry uses internally so
-  the tool's call sites stay simple.
+Returning `Arc<RwLock<...>>` rather than a lifetime-bound guard composes
+cleanly with `ToolContext: Clone` and matches the established pattern.
+Per-conversation handles never appear in two places: `get_or_create`
+returns the same `Arc` for the same conversation id.
+
+## Child Process Reaper (REQ-BASH-007)
+
+Phoenix sets up the reaper at startup and runs the kill-tree at shutdown:
+
+```rust
+pub fn install_reaper() {
+    #[cfg(target_os = "linux")]
+    {
+        use libc::{prctl, PR_SET_CHILD_SUBREAPER};
+        let rc = unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        if rc != 0 {
+            tracing::warn!("PR_SET_CHILD_SUBREAPER failed; orphaned descendants will reparent to init");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!("PR_SET_CHILD_SUBREAPER unavailable on this OS; \
+                        descendants that escape their process group may leak on Phoenix exit");
+    }
+}
+
+pub async fn shutdown_kill_tree(registry: &BashHandleRegistry) {
+    let live_pgids: Vec<i32> = registry.snapshot_live_pgids().await;
+    for pgid in &live_pgids {
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    tokio::time::sleep(Duration::from_secs(SHUTDOWN_KILL_GRACE_SECONDS)).await;
+}
+```
+
+Why this matters: the prior draft assumed Phoenix dying would cascade
+SIGHUP to its children. That is wrong on Linux for processes that don't
+share a controlling terminal — SIGHUP is a TTY-hangup signal, not a parent-
+death signal. Without the subreaper bit, double-forked daemons (`(cmd &) &`),
+programs that call `setsid`, and any descendant that resets its own pgid
+will outlive Phoenix and leak. With the subreaper bit set, escapees
+reparent to Phoenix rather than init; the shutdown kill-tree pass then
+SIGKILLs them along with the immediate group.
+
+`install_reaper()` is called from the Phoenix startup sequence before any
+tool routes accept calls. `shutdown_kill_tree()` is wired into the same
+shutdown handler that closes the database and stops the SSE relay.
+
+The kill-tree is `SIGKILL`, not `SIGTERM`, because Phoenix is exiting
+anyway — graceful-shutdown handlers in the children would race with
+Phoenix's exit. `SHUTDOWN_KILL_GRACE_SECONDS` (default 2) is the time
+Phoenix waits for the kernel to deliver the exits before returning control.
 
 ## In-Memory Handle Registry
 
 ```rust
 pub struct BashHandleRegistry {
-    inner: Arc<DashMap<ConversationId, ConversationHandles>>,
-    db: Arc<DbConn>,
+    inner: Arc<DashMap<ConversationId, Arc<RwLock<ConversationHandles>>>>,
 }
 
-struct ConversationHandles {
-    next_id: AtomicU64,
-    live: HashMap<HandleId, Arc<LiveHandle>>,
-    tombstones: HashMap<HandleId, Tombstone>,  // populated lazily from SQLite
+pub struct ConversationHandles {
+    next_id: u64,
+    live: HashMap<HandleId, Arc<Handle>>,
+    tombstones: HashMap<HandleId, Arc<Handle>>,
 }
 
-pub struct LiveHandle {
-    handle_id: HandleId,           // "b-1", "b-2", ...
+pub struct Handle {
+    handle_id: HandleId,
     conversation_id: ConversationId,
     cmd: String,
     started_at: SystemTime,
+    state: RwLock<Arc<HandleState>>,
+    exit_signal: tokio::sync::watch::Sender<Option<ExitState>>,
+    exit_observer: tokio::sync::watch::Receiver<Option<ExitState>>,
+}
+
+pub enum HandleState {
+    Live(LiveData),
+    Tombstoned(Tombstone),
+}
+
+pub struct LiveData {
     pgid: i32,
-    child: Mutex<Option<tokio::process::Child>>,  // taken by the wait task
     ring: Mutex<RingBuffer>,
-    next_offset: AtomicU64,
-    exit_signal: tokio::sync::Notify,             // pulsed on ProcessExited
-    exit_state: OnceLock<ExitState>,              // set once when wait fires
+    next_offset: u64,
+}
+
+pub struct Tombstone {
+    final_cause: FinalCause,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    finished_at: SystemTime,
+    final_tail: Vec<RingLine>,
+    next_offset_at_exit: u64,
+    kill_attempted_at: Option<SystemTime>,
+    kill_signal_sent: Option<KillSignal>,
+}
+
+pub enum FinalCause {
+    Exited,
+    Killed,
+    Signaled,           // external signal (oom-killer, external `kill -9`)
+    KillPendingKernel,  // Phoenix-sent kill, process not yet exited
 }
 
 pub struct RingBuffer {
@@ -167,60 +266,51 @@ pub struct RingLine {
     offset: u64,
     bytes: Bytes,
 }
-
-pub struct Tombstone {
-    handle_id: HandleId,
-    cmd: String,
-    final_cause: FinalCause,
-    exit_code: Option<i32>,
-    duration_ms: u64,
-    finished_at: SystemTime,
-    final_tail: Vec<RingLine>,    // bounded by TOMBSTONE_TAIL_LINES
-    next_offset_at_exit: u64,
-}
-
-pub enum FinalCause {
-    Exited,
-    Killed,
-    LostInRestart { shutdown_marker_ts: SystemTime },
-}
 ```
 
-Tombstones live in memory after demotion (so subsequent peeks are O(1)) and
-are also persisted to SQLite for the `lost_in_restart` scenario. On startup,
-the SQLite store is read into the in-memory map; a record marked
-`lost_in_restart` is materialised as a `Tombstone` with `FinalCause::LostInRestart`
-and an empty `final_tail` (we don't persist live ring contents to SQLite in
-v1; see `BashHandleOutputDiskSpill` deferred entry in `bash.allium`).
+`RwLock<Arc<HandleState>>` rather than `ArcSwap` is the deliberate choice:
+contention is bounded (per-conversation cap is 8 handles, peek is brief,
+demotion is once-per-process), the existing browser pattern uses `RwLock`,
+and `ArcSwap`'s hazard-pointer model has surprising `Drop`-ordering
+behavior that doesn't pull its weight here.
 
-## Spawn Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-007, REQ-BASH-011)
+`tokio::sync::watch::channel<Option<ExitState>>` rather than `Notify` for
+the exit signal: `Notify::notify_waiters` only wakes tasks already parked
+in `notified()`; tasks that call `notified().await` after the notification
+fired block forever. `watch` channels are always observable — a late
+subscriber sees the most recent value. `OnceLock<ExitState>` would also
+work; `watch` was picked because in-flight wait responses use
+`changed().await` naturally.
+
+## Spawn Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011)
 
 ```
 agent → BashTool::run(input, ctx)
-        ├─ parse + validate input (mutual exclusion, ranges)
-        ├─ if mode supplied: map to wait_seconds + set _deprecation
+        ├─ parse + validate input (oneOf, mode-vs-wait_seconds conflict, ranges)
+        ├─ if mode supplied (and wait_seconds absent): map to wait_seconds + set _deprecation
         ├─ if not spawn: dispatch to peek/wait/kill handlers
         │
         └─ spawn path:
             ├─ bash_check::check(cmd) — REQ-BASH-011
             │     ┌─ reject → command_safety_rejected error
             │     └─ ok    → continue
-            ├─ ctx.bash_handles().reserve_slot(conversation_id)
+            ├─ ctx.bash_handles().await? → Arc<RwLock<ConversationHandles>>
+            ├─ ConversationHandles::reserve_slot()
             │     ┌─ count >= LIVE_HANDLE_CAP → handle_cap_reached error
             │     └─ slot reserved with handle_id allocation
-            ├─ persist tombstone shadow (status=running) to SQLite
             ├─ spawn child process (group leader)
-            │     ┌─ spawn fails → spawn_failed error; rollback shadow record
+            │     ┌─ spawn fails → spawn_failed error; release reservation
             │     └─ ok          → child handle in hand
-            ├─ register LiveHandle in conversation map
+            ├─ register Handle with state = Live(LiveData {...})
             ├─ spawn three async tasks:
-            │     reader_stdout: read pipe → ring (with exit_signal pulse on EOF)
+            │     reader_stdout: read pipe → ring (split on '\n', append RingLine)
             │     reader_stderr: read pipe → ring (same)
-            │     waiter:        Child::wait().await → run demotion → pulse exit_signal
+            │     waiter:        Child::wait().await → run demotion → publish exit on watch
             ├─ race tokio::select! between:
-            │     waiter exit_signal → SpawnResponseExited
-            │     sleep(wait_seconds) → SpawnResponseStillRunning
-            └─ return response (handle remains live regardless)
+            │     waiter exit_observer.changed() → SpawnExitsWithinWait
+            │     sleep(wait_seconds) → SpawnExceedsWait
+            │     ctx.cancel.cancelled() → respond_cancel
+            └─ return response (handle remains live regardless of which arm won)
 ```
 
 Pseudocode:
@@ -231,19 +321,17 @@ async fn spawn(&self, cmd: &str, wait_seconds: u64, ctx: &ToolContext) -> ToolOu
         return ToolOutput::error("command_safety_rejected", reason);
     }
 
-    let scope = ctx.bash_handles();
-    let slot = match scope.reserve_slot() {
+    let handles_arc = ctx.bash_handles().await?;
+    let mut handles = handles_arc.write().await;
+    let slot = match handles.reserve_slot() {
         Ok(s) => s,
-        Err(LiveHandles { live }) => {
+        Err(LiveHandlesFull { live }) => {
             return ToolOutput::error_with_fields(
                 "handle_cap_reached",
                 json!({ "cap": LIVE_HANDLE_CAP, "live_handles": live, "hint": HINT_TEXT }),
             );
         }
     };
-
-    let shadow_record = TombstoneRecord::initial(&slot.handle_id, cmd, &slot.conversation_id);
-    self.db.write_tombstone(&shadow_record).await?;
 
     let mut command = tokio::process::Command::new("bash");
     command.args(["-c", cmd])
@@ -256,162 +344,151 @@ async fn spawn(&self, cmd: &str, wait_seconds: u64, ctx: &ToolContext) -> ToolOu
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            self.db.delete_tombstone(&slot.handle_id).await.ok();
-            scope.release_reserved(&slot);
+            handles.release_reserved(&slot);
             return ToolOutput::error("spawn_failed", e.to_string());
         }
     };
 
-    let live = Arc::new(LiveHandle::new(slot, cmd.to_string(), child.id().unwrap() as i32));
-    scope.commit(live.clone(), child);
+    let pgid = child.id().unwrap() as i32;
+    let (exit_tx, exit_rx) = tokio::sync::watch::channel(None);
+    let handle = Arc::new(Handle::new(slot, cmd.to_string(), pgid, exit_tx, exit_rx.clone()));
+    handles.commit_live(handle.clone());
+    drop(handles); // release write lock before spawning long-lived tasks
 
-    // wait window race
+    spawn_reader_tasks(&handle, child.stdout.take(), child.stderr.take());
+    spawn_waiter_task(handle.clone(), child);
+
+    let mut exit_rx = exit_rx;
     tokio::select! {
         biased;
-        _ = ctx.cancel.cancelled() => self.respond_cancel(live).await,
-        _ = live.exit_signal.notified() => self.respond_exited(live, ctx).await,
+        _ = ctx.cancel.cancelled() => self.respond_cancel(handle).await,
+        Ok(_) = exit_rx.changed() => self.respond_exited(handle, ctx).await,
         _ = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            self.respond_still_running(live, wait_seconds * 1000, ctx).await
+            self.respond_still_running(handle, wait_seconds * 1000, ctx).await
         }
     }
 }
 ```
 
-The reader/waiter tasks are spawned inside `scope.commit` so the registry's
-internal locking owns their lifecycle.
-
 ### Reader task
 
 ```rust
-async fn read_loop(pipe: ChildStdout|ChildStderr, ring: Arc<Mutex<RingBuffer>>,
-                   next_offset: Arc<AtomicU64>) {
+async fn read_loop(pipe: ChildStdout|ChildStderr, handle: Arc<Handle>) {
     let mut buf = BytesMut::with_capacity(4096);
     loop {
         match pipe.read_buf(&mut buf).await {
             Ok(0) => break,
-            Ok(_) => split_lines_into_ring(&mut buf, &ring, &next_offset),
+            Ok(_) => split_lines_into_ring(&mut buf, &handle),
             Err(e) => { tracing::debug!(?e, "pipe read error"); break; }
         }
     }
 }
 ```
 
-`split_lines_into_ring` splits incoming bytes on `\n`, assigning each
-complete line a fresh offset and appending it to the ring under the mutex. A
-trailing partial line is held in `buf` until the next read brings the
-newline. On EOF, any held partial bytes are flushed as a final line
-regardless of trailing newline (otherwise output without a final newline
-would be invisible).
+`split_lines_into_ring` splits incoming bytes on `\n`, assigns each
+complete line a fresh offset (under the live ring's mutex), and appends
+to the ring. A trailing partial line is held in `buf` until the next
+read brings the newline. On EOF, any held partial bytes are flushed as a
+final line regardless of trailing newline.
 
 ### Waiter task
 
 ```rust
-async fn wait_for_exit(child: tokio::process::Child, live: Arc<LiveHandle>,
-                       db: Arc<DbConn>) {
-    let exit_status = child.wait().await;  // reaps the zombie
-    let final_cause = match exit_status {
+async fn wait_for_exit(child: tokio::process::Child, handle: Arc<Handle>) {
+    let exit_status = child.wait().await;
+    let final_cause = match &exit_status {
         Ok(s) if s.code().is_some() => FinalCause::Exited,
-        Ok(_) => FinalCause::Killed,         // killed by signal; no code
-        Err(_) => FinalCause::Exited,        // shouldn't happen post-wait
+        Ok(s) if s.signal().is_some() => FinalCause::Signaled,
+        Ok(_) => FinalCause::Killed,
+        Err(_) => FinalCause::Exited,
     };
     let exit_code = exit_status.ok().and_then(|s| s.code());
 
-    let tombstone = live.demote_to_tombstone(final_cause, exit_code);
-    db.update_tombstone(&tombstone).await.ok();
-    live.exit_signal.notify_waiters();
+    let tombstone = handle.demote_to_tombstone(final_cause, exit_code).await;
+    let _ = handle.exit_signal.send(Some(ExitState::from(tombstone)));
 }
 ```
 
-`demote_to_tombstone` runs under the same lock that guards the live ring.
-After the call returns, the live ring is gone and the tombstone is
-populated. `LiveHandle` re-shapes itself by an internal swap; the
-`Arc<LiveHandle>` reference held by the registry now points at a structure
-where the relevant fields read from the tombstone.
+`demote_to_tombstone` acquires the handle's `RwLock<Arc<HandleState>>` for
+write, snapshots the live ring's tail (last `TOMBSTONE_TAIL_LINES`),
+constructs the `Tombstone`, swaps state from `Live` → `Tombstoned`, and
+returns. After the swap, the live ring is dropped and its memory freed.
 
-In Rust, this is cleanest as two Arc-pointed states:
-
-```rust
-pub enum HandleState {
-    Live(LiveData),
-    Tombstoned(Tombstone),
-}
-
-pub struct Handle {
-    handle_id: HandleId,
-    conversation_id: ConversationId,
-    cmd: String,
-    started_at: SystemTime,
-    state: ArcSwap<HandleState>,
-    exit_signal: tokio::sync::Notify,
-}
-```
-
-`ArcSwap` lets the demotion swap state from `Live` to `Tombstoned` without
-holding a write lock against in-flight peek operations.
+The `final_cause` discrimination:
+- `Exited`: the kernel returned a status code (whether 0 or non-zero).
+- `Signaled`: the process was terminated by a signal Phoenix did not send
+  (oom-killer, external `kill -9`). Distinguished because the agent may
+  want to know.
+- `Killed`: Phoenix sent the signal (via the kill operation or the
+  shutdown kill-tree). Recorded by the kill path before the wait
+  completes; the waiter sees the signal-exit and reads the recorded
+  `Killed` cause.
+- `KillPendingKernel`: set transiently by the kill response when the
+  process didn't exit within `KILL_RESPONSE_TIMEOUT_SECONDS`. The waiter
+  task survives this state; if the process eventually exits, the cause
+  is overwritten to `Killed`.
 
 ## Peek (REQ-BASH-003, REQ-BASH-004)
 
 ```rust
 async fn peek(&self, handle_id: &str, read_args: ReadArgs, ctx: &ToolContext) -> ToolOutput {
-    let scope = ctx.bash_handles();
-    let handle = match scope.lookup(handle_id) {
-        Some(h) => h,
-        None => return self.lookup_persisted_or_not_found(handle_id, ctx).await,
+    let handles_arc = ctx.bash_handles().await?;
+    let handles = handles_arc.read().await;
+    let Some(handle) = handles.lookup(handle_id) else {
+        return ToolOutput::error("handle_not_found", json!({ "handle_id": handle_id }));
     };
-    self.shape_response(handle, read_args, /*tombstone_only*/ false).await
+    drop(handles);
+    self.shape_response(handle, read_args).await
 }
 
-fn shape_response(&self, handle: Arc<Handle>, read_args: ReadArgs, ...) -> Response {
-    match handle.state.load().as_ref() {
+async fn shape_response(&self, handle: Arc<Handle>, read_args: ReadArgs) -> ToolOutput {
+    let state_guard = handle.state.read().await;
+    match state_guard.as_ref() {
         HandleState::Live(live) => {
             let ring = live.ring.lock();
             let window = read_window(&ring, &read_args);
-            Response::running(handle.handle_id.clone(), window)
+            ToolOutput::structured("bash", running_response(handle.handle_id.clone(), window))
         }
         HandleState::Tombstoned(t) => {
             let window = read_window_from_tail(&t.final_tail, &read_args);
-            Response::tombstoned(handle.handle_id.clone(), &t, window)
+            ToolOutput::structured("bash", tombstoned_response(handle.handle_id.clone(), t, window))
         }
     }
 }
 ```
 
-`read_window` honours `lines=N` (last N lines from the back) and `since=K`
+`read_window` honors `lines=N` (last N lines from the back) and `since=K`
 (slice from the first line whose offset >= K, up to the tail) and computes
-`truncated_before` from the ring's `start_offset` versus the requested view.
+`truncated_before` from the ring's `start_offset` versus the requested
+view.
 
-`lookup_persisted_or_not_found` covers the case where the handle is not in
-memory but exists in the SQLite shadow store as `lost_in_restart`. The
-record is materialised into an in-memory `Tombstoned` handle (with empty
-`final_tail`) on first lookup so subsequent peeks are O(1).
+A handle that's not in the live or tombstone tables returns
+`handle_not_found` immediately. Cross-conversation handle ids return the
+same response — the lookup is conversation-keyed.
 
 ## Wait (REQ-BASH-003)
-
-`wait` is `peek` with a blocking phase up front:
 
 ```rust
 async fn wait(&self, handle_id: &str, wait_seconds: u64, read_args: ReadArgs,
               ctx: &ToolContext) -> ToolOutput {
-    let scope = ctx.bash_handles();
-    let handle = match scope.lookup(handle_id) {
-        Some(h) => h,
-        None => return self.lookup_persisted_or_not_found(handle_id, ctx).await,
+    let handles_arc = ctx.bash_handles().await?;
+    let handles = handles_arc.read().await;
+    let Some(handle) = handles.lookup(handle_id) else {
+        return ToolOutput::error("handle_not_found", json!({ "handle_id": handle_id }));
     };
+    drop(handles);
 
-    if matches!(*handle.state.load().as_ref(), HandleState::Tombstoned(_)) {
-        return self.shape_response(handle, read_args, true).await;
+    if matches!(*handle.state.read().await.as_ref(), HandleState::Tombstoned(_)) {
+        return self.shape_response(handle, read_args).await;
     }
 
+    let mut exit_rx = handle.exit_observer.clone();
     tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => self.respond_cancel(handle).await,
-        _ = handle.exit_signal.notified() => {
-            // demotion ran; load the now-tombstoned state
-            self.shape_response(handle, read_args, true).await
-        }
+        Ok(_) = exit_rx.changed() => self.shape_response(handle, read_args).await,
         _ = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            // still running — same handle returned
-            self.shape_response(handle, read_args, false).await
+            self.shape_response(handle, read_args).await
                 .with_status_still_running(wait_seconds * 1000)
         }
     }
@@ -425,16 +502,18 @@ accumulates handles by repeated waits.
 
 ```rust
 async fn kill(&self, handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> ToolOutput {
-    let scope = ctx.bash_handles();
-    let handle = match scope.lookup(handle_id) {
-        Some(h) => h,
-        None => return self.lookup_persisted_or_not_found(handle_id, ctx).await,
+    let handles_arc = ctx.bash_handles().await?;
+    let handles = handles_arc.read().await;
+    let Some(handle) = handles.lookup(handle_id) else {
+        return ToolOutput::error("handle_not_found", json!({ "handle_id": handle_id }));
     };
+    drop(handles);
 
-    let live = match handle.state.load().as_ref() {
+    let live = match handle.state.read().await.as_ref() {
         HandleState::Live(live) => live.clone(),
         HandleState::Tombstoned(_) => {
-            return self.shape_response(handle, ReadArgs::default(), true)
+            // already terminal — no signal sent
+            return self.shape_response(handle, ReadArgs::default())
                 .await
                 .with_already_terminal(true);
         }
@@ -442,86 +521,68 @@ async fn kill(&self, handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> 
 
     let pgid = live.pgid;
     send_signal_to_group(pgid, signal.as_libc()).ok();
-    let signal_sent = signal;
 
-    let escalated = tokio::select! {
-        _ = handle.exit_signal.notified() => None,
-        _ = tokio::time::sleep(Duration::from_secs(KILL_GRACE_SECONDS)) => {
-            if signal == KillSignal::TERM {
-                send_signal_to_group(pgid, libc::SIGKILL).ok();
-                handle.exit_signal.notified().await;
-                Some(KillSignal::KILL)
-            } else {
-                handle.exit_signal.notified().await;
-                None
-            }
+    let mut exit_rx = handle.exit_observer.clone();
+    tokio::select! {
+        biased;
+        Ok(_) = exit_rx.changed() => {
+            self.shape_response(handle, ReadArgs::default())
+                .await
+                .with_kill_metadata(signal, /*pending=*/ false)
         }
-    };
-
-    self.shape_response(handle, ReadArgs::default(), true).await
-        .with_kill_metadata(signal_sent, escalated)
+        _ = tokio::time::sleep(Duration::from_secs(KILL_RESPONSE_TIMEOUT_SECONDS)) => {
+            handle.mark_kill_pending_kernel(signal).await;
+            self.shape_response(handle, ReadArgs::default())
+                .await
+                .with_kill_metadata(signal, /*pending=*/ true)
+        }
+    }
 }
 ```
 
-`send_signal_to_group` sends to `-pgid` so all descendants of the original
-shell child are signalled, not just the bash that ran `bash -c "..."`.
+The kill tool does **not** auto-escalate. If the agent passed `signal:
+TERM` and 30 seconds elapse without the process exiting, the response
+returns `status: "kill_pending_kernel"` with `signal_sent: "TERM"` and
+the agent decides whether to call kill again with `signal: "KILL"`.
 
-## SQLite Tombstone Shadow Store (REQ-BASH-007)
+`mark_kill_pending_kernel` updates the live state to record `kill_attempted_at`
+and `kill_signal_sent`. The waiter task survives — if the process
+eventually exits (the kernel finally delivers, the frozen mount comes
+back), `HandleProcessKilled` fires and the handle transitions
+`kill_pending_kernel → killed`. A subsequent peek/wait/kill observes the
+now-terminal state.
 
-```sql
--- migration: bash_tombstones
-CREATE TABLE bash_tombstones (
-    handle_id          TEXT NOT NULL,
-    conversation_id    TEXT NOT NULL,
-    cmd                TEXT NOT NULL,
-    status             TEXT NOT NULL,          -- 'running' | 'exited' | 'killed' | 'lost_in_restart'
-    started_at         INTEGER NOT NULL,       -- unix ms
-    finished_at        INTEGER,                -- unix ms; null while running
-    duration_ms        INTEGER,                -- null while running
-    exit_code          INTEGER,                -- nullable always; signal-killed has no code
-    final_cause        TEXT,                   -- null while running
-    final_tail_json    TEXT,                   -- json array of {offset, bytes_b64}; null while running
-    shutdown_marker_ts INTEGER,                -- only for lost_in_restart
-    PRIMARY KEY (conversation_id, handle_id)
-);
-CREATE INDEX bash_tombstones_status ON bash_tombstones(status);
-```
+`send_signal_to_group(-pgid, ...)` signals the entire process group, not
+just the bash that ran `bash -c "..."`. Combined with the subreaper bit
+set at startup, this catches escapees that reparent to Phoenix.
 
-A separate `phoenix_runtime_state` row records the most recent graceful
-shutdown timestamp; reconciliation reads it for `shutdown_marker_ts`.
+## Hard-Delete Cascade (REQ-BASH-006)
 
-### Reconciliation on startup
+Wired into the bedrock conversation-hard-delete handler:
 
 ```rust
-async fn reconcile_bash_tombstones(db: &DbConn) -> anyhow::Result<()> {
-    let last_shutdown = db.read_runtime_state("phoenix_shutdown_at").await?;
-    let marker = last_shutdown.unwrap_or_else(|| SystemTime::now());
-
-    db.execute("
-        UPDATE bash_tombstones
-        SET status = 'lost_in_restart',
-            shutdown_marker_ts = ?,
-            final_cause = 'lost_in_restart'
-        WHERE status = 'running'
-    ", &[marker.unix_ms()]).await?;
-
-    Ok(())
+async fn cascade_bash_on_delete(registry: &BashHandleRegistry, conv: &ConversationId) {
+    let Some(handles_arc) = registry.remove(conv) else { return; };
+    let handles = handles_arc.write().await;
+    for (_, handle) in handles.live.iter() {
+        if let HandleState::Live(live) = handle.state.read().await.as_ref() {
+            let _ = unsafe { libc::kill(-live.pgid, libc::SIGKILL) };
+        }
+    }
+    // tombstones drop with the registry entry; no SQLite to clean up
 }
 ```
 
-This runs in the bedrock startup sequence before any tool routes accept
-calls, so the very first peek after restart sees consistent state.
+The conversation-hard-delete handler runs this synchronously alongside
+the tmux server kill (`specs/tmux-integration/`) and any other per-
+conversation cleanup. There is no SQLite shadow store to clean up;
+in-memory tombstones are dropped along with the registry entry.
 
-### Hard-delete cascade (REQ-BASH-006)
-
-```sql
--- in conversation hard-delete transaction
-DELETE FROM bash_tombstones WHERE conversation_id = ?;
-```
-
-The matching in-memory cleanup runs during the same delete handler (kill any
-live processes in the conversation, drop the `ConversationHandles` map
-entry).
+> **Bedrock dependency:** the hard-delete cascade requires bedrock to
+> emit a `ConversationHardDeleted` event (or expose the cascade
+> orchestrator). At the time of this revision, bedrock has neither
+> directly. The cascade integration is gated on adding that hook. Track
+> as a separate spec dependency in the bedrock spec.
 
 ## Error Envelope (REQ-BASH-008)
 
@@ -536,7 +597,8 @@ entry).
 All error identifiers (per REQ-BASH-008): `handle_not_found`,
 `handle_cap_reached`, `wait_seconds_out_of_range`,
 `peek_args_mutually_exclusive`, `command_safety_rejected`,
-`spawn_failed`, `mutually_exclusive_modes`.
+`spawn_failed`, `mutually_exclusive_modes`,
+`mode_and_wait_seconds_conflict`.
 
 Error-specific fields (representative subset):
 
@@ -564,6 +626,14 @@ Error-specific fields (representative subset):
   "error": "peek_args_mutually_exclusive",
   "error_message": "specify exactly one of lines or since"
 }
+
+// mode_and_wait_seconds_conflict
+{
+  "error": "mode_and_wait_seconds_conflict",
+  "error_message": "mode is deprecated; do not pass mode and wait_seconds together",
+  "mode": "background",
+  "wait_seconds": 30
+}
 ```
 
 A successful tool call where the *command* failed (non-zero exit) is **not**
@@ -589,6 +659,7 @@ than a real shell command:
 | wait        | `wait b-7 (up to 30s)` |
 | kill (TERM) | `kill b-7 (TERM)` |
 | kill (KILL) | `kill b-7 (KILL)` |
+| kill (pending) | `kill b-7 (TERM, pending)` |
 
 The `display` field is computed by the tool result formatter, not the LLM
 input layer.
@@ -630,28 +701,31 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - Ring buffer line splitting, eviction, offset assignment, `truncated_before`
   computation under various read patterns (lines=N, since=K, both at
   edges).
-- Tombstone demotion: live → tombstoned via `ArcSwap`; tail truncation at
-  `TOMBSTONE_TAIL_LINES`; offset preservation across the boundary.
-- Schema validation: mutual exclusion, `oneOf` enforcement, `mode` aliasing,
-  range checks on `wait_seconds`.
+- Tombstone demotion: live → tombstoned via `RwLock<Arc<HandleState>>`
+  swap; tail truncation at `TOMBSTONE_TAIL_LINES`; offset preservation
+  across the boundary.
+- Schema validation: `oneOf` enforcement, mutual exclusion, `mode` aliasing,
+  `mode_and_wait_seconds_conflict` dual-pass rejection, range checks on
+  `wait_seconds`.
 - Error envelope shapes for each stable error id.
 
 ### Integration tests
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
 - Spawn → wait_seconds elapses → `status: "still_running"` with handle.
 - Repeated `wait` on same handle returns same handle id on each re-timeout.
-- `kill` with TERM that doesn't take → auto-escalates to KILL within
-  `KILL_GRACE_SECONDS`; response shows `signal_escalated: "KILL"`.
+- `kill` with TERM → process exits within timeout → `status: "killed"`,
+  `signal_sent: "TERM"`, no auto-escalation.
+- `kill` with TERM → process does NOT exit within
+  `KILL_RESPONSE_TIMEOUT_SECONDS` → `status: "kill_pending_kernel"`,
+  `signal_sent: "TERM"`. Subsequent `kill` with `signal: KILL` escalates
+  explicitly.
 - `kill` on already-exited handle → `already_terminal: true`, no signal sent.
-- Hard-delete a conversation with live handles → processes killed, SQLite
-  records gone, in-memory entries gone.
-- Phoenix shutdown with live handles → SQLite records remain `running`;
-  startup reconciliation rewrites them to `lost_in_restart` with
-  `shutdown_marker_ts` from the previous shutdown record.
-- Phoenix SIGKILL'd (no graceful shutdown record) → reconciliation uses
-  startup time as the marker.
-- Peek on `lost_in_restart` handle → returns the structured tombstone
-  response (status, marker, no final_tail).
+- External `kill -9` from outside Phoenix → handle reaches `status:
+  "signaled"` (not `killed`).
+- Hard-delete a conversation with live handles → processes killed,
+  in-memory entries gone.
+- Phoenix shutdown with live handles → kill-tree pass SIGKILLs all groups;
+  reaper bit is set so escapees are caught.
 - Cap rejection: spawn while at cap returns `handle_cap_reached` with the
   full live-handles list.
 - Cross-conversation handle access: a handle id from conv A used in conv B
@@ -661,9 +735,8 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - `peek(since=end_offset)` after any sequence of writes never re-reads
   content (offset monotonicity).
 - For any sequence of spawn/peek/wait/kill within `LIVE_HANDLE_CAP`, the
-  in-memory and SQLite state remain consistent (tombstone shadow exists for
-  every handle, terminal state implies tombstone, no live handle has an
-  exited shadow record).
+  in-memory state is consistent (live count never exceeds cap, terminal
+  state implies tombstone, no live handle has both representations).
 - `read_window` over a partially-evicted ring sets `truncated_before=true`
   iff the requested view extends below the current `start_offset`.
 
@@ -680,33 +753,32 @@ verifying the check runs before spawn:
 
 ```
 src/tools/
-├── mod.rs               # Tool registry, trait definitions
 ├── bash.rs              # BashTool dispatch (spawn/peek/wait/kill)
 ├── bash/
-│   ├── handle.rs        # Handle, LiveData, Tombstone, ArcSwap-backed state
+│   ├── handle.rs        # Handle, LiveData, Tombstone, RwLock<Arc<HandleState>> swap
 │   ├── ring.rs          # RingBuffer, RingLine, eviction
 │   ├── registry.rs      # BashHandleRegistry, ConversationHandles
 │   ├── reader.rs        # stdout/stderr → ring tasks
-│   ├── waiter.rs        # Child::wait → demotion task
-│   ├── kill.rs          # signal sending + auto-escalation logic
-│   └── shadow.rs        # SQLite tombstone read/write/reconciliation
+│   ├── waiter.rs        # Child::wait → demotion task; FinalCause discrimination
+│   ├── kill.rs          # signal sending; KILL_RESPONSE_TIMEOUT; kill_pending_kernel transition
+│   └── reaper.rs        # PR_SET_CHILD_SUBREAPER setup + shutdown_kill_tree
 ├── bash_check.rs        # Command safety checks (REQ-BASH-011)
 ├── patch.rs             # PatchTool
 ├── patch/               # Patch tool internals
 └── ...
 ```
 
-`bash.rs` is the dispatch layer: parse input, route to spawn/peek/wait/kill.
-The handle/registry/ring/reader/waiter/kill modules under `bash/` carry the
-state-machine implementation of `bash.allium`.
+The project's clippy convention requires `foo.rs + foo/` rather than
+`foo/mod.rs`; the layout above complies.
 
 ## Migration from Prior Revision
 
 The old `mode` enum survives as an alias on the schema for one or two
-releases. Tool-call SSE wire records from older sessions remain readable —
-their schemas didn't include the new fields, so deserialisation tolerates
-absence. The tool's *response* shape is new: callers (UI, eval harness,
-generated TypeScript via `ts_rs`) must update.
+releases (concretely: removed in the second Phoenix release after this
+revision lands). Tool-call SSE wire records from older sessions remain
+readable — their schemas didn't include the new fields, so deserialization
+tolerates absence. The tool's *response* shape is new: callers (UI, eval
+harness, generated TypeScript via `ts_rs`) must update.
 
 Specifically:
 - Old success response: `{ output: string, exit_code: int }`.
@@ -725,3 +797,31 @@ not an error. No new bedrock state; no new transition. Tool-result handling
 in `runtime/` may need to surface the still-running status to the UI in a
 visually distinct way (e.g., a "running" badge on the tool call card with a
 peek button), but that is a UI concern, not a state-machine concern.
+
+The `subagent` tool propagates the bash schema to nested agents. Any
+schema-passthrough logic that hardcoded the old `mode` enum needs to be
+updated to also accept `wait_seconds` and the operation modes.
+
+### Cross-cutting changes the migration touches
+
+- `src/tools/bash.rs`: rewrite around dispatch + handle ops.
+- `src/tools/bash/`: new module subtree.
+- `src/tools.rs`: ToolContext gains `bash_handles()`; tool registry gains
+  the new bash module wiring.
+- `src/api/wire.rs`: bash response shape changes (SseWireEvent variants
+  that carry tool results).
+- `ui/src/generated/`: regenerated by `./dev.py codegen`.
+- `ui/src/sseSchemas.ts`: valibot schemas for the new shape.
+- `ui/src/components/.../tool-results/...`: new rendering for
+  `still_running`, peek/wait/kill displays.
+- `src/llm/mock.rs`: mocked bash responses in test fixtures need updating.
+- `src/tools/subagent.rs`: schema passthrough.
+- `phoenix-client.py`: any client-side parsing of bash output.
+- `src/db/migrations/`: **no new migration** (we deliberately dropped the
+  SQLite shadow store — see REQ-BASH-006 rationale).
+- `src/runtime/`: hard-delete cascade gains a bash-cleanup step (depends
+  on bedrock surfacing a hard-delete event; see Bedrock dependency above).
+- Phoenix startup: `install_reaper()` call wired into the existing
+  startup sequence.
+- Phoenix shutdown: `shutdown_kill_tree()` wired into the existing
+  shutdown handler.
