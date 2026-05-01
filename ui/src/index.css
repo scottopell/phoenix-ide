@@ -8685,3 +8685,36 @@ html * {
 .annotation-dialog-actions button.primary { background: var(--accent-blue, #3b82f6); border-color: var(--accent-blue, #3b82f6); color: white; }
 .annotation-dialog-actions button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-blue, #3b82f6) 80%, black); }
 .annotation-dialog-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ============================================================
+ * Split-pane prose reader (task 08654)
+ * ≥1280px: ConversationPage's #app becomes a flex container with
+ * .conversation-column on the left and .conversation-viewer-pane on
+ * the right. Below 1280px the prose reader keeps its existing full-
+ * screen overlay (driven by ConversationPage's narrow-desktop early-
+ * return branch).
+ * ============================================================ */
+
+#app.app-split-pane {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  height: 100%;
+  min-height: 0;
+}
+
+#app.app-split-pane > .conversation-column {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+.conversation-viewer-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  border-left: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  overflow: hidden;
+}

@@ -10,6 +10,7 @@ import { InputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
+import { PaneDivider } from '../components/PaneDivider';
 import { QuestionPanel } from '../components/QuestionPanel';
 import {
   useMessageQueue,
@@ -27,7 +28,6 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom } from '../conversation';
-import { PaneDivider } from '../components/PaneDivider';
 import { useResizablePane } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
@@ -103,6 +103,25 @@ function ConversationPageContent() {
   // File explorer context (shared with desktop panel)
   const fileExplorer = useFileExplorer();
   const [isDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
+  // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
+  // Below this we keep the existing full-screen overlay UX; above, the
+  // reader sits beside the chat as a resizable sibling pane.
+  const [isWideDesktop, setIsWideDesktop] = useState(
+    () => window.matchMedia('(min-width: 1280px)').matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1280px)');
+    const handler = (e: MediaQueryListEvent) => setIsWideDesktop(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+  const viewerPane = useResizablePane({
+    key: 'viewer-pane-width',
+    min: 360,
+    max: 1200,
+    defaultSize: 600,
+    collapseThreshold: 280,
+  });
 
   // Mobile-only overlays
   const [showFileBrowser, setShowFileBrowser] = useState(false);
@@ -687,8 +706,10 @@ function ConversationPageContent() {
     );
   }
 
-  // Desktop: prose reader replaces conversation content
-  if (isDesktop && fileExplorer.proseReaderState) {
+  // Narrow desktop (1025-1279px): prose reader replaces conversation
+  // content as a full-screen pane. Wide desktop (≥1280px) renders it as
+  // a split-pane sibling inside the main return below (task 08654).
+  if (isDesktop && !isWideDesktop && fileExplorer.proseReaderState) {
     const prs = fileExplorer.proseReaderState;
     return (
       <div id="app">
@@ -740,8 +761,15 @@ function ConversationPageContent() {
     </div>
   ) : null;
 
+  // Split-pane prose reader: rendered inside `#app` as a sibling of
+  // .conversation-column when wide-desktop and a file is open. CSS in
+  // .app-split-pane (index.css) flexes the children horizontally.
+  const showSplitPaneReader =
+    isDesktop && isWideDesktop && !!fileExplorer.proseReaderState;
+  const splitPanePrs = fileExplorer.proseReaderState;
+
   return (
-    <div id="app">
+    <div id="app" className={showSplitPaneReader ? 'app-split-pane' : undefined}>
       <div className="conversation-column">
       {seedBreadcrumb}
       <MessageList
@@ -1086,6 +1114,31 @@ function ConversationPageContent() {
             patchContext={mobileProseFile.patchContext ?? undefined}
           />
         </Suspense>
+      )}
+      {showSplitPaneReader && splitPanePrs && (
+        <>
+          <PaneDivider
+            orientation="vertical"
+            title="Drag to resize the file viewer • Double-click to collapse"
+            onPointerDown={(e) => viewerPane.startDrag(e, 'x')}
+            onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
+          />
+          <div
+            className="conversation-viewer-pane"
+            style={{ width: viewerPane.collapsed ? 0 : viewerPane.size, flexShrink: 0 }}
+          >
+            <Suspense fallback={null}>
+              <ProseReader
+                filePath={splitPanePrs.path}
+                rootDir={splitPanePrs.rootDir}
+                onClose={handleCloseProseReader}
+                onSendNotes={handleSendNotes}
+                patchContext={splitPanePrs.patchContext ?? undefined}
+                inline
+              />
+            </Suspense>
+          </div>
+        </>
       )}
     </div>
   );
