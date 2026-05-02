@@ -58,3 +58,31 @@ export function useConversationSelectors(slug: string) {
     isLive: atom.connectionState === 'live',
   };
 }
+
+/**
+ * Subscribes to just the active conversation's `cwd`. Returns `null` when
+ * `slug` is null or the conversation hasn't loaded yet.
+ *
+ * `useConversationAtom` re-renders on every atom change — including the
+ * per-token streaming buffer. Callers that only care about cwd would
+ * otherwise re-render on every `sse_token`. `useSyncExternalStore` compares
+ * snapshots with `Object.is`, so returning the same string twice is a
+ * structural no-render.
+ *
+ * Also skips the store entirely when `slug` is null, avoiding a stray
+ * empty-slug atom entry from `getSnapshot('')`.
+ */
+export function useConversationCwd(slug: string | null): string | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => (slug ? store.getSnapshot(slug).conversation?.cwd ?? null : null),
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}

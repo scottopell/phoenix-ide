@@ -4,7 +4,7 @@ import { api } from '../api';
 import type { Conversation } from '../api';
 import { cacheDB } from '../cache';
 import { useResizablePane } from '../hooks';
-import { useConversationAtom } from '../conversation';
+import { useConversationCwd } from '../conversation';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
@@ -107,9 +107,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // that's updated immediately by `sse_conversation_update` events the
   // backend emits when it mutates `cwd`. Atom value wins; poll is the
   // fallback on first render before the SSE init lands. Task 08612.
-  const [activeConvAtom] = useConversationAtom(activeSlug ?? '');
-  const effectiveCwd =
-    activeConvAtom.conversation?.cwd ?? activeConversation?.cwd ?? '/';
+  //
+  // `useConversationCwd` is a selector hook: it only re-renders when
+  // the cwd string actually changes. Subscribing to the full atom would
+  // re-render on every `sse_token` because tokens churn the atom's
+  // `streamingBuffer` field, even though cwd never moves during streaming.
+  const liveCwd = useConversationCwd(activeSlug);
+  const effectiveCwd = liveCwd ?? activeConversation?.cwd ?? '/';
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
