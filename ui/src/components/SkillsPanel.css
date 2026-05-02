@@ -20,6 +20,9 @@
   cursor: pointer;
   user-select: none;
   transition: background 150ms ease;
+  /* If a sibling expand pushes this header during browser auto-scroll,
+   * leave a small margin so the click target stays in view. Task 13002. */
+  scroll-margin-top: 8px;
 }
 
 .skills-panel-header:hover {
@@ -43,8 +46,14 @@
   text-overflow: ellipsis;
 }
 
+/* Constrain expanded panel height with internal scroll so a long
+ * skill list doesn't squeeze the FileTree above (or other expanded
+ * sections below) out of usable space. Mirrors .tasks-panel-body's
+ * containment. Task 13002. */
 .skills-panel-body {
   padding: 0 8px 8px;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
 /* Skill groups */

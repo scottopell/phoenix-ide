@@ -20,6 +20,9 @@
   cursor: pointer;
   user-select: none;
   transition: background 150ms ease;
+  /* Keep header visible during browser auto-scroll on sibling expand.
+   * Task 13002. */
+  scroll-margin-top: 8px;
 }
 
 .mcp-panel-header:hover {
@@ -81,8 +84,13 @@
   to { transform: rotate(360deg); }
 }
 
+/* Constrain expanded panel height with internal scroll so a worktree
+ * with many MCP servers doesn't squeeze the sibling sections off-screen.
+ * Mirrors .tasks-panel-body and .skills-panel-body. Task 13002. */
 .mcp-panel-body {
   padding: 0 12px 8px;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
 .mcp-server-item {

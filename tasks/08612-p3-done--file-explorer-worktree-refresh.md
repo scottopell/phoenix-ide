@@ -1,7 +1,7 @@
 ---
 created: 2026-03-13
 priority: p3
-status: ready
+status: done
 artifact: pending
 ---
 

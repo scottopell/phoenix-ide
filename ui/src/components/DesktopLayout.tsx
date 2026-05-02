@@ -4,6 +4,7 @@ import { api } from '../api';
 import type { Conversation } from '../api';
 import { cacheDB } from '../cache';
 import { useResizablePane } from '../hooks';
+import { useConversationAtom } from '../conversation';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
@@ -98,6 +99,18 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     [conversations, activeSlug],
   );
 
+  // Active-conversation cwd reactivity: the periodic poll
+  // (`loadConversations` every 5s) eventually picks up cwd transitions
+  // (Explore → Work after task approval, complete/abandon revert) but
+  // with up to ~5s of lag, leaving the file explorer stuck on the old
+  // root. Subscribe to the conversation atom for the active slug —
+  // that's updated immediately by `sse_conversation_update` events the
+  // backend emits when it mutates `cwd`. Atom value wins; poll is the
+  // fallback on first render before the SSE init lands. Task 08612.
+  const [activeConvAtom] = useConversationAtom(activeSlug ?? '');
+  const effectiveCwd =
+    activeConvAtom.conversation?.cwd ?? activeConversation?.cwd ?? '/';
+
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
   // panel via isDesktop — children stays in the same tree position throughout.
@@ -129,7 +142,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           <FileExplorerPanel
             collapsed={fileExplorerPane.collapsed}
             onToggle={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
-            rootPath={activeConversation?.cwd || '/'}
+            rootPath={effectiveCwd}
             conversationId={activeConversation?.id}
             showToast={showSuccess}
             branchName={activeConversation?.branch_name}
