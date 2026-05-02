@@ -12,11 +12,14 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import React, { memo, useState, useMemo } from 'react';
+import React, { memo, useState, useMemo, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
+import { api } from '../api';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
+import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
 
@@ -793,6 +796,7 @@ function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
         <span className="subagent-summary-outcome">
           {truncate(resultText, 50)}
         </span>
+        <OpenConversationButton agentId={result.agent_id} />
         <span className="subagent-summary-expand">
           {conversationExpanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
         </span>
@@ -847,6 +851,63 @@ function getOutcomeText(outcome: SubAgentResult['outcome']): string {
   return outcome.error || 'Failed';
 }
 
+const ExternalLinkIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    <polyline points="15 3 21 3 21 9" />
+    <line x1="10" y1="14" x2="21" y2="3" />
+  </svg>
+);
+
+/**
+ * Navigates to a sub-agent's conversation. Sub-agent `agent_id` is the
+ * child conversation_id by construction (runtime/executor.rs invariant);
+ * the route is keyed by slug, so resolve via cacheDB (populated by the
+ * sidebar poll + SSE) with a REST fallback for the rare cache miss.
+ * Renders nothing if the conversation can't be resolved (e.g. deleted).
+ */
+function OpenConversationButton({ agentId }: { agentId: string }) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [missing, setMissing] = useState(false);
+
+  const onClick = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (busy) return;
+    setBusy(true);
+    try {
+      let conv = await cacheDB.getConversation(agentId);
+      if (!conv) {
+        conv = await api.getConversationById(agentId);
+      }
+      if (conv?.slug) {
+        navigate(`/c/${conv.slug}`);
+      } else {
+        setMissing(true);
+      }
+    } catch {
+      setMissing(true);
+    } finally {
+      setBusy(false);
+    }
+  }, [agentId, busy, navigate]);
+
+  if (missing) return null;
+
+  return (
+    <button
+      type="button"
+      className="subagent-open-link"
+      onClick={onClick}
+      title="Open sub-agent conversation"
+      aria-label="Open sub-agent conversation"
+      disabled={busy}
+    >
+      <ExternalLinkIcon />
+    </button>
+  );
+}
+
 /** Single completed sub-agent with expandable result */
 function CompletedSubAgent({ result }: { result: SubAgentResult }) {
   const [expanded, setExpanded] = useState(false);
@@ -861,6 +922,7 @@ function CompletedSubAgent({ result }: { result: SubAgentResult }) {
         <span className="subagent-label" title={result.task}>
           {truncate(result.task, 50)}
         </span>
+        <OpenConversationButton agentId={result.agent_id} />
         {hasLongResult && (
           <span className="subagent-expand-toggle">
             {expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
@@ -904,6 +966,7 @@ function SubAgentStatusImpl({ stateData }: { stateData: AwaitingSubAgentsState }
               {truncate(agent.task, 50)}
             </span>
             <span className="subagent-status">running...</span>
+            <OpenConversationButton agentId={agent.agent_id} />
           </div>
         ))}
       </div>

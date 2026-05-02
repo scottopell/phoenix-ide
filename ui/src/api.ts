@@ -432,6 +432,13 @@ export const api = {
     return resp.json();
   },
 
+  async getConversationById(id: string): Promise<Conversation | null> {
+    const resp = await fetch(`/api/conversations/${id}`);
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error('Failed to get conversation');
+    return (await resp.json()).conversation as Conversation;
+  },
+
   async sendMessage(
     convId: string,
     text: string,
