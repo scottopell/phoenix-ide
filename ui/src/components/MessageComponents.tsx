@@ -12,7 +12,7 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import React, { memo, useState, useMemo, useCallback } from 'react';
+import React, { memo, useState, useMemo, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -870,27 +870,39 @@ function OpenConversationButton({ agentId }: { agentId: string }) {
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
   const [missing, setMissing] = useState(false);
+  // Synchronous guard against fast double-clicks. `busy` state lags by a
+  // render so two clicks fired before React commits would both pass the
+  // guard; a ref flips immediately.
+  const inFlight = useRef(false);
 
   const onClick = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (busy) return;
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy(true);
     try {
-      let conv = await cacheDB.getConversation(agentId);
-      if (!conv) {
-        conv = await api.getConversationById(agentId);
+      const cached = await cacheDB.getConversation(agentId);
+      if (cached?.slug) {
+        navigate(`/c/${cached.slug}`);
+        return;
       }
-      if (conv?.slug) {
-        navigate(`/c/${conv.slug}`);
+      // Cache miss: ask the server. `getConversationSlug` returns null only
+      // for 404 (conversation deleted) — that's the one case where we hide
+      // the button permanently. Transient failures throw and we leave the
+      // button in place so the user can retry.
+      const slug = await api.getConversationSlug(agentId);
+      if (slug) {
+        navigate(`/c/${slug}`);
       } else {
         setMissing(true);
       }
     } catch {
-      setMissing(true);
+      // Transient error — keep the button enabled so the user can retry.
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
-  }, [agentId, busy, navigate]);
+  }, [agentId, navigate]);
 
   if (missing) return null;
 
