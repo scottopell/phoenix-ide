@@ -260,10 +260,43 @@ impl BrowserSession {
 
     /// Create a new browser session.
     ///
-    /// Tries system Chrome first (zero download). On failure, downloads a
-    /// compatible Chromium via `BrowserFetcher` and caches it for future runs.
+    /// Order of attempts:
+    ///   1. `PHOENIX_CHROME_EXECUTABLE` env var — explicit override. Set by
+    ///      `./dev.py check` when it finds a Chromium binary in a cache
+    ///      directory (Playwright `/opt/pw-browsers/`, Puppeteer `~/.cache/`,
+    ///      etc.) so the tests don't have to download. Production users
+    ///      can set this manually to point at any Chrome they trust.
+    ///   2. System Chrome via chromiumoxide's lookup (PATH + standard
+    ///      install paths).
+    ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
     async fn new(conversation_id: &str) -> Result<Self, BrowserError> {
-        // 1. Try system Chrome (no explicit executable — chromiumoxide finds it)
+        // 1. Explicit env-var override — used by the test harness in
+        //    sandboxes where Chrome lives at a non-standard path that
+        //    chromiumoxide's lookup doesn't probe.
+        if let Ok(explicit) = std::env::var("PHOENIX_CHROME_EXECUTABLE") {
+            let explicit_path = PathBuf::from(&explicit);
+            if explicit_path.exists() {
+                tracing::info!(
+                    "Using PHOENIX_CHROME_EXECUTABLE={}",
+                    explicit_path.display()
+                );
+                match Self::launch_and_init(conversation_id, Some(&explicit_path)).await {
+                    Ok(session) => return Ok(session),
+                    Err(e) => {
+                        tracing::warn!(
+                            "PHOENIX_CHROME_EXECUTABLE set but launch failed ({e}); falling through"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "PHOENIX_CHROME_EXECUTABLE={} does not exist; falling through",
+                    explicit_path.display()
+                );
+            }
+        }
+
+        // 2. System Chrome (no explicit executable — chromiumoxide finds it)
         match Self::launch_and_init(conversation_id, None).await {
             Ok(session) => return Ok(session),
             Err(e) => {
