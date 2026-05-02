@@ -810,6 +810,72 @@ def _fetcher_download_reachable() -> bool:
     return resp.status == 200
 
 
+def _outbound_https_reachable() -> bool:
+    """Probe whether outbound HTTPS to public hosts works.
+
+    Some browser tests (currently `test_browser_navigate_remote`)
+    actually navigate to real websites; they need real internet, not
+    just a working Chromium. Sandbox networks often block this. We
+    probe `https://example.com` itself — that's the exact host the
+    test hits, so a green probe means the test will work and a red
+    probe means it would fail for environmental reasons (signal we
+    skip via `PHOENIX_SKIP_NETWORK_TESTS=1`).
+    """
+    import urllib.request as ureq
+    import urllib.error as uerr
+    req = ureq.Request("https://example.com/", method="HEAD")
+    try:
+        resp = ureq.urlopen(req, timeout=1.5)
+    except (uerr.HTTPError, uerr.URLError, OSError):
+        return False
+    return 200 <= resp.status < 400
+
+
+def _classify_browser_env() -> None:
+    """Pick a Chromium binary or auto-skip browser tests.
+
+    Resolution order:
+      1. `PHOENIX_SKIP_BROWSER_TESTS` already set → user opt-out, honour.
+      2. Chromium found via PATH or cache dirs → set
+         `PHOENIX_CHROME_EXECUTABLE` so the test harness launches it
+         directly (bypassing chromiumoxide's lookup + fetcher chain).
+      3. No binary BUT the fetcher CDN is reachable → don't skip,
+         let the auto-fetcher download.
+      4. No binary AND fetcher unreachable → set
+         `PHOENIX_SKIP_BROWSER_TESTS=1` so all browser tests skip
+         instead of failing with launch errors.
+    """
+    if "PHOENIX_SKIP_BROWSER_TESTS" in os.environ:
+        return
+    chrome_path = _find_chromium_binary()
+    if chrome_path is not None:
+        os.environ.setdefault("PHOENIX_CHROME_EXECUTABLE", str(chrome_path))
+        print(f"  i  Chromium: {chrome_path}")
+        return
+    if _fetcher_download_reachable():
+        print("  i  Chromium: not found locally; auto-fetcher will download")
+        return
+    os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
+    print("  i  Chromium: not available — skipping browser tests (no binary, fetcher unreachable)")
+
+
+def _classify_network_env() -> None:
+    """Auto-skip tests that need outbound HTTPS when the env can't make
+    those requests. The probe targets the same host the affected tests
+    hit (currently example.com) so a green probe means the test will
+    work and a red probe means it would fail for environmental reasons.
+
+    Sets `PHOENIX_SKIP_NETWORK_TESTS=1` on probe failure; the Rust
+    `require_network!()` macro reads this and short-circuits each
+    network-dependent test.
+    """
+    if "PHOENIX_SKIP_NETWORK_TESTS" in os.environ:
+        return
+    if not _outbound_https_reachable():
+        os.environ["PHOENIX_SKIP_NETWORK_TESTS"] = "1"
+        print("  i  outbound HTTPS: unavailable — skipping remote-network tests")
+
+
 def cmd_check():
     """Run lint, format check, tests, and task validation in parallel."""
     results = []  # (name, returncode, elapsed, output)
@@ -945,34 +1011,15 @@ def cmd_check():
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     ensure_ui_deps()
 
-    # Probe for Chrome before running the Rust lane. Browser-tool tests
-    # call `BrowserSession::new()` which (1) honours the explicit
-    # `PHOENIX_CHROME_EXECUTABLE` env var, then (2) tries chromiumoxide's
-    # system-Chrome lookup, then (3) falls back to the auto-fetcher.
-    # Sandboxes (cloud, corp network) often have a usable Chromium
-    # cached by Playwright/Puppeteer/etc. but the fetcher's CDN
-    # unreachable from rustls' webpki-roots — so we want to USE the
-    # cached binary if present, and only skip when nothing works.
-    #
-    # Resolution order:
-    #   - PATH binary OR a cached binary in a known location
-    #     → set PHOENIX_CHROME_EXECUTABLE, tests RUN against it
-    #   - No binary AND the fetcher download URL not 200 OK
-    #     → set PHOENIX_SKIP_BROWSER_TESTS=1, tests skip cleanly
-    #   - No binary BUT fetcher reachable
-    #     → don't skip, let chromiumoxide download
-    #   - PHOENIX_SKIP_BROWSER_TESTS already set externally
-    #     → honoured verbatim
-    if "PHOENIX_SKIP_BROWSER_TESTS" not in os.environ:
-        chrome_path = _find_chromium_binary()
-        if chrome_path is not None:
-            os.environ.setdefault("PHOENIX_CHROME_EXECUTABLE", str(chrome_path))
-            print(f"  i  using Chromium at {chrome_path} (PHOENIX_CHROME_EXECUTABLE)")
-        elif _fetcher_download_reachable():
-            print("  i  no Chromium binary found — chromiumoxide auto-fetcher will download. Set PHOENIX_SKIP_BROWSER_TESTS=1 to skip if the download fails.")
-        else:
-            os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
-            print("  i  no Chromium binary found and fetcher CDN unreachable — browser tests will be skipped (PHOENIX_SKIP_BROWSER_TESTS=1)")
+    # Classify the environment up front so the Rust suite skips the
+    # classes of tests that would otherwise produce env-noise failures.
+    # Goal: a red `./dev.py check` always means "code is broken", never
+    # "your network is broken" or "you don't have Chrome". The internal
+    # signal env vars (PHOENIX_CHROME_EXECUTABLE, PHOENIX_SKIP_BROWSER_TESTS,
+    # PHOENIX_SKIP_NETWORK_TESTS) are mechanism — users never need to
+    # set them by hand.
+    _classify_browser_env()
+    _classify_network_env()
 
     # Probe for working commit signing. Some envs configure a custom
     # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that

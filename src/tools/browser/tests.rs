@@ -14,16 +14,27 @@ use tokio_util::sync::CancellationToken;
 
 /// Check if Chrome is available or obtainable.
 ///
-/// With the `_fetcher-rustls-tokio` feature, `BrowserSession::new()` will
-/// auto-download Chromium when no system browser is found. The fetcher's
-/// CDN is unreachable in some restricted envs (cloud sandboxes, corp
-/// networks), where the download fails noisily mid-suite. `dev.py check`
-/// probes for a usable Chrome at startup and sets `PHOENIX_SKIP_BROWSER_TESTS=1`
-/// when neither a local binary nor the fetcher endpoint is reachable; this
-/// function honours that signal so the suite stays green in those envs.
+/// `dev.py check` classifies the environment up front and sets internal
+/// signal env vars so the test suite skips the classes of tests that
+/// would otherwise fail for environmental reasons (no usable Chromium,
+/// no outbound network). This function consults that signal — callers
+/// never need to set anything by hand.
 fn chrome_available() -> bool {
     !matches!(
         std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+        Ok("1") | Ok("true"),
+    )
+}
+
+/// Check if outbound HTTPS to the public internet is available. The
+/// `*_remote` browser tests navigate to real websites (example.com)
+/// and need real network. `dev.py check` probes reachability and sets
+/// `PHOENIX_SKIP_NETWORK_TESTS=1` in restricted envs (no outbound
+/// HTTPS) so those tests skip cleanly instead of producing env-noise
+/// failures.
+fn network_available() -> bool {
+    !matches!(
+        std::env::var("PHOENIX_SKIP_NETWORK_TESTS").as_deref(),
         Ok("1") | Ok("true"),
     )
 }
@@ -33,6 +44,16 @@ macro_rules! require_chrome {
     () => {
         if !chrome_available() {
             eprintln!("Skipping test: Chrome/Chromium not available");
+            return;
+        }
+    };
+}
+
+/// Skip macro for tests that require outbound HTTPS to public hosts.
+macro_rules! require_network {
+    () => {
+        if !network_available() {
+            eprintln!("Skipping test: outbound HTTPS not available in this env");
             return;
         }
     };
@@ -771,6 +792,7 @@ async fn test_browser_session_persistence() {
 #[tokio::test]
 async fn test_browser_navigate_remote() {
     require_chrome!();
+    require_network!();
 
     let (ctx, _manager) = test_context("test-navigate-remote");
 
