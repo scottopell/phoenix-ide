@@ -845,9 +845,9 @@ def _classify_browser_env() -> None:
          `PHOENIX_SKIP_BROWSER_TESTS=1` so all browser tests skip
          instead of failing with launch errors.
 
-    Only the auto-skip branch prints — finding a binary or letting
-    the fetcher do its thing is the happy path and not worth notifying
-    about.
+    Per the cmd_check probe rule: print only when classification
+    changes test behavior. Branches 2 and 3 are silent (happy paths);
+    branch 4 prints because it skips a class of tests.
     """
     if "PHOENIX_SKIP_BROWSER_TESTS" in os.environ:
         return
@@ -870,6 +870,9 @@ def _classify_network_env() -> None:
     Sets `PHOENIX_SKIP_NETWORK_TESTS=1` on probe failure; the Rust
     `require_network!()` macro reads this and short-circuits each
     network-dependent test.
+
+    Per the cmd_check probe rule: silent on the green path; prints
+    only when skipping the network-dependent test class.
     """
     if "PHOENIX_SKIP_NETWORK_TESTS" in os.environ:
         return
@@ -1015,11 +1018,17 @@ def cmd_check():
 
     # Classify the environment up front so the Rust suite skips the
     # classes of tests that would otherwise produce env-noise failures.
-    # Goal: a red `./dev.py check` always means "code is broken", never
-    # "your network is broken" or "you don't have Chrome". The internal
-    # signal env vars (PHOENIX_CHROME_EXECUTABLE, PHOENIX_SKIP_BROWSER_TESTS,
-    # PHOENIX_SKIP_NETWORK_TESTS) are mechanism — users never need to
-    # set them by hand.
+    #
+    # Contract for `./dev.py check`:
+    #   - Red == broken code. Never "your network is broken" or
+    #     "you don't have Chrome installed".
+    #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
+    #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
+    #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
+    #   - Probes print iff classification CHANGES test behavior:
+    #     auto-skipping a class, overriding a config, etc. Happy paths
+    #     (Chromium found, fetcher reachable, signing works, deps
+    #     present) stay silent so a normal-env run is clean.
     _classify_browser_env()
     _classify_network_env()
 
@@ -1029,6 +1038,9 @@ def cmd_check():
     # If a probe commit fails, override `commit.gpgsign=false` for child
     # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
     # not the developer's actual git config.
+    #
+    # Per the print-only-on-behavior-change rule above, the success
+    # branch is silent and only the override branch prints.
     import tempfile as _tempfile
     try:
         with _tempfile.TemporaryDirectory() as _td:
