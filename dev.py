@@ -443,7 +443,7 @@ def start_vite(port: int, phoenix_port: int):
 
     ensure_ui_deps()
 
-    env = os.environ.copy()
+    env = node_env()
     # Pass Phoenix port to Vite for proxy configuration
     env["VITE_API_PORT"] = str(phoenix_port)
     
