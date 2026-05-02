@@ -20,6 +20,9 @@
   cursor: pointer;
   user-select: none;
   transition: background 150ms ease;
+  /* Keep header visible during browser auto-scroll on sibling expand.
+   * Task 13002. */
+  scroll-margin-top: 8px;
 }
 
 .tasks-panel-header:hover {

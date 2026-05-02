@@ -1,7 +1,7 @@
 ---
 created: 2026-05-02
 priority: p3
-status: ready
+status: done
 artifact: ui/src/components/FileExplorer/FileExplorerPanel.tsx
 ---
 
