@@ -154,13 +154,20 @@ mod tests {
                 message_id,
                 display_data,
                 content,
-            } => json!({
-                "type": "message_updated",
-                "sequence_id": sequence_id,
-                "message_id": message_id,
-                "display_data": display_data,
-                "content": content,
-            }),
+                duration_ms,
+            } => {
+                let mut obj = json!({
+                    "type": "message_updated",
+                    "sequence_id": sequence_id,
+                    "message_id": message_id,
+                    "display_data": display_data,
+                    "content": content,
+                });
+                if let Some(ms) = duration_ms {
+                    obj["duration_ms"] = json!(ms);
+                }
+                obj
+            }
             SseEvent::StateChange {
                 sequence_id,
                 state,
@@ -394,6 +401,7 @@ mod tests {
             message_id: "msg-abc".to_string(),
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
+            duration_ms: None,
         };
         assert_parity(&event);
     }
@@ -408,6 +416,7 @@ mod tests {
             content: Some(MessageContent::Agent(vec![ContentBlock::Text {
                 text: "updated".to_string(),
             }])),
+            duration_ms: None,
         };
         assert_parity(&event);
     }
@@ -419,8 +428,29 @@ mod tests {
             message_id: "msg-xyz".to_string(),
             display_data: None,
             content: None,
+            duration_ms: None,
         };
         assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_message_updated_with_duration_ms() {
+        // Typed `duration_ms` must appear in the serialized output.
+        let event = SseEvent::MessageUpdated {
+            sequence_id: 12,
+            message_id: "msg-tool-result".to_string(),
+            display_data: None,
+            content: None,
+            duration_ms: Some(1234),
+        };
+        assert_parity(&event);
+        // Belt + braces: assert the field is actually present in the typed output.
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(
+            typed.get("duration_ms"),
+            Some(&json!(1234)),
+            "duration_ms must be present on the wire"
+        );
     }
 
     #[test]
@@ -515,6 +545,7 @@ mod tests {
             message_id: "msg-abc".to_string(),
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
+            duration_ms: None,
         };
         let axum_event = sse_event_to_axum(event);
         let dbg = format!("{axum_event:?}");

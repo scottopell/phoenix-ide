@@ -264,6 +264,7 @@ export function useConnection({
               messageId: data.message_id,
               ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
               ...(data.content != null && { content: data.content as import('../api').Message['content'] }),
+              ...(data.duration_ms != null && { durationMs: data.duration_ms }),
             });
           });
 

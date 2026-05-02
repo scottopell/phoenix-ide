@@ -66,6 +66,8 @@ export type SSEAction =
       messageId: string;
       displayData?: Record<string, unknown>;
       content?: Message['content'];
+      /** Typed tool-execution duration; present only for tool-result updates. */
+      durationMs?: number;
     }
   | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState }
   | { type: 'sse_agent_done'; sequenceId: number }
@@ -353,10 +355,19 @@ export function conversationReducer(
       return applyIfNewer(atom, 'sse_message_updated', action.sequenceId, (a) => {
         const idx = a.messages.findIndex((m) => m.message_id === action.messageId);
         if (idx < 0) return a;
+        // Merge `durationMs` into `display_data` so `ToolUseBlock` can read it
+        // from a single place regardless of whether the message arrived via
+        // reconnect (DB-persisted `display_data`) or live connection (typed wire
+        // field). Both paths converge here on the client.
+        const durPatch =
+          action.durationMs !== undefined
+            ? { display_data: { ...(a.messages[idx]!.display_data ?? {}), duration_ms: action.durationMs } }
+            : {};
         const merged = {
           ...a.messages[idx]!,
           ...(action.displayData !== undefined && { display_data: action.displayData }),
           ...(action.content !== undefined && { content: action.content }),
+          ...durPatch,
         };
         const newMessages = [...a.messages];
         newMessages[idx] = merged;

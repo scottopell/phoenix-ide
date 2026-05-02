@@ -197,13 +197,15 @@ export const SseMessageDataSchema = v.looseObject({
 /** `message_updated`: in-place mutation of an existing message's mutable
  *  fields. `display_data` and `content` are optional because either one can
  *  change independently — the server sends both keys (possibly `null`) every
- *  time. `sequence_id` is the envelope id; the persisted `message.sequence_id`
- *  is immutable and not repeated here. */
+ *  time. `duration_ms` is present only on tool-result updates; absent on
+ *  all other paths. `sequence_id` is the envelope id; the persisted
+ *  `message.sequence_id` is immutable and not repeated here. */
 export const SseMessageUpdatedDataSchema = v.looseObject({
   sequence_id: v.number(),
   message_id: v.string(),
   display_data: v.nullable(v.unknown()),
   content: v.nullable(v.unknown()),
+  duration_ms: v.exactOptional(v.number()),
 }) satisfies v.GenericSchema<unknown, WireMessageUpdatedData>;
 
 /** `state_change`: conversation phase transition. The inner `state` is a
