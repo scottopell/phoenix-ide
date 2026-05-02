@@ -620,3 +620,53 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// Codex backend — request body shape (`store: false`, default instructions)
+// ============================================================================
+
+#[cfg(test)]
+mod codex_request_shape {
+    use super::*;
+
+    fn user_msg(text: &str) -> LlmMessage {
+        LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// Platform path leaves `store` unset and `instructions` only when system is provided.
+    #[test]
+    fn platform_path_omits_store_and_default_instructions() {
+        let req = make_llm_request(vec![user_msg("hi")]);
+        let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
+        assert_eq!(r.store, None);
+        assert_eq!(r.instructions, None);
+    }
+
+    /// Codex path injects `store: false` and supplies a default instructions string.
+    #[test]
+    fn codex_path_sets_store_false_and_default_instructions() {
+        let req = make_llm_request(vec![user_msg("hi")]);
+        let r = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(r.store, Some(false));
+        assert_eq!(
+            r.instructions.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+    }
+
+    /// User-provided system instructions take precedence over the codex default.
+    #[test]
+    fn codex_path_preserves_user_instructions() {
+        use crate::llm::types::SystemContent;
+        let mut req = make_llm_request(vec![user_msg("hi")]);
+        req.system = vec![SystemContent::new("be terse")];
+        let r = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(r.store, Some(false));
+        assert_eq!(r.instructions.as_deref(), Some("be terse"));
+    }
+}

@@ -551,7 +551,7 @@ pub(crate) struct ResponsesApiRequest {
     model: String,
     pub(crate) input: Vec<ResponsesApiInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
+    pub(crate) instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -561,7 +561,7 @@ pub(crate) struct ResponsesApiRequest {
     /// `store: false` opts out of `OpenAI`'s server-side conversation persistence.
     /// Required for the `ChatGPT`-backend codex bridge; harmless on platform.
     #[serde(skip_serializing_if = "Option::is_none")]
-    store: Option<bool>,
+    pub(crate) store: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -670,5 +670,12 @@ pub(crate) mod test_helpers {
         request: &crate::llm::types::LlmRequest,
     ) -> ResponsesApiRequest {
         super::translate_to_responses_request(api_name, request, false)
+    }
+
+    pub fn translate_to_responses_request_codex(
+        api_name: &str,
+        request: &crate::llm::types::LlmRequest,
+    ) -> ResponsesApiRequest {
+        super::translate_to_responses_request(api_name, request, true)
     }
 }

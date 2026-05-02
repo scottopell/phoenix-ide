@@ -237,13 +237,26 @@ struct CachedToken {
     exp: Option<i64>,
 }
 
+/// State protected by the inner mutex. Holding the mutex through the entire
+/// `fetch()` body serialises concurrent refreshes — the OAuth server rotates
+/// refresh tokens and rejects replays as `refresh_token_reused`, so racing two
+/// refreshes for the same expired token would fail one of them.
+#[derive(Default)]
+struct InnerState {
+    cached: Option<CachedToken>,
+    /// Set by `invalidate()` after a 401; forces the next `fetch()` to skip
+    /// the "JWT exp still in the future" shortcut and rotate via the refresh
+    /// token, so a server-side revocation actually replaces the token.
+    force_refresh: bool,
+}
+
 /// `CredentialSource` impl for `ChatGPT` `OAuth` tokens borrowed from the `Codex` CLI.
 pub struct CodexCredential {
     auth_path: PathBuf,
-    cached: Mutex<Option<CachedToken>>,
-    /// `account_id` cached from the most recent file read. Read once at construction
-    /// and refreshed lazily; the Codex CLI writes it during `codex login` and it
-    /// rarely changes during a session.
+    inner: Mutex<InnerState>,
+    /// `account_id` mirrored from the most recent file read. Updated by
+    /// `fetch()` so per-request callers (`account_id()`) see the current
+    /// account after a `codex login` mid-session.
     account_id: StdMutex<Option<String>>,
 }
 
@@ -251,7 +264,7 @@ impl std::fmt::Debug for CodexCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodexCredential")
             .field("auth_path", &self.auth_path)
-            .field("cached", &"[redacted]")
+            .field("inner", &"[redacted]")
             .field(
                 "account_id",
                 &self.account_id.lock().ok().map(|g| g.is_some()),
@@ -264,7 +277,7 @@ impl CodexCredential {
     pub fn new(auth_path: PathBuf) -> Self {
         Self {
             auth_path,
-            cached: Mutex::new(None),
+            inner: Mutex::new(InnerState::default()),
             account_id: StdMutex::new(None),
         }
     }
@@ -294,14 +307,21 @@ impl CodexCredential {
         self.account_id.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Acquire a valid access token, refreshing if needed. This is the all-in-one
-    /// path that `get()` calls; broken out so it can return a typed error for
-    /// logging while `get()` itself returns `Option<String>` per trait.
+    /// Acquire a valid access token, refreshing if needed. The mutex is held
+    /// for the full body so concurrent callers that arrive with an expired
+    /// token serialise behind a single refresh — the second caller sees the
+    /// freshly-cached token and returns without issuing its own refresh.
+    ///
+    /// `force_refresh` is only cleared after a successful refresh, so a
+    /// transient refresh failure (network blip) does not silently demote the
+    /// next call back to "JWT looks fine, return cached token."
     async fn fetch(&self) -> Result<String, CodexAuthError> {
-        // Fast path: cached token still good.
-        {
-            let cached = self.cached.lock().await;
-            if let Some(c) = cached.as_ref() {
+        let mut state = self.inner.lock().await;
+        let forced = state.force_refresh;
+
+        // Fast path: in-memory cache still good (and not invalidated).
+        if !forced {
+            if let Some(c) = state.cached.as_ref() {
                 if let Some(exp) = c.exp {
                     if now_unix() < exp - REFRESH_SKEW_SECS {
                         return Ok(c.access_token.clone());
@@ -310,31 +330,35 @@ impl CodexCredential {
             }
         }
 
-        // Slow path: re-read file. The CLI may have refreshed for us; if so, use what's there.
+        // Re-read the file. The Codex CLI may have refreshed for us, in which
+        // case we adopt its token without doing our own refresh.
         let mut auth = read_auth_file(&self.auth_path)?;
         let tokens = auth
             .tokens
             .as_mut()
             .ok_or_else(|| CodexAuthError::NoAccessToken(self.auth_path.clone()))?;
 
-        // Update cached account_id from file (covers re-login during session).
         if let Ok(mut guard) = self.account_id.lock() {
             (*guard).clone_from(&tokens.account_id);
         }
 
-        let exp = jwt_exp(&tokens.access_token);
-        if let Some(exp_unix) = exp {
-            if now_unix() < exp_unix - REFRESH_SKEW_SECS {
-                let token = tokens.access_token.clone();
-                *self.cached.lock().await = Some(CachedToken {
-                    access_token: token.clone(),
-                    exp: Some(exp_unix),
-                });
-                return Ok(token);
+        // Skip the file-fresh shortcut when forced — invalidate() is called
+        // after a 401, so even a JWT whose `exp` claim is still future is now
+        // server-side revoked. Going straight to refresh is the only way to
+        // actually rotate.
+        if !forced {
+            if let Some(exp_unix) = jwt_exp(&tokens.access_token) {
+                if now_unix() < exp_unix - REFRESH_SKEW_SECS {
+                    let token = tokens.access_token.clone();
+                    state.cached = Some(CachedToken {
+                        access_token: token.clone(),
+                        exp: Some(exp_unix),
+                    });
+                    return Ok(token);
+                }
             }
         }
 
-        // Refresh.
         let refresh_token = tokens
             .refresh_token
             .clone()
@@ -343,18 +367,7 @@ impl CodexCredential {
 
         tracing::info!("codex_credential: refreshing access token");
         let new_tokens = refresh_tokens(&refresh_token).await?;
-
-        if let Some(at) = new_tokens.access_token {
-            tokens.access_token = at;
-        }
-        if let Some(it) = new_tokens.id_token {
-            tokens.id_token = Some(it);
-        }
-        if let Some(rt) = new_tokens.refresh_token {
-            tokens.refresh_token = Some(rt);
-        }
-        auth.last_refresh = Some(now_iso8601_utc());
-
+        apply_refresh_response(&mut auth, new_tokens);
         write_auth_file(&self.auth_path, &auth)?;
 
         let new_token = auth
@@ -363,12 +376,32 @@ impl CodexCredential {
             .map(|t| t.access_token.clone())
             .unwrap_or_default();
         let new_exp = jwt_exp(&new_token);
-        *self.cached.lock().await = Some(CachedToken {
+        state.cached = Some(CachedToken {
             access_token: new_token.clone(),
             exp: new_exp,
         });
+        // Successful refresh — clear the force_refresh flag set by invalidate().
+        state.force_refresh = false;
         Ok(new_token)
     }
+}
+
+/// Apply a refresh response to an in-memory `AuthFile`, preserving any
+/// non-rotated token fields and stamping `last_refresh`. Pure so it can be
+/// unit-tested without a live OAuth endpoint.
+fn apply_refresh_response(auth: &mut AuthFile, response: RefreshResponse) {
+    if let Some(tokens) = auth.tokens.as_mut() {
+        if let Some(at) = response.access_token {
+            tokens.access_token = at;
+        }
+        if let Some(it) = response.id_token {
+            tokens.id_token = Some(it);
+        }
+        if let Some(rt) = response.refresh_token {
+            tokens.refresh_token = Some(rt);
+        }
+    }
+    auth.last_refresh = Some(now_iso8601_utc());
 }
 
 #[async_trait::async_trait]
@@ -384,13 +417,16 @@ impl CredentialSource for CodexCredential {
     }
 
     async fn invalidate(&self) -> bool {
-        let mut cached = self.cached.lock().await;
-        if cached.is_some() {
-            *cached = None;
-            true
-        } else {
-            false
-        }
+        // Always set force_refresh so the next fetch() rotates via the refresh
+        // token, even if `cached` was empty (e.g. the previous fetch failed
+        // before populating it) or the JWT `exp` is still in the future. The
+        // caller relies on a true return for retry; we return true whenever
+        // force_refresh was newly set OR a cache existed.
+        let mut state = self.inner.lock().await;
+        let had_cache = state.cached.take().is_some();
+        let was_already_forced = state.force_refresh;
+        state.force_refresh = true;
+        had_cache || !was_already_forced
     }
 }
 
@@ -495,6 +531,116 @@ mod tests {
         let (cred, _) = CodexCredential::load(path).unwrap();
         let _ = cred.get().await;
         assert!(cred.invalidate().await);
-        assert!(!cred.invalidate().await); // already cleared
+        // Subsequent invalidate is a no-op once cache is cleared and force_refresh already set.
+        assert!(!cred.invalidate().await);
+    }
+
+    /// After `invalidate()` (e.g. on a 401), the next fetch must rotate via the
+    /// refresh token even if the cached JWT's `exp` claim is still in the
+    /// future — otherwise a server-side revocation would never get replaced.
+    /// We observe the rotation attempt by removing the refresh_token from the
+    /// file: the second `get()` should fail with `NoRefreshToken`, proving we
+    /// reached the refresh branch instead of returning the (revoked) token.
+    #[tokio::test]
+    async fn invalidate_forces_refresh_even_if_jwt_still_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let jwt = fake_jwt(now_unix() + 3600);
+        let body = format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","account_id":"a"}}}}"#
+        );
+        std::fs::write(&path, body).unwrap();
+        let (cred, _) = CodexCredential::load(path).unwrap();
+
+        // First call succeeds via the JWT-still-fresh shortcut.
+        assert_eq!(cred.get().await.as_deref(), Some(jwt.as_str()));
+
+        // After invalidate, force_refresh skips the shortcut and reaches the
+        // refresh path, which fails because no refresh_token is present.
+        cred.invalidate().await;
+        assert!(cred.get().await.is_none());
+        let err = cred.fetch().await.unwrap_err();
+        assert!(matches!(err, CodexAuthError::NoRefreshToken(_)));
+    }
+
+    #[test]
+    fn apply_refresh_response_rotates_all_three_tokens() {
+        let mut auth = AuthFile {
+            auth_mode: Some("chatgpt".into()),
+            tokens: Some(AuthTokens {
+                access_token: "old_at".into(),
+                id_token: Some("old_it".into()),
+                refresh_token: Some("old_rt".into()),
+                account_id: Some("acc".into()),
+                other: Default::default(),
+            }),
+            last_refresh: None,
+            other: Default::default(),
+        };
+        let response = RefreshResponse {
+            access_token: Some("new_at".into()),
+            id_token: Some("new_it".into()),
+            refresh_token: Some("new_rt".into()),
+        };
+        apply_refresh_response(&mut auth, response);
+        let tokens = auth.tokens.unwrap();
+        assert_eq!(tokens.access_token, "new_at");
+        assert_eq!(tokens.id_token.as_deref(), Some("new_it"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new_rt"));
+        // account_id is untouched by refresh.
+        assert_eq!(tokens.account_id.as_deref(), Some("acc"));
+        assert!(auth.last_refresh.is_some());
+    }
+
+    #[test]
+    fn apply_refresh_response_preserves_omitted_fields() {
+        let mut auth = AuthFile {
+            auth_mode: Some("chatgpt".into()),
+            tokens: Some(AuthTokens {
+                access_token: "old_at".into(),
+                id_token: Some("old_it".into()),
+                refresh_token: Some("old_rt".into()),
+                account_id: Some("acc".into()),
+                other: Default::default(),
+            }),
+            last_refresh: None,
+            other: Default::default(),
+        };
+        // Only access_token rotates; id_token and refresh_token preserved.
+        let response = RefreshResponse {
+            access_token: Some("new_at".into()),
+            id_token: None,
+            refresh_token: None,
+        };
+        apply_refresh_response(&mut auth, response);
+        let tokens = auth.tokens.unwrap();
+        assert_eq!(tokens.access_token, "new_at");
+        assert_eq!(tokens.id_token.as_deref(), Some("old_it"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("old_rt"));
+    }
+
+    #[test]
+    fn apply_refresh_response_stamps_last_refresh_even_with_empty_response() {
+        let mut auth = AuthFile {
+            auth_mode: Some("chatgpt".into()),
+            tokens: Some(AuthTokens {
+                access_token: "x".into(),
+                id_token: None,
+                refresh_token: None,
+                account_id: None,
+                other: Default::default(),
+            }),
+            last_refresh: None,
+            other: Default::default(),
+        };
+        apply_refresh_response(
+            &mut auth,
+            RefreshResponse {
+                access_token: None,
+                id_token: None,
+                refresh_token: None,
+            },
+        );
+        assert!(auth.last_refresh.is_some());
     }
 }

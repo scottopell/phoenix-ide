@@ -2,8 +2,12 @@
 
 use super::models::{ApiFormat, ModelSpec};
 use super::types::{LlmRequest, LlmResponse};
-use super::{anthropic, openai, LlmAuth, LlmError, LlmService, TokenChunk, CODEX_BACKEND_URL};
+use super::{
+    anthropic, openai, CodexCredential, LlmAuth, LlmError, LlmService, TokenChunk,
+    CODEX_BACKEND_URL,
+};
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Unified service implementation that dispatches by API format
@@ -20,6 +24,11 @@ pub struct LlmServiceImpl {
     /// `store: false` is set and a default `instructions` value is injected
     /// when the caller did not provide one.
     pub use_codex_backend: bool,
+    /// Concrete `CodexCredential` reference used to source the
+    /// `chatgpt-account-id` header per request — re-read each call so a
+    /// `codex login` against a different account during the session reaches
+    /// the wire instead of being pinned at registry build time.
+    pub codex_credential: Option<Arc<CodexCredential>>,
 }
 
 impl LlmServiceImpl {
@@ -39,6 +48,7 @@ impl LlmServiceImpl {
             openai_base_url,
             custom_headers,
             use_codex_backend: false,
+            codex_credential: None,
         }
     }
 
@@ -50,6 +60,7 @@ impl LlmServiceImpl {
         spec: ModelSpec,
         auth: LlmAuth,
         custom_headers: Vec<(String, String)>,
+        codex_credential: Arc<CodexCredential>,
     ) -> Self {
         Self {
             spec,
@@ -59,6 +70,7 @@ impl LlmServiceImpl {
             openai_base_url: Some(CODEX_BACKEND_URL.to_string()),
             custom_headers,
             use_codex_backend: true,
+            codex_credential: Some(codex_credential),
         }
     }
 }
@@ -113,6 +125,9 @@ impl LlmService for LlmServiceImpl {
 
 impl LlmServiceImpl {
     /// Build the custom headers for a request, auto-injecting `provider` based on the model spec.
+    /// When the codex bridge is in use, the live `chatgpt-account-id` is read
+    /// from the credential at every request so a mid-session account switch
+    /// (re-running `codex login`) reaches the wire.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
         if !headers.is_empty()
@@ -128,6 +143,16 @@ impl LlmServiceImpl {
                     "provider".to_string(),
                     self.spec.provider.header_value().to_string(),
                 ));
+            }
+        }
+        if let Some(ref cred) = self.codex_credential {
+            if let Some(account_id) = cred.account_id() {
+                if !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("chatgpt-account-id"))
+                {
+                    headers.push(("chatgpt-account-id".to_string(), account_id));
+                }
             }
         }
         headers
