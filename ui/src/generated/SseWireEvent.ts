@@ -36,7 +36,13 @@ messages: Array<unknown>, agent_working: boolean, display_state: string, last_se
  * validated against `MessageSchema` and transformed to the UI's
  * `Message` type at the valibot boundary.
  */
-message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null, } | { "type": "state_change", sequence_id: number, state: unknown, display_state: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
+message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null, 
+/**
+ * Tool-execution duration in milliseconds. Present only when the
+ * `MessageUpdated` event is emitted for a tool-result message;
+ * absent (`undefined` on the TS side) for all other update paths.
+ */
+duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, display_state: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
 /**
  * Generated as `unknown` — the existing UI reads only the flat
  * `message` field. Kind-aware consumers can narrow against

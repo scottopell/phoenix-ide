@@ -1659,7 +1659,21 @@ where
                             None,
                         )
                         .await?;
-                    let _ = self.broadcast_tx.send_message(tool_msg);
+                    let _ = self.broadcast_tx.send_message(tool_msg.clone());
+                    // Emit a typed `MessageUpdated` so the live-connection reducer
+                    // can populate `display_data.duration_ms` without parsing the
+                    // opaque `display_data` blob. Reconnect paths read from the
+                    // DB where `duration_ms` is already baked into `display_data`
+                    // by `merge_duration_into_display_data` above.
+                    if result.duration_ms.is_some() {
+                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+                            sequence_id: seq,
+                            message_id: tool_msg.message_id.clone(),
+                            display_data: None,
+                            content: None,
+                            duration_ms: result.duration_ms,
+                        });
+                    }
                 }
             }
         }
@@ -1745,6 +1759,7 @@ where
                 message_id: message_id.clone(),
                 display_data: Some(display_data.clone()),
                 content: Some(updated_content),
+                duration_ms: None,
             });
         } else {
             // No spawn_tool_id - create a standalone summary message

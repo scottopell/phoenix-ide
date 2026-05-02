@@ -236,6 +236,12 @@ pub enum SseWireEvent {
         display_data: Option<Value>,
         #[ts(type = "unknown | null")]
         content: Option<Value>,
+        /// Tool-execution duration in milliseconds. Present only when the
+        /// `MessageUpdated` event is emitted for a tool-result message;
+        /// absent (`undefined` on the TS side) for all other update paths.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        duration_ms: Option<u64>,
     },
     /// Conversation phase transition. `state` is opaque here — the UI has
     /// its own tagged-union validator (`parseConversationState`).
@@ -339,6 +345,7 @@ impl From<SseEvent> for SseWireEvent {
                 message_id,
                 display_data,
                 content,
+                duration_ms,
             } => SseWireEvent::MessageUpdated {
                 sequence_id,
                 message_id,
@@ -347,6 +354,7 @@ impl From<SseEvent> for SseWireEvent {
                 // and serializes to the same JSON shape as a Message's
                 // `content` field; pass through as `Value` here.
                 content: content.map(|c| serde_json::to_value(&c).unwrap_or(Value::Null)),
+                duration_ms,
             },
             SseEvent::StateChange {
                 sequence_id,

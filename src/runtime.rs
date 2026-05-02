@@ -337,6 +337,11 @@ pub enum SseEvent {
         message_id: String,
         display_data: Option<serde_json::Value>,
         content: Option<crate::db::MessageContent>,
+        /// Typed tool-execution duration in milliseconds, emitted alongside
+        /// the tool-result `Message` event so the client can display elapsed
+        /// time without an opaque `display_data` parse. `None` when emitting
+        /// from non-tool-result paths (e.g. sub-agent summary).
+        duration_ms: Option<u64>,
     },
     StateChange {
         sequence_id: i64,
