@@ -96,8 +96,12 @@ function wrapInCodeSpan(content: string): string {
     }
   }
   const fence = '`'.repeat(longest + 1);
-  // CommonMark: if content starts or ends with a backtick, pad with a
-  // space so the delimiter doesn't merge with the content.
+  // CommonMark: if the content begins or ends with a backtick, the
+  // delimiter would visually merge with the content. Padding with a
+  // space prevents that — the renderer strips a single leading/
+  // trailing space inside a code span. Whitespace-only or
+  // whitespace-bracketed content doesn't need this special case (the
+  // renderer's whitespace-collapsing rules already handle it).
   const needsPad = content.startsWith('`') || content.endsWith('`');
   const padded = needsPad ? ` ${content} ` : content;
   return `${fence}${padded}${fence}`;

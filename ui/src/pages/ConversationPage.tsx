@@ -1203,8 +1203,27 @@ function ConversationPageContent() {
           <div
             className="viewer-pane-divider"
             title="Drag to resize the viewer pane • Double-click to collapse"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize viewer pane"
+            tabIndex={0}
             onPointerDown={(e) => viewerPane.startDrag(e, 'x')}
             onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
+            onKeyDown={(e) => {
+              // Keyboard nudge: arrow keys ±32px, Home/End to clamp.
+              // Matches the WAI-ARIA `separator` resize pattern.
+              const STEP = 32;
+              if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                viewerPane.setSize(viewerPane.size + STEP);
+              } else if (e.key === 'ArrowRight') {
+                e.preventDefault();
+                viewerPane.setSize(viewerPane.size - STEP);
+              } else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                viewerPane.setCollapsed(!viewerPane.collapsed);
+              }
+            }}
           />
           <div className="conversation-viewer-pane">
             <Suspense fallback={null}>

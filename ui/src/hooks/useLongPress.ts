@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 
 /**
  * Long-press gesture hook — invokes `onLongPress` when the user holds a
@@ -65,6 +65,12 @@ export function useLongPress<T>(
     },
     [movementThresholdPx, cancel],
   );
+
+  // Clear any pending timer on unmount. Without this, a viewer that
+  // closes mid-press would fire `onLongPress` against unmounted state
+  // — typically a stale closure leading to no-ops or warnings, and
+  // potentially user-visible bugs if the closure mutates context.
+  useEffect(() => cancel, [cancel]);
 
   return { start, move, end: cancel };
 }
