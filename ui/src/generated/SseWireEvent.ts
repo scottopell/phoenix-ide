@@ -30,7 +30,7 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, display_state: string, last_sequence_id: number, context_window_size: number, model_context_window: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, } | { "type": "message", sequence_id: number, 
+messages: Array<unknown>, agent_working: boolean, display_state: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, } | { "type": "message", sequence_id: number, 
 /**
  * See the note on `Init.messages` — the message payload is
  * validated against `MessageSchema` and transformed to the UI's

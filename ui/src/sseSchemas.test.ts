@@ -107,9 +107,9 @@ describe('parseEvent', () => {
 
   describe('init schema', () => {
     // Task 02677 tightened the init schema so that fields the Rust side
-    // always sets (display_state, context_window_size, model_context_window,
-    // breadcrumbs, commits_behind, commits_ahead, project_name) are required
-    // here too. The generated TS type in `./generated/sse` is the source of
+    // always sets (display_state, context_window_size, breadcrumbs,
+    // commits_behind, commits_ahead, project_name) are required here
+    // too. The generated TS type in `./generated/sse` is the source of
     // truth; the schema `satisfies v.GenericSchema<unknown, WireInitData>`
     // would fail to compile if these were still marked optional.
     const validInit = {
@@ -120,7 +120,6 @@ describe('parseEvent', () => {
       last_sequence_id: 0,
       display_state: 'idle',
       context_window_size: 0,
-      model_context_window: 200_000,
       breadcrumbs: [],
       commits_behind: 0,
       commits_ahead: 0,

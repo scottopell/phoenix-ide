@@ -657,6 +657,34 @@ async fn create_conversation(
     } else {
         None
     };
+    // Resolve the model NOW so the conversation record reflects what is
+    // actually being used (instead of leaving NULL and forcing every
+    // consumer to reach for a default).
+    //
+    // - Explicit `req.model` always wins.
+    // - Explore mode with no explicit model: drop to the cheap model for
+    //   the registry's default-provider family (task 08670). Explore is
+    //   read-only planning — Haiku-tier is fast enough for the iterative
+    //   "think out loud, refine" loop and avoids charging Sonnet rates
+    //   for plan iteration. Mirrors the sub-agent path at
+    //   `runtime/executor.rs:914`.
+    // - All other modes default to the registry default.
+    //   Task 08609: a NULL `model` field surfaces as a literal "null" in
+    //   tooltips, so we always persist a concrete id.
+    let registry_default = state.llm_registry.default_model_id();
+    let cheap_for_explore = state
+        .llm_registry
+        .cheap_model_id_for_provider(registry_default);
+    let resolved_model = req.model.as_deref().map_or_else(
+        || {
+            if matches!(conv_mode, crate::db::ConvMode::Explore) {
+                cheap_for_explore
+            } else {
+                registry_default.to_string()
+            }
+        },
+        String::from,
+    );
     let conversation = state
         .runtime
         .db()
@@ -664,9 +692,9 @@ async fn create_conversation(
             &id,
             &slug,
             &effective_cwd,
-            true,                 // user_initiated
-            None,                 // no parent
-            req.model.as_deref(), // selected model
+            true,                          // user_initiated
+            None,                          // no parent
+            Some(resolved_model.as_str()), // resolved model (default if not explicit)
             project_id.as_deref(),
             &conv_mode,
             desired_base_branch,
@@ -1182,13 +1210,6 @@ async fn stream_conversation(
         .map_err(AppError::Internal)?;
     let broadcast_rx = handle.broadcast_tx.subscribe();
 
-    // Get model's context window for percentage calculation
-    let model_id = conversation
-        .model
-        .as_deref()
-        .unwrap_or(state.llm_registry.default_model_id());
-    let model_context_window = state.llm_registry.context_window(model_id);
-
     // Compute initial commits_behind for Work conversations.
     // Extract the git info we need for both the init value and the polling task.
     let work_git_info = match &conversation.conv_mode {
@@ -1265,7 +1286,6 @@ async fn stream_conversation(
         display_state: conversation.state.display_state().as_str().to_string(),
         last_sequence_id: init_seq,
         context_window_size,
-        model_context_window,
         breadcrumbs,
         commits_behind: initial_commits_behind,
         commits_ahead: initial_commits_ahead,
@@ -2815,12 +2835,6 @@ async fn shared_sse_stream(
         .map_err(AppError::Internal)?;
     let broadcast_rx = handle.broadcast_tx.subscribe();
 
-    let model_id = conversation
-        .model
-        .as_deref()
-        .unwrap_or(state.llm_registry.default_model_id());
-    let model_context_window = state.llm_registry.context_window(model_id);
-
     let project_name = if let Some(ref project_id) = conversation.project_id {
         state.db.get_project(project_id).await.ok().and_then(|p| {
             std::path::Path::new(&p.canonical_path)
@@ -2842,7 +2856,6 @@ async fn shared_sse_stream(
         display_state: conversation.state.display_state().as_str().to_string(),
         last_sequence_id: init_seq,
         context_window_size,
-        model_context_window,
         breadcrumbs,
         commits_behind: 0,
         commits_ahead: 0,

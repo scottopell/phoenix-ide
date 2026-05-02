@@ -310,8 +310,6 @@ pub enum SseEvent {
         last_sequence_id: i64,
         /// Current context window usage in tokens
         context_window_size: u64,
-        /// Model's maximum context window in tokens (for calculating percentage)
-        model_context_window: usize,
         breadcrumbs: Vec<SseBreadcrumb>,
         /// How many commits the base branch is ahead of this conversation's task branch.
         /// Only populated for Work-mode conversations. 0 means up-to-date or not applicable.

@@ -359,7 +359,7 @@ export function StateBar({
                   {canPickModel ? (
                     <button
                       className="conv-model conv-model--button"
-                      title={`Model: ${conversation.model} (click to change)`}
+                      title={`Model: ${conversation.model ?? 'default'} (click to change)`}
                       onClick={handleModelTriggerClick}
                       aria-haspopup="listbox"
                       aria-expanded={pickerOpen}
@@ -369,7 +369,7 @@ export function StateBar({
                       <span className="conv-model-caret" aria-hidden="true">&#9662;</span>
                     </button>
                   ) : (
-                    <span className="conv-model" title={`Model: ${conversation.model}`}>
+                    <span className="conv-model" title={`Model: ${conversation.model ?? 'default'}`}>
                       {modelAbbrev}
                       {is1m && <span className="model-1m-badge">1M</span>}
                     </span>
