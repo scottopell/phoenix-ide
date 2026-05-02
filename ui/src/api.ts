@@ -432,11 +432,20 @@ export const api = {
     return resp.json();
   },
 
-  async getConversationById(id: string): Promise<Conversation | null> {
-    const resp = await fetch(`/api/conversations/${id}`);
+  /**
+   * Resolves a conversation id to its current slug. Returns null when the
+   * conversation does not exist (404). Other errors throw so callers can
+   * distinguish "deleted" from "transient failure" — the latter is
+   * retryable.
+   *
+   * Uses the lightweight `/slug` endpoint instead of the full conversation
+   * GET to avoid pulling the entire message history just to read one field.
+   */
+  async getConversationSlug(id: string): Promise<string | null> {
+    const resp = await fetch(`/api/conversations/${id}/slug`);
     if (resp.status === 404) return null;
-    if (!resp.ok) throw new Error('Failed to get conversation');
-    return (await resp.json()).conversation as Conversation;
+    if (!resp.ok) throw new Error('Failed to resolve conversation slug');
+    return (await resp.json()).slug as string;
   },
 
   async sendMessage(

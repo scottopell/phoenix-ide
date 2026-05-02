@@ -72,6 +72,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/new", post(create_conversation))
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
+        .route("/api/conversations/:id/slug", get(get_conversation_slug))
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
@@ -923,6 +924,24 @@ async fn get_conversation(
         display_state: conversation.state.display_state().as_str().to_string(),
         context_window_size,
     }))
+}
+
+/// `GET /api/conversations/:id/slug` — minimal lookup that returns just the
+/// current slug. The full `get_conversation` payload includes every message
+/// in the conversation, which is wasteful when a caller only needs to
+/// resolve `agent_id` → slug for navigation (sub-agent links, task 08533).
+async fn get_conversation_slug(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "slug": conversation.slug })))
 }
 
 async fn get_system_prompt(
