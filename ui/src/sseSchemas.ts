@@ -176,7 +176,6 @@ export const SseInitDataSchema = v.looseObject({
   last_sequence_id: v.number(),
   display_state: v.string(),
   context_window_size: v.number(),
-  model_context_window: v.number(),
   breadcrumbs: v.array(SseBreadcrumbSchema),
   commits_behind: v.number(),
   commits_ahead: v.number(),

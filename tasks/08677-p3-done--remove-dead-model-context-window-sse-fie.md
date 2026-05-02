@@ -1,7 +1,7 @@
 ---
 created: 2026-04-21
 priority: p3
-status: ready
+status: done
 artifact: src/runtime.rs
 ---
 

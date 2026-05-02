@@ -152,7 +152,6 @@ describe('SharePage SSE schema validation', () => {
         last_sequence_id: 0,
         display_state: 'idle',
         context_window_size: 0,
-        model_context_window: 200_000,
         breadcrumbs: [],
         commits_behind: 0,
         commits_ahead: 0,
