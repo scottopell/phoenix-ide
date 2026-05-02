@@ -55,15 +55,21 @@ const ChevronUpIcon = () => (
 const REMARK_PLUGINS = [remarkGfm];
 
 /** Format a tool execution duration for display in the tool block header.
- *  < 60s   -> "4s" or "3.2s" (one decimal for < 10s)
- *  >= 60s  -> "1m 4s" (seconds omitted when 0: "2m")
+ *  < 10s   -> "3.2s" (one decimal place)
+ *  < 60s   -> "42s"
+ *  >= 60s  -> "1m 4s" (seconds part omitted when 0: "2m")
+ *
+ *  Uses integer millisecond arithmetic so boundary values are exact:
+ *  59 999 ms -> "59s", 60 000 ms -> "1m", 119 999 ms -> "1m 59s".
  */
 function formatToolDuration(ms: number): string {
-  const s = ms / 1000;
-  if (s < 10) return `${s.toFixed(1)}s`;
-  if (s < 60) return `${Math.round(s)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s % 60);
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 10) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const m = Math.floor(totalSeconds / 60);
+  const rem = totalSeconds % 60;
   return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
 }
 

@@ -326,6 +326,41 @@ describe('parseEvent', () => {
       expect(res.ok).toBe(true);
     });
 
+    it('accepts update with duration_ms present', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseMessageUpdatedDataSchema,
+        makeEvent({
+          sequence_id: 8,
+          message_id: 'msg-tool',
+          display_data: null,
+          content: null,
+          duration_ms: 1234,
+        }),
+        'message_updated',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.data.duration_ms).toBe(1234);
+    });
+
+    it('accepts update with duration_ms absent (non-tool paths)', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseMessageUpdatedDataSchema,
+        makeEvent({
+          sequence_id: 9,
+          message_id: 'msg-subagent',
+          display_data: { type: 'subagent_summary' },
+          content: null,
+        }),
+        'message_updated',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.data.duration_ms).toBeUndefined();
+    });
+
     it('rejects update missing message_id', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();

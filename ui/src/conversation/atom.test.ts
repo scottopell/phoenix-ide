@@ -535,6 +535,59 @@ describe('conversationReducer', () => {
       expect(twice).toBe(once); // applyIfNewer returned atom unchanged
       expect((twice.messages[0]!.display_data as { type: string }).type).toBe('after');
     });
+
+    it('merges durationMs into display_data, preserving existing keys', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        message_type: 'tool',
+        display_data: { bash: [{ tool_use_id: 'abc', display: 'ls' }] } as Record<string, unknown>,
+        content: { tool_use_id: 'abc', content: 'file.txt', is_error: false } as Message['content'],
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 20,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 21,
+        messageId: original.message_id,
+        durationMs: 4567,
+      });
+
+      const dd = next.messages[0]!.display_data as Record<string, unknown>;
+      // duration_ms was injected
+      expect(dd['duration_ms']).toBe(4567);
+      // existing keys survive
+      expect(dd['bash']).toEqual([{ tool_use_id: 'abc', display: 'ls' }]);
+      expect(next.lastSequenceId).toBe(21);
+    });
+
+    it('durationMs update is gated by sequenceId (replay guard)', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        message_type: 'tool',
+        display_data: null,
+        content: { tool_use_id: 'abc', content: 'ok', is_error: false } as Message['content'],
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastSequenceId: 30,
+      };
+
+      // Stale sequenceId — should be rejected
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 29,
+        messageId: original.message_id,
+        durationMs: 9999,
+      });
+
+      expect(next).toBe(atom); // applyIfNewer returned unchanged
+      expect(next.messages[0]!.display_data).toBeNull();
+    });
   });
 
   describe('sse_state_change', () => {
