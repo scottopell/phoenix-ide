@@ -1,7 +1,7 @@
 ---
 created: 2026-04-08
 priority: p2
-status: ready
+status: wont-do
 artifact: ui/src/components/Sidebar.tsx
 ---
 
@@ -49,3 +49,40 @@ Each collapsible section should:
 - [ ] Expanded sections have max-height with internal scroll
 - [ ] All sections (Files, Skills, MCP, Tasks) behave consistently
 - [ ] Sidebar remains usable with multiple sections expanded
+
+---
+
+## Closed wont-do (2026-05-02)
+
+This task is built on a wrong reading of the architecture and the
+artifact path is incorrect. Replaced by two narrower tasks (filed
+when this one was closed):
+
+- **Scroll-containment fix** — FileExplorerPanel: contain expanded
+  Skills / Tasks panels with internal scroll so multi-section
+  expansion doesn't push the FileTree (and the click target) out of
+  view. This is the real UX bug behind "issue #2" of this task.
+- **Files-as-peer (design)** — should the file tree become a
+  collapsible peer of Skills / MCP / Tasks instead of being the
+  panel's primary content? That's the steel-manned read of "issue
+  #1" but it's a real UX design decision that needs your call before
+  any implementation.
+
+### Why the premise was wrong
+
+This task said: "The sidebar has collapsible sections for Skills, MCP,
+and Tasks, but no equivalent for Files. The file explorer is a
+separate panel (FileExplorerPanel) that lives outside the sidebar."
+
+Reality:
+- `Sidebar.tsx` is the LEFT column — conversation list, projects,
+  theme toggle. It has no Skills/MCP/Tasks sections.
+- `FileExplorerPanel.tsx` is the MIDDLE column. It contains the
+  FileTree (the "Files" section, primary content with header
+  literally labeled "Files") AND the Skills/MCP/Tasks panels below.
+- So Skills/MCP/Tasks aren't "in the sidebar" — they're nested in
+  the file explorer panel. Files isn't missing — it's the panel
+  itself.
+
+The artifact path on the original task (`ui/src/components/Sidebar.tsx`)
+also points at the wrong file.
