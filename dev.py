@@ -844,19 +844,21 @@ def _classify_browser_env() -> None:
       4. No binary AND fetcher unreachable → set
          `PHOENIX_SKIP_BROWSER_TESTS=1` so all browser tests skip
          instead of failing with launch errors.
+
+    Only the auto-skip branch prints — finding a binary or letting
+    the fetcher do its thing is the happy path and not worth notifying
+    about.
     """
     if "PHOENIX_SKIP_BROWSER_TESTS" in os.environ:
         return
     chrome_path = _find_chromium_binary()
     if chrome_path is not None:
         os.environ.setdefault("PHOENIX_CHROME_EXECUTABLE", str(chrome_path))
-        print(f"  i  Chromium: {chrome_path}")
         return
     if _fetcher_download_reachable():
-        print("  i  Chromium: not found locally; auto-fetcher will download")
         return
     os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
-    print("  i  Chromium: not available — skipping browser tests (no binary, fetcher unreachable)")
+    print("  i  Chromium unavailable — skipping browser tests")
 
 
 def _classify_network_env() -> None:
