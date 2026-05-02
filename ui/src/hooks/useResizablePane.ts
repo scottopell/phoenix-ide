@@ -24,6 +24,10 @@ export interface UseResizablePaneResult {
   setCollapsed: (value: boolean) => void;
   /** Restore to last remembered non-collapsed size */
   expandFromCollapsed: () => void;
+  /** Imperatively set the size in px (clamped to [min, max]). Used by
+   *  keyboard resize handlers — arrow-key nudges from a focused
+   *  separator role. */
+  setSize: (px: number) => void;
 }
 
 function readNumber(key: string, fallback: number): number {
@@ -176,5 +180,13 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
     setSize((s) => (s < defaultSize ? defaultSize : s));
   }, [defaultSize]);
 
-  return { size, collapsed, startDrag, setCollapsed, expandFromCollapsed };
+  const setSizeClamped = useCallback(
+    (px: number) => {
+      setSize(clamp(px));
+      setCollapsedState(false);
+    },
+    [clamp],
+  );
+
+  return { size, collapsed, startDrag, setCollapsed, expandFromCollapsed, setSize: setSizeClamped };
 }

@@ -231,19 +231,28 @@ export function ProseReader({
     return undefined;
   }, [highlightedLine]);
 
-  // Cmd/Ctrl+A: select all in viewer body
+  // Cmd/Ctrl+A: select all in viewer body. Guard against stealing the
+  // shortcut from editable elements (annotation textarea, chat input,
+  // any other input/textarea/contentEditable that happens to be open) —
+  // those should keep their native "select all in field" behaviour.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
-        const container = contentRef.current;
-        if (container) {
-          e.preventDefault();
-          const range = document.createRange();
-          range.selectNodeContents(container);
-          const sel = window.getSelection();
-          sel?.removeAllRanges();
-          sel?.addRange(range);
+      if (!((e.ctrlKey || e.metaKey) && e.key === 'a')) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) {
+          return;
         }
+      }
+      const container = contentRef.current;
+      if (container) {
+        e.preventDefault();
+        const range = document.createRange();
+        range.selectNodeContents(container);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
