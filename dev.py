@@ -751,6 +751,65 @@ def cmd_status():
             pass
 
 
+def _find_chromium_binary() -> Path | None:
+    """Locate a usable Chromium/Chrome binary, in this order:
+
+    1. `PATH` (`google-chrome`, `chromium`, `chromium-browser`, `chrome`).
+    2. Playwright's standard install dir at `/opt/pw-browsers/chromium-*/chrome-linux/chrome`.
+    3. Playwright's per-user cache at `~/.cache/ms-playwright/chromium-*/chrome-linux/chrome`.
+    4. Puppeteer's per-user cache at `~/.cache/puppeteer/chrome/*/chrome-linux*/chrome`.
+    5. chromiumoxide's own cache at `~/.local/share/chromiumoxide/`.
+
+    Returns the first existing executable, or `None`. The result flows
+    into `PHOENIX_CHROME_EXECUTABLE` so `BrowserSession::new()` can use
+    the binary directly without invoking the fetcher.
+    """
+    import shutil
+    for name in ("google-chrome", "chromium", "chromium-browser", "chrome", "google-chrome-stable"):
+        p = shutil.which(name)
+        if p:
+            return Path(p)
+    home = Path.home()
+    glob_roots: list[tuple[Path, str]] = [
+        (Path("/opt/pw-browsers"), "chromium-*/chrome-linux/chrome"),
+        (home / ".cache" / "ms-playwright", "chromium-*/chrome-linux/chrome"),
+        (home / ".cache" / "puppeteer" / "chrome", "*/chrome-linux*/chrome"),
+        (home / ".local" / "share" / "chromiumoxide", "*/chrome-linux/chrome"),
+        (home / ".local" / "share" / "chromiumoxide", "chrome-linux/chrome"),
+    ]
+    for root, pattern in glob_roots:
+        if not root.is_dir():
+            continue
+        for hit in sorted(root.glob(pattern)):
+            if hit.is_file() and os.access(hit, os.X_OK):
+                return hit
+    return None
+
+
+def _fetcher_download_reachable() -> bool:
+    """Probe whether chromiumoxide's fetcher could reach its CDN.
+
+    The fetcher first hits a JSON manifest on `googlechromelabs.github.io`
+    then downloads the binary from `storage.googleapis.com`. We HEAD the
+    manifest and require 200 OK — any other response (403/404/cert
+    failure/timeout) means the fetcher path is unreliable in this env
+    and the test harness should skip rather than waste a minute hitting
+    the same wall the Rust-side rustls TLS stack will hit.
+
+    1.5s budget is enough on a healthy network and short enough not to
+    slow `check` when offline.
+    """
+    import urllib.request as ureq
+    import urllib.error as uerr
+    url = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json"
+    req = ureq.Request(url, method="HEAD")
+    try:
+        resp = ureq.urlopen(req, timeout=1.5)
+    except (uerr.HTTPError, uerr.URLError, OSError):
+        return False
+    return resp.status == 200
+
+
 def cmd_check():
     """Run lint, format check, tests, and task validation in parallel."""
     results = []  # (name, returncode, elapsed, output)
@@ -886,43 +945,34 @@ def cmd_check():
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     ensure_ui_deps()
 
-    # Probe for Chrome before running the Rust lane. The browser-tool tests
-    # rely on chromiumoxide's auto-fetcher to download Chromium when no
-    # local binary is present, and the fetcher's CDN is unreachable in
-    # restricted envs (cloud sandboxes, corp networks). Honour an externally-
-    # set PHOENIX_SKIP_BROWSER_TESTS verbatim. Otherwise: only auto-skip when
-    # BOTH (a) no Chrome binary is on PATH AND (b) the fetcher's CDN is
-    # unreachable — so normal dev/CI envs without preinstalled Chrome still
-    # exercise the fetcher path that the comment in chrome_available()
-    # describes.
+    # Probe for Chrome before running the Rust lane. Browser-tool tests
+    # call `BrowserSession::new()` which (1) honours the explicit
+    # `PHOENIX_CHROME_EXECUTABLE` env var, then (2) tries chromiumoxide's
+    # system-Chrome lookup, then (3) falls back to the auto-fetcher.
+    # Sandboxes (cloud, corp network) often have a usable Chromium
+    # cached by Playwright/Puppeteer/etc. but the fetcher's CDN
+    # unreachable from rustls' webpki-roots — so we want to USE the
+    # cached binary if present, and only skip when nothing works.
+    #
+    # Resolution order:
+    #   - PATH binary OR a cached binary in a known location
+    #     → set PHOENIX_CHROME_EXECUTABLE, tests RUN against it
+    #   - No binary AND the fetcher download URL not 200 OK
+    #     → set PHOENIX_SKIP_BROWSER_TESTS=1, tests skip cleanly
+    #   - No binary BUT fetcher reachable
+    #     → don't skip, let chromiumoxide download
+    #   - PHOENIX_SKIP_BROWSER_TESTS already set externally
+    #     → honoured verbatim
     if "PHOENIX_SKIP_BROWSER_TESTS" not in os.environ:
-        import shutil as _shutil
-        _chrome_bins = ["google-chrome", "chromium", "chromium-browser", "chrome", "google-chrome-stable"]
-        _has_local_chrome = any(_shutil.which(b) for b in _chrome_bins)
-        if not _has_local_chrome:
-            # Quick probe of the chromiumoxide fetcher endpoint
-            # (googlechromelabs.github.io hosts the version manifest the
-            # fetcher uses). 1.5s budget is enough for a healthy network
-            # and short enough to not slow `check` when offline.
-            import urllib.request as _ureq
-            import urllib.error as _uerr
-            _fetcher_reachable = False
-            try:
-                _ureq.urlopen(
-                    "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json",
-                    timeout=1.5,
-                )
-                _fetcher_reachable = True
-            except _uerr.HTTPError:
-                # Any HTTP response means we reached the host.
-                _fetcher_reachable = True
-            except Exception:
-                _fetcher_reachable = False
-            if not _fetcher_reachable:
-                os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
-                print("  i  no Chrome on PATH and fetcher CDN unreachable — browser tests will be skipped (PHOENIX_SKIP_BROWSER_TESTS=1)")
-            else:
-                print("  i  no Chrome on PATH — browser tests will rely on chromiumoxide's auto-fetcher; set PHOENIX_SKIP_BROWSER_TESTS=1 to skip if the download fails")
+        chrome_path = _find_chromium_binary()
+        if chrome_path is not None:
+            os.environ.setdefault("PHOENIX_CHROME_EXECUTABLE", str(chrome_path))
+            print(f"  i  using Chromium at {chrome_path} (PHOENIX_CHROME_EXECUTABLE)")
+        elif _fetcher_download_reachable():
+            print("  i  no Chromium binary found — chromiumoxide auto-fetcher will download. Set PHOENIX_SKIP_BROWSER_TESTS=1 to skip if the download fails.")
+        else:
+            os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
+            print("  i  no Chromium binary found and fetcher CDN unreachable — browser tests will be skipped (PHOENIX_SKIP_BROWSER_TESTS=1)")
 
     # Probe for working commit signing. Some envs configure a custom
     # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
