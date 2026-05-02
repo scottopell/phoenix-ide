@@ -144,10 +144,12 @@ function ConversationPageContent() {
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
   }, []);
+  const VIEWER_PANE_MIN = 360;
+  const VIEWER_PANE_MAX = 1200;
   const viewerPane = useResizablePane({
     key: 'viewer-pane-width',
-    min: 360,
-    max: 1200,
+    min: VIEWER_PANE_MIN,
+    max: VIEWER_PANE_MAX,
     defaultSize: 600,
     collapseThreshold: 280,
   });
@@ -1206,12 +1208,17 @@ function ConversationPageContent() {
             role="separator"
             aria-orientation="vertical"
             aria-label="Resize viewer pane"
+            aria-valuemin={VIEWER_PANE_MIN}
+            aria-valuemax={VIEWER_PANE_MAX}
+            aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
             tabIndex={0}
             onPointerDown={(e) => viewerPane.startDrag(e, 'x')}
             onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
             onKeyDown={(e) => {
-              // Keyboard nudge: arrow keys ±32px, Home/End to clamp.
-              // Matches the WAI-ARIA `separator` resize pattern.
+              // Keyboard resize for the WAI-ARIA `separator` pattern.
+              // ArrowLeft / ArrowRight nudge ±32px; Home / End clamp
+              // to min / max; Enter / Space toggle collapse. setSize
+              // applies the same clamp the drag path uses.
               const STEP = 32;
               if (e.key === 'ArrowLeft') {
                 e.preventDefault();
@@ -1219,6 +1226,12 @@ function ConversationPageContent() {
               } else if (e.key === 'ArrowRight') {
                 e.preventDefault();
                 viewerPane.setSize(viewerPane.size - STEP);
+              } else if (e.key === 'Home') {
+                e.preventDefault();
+                viewerPane.setSize(VIEWER_PANE_MAX);
+              } else if (e.key === 'End') {
+                e.preventDefault();
+                viewerPane.setSize(VIEWER_PANE_MIN);
               } else if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
                 viewerPane.setCollapsed(!viewerPane.collapsed);
