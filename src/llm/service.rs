@@ -2,7 +2,7 @@
 
 use super::models::{ApiFormat, ModelSpec};
 use super::types::{LlmRequest, LlmResponse};
-use super::{anthropic, openai, LlmAuth, LlmError, LlmService, TokenChunk};
+use super::{anthropic, openai, LlmAuth, LlmError, LlmService, TokenChunk, CODEX_BACKEND_URL};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
@@ -15,6 +15,11 @@ pub struct LlmServiceImpl {
     pub anthropic_base_url: Option<String>,
     pub openai_base_url: Option<String>,
     pub custom_headers: Vec<(String, String)>,
+    /// When true, `OpenAI` Responses requests target the `ChatGPT` backend
+    /// (`chatgpt.com/backend-api/codex`) and the request body is adjusted:
+    /// `store: false` is set and a default `instructions` value is injected
+    /// when the caller did not provide one.
+    pub use_codex_backend: bool,
 }
 
 impl LlmServiceImpl {
@@ -33,6 +38,27 @@ impl LlmServiceImpl {
             anthropic_base_url,
             openai_base_url,
             custom_headers,
+            use_codex_backend: false,
+        }
+    }
+
+    /// Build a service that routes `OpenAI` Responses calls through the `ChatGPT`
+    /// backend (codex bridge). The base URL is forced to `CODEX_BACKEND_URL`
+    /// regardless of any `OPENAI_BASE_URL` / `LLM_GATEWAY` setting; gateway and
+    /// `Anthropic` URL fields are ignored on this path.
+    pub fn new_with_codex_backend(
+        spec: ModelSpec,
+        auth: LlmAuth,
+        custom_headers: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            spec,
+            auth,
+            gateway: None,
+            anthropic_base_url: None,
+            openai_base_url: Some(CODEX_BACKEND_URL.to_string()),
+            custom_headers,
+            use_codex_backend: true,
         }
     }
 }
@@ -131,6 +157,7 @@ impl LlmServiceImpl {
                     self.openai_base_url.as_deref(),
                     &headers,
                     request,
+                    self.use_codex_backend,
                 )
                 .await
             }
@@ -167,6 +194,7 @@ impl LlmServiceImpl {
                     &headers,
                     request,
                     chunk_tx,
+                    self.use_codex_backend,
                 )
                 .await
             }

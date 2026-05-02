@@ -36,9 +36,11 @@ pub async fn complete(
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request: &LlmRequest,
+    use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
     let url = resolve_endpoint(gateway, base_url_override);
-    let responses_request = translate_to_responses_request(&spec.api_name, request);
+    let responses_request =
+        translate_to_responses_request(&spec.api_name, request, use_codex_backend);
 
     let client = Client::builder()
         .timeout(Duration::from_mins(5))
@@ -216,6 +218,7 @@ impl ResponsesStreamAccumulator {
 }
 
 /// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
     api_key: &str,
@@ -224,11 +227,13 @@ pub async fn complete_streaming(
     custom_headers: &[(String, String)],
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
     let url = resolve_endpoint(gateway, base_url_override);
-    let mut responses_request = translate_to_responses_request(&spec.api_name, request);
+    let mut responses_request =
+        translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     responses_request.stream = Some(true);
 
     let client = Client::builder()
@@ -293,14 +298,28 @@ pub async fn complete_streaming(
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
+///
+/// `use_codex_backend` controls two `ChatGPT`-backend-specific tweaks:
+/// - `store: false` is sent so the conversation isn't persisted server-side.
+/// - When `system` is empty, a default `instructions` value is injected. The
+///   `ChatGPT` backend rejects requests without instructions, while the platform
+///   Responses API tolerates omission.
 #[allow(clippy::too_many_lines)] // single-pass message translation; splitting would add indirection without clarity
-fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> ResponsesApiRequest {
+fn translate_to_responses_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+) -> ResponsesApiRequest {
     use super::types::ImageSource;
 
     let mut input_items = Vec::new();
 
     let instructions = if request.system.is_empty() {
-        None
+        if use_codex_backend {
+            Some("You are a helpful assistant.".to_string())
+        } else {
+            None
+        }
     } else {
         Some(
             request
@@ -443,6 +462,7 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
         tools,
         max_output_tokens: request.max_tokens,
         stream: None,
+        store: if use_codex_backend { Some(false) } else { None },
     }
 }
 
@@ -538,6 +558,10 @@ pub(crate) struct ResponsesApiRequest {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// `store: false` opts out of `OpenAI`'s server-side conversation persistence.
+    /// Required for the `ChatGPT`-backend codex bridge; harmless on platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -645,6 +669,6 @@ pub(crate) mod test_helpers {
         api_name: &str,
         request: &crate::llm::types::LlmRequest,
     ) -> ResponsesApiRequest {
-        super::translate_to_responses_request(api_name, request)
+        super::translate_to_responses_request(api_name, request, false)
     }
 }

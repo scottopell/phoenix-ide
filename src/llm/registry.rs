@@ -3,8 +3,8 @@
 #![allow(dead_code)] // new_empty() used in tests
 
 use super::{
-    all_models, discover_models, probe_gateway, DiscoveryConfig, LlmService, LlmServiceImpl,
-    LoggingService, Provider,
+    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
+    LlmService, LlmServiceImpl, LoggingService, Provider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -159,6 +159,13 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
+    /// Experimental: when set, `OpenAI` models are routed through the `ChatGPT` backend
+    /// (`https://chatgpt.com/backend-api/codex`) using `OAuth` tokens borrowed from
+    /// the local `Codex` CLI's `~/.codex/auth.json`. Bypasses platform API key auth
+    /// for `OpenAI` models only; `Anthropic` and `Mock` are unaffected. Gated behind
+    /// `OPENAI_USE_CODEX_AUTH=1`. The credential is loaded once at registry build;
+    /// if loading fails, `OpenAI` models are not registered.
+    pub codex_credential: Option<Arc<CodexCredential>>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -179,6 +186,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
             .field("auth_style", &self.auth_style)
+            .field("codex_credential", &self.codex_credential.is_some())
             .finish()
     }
 }
@@ -195,6 +203,7 @@ impl Clone for LlmConfig {
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
             auth_style: self.auth_style,
+            codex_credential: self.codex_credential.as_ref().map(Arc::clone),
         }
     }
 }
@@ -211,6 +220,7 @@ impl Default for LlmConfig {
             openai_base_url: None,
             custom_headers: Vec::new(),
             auth_style: AuthStyle::ApiKey,
+            codex_credential: None,
         }
     }
 }
@@ -251,6 +261,28 @@ impl LlmConfig {
             })
             .unwrap_or_default();
 
+        let codex_credential = if std::env::var("OPENAI_USE_CODEX_AUTH")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        {
+            match CodexCredential::load(codex_credential::default_auth_path()) {
+                Ok((cred, account_id)) => {
+                    tracing::info!(
+                        account_id = account_id.as_deref().unwrap_or("<none>"),
+                        "OPENAI_USE_CODEX_AUTH enabled — routing OpenAI models via ChatGPT backend"
+                    );
+                    Some(cred)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "OPENAI_USE_CODEX_AUTH set but codex credential load failed; OpenAI models unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
@@ -268,6 +300,7 @@ impl LlmConfig {
             } else {
                 AuthStyle::ApiKey
             },
+            codex_credential,
         }
     }
 }
@@ -499,6 +532,26 @@ impl ModelRegistry {
         if spec.provider == Provider::Mock {
             let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
             return Some(Arc::new(LoggingService::new(service)));
+        }
+
+        // Codex auth bridge: when enabled, OpenAI models route through the ChatGPT
+        // backend with borrowed OAuth tokens. Anthropic models fall through to the
+        // normal path. If the credential failed to load, OpenAI models are skipped.
+        if spec.provider == Provider::OpenAI {
+            if let Some(ref cred) = config.codex_credential {
+                let auth =
+                    LlmAuth::new(Arc::clone(cred) as Arc<dyn CredentialSource>, AuthStyle::PlainBearer);
+                let mut headers = config.custom_headers.clone();
+                if let Some(account_id) = cred.account_id() {
+                    headers.push(("chatgpt-account-id".to_string(), account_id));
+                }
+                let service = Arc::new(LlmServiceImpl::new_with_codex_backend(
+                    spec.clone(),
+                    auth,
+                    headers,
+                ));
+                return Some(Arc::new(LoggingService::new(service)));
+            }
         }
 
         let auth = if let Some(ref helper) = config.credential_helper {
