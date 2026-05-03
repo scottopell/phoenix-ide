@@ -466,16 +466,25 @@ fn translate_to_responses_request(
         store: if use_codex_backend { Some(false) } else { None },
         prompt_cache_key: Some(request.cache_key.as_str().to_string()),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
-        // and `parallel_tool_calls` mirror the server-side defaults but
-        // become meaningful when callers later want non-default behavior;
-        // sending them now stabilises the wire shape. `tool_choice` is
-        // omitted when no tools are sent (the API rejects "auto" without a
-        // tools array).
+        // mirrors the server-side default but stabilises the wire shape so
+        // non-default strategies become a smaller change later. Omitted when
+        // no tools are sent (the API rejects "auto" without a tools array).
         tool_choice: if has_tools {
             Some("auto".to_string())
         } else {
             None
         },
+        // `parallel_tool_calls: true` lets the model emit multiple ToolUse
+        // blocks in one assistant message. Phoenix's executor runs tools
+        // serially (state.rs `ToolExecuting { current_tool, remaining_tools }`),
+        // so we don't gain parallelism — but we do save (N-1) LLM round-trips
+        // when the model recognises a batch as safely-parallel ("read these
+        // three files"). Tradeoff: the model commits to all N tools without
+        // seeing intermediate results, so a bad batch wastes the unused
+        // calls. Modern models are decent at not batching dependent tools,
+        // so on balance the round-trip savings win. Revisit if Phoenix gains
+        // a parallel executor (then this becomes a true no-brainer) or if we
+        // see the model batching too aggressively in practice.
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         // Reasoning-model multi-turn correctness: tells the server to
         // include the encrypted reasoning trace in output, which we then
