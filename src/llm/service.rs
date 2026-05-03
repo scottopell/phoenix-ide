@@ -159,10 +159,14 @@ impl LlmServiceImpl {
     }
 
     async fn complete_inner(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let headers = self.headers_for_provider();
         match self.spec.api_format {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
+                // Build headers AFTER resolve so any per-request state the
+                // credential refresh updates (notably the codex account_id
+                // pulled from auth.json) is reflected in this request's
+                // headers, not the previous request's snapshot.
+                let headers = self.headers_for_provider();
                 anthropic::complete(
                     &self.spec,
                     &resolved,
@@ -175,6 +179,7 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIResponses => {
                 let key = self.auth.resolve().await?.credential;
+                let headers = self.headers_for_provider();
                 openai::complete(
                     &self.spec,
                     &key,
@@ -194,10 +199,10 @@ impl LlmServiceImpl {
         request: &LlmRequest,
         chunk_tx: &broadcast::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let headers = self.headers_for_provider();
         match self.spec.api_format {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
+                let headers = self.headers_for_provider();
                 anthropic::complete_streaming(
                     &self.spec,
                     &resolved,
@@ -211,6 +216,7 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIResponses => {
                 let key = self.auth.resolve().await?.credential;
+                let headers = self.headers_for_provider();
                 openai::complete_streaming(
                     &self.spec,
                     &key,

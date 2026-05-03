@@ -135,25 +135,49 @@ fn read_auth_file(path: &PathBuf) -> Result<AuthFile, CodexAuthError> {
 }
 
 /// Atomically write `auth.json` with mode 0600.
+///
+/// On Unix, the temp file is opened with mode 0600 from the start so the
+/// access/refresh tokens never sit briefly readable to other local users
+/// under the process umask. Falls back to a write-then-chmod sequence on
+/// non-Unix.
 fn write_auth_file(path: &PathBuf, auth: &AuthFile) -> Result<(), CodexAuthError> {
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(auth).map_err(|err| CodexAuthError::ParseAuthFile {
         path: path.clone(),
         err,
     })?;
-    std::fs::write(&tmp, bytes).map_err(|err| CodexAuthError::Io {
-        path: tmp.clone(),
-        err,
-    })?;
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&tmp, perms).map_err(|err| CodexAuthError::Io {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|err| CodexAuthError::Io {
+                path: tmp.clone(),
+                err,
+            })?;
+        file.write_all(&bytes).map_err(|err| CodexAuthError::Io {
+            path: tmp.clone(),
+            err,
+        })?;
+        file.sync_all().map_err(|err| CodexAuthError::Io {
             path: tmp.clone(),
             err,
         })?;
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, &bytes).map_err(|err| CodexAuthError::Io {
+            path: tmp.clone(),
+            err,
+        })?;
+    }
+
     std::fs::rename(&tmp, path).map_err(|err| CodexAuthError::Io {
         path: path.clone(),
         err,
@@ -220,13 +244,26 @@ async fn refresh_tokens(refresh_token: &str) -> Result<RefreshResponse, CodexAut
         ) {
             return Err(CodexAuthError::RefreshTokenInvalid { reason });
         }
+        // Don't put the response body in the error: the OAuth endpoint may
+        // emit token-bearing payloads under malformed-success conditions, and
+        // this error string ends up in `tracing::warn!` output. Log only what
+        // is safe to log.
         return Err(CodexAuthError::RefreshFailed(format!(
-            "HTTP {status}: {text}"
+            "HTTP {status} (body redacted)"
         )));
     }
 
-    serde_json::from_str(&text)
-        .map_err(|e| CodexAuthError::RefreshFailed(format!("response parse: {e} body={text}")))
+    let parsed: RefreshResponse = serde_json::from_str(&text)
+        .map_err(|e| CodexAuthError::RefreshFailed(format!("response parse: {e}")))?;
+    // Reject success responses missing an access_token. Without this check,
+    // `apply_refresh_response` would preserve the old (expired) token and the
+    // service would happily keep using it.
+    if parsed.access_token.as_deref().is_none_or(str::is_empty) {
+        return Err(CodexAuthError::RefreshFailed(
+            "OAuth endpoint returned success with empty/missing access_token".to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +272,11 @@ struct CachedToken {
     /// `exp` from the JWT, in seconds since epoch. May be `None` if unparseable —
     /// in that case we always treat it as expired and re-read the file.
     exp: Option<i64>,
+    /// Mtime of `auth.json` when this entry was cached. On the next fetch we
+    /// stat the file and force a re-read if the mtime has changed, so a
+    /// `codex login` against a different account mid-session is picked up
+    /// even if the previously-cached token is still within its `exp` window.
+    file_mtime: Option<std::time::SystemTime>,
 }
 
 /// State protected by the inner mutex. Holding the mutex through the entire
@@ -250,6 +292,13 @@ struct InnerState {
     force_refresh: bool,
 }
 
+/// Return the file mtime, or `None` if it can't be read (the caller treats
+/// `None` as "file changed" so a stat failure forces a re-read rather than
+/// silently serving a stale cache).
+fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
 /// `CredentialSource` impl for `ChatGPT` `OAuth` tokens borrowed from the `Codex` CLI.
 pub struct CodexCredential {
     auth_path: PathBuf,
@@ -258,6 +307,11 @@ pub struct CodexCredential {
     /// `fetch()` so per-request callers (`account_id()`) see the current
     /// account after a `codex login` mid-session.
     account_id: StdMutex<Option<String>>,
+    /// Most recent fetch failure message, surfaced via the `CredentialSource`
+    /// `last_error_hint()` trait method so the UI shows actionable recovery
+    /// guidance ("run `codex login`") instead of the generic auth-failure
+    /// message.
+    last_error: StdMutex<Option<String>>,
 }
 
 impl std::fmt::Debug for CodexCredential {
@@ -269,6 +323,10 @@ impl std::fmt::Debug for CodexCredential {
                 "account_id",
                 &self.account_id.lock().ok().map(|g| g.is_some()),
             )
+            .field(
+                "last_error",
+                &self.last_error.lock().ok().map(|g| g.is_some()),
+            )
             .finish()
     }
 }
@@ -279,6 +337,7 @@ impl CodexCredential {
             auth_path,
             inner: Mutex::new(InnerState::default()),
             account_id: StdMutex::new(None),
+            last_error: StdMutex::new(None),
         }
     }
 
@@ -318,13 +377,19 @@ impl CodexCredential {
     async fn fetch(&self) -> Result<String, CodexAuthError> {
         let mut state = self.inner.lock().await;
         let forced = state.force_refresh;
+        let current_mtime = file_mtime(&self.auth_path);
 
-        // Fast path: in-memory cache still good (and not invalidated).
+        // Fast path: in-memory cache still good AND auth.json hasn't changed
+        // since we cached. The mtime check picks up `codex login` against a
+        // different account mid-session — without it the in-memory cache
+        // serves the previous user's token until expiry.
         if !forced {
             if let Some(c) = state.cached.as_ref() {
-                if let Some(exp) = c.exp {
-                    if now_unix() < exp - REFRESH_SKEW_SECS {
-                        return Ok(c.access_token.clone());
+                if c.file_mtime == current_mtime {
+                    if let Some(exp) = c.exp {
+                        if now_unix() < exp - REFRESH_SKEW_SECS {
+                            return Ok(c.access_token.clone());
+                        }
                     }
                 }
             }
@@ -342,6 +407,10 @@ impl CodexCredential {
             (*guard).clone_from(&tokens.account_id);
         }
 
+        // Re-stat after read so we cache the mtime that matches what we
+        // actually loaded.
+        let post_read_mtime = file_mtime(&self.auth_path);
+
         // Skip the file-fresh shortcut when forced — invalidate() is called
         // after a 401, so even a JWT whose `exp` claim is still future is now
         // server-side revoked. Going straight to refresh is the only way to
@@ -353,6 +422,7 @@ impl CodexCredential {
                     state.cached = Some(CachedToken {
                         access_token: token.clone(),
                         exp: Some(exp_unix),
+                        file_mtime: post_read_mtime,
                     });
                     return Ok(token);
                 }
@@ -379,6 +449,7 @@ impl CodexCredential {
         state.cached = Some(CachedToken {
             access_token: new_token.clone(),
             exp: new_exp,
+            file_mtime: file_mtime(&self.auth_path),
         });
         // Successful refresh — clear the force_refresh flag set by invalidate().
         state.force_refresh = false;
@@ -404,13 +475,53 @@ fn apply_refresh_response(auth: &mut AuthFile, response: RefreshResponse) {
     auth.last_refresh = Some(now_iso8601_utc());
 }
 
+/// Convert a `CodexAuthError` into a short, user-actionable hint string for
+/// `LlmAuth::resolve()` to display. Pure mapping — keeps the trait method
+/// non-async and avoids holding any locks while formatting.
+fn error_hint(err: &CodexAuthError) -> String {
+    match err {
+        CodexAuthError::NotFound(_) => {
+            "ChatGPT credentials not found at ~/.codex/auth.json — run `codex login`"
+                .to_string()
+        }
+        CodexAuthError::WrongAuthMode { .. } => {
+            "~/.codex/auth.json is in API-key mode, not ChatGPT — run `codex login` to switch"
+                .to_string()
+        }
+        CodexAuthError::NoAccessToken(_) | CodexAuthError::NoRefreshToken(_) => {
+            "Codex credentials are missing fields — run `codex login` to refresh".to_string()
+        }
+        CodexAuthError::RefreshTokenInvalid { reason } => {
+            format!("ChatGPT refresh token rejected ({reason}) — run `codex login` to re-authenticate")
+        }
+        CodexAuthError::RefreshFailed(msg) => {
+            format!("ChatGPT token refresh failed: {msg}")
+        }
+        CodexAuthError::Io { err, .. } => {
+            format!("Could not read ~/.codex/auth.json: {err}")
+        }
+        CodexAuthError::ParseAuthFile { err, .. } => {
+            format!("~/.codex/auth.json is malformed: {err}")
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl CredentialSource for CodexCredential {
     async fn get(&self) -> Option<String> {
         match self.fetch().await {
-            Ok(token) => Some(token),
+            Ok(token) => {
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = None;
+                }
+                Some(token)
+            }
             Err(e) => {
+                let hint = error_hint(&e);
                 tracing::warn!(error = %e, "codex_credential: get() failed");
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = Some(hint);
+                }
                 None
             }
         }
@@ -427,6 +538,10 @@ impl CredentialSource for CodexCredential {
         let was_already_forced = state.force_refresh;
         state.force_refresh = true;
         had_cache || !was_already_forced
+    }
+
+    async fn last_error_hint(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|g| g.clone())
     }
 }
 
