@@ -55,8 +55,6 @@ similar = "2"  # For generating diffs
 nix = { version = "0.29", features = ["signal", "process", "term", "fs"] }
 libc = "0.2"
 
-# Terminal emulation (for relay loop and read_terminal agent tool)
-alacritty_terminal = { git = "https://github.com/alacritty/alacritty", tag = "v0.17.0", package = "alacritty_terminal", default-features = false }
 # OSC 133 parsing for CommandTracker (REQ-TERM-021)
 vte = "0.15"
 
@@ -96,8 +94,6 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-# Evaluation dev-dep (task 24673 — wezterm eval, done). Remove after merge.
-tattoy-wezterm-term = "0.1.0-fork.5"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
