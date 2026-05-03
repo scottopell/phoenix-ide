@@ -80,6 +80,7 @@ def node_env() -> dict:
 PROD_SERVICE_NAME = "phoenix-ide"
 PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
+PROD_ENV_FILE = Path("/etc/phoenix-ide/phoenix.env")
 PROD_PORT = 8031
 
 # Lima VM configuration (dev environment only — create/shell/destroy)
@@ -1455,6 +1456,9 @@ class SystemdConfig:
     # When set, injects Environment=HOME=<path> so the service user can find
     # ~/.claude/.credentials.json for per-request OAuth token reads.
     home_dir: str | None = None
+    # When set, appends `EnvironmentFile=<path>`. Values in this file override
+    # the inline `Environment=` lines (systemd processes assignments in order).
+    env_file_path: str | None = None
 
 
 def detect_service_user() -> str:
@@ -1513,6 +1517,37 @@ WantedBy=sockets.target
 """
 
 
+def _install_prod_env_file(env: dict[str, str], service_user: str) -> str | None:
+    """Install /etc/phoenix-ide/phoenix.env from a parsed env dict.
+
+    Mode 0640 root:<service_user> -- readable by the service unit, not world-readable
+    (matters once the file holds API keys). Returns the installed path, or None if
+    `env` was empty (in which case any stale file is removed).
+    """
+    if not env:
+        # Best-effort cleanup of stale config from an earlier deploy.
+        subprocess.run(["sudo", "rm", "-f", str(PROD_ENV_FILE)], check=False)
+        return None
+
+    # Re-escape embedded newlines (e.g. LLM_CUSTOM_HEADERS) so each line is a
+    # single KEY=value pair. The Rust loader unescapes `\n` itself.
+    lines = [f"{k}={v.replace(chr(10), '\\n')}" for k, v in env.items()]
+    content = "\n".join(lines) + "\n"
+
+    subprocess.run(["sudo", "mkdir", "-p", str(PROD_ENV_FILE.parent)], check=True)
+    proc = subprocess.run(
+        ["sudo", "tee", str(PROD_ENV_FILE)],
+        input=content.encode(),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        print(f"Failed to write prod env file: {proc.stderr.decode()}", file=sys.stderr)
+        sys.exit(1)
+    subprocess.run(["sudo", "chown", f"root:{service_user}", str(PROD_ENV_FILE)], check=True)
+    subprocess.run(["sudo", "chmod", "0640", str(PROD_ENV_FILE)], check=True)
+    return str(PROD_ENV_FILE)
+
+
 def generate_systemd_service(config: SystemdConfig, version: str) -> str:
     """Generate systemd service unit file content.
 
@@ -1533,6 +1568,8 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
         # System users have no real home, so we point HOME at the deploying user's home.
         env_lines.append(f"Environment=HOME={config.home_dir}")
 
+    if config.env_file_path:
+        env_lines.append(f"EnvironmentFile={config.env_file_path}")
 
     env_section = "\n".join(env_lines)
 
@@ -1606,6 +1643,22 @@ def native_prod_deploy(version: str | None = None):
     subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
     subprocess.run(["sudo", "chown", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
 
+    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, OPENAI_USE_CODEX_AUTH, etc.)
+    env_overrides: dict[str, str] = {}
+    env_file_loaded = _load_env_file(env_overrides)
+    if env_file_loaded:
+        print(f"  Loaded env from {env_file_loaded}")
+
+    # Auto-detect gateway only if env file didn't provide LLM config (mirrors launchd).
+    if env_overrides.get("LLM_API_KEY_HELPER") or env_overrides.get("LLM_GATEWAY"):
+        gateway = None
+    else:
+        gateway = get_llm_gateway()
+
+    env_file_path = _install_prod_env_file(env_overrides, service_user)
+    if env_file_path:
+        print(f"  Installed prod env file: {env_file_path} (0640 root:{service_user})")
+
     # Configure for native deployment.
     # OAuth token auth: the binary reads ~/.claude/.credentials.json per request.
     # Requires: chmod g+r ~/.claude/.credentials.json + service user in owner's group.
@@ -1614,8 +1667,9 @@ def native_prod_deploy(version: str | None = None):
         NATIVE_SYSTEMD_CONFIG,
         user=service_user,
         db_path=str(native_db_path),
-        llm_gateway=get_llm_gateway(),
+        llm_gateway=gateway,
         home_dir=str(Path.home()),
+        env_file_path=env_file_path,
     )
 
     # Install systemd socket unit (for socket activation)
