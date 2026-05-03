@@ -1587,8 +1587,11 @@ Type=simple
 User={config.user}
 {env_section}
 ExecStart={config.install_dir}/phoenix-ide
-# SIGHUP triggers graceful shutdown; systemd restarts with same socket
-ExecReload=/bin/kill -HUP $MAINPID
+# SIGHUP triggers graceful shutdown; systemd restarts with same socket.
+# `+` prefix runs ExecReload as root, ignoring User= -- otherwise a deploy
+# that crosses a User= boundary leaves scottopell trying to signal a
+# phoenix-dev process and silently fails with EPERM.
+ExecReload=+/bin/kill -HUP $MAINPID
 # Restart always (including after SIGHUP which exits 0)
 Restart=always
 RestartSec=1
@@ -1726,11 +1729,41 @@ def native_prod_deploy(version: str | None = None):
         # Service running - send SIGHUP for hot reload
         # With socket activation, this triggers graceful shutdown -> systemd restart
         print("Sending reload signal (SIGHUP) for zero-downtime upgrade...")
+        # Capture MainPID before reload so we can verify the process actually
+        # restarted. is-active alone isn't enough -- if ExecReload fails
+        # (e.g. EPERM signaling across a User= change), the OLD process keeps
+        # serving and the unit still reports active. The /version endpoint
+        # returns the cargo package version, so it can't distinguish either.
+        old_pid = subprocess.run(
+            ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
+            capture_output=True, text=True,
+        ).stdout.strip()
         subprocess.run(["sudo", "systemctl", "reload", PROD_SERVICE_NAME], check=True)
-        
-        # Wait briefly for restart
-        time.sleep(2)
-        
+
+        # Poll for new PID. SIGHUP graceful exit + Restart=always cycles the
+        # process; the new MainPID should appear within a few seconds.
+        new_pid = old_pid
+        for _ in range(15):
+            time.sleep(1)
+            new_pid = subprocess.run(
+                ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if new_pid not in ("0", "", old_pid):
+                break
+
+        if new_pid in ("0", "", old_pid):
+            print(
+                f"\n✗ Reload did not replace the running process "
+                f"(MainPID still {old_pid or '<none>'}).",
+                file=sys.stderr,
+            )
+            print(
+                f"  Inspect: sudo journalctl -u {PROD_SERVICE_NAME} -n 50 --no-pager",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         # Verify it came back up
         result = subprocess.run(
             ["systemctl", "is-active", PROD_SERVICE_NAME],
