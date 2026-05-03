@@ -13,8 +13,7 @@ use super::{SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnReques
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::llm::{
-    ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey,
-    SystemContent,
+    ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{

@@ -7,9 +7,6 @@
 //!
 //! Modelled after Simon Willison's `llm-openai-via-codex` plugin.
 //!
-//! Experimental: gated behind `OPENAI_USE_CODEX_AUTH=1`. Removing this file and
-//! the env-flag branch in `registry.rs` reverts to standard `OpenAI` API key auth.
-//!
 //! # Wire details
 //! - Refresh URL: `https://auth.openai.com/oauth/token`
 //! - Client ID: `app_EMoamEEZ73f0CkXaXp7hrann`
@@ -119,12 +116,11 @@ fn read_auth_file(path: &PathBuf) -> Result<AuthFile, CodexAuthError> {
         path: path.clone(),
         err,
     })?;
-    let auth: AuthFile = serde_json::from_slice(&bytes).map_err(|err| {
-        CodexAuthError::ParseAuthFile {
+    let auth: AuthFile =
+        serde_json::from_slice(&bytes).map_err(|err| CodexAuthError::ParseAuthFile {
             path: path.clone(),
             err,
-        }
-    })?;
+        })?;
     if auth.auth_mode.as_deref() != Some("chatgpt") {
         return Err(CodexAuthError::WrongAuthMode {
             path: path.clone(),
@@ -189,8 +185,9 @@ fn write_auth_file(path: &PathBuf, auth: &AuthFile) -> Result<(), CodexAuthError
 fn jwt_exp(token: &str) -> Option<i64> {
     let payload_b64 = token.split('.').nth(1)?;
     // JWTs use URL-safe base64 without padding.
-    let payload =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()).ok()?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
     value.get("exp").and_then(serde_json::Value::as_i64)
 }
@@ -203,7 +200,9 @@ fn now_unix() -> i64 {
 }
 
 fn now_iso8601_utc() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string()
 }
 
 /// Call `OpenAI`'s `OAuth` token endpoint to refresh.
@@ -481,8 +480,7 @@ fn apply_refresh_response(auth: &mut AuthFile, response: RefreshResponse) {
 fn error_hint(err: &CodexAuthError) -> String {
     match err {
         CodexAuthError::NotFound(_) => {
-            "ChatGPT credentials not found at ~/.codex/auth.json — run `codex login`"
-                .to_string()
+            "ChatGPT credentials not found at ~/.codex/auth.json — run `codex login`".to_string()
         }
         CodexAuthError::WrongAuthMode { .. } => {
             "~/.codex/auth.json is in API-key mode, not ChatGPT — run `codex login` to switch"
@@ -492,7 +490,9 @@ fn error_hint(err: &CodexAuthError) -> String {
             "Codex credentials are missing fields — run `codex login` to refresh".to_string()
         }
         CodexAuthError::RefreshTokenInvalid { reason } => {
-            format!("ChatGPT refresh token rejected ({reason}) — run `codex login` to re-authenticate")
+            format!(
+                "ChatGPT refresh token rejected ({reason}) — run `codex login` to re-authenticate"
+            )
         }
         CodexAuthError::RefreshFailed(msg) => {
             format!("ChatGPT token refresh failed: {msg}")
@@ -571,7 +571,11 @@ mod tests {
     fn read_auth_file_rejects_wrong_auth_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        std::fs::write(&path, br#"{"auth_mode":"apikey","tokens":{"access_token":"x"}}"#).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"auth_mode":"apikey","tokens":{"access_token":"x"}}"#,
+        )
+        .unwrap();
         let err = read_auth_file(&path).unwrap_err();
         assert!(matches!(err, CodexAuthError::WrongAuthMode { .. }));
     }

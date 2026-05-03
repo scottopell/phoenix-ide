@@ -38,6 +38,21 @@ pub async fn complete(
     request: &LlmRequest,
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
+    if use_codex_backend {
+        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(1);
+        return complete_streaming(
+            spec,
+            api_key,
+            gateway,
+            base_url_override,
+            custom_headers,
+            request,
+            &chunk_tx,
+            use_codex_backend,
+        )
+        .await;
+    }
+
     let url = resolve_endpoint(gateway, base_url_override);
     let responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
@@ -461,7 +476,11 @@ fn translate_to_responses_request(
         input: input_items,
         instructions,
         tools,
-        max_output_tokens: request.max_tokens,
+        max_output_tokens: if use_codex_backend {
+            None
+        } else {
+            request.max_tokens
+        },
         stream: None,
         store: if use_codex_backend { Some(false) } else { None },
         prompt_cache_key: Some(request.cache_key.as_str().to_string()),
@@ -585,7 +604,7 @@ pub(crate) struct ResponsesApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
+    pub(crate) max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     /// `store: false` opts out of `OpenAI`'s server-side conversation persistence.
