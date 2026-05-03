@@ -505,13 +505,7 @@ fn translate_to_responses_request(
         // a parallel executor (then this becomes a true no-brainer) or if we
         // see the model batching too aggressively in practice.
         parallel_tool_calls: if has_tools { Some(true) } else { None },
-        // Reasoning-model multi-turn correctness: tells the server to
-        // include the encrypted reasoning trace in output, which we then
-        // need to round-trip into the next turn's input for the prefix
-        // cache to hit. Harmless for non-reasoning models — they just
-        // never produce one. Always-on is simpler than gating on
-        // model.supports_reasoning (which we don't track today).
-        include: vec!["reasoning.encrypted_content".to_string()],
+        include: Vec::new(),
     }
 }
 
@@ -627,11 +621,9 @@ pub(crate) struct ResponsesApiRequest {
     /// shape. Omitted when no tools are sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parallel_tool_calls: Option<bool>,
-    /// Output items the server should include in the response. We always
-    /// request `reasoning.encrypted_content` so multi-turn reasoning models
-    /// can have their encrypted thinking round-tripped back into the next
-    /// turn's input — without this the prefix cache breaks across turns
-    /// for any reasoning-capable model.
+    /// Output items the server should include in the response. Keep empty
+    /// until Phoenix has a durable transcript representation for additional
+    /// output item types such as encrypted reasoning.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) include: Vec<String>,
 }

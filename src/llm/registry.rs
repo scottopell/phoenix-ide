@@ -171,6 +171,9 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
+    /// Explicit opt-in for routing `OpenAI` models through local Codex `ChatGPT`
+    /// credentials. Parsed from `OPENAI_USE_CODEX_AUTH=1`.
+    pub use_codex_auth: bool,
     /// When populated, `OpenAI` models are routed through the
     /// `ChatGPT` backend (`https://chatgpt.com/backend-api/codex`) using
     /// `OAuth` tokens borrowed from the local `Codex` CLI's `~/.codex/auth.json`.
@@ -196,6 +199,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
             .field("auth_style", &self.auth_style)
+            .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
             .finish()
     }
@@ -213,6 +217,7 @@ impl Clone for LlmConfig {
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
             auth_style: self.auth_style,
+            use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
         }
     }
@@ -230,6 +235,7 @@ impl Default for LlmConfig {
             openai_base_url: None,
             custom_headers: Vec::new(),
             auth_style: AuthStyle::ApiKey,
+            use_codex_auth: false,
             codex_credential: None,
         }
     }
@@ -271,20 +277,26 @@ impl LlmConfig {
             })
             .unwrap_or_default();
 
-        let codex_credential = match CodexCredential::load(codex_credential::default_auth_path()) {
-            Ok((cred, account_id)) => {
-                tracing::info!(
-                    account_id = account_id.as_deref().unwrap_or("<none>"),
-                    "Codex ChatGPT credentials found — routing OpenAI models via ChatGPT backend"
-                );
-                Some(cred)
+        let use_codex_auth = std::env::var("OPENAI_USE_CODEX_AUTH")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+        let codex_credential = if use_codex_auth {
+            match CodexCredential::load(codex_credential::default_auth_path()) {
+                Ok((cred, account_id)) => {
+                    tracing::info!(
+                        account_id = account_id.as_deref().unwrap_or("<none>"),
+                        "OPENAI_USE_CODEX_AUTH enabled — routing OpenAI models via ChatGPT backend"
+                    );
+                    Some(cred)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "OPENAI_USE_CODEX_AUTH set but codex credential load failed; OpenAI models unavailable");
+                    None
+                }
             }
-            Err(codex_credential::CodexAuthError::NotFound(_)) => None,
-            Err(e) => {
-                tracing::warn!(error = %e,
-                    "Codex credential load failed; falling back to other OpenAI auth sources");
-                None
-            }
+        } else {
+            None
         };
 
         Self {
@@ -304,6 +316,7 @@ impl LlmConfig {
             } else {
                 AuthStyle::ApiKey
             },
+            use_codex_auth,
             codex_credential,
         }
     }
@@ -554,12 +567,11 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(service)));
         }
 
-        // Prefer Codex ChatGPT auth for OpenAI models when available; otherwise
-        // fall through to gateway/helper/API-key auth.
-        if spec.provider == Provider::OpenAI {
-            let Some(cred) = config.codex_credential.as_ref() else {
-                return Self::try_create_model_with_standard_auth(spec, config);
-            };
+        // Codex ChatGPT auth is an explicit OpenAI opt-in. If enabled but the
+        // credential failed to load, OpenAI models are unavailable rather than
+        // silently falling through to another auth path.
+        if config.use_codex_auth && spec.provider == Provider::OpenAI {
+            let cred = config.codex_credential.as_ref()?;
             let auth = LlmAuth::new(
                 Arc::clone(cred) as Arc<dyn CredentialSource>,
                 AuthStyle::PlainBearer,
@@ -872,14 +884,15 @@ mod tests {
         crate::llm::CodexCredential::load(path).unwrap().0
     }
 
-    /// With a valid Codex credential, OpenAI models register via the codex
-    /// branch (no need for OPENAI_API_KEY) and are distinct from Anthropic
-    /// registration.
+    /// With Codex auth enabled and a valid credential, OpenAI models register
+    /// via the codex branch (no need for OPENAI_API_KEY) and are distinct from
+    /// Anthropic registration.
     #[test]
     fn test_codex_auth_registers_openai_models_without_api_key() {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
+            use_codex_auth: true,
             codex_credential: Some(fake_codex_credential(&dir)),
             ..Default::default()
         };
@@ -894,33 +907,38 @@ mod tests {
         );
     }
 
-    /// If Codex credential load fails, standard OpenAI auth remains available.
+    /// With Codex auth enabled but credential load failed, OpenAI models must
+    /// not silently fall through to OPENAI_API_KEY auth.
     #[test]
-    fn test_codex_auth_falls_back_to_openai_api_key_when_cred_missing() {
+    fn test_codex_auth_refuses_silent_fallback_when_cred_missing() {
         let config = LlmConfig {
             openai_api_key: Some("a-real-key".to_string()),
+            use_codex_auth: true,
             codex_credential: None, // load failed
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
         assert!(
-            registry.get("gpt-5.5").is_some(),
-            "OpenAI should fall back to OPENAI_API_KEY when codex credentials are absent"
+            registry.get("gpt-5.5").is_none(),
+            "OpenAI must not fall through to OPENAI_API_KEY when codex auth is enabled but credentials are absent"
         );
     }
 
-    /// A valid Codex credential is sufficient to activate OpenAI models.
+    /// With Codex auth disabled, codex_credential is ignored and standard
+    /// OpenAI auth remains available.
     #[test]
-    fn test_codex_branch_activates_from_cred_presence() {
+    fn test_codex_branch_is_gated_by_env_flag_not_just_cred_presence() {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
+            openai_api_key: Some("a-real-key".to_string()),
+            use_codex_auth: false,
             codex_credential: Some(fake_codex_credential(&dir)),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
         assert!(
             registry.get("gpt-5.5").is_some(),
-            "OpenAI should register via Codex credentials without OPENAI_API_KEY"
+            "OpenAI should register via OPENAI_API_KEY when codex auth is disabled"
         );
     }
 
@@ -928,6 +946,7 @@ mod tests {
     fn test_default_model_prefers_openai_over_mock() {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
+            use_codex_auth: true,
             codex_credential: Some(fake_codex_credential(&dir)),
             ..Default::default()
         };

@@ -697,16 +697,15 @@ mod codex_request_shape {
         assert_eq!(a.as_str().len(), 36);
     }
 
-    /// `include` always carries `reasoning.encrypted_content` so multi-turn
-    /// reasoning models can have their thinking round-tripped — both
-    /// platform and codex paths.
+    /// `include` stays empty until Phoenix can preserve additional output
+    /// items, such as encrypted reasoning, in the transcript.
     #[test]
-    fn include_carries_reasoning_encrypted_content_on_both_paths() {
+    fn include_is_empty_on_both_paths() {
         let req = make_llm_request(vec![user_msg("hi")]);
         let p = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
-        assert_eq!(p.include, vec!["reasoning.encrypted_content".to_string()]);
+        assert!(p.include.is_empty());
         let c = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
-        assert_eq!(c.include, vec!["reasoning.encrypted_content".to_string()]);
+        assert!(c.include.is_empty());
     }
 
     /// `tool_choice` and `parallel_tool_calls` are sent when tools are
