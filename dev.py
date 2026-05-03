@@ -891,21 +891,67 @@ def cmd_check():
     CHECK_TIMEOUT = 300  # 5 minutes per step -- kill and fail if exceeded
 
     def run_step(name, cmd, cwd=ROOT):
+        # Stream stdout+stderr line-by-line into a bounded buffer so that on
+        # timeout we keep the last N lines of output instead of throwing it
+        # away. Process is launched in its own session so SIGKILL can target
+        # the whole group \u2014 vitest, eslint, etc. fork worker children; killing
+        # only the parent leaves orphans whose pipes the harness can still
+        # be blocked on, masking the original hang.
+        from collections import deque
+        TAIL_LINES = 200
         t0 = time.monotonic()
+        env = node_env() if Path(cwd) == UI_DIR else None
+        buf: deque[str] = deque(maxlen=TAIL_LINES)
+        truncated = False
+
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, start_new_session=True, bufsize=1,
+        )
+
+        def reader():
+            nonlocal truncated
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if len(buf) == buf.maxlen:
+                    truncated = True
+                buf.append(line.rstrip("\n"))
+            proc.stdout.close()
+
+        rt = threading.Thread(target=reader, daemon=True)
+        rt.start()
+
+        timed_out = False
         try:
-            # UI steps need the correct Node.js version on PATH
-            env = node_env() if Path(cwd) == UI_DIR else None
-            proc = subprocess.run(
-                cmd, cwd=cwd, capture_output=True, text=True,
-                timeout=CHECK_TIMEOUT, env=env,
-            )
-            elapsed = time.monotonic() - t0
-            output = (proc.stdout + proc.stderr).strip()
-            rc = proc.returncode
+            rc = proc.wait(timeout=CHECK_TIMEOUT)
         except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - t0
-            output = f"TIMEOUT after {CHECK_TIMEOUT}s"
-            rc = 1
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                rc = proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                rc = proc.wait(timeout=5)
+        # Reader exits when stdout closes (proc termination drops the pipe).
+        rt.join(timeout=5)
+        elapsed = time.monotonic() - t0
+
+        tail = "\n".join(buf).strip()
+        if timed_out:
+            header = f"TIMEOUT after {CHECK_TIMEOUT}s \u2014 last {len(buf)} lines of output"
+            if truncated:
+                header += " (earlier lines dropped)"
+            output = header + ("\n" + tail if tail else "\n(no output captured before timeout)")
+            rc = rc if rc != 0 else 1
+        else:
+            output = tail
+
         with results_lock:
             ok = "\u2713" if rc == 0 else "\u2717"
             results.append((name, rc, elapsed, output))
