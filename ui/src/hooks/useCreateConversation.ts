@@ -57,8 +57,13 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => {
     getModels().then(modelsData => {
       setModels(modelsData);
-      // Set default only if user has no saved preference
-      setSelectedModel(prev => prev ?? modelsData.default);
+      // Honor saved preference only if it's still a registered model. Without
+      // this, a stale localStorage entry (e.g. a model that was the only
+      // option at a previous deploy and has since been superseded) silently
+      // sticks and the user submits against an unintended model.
+      setSelectedModel(prev =>
+        prev && modelsData.models.some(m => m.id === prev) ? prev : modelsData.default,
+      );
     }).catch(console.error);
     api.getEnv().then(env => {
       setHomeDir(env.home_dir);
