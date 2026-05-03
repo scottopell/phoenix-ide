@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -926,9 +927,15 @@ def cmd_check():
         """
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
-            run_step("cargo check musl", [
-                "cargo", "check", "--target", "x86_64-unknown-linux-musl",
-            ])
+            # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
+            # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
+            # See task 60001 for installing musl-cross-make on this machine.
+            if shutil.which("x86_64-linux-musl-gcc"):
+                run_step("cargo check musl", [
+                    "cargo", "check", "--target", "x86_64-unknown-linux-musl",
+                ])
+            else:
+                print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
         else:
             run_step("cargo check musl", ["cargo", "check"])
         has_nextest = subprocess.run(
