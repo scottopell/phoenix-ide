@@ -1462,25 +1462,27 @@ class SystemdConfig:
 
 
 def detect_service_user() -> str:
-    """Detect which service user to run phoenix-ide as.
+    """Determine which user to run the systemd service as.
 
-    Checks for supported users in priority order. Fails with a clear message
-    if none exist so the operator knows what to create.
+    Single-operator homelab: run as the deploying user. This makes `~/.codex`,
+    `~/.claude`, git config, and ssh keys readable to the service without
+    per-file ACL gymnastics.
+
+    If invoked under sudo, prefer the real (`SUDO_USER`) user over root.
     """
     import pwd
-    for candidate in ("phoenix-dev", "exedev"):
-        try:
-            pwd.getpwnam(candidate)
-            return candidate
-        except KeyError:
-            continue
-    print(
-        "ERROR: No supported service user found. "
-        "Create one of: phoenix-dev, exedev\n"
-        "  e.g.: sudo useradd --system --no-create-home phoenix-dev",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    uid = os.getuid()
+    if uid == 0:
+        sudo_user = os.environ.get("SUDO_USER")
+        if not sudo_user:
+            print(
+                "ERROR: deploy is running as root with no SUDO_USER set. "
+                "Re-run as your normal user; the script uses sudo internally.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return pwd.getpwnam(sudo_user).pw_name
+    return pwd.getpwuid(uid).pw_name
 
 
 # Configs for each deployment target
@@ -1641,7 +1643,9 @@ def native_prod_deploy(version: str | None = None):
     native_db_dir = Path("/var/lib/phoenix-ide")
     native_db_path = native_db_dir / "prod.db"
     subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
-    subprocess.run(["sudo", "chown", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
+    # `-R` so an existing prod.db (and its sqlite -shm/-wal sidecars) created
+    # under a previous service_user are migrated to the current one.
+    subprocess.run(["sudo", "chown", "-R", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
 
     # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, OPENAI_USE_CODEX_AUTH, etc.)
     env_overrides: dict[str, str] = {}
