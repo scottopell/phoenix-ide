@@ -455,6 +455,7 @@ fn translate_to_responses_request(
         )
     };
 
+    let has_tools = !request.tools.is_empty();
     ResponsesApiRequest {
         model: api_name.to_string(),
         input: input_items,
@@ -464,6 +465,25 @@ fn translate_to_responses_request(
         stream: None,
         store: if use_codex_backend { Some(false) } else { None },
         prompt_cache_key: Some(request.cache_key.as_str().to_string()),
+        // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
+        // and `parallel_tool_calls` mirror the server-side defaults but
+        // become meaningful when callers later want non-default behavior;
+        // sending them now stabilises the wire shape. `tool_choice` is
+        // omitted when no tools are sent (the API rejects "auto" without a
+        // tools array).
+        tool_choice: if has_tools {
+            Some("auto".to_string())
+        } else {
+            None
+        },
+        parallel_tool_calls: if has_tools { Some(true) } else { None },
+        // Reasoning-model multi-turn correctness: tells the server to
+        // include the encrypted reasoning trace in output, which we then
+        // need to round-trip into the next turn's input for the prefix
+        // cache to hit. Harmless for non-reasoning models — they just
+        // never produce one. Always-on is simpler than gating on
+        // model.supports_reasoning (which we don't track today).
+        include: vec!["reasoning.encrypted_content".to_string()],
     }
 }
 
@@ -569,6 +589,23 @@ pub(crate) struct ResponsesApiRequest {
     /// `PromptCacheKey`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_cache_key: Option<String>,
+    /// Tool selection strategy. `"auto"` is the server-side default; sent
+    /// explicitly to stabilise the wire shape and to make non-default
+    /// strategies a smaller change later. Omitted when no tools are sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_choice: Option<String>,
+    /// Allow the model to emit multiple tool calls in one response. The
+    /// server-side default is `true`; sent explicitly to stabilise wire
+    /// shape. Omitted when no tools are sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parallel_tool_calls: Option<bool>,
+    /// Output items the server should include in the response. We always
+    /// request `reasoning.encrypted_content` so multi-turn reasoning models
+    /// can have their encrypted thinking round-tripped back into the next
+    /// turn's input — without this the prefix cache breaks across turns
+    /// for any reasoning-capable model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) include: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -154,6 +154,26 @@ impl LlmServiceImpl {
                     headers.push(("chatgpt-account-id".to_string(), account_id));
                 }
             }
+            // OpenAI-Beta is required by the ChatGPT-backend Responses
+            // endpoint for the experimental Responses surface; Codex CLI
+            // and Pi both send it. `originator` is OpenAI's telemetry-
+            // attribution channel so traffic from Phoenix is identifiable
+            // alongside Codex CLI and Pi traffic.
+            if !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("openai-beta"))
+            {
+                headers.push((
+                    "OpenAI-Beta".to_string(),
+                    "responses=experimental".to_string(),
+                ));
+            }
+            if !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("originator"))
+            {
+                headers.push(("originator".to_string(), "phoenix-ide".to_string()));
+            }
         }
         headers
     }

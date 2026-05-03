@@ -698,4 +698,41 @@ mod codex_request_shape {
         // UUID v4 string length sanity check.
         assert_eq!(a.as_str().len(), 36);
     }
+
+    /// `include` always carries `reasoning.encrypted_content` so multi-turn
+    /// reasoning models can have their thinking round-tripped — both
+    /// platform and codex paths.
+    #[test]
+    fn include_carries_reasoning_encrypted_content_on_both_paths() {
+        let req = make_llm_request(vec![user_msg("hi")]);
+        let p = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
+        assert_eq!(p.include, vec!["reasoning.encrypted_content".to_string()]);
+        let c = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(c.include, vec!["reasoning.encrypted_content".to_string()]);
+    }
+
+    /// `tool_choice` and `parallel_tool_calls` are sent when tools are
+    /// present, omitted when no tools — the API rejects "auto" without a
+    /// tools array.
+    #[test]
+    fn tool_choice_and_parallel_only_sent_with_tools() {
+        // No tools → both fields omitted
+        let no_tools = make_llm_request(vec![user_msg("hi")]);
+        let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &no_tools);
+        assert_eq!(r.tool_choice, None);
+        assert_eq!(r.parallel_tool_calls, None);
+
+        // With tools → both fields present with their explicit defaults
+        use crate::llm::types::ToolDefinition;
+        let mut with_tools = make_llm_request(vec![user_msg("hi")]);
+        with_tools.tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Run a bash command".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+        }];
+        let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &with_tools);
+        assert_eq!(r.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(r.parallel_tool_calls, Some(true));
+    }
 }
