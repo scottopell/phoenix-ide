@@ -935,12 +935,34 @@ def cmd_check():
             ["cargo", "nextest", "--version"],
             capture_output=True,
         ).returncode == 0
+        # nextest defaults to available_parallelism (= num_cpus). On low-RAM
+        # boxes, num_cpus parallel test threads can swap and stall sensitive
+        # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
+        # times out if Chrome can't get CPU+RAM during launch). Cap the
+        # thread count by ~1.5 GiB headroom per thread so resource-starved
+        # machines back off, while leaving fast machines effectively
+        # unchanged.
+        cpus = os.cpu_count() or 4
+        try:
+            with open("/proc/meminfo") as f:
+                mem_gib = next(
+                    int(l.split()[1]) for l in f if l.startswith("MemTotal:")
+                ) / (1024 * 1024)
+            mem_cap = max(1, int(mem_gib // 1.5))
+        except (OSError, StopIteration):
+            mem_cap = cpus
+        test_threads = max(2, min(cpus - 1, mem_cap))
+        if test_threads < cpus:
+            print(f"  i  cargo test: capping to {test_threads} threads "
+                  f"(cpus={cpus}, mem_cap={mem_cap})")
         if has_nextest:
             compile_cmd = ["cargo", "nextest", "run", "--no-run"]
-            test_cmd = ["cargo", "nextest", "run"]
+            test_cmd = ["cargo", "nextest", "run",
+                        "--test-threads", str(test_threads)]
         else:
             compile_cmd = ["cargo", "test", "--no-run"]
-            test_cmd = ["cargo", "test"]
+            test_cmd = ["cargo", "test", "--",
+                        "--test-threads", str(test_threads)]
         run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd)
         # Codegen staleness guard. `cargo test` above re-runs the ts-rs
