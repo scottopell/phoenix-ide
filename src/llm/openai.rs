@@ -463,6 +463,7 @@ fn translate_to_responses_request(
         max_output_tokens: request.max_tokens,
         stream: None,
         store: if use_codex_backend { Some(false) } else { None },
+        prompt_cache_key: Some(request.cache_key.as_str().to_string()),
     }
 }
 
@@ -562,6 +563,12 @@ pub(crate) struct ResponsesApiRequest {
     /// Required for the `ChatGPT`-backend codex bridge; harmless on platform.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) store: Option<bool>,
+    /// Stable identifier for the prompt-prefix cache. Set on every request:
+    /// the field is `Option` only because the wire protocol allows omission,
+    /// but the typed `LlmRequest` requires the caller to pick a key (see
+    /// `PromptCacheKey`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

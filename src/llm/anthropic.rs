@@ -1055,7 +1055,7 @@ pub(crate) struct AnthropicUsage {
 mod tests {
     use super::*;
     use crate::llm::models::{ApiFormat, ModelSpec, Provider};
-    use crate::llm::types::{LlmRequest, ToolDefinition};
+    use crate::llm::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn test_spec(supports_tool_search: bool) -> ModelSpec {
         ModelSpec {
@@ -1089,6 +1089,7 @@ mod tests {
                 },
             ],
             max_tokens: None,
+            cache_key: PromptCacheKey::ephemeral(),
         }
     }
 

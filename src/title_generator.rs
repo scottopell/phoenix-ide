@@ -2,7 +2,9 @@
 //!
 //! Generates short, meaningful titles based on the initial user message.
 
-use crate::llm::{ContentBlock, LlmMessage, LlmRequest, LlmResponse, LlmService, MessageRole};
+use crate::llm::{
+    ContentBlock, LlmMessage, LlmRequest, LlmResponse, LlmService, MessageRole, PromptCacheKey,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -42,6 +44,8 @@ pub async fn generate_title(
         }],
         tools: vec![],
         max_tokens: Some(50), // Title should be very short
+        // Shared by every title-generation call so TITLE_PROMPT caches.
+        cache_key: PromptCacheKey::stable("title-generator"),
     };
 
     // Apply timeout

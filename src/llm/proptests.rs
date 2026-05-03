@@ -321,6 +321,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         messages,
         tools: vec![],
         max_tokens: None,
+        cache_key: super::types::PromptCacheKey::stable("proptest"),
     }
 }
 
@@ -668,5 +669,33 @@ mod codex_request_shape {
         let r = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
         assert_eq!(r.store, Some(false));
         assert_eq!(r.instructions.as_deref(), Some("be terse"));
+    }
+
+    /// `prompt_cache_key` round-trips from `LlmRequest.cache_key` to the
+    /// Responses request body — both platform and codex paths.
+    #[test]
+    fn prompt_cache_key_reaches_wire_on_both_paths() {
+        use crate::llm::types::PromptCacheKey;
+        let mut req = make_llm_request(vec![user_msg("hi")]);
+        req.cache_key = PromptCacheKey::stable("conv-abc-123");
+
+        let platform =
+            openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
+        assert_eq!(platform.prompt_cache_key.as_deref(), Some("conv-abc-123"));
+
+        let codex =
+            openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(codex.prompt_cache_key.as_deref(), Some("conv-abc-123"));
+    }
+
+    /// `ephemeral()` produces distinct keys per call (UUID-shaped).
+    #[test]
+    fn ephemeral_produces_distinct_keys() {
+        use crate::llm::types::PromptCacheKey;
+        let a = PromptCacheKey::ephemeral();
+        let b = PromptCacheKey::ephemeral();
+        assert_ne!(a.as_str(), b.as_str());
+        // UUID v4 string length sanity check.
+        assert_eq!(a.as_str().len(), 36);
     }
 }
