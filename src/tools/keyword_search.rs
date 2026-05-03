@@ -7,7 +7,9 @@
 //! REQ-KWS-005: LLM Selection
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, SystemContent};
+use crate::llm::{
+    ContentBlock, LlmMessage, LlmRequest, MessageRole, PromptCacheKey, SystemContent,
+};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -150,6 +152,8 @@ impl KeywordSearchTool {
             }],
             tools: vec![],
             max_tokens: Some(4096),
+            // Shared by every keyword-search filter call so FILTER_SYSTEM_PROMPT caches.
+            cache_key: PromptCacheKey::stable("keyword-search-filter"),
         };
 
         let response = llm

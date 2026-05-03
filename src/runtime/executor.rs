@@ -12,7 +12,9 @@ use super::traits::{LlmClient, Storage, ToolExecutor};
 use super::{SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
-use crate::llm::{ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, SystemContent};
+use crate::llm::{
+    ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
+};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
@@ -1398,6 +1400,9 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
+                // Every turn in a conversation reuses the same prefix
+                // (system prompt + earlier turns), so all turns share one key.
+                cache_key: PromptCacheKey::stable(&conv_id),
             };
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
@@ -1931,6 +1936,10 @@ where
                 )],
                 tools: vec![],          // No tools for continuation
                 max_tokens: Some(2000), // Limit summary length
+                // Same conversation as the main loop — different system
+                // prompt won't share a prefix in practice, but using the
+                // conv id keeps the cache cohort coherent.
+                cache_key: PromptCacheKey::stable(&conv_id),
             };
 
             match llm_client.complete(&request).await {

@@ -55,6 +55,7 @@
 //! occur, aiding diagnosis.
 
 mod anthropic;
+pub mod codex_credential;
 pub mod credential_helper;
 mod discovery;
 mod error;
@@ -68,6 +69,7 @@ mod service;
 pub(crate) mod sse;
 mod types;
 
+pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};

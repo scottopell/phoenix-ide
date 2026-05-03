@@ -4,6 +4,55 @@ pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
 
 use serde::{Deserialize, Serialize};
 
+/// Identifier for `OpenAI`'s `prompt_cache_key` Responses-API field. Required
+/// on every `LlmRequest` so callers must explicitly choose a caching strategy
+/// — passing the wrong key only loses cache hits, never breaks correctness,
+/// but silently omitting one is exactly the failure mode this type prevents.
+///
+/// Same key + same prefix bytes (system prompt, leading messages, tools) =
+/// cache hit on the `OpenAI` Responses backend. `Anthropic` ignores this
+/// field; it has its own per-block `cache_control` mechanism wired through
+/// `SystemContent::cached`.
+///
+/// # Choosing a constructor
+///
+/// - [`PromptCacheKey::stable`] for any call that belongs to a cohort that
+///   should reuse cached prefix tokens. Common ids:
+///     - `conversation_id` for the main turn loop (every turn shares the
+///       system prompt + earlier-turn cache)
+///     - a category like `"title-gen"` for utility calls that share
+///       boilerplate across all conversations
+///     - a chain or session id for grouped sub-calls
+/// - [`PromptCacheKey::ephemeral`] only for cases with no caching cohort
+///   (one-off tests, ad-hoc internal calls). Generates a fresh value per
+///   call so the request is well-formed but cannot share prefix tokens
+///   with anything else.
+///
+/// There is intentionally no `Default`: each call site has to decide.
+#[derive(Debug, Clone)]
+pub struct PromptCacheKey(String);
+
+impl PromptCacheKey {
+    /// A stable cache key shared by all calls passing the same `id`. Calls
+    /// using this key reuse cached prefix tokens against each other on the
+    /// `OpenAI` Responses backend.
+    pub fn stable(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// A fresh per-call key. The request is well-formed but the cache can
+    /// never hit. Use only when there's no natural caching cohort (currently
+    /// only test fixtures — production call sites all have a stable cohort).
+    #[allow(dead_code)] // public API kept for legitimate one-off production use
+    pub fn ephemeral() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// LLM request
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
@@ -11,6 +60,11 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
+    /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
+    /// choice is the caller's because only the caller knows its caching
+    /// cohort. Used as `prompt_cache_key` on the `OpenAI` Responses path,
+    /// ignored by `Anthropic`.
+    pub cache_key: PromptCacheKey,
 }
 
 /// System prompt content

@@ -20,7 +20,7 @@ use crate::db::{
 };
 use crate::llm::{
     ContentBlock, LlmError, LlmMessage, LlmRequest, LlmService, MessageRole, ModelRegistry,
-    SystemContent, TokenChunk,
+    PromptCacheKey, SystemContent, TokenChunk,
 };
 use chrono::Utc;
 use std::sync::Arc;
@@ -559,6 +559,9 @@ fn build_answer_request(bundled: &BundledContext, question: &str) -> LlmRequest 
         }],
         tools: vec![],
         max_tokens: Some(ANSWER_MAX_TOKENS),
+        // Shared by every chain answer call across all chains, so the
+        // ANSWER_SYSTEM_PROMPT prefix caches once.
+        cache_key: PromptCacheKey::stable("chain-qa-answer"),
     }
 }
 
@@ -716,6 +719,8 @@ async fn summarize_leaf_in_process(
         }],
         tools: vec![],
         max_tokens: Some(LEAF_SUMMARY_MAX_TOKENS),
+        // Shared by every leaf-summary call so the boilerplate prompt caches.
+        cache_key: PromptCacheKey::stable("chain-qa-leaf-summary"),
     };
     let response = service.complete(&request).await?;
     Ok(response.text())

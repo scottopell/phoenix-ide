@@ -36,9 +36,26 @@ pub async fn complete(
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request: &LlmRequest,
+    use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
+    if use_codex_backend {
+        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(1);
+        return complete_streaming(
+            spec,
+            api_key,
+            gateway,
+            base_url_override,
+            custom_headers,
+            request,
+            &chunk_tx,
+            use_codex_backend,
+        )
+        .await;
+    }
+
     let url = resolve_endpoint(gateway, base_url_override);
-    let responses_request = translate_to_responses_request(&spec.api_name, request);
+    let responses_request =
+        translate_to_responses_request(&spec.api_name, request, use_codex_backend);
 
     let client = Client::builder()
         .timeout(Duration::from_mins(5))
@@ -216,6 +233,7 @@ impl ResponsesStreamAccumulator {
 }
 
 /// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
     api_key: &str,
@@ -224,11 +242,13 @@ pub async fn complete_streaming(
     custom_headers: &[(String, String)],
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
     let url = resolve_endpoint(gateway, base_url_override);
-    let mut responses_request = translate_to_responses_request(&spec.api_name, request);
+    let mut responses_request =
+        translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     responses_request.stream = Some(true);
 
     let client = Client::builder()
@@ -293,14 +313,28 @@ pub async fn complete_streaming(
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
+///
+/// `use_codex_backend` controls two `ChatGPT`-backend-specific tweaks:
+/// - `store: false` is sent so the conversation isn't persisted server-side.
+/// - When `system` is empty, a default `instructions` value is injected. The
+///   `ChatGPT` backend rejects requests without instructions, while the platform
+///   Responses API tolerates omission.
 #[allow(clippy::too_many_lines)] // single-pass message translation; splitting would add indirection without clarity
-fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> ResponsesApiRequest {
+fn translate_to_responses_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+) -> ResponsesApiRequest {
     use super::types::ImageSource;
 
     let mut input_items = Vec::new();
 
     let instructions = if request.system.is_empty() {
-        None
+        if use_codex_backend {
+            Some("You are a helpful assistant.".to_string())
+        } else {
+            None
+        }
     } else {
         Some(
             request
@@ -436,13 +470,42 @@ fn translate_to_responses_request(api_name: &str, request: &LlmRequest) -> Respo
         )
     };
 
+    let has_tools = !request.tools.is_empty();
     ResponsesApiRequest {
         model: api_name.to_string(),
         input: input_items,
         instructions,
         tools,
-        max_output_tokens: request.max_tokens,
+        max_output_tokens: if use_codex_backend {
+            None
+        } else {
+            request.max_tokens
+        },
         stream: None,
+        store: if use_codex_backend { Some(false) } else { None },
+        prompt_cache_key: Some(request.cache_key.as_str().to_string()),
+        // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
+        // mirrors the server-side default but stabilises the wire shape so
+        // non-default strategies become a smaller change later. Omitted when
+        // no tools are sent (the API rejects "auto" without a tools array).
+        tool_choice: if has_tools {
+            Some("auto".to_string())
+        } else {
+            None
+        },
+        // `parallel_tool_calls: true` lets the model emit multiple ToolUse
+        // blocks in one assistant message. Phoenix's executor runs tools
+        // serially (state.rs `ToolExecuting { current_tool, remaining_tools }`),
+        // so we don't gain parallelism — but we do save (N-1) LLM round-trips
+        // when the model recognises a batch as safely-parallel ("read these
+        // three files"). Tradeoff: the model commits to all N tools without
+        // seeing intermediate results, so a bad batch wastes the unused
+        // calls. Modern models are decent at not batching dependent tools,
+        // so on balance the round-trip savings win. Revisit if Phoenix gains
+        // a parallel executor (then this becomes a true no-brainer) or if we
+        // see the model batching too aggressively in practice.
+        parallel_tool_calls: if has_tools { Some(true) } else { None },
+        include: Vec::new(),
     }
 }
 
@@ -531,13 +594,38 @@ pub(crate) struct ResponsesApiRequest {
     model: String,
     pub(crate) input: Vec<ResponsesApiInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
+    pub(crate) instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
+    pub(crate) max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// `store: false` opts out of `OpenAI`'s server-side conversation persistence.
+    /// Required for the `ChatGPT`-backend codex bridge; harmless on platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) store: Option<bool>,
+    /// Stable identifier for the prompt-prefix cache. Set on every request:
+    /// the field is `Option` only because the wire protocol allows omission,
+    /// but the typed `LlmRequest` requires the caller to pick a key (see
+    /// `PromptCacheKey`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_key: Option<String>,
+    /// Tool selection strategy. `"auto"` is the server-side default; sent
+    /// explicitly to stabilise the wire shape and to make non-default
+    /// strategies a smaller change later. Omitted when no tools are sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_choice: Option<String>,
+    /// Allow the model to emit multiple tool calls in one response. The
+    /// server-side default is `true`; sent explicitly to stabilise wire
+    /// shape. Omitted when no tools are sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parallel_tool_calls: Option<bool>,
+    /// Output items the server should include in the response. Keep empty
+    /// until Phoenix has a durable transcript representation for additional
+    /// output item types such as encrypted reasoning.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) include: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -645,6 +733,13 @@ pub(crate) mod test_helpers {
         api_name: &str,
         request: &crate::llm::types::LlmRequest,
     ) -> ResponsesApiRequest {
-        super::translate_to_responses_request(api_name, request)
+        super::translate_to_responses_request(api_name, request, false)
+    }
+
+    pub fn translate_to_responses_request_codex(
+        api_name: &str,
+        request: &crate::llm::types::LlmRequest,
+    ) -> ResponsesApiRequest {
+        super::translate_to_responses_request(api_name, request, true)
     }
 }

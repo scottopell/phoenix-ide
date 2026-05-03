@@ -321,6 +321,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         messages,
         tools: vec![],
         max_tokens: None,
+        cache_key: super::types::PromptCacheKey::stable("proptest"),
     }
 }
 
@@ -618,5 +619,117 @@ proptest! {
                 "tool_uses() returned an MCP tool: {id}"
             );
         }
+    }
+}
+
+// ============================================================================
+// Codex backend — request body shape (`store: false`, default instructions)
+// ============================================================================
+
+#[cfg(test)]
+mod codex_request_shape {
+    use super::*;
+
+    fn user_msg(text: &str) -> LlmMessage {
+        LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// Platform path leaves `store` unset and `instructions` only when system is provided.
+    #[test]
+    fn platform_path_omits_store_and_default_instructions() {
+        let req = make_llm_request(vec![user_msg("hi")]);
+        let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
+        assert_eq!(r.store, None);
+        assert_eq!(r.instructions, None);
+    }
+
+    /// Codex path injects `store: false` and supplies a default instructions string.
+    #[test]
+    fn codex_path_sets_store_false_and_default_instructions() {
+        let req = make_llm_request(vec![user_msg("hi")]);
+        let r = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(r.store, Some(false));
+        assert_eq!(
+            r.instructions.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+    }
+
+    /// User-provided system instructions take precedence over the codex default.
+    #[test]
+    fn codex_path_preserves_user_instructions() {
+        use crate::llm::types::SystemContent;
+        let mut req = make_llm_request(vec![user_msg("hi")]);
+        req.system = vec![SystemContent::new("be terse")];
+        let r = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(r.store, Some(false));
+        assert_eq!(r.instructions.as_deref(), Some("be terse"));
+    }
+
+    /// `prompt_cache_key` round-trips from `LlmRequest.cache_key` to the
+    /// Responses request body — both platform and codex paths.
+    #[test]
+    fn prompt_cache_key_reaches_wire_on_both_paths() {
+        use crate::llm::types::PromptCacheKey;
+        let mut req = make_llm_request(vec![user_msg("hi")]);
+        req.cache_key = PromptCacheKey::stable("conv-abc-123");
+
+        let platform = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
+        assert_eq!(platform.prompt_cache_key.as_deref(), Some("conv-abc-123"));
+
+        let codex = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert_eq!(codex.prompt_cache_key.as_deref(), Some("conv-abc-123"));
+    }
+
+    /// `ephemeral()` produces distinct keys per call (UUID-shaped).
+    #[test]
+    fn ephemeral_produces_distinct_keys() {
+        use crate::llm::types::PromptCacheKey;
+        let a = PromptCacheKey::ephemeral();
+        let b = PromptCacheKey::ephemeral();
+        assert_ne!(a.as_str(), b.as_str());
+        // UUID v4 string length sanity check.
+        assert_eq!(a.as_str().len(), 36);
+    }
+
+    /// `include` stays empty until Phoenix can preserve additional output
+    /// items, such as encrypted reasoning, in the transcript.
+    #[test]
+    fn include_is_empty_on_both_paths() {
+        let req = make_llm_request(vec![user_msg("hi")]);
+        let p = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
+        assert!(p.include.is_empty());
+        let c = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
+        assert!(c.include.is_empty());
+    }
+
+    /// `tool_choice` and `parallel_tool_calls` are sent when tools are
+    /// present, omitted when no tools — the API rejects "auto" without a
+    /// tools array.
+    #[test]
+    fn tool_choice_and_parallel_only_sent_with_tools() {
+        // No tools → both fields omitted
+        let no_tools = make_llm_request(vec![user_msg("hi")]);
+        let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &no_tools);
+        assert_eq!(r.tool_choice, None);
+        assert_eq!(r.parallel_tool_calls, None);
+
+        // With tools → both fields present with their explicit defaults
+        use crate::llm::types::ToolDefinition;
+        let mut with_tools = make_llm_request(vec![user_msg("hi")]);
+        with_tools.tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Run a bash command".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+        }];
+        let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &with_tools);
+        assert_eq!(r.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(r.parallel_tool_calls, Some(true));
     }
 }

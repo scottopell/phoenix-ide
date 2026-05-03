@@ -3,8 +3,8 @@
 #![allow(dead_code)] // new_empty() used in tests
 
 use super::{
-    all_models, discover_models, probe_gateway, DiscoveryConfig, LlmService, LlmServiceImpl,
-    LoggingService, Provider,
+    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
+    LlmService, LlmServiceImpl, LoggingService, Provider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +38,14 @@ pub trait CredentialSource: Send + Sync + std::fmt::Debug {
     /// Invalidate any cached value (e.g. after a 401).
     /// Returns `true` if there was a cached value to invalidate (i.e. a retry is worthwhile).
     async fn invalidate(&self) -> bool;
+    /// Optional source-specific hint to surface on auth failures, used by
+    /// `LlmAuth::resolve()` to enrich the generic "credential unavailable"
+    /// message with actionable recovery guidance (e.g. "run `codex login`").
+    /// Returns `None` to fall back to the generic message. Default-impl `None`
+    /// keeps existing implementations unchanged.
+    async fn last_error_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A static credential string that never changes.
@@ -97,10 +105,14 @@ impl LlmAuth {
             });
         }
         let recovering = self.source.is_recovering().await;
-        let message = if recovering {
-            "Waiting for authentication — complete the sign-in flow to continue"
+        // Prefer the source's own hint (e.g. "run `codex login`") over the
+        // generic message; fall back to the recovery / generic text.
+        let message = if let Some(hint) = self.source.last_error_hint().await {
+            hint
+        } else if recovering {
+            "Waiting for authentication — complete the sign-in flow to continue".to_string()
         } else {
-            "Credential unavailable — check API key or LLM_API_KEY_HELPER"
+            "Credential unavailable — check API key or LLM_API_KEY_HELPER".to_string()
         };
         let mut err = super::LlmError::auth(message);
         err.recovery_in_progress = recovering;
@@ -159,6 +171,14 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
+    /// Explicit opt-in for routing `OpenAI` models through local Codex `ChatGPT`
+    /// credentials. Parsed from `OPENAI_USE_CODEX_AUTH=1`.
+    pub use_codex_auth: bool,
+    /// When populated, `OpenAI` models are routed through the
+    /// `ChatGPT` backend (`https://chatgpt.com/backend-api/codex`) using
+    /// `OAuth` tokens borrowed from the local `Codex` CLI's `~/.codex/auth.json`.
+    /// `Anthropic` and `Mock` providers are unaffected.
+    pub codex_credential: Option<Arc<CodexCredential>>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -179,6 +199,8 @@ impl std::fmt::Debug for LlmConfig {
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
             .field("auth_style", &self.auth_style)
+            .field("use_codex_auth", &self.use_codex_auth)
+            .field("codex_credential", &self.codex_credential.is_some())
             .finish()
     }
 }
@@ -195,6 +217,8 @@ impl Clone for LlmConfig {
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
             auth_style: self.auth_style,
+            use_codex_auth: self.use_codex_auth,
+            codex_credential: self.codex_credential.as_ref().map(Arc::clone),
         }
     }
 }
@@ -211,6 +235,8 @@ impl Default for LlmConfig {
             openai_base_url: None,
             custom_headers: Vec::new(),
             auth_style: AuthStyle::ApiKey,
+            use_codex_auth: false,
+            codex_credential: None,
         }
     }
 }
@@ -251,6 +277,28 @@ impl LlmConfig {
             })
             .unwrap_or_default();
 
+        let use_codex_auth = std::env::var("OPENAI_USE_CODEX_AUTH")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+        let codex_credential = if use_codex_auth {
+            match CodexCredential::load(codex_credential::default_auth_path()) {
+                Ok((cred, account_id)) => {
+                    tracing::info!(
+                        account_id = account_id.as_deref().unwrap_or("<none>"),
+                        "OPENAI_USE_CODEX_AUTH enabled — routing OpenAI models via ChatGPT backend"
+                    );
+                    Some(cred)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "OPENAI_USE_CODEX_AUTH set but codex credential load failed; OpenAI models unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
@@ -268,6 +316,8 @@ impl LlmConfig {
             } else {
                 AuthStyle::ApiKey
             },
+            use_codex_auth,
+            codex_credential,
         }
     }
 }
@@ -338,17 +388,33 @@ impl ModelRegistry {
         services: &HashMap<String, Arc<dyn LlmService>>,
         config: &LlmConfig,
     ) -> String {
-        config
-            .default_model
-            .clone()
-            .or_else(|| {
-                const PREFERRED: &[&str] = &["claude-sonnet-4-6", "claude-sonnet-4-5"];
-                PREFERRED
-                    .iter()
-                    .find(|id| services.contains_key(**id))
-                    .map(|id| (*id).to_string())
-                    .or_else(|| services.keys().next().cloned())
-            })
+        const PREFERRED: &[&str] = &[
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "gpt-5.5",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "mock",
+        ];
+        // Honor `DEFAULT_MODEL` only if it actually got registered. A
+        // configured default that points at e.g. an OpenAI model when codex
+        // auth failed would otherwise pin the registry's default to an
+        // unavailable id, breaking every code path that calls `default()`.
+        if let Some(ref configured) = config.default_model {
+            if services.contains_key(configured) {
+                return configured.clone();
+            }
+            tracing::warn!(
+                requested = %configured,
+                "DEFAULT_MODEL is configured but not available; falling back to a registered model"
+            );
+        }
+        PREFERRED
+            .iter()
+            .find(|id| services.contains_key(**id))
+            .map(|id| (*id).to_string())
+            .or_else(|| services.keys().next().cloned())
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
     }
 
@@ -501,6 +567,31 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(service)));
         }
 
+        // Codex ChatGPT auth is an explicit OpenAI opt-in. If enabled but the
+        // credential failed to load, OpenAI models are unavailable rather than
+        // silently falling through to another auth path.
+        if config.use_codex_auth && spec.provider == Provider::OpenAI {
+            let cred = config.codex_credential.as_ref()?;
+            let auth = LlmAuth::new(
+                Arc::clone(cred) as Arc<dyn CredentialSource>,
+                AuthStyle::PlainBearer,
+            );
+            let service = Arc::new(LlmServiceImpl::new_with_codex_backend(
+                spec.clone(),
+                auth,
+                config.custom_headers.clone(),
+                Arc::clone(cred),
+            ));
+            return Some(Arc::new(LoggingService::new(service)));
+        }
+
+        Self::try_create_model_with_standard_auth(spec, config)
+    }
+
+    fn try_create_model_with_standard_auth(
+        spec: &super::ModelSpec,
+        config: &LlmConfig,
+    ) -> Option<Arc<dyn LlmService>> {
         let auth = if let Some(ref helper) = config.credential_helper {
             // credential_helper takes highest priority — dynamic credential for all providers
             LlmAuth::new(
@@ -779,6 +870,105 @@ mod tests {
         assert!(!registry.available_models().is_empty());
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-5.5").is_some());
+    }
+
+    /// Helper: build a CodexCredential pointing at a freshly-written valid
+    /// auth.json file so try_create_model can complete the codex branch.
+    fn fake_codex_credential(_dir: &tempfile::TempDir) -> Arc<crate::llm::CodexCredential> {
+        let path = _dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"x","refresh_token":"r","account_id":"acc-1"}}"#,
+        )
+        .unwrap();
+        crate::llm::CodexCredential::load(path).unwrap().0
+    }
+
+    /// With Codex auth enabled and a valid credential, OpenAI models register
+    /// via the codex branch (no need for OPENAI_API_KEY) and are distinct from
+    /// Anthropic registration.
+    #[test]
+    fn test_codex_auth_registers_openai_models_without_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(
+            registry.get("gpt-5.5").is_some(),
+            "OpenAI model should register via codex auth without OPENAI_API_KEY"
+        );
+        assert!(
+            registry.get("claude-sonnet-4-6").is_some(),
+            "Anthropic models unaffected by codex auth"
+        );
+    }
+
+    /// With Codex auth enabled but credential load failed, OpenAI models must
+    /// not silently fall through to OPENAI_API_KEY auth.
+    #[test]
+    fn test_codex_auth_refuses_silent_fallback_when_cred_missing() {
+        let config = LlmConfig {
+            openai_api_key: Some("a-real-key".to_string()),
+            use_codex_auth: true,
+            codex_credential: None, // load failed
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(
+            registry.get("gpt-5.5").is_none(),
+            "OpenAI must not fall through to OPENAI_API_KEY when codex auth is enabled but credentials are absent"
+        );
+    }
+
+    /// With Codex auth disabled, codex_credential is ignored and standard
+    /// OpenAI auth remains available.
+    #[test]
+    fn test_codex_branch_is_gated_by_env_flag_not_just_cred_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            openai_api_key: Some("a-real-key".to_string()),
+            use_codex_auth: false,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(
+            registry.get("gpt-5.5").is_some(),
+            "OpenAI should register via OPENAI_API_KEY when codex auth is disabled"
+        );
+    }
+
+    #[test]
+    fn test_default_model_prefers_openai_over_mock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert_eq!(registry.default_model_id(), "gpt-5.5");
+    }
+
+    /// pick_default_model must not pin to a configured DEFAULT_MODEL that
+    /// isn't actually registered (e.g. DEFAULT_MODEL=gpt-5.5 with codex
+    /// auth disabled and only an Anthropic key set).
+    #[test]
+    fn test_default_model_falls_back_when_configured_one_unavailable() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        // gpt-5.5 isn't registered (no OpenAI auth), so default must fall
+        // back to a model that actually exists.
+        assert_ne!(registry.default_model_id(), "gpt-5.5");
+        assert!(registry.get(registry.default_model_id()).is_some());
     }
 
     #[test]

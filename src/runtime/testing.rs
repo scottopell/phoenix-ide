@@ -5,7 +5,7 @@
 use super::traits::*;
 use crate::db::{Message, MessageContent, MessageType, UsageData};
 use crate::llm::ModelRegistry;
-use crate::llm::{LlmError, LlmRequest, LlmResponse, ToolDefinition};
+use crate::llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinition};
 use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
@@ -746,6 +746,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: Some(100),
+            cache_key: PromptCacheKey::ephemeral(),
         };
 
         let response = mock.complete(&request).await.unwrap();
