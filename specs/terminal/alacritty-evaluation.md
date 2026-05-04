@@ -1,5 +1,10 @@
 # alacritty_terminal Migration Evaluation
 
+> **Historical record.** The adapter modules and proptests referenced below
+> (`src/terminal/alacritty_parser.rs`, `cargo test terminal::alacritty_parser`,
+> the `alac_proptest` module) were removed in PR #15 after the evaluation
+> concluded. Findings stand; reproduction commands no longer apply.
+
 **Status:** Complete — go/no-go recommendation issued  
 **Task:** 24676  
 **Date:** 2026-04-13  

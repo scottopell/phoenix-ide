@@ -1,5 +1,10 @@
 # wezterm-term Migration Evaluation
 
+> **Historical record.** The adapter modules and proptests referenced below
+> (`src/terminal/wezterm_parser.rs`, `cargo test terminal::wezterm_parser`,
+> the `wez_proptest` module) were removed in PR #15 after the evaluation
+> concluded. Findings stand; reproduction commands no longer apply.
+
 **Status:** Complete — go/no-go recommendation issued  
 **Task:** 24673  
 **Date:** 2026-04-13  
