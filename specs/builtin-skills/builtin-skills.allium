@@ -1,0 +1,151 @@
+-- allium: 3
+-- specs/builtin-skills/builtin-skills.allium
+--
+-- Scope: Built-in skills — registry, discovery integration, override precedence
+-- Imports: skills (extends Skill discovery and invocation)
+-- Excludes: Filesystem skill discovery (already in skills.allium)
+--           Frontmatter parsing (already in skills.allium)
+--           Argument substitution (already in skills.allium)
+
+import skills
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A built-in skill is content compiled into the phoenix binary as a
+-- &'static str. The system never writes built-ins.
+external entity BuiltinSkill {
+    name: String                -- registry-declared identifier
+    description: String         -- registry-declared one-line description
+    content: String             -- &'static str body (no frontmatter required)
+    argument_hint: String?      -- optional hint shown in autocomplete
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The registry of built-in skills compiled into the binary.
+    -- Implementation: src/skills/builtin.rs ALL constant.
+    builtin_registry: List<BuiltinSkill> = []
+}
+
+------------------------------------------------------------
+-- Rules: Discovery Integration
+------------------------------------------------------------
+
+-- Built-in skills are appended to the catalog AFTER the filesystem walk
+-- completes. The existing name-dedup rule (first seen wins, defined in
+-- skills.allium DiscoverSkillCatalog) means a filesystem skill of the same
+-- name is already collected, so the built-in is skipped.
+
+rule AppendBuiltinSkills {
+    when: FilesystemDiscoveryComplete(catalog)
+
+    ensures: for builtin in builtin_registry where not name_taken(catalog, builtin.name):
+        SkillRegistered(
+            name: builtin.name,
+            description: builtin.description,
+            argument_hint: builtin.argument_hint,
+            source: Builtin,
+            body_provider: builtin.content
+        )
+    -- name_taken: black box checking if any skill in catalog has the given name
+    -- SkillRegistered: chained event consumed by the sort/finalize stage of
+    --   DiscoverSkillCatalog (skills.allium)
+
+    @guidance
+        -- Sequencing matters: the filesystem walk runs first, then this rule
+        -- fires once, then the catalog is sorted by name. Reordering would
+        -- invert the precedence rule below.
+        -- Implementation: discover_skills_with_home() in src/system_prompt.rs,
+        -- after the existing walk-up + children + $HOME scans.
+}
+
+------------------------------------------------------------
+-- Rules: Invocation Source Dispatch
+------------------------------------------------------------
+
+rule ReadBuiltinSkillContent {
+    when: SkillContentRequested(skill)
+
+    requires: skill.source = Builtin
+
+    let entry = registry_lookup(builtin_registry, skill.name)
+    -- registry_lookup: black box returning the BuiltinSkill matching name
+
+    requires: exists entry
+
+    ensures: SkillContent.created(body: entry.content)
+
+    @guidance
+        -- The Builtin source variant only exists in the catalog because
+        -- AppendBuiltinSkills placed it there from the registry, so the
+        -- lookup is guaranteed to succeed under normal operation.
+        -- A missing-entry result would indicate corruption (e.g. registry
+        -- mutated mid-session) and should produce an error.
+}
+
+rule ReadFilesystemSkillContent {
+    when: SkillContentRequested(skill)
+
+    requires: skill.source = Filesystem
+
+    ensures: SkillContent.created(body: read_file(skill.path))
+    -- read_file: black box returning the SKILL.md file contents
+    -- Existing behavior preserved from skills spec.
+}
+
+------------------------------------------------------------
+-- Rules: Catalog Rendering
+------------------------------------------------------------
+
+rule RenderBuiltinInCatalog {
+    when: CatalogEntryFormatted(skill)
+
+    requires: skill.source = Builtin
+
+    ensures: entry_text = "- **" + skill.name + "** — " + skill.description + " (built-in)"
+
+    @guidance
+        -- Filesystem skills render with the path in backticks (existing
+        -- skills.allium InjectSkillCatalog rule). Built-ins render with the
+        -- literal "(built-in)" annotation so the LLM can distinguish them
+        -- when a user asks "where did this skill come from?".
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A skill source variant always implies a readable body. There is no
+-- "registered but unreadable" state.
+invariant SourceImpliesReadable {
+    for skill in Skills:
+        (skill.source = Filesystem implies file_exists(skill.path)) and
+        (skill.source = Builtin implies exists registry_lookup(builtin_registry, skill.name))
+}
+
+-- Filesystem skills always shadow built-ins of the same name. The catalog
+-- never contains both a filesystem and a built-in entry with the same name.
+invariant FilesystemShadowsBuiltin {
+    for fs_skill in Skills where fs_skill.source = Filesystem:
+        for builtin in builtin_registry where builtin.name = fs_skill.name:
+            not exists bs in Skills where bs.source = Builtin and bs.name = builtin.name
+}
+
+-- The existing SkillNamesUnique invariant from skills.allium remains in force
+-- and is reinforced here: built-ins do not break name uniqueness because they
+-- are filtered by the same name-dedup as filesystem skills.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- (resolved) Naming: built-in. Decided 2026-05-04.
+-- (resolved) Override: filesystem wins. Decided 2026-05-04.
+-- (resolved) UI grouping: separate "Built-in" group. Decided 2026-05-04.
+
+open question "Disabling a built-in without providing a filesystem replacement: not currently supported. Workaround is an empty filesystem SKILL.md to shadow. If this becomes a real user request, design an opt-out config (e.g. ~/.phoenix-ide/disabled-skills.toml)."

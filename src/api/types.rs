@@ -285,16 +285,18 @@ pub struct FileSearchQuery {
     pub limit: Option<usize>,
 }
 
-/// A single skill entry returned by the skills API (REQ-IR-005)
+/// A single skill entry returned by the skills API (REQ-IR-005, REQ-BS-003)
 #[derive(Debug, Serialize)]
 pub struct SkillEntry {
     pub name: String,
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
-    /// Where this skill was discovered (e.g., ".claude/skills" or ".agents/skills")
+    /// Where this skill was discovered. Either a discovery directory like
+    /// `".claude/skills"` / `".agents/skills"` for filesystem skills, or the
+    /// literal `"builtin"` for skills bundled with the phoenix binary.
     pub source: String,
-    /// Absolute path to the SKILL.md file
+    /// Absolute path to the SKILL.md file. Empty string for built-in skills.
     pub path: String,
 }
 

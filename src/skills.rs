@@ -3,7 +3,9 @@
 //! Both the user `/skill` path (`message_expander`) and the LLM Skill tool
 //! (`tools/skill.rs`) call `invoke_skill()` to produce identical output.
 
-use crate::system_prompt::SkillMetadata;
+pub mod builtin;
+
+use crate::system_prompt::{SkillMetadata, SkillSource};
 
 /// The result of invoking a skill.
 #[derive(Debug, Clone)]
@@ -44,18 +46,24 @@ pub fn invoke_skill(
             )
         })?;
 
-    let raw_content = std::fs::read_to_string(&skill.path)
-        .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?;
+    let raw_content = match &skill.source {
+        SkillSource::Filesystem { path, .. } => std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?,
+        SkillSource::Builtin => builtin::find(&skill.name)
+            .map(|b| b.content.to_string())
+            .ok_or_else(|| {
+                format!("Built-in skill '{skill_name}' is registered but content is missing")
+            })?,
+    };
 
     // REQ-SK-001: Strip YAML frontmatter
     let body = strip_frontmatter(&raw_content);
 
-    // REQ-SK-003: Prepend base directory
-    let skill_dir = skill
-        .path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // REQ-SK-003: Prepend base directory.
+    // Built-ins surface a `builtin://` marker rather than a fabricated path so
+    // the LLM does not attempt filesystem reads against a directory that does
+    // not exist.
+    let skill_dir = skill.skill_dir();
     let body_with_dir = format!("Base directory for this skill: {skill_dir}\n\n{body}");
 
     // REQ-SK-004: Argument substitution
@@ -289,6 +297,24 @@ mod tests {
         assert!(err.contains("deploy"));
         assert!(err.contains("build"));
         assert!(err.contains("lint"));
+    }
+
+    #[test]
+    fn test_invoke_skill_builtin_returns_registry_content() {
+        // Use the live registry: caveman is shipped in ALL.
+        let tmp = TempDir::new().unwrap();
+        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let result = invoke_skill("caveman", "", &skills).unwrap();
+        assert_eq!(result.name, "caveman");
+        assert!(
+            result.skill_dir.starts_with("builtin://"),
+            "built-in skill_dir should be a synthetic marker, got {}",
+            result.skill_dir
+        );
+        // Body should contain the level descriptions from the vendored markdown
+        assert!(result.body.contains("caveman"));
+        // Frontmatter is stripped
+        assert!(!result.body.starts_with("---"));
     }
 
     #[test]

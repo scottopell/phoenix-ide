@@ -52,16 +52,55 @@ pub struct GuidanceFile {
     pub content: String,
 }
 
-/// Metadata extracted from a skill's SKILL.md frontmatter
+/// Where a skill came from. Filesystem skills are read from disk on
+/// invocation; built-in skills carry their content as a `&'static str`
+/// in the in-binary registry (`crate::skills::builtin`).
+#[derive(Debug, Clone)]
+pub enum SkillSource {
+    Filesystem {
+        /// Absolute path to the SKILL.md file
+        path: PathBuf,
+        /// Discovery directory, e.g. ".claude/skills" or ".agents/skills"
+        source_dir: String,
+    },
+    /// Skill is bundled with the phoenix binary; content lives in
+    /// `crate::skills::builtin::ALL`.
+    Builtin,
+}
+
+/// Metadata for a skill discovered (filesystem or built-in).
 #[derive(Debug, Clone)]
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
-    pub path: PathBuf,
     /// Optional argument hint shown in autocomplete (from `argument-hint:` frontmatter field)
     pub argument_hint: Option<String>,
-    /// Where this skill was discovered (e.g., ".claude/skills" or ".agents/skills")
-    pub source: String,
+    pub source: SkillSource,
+}
+
+impl SkillMetadata {
+    /// Synthetic "skill directory" passed to the LLM as `Base directory for
+    /// this skill:` for companion-file access. Built-in skills have no on-disk
+    /// directory; we surface a `builtin://` marker so the LLM does not attempt
+    /// `cat` on a fabricated path.
+    pub fn skill_dir(&self) -> String {
+        match &self.source {
+            SkillSource::Filesystem { path, .. } => path
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            SkillSource::Builtin => format!("builtin://{}", self.name),
+        }
+    }
+
+    /// Catalog display fragment shown after the description in the system
+    /// prompt skill catalog (e.g. `` `/abs/path/SKILL.md` `` or `(built-in)`).
+    pub fn display_location(&self) -> String {
+        match &self.source {
+            SkillSource::Filesystem { path, .. } => format!("`{}`", path.display()),
+            SkillSource::Builtin => "(built-in)".to_string(),
+        }
+    }
 }
 
 /// Parsed frontmatter fields from a SKILL.md file
@@ -168,8 +207,10 @@ fn collect_skills_from_dir(
                     name: full_name.clone(),
                     description: fm.description,
                     argument_hint: fm.argument_hint,
-                    path: skill_md,
-                    source: source.to_string(),
+                    source: SkillSource::Filesystem {
+                        path: skill_md,
+                        source_dir: source.to_string(),
+                    },
                 });
             }
             // Recurse into skills/ subdirectory for namespaced sub-skills
@@ -217,6 +258,18 @@ pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
 pub fn discover_skills_with_home(
     working_dir: &Path,
     home_override: Option<&Path>,
+) -> Vec<SkillMetadata> {
+    discover_skills_with_registry(working_dir, home_override, crate::skills::builtin::ALL)
+}
+
+/// Discovery with an explicit built-in registry. Tests pass an empty slice to
+/// keep filesystem-only assertions deterministic; production callers go
+/// through [`discover_skills_with_home`] which uses the live registry.
+#[allow(clippy::too_many_lines)]
+pub fn discover_skills_with_registry(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+    builtins: &[&crate::skills::builtin::BuiltinSkill],
 ) -> Vec<SkillMetadata> {
     let mut skills: Vec<SkillMetadata> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
@@ -310,6 +363,20 @@ pub fn discover_skills_with_home(
         }
     }
 
+    // Append built-in skills last. Existing name dedup means a filesystem
+    // skill of the same name has already been collected and the built-in is
+    // skipped — this is the documented override rule (REQ-BS-002).
+    for builtin in builtins {
+        if seen_names.insert(builtin.name.to_string()) {
+            skills.push(SkillMetadata {
+                name: builtin.name.to_string(),
+                description: builtin.description.to_string(),
+                argument_hint: builtin.argument_hint.map(str::to_string),
+                source: SkillSource::Builtin,
+            });
+        }
+    }
+
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
@@ -366,12 +433,31 @@ pub fn build_system_prompt(
 ///
 /// When `home_override` is `Some`, that path is used instead of `$HOME` for
 /// the explicit home-directory skill scan. See [`discover_skills_with_home`].
-#[allow(clippy::too_many_lines)] // One match arm per ModeContext variant; splitting hurts readability
 pub fn build_system_prompt_with_home(
     working_dir: &Path,
     is_sub_agent: bool,
     mode: Option<&ModeContext>,
     home_override: Option<&Path>,
+) -> String {
+    build_system_prompt_with_registry(
+        working_dir,
+        is_sub_agent,
+        mode,
+        home_override,
+        crate::skills::builtin::ALL,
+    )
+}
+
+/// System prompt build with an explicit built-in registry. Tests pass an
+/// empty slice to assert filesystem-only behavior; production callers go
+/// through [`build_system_prompt_with_home`] which uses the live registry.
+#[allow(clippy::too_many_lines)] // One match arm per ModeContext variant; splitting hurts readability
+pub fn build_system_prompt_with_registry(
+    working_dir: &Path,
+    is_sub_agent: bool,
+    mode: Option<&ModeContext>,
+    home_override: Option<&Path>,
+    builtins: &[&crate::skills::builtin::BuiltinSkill],
 ) -> String {
     let mut prompt = String::from(BASE_PROMPT);
 
@@ -397,15 +483,15 @@ pub fn build_system_prompt_with_home(
     }
 
     // Inject skill catalog (metadata only — full instructions loaded on demand via bash)
-    let skills = discover_skills_with_home(working_dir, home_override);
+    let skills = discover_skills_with_registry(working_dir, home_override, builtins);
     if !skills.is_empty() {
         prompt.push_str("\n\n<available_skills>\n");
         prompt.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
         for skill in &skills {
-            let path = skill.path.display();
+            let location = skill.display_location();
             let _ = writeln!(
                 prompt,
-                "\n- **{}** — {} (`{path}`)",
+                "\n- **{}** — {} {location}",
                 skill.name, skill.description
             );
         }
@@ -557,7 +643,8 @@ mod tests {
     fn test_build_system_prompt_no_guidance() {
         let temp = TempDir::new().unwrap();
         // Use temp as home override to avoid $HOME skill contamination
-        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
+        let prompt =
+            build_system_prompt_with_registry(temp.path(), false, None, Some(temp.path()), &[]);
 
         assert!(prompt.contains("helpful AI assistant"));
         assert!(!prompt.contains("<project_guidance>"));
@@ -569,7 +656,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("AGENTS.md"), "# Project Rules\nBe nice.").unwrap();
 
-        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
+        let prompt =
+            build_system_prompt_with_registry(temp.path(), false, None, Some(temp.path()), &[]);
 
         assert!(prompt.contains("<project_guidance>"));
         assert!(prompt.contains("# Project Rules"));
@@ -580,7 +668,8 @@ mod tests {
     #[test]
     fn test_build_system_prompt_sub_agent() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt_with_home(temp.path(), true, None, Some(temp.path()));
+        let prompt =
+            build_system_prompt_with_registry(temp.path(), true, None, Some(temp.path()), &[]);
 
         assert!(prompt.contains("sub-agent"));
         assert!(prompt.contains("submit_result"));
@@ -647,7 +736,7 @@ mod tests {
     #[test]
     fn test_discover_skills_none() {
         let temp = TempDir::new().unwrap();
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
         assert!(skills.is_empty());
     }
 
@@ -662,15 +751,23 @@ mod tests {
             "Does something useful. Use when you need something.",
         );
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "my-skill");
-        assert!(skills[0].description.contains("Does something useful"));
-        assert_eq!(
-            skills[0].path,
-            temp.path().join(".claude/skills/my-skill").join("SKILL.md")
-        );
-        assert_eq!(skills[0].source, ".claude/skills");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
+        let claude_skills: Vec<&SkillMetadata> =
+            skills.iter().filter(|s| s.name == "my-skill").collect();
+        assert_eq!(claude_skills.len(), 1);
+        assert!(claude_skills[0]
+            .description
+            .contains("Does something useful"));
+        match &claude_skills[0].source {
+            SkillSource::Filesystem { path, source_dir } => {
+                assert_eq!(
+                    path,
+                    &temp.path().join(".claude/skills/my-skill").join("SKILL.md")
+                );
+                assert_eq!(source_dir, ".claude/skills");
+            }
+            SkillSource::Builtin => panic!("expected Filesystem source"),
+        }
     }
 
     #[test]
@@ -684,10 +781,16 @@ mod tests {
             "An agents skill",
         );
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "my-skill");
-        assert_eq!(skills[0].source, ".agents/skills");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
+        let agent_skills: Vec<&SkillMetadata> =
+            skills.iter().filter(|s| s.name == "my-skill").collect();
+        assert_eq!(agent_skills.len(), 1);
+        match &agent_skills[0].source {
+            SkillSource::Filesystem { source_dir, .. } => {
+                assert_eq!(source_dir, ".agents/skills");
+            }
+            SkillSource::Builtin => panic!("expected Filesystem source"),
+        }
     }
 
     #[test]
@@ -708,7 +811,7 @@ mod tests {
             "First alphabetically",
         );
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].name, "aaa-skill");
         assert_eq!(skills[1].name, "zzz-skill");
@@ -738,7 +841,7 @@ mod tests {
         );
 
         // Discover from child -- child should win
-        let skills = discover_skills_with_home(&child, Some(temp.path()));
+        let skills = discover_skills_with_registry(&child, Some(temp.path()), &[]);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Child description");
     }
@@ -761,13 +864,21 @@ mod tests {
             "From .agents/skills",
         );
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
-        assert_eq!(skills.len(), 2);
-        // sorted by name
-        assert_eq!(skills[0].name, "agents-skill");
-        assert_eq!(skills[0].source, ".agents/skills");
-        assert_eq!(skills[1].name, "claude-skill");
-        assert_eq!(skills[1].source, ".claude/skills");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
+        let agents = skills.iter().find(|s| s.name == "agents-skill").unwrap();
+        let claude = skills.iter().find(|s| s.name == "claude-skill").unwrap();
+        match &agents.source {
+            SkillSource::Filesystem { source_dir, .. } => {
+                assert_eq!(source_dir, ".agents/skills");
+            }
+            SkillSource::Builtin => panic!("expected Filesystem source"),
+        }
+        match &claude.source {
+            SkillSource::Filesystem { source_dir, .. } => {
+                assert_eq!(source_dir, ".claude/skills");
+            }
+            SkillSource::Builtin => panic!("expected Filesystem source"),
+        }
     }
 
     #[test]
@@ -789,10 +900,15 @@ mod tests {
             "From agents",
         );
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].description, "From claude");
-        assert_eq!(skills[0].source, ".claude/skills");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
+        let shared = skills.iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.description, "From claude");
+        match &shared.source {
+            SkillSource::Filesystem { source_dir, .. } => {
+                assert_eq!(source_dir, ".claude/skills");
+            }
+            SkillSource::Builtin => panic!("expected Filesystem source"),
+        }
     }
 
     #[test]
@@ -807,7 +923,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
         assert!(skills.is_empty());
     }
 
@@ -822,7 +938,8 @@ mod tests {
             "Deploy the app. Use when deploying.",
         );
 
-        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
+        let prompt =
+            build_system_prompt_with_registry(temp.path(), false, None, Some(temp.path()), &[]);
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("</available_skills>"));
@@ -834,7 +951,8 @@ mod tests {
     #[test]
     fn test_build_system_prompt_no_skills() {
         let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt_with_home(temp.path(), false, None, Some(temp.path()));
+        let prompt =
+            build_system_prompt_with_registry(temp.path(), false, None, Some(temp.path()), &[]);
 
         assert!(!prompt.contains("<available_skills>"));
     }
@@ -867,7 +985,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(
             names.contains(&"allium"),
@@ -906,7 +1024,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"a"));
         assert!(names.contains(&"a:b"));
@@ -933,7 +1051,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[]);
         assert!(
             skills.is_empty(),
             "sub-skills of non-skill dirs should not be found"
@@ -948,8 +1066,13 @@ mod tests {
             base_branch: "main".to_string(),
             worktree_path: "/home/user/project/worktrees/abc123".to_string(),
         };
-        let prompt =
-            build_system_prompt_with_home(temp.path(), false, Some(&mode), Some(temp.path()));
+        let prompt = build_system_prompt_with_registry(
+            temp.path(),
+            false,
+            Some(&mode),
+            Some(temp.path()),
+            &[],
+        );
 
         assert!(prompt.contains("Work mode"));
         assert!(prompt.contains("task-42-fix-bug"));
@@ -957,5 +1080,108 @@ mod tests {
         assert!(prompt.contains("MUST stay inside this worktree"));
         assert!(prompt.contains("Task-file status renames"));
         assert!(prompt.contains("Your task ID prefix is"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Built-in skill discovery (specs/builtin-skills/)
+    // -------------------------------------------------------------------------
+
+    fn test_builtin(name: &'static str) -> crate::skills::builtin::BuiltinSkill {
+        crate::skills::builtin::BuiltinSkill {
+            name,
+            description: "test built-in",
+            argument_hint: None,
+            content: "# test\nbody",
+        }
+    }
+
+    #[test]
+    fn test_builtin_appears_when_no_filesystem_skill() {
+        let temp = TempDir::new().unwrap();
+        let bi = test_builtin("caveman");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[&bi]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "caveman");
+        assert!(matches!(skills[0].source, SkillSource::Builtin));
+    }
+
+    #[test]
+    fn test_filesystem_skill_shadows_builtin_with_same_name() {
+        let temp = TempDir::new().unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "caveman",
+            "caveman",
+            "User's own caveman skill",
+        );
+        let bi = test_builtin("caveman");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[&bi]);
+        assert_eq!(skills.len(), 1, "exactly one caveman should be visible");
+        match &skills[0].source {
+            SkillSource::Filesystem { source_dir, .. } => {
+                assert_eq!(source_dir, ".claude/skills");
+            }
+            SkillSource::Builtin => {
+                panic!("filesystem caveman should shadow built-in (REQ-BS-002)")
+            }
+        }
+        assert!(skills[0].description.contains("User's own"));
+    }
+
+    #[test]
+    fn test_builtin_and_filesystem_coexist_when_names_differ() {
+        let temp = TempDir::new().unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "build",
+            "build",
+            "Build the project",
+        );
+        let bi = test_builtin("caveman");
+        let skills = discover_skills_with_registry(temp.path(), Some(temp.path()), &[&bi]);
+        assert_eq!(skills.len(), 2);
+        // Sorted: build < caveman
+        assert_eq!(skills[0].name, "build");
+        assert!(matches!(skills[0].source, SkillSource::Filesystem { .. }));
+        assert_eq!(skills[1].name, "caveman");
+        assert!(matches!(skills[1].source, SkillSource::Builtin));
+    }
+
+    #[test]
+    fn test_catalog_renders_builtin_with_marker_not_path() {
+        let temp = TempDir::new().unwrap();
+        let bi = test_builtin("caveman");
+        let prompt =
+            build_system_prompt_with_registry(temp.path(), false, None, Some(temp.path()), &[&bi]);
+        assert!(prompt.contains("**caveman**"));
+        assert!(prompt.contains("(built-in)"));
+        // No fabricated path for the built-in
+        assert!(!prompt.contains("/caveman/SKILL.md"));
+    }
+
+    #[test]
+    fn test_skill_dir_for_builtin_is_synthetic() {
+        let bi = SkillMetadata {
+            name: "caveman".to_string(),
+            description: "x".to_string(),
+            argument_hint: None,
+            source: SkillSource::Builtin,
+        };
+        assert_eq!(bi.skill_dir(), "builtin://caveman");
+        assert_eq!(bi.display_location(), "(built-in)");
+    }
+
+    #[test]
+    fn test_live_registry_includes_caveman() {
+        // Sanity-check that the production path exposes the bundled skill.
+        let temp = TempDir::new().unwrap();
+        let skills = discover_skills_with_home(temp.path(), Some(temp.path()));
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"caveman"),
+            "live registry should include caveman; got {names:?}"
+        );
     }
 }

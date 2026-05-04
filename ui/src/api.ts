@@ -241,13 +241,18 @@ export interface FileSearchEntry {
   is_text_file: boolean;
 }
 
-/** A single skill entry returned by the skills API (REQ-IR-005) */
+/** A single skill entry returned by the skills API (REQ-IR-005, REQ-BS-003) */
 export interface SkillEntry {
   name: string;
   description: string;
   argument_hint?: string | null;
+  /**
+   * Where this skill was discovered. Either a discovery directory like
+   * `".claude/skills"` / `".agents/skills"` for filesystem skills, or the
+   * literal `"builtin"` for skills bundled with the phoenix binary.
+   */
   source: string;
-  /** Absolute path to the SKILL.md file */
+  /** Absolute path to the SKILL.md file. Empty string for built-in skills. */
   path: string;
 }
 
