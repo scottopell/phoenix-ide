@@ -39,13 +39,12 @@ function groupLabel(skill: SkillEntry): string {
 }
 
 /**
- * Group skills by source, with the "Built-in" group pinned first so users see
- * phoenix-bundled skills before filesystem ones.
+ * Group skills by source. The "Built-in" group is pulled to the front of the
+ * resulting Map (Maps preserve insertion order) so phoenix-bundled skills
+ * render above filesystem ones in the panel.
  */
 function groupSkills(skills: SkillEntry[]): Map<string, SkillEntry[]> {
   const groups = new Map<string, SkillEntry[]>();
-  // Pre-create Built-in entry so it sorts to insertion-order position 0
-  // when present.
   for (const skill of skills) {
     const label = groupLabel(skill);
     const existing = groups.get(label);
@@ -55,6 +54,8 @@ function groupSkills(skills: SkillEntry[]): Map<string, SkillEntry[]> {
       groups.set(label, [skill]);
     }
   }
+  // Reorder so Built-in is first. Without this the group lands wherever the
+  // first built-in skill appeared in the source array.
   if (groups.has(BUILTIN_GROUP)) {
     const builtins = groups.get(BUILTIN_GROUP)!;
     groups.delete(BUILTIN_GROUP);

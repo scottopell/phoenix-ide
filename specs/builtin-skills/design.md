@@ -115,9 +115,9 @@ let _ = writeln!(prompt, "\n- **{}** — {} {location}", skill.name, skill.descr
 UI (`SkillsPanel.tsx`):
 
 ```ts
-function groupLabel(skill: Skill): string {
-  if (skill.source.kind === "builtin") return "Built-in";
-  return groupLabelFromPath(skill.source.path);
+function groupLabel(skill: SkillEntry): string {
+  if (skill.source === "builtin") return "Built-in";
+  return groupLabelFromPath(skill.path);
 }
 ```
 
@@ -127,19 +127,45 @@ the panel — name, description, argument hint — only the group label differs.
 
 ## Wire Format
 
-`SkillSource` serializes as a tagged union for the HTTP API:
+The Rust-side `SkillSource` enum is collapsed to flat string fields when
+serialized for the HTTP API. This keeps `SkillEntry` byte-compatible with the
+pre-existing wire shape (REQ-IR-005) — no breaking change for consumers — and
+the additional information (`source_dir`, distinguishing built-ins) is
+recoverable from the `source` value alone.
 
 ```jsonc
 // Filesystem skill
-{ "source": { "kind": "filesystem", "path": "/abs/path/SKILL.md", "source_dir": ".claude/skills" } }
+{
+  "name": "build",
+  "description": "Build the project",
+  "source": ".claude/skills",     // discovery directory
+  "path": "/abs/path/SKILL.md"
+}
 
 // Built-in skill
-{ "source": { "kind": "builtin" } }
+{
+  "name": "caveman",
+  "description": "Talk like caveman ...",
+  "source": "builtin",            // sentinel value
+  "path": ""                      // empty: no on-disk SKILL.md
+}
 ```
 
-`#[serde(tag = "kind", rename_all = "lowercase")]` on the enum produces this
-shape. The TypeScript type is regenerated via the existing ts-rs codegen
-path (`./dev.py codegen`) so the UI gets a discriminated union for free.
+The mapping happens in the API handler (`src/api/handlers.rs`
+`list_conversation_skills`):
+
+```rust
+match &s.source {
+    SkillSource::Filesystem { path, source_dir } => {
+        (source_dir.clone(), path.to_string_lossy().to_string())
+    }
+    SkillSource::Builtin => ("builtin".to_string(), String::new()),
+}
+```
+
+The TypeScript `SkillEntry` type in `ui/src/api.ts` documents both cases.
+Consumers branch on `skill.source === "builtin"` to distinguish built-ins
+from filesystem skills.
 
 ## Override Test Matrix
 
