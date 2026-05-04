@@ -222,7 +222,13 @@ impl ToolContext {
     ///
     /// REQ-TMUX-013.
     pub async fn tmux(&self) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
-        self.tmux_registry.ensure_live(&self.conversation_id).await
+        // `working_dir` is the conversation's CWD — used by tmux's
+        // `new-session -c` when a fresh server is spawned so the pane
+        // shell starts in the conversation's project. Ignored on
+        // re-attach (see `ensure_live` doc).
+        self.tmux_registry
+            .ensure_live(&self.conversation_id, &self.working_dir)
+            .await
     }
 
     /// Direct access to the registry (used by the hard-delete cascade

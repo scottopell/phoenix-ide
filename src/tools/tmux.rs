@@ -436,6 +436,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_session_starts_in_supplied_cwd() {
+        // Regression: tmux new-session was being issued without `-c
+        // <cwd>`, so the pane shell inherited Phoenix's own working
+        // directory instead of the conversation's project. The agent
+        // and the in-app terminal then both landed in /home/bits/dev/
+        // phoenix-ide regardless of which conversation they were
+        // attached to.
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        // Use a directory that's NOT the test process's cwd so the
+        // assertion catches the pre-fix "tmux inherits Phoenix's CWD"
+        // behavior.
+        let cwd_tmp = TempDir::new().unwrap();
+        let cwd = cwd_tmp.path().canonicalize().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "conv-cwd-test".to_string(),
+            cwd.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(crate::llm::ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            registry,
+        );
+
+        // First op spawns the session with `-c <cwd>`. Ask tmux for
+        // the pane's current path and compare.
+        let r = TmuxTool
+            .run(
+                json!({"args": ["display-message", "-p", "#{pane_current_path}"]}),
+                ctx,
+            )
+            .await;
+        assert!(r.success, "got: {}", r.output);
+        let v = parse_response(&r);
+        let stdout = v["stdout"].as_str().unwrap().trim();
+        let actual = std::path::PathBuf::from(stdout)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(stdout));
+        assert_eq!(actual, cwd, "pane should start in {cwd:?}, got {stdout:?}");
+
+        // Cleanup.
+        let sock = socket_tmp.path().join("conv-conv-cwd-test.sock");
+        let _ = tokio::process::Command::new("tmux")
+            .args(["-S", &sock.to_string_lossy(), "kill-server"])
+            .env_remove("TMUX")
+            .status()
+            .await;
+    }
+
+    #[tokio::test]
     async fn first_operation_spawns_server_and_responds_ok() {
         if skip_unless_tmux() {
             return;

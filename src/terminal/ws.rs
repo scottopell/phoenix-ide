@@ -253,8 +253,10 @@ async fn acquire_handle(
     }
 
     // Slow path: spawn a new PTY. Resolve the exec plan first
-    // (REQ-TMUX-004 / design.md §"Terminal Attach Path").
-    let plan = resolve_exec_plan(conversation_id, runtime).await;
+    // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
+    // forwarded so a fresh tmux server starts its pane in the
+    // conversation's project directory rather than Phoenix's own CWD.
+    let plan = resolve_exec_plan(conversation_id, cwd, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -309,12 +311,16 @@ async fn acquire_handle(
 /// server on first call (REQ-TMUX-002), reuses it after Phoenix
 /// restart (REQ-TMUX-005), and recreates over a stale socket
 /// (REQ-TMUX-006).
-async fn resolve_exec_plan(conversation_id: &str, runtime: &Arc<RuntimeManager>) -> PtyExecPlan {
+async fn resolve_exec_plan(
+    conversation_id: &str,
+    cwd: &std::path::Path,
+    runtime: &Arc<RuntimeManager>,
+) -> PtyExecPlan {
     let registry = runtime.tmux_registry();
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry.ensure_live(conversation_id).await {
+    match registry.ensure_live(conversation_id, cwd).await {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {

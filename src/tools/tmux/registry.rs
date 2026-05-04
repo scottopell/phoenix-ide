@@ -265,10 +265,16 @@ impl TmuxRegistry {
     /// drive the probe-and-act sequence (REQ-TMUX-002 / REQ-TMUX-005 /
     /// REQ-TMUX-006).
     ///
+    /// `cwd` is the conversation's working directory; passed to tmux's
+    /// `new-session -c` when a fresh server is spawned so the pane
+    /// shell starts in the conversation's project. `cwd` is ignored
+    /// when the probe sees `Live` — re-attaching to an existing server
+    /// uses whatever start directory was set when it was first spawned.
+    ///
     /// On `Live`: no spawn, status=Live.
-    /// On `NoSocket`: spawn `main` session, status=Live.
-    /// On `DeadSocket`: unlink stale file, spawn `main` session,
-    /// status=Live.
+    /// On `NoSocket`: spawn `main` session in `cwd`, status=Live.
+    /// On `DeadSocket`: unlink stale file, spawn `main` session in
+    /// `cwd`, status=Live.
     ///
     /// Concurrent calls on the same conversation race for the per-
     /// conversation write lock; the loser observes the freshly-spawned
@@ -276,6 +282,7 @@ impl TmuxRegistry {
     pub async fn ensure_live(
         &self,
         conversation_id: &str,
+        cwd: &Path,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
         if !self.binary_available {
             return Err(TmuxError::BinaryUnavailable);
@@ -305,7 +312,7 @@ impl TmuxRegistry {
                 server.status = ServerStatus::Live;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path, &self.config_path()).await?;
+                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -317,7 +324,7 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path, &self.config_path()).await?;
+                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
                 server.status = ServerStatus::Live;
             }
         }
@@ -454,12 +461,22 @@ pub async fn cascade_tmux_on_delete(
 }
 
 /// Spawn a fresh detached tmux session named `main` against
-/// `socket_path` (REQ-TMUX-002 / `tmux_default_session`). This is the
-/// only place `new-session -d` is issued, and therefore the only place
-/// where `-f <config_path>` actually loads the Phoenix-shipped config —
+/// `socket_path` with `cwd` as the pane's start directory
+/// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
+/// `new-session -d` is issued, and therefore the only place where
+/// `-f <config_path>` actually loads the Phoenix-shipped config —
 /// subsequent invocations against the same socket connect to the
 /// already-running server and inherit its loaded config.
-pub async fn spawn_session(socket_path: &Path, config_path: &Path) -> Result<(), TmuxError> {
+///
+/// `-c <cwd>` is load-bearing: without it tmux would inherit Phoenix's
+/// own working directory for the pane's shell, putting the agent (and
+/// any in-app terminal that later attaches) in the Phoenix repo
+/// instead of the conversation's project directory.
+pub async fn spawn_session(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+) -> Result<(), TmuxError> {
     let output = tokio::process::Command::new("tmux")
         .args([
             "-f",
@@ -468,6 +485,8 @@ pub async fn spawn_session(socket_path: &Path, config_path: &Path) -> Result<(),
             &socket_path.to_string_lossy(),
             "new-session",
             "-d",
+            "-c",
+            &cwd.to_string_lossy(),
             "-s",
             TMUX_DEFAULT_SESSION,
         ])
@@ -535,7 +554,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         assert!(matches!(
-            reg.ensure_live("conv-x").await,
+            reg.ensure_live("conv-x", tmp.path()).await,
             Err(TmuxError::BinaryUnavailable)
         ));
     }
