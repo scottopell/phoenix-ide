@@ -221,25 +221,34 @@ mod tests {
             .any(|l| { l["bytes"].as_str().unwrap_or("") == "hello" }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fast_exit_preserves_trailing_output_no_reader_race() {
         // Regression for the codex review: the waiter used to call
         // transition_to_terminal as soon as child.wait() resolved, but
         // the stdout reader task could still be holding kernel-buffered
         // bytes that hadn't yet been appended to the live ring. Once
         // tombstoned, the next reader append silently dropped those
-        // bytes — fast-exiting commands lost trailing output.
+        // bytes.
         //
-        // Test: 20 fast-exit iterations with a deterministic last line
-        // (including an unterminated trailing chunk). Without the fix,
-        // some iterations show truncated output. With the fix, every
-        // iteration captures everything.
+        // The race window opens between the reader's `read()` returning
+        // bytes and its subsequent `state()` lookup. For tiny payloads,
+        // the kernel typically returns all bytes in one read — the
+        // append happens before the waiter has a chance to tombstone.
+        // To force the race window open, emit enough bytes to require
+        // multiple read iterations: the waiter can win the schedule on
+        // ANY of the iterations after the child has exited.
+        //
+        // Payload: ~30 KB of "hello\n" lines + a unique trailing
+        // unterminated marker. With the reader's 4 KB read buffer
+        // (see read_pipe_to_ring), that's ~7 read iterations per
+        // invocation. 50 iterations × 7 windows = 350 race chances.
         let tool = BashTool;
-        for i in 0..20 {
+        for i in 0..50 {
             let registry = Arc::new(BashHandleRegistry::new());
             let c = ctx_with_registry(registry);
             let marker = format!("final-marker-{i}");
-            let cmd = format!("printf 'a\\nb\\nc\\n{marker}'");
+            // 5000 lines of "hello\n" = 30 000 bytes, then the marker.
+            let cmd = format!("yes hello | head -n 5000; printf '{marker}'");
             let r = tool.run(json!({"cmd": &cmd, "wait_seconds": 5}), c).await;
             let v = parse_response(&r);
             assert_eq!(v["status"], "exited", "iter {i}: got {v}");
@@ -252,7 +261,8 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains(&marker)),
                 "iter {i}: response missing final unterminated marker; \
-                 got: {lines:?}"
+                 last 5 lines: {:?}",
+                &lines[lines.len().saturating_sub(5)..]
             );
         }
     }
