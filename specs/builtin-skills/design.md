@@ -2,14 +2,79 @@
 
 ## Architecture Overview
 
-Skills today come from one place: the filesystem. `discover_skills` walks
-`.claude/skills/` and `.agents/skills/` directories from CWD up to root (plus
-`$HOME` and immediate children of CWD), and `invoke_skill` reads SKILL.md via
-`std::fs::read_to_string(&skill.path)`.
+Built-in skills are an embedded directory tree compiled into the phoenix
+binary. At server startup, the tree is materialized to a real on-disk
+location (`<HOME>/.phoenix-ide/builtin-skills/<name>/`) so each built-in
+becomes a normal filesystem skill from every consumer's point of view —
+discovery, invocation, the system-prompt catalog, the HTTP API, and the UI
+all read from disk via the existing skill machinery.
 
-Built-in skills add a second source: `&'static str` content compiled into the
-binary. They flow through the same metadata type, the same catalog injection,
-and the same expansion function. The only branch is the read step.
+The architectural value of the disk-extraction approach: built-ins can ship
+companion files (references, scripts, examples) without any new API or
+abstraction. The LLM sees a `Base directory for this skill: /abs/path/`
+header just like with user skills and can `cat references/foo.md` directly.
+
+## Embedded Layout
+
+```
+src/skills/builtin/
+  caveman/
+    SKILL.md
+  allium/
+    SKILL.md
+    references/
+      language-reference.md
+```
+
+Each subdirectory is one skill. `SKILL.md` is required (with the standard
+`name`/`description`/`argument-hint` frontmatter); any other files travel
+along as companions and are visible to the LLM through the skill's base
+directory.
+
+`#[derive(rust_embed::RustEmbed)] #[folder = "src/skills/builtin/"]` embeds
+the tree at compile time.
+
+## Extraction
+
+```rust
+// src/skills/builtin.rs
+pub const EXTRACT_SUBDIR: &str = "builtin-skills";
+
+pub fn default_extract_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".phoenix-ide").join(EXTRACT_SUBDIR))
+}
+
+pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
+    for path in BuiltinAssets::iter() {
+        let asset = BuiltinAssets::get(&path).expect("asset must exist");
+        let dest = target_dir.join(path.as_ref());
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Idempotent: skip the write when the file already matches.
+        let needs_write = match std::fs::read(&dest) {
+            Ok(existing) => existing != asset.data.as_ref(),
+            Err(_) => true,
+        };
+        if needs_write {
+            std::fs::write(&dest, asset.data.as_ref())?;
+        }
+    }
+    Ok(())
+}
+```
+
+Called from `main.rs` once the data directory exists. Failure is non-fatal:
+extraction errors are logged at `warn!` and the server continues — built-ins
+simply won't appear in the catalog.
+
+The extraction is intentionally additive — it does not delete files that
+were present in a prior phoenix version but removed in this one. This keeps
+the operation race-safe across concurrent phoenix processes (dev worktree +
+prod), at the cost of leaving stale files when a built-in is renamed or
+removed. Operators can wipe `~/.phoenix-ide/builtin-skills/` to reset.
 
 ## Data Model
 
@@ -17,14 +82,14 @@ and the same expansion function. The only branch is the read step.
 // src/system_prompt.rs
 pub enum SkillSource {
     Filesystem {
-        /// Absolute path to SKILL.md
+        /// Absolute path to the SKILL.md file
         path: PathBuf,
         /// Discovery directory, e.g. ".claude/skills" or ".agents/skills"
         source_dir: String,
     },
-    /// Skill is bundled with the phoenix binary; content lives in
-    /// src/skills/builtin.rs
-    Builtin,
+    /// Skill is bundled with the phoenix binary. The path points at the
+    /// extracted SKILL.md under <HOME>/.phoenix-ide/builtin-skills/<name>/.
+    Builtin { path: PathBuf },
 }
 
 pub struct SkillMetadata {
@@ -35,82 +100,54 @@ pub struct SkillMetadata {
 }
 ```
 
-The previous `path: PathBuf` and `source: String` fields collapse into the
-enum. Callers that need the path now match on `SkillSource::Filesystem` —
-this makes "code that assumes a filesystem path" structurally explicit.
-
-## Built-in Registry
-
-```rust
-// src/skills/builtin.rs (new)
-pub struct BuiltinSkill {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub argument_hint: Option<&'static str>,
-    pub content: &'static str,
-}
-
-pub const CAVEMAN: BuiltinSkill = BuiltinSkill {
-    name: "caveman",
-    description: "Talk like caveman. Drops articles and filler. Cuts ~75% \
-                  of output tokens without losing technical accuracy.",
-    argument_hint: Some("[lite|full|ultra|wenyan]"),
-    content: include_str!("builtin/caveman.md"),
-};
-
-pub const ALL: &[&BuiltinSkill] = &[&CAVEMAN, &CAVEMAN_COMMIT, &CAVEMAN_REVIEW];
-```
-
-`include_str!` keeps the markdown editable as a `.md` file (so syntax
-highlighting, formatting, and review work normally) while still compiling
-into the binary as `&'static str`. Frontmatter in the `.md` file is a
-documentation aid — the registry holds the canonical metadata.
+The variant is a *tag*, not a content discriminator. Both variants carry a
+real path. Helpers on `SkillMetadata` (`skill_dir`, `skill_md_path`,
+`display_location`) hide the distinction from most callers.
 
 ## Discovery Order and Precedence (REQ-BS-002)
 
-`discover_skills_with_home`:
+`discover_skills_with_options(working_dir, home_override, builtin_dir)`:
 
-1. Walk filesystem (existing logic) — collects filesystem skills with the
-   existing dedup (canonical path, content hash, name).
-2. **New step**: iterate `builtin::ALL`. For each, call the existing
-   `seen_names.insert(name)` guard. If the name is already taken by a
-   filesystem skill, the built-in is skipped.
-3. Sort by name (existing).
+1. Walk filesystem from `working_dir` → root, scanning `SKILL_DIRS` at each
+   level. Existing dedup (canonical path, content hash, name).
+2. Scan immediate children of `working_dir` (projects-directory case).
+3. Scan `$HOME/.claude/skills/` and `$HOME/.agents/skills/` if not visited.
+4. **Scan `builtin_dir`** (when `Some`) via `collect_builtin_skills_from_dir`.
+   Reuses the same dedup state, so any name already collected from the user
+   filesystem shadows the built-in.
+5. Sort by name.
 
-This matches the existing "first seen wins" semantic and keeps the rule
-simple: filesystem entries are seen first, so they shadow built-ins of the
-same name. No new precedence machinery.
+Test seam: pass `builtin_dir = None` to assert filesystem-only behavior.
+Production goes through `discover_skills(working_dir)` which uses
+`default_extract_dir()`.
 
 ## Invocation (REQ-BS-004)
 
 ```rust
 // src/skills.rs invoke_skill
-let raw_content = match &skill.source {
-    SkillSource::Filesystem { path, .. } => std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read skill file: {e}"))?,
-    SkillSource::Builtin => builtin::find(&skill.name)
-        .map(|b| b.content.to_string())
-        .ok_or_else(|| format!("Built-in skill '{}' content missing", skill.name))?,
-};
+let raw_content = std::fs::read_to_string(skill.skill_md_path())
+    .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?;
 ```
 
-`builtin::find(name)` is a linear scan over `ALL` (the registry is small;
-trading O(N) lookup for the simplest possible registry shape). The
-`ok_or_else` branch should be unreachable — a `Builtin` source variant only
-exists because discovery placed it there from the registry — but the error
-preserves invariant: source variant always implies a readable body.
+Built-ins and filesystem skills share one read path because both have real
+paths. The `Base directory for this skill: <skill_dir>` header given to the
+LLM points at the real on-disk directory in either case, so companion-file
+reads work identically.
 
 ## Catalog Rendering (REQ-BS-003)
 
-System prompt (`build_system_prompt_with_home`):
+System prompt (`build_system_prompt_with_options`):
 
 ```rust
-let location = match &skill.source {
-    SkillSource::Filesystem { path, .. } => format!("`{}`", path.display()),
-    SkillSource::Builtin => "(built-in)".to_string(),
-};
+let location = skill.display_location();
+//   Filesystem -> "(`/abs/path/SKILL.md`)"
+//   Builtin    -> "(built-in)"
 let _ = writeln!(prompt, "\n- **{}** — {} {location}", skill.name, skill.description);
 ```
+
+The catalog deliberately hides the extracted path for built-ins to keep the
+catalog terse. The LLM still has a real path available via the skill's
+`Base directory` line when the skill is invoked.
 
 UI (`SkillsPanel.tsx`):
 
@@ -121,24 +158,21 @@ function groupLabel(skill: SkillEntry): string {
 }
 ```
 
-The `Built-in` group is sorted to appear first (or pinned, depending on the
-existing sort). Built-ins are visually identical to filesystem skills inside
-the panel — name, description, argument hint — only the group label differs.
+The `Built-in` group is reordered to the front of the Map after grouping so
+phoenix-bundled skills appear above user-installed ones.
 
 ## Wire Format
 
-The Rust-side `SkillSource` enum is collapsed to flat string fields when
-serialized for the HTTP API. This keeps `SkillEntry` byte-compatible with the
-pre-existing wire shape (REQ-IR-005) — no breaking change for consumers — and
-the additional information (`source_dir`, distinguishing built-ins) is
-recoverable from the `source` value alone.
+`SkillEntry` is a flat shape — no breaking change from the pre-existing wire
+format. The Rust-side `SkillSource` enum is collapsed to flat string fields
+in the API handler:
 
 ```jsonc
 // Filesystem skill
 {
   "name": "build",
   "description": "Build the project",
-  "source": ".claude/skills",     // discovery directory
+  "source": ".claude/skills",
   "path": "/abs/path/SKILL.md"
 }
 
@@ -146,30 +180,33 @@ recoverable from the `source` value alone.
 {
   "name": "caveman",
   "description": "Talk like caveman ...",
-  "source": "builtin",            // sentinel value
-  "path": ""                      // empty: no on-disk SKILL.md
+  "source": "builtin",
+  "path": "/home/user/.phoenix-ide/builtin-skills/caveman/SKILL.md"
 }
 ```
 
-The mapping happens in the API handler (`src/api/handlers.rs`
-`list_conversation_skills`):
+Mapping in `src/api/handlers.rs` `list_conversation_skills`:
 
 ```rust
 match &s.source {
     SkillSource::Filesystem { path, source_dir } => {
         (source_dir.clone(), path.to_string_lossy().to_string())
     }
-    SkillSource::Builtin => ("builtin".to_string(), String::new()),
+    SkillSource::Builtin { path } => {
+        ("builtin".to_string(), path.to_string_lossy().to_string())
+    }
 }
 ```
 
-The TypeScript `SkillEntry` type in `ui/src/api.ts` documents both cases.
-Consumers branch on `skill.source === "builtin"` to distinguish built-ins
-from filesystem skills.
+The TypeScript `SkillEntry` in `ui/src/api.ts` documents both cases.
+Consumers branch on `skill.source === "builtin"` to distinguish. Note the
+`path` is now always populated — the SkillViewer fetches body via the
+existing `/api/files/read?path=...` endpoint regardless of source. There is
+no built-in-specific HTTP endpoint.
 
 ## Override Test Matrix
 
-| Filesystem has `caveman` | Registry has `caveman` | Result |
+| Filesystem has `caveman` | Extract dir has `caveman` | Result |
 |---|---|---|
 | no  | no  | not present |
 | no  | yes | built-in served |
@@ -178,23 +215,24 @@ from filesystem skills.
 
 ## Out of Scope
 
-- **Disabling built-ins via config.** Users who want caveman gone can either
-  drop an empty `~/.claude/skills/caveman/SKILL.md` (filesystem shadow with
-  empty body) or — if removing entirely matters — that's a separate spec.
-- **MCP tool description shrink.** Same caveman ecosystem, but a different
-  concern (compresses MCP descriptions, not skills) and lives in a separate
-  change.
-- **Statusline / stats.** Phoenix is a web UI, not a Claude Code CLI;
-  caveman's stats badge doesn't apply.
+- **Disabling built-ins via config.** Workaround: drop an empty filesystem
+  `SKILL.md` to shadow.
+- **Pruning stale extracts.** Renamed/removed built-ins leave their files in
+  the extract dir. Manual cleanup via `rm -rf ~/.phoenix-ide/builtin-skills/`.
+- **Per-version isolation.** Multiple phoenix binaries sharing one `$HOME`
+  will overwrite each other's extracted files at startup. Acceptable today;
+  revisit if needed.
 
 ## Testing Strategy
 
-- Unit: registry lookup hit and miss; `SkillSource` serde round-trip.
-- Discovery: built-ins appear when no filesystem skill exists; filesystem
-  shadows built-in of same name; built-in not present means catalog excludes
-  it.
+- Unit: `extract_to` writes files, is idempotent, restores tampered files.
+- Discovery: built-in appears when no filesystem skill exists; filesystem
+  shadows built-in of same name; coexistence when names differ.
 - System prompt: catalog renders `(built-in)` for built-in entries and the
-  path for filesystem entries.
-- Invocation: `invoke_skill` returns the registry content for a built-in;
-  same return shape as filesystem.
-- UI: `SkillsPanel` groups built-ins under "Built-in".
+  path for filesystem entries; the extract path does not leak into the
+  catalog line.
+- Invocation: `invoke_skill` reads from the extracted path for built-ins
+  (verified end-to-end with the real registry — confirms caveman + allium
+  are present).
+- Companion-file access: the allium reference file is on disk after
+  extraction (the value-prop test for the disk-extraction design).

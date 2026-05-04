@@ -53,12 +53,9 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
     setPromptError(null);
     setPromptContent(null);
 
-    const url =
-      skill.source === 'builtin'
-        ? `/api/builtin-skills/${encodeURIComponent(skill.name)}`
-        : `/api/files/read?path=${encodeURIComponent(skill.path)}`;
-
-    fetch(url)
+    // Built-ins are extracted to disk at server startup, so they share the
+    // same read endpoint as filesystem skills.
+    fetch(`/api/files/read?path=${encodeURIComponent(skill.path)}`)
       .then(async (resp) => {
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ error: 'Unknown error' }));
@@ -80,7 +77,7 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
       });
 
     return () => { cancelled = true; };
-  }, [skill.path, skill.source, skill.name]);
+  }, [skill.path]);
 
   const handleInsert = () => {
     window.dispatchEvent(
