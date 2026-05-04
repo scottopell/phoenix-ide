@@ -189,6 +189,7 @@ fresh server."#
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        tracing::debug!(argv = ?full_args, "tmux pass-through invocation");
 
         let child = match cmd.spawn() {
             Ok(c) => c,
