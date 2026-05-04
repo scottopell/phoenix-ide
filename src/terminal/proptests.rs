@@ -3,7 +3,6 @@
 //! Spec: `specs/terminal/terminal.allium`
 //! Obligations covered:
 //!   - `OneTerminalPerConversation` invariant (REQ-TERM-003)
-//!   - `ParserDimensionSync` invariant (REQ-TERM-006, REQ-TERM-010)
 //!   - `is_terminal()` correctness (REQ-TERM-012 precondition)
 //!   - Dims validity (`ResizeFrameRejected` precondition)
 //!   - `try_insert` atomic semantics (used on the fresh-session path; the

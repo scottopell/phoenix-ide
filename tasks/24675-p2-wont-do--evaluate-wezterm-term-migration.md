@@ -1,11 +1,15 @@
 ---
 created: 2026-04-13
 priority: p2
-status: in-progress
+status: wont-do
 artifact: pending
 ---
 
 # evaluate-wezterm-term-migration
+
+> **Wont-do: duplicate of task 24673** (same evaluation, also done). The
+> evaluation was carried out under 24673 with the no-go conclusion captured
+> in `specs/terminal/wezterm-evaluation.md`. Closing this duplicate.
 
 ## Plan
 
