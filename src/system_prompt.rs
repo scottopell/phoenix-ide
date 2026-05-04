@@ -94,10 +94,12 @@ impl SkillMetadata {
     }
 
     /// Catalog display fragment shown after the description in the system
-    /// prompt skill catalog (e.g. `` `/abs/path/SKILL.md` `` or `(built-in)`).
+    /// prompt skill catalog. Filesystem entries render as ``(`/abs/path/SKILL.md`)``
+    /// (matching the format documented in `specs/skills/skills.allium`); built-ins
+    /// render as `(built-in)`.
     pub fn display_location(&self) -> String {
         match &self.source {
-            SkillSource::Filesystem { path, .. } => format!("`{}`", path.display()),
+            SkillSource::Filesystem { path, .. } => format!("(`{}`)", path.display()),
             SkillSource::Builtin => "(built-in)".to_string(),
         }
     }

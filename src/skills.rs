@@ -301,9 +301,10 @@ mod tests {
 
     #[test]
     fn test_invoke_skill_builtin_returns_registry_content() {
-        // Use the live registry: caveman is shipped in ALL.
+        // Use the live registry with $HOME pinned to the tempdir so a
+        // developer's ~/.claude/skills/caveman/ can't shadow the built-in.
         let tmp = TempDir::new().unwrap();
-        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let skills = crate::system_prompt::discover_skills_with_home(tmp.path(), Some(tmp.path()));
         let result = invoke_skill("caveman", "", &skills).unwrap();
         assert_eq!(result.name, "caveman");
         assert!(
