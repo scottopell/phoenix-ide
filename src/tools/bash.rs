@@ -222,6 +222,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fast_exit_preserves_trailing_output_no_reader_race() {
+        // Regression for the codex review: the waiter used to call
+        // transition_to_terminal as soon as child.wait() resolved, but
+        // the stdout reader task could still be holding kernel-buffered
+        // bytes that hadn't yet been appended to the live ring. Once
+        // tombstoned, the next reader append silently dropped those
+        // bytes — fast-exiting commands lost trailing output.
+        //
+        // Test: 20 fast-exit iterations with a deterministic last line
+        // (including an unterminated trailing chunk). Without the fix,
+        // some iterations show truncated output. With the fix, every
+        // iteration captures everything.
+        let tool = BashTool;
+        for i in 0..20 {
+            let registry = Arc::new(BashHandleRegistry::new());
+            let c = ctx_with_registry(registry);
+            let marker = format!("final-marker-{i}");
+            let cmd = format!("printf 'a\\nb\\nc\\n{marker}'");
+            let r = tool.run(json!({"cmd": &cmd, "wait_seconds": 5}), c).await;
+            let v = parse_response(&r);
+            assert_eq!(v["status"], "exited", "iter {i}: got {v}");
+            let lines: Vec<String> = v["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["bytes"].as_str().unwrap_or("").to_string())
+                .collect();
+            assert!(
+                lines.iter().any(|l| l.contains(&marker)),
+                "iter {i}: response missing final unterminated marker; \
+                 got: {lines:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn spawn_wait_seconds_elapses_returns_still_running_with_handle() {
         let tool = BashTool;
         let result = tool

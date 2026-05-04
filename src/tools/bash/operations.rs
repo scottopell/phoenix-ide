@@ -635,23 +635,29 @@ fn start_io_tasks(handle: &Arc<Handle>, mut child: tokio::process::Child) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    if let Some(stdout) = stdout {
+    // Spawn the readers and capture their JoinHandles so the waiter
+    // can join them between `child.wait()` and `transition_to_terminal`.
+    // Without this synchronisation, the waiter races readers: the child
+    // exits, the waiter resolves wait() and tombstones the handle, and
+    // the readers' next read of the (already-buffered) final chunk hits
+    // a non-Live state and silently drops those bytes.
+    let stdout_join = stdout.map(|s| {
         let h = handle.clone();
         tokio::spawn(async move {
-            read_pipe_to_ring(stdout, h, "stdout").await;
-        });
-    }
-    if let Some(stderr) = stderr {
+            read_pipe_to_ring(s, h, "stdout").await;
+        })
+    });
+    let stderr_join = stderr.map(|s| {
         let h = handle.clone();
         tokio::spawn(async move {
-            read_pipe_to_ring(stderr, h, "stderr").await;
-        });
-    }
+            read_pipe_to_ring(s, h, "stderr").await;
+        })
+    });
 
-    // Waiter task: call wait() and demote the handle on exit.
+    // Waiter task: call wait(), drain readers, then demote the handle.
     let h = handle.clone();
     tokio::spawn(async move {
-        run_waiter(h, child).await;
+        run_waiter(h, child, stdout_join, stderr_join).await;
     });
 }
 
@@ -689,7 +695,20 @@ where
     }
 }
 
-async fn run_waiter(handle: Arc<Handle>, mut child: tokio::process::Child) {
+/// Bound on how long the waiter waits for the stdout/stderr reader
+/// tasks to drain after `child.wait()` resolves. Pipes EOF promptly
+/// when the child exits, but a grandchild that inherited the stdout fd
+/// and still holds it open would block the reader indefinitely; this
+/// timeout protects the waiter from that pathological case at the cost
+/// of dropping a few bytes in extreme scenarios.
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+
+async fn run_waiter(
+    handle: Arc<Handle>,
+    mut child: tokio::process::Child,
+    stdout_join: Option<tokio::task::JoinHandle<()>>,
+    stderr_join: Option<tokio::task::JoinHandle<()>>,
+) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
     let exit_status = child.wait().await;
@@ -701,6 +720,21 @@ async fn run_waiter(handle: Arc<Handle>, mut child: tokio::process::Child) {
             FinalCause::Exited { exit_code: None }
         }
     };
+
+    // Drain the reader tasks BEFORE transitioning to terminal so the
+    // ring captures any final chunk the kernel buffered between the
+    // child's last write and its exit. Without this, the tombstone
+    // tail can be missing trailing output from fast-exiting commands
+    // or commands whose final line was unterminated.
+    let drain = async {
+        if let Some(h) = stdout_join {
+            let _ = h.await;
+        }
+        if let Some(h) = stderr_join {
+            let _ = h.await;
+        }
+    };
+    let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
 
     let elapsed = started_at.elapsed();
     if handle

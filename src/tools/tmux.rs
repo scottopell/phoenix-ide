@@ -205,32 +205,59 @@ fresh server."#
     }
 }
 
+enum RunOutcome {
+    Cancelled,
+    TimedOut,
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
 /// Drive the subprocess to completion, racing against `wait_seconds`
-/// and the cancellation token. The `Child` is consumed in exactly one
-/// branch — `wait_with_output` moves it on the success path; the
-/// cancel and timeout paths take it via `Option::take()` so the move
-/// is structurally non-overlapping.
+/// and the cancellation token.
+///
+/// stdout and stderr are taken off the child up-front and drained by
+/// concurrent reader tasks. This matters for commands that emit more
+/// than the OS pipe buffer (~64 KB on Linux): a pure `child.wait()`
+/// would wedge because the child blocks writing while no one reads,
+/// then we'd hit `wait_seconds` and report `timed_out` with empty
+/// output. With concurrent readers, the child can keep writing past
+/// the buffer and we still observe its true exit.
+///
+/// On wait → readers EOF as the child closes its pipes; we join them.
+/// On cancel/timeout → we kill the child, then join the readers (their
+/// pipes EOF on kill); whatever bytes the child emitted before death
+/// are preserved.
 async fn run_with_timeout(
-    child: tokio::process::Child,
+    mut child: tokio::process::Child,
     wait_seconds: u64,
     started: Instant,
     ctx: ToolContext,
 ) -> ToolOutput {
     let cancel = ctx.cancel.clone();
-    let mut child_slot = Some(child);
     let timeout = tokio::time::sleep(Duration::from_secs(wait_seconds));
     tokio::pin!(timeout);
 
-    // We can't `&mut child_slot.take().unwrap().wait_with_output()`
-    // inside select! because that takes the Child eagerly even on
-    // arms that never fire. Use a future borrow against a mutable
-    // child reference for the wait branch.
-    let mut child_owned = child_slot.take().expect("child set above");
+    // Spawn drain tasks BEFORE racing on wait. Once stdout/stderr are
+    // taken off `child`, the Child is otherwise unaffected — wait()
+    // and start_kill() still work — and we can keep ownership across
+    // all select arms.
+    let stdout_task = spawn_drain_task(child.stdout.take());
+    let stderr_task = spawn_drain_task(child.stderr.take());
 
-    tokio::select! {
+    let outcome = tokio::select! {
         biased;
-        () = cancel.cancelled() => {
-            kill_and_reap(child_owned).await;
+        () = cancel.cancelled() => RunOutcome::Cancelled,
+        () = &mut timeout => RunOutcome::TimedOut,
+        wait_result = child.wait() => RunOutcome::Exited(wait_result),
+    };
+
+    match outcome {
+        RunOutcome::Cancelled => {
+            // Kill so the readers EOF promptly; ignore output.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            // Drain readers (bounded — pipes already closed).
+            let _ = tokio::time::timeout(Duration::from_secs(1), stdout_task).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), stderr_task).await;
             structured_response(
                 "cancelled",
                 None,
@@ -240,8 +267,14 @@ async fn run_with_timeout(
                 false,
             )
         }
-        () = &mut timeout => {
-            let (so, se, truncated) = kill_and_capture(child_owned).await;
+        RunOutcome::TimedOut => {
+            // Kill the child, then capture whatever the readers got
+            // before the kill closed the pipes.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let stdout = collect_drain(stdout_task).await;
+            let stderr = collect_drain(stderr_task).await;
+            let (so, se, truncated) = truncate_pair(&stdout, &stderr);
             structured_response(
                 "timed_out",
                 None,
@@ -251,58 +284,54 @@ async fn run_with_timeout(
                 truncated,
             )
         }
-        wait_result = child_owned.wait() => {
-            // Drain output AFTER the wait observes exit so we don't
-            // race the process and the OS pipe drain. `try_wait` is
-            // already settled here so this is a no-op for wait, then
-            // we read all of stdout/stderr.
-            match wait_result {
-                Ok(status) => {
-                    let stdout = drain_pipe(child_owned.stdout.take()).await;
-                    let stderr = drain_pipe(child_owned.stderr.take()).await;
-                    let (so, se, truncated) = truncate_pair(&stdout, &stderr);
-                    structured_response(
-                        "ok",
-                        status.code(),
-                        started.elapsed().as_millis(),
-                        &so,
-                        &se,
-                        truncated,
-                    )
-                }
-                Err(e) => error_envelope(
-                    "tmux_wait_failed",
-                    &format!("failed to wait on tmux subprocess: {e}"),
-                ),
-            }
+        RunOutcome::Exited(Ok(status)) => {
+            // Child exited; pipes EOF; readers finish. Join them.
+            let stdout = collect_drain(stdout_task).await;
+            let stderr = collect_drain(stderr_task).await;
+            let (so, se, truncated) = truncate_pair(&stdout, &stderr);
+            structured_response(
+                "ok",
+                status.code(),
+                started.elapsed().as_millis(),
+                &so,
+                &se,
+                truncated,
+            )
         }
+        RunOutcome::Exited(Err(e)) => error_envelope(
+            "tmux_wait_failed",
+            &format!("failed to wait on tmux subprocess: {e}"),
+        ),
     }
 }
 
-async fn drain_pipe<R: tokio::io::AsyncReadExt + Unpin>(reader: Option<R>) -> Vec<u8> {
-    let Some(mut r) = reader else {
-        return Vec::new();
-    };
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(1), r.read_to_end(&mut buf)).await;
-    buf
+/// Spawn a tokio task that reads `reader` to EOF, returning the
+/// collected bytes via the task's `JoinHandle`. Returns a handle that
+/// resolves to an empty `Vec` when the reader is `None`.
+fn spawn_drain_task<R>(reader: Option<R>) -> tokio::task::JoinHandle<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let Some(mut r) = reader else {
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        let _ = r.read_to_end(&mut buf).await;
+        buf
+    })
 }
 
-/// Kill the child and reap it without capturing output. Used on the
-/// cancel path where we don't want to risk hanging on a slow drain.
-async fn kill_and_reap(mut child: tokio::process::Child) {
-    let _ = child.start_kill();
-    let wait = child.wait();
-    let _ = tokio::time::timeout(Duration::from_secs(1), wait).await;
-}
-
-/// Kill the child, drain its captured output, and return the
-/// truncated pair. Used on the timeout path.
-async fn kill_and_capture(mut child: tokio::process::Child) -> (String, String, bool) {
-    let _ = child.start_kill();
-    match tokio::time::timeout(Duration::from_secs(2), child.wait_with_output()).await {
-        Ok(Ok(out)) => truncate_pair(&out.stdout, &out.stderr),
-        _ => (String::new(), String::new(), false),
+/// Bounded join on a drain task. The 2-second timeout protects against
+/// pathological pipe-fd-leak scenarios (e.g. a tmux child somehow
+/// fork-and-keep that holds the write end open after `kill-server`).
+/// Under normal operation the join resolves immediately because the
+/// pipe has already EOF'd by the time we reach this call.
+async fn collect_drain(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match tokio::time::timeout(Duration::from_secs(2), task).await {
+        Ok(Ok(buf)) => buf,
+        _ => Vec::new(),
     }
 }
 
