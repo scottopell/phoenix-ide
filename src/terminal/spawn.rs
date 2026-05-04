@@ -50,6 +50,7 @@ pub enum PtyExecPlan {
 ///
 /// The argv branching (REQ-TMUX-004) is materialised before fork by the
 /// caller and passed in as `plan` so this function stays synchronous.
+#[allow(clippy::too_many_lines)] // inherently dense fork+exec sequence
 pub fn spawn_pty(
     cwd: &Path,
     initial_dims: Dims,
@@ -130,11 +131,33 @@ pub fn spawn_pty(
                 } => {
                     let tmux_c = CString::new("tmux").unwrap();
                     let dash_f = CString::new("-f").unwrap();
-                    let conf_c = CString::new(config_path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| CString::new("").unwrap());
+                    // Interior-NUL is the only way `CString::new` fails for these
+                    // paths. NUL bytes in the socket / config path would mean
+                    // someone constructed a deliberately-malformed PathBuf —
+                    // fail loud so the operator sees what happened, rather
+                    // than handing exec a bogus empty path that surfaces as
+                    // a confusing "execvpe tmux" error far downstream.
+                    let conf_c = match CString::new(config_path.to_string_lossy().into_owned()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!(
+                                "tmux config_path contains interior NUL ({}): {e}",
+                                config_path.display()
+                            );
+                            unsafe { libc::_exit(1) };
+                        }
+                    };
                     let dash_s = CString::new("-S").unwrap();
-                    let sock_c = CString::new(socket_path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| CString::new("").unwrap());
+                    let sock_c = match CString::new(socket_path.to_string_lossy().into_owned()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!(
+                                "tmux socket_path contains interior NUL ({}): {e}",
+                                socket_path.display()
+                            );
+                            unsafe { libc::_exit(1) };
+                        }
+                    };
                     let attach = CString::new("attach").unwrap();
                     let dash_t = CString::new("-t").unwrap();
                     let main_c = CString::new("main").unwrap();

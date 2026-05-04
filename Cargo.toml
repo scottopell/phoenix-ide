@@ -86,7 +86,9 @@ ureq = { version = "2", features = ["json"] }
 unicode-security = "0.1.2"
 
 # Locating tmux on PATH at registry init (specs/tmux-integration/REQ-TMUX-003).
-which = "6"
+# Aligned with the `which 8` already pulled in transitively via chromiumoxide
+# to avoid duplicate-major-version build cost.
+which = "8"
 
 # Rust -> TypeScript type codegen for the SSE wire format.
 # Used by the `export_sse_types` test in `src/api/wire.rs` to (re)generate

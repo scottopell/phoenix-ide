@@ -24,7 +24,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 
 use super::probe::{probe, ProbeResult};
 
@@ -131,6 +131,12 @@ pub struct TmuxRegistry {
     inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
     socket_dir: PathBuf,
     binary_available: bool,
+    /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
+    /// file. Runs at most once per process — config-text bumps require a
+    /// Phoenix restart anyway (existing tmux servers don't reload `-f`).
+    /// `OnceCell::get_or_try_init` retries on failure so a transient
+    /// disk error doesn't permanently brick the registry.
+    runtime_assets: OnceCell<()>,
 }
 
 impl TmuxRegistry {
@@ -152,6 +158,7 @@ impl TmuxRegistry {
             inner: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
+            runtime_assets: OnceCell::new(),
         }
     }
 
@@ -166,6 +173,7 @@ impl TmuxRegistry {
             inner: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
+            runtime_assets: OnceCell::new(),
         }
     }
 
@@ -191,43 +199,64 @@ impl TmuxRegistry {
         self.socket_dir.join(SERVER_CONFIG_FILENAME)
     }
 
-    /// Idempotent mkdir of the socket directory (perms 0700) AND write
-    /// of the Phoenix server config file. Called lazily on first use.
-    /// Re-writing the config file each time is safe and ensures bumps
-    /// to [`SERVER_CONFIG_TEXT`] propagate without manual intervention.
-    fn ensure_runtime_assets(&self) -> Result<(), TmuxError> {
-        if !self.socket_dir.exists() {
-            std::fs::create_dir_all(&self.socket_dir).map_err(|source| {
-                TmuxError::SocketDirCreate {
-                    path: self.socket_dir.clone(),
-                    source,
-                }
+    /// One-shot bootstrap of the socket dir (perms 0700) and the
+    /// Phoenix server config file. Gated by [`Self::runtime_assets`]
+    /// so it runs at most once per process — config-text bumps require
+    /// a Phoenix restart to take effect anyway, since running tmux
+    /// servers don't re-read `-f` on subsequent invocations.
+    ///
+    /// Always enforces 0700 on Unix even if the directory pre-existed
+    /// (a pre-existing dir with broader perms would otherwise leak the
+    /// socket-path security boundary). On a chmod failure, logs at WARN
+    /// and continues — degraded security beats refusing to start.
+    ///
+    /// Uses `tokio::fs` so the bootstrap doesn't block the runtime.
+    async fn ensure_runtime_assets(&self) -> Result<(), TmuxError> {
+        self.runtime_assets
+            .get_or_try_init(|| async { self.bootstrap_runtime_assets().await })
+            .await?;
+        Ok(())
+    }
+
+    async fn bootstrap_runtime_assets(&self) -> Result<(), TmuxError> {
+        // Idempotent mkdir.
+        tokio::fs::create_dir_all(&self.socket_dir)
+            .await
+            .map_err(|source| TmuxError::SocketDirCreate {
+                path: self.socket_dir.clone(),
+                source,
             })?;
-            // Lock the directory down to the current user only. The socket
-            // path is a security boundary — anyone who can read it can
-            // attach to every conversation's tmux server.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o700);
-                std::fs::set_permissions(&self.socket_dir, perms).map_err(|source| {
-                    TmuxError::SocketDirCreate {
-                        path: self.socket_dir.clone(),
-                        source,
-                    }
-                })?;
+
+        // Lock the directory down to the current user only — the socket
+        // path is a security boundary (anyone who can read it can attach
+        // to every conversation's tmux server). Always enforce on every
+        // bootstrap, even if the dir pre-existed: a pre-existing dir
+        // with broader perms left the boundary open before this fix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            if let Err(e) = tokio::fs::set_permissions(&self.socket_dir, perms).await {
+                // Don't fail registry init on a chmod failure (e.g. an
+                // unusual filesystem that doesn't honor mode bits) —
+                // the directory is at least usable. Make the degraded
+                // posture loud so the operator can investigate.
+                tracing::warn!(
+                    socket_dir = %self.socket_dir.display(),
+                    error = %e,
+                    "tmux: failed to enforce 0700 on socket dir; per-conversation sockets may be reachable by other users on this host"
+                );
             }
         }
 
-        // Write the Phoenix-shipped config file. Overwrite each time so
-        // a bump to SERVER_CONFIG_TEXT lands without operator action.
+        // Write the Phoenix-shipped config file once.
         let config_path = self.config_path();
-        std::fs::write(&config_path, SERVER_CONFIG_TEXT).map_err(|source| {
-            TmuxError::SocketDirCreate {
+        tokio::fs::write(&config_path, SERVER_CONFIG_TEXT)
+            .await
+            .map_err(|source| TmuxError::SocketDirCreate {
                 path: config_path,
                 source,
-            }
-        })?;
+            })?;
 
         Ok(())
     }
@@ -251,33 +280,25 @@ impl TmuxRegistry {
         if !self.binary_available {
             return Err(TmuxError::BinaryUnavailable);
         }
-        self.ensure_runtime_assets()?;
+        self.ensure_runtime_assets().await?;
 
         let server_arc = self.get_or_insert(conversation_id).await;
 
-        let socket_path = server_arc.read().await.socket_path.clone();
-
-        let probe_result = probe(&socket_path)
-            .await
-            .map_err(|source| TmuxError::ProbeFailed {
-                socket_path: socket_path.clone(),
-                source,
-            })?;
-
         let mut server = server_arc.write().await;
-        // Re-probe under the write lock to absorb a concurrent peer that
-        // spawned the server while we were waiting on the lock. The
-        // outer probe is best-effort; the authoritative check is here.
-        let probe_result = if matches!(probe_result, ProbeResult::Live) {
-            ProbeResult::Live
-        } else {
+        // Probe under the per-conversation write lock — the only
+        // authoritative point of decision. An earlier outer-lock probe
+        // was an unsound shortcut: if the server died (or the outer
+        // probe transiently lied) between probe and lock acquisition,
+        // marking the entry Live would skip the spawn and leave a
+        // dead-but-Live entry behind. Always probing under the lock
+        // gives us the latest server state at the moment we decide.
+        let probe_result =
             probe(&server.socket_path)
                 .await
                 .map_err(|source| TmuxError::ProbeFailed {
                     socket_path: server.socket_path.clone(),
                     source,
-                })?
-        };
+                })?;
 
         match probe_result {
             ProbeResult::Live => {
@@ -524,7 +545,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("nested").join("tmux-sockets");
         let reg = TmuxRegistry::with_socket_dir_and_binary(dir.clone(), false);
-        reg.ensure_runtime_assets().expect("mkdir + config write");
+        reg.ensure_runtime_assets()
+            .await
+            .expect("mkdir + config write");
         let meta = std::fs::metadata(&dir).unwrap();
         #[cfg(unix)]
         {
@@ -538,6 +561,59 @@ mod tests {
         assert!(config_path.exists(), "config file should exist");
         let written = std::fs::read_to_string(&config_path).unwrap();
         assert_eq!(written, SERVER_CONFIG_TEXT);
+    }
+
+    #[tokio::test]
+    async fn ensure_runtime_assets_tightens_perms_on_pre_existing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("preexisting");
+        // Pre-create the dir with broader perms — simulates a manually
+        // created socket dir or one inherited from an earlier
+        // installation. Phoenix should tighten it on bootstrap.
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let reg = TmuxRegistry::with_socket_dir_and_binary(dir.clone(), false);
+        reg.ensure_runtime_assets()
+            .await
+            .expect("bootstrap on pre-existing dir");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&dir).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "pre-existing dir's perms should be tightened to 0700"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_runtime_assets_runs_at_most_once_per_registry() {
+        // A second call to ensure_runtime_assets should not overwrite
+        // the config file (the OnceCell guard prevents redundant work).
+        // We verify this by hand-mutating the file between calls and
+        // checking that the second call leaves our mutation intact.
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        reg.ensure_runtime_assets().await.expect("first call");
+        let config_path = reg.config_path();
+
+        // Hand-mutate the on-disk file.
+        std::fs::write(&config_path, b"# clobbered for test\n").unwrap();
+
+        reg.ensure_runtime_assets().await.expect("second call");
+        let observed = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            observed, b"# clobbered for test\n",
+            "second ensure_runtime_assets should not overwrite the config file"
+        );
     }
 
     #[test]
