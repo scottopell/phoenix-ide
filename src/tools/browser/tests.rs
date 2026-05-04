@@ -67,8 +67,10 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         conversation_id.to_string(),
         std::env::temp_dir(),
         manager.clone(),
+        Arc::new(crate::tools::BashHandleRegistry::new()),
         Arc::new(crate::llm::ModelRegistry::new_empty()),
         crate::terminal::ActiveTerminals::new(),
+        Arc::new(crate::tools::TmuxRegistry::new()),
     );
     (ctx, manager)
 }

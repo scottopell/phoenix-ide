@@ -1,0 +1,598 @@
+-- allium: 3
+-- tmux-integration.allium
+--
+-- Tmux Integration: Behavioural Specification
+--
+-- Scope: per-conversation tmux server lifecycle, the `tmux` agent tool, and
+-- the in-app terminal's tmux-attach behaviour when the binary is available.
+--
+-- Includes: socket-path scoping via `-S <absolute-path>`, lazy server spawn,
+--           stale-socket detection (silent recreate, no breadcrumb),
+--           hard-delete cascade, tool pass-through invocation, terminal
+--           attach fallback to direct PTY when tmux is absent.
+-- Excludes:
+--   - PTY mechanics inside the terminal (governed by specs/terminal/)
+--   - Bash handle lifecycle (governed by specs/bash/bash.allium)
+--   - The agent's choice of which tool to use (a content-of-description
+--     concern, not a behavioural one)
+--   - Tmux server internals (sessions, panes, windows) — Phoenix treats the
+--     server as opaque beyond "running / stale / gone"
+--   - Multi-attach: the existing single-attach constraint from
+--     specs/terminal/ REQ-TERM-003 applies on both the tmux-attach path
+--     and the direct-PTY fallback. Multi-attach is deferred to a future
+--     revision.
+--
+-- Requirement traceability: REQ-TMUX-001 through REQ-TMUX-013
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The agent that calls the tmux tool. Identity scoping by conversation
+-- mirrors specs/bash/bash.allium: the registry lookup is conversation-
+-- keyed, so the agent can only address its own conversation's server.
+actor LlmAgent {
+    identified_by: bedrock/Conversation
+}
+
+-- The user who opens the in-app terminal. The terminal spec covers
+-- authentication; this spec only models the attach-vs-direct-PTY fork.
+actor User {
+    identified_by: ApiSession
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The tmux binary on the host. Phoenix invokes it as a child process; its
+-- internals (server state, sessions, panes) are opaque beyond probe-via-
+-- `tmux -S <sock> ls`.
+external entity TmuxBinary {
+    available: Boolean
+        -- Discovered once at Phoenix startup via `which tmux` or
+        -- equivalent; cached on the registry.
+}
+
+-- The Unix-domain socket the tmux server binds. Filesystem path is
+-- ~/.phoenix-ide/tmux-sockets/conv-<id>.sock (REQ-TMUX-001). Phoenix's
+-- role is creating the directory, unlinking stale files on detection,
+-- and deleting the file on conversation hard-delete.
+external entity TmuxSocketFile {
+    path: String
+}
+
+-- The PTY allocated by the in-app terminal feature. When tmux is
+-- available, the PTY runs `tmux -S <sock> attach`; otherwise it runs
+-- $SHELL directly per specs/terminal/.
+external entity TerminalPty {
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The tool's output envelope (REQ-TMUX-012).
+value TmuxToolResponse {
+    status:      ToolResponseStatus
+    exit_code:   Integer?
+    duration_ms: Integer
+    stdout:      String
+    stderr:      String
+    truncated:   Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Result of probing an existing socket file. Phoenix issues
+-- `tmux -S <sock> ls` and inspects the response.
+enum ProbeOutcome {
+    live
+    | dead_socket
+    | no_socket
+}
+
+-- Conversation tmux server lifecycle.
+enum ServerStatus {
+    not_running
+    | live
+    | gone
+}
+
+-- Tool response variants (REQ-TMUX-012).
+enum ToolResponseStatus {
+    ok
+    | timed_out
+    | cancelled
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One TmuxServer per conversation. Created on first observation (any tmux
+-- operation triggers ensure_live which lazily registers the entity).
+-- Conversations with no tmux operation never have an entry.
+entity TmuxServer {
+    conversation: bedrock/Conversation
+
+    -- Lifecycle state.
+    status: ServerStatus
+
+    transitions status {
+        not_running -> live
+        live -> gone
+        terminal: gone
+    }
+
+    -- The socket file path, computed from conversation_id at registry-
+    -- entry creation time and stable for the entity's lifetime.
+    socket_path: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    tmux_socket_dir: String = "~/.phoenix-ide/tmux-sockets/"
+    -- Created lazily on first use with permissions 0700.
+
+    tmux_default_session: String = "main"
+    -- Session name created on lazy spawn. Tmux's default-target rules
+    -- pick this session for argless commands.
+
+    tmux_tool_default_wait_seconds: Integer = 30
+    -- Default wait for an agent tmux call.
+
+    tmux_tool_max_wait_seconds: Integer = 900
+    -- Upper bound on a single tmux tool call's wait window.
+
+    tmux_output_max_bytes: Integer = 131072
+    -- 128 KB. Combined stdout+stderr beyond this is middle-truncated.
+
+    tmux_truncation_keep_bytes: Integer = 4096
+    -- 4 KB preserved from each end on truncation.
+}
+
+------------------------------------------------------------
+-- Rules — server lifecycle
+------------------------------------------------------------
+
+-- REQ-TMUX-002: lazy spawn on first operation, no prior socket.
+rule ServerSpawnedLazily {
+    when: TmuxOperationRequested(conversation)
+
+    requires: tmux_binary_available()
+    requires: probe_socket(conversation) = no_socket
+    requires: not exists TmuxServer{conversation: conversation}
+
+    let path = socket_path_for(conversation)
+
+    ensures: TmuxServer.created(
+        conversation: conversation,
+        status:       live,
+        socket_path:  path
+    )
+    ensures: TmuxServerStarted(path, config.tmux_default_session)
+
+    @guidance
+        -- Spawn sequence (in src/tools/tmux/registry.rs):
+        --   1. Ensure config.tmux_socket_dir exists with 0700 permissions
+        --      (idempotent mkdir).
+        --   2. Issue: tmux -S <sock> new-session -d -s <main>; the -d
+        --      makes the session detached so the agent's call doesn't
+        --      try to attach from a non-TTY context.
+        --   3. Verify success by issuing tmux -S <sock> ls; if it fails,
+        --      surface tmux_server_unavailable to the caller.
+        --   4. Register the TmuxServer entity with status=live.
+        --   5. Continue the original operation against the now-live
+        --      server.
+        --
+        -- The default session name `main` is significant: tmux's "most-
+        -- recent session" rule resolves argless target arguments (tmux
+        -- capture-pane with no -t) to whichever session was used most
+        -- recently. With only `main` present, that is always `main`.
+}
+
+-- REQ-TMUX-006: stale socket detected → unlink, spawn fresh. No
+-- breadcrumb is rendered: the original draft proposed a send-keys -l
+-- breadcrumb in the next attach, but the panel review surfaced that
+-- send-keys writes to the slave PTY's stdin, which gets interpreted by
+-- whatever process is running in the pane (vim, REPL, custom shell).
+-- Silent recreate is the safe v1 behavior.
+rule ServerSpawnedAfterStale {
+    when: TmuxOperationRequested(conversation)
+
+    requires: tmux_binary_available()
+    requires: probe_socket(conversation) = dead_socket
+
+    let path = socket_path_for(conversation)
+
+    ensures: SocketFileUnlinked(path)
+    ensures: TmuxServer.created(
+        conversation: conversation,
+        status:       live,
+        socket_path:  path
+    )
+    ensures: TmuxServerStarted(path, config.tmux_default_session)
+
+    @guidance
+        -- Stale state is the typical post-system-reboot condition: the
+        -- socket file persists in the Phoenix data dir, but the tmux
+        -- server process was killed when the kernel rebooted. Probe via
+        -- `tmux ls` returns nonzero. Phoenix unlinks and recreates.
+        -- The user's prior pane content is lost — that is the
+        -- system-reboot semantic, no recovery is attempted.
+}
+
+-- REQ-TMUX-005: live server reused on operation (typical after Phoenix
+-- restart while the tmux server kept running independently).
+rule ServerProbedLive {
+    when: TmuxOperationRequested(conversation)
+
+    requires: tmux_binary_available()
+    requires: probe_socket(conversation) = live
+    requires: not exists TmuxServer{conversation: conversation}
+
+    let path = socket_path_for(conversation)
+
+    ensures: TmuxServer.created(
+        conversation: conversation,
+        status:       live,
+        socket_path:  path
+    )
+
+    @guidance
+        -- Phoenix's process restart does not affect tmux servers; the OS
+        -- keeps them running independently. On the first tmux operation
+        -- after restart, Phoenix probes, sees `live`, and registers an
+        -- entry that references the existing server. No reattach
+        -- handshake is needed: tmux's protocol is stateless from the
+        -- client side.
+}
+
+------------------------------------------------------------
+-- Rules — tmux agent tool
+------------------------------------------------------------
+
+-- REQ-TMUX-003: agent's tmux tool call. Emits TmuxOperationRequested
+-- which the lifecycle rules (ServerSpawnedLazily / ServerSpawnedAfterStale
+-- / ServerProbedLive) react to before the subprocess fires. Once the
+-- server is live, the tool subprocess runs.
+rule TmuxToolCalled {
+    when: AgentCallsTmuxTool(conversation, args, wait_seconds)
+
+    requires: tmux_binary_available()
+    requires: 0 < wait_seconds
+    requires: wait_seconds <= config.tmux_tool_max_wait_seconds
+
+    ensures: TmuxOperationRequested(conversation)
+        -- Triggers the lifecycle rules; one of them ensures status=live
+        -- by the time TmuxSubprocessSpawned fires below.
+    ensures: TmuxSubprocessSpawned(socket_path_for(conversation), args, wait_seconds)
+    ensures: TmuxToolResponseShaped(conversation, socket_path_for(conversation), args)
+
+    @guidance
+        -- Phoenix prepends `-S <sock>` before `args`. Tmux's CLI parser
+        -- rejects two server-selection flags on one command, so an agent
+        -- that supplies its own -S or -L receives a usage error from tmux
+        -- itself. The conversation's isolation is preserved structurally
+        -- regardless.
+        --
+        -- The response shape is governed by the three sibling rules:
+        --   TmuxToolReturnedOk        (subprocess exited normally)
+        --   TmuxToolCallTimedOut      (wait window elapsed)
+        --   TmuxToolCallCancelled     (ToolContext.cancel pulsed)
+        --
+        -- Truncation: if (len(stdout) + len(stderr)) > tmux_output_max_bytes,
+        -- middle-truncate per the same rule as the bash tool's prior
+        -- revision and set truncated=true.
+}
+
+-- REQ-TMUX-003: subprocess exited normally within the wait window.
+rule TmuxToolReturnedOk {
+    when: TmuxSubprocessExited(server, args, exit_code, captured)
+
+    requires: server.status = live
+
+    ensures: AgentReceivesTmuxResponse(
+        status:      ok,
+        exit_code:   exit_code,
+        duration_ms: captured.duration_ms,
+        stdout:      captured.stdout,
+        stderr:      captured.stderr,
+        truncated:   captured.truncated
+    )
+}
+
+-- REQ-TMUX-010: wait window elapsed before subprocess exited.
+rule TmuxToolCallTimedOut {
+    when: TmuxSubprocessExceedsWait(server, args, wait_seconds, captured)
+
+    requires: server.status = live
+
+    ensures: TmuxSubprocessKilled(server.socket_path, args)
+    ensures: AgentReceivesTmuxResponse(
+        status:      timed_out,
+        exit_code:   null,
+        duration_ms: wait_seconds * 1000,
+        stdout:      captured.stdout,
+        stderr:      captured.stderr,
+        truncated:   captured.truncated
+    )
+}
+
+-- REQ-TMUX-010: tool call cancelled via ToolContext.cancel.
+rule TmuxToolCallCancelled {
+    when: TmuxSubprocessCancelled(server, args, captured)
+
+    requires: server.status = live
+
+    ensures: TmuxSubprocessKilled(server.socket_path, args)
+    ensures: AgentReceivesTmuxResponse(
+        status:      cancelled,
+        exit_code:   null,
+        duration_ms: captured.duration_ms,
+        stdout:      captured.stdout,
+        stderr:      captured.stderr,
+        truncated:   captured.truncated
+    )
+}
+
+-- REQ-TMUX-003: tmux binary not available on this host.
+rule TmuxToolBinaryUnavailable {
+    when: AgentCallsTmuxTool(conversation, args, wait_seconds)
+
+    requires: not tmux_binary_available()
+
+    ensures: AgentReceivesError(
+        error: "tmux_binary_unavailable"
+    )
+}
+
+------------------------------------------------------------
+-- Rules — in-app terminal attach
+------------------------------------------------------------
+
+-- REQ-TMUX-004: in-app terminal opened, tmux available — PTY runs `tmux
+-- attach` rather than $SHELL. Emits TmuxOperationRequested so the
+-- lifecycle rules ensure the server is live before attach.
+rule UserOpensTerminalWithTmuxAvailable {
+    when: UserOpensTerminal(conversation)
+
+    requires: tmux_binary_available()
+
+    ensures: TmuxOperationRequested(conversation)
+    ensures: TerminalPtyExecutesTmuxAttach(conversation, config.tmux_default_session)
+
+    @guidance
+        -- The terminal spec's PTY spawn (PtySpawned) and WebSocket I/O
+        -- relay (PtyOutputForwarded, UserInputForwarded) apply unchanged;
+        -- this rule only changes what the PTY child process is. setsid,
+        -- TIOCSCTTY, dup2, the WebSocket handshake, and resize handling
+        -- all proceed identically.
+        --
+        -- TmuxOperationRequested fires as part of this attach so
+        -- ServerSpawnedLazily / ServerSpawnedAfterStale / ServerProbedLive
+        -- runs before the attach.
+        --
+        -- The terminal spec's "exactly one terminal per conversation"
+        -- constraint (REQ-TERM-003) applies on this path. Multi-attach
+        -- via tmux's native protocol is deferred (see Deferred section).
+}
+
+-- REQ-TMUX-004 fallback: tmux not available, direct PTY spawn from
+-- specs/terminal/.
+rule UserOpensTerminalWithoutTmux {
+    when: UserOpensTerminal(conversation)
+
+    requires: not tmux_binary_available()
+
+    ensures: TerminalPtyExecutesUserShell(conversation)
+
+    @guidance
+        -- Pure passthrough to the v1 terminal spec behaviour; no tmux
+        -- involvement.
+}
+
+------------------------------------------------------------
+-- Rules — hard-delete cascade and soft-state no-ops
+------------------------------------------------------------
+
+-- REQ-TMUX-007: conversation hard-delete cascades to tmux server.
+rule ServerKilledByConversationDelete {
+    when: ConversationHardDeleted(conversation)
+
+    requires: exists TmuxServer{conversation: conversation}
+    let server = TmuxServer{conversation: conversation}
+    requires: server.status != gone
+
+    ensures: TmuxServerKilled(server.socket_path)
+    ensures: SocketFileUnlinked(server.socket_path)
+    ensures: not exists TmuxServer{conversation: conversation}
+
+    @guidance
+        -- Runs synchronously in the conversation hard-delete handler,
+        -- alongside the bash handle cascade (specs/bash/REQ-BASH-006).
+        -- Failures of `kill-server` (e.g., server already dead, socket
+        -- file already gone) are not errors; the post-condition (file
+        -- gone, registry empty) is what matters. tmux kill-server is a
+        -- subprocess invocation, not a SQL statement, so it cannot share
+        -- a transaction with the conversation row delete; the cascade
+        -- orchestrator runs both in the same handler and logs partial
+        -- failure.
+}
+
+-- REQ-TMUX-008 (soft-state preservation contract): expressed as a
+-- non-rule in this spec — there is no `ConversationSoftStateChanged`
+-- event in bedrock, and modeling soft state as a no-op rule that
+-- listens to a non-existent event was previously a dangling reference.
+-- The contract that "tmux servers survive archive/close-tab" is
+-- enforced structurally by the absence of any rule that destroys a
+-- TmuxServer except ServerKilledByConversationDelete (which fires on
+-- ConversationHardDeleted only). The requirements text REQ-TMUX-008
+-- documents the intent for human readers.
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-TMUX-001
+invariant SocketPathDeterministic {
+    for s in TmuxServer:
+        s.socket_path = socket_path_for(s.conversation)
+}
+
+-- REQ-TMUX-001
+invariant OneServerPerConversation {
+    for c in bedrock/Conversation:
+        count(TmuxServer{conversation: c, status: live}) <= 1
+}
+
+-- REQ-TMUX-007
+invariant LiveServerHasSocketPath {
+    for s in TmuxServer where s.status = live:
+        s.socket_path != ""
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AgentTmuxAccess {
+    facing agent: LlmAgent
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        TmuxServer.status
+
+    provides:
+        AgentCallsTmuxTool(conversation, args, wait_seconds)
+            when tmux_binary_available()
+            and 0 < wait_seconds
+            and wait_seconds <= config.tmux_tool_max_wait_seconds
+
+    @guarantee SocketIsolation
+        -- The agent's tmux invocations cannot reach another conversation's
+        -- tmux server, the user's host tmux server, or any other tmux
+        -- instance not owned by Phoenix. Mechanism: `-S <conv-sock>` is
+        -- prepended by Phoenix and the kernel-level Unix-socket boundary
+        -- prevents reaching foreign tmux servers regardless of the agent's
+        -- arguments. An agent's stray `-L` or `-S` triggers a tmux usage
+        -- error rather than a server-selection escape.
+
+    @guarantee NoStdinAccess
+        -- Phoenix does not pass any stdin to the tmux subprocess. The
+        -- agent cannot send input via this tool; for that, the agent uses
+        -- `tmux send-keys` (a tmux subcommand, not stdin to the tmux
+        -- client itself).
+}
+
+surface UserTerminalTmuxBridging {
+    facing user: User
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        TmuxServer.status
+
+    provides:
+
+    @guarantee SeamlessFallback
+        -- When the tmux binary is unavailable, the user's terminal-open
+        -- experience is identical to specs/terminal/ pre-tmux-integration.
+        -- No error, no degradation message — the system silently falls
+        -- back to direct $SHELL spawn.
+
+    @guarantee SingleAttachPreserved
+        -- The existing single-attach constraint from specs/terminal/
+        -- REQ-TERM-003 applies on both the tmux-attach path and the
+        -- direct-PTY fallback. A second open-terminal request on a
+        -- conversation that already has an active terminal is rejected
+        -- per the existing terminal spec's behaviour, regardless of which
+        -- path the active terminal is on.
+}
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred TmuxMultiAttach
+    -- Tmux's native protocol supports multiple clients attached to the
+    -- same session simultaneously (each client gets its own resize and
+    -- input stream; output is broadcast). The original draft of this
+    -- spec proposed enabling multi-attach on the tmux path while
+    -- preserving single-attach on the direct-PTY fallback. The panel
+    -- review flagged this as not v1-essential — multi-attach raises UI
+    -- design questions (resize coordination across connections,
+    -- attribution of input across clients) that don't have clear
+    -- answers yet. Deferred. Relaxing the single-attach constraint in a
+    -- future revision does not change anything in the
+    -- specs/tmux-integration/ surfaces; only the terminal spec's
+    -- REQ-TERM-003 wording would need updating.
+    -- Location: specs/terminal/
+
+deferred TmuxStaleRecoveryNotification
+    -- v1 silently unlinks and recreates after a stale socket detection
+    -- (system reboot recovery). The original draft proposed a
+    -- `send-keys -l` breadcrumb in the recovered pane, but that approach
+    -- writes to the slave PTY's stdin and would be interpreted as input
+    -- by whatever process happened to be running in the pane (vim, REPL,
+    -- custom shell). A future revision could surface the loss via
+    -- `display-message` (status bar), an audit log entry, or an
+    -- agent-visible synthetic tool input. Out of scope until a clear
+    -- failure mode justifies the additional surface area.
+    -- Location: src/tools/tmux/
+
+deferred TmuxResourceQuotas
+    -- Per-conversation tmux servers consume process slots and memory. A
+    -- runaway agent could create dozens of long-lived tmux windows. v1
+    -- relies on tmux's own per-server limits (high but not unbounded);
+    -- explicit quotas (max windows per conversation, max sessions per
+    -- conversation) belong in v2 if abuse patterns emerge.
+    -- Location: src/tools/tmux/registry.rs
+
+deferred TmuxSocketRelocation
+    -- Some operators may want sockets in a different directory (e.g., a
+    -- per-user runtime dir like /run/user/<uid>/phoenix-ide/). v1 hard-
+    -- codes ~/.phoenix-ide/tmux-sockets/ for predictability and co-
+    -- location with the SQLite db and logs. Revisit if multi-tenant or
+    -- rootless-container scenarios surface a need.
+    -- Location: src/tools/tmux/registry.rs
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+-- No open questions remain. Decisions resolved during the elicitation
+-- conversation dated April 2026 and confirmed by the panel review:
+--   - Per-conversation socket via `-S <absolute-path>`. The original
+--     draft used `-L <label>` plus per-invocation TMUX_TMPDIR overrides,
+--     but the env-var dance has subtle ordering issues and an agent's
+--     stray `-L` would override Phoenix's. `-S <absolute-path>` is
+--     immutable from outside Phoenix.
+--   - Socket dir at ~/.phoenix-ide/tmux-sockets/, explicit naming for
+--     discoverability.
+--   - Lazy spawn on first operation; default session name `main`.
+--   - Lifetime until conversation hard-delete.
+--   - Survives Phoenix restart; stale-socket detection on system reboot,
+--     silent recreate (no breadcrumb).
+--   - In-app terminal auto-attaches when tmux available; falls back to
+--     direct PTY otherwise.
+--   - Single-attach constraint preserved on both paths (multi-attach
+--     deferred).
+--   - Tool surface is pure pass-through (no verb wrapper, no
+--     whitelisting).
+--   - Tool name is `tmux` (matches what it literally is).
+--   - Soft-state changes (archive, close) do not affect the server.
+--   - ToolContext accessor `ctx.tmux()` returns
+--     `Result<Arc<RwLock<TmuxServer>>, TmuxError>` matching the existing
+--     `ctx.browser()` and the `ctx.bash_handles()` defined in
+--     specs/bash/.

@@ -10,7 +10,7 @@
 
 use super::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use super::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
-use super::spawn::{set_nonblocking, set_winsize_raw, spawn_pty};
+use super::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
 use crate::api::AppState;
 use crate::runtime::{RuntimeManager, SseEvent};
 use axum::extract::ws::{Message, WebSocket};
@@ -87,6 +87,7 @@ async fn handle_socket(
         &cwd,
         initial_dims,
         &mut ws_sender,
+        &runtime,
     )
     .await
     else {
@@ -241,16 +242,27 @@ async fn acquire_handle(
     cwd: &std::path::Path,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    runtime: &Arc<RuntimeManager>,
 ) -> Option<(Arc<TerminalHandle>, OwnedSemaphorePermit)> {
-    // Fast path: reclaim if a handle already exists.
+    // Fast path: reclaim if a handle already exists. The reclaim path
+    // does not consult the tmux registry because the existing PTY is
+    // already running whatever it was originally given (tmux attach or
+    // $SHELL); switching mid-session would require killing the child.
     if let Some(existing) = terminals.get(conversation_id) {
         return reclaim(conversation_id, existing).await;
     }
 
-    // Slow path: spawn a new PTY.
+    // Slow path: spawn a new PTY. Resolve the exec plan first
+    // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
+    // forwarded so a fresh tmux server starts its pane in the
+    // conversation's project directory rather than Phoenix's own CWD.
+    let plan = resolve_exec_plan(conversation_id, cwd, runtime).await;
+
     let cwd_owned = cwd.to_path_buf();
-    let handle = match tokio::task::spawn_blocking(move || spawn_pty(&cwd_owned, initial_dims))
-        .await
+    let handle = match tokio::task::spawn_blocking(move || {
+        spawn_pty(&cwd_owned, initial_dims, plan)
+    })
+    .await
     {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
@@ -291,6 +303,40 @@ async fn acquire_handle(
         return None;
     };
     reclaim(conversation_id, existing).await
+}
+
+/// Decide whether the freshly-spawned PTY should run `tmux attach`
+/// against the conversation's dedicated socket or fall back to
+/// `$SHELL -i` (REQ-TMUX-004). Lazy-spawns the conversation's tmux
+/// server on first call (REQ-TMUX-002), reuses it after Phoenix
+/// restart (REQ-TMUX-005), and recreates over a stale socket
+/// (REQ-TMUX-006).
+async fn resolve_exec_plan(
+    conversation_id: &str,
+    cwd: &std::path::Path,
+    runtime: &Arc<RuntimeManager>,
+) -> PtyExecPlan {
+    let registry = runtime.tmux_registry();
+    if !registry.binary_available() {
+        return PtyExecPlan::Shell;
+    }
+    match registry.ensure_live(conversation_id, cwd).await {
+        Ok(server_arc) => {
+            let server = server_arc.read().await;
+            PtyExecPlan::Tmux {
+                socket_path: server.socket_path.clone(),
+                config_path: registry.config_path(),
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                conv_id = %conversation_id,
+                error = %e,
+                "Terminal: tmux ensure_live failed, falling back to direct shell"
+            );
+            PtyExecPlan::Shell
+        }
+    }
 }
 
 /// Evict the relay currently attached to `existing` and take over the single

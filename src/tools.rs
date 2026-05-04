@@ -3,7 +3,7 @@
 //! REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 
 mod ask_user_question;
-mod bash;
+pub mod bash;
 pub mod bash_check;
 pub mod browser;
 mod keyword_search;
@@ -18,9 +18,12 @@ mod subagent;
 mod terminal_command_history;
 mod terminal_last_command;
 mod think;
+pub mod tmux;
 
 pub use ask_user_question::AskUserQuestionTool;
-pub use bash::BashTool;
+pub use bash::{
+    BashHandleError, BashHandleRegistry, BashTool, ConversationHandles as BashConversationHandles,
+};
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
     BrowserKeyPressTool, BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
@@ -37,6 +40,7 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
+pub use tmux::{TmuxError, TmuxRegistry, TmuxServer, TmuxTool};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -119,31 +123,50 @@ pub struct ToolContext {
     /// Browser session manager (access via `browser()` method)
     browser_sessions: Arc<BrowserSessionManager>,
 
+    /// Per-process bash handle registry (access via `bash_handles()` method).
+    /// Owns the per-conversation handle tables, ring buffers, tombstones,
+    /// and live-handle cap enforcement (REQ-BASH-005, REQ-BASH-006,
+    /// REQ-BASH-014). Reached by tools through `bash_handles()` /
+    /// `bash_handle_registry()`.
+    bash_handles: Arc<BashHandleRegistry>,
+
     /// LLM registry for tools that need model access
     llm_registry: Arc<ModelRegistry>,
 
     /// Active PTY terminal sessions — used by the terminal-command tools
     /// (`terminal_last_command`, `terminal_command_history`).
     pub terminals: crate::terminal::ActiveTerminals,
+
+    /// Per-process tmux server registry (access via `tmux()` method).
+    /// Owns the per-conversation tmux server entries (`Arc<RwLock<TmuxServer>>`)
+    /// and resolves the deterministic socket path
+    /// (`~/.phoenix-ide/tmux-sockets/conv-<id>.sock`). REQ-TMUX-001 /
+    /// REQ-TMUX-013.
+    tmux_registry: Arc<TmuxRegistry>,
 }
 
 impl ToolContext {
     /// Create a new tool context
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cancel: CancellationToken,
         conversation_id: String,
         working_dir: PathBuf,
         browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
     ) -> Self {
         Self {
             cancel,
             conversation_id,
             working_dir,
             browser_sessions,
+            bash_handles,
             llm_registry,
             terminals,
+            tmux_registry,
         }
     }
 
@@ -159,9 +182,60 @@ impl ToolContext {
             .await
     }
 
+    /// Get the per-conversation bash handle table.
+    ///
+    /// Lazily creates the conversation entry on first call; subsequent
+    /// calls in the same conversation return the same `Arc<RwLock<...>>`.
+    /// Returns a `Result` for shape-parity with [`Self::browser`] —
+    /// `get_or_create` is currently infallible, but the surface accepts
+    /// future failure modes (e.g. registry resource exhaustion) without
+    /// reshaping every callsite.
+    ///
+    /// REQ-BASH-014: Stateless Tool with Per-Conversation Handle Registry.
+    pub async fn bash_handles(
+        &self,
+    ) -> Result<Arc<RwLock<BashConversationHandles>>, BashHandleError> {
+        Ok(self.bash_handles.get_or_create(&self.conversation_id).await)
+    }
+
+    /// Direct access to the registry (used by the hard-delete cascade
+    /// integration in task 02696, and by the shutdown kill-tree pass).
+    pub fn bash_handle_registry(&self) -> &Arc<BashHandleRegistry> {
+        &self.bash_handles
+    }
+
     /// Get the LLM registry
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
         &self.llm_registry
+    }
+
+    /// Resolve the conversation's tmux server, lazily spawning it on
+    /// first use and reusing it on subsequent calls. Returns the same
+    /// `Arc<RwLock<TmuxServer>>` across repeated calls in one
+    /// conversation; concurrent first-use callers share a single spawn
+    /// (the registry's per-conversation write lock serialises them).
+    ///
+    /// Errors:
+    /// - [`TmuxError::BinaryUnavailable`] when `which("tmux")` failed at
+    ///   registry init.
+    /// - Other variants when the probe / spawn / mkdir steps fail.
+    ///
+    /// REQ-TMUX-013.
+    pub async fn tmux(&self) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
+        // `working_dir` is the conversation's CWD — used by tmux's
+        // `new-session -c` when a fresh server is spawned so the pane
+        // shell starts in the conversation's project. Ignored on
+        // re-attach (see `ensure_live` doc).
+        self.tmux_registry
+            .ensure_live(&self.conversation_id, &self.working_dir)
+            .await
+    }
+
+    /// Direct access to the registry (used by the hard-delete cascade
+    /// integration in task 02696 and by the terminal attach path).
+    #[allow(dead_code)] // Wired up in task 02696.
+    pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
+        &self.tmux_registry
     }
 }
 
@@ -232,8 +306,18 @@ fn read_only_tools() -> Vec<Arc<dyn Tool>> {
 /// Shell and file-mutating tools.
 /// Present in Direct, Work, sandboxed Explore, and Work sub-agents. Absent
 /// from Explore-no-sandbox and Explore sub-agents (which only read).
+///
+/// `TmuxTool` is registered alongside bash because it serves the same
+/// "run a command in this conversation" purpose with a complementary
+/// persistence model (REQ-TMUX-003 / REQ-TMUX-009). When the tmux
+/// binary is unavailable the tool's first invocation returns
+/// `tmux_binary_unavailable` rather than failing at registration.
 fn write_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(BashTool), Arc::new(PatchTool::default())]
+    vec![
+        Arc::new(BashTool),
+        Arc::new(PatchTool::default()),
+        Arc::new(TmuxTool),
+    ]
 }
 
 /// Headless-browser tools. Available in every conversation mode.
@@ -324,6 +408,7 @@ impl ToolRegistry {
     pub fn for_subagent_explore() -> Self {
         let mut tools = read_only_tools();
         tools.push(Arc::new(BashTool));
+        tools.push(Arc::new(TmuxTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
         Self { tools }
@@ -508,6 +593,7 @@ mod tests {
         let direct = names(&ToolRegistry::direct());
         assert!(direct.contains("bash"));
         assert!(direct.contains("patch"));
+        assert!(direct.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
         }
@@ -521,18 +607,20 @@ mod tests {
         let work = names(&ToolRegistry::explore_with_sandbox());
         assert!(work.contains("bash"));
         assert!(work.contains("patch"));
+        assert!(work.contains("tmux"));
         assert!(work.contains("propose_task"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(work.contains(*tool), "Work missing {tool}");
         }
 
-        // Explore (no sandbox): read-only + propose_task, no bash/patch,
+        // Explore (no sandbox): read-only + propose_task, no bash/patch/tmux,
         // no terminal (the agent only sees what's in the repo here).
         let explore = names(&ToolRegistry::explore_no_sandbox());
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("patch"));
+        assert!(!explore.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !explore.contains(*tool),
@@ -540,10 +628,11 @@ mod tests {
             );
         }
 
-        // Sub-agent Explore: read-only + bash + submit. No patch, no spawn,
+        // Sub-agent Explore: read-only + bash + tmux + submit. No patch, no spawn,
         // no ask_user, no propose_task, no parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore());
         assert!(sub_explore.contains("bash"));
+        assert!(sub_explore.contains("tmux"));
         assert!(sub_explore.contains("submit_result"));
         assert!(sub_explore.contains("submit_error"));
         assert!(!sub_explore.contains("patch"));
@@ -561,6 +650,7 @@ mod tests {
         let sub_work = names(&ToolRegistry::for_subagent_work());
         assert!(sub_work.contains("bash"));
         assert!(sub_work.contains("patch"));
+        assert!(sub_work.contains("tmux"));
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));
@@ -569,6 +659,71 @@ mod tests {
                 !sub_work.contains(*tool),
                 "Sub-agent should not have parent terminal tool {tool}"
             );
+        }
+    }
+
+    /// REQ-BASH-010 / task 02697: the bash tool's input schema must reach
+    /// every registry that exposes bash, including sub-agent registries,
+    /// with all four operation keys (`cmd|peek|wait|kill`) declared as
+    /// optional properties, and the deprecated `mode` enum kept as a
+    /// backward-compat alias.
+    ///
+    /// Anthropic's tool-use API rejects top-level `oneOf` / `allOf` /
+    /// `anyOf` in input_schema, so mutual exclusivity between the four
+    /// operation keys is documented in the schema description and
+    /// enforced at runtime via `mutually_exclusive_modes`.
+    #[test]
+    fn bash_input_schema_flows_through_to_subagent_registries() {
+        for (label, registry) in [
+            ("direct", ToolRegistry::direct()),
+            ("subagent_explore", ToolRegistry::for_subagent_explore()),
+            ("subagent_work", ToolRegistry::for_subagent_work()),
+        ] {
+            let bash = registry
+                .find_tool("bash")
+                .unwrap_or_else(|| panic!("{label} registry missing bash"));
+            let schema = bash.input_schema();
+
+            // The Anthropic API rejects top-level oneOf/allOf/anyOf.
+            assert!(
+                schema.get("oneOf").is_none(),
+                "{label}: bash schema must not use top-level oneOf (Anthropic API rejects)"
+            );
+            assert!(
+                schema.get("allOf").is_none(),
+                "{label}: bash schema must not use top-level allOf"
+            );
+            assert!(
+                schema.get("anyOf").is_none(),
+                "{label}: bash schema must not use top-level anyOf"
+            );
+
+            // Mutual exclusivity is documented in the description.
+            let description = schema
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or_else(|| panic!("{label}: bash schema missing description"));
+            assert!(
+                description.contains("Exactly one"),
+                "{label}: bash schema description should declare mutual exclusivity"
+            );
+
+            let properties = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{label}: bash schema missing properties"));
+            for key in &["cmd", "peek", "wait", "kill"] {
+                assert!(
+                    properties.contains_key(*key),
+                    "{label}: bash schema missing operation key `{key}`"
+                );
+            }
+            assert!(properties.contains_key("wait_seconds"));
+            assert!(properties.contains_key("signal"));
+            assert!(properties.contains_key("lines"));
+            assert!(properties.contains_key("since"));
+            // Deprecation alias still surfaces.
+            assert!(properties.contains_key("mode"));
         }
     }
 }

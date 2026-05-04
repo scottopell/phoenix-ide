@@ -91,6 +91,19 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     if (isDesktop) loadConversations(true);
   }, [location.pathname, isDesktop, loadConversations]);
 
+  // REQ-BED-032: when the per-conversation SSE stream surfaces a
+  // hard-delete cascade event, refresh the sidebar immediately rather
+  // than waiting for the 5s polling tick. The cascade today emits on
+  // the per-conversation channel only (see `run_hard_delete_cascade` in
+  // `src/api/handlers.rs`), so this listener fires only for the tab the
+  // user just closed — other tabs catch up via polling.
+  useEffect(() => {
+    if (!isDesktop) return;
+    const handler = () => loadConversations(true);
+    window.addEventListener('phoenix:conversation-hard-deleted', handler);
+    return () => window.removeEventListener('phoenix:conversation-hard-deleted', handler);
+  }, [isDesktop, loadConversations]);
+
   // Extract active slug and find active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;

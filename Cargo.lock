@@ -1876,6 +1876,7 @@ dependencies = [
  "ureq",
  "uuid",
  "vte",
+ "which",
 ]
 
 [[package]]

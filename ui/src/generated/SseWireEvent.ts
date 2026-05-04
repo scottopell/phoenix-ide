@@ -48,4 +48,4 @@ duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: 
  * `message` field. Kind-aware consumers can narrow against
  * `UserFacingError` (also exported by ts-rs for future use).
  */
-error: unknown, };
+error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, };

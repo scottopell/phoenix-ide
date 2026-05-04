@@ -1042,6 +1042,27 @@ impl ConvState {
         )
     }
 
+    /// Mirror of the Allium-defined `is_busy` derivation in
+    /// `specs/bedrock/bedrock.allium`:
+    ///
+    /// > `is_busy: core_status in { llm_requesting, executing_tools,
+    /// >                            awaiting_sub_agents, cancelling_tool,
+    /// >                            cancelling_sub_agents }`
+    ///
+    /// Used by REQ-BED-032's `RejectHardDeleteWhileBusy` rule. The
+    /// hard-delete cascade refuses to fire while busy because the cleanup
+    /// would race the in-flight tool execution's own teardown.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            ConvState::LlmRequesting { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::CancellingSubAgents { .. }
+        )
+    }
+
     /// Stable, payload-free name of this variant. Used by structured
     /// error types (e.g. `TransitionError::InvalidTransition`) and
     /// tracing so they can carry a state discriminator without the

@@ -22,7 +22,7 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
-use crate::tools::{BrowserSessionManager, ToolRegistry};
+use crate::tools::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry, ToolRegistry};
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -61,6 +61,15 @@ pub struct RuntimeManager {
     llm_registry: Arc<ModelRegistry>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
+    /// Per-process bash handle registry. Shared by every conversation's
+    /// `ToolContext`; each conversation gets its own `ConversationHandles`
+    /// table inside (REQ-BASH-014).
+    bash_handles: Arc<BashHandleRegistry>,
+    /// Per-process tmux server registry. Shared by every conversation's
+    /// `ToolContext`; each conversation gets its own `Arc<RwLock<TmuxServer>>`
+    /// inside, keyed by `conversation_id`. The `which("tmux")` result is
+    /// cached on construction (REQ-TMUX-001 / REQ-TMUX-013).
+    tmux_registry: Arc<TmuxRegistry>,
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
@@ -379,6 +388,16 @@ pub enum SseEvent {
         sequence_id: i64,
         error: user_facing_error::UserFacingError,
     },
+    /// REQ-BED-032 step 6: emitted exactly once after a hard-delete cascade
+    /// completes. UI consumers (sidebar, navigation) use it to refresh
+    /// views. The `conversation_id` field is redundant with the broadcaster
+    /// scope today (the per-conversation channel implies the id) but is
+    /// carried explicitly so a future user-scope broadcaster can
+    /// disambiguate without changing the wire shape.
+    ConversationHardDeleted {
+        sequence_id: i64,
+        conversation_id: String,
+    },
 }
 
 impl RuntimeManager {
@@ -396,6 +415,8 @@ impl RuntimeManager {
             llm_registry,
             platform,
             browser_sessions: Arc::new(BrowserSessionManager::default()),
+            bash_handles: Arc::new(BashHandleRegistry::new()),
+            tmux_registry: Arc::new(TmuxRegistry::new()),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
@@ -415,6 +436,18 @@ impl RuntimeManager {
     /// Get the browser session manager
     pub fn browser_sessions(&self) -> &Arc<BrowserSessionManager> {
         &self.browser_sessions
+    }
+
+    /// Get the bash handle registry (REQ-BASH-007 shutdown kill-tree,
+    /// REQ-BASH-006 hard-delete cascade).
+    pub fn bash_handles(&self) -> &Arc<BashHandleRegistry> {
+        &self.bash_handles
+    }
+
+    /// Get the tmux server registry (REQ-TMUX-007 hard-delete cascade,
+    /// terminal attach path).
+    pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
+        &self.tmux_registry
     }
 
     /// Get the spawn channel sender (cloned for each runtime)
@@ -599,6 +632,8 @@ impl RuntimeManager {
             llm_client,
             tool_executor,
             self.browser_sessions.clone(),
+            self.bash_handles.clone(),
+            self.tmux_registry.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
             event_rx,
@@ -821,6 +856,8 @@ impl RuntimeManager {
             llm_client,
             tool_executor,
             self.browser_sessions.clone(),
+            self.bash_handles.clone(),
+            self.tmux_registry.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
             event_rx,
@@ -920,6 +957,22 @@ impl RuntimeManager {
     ) -> Result<broadcast::Receiver<SseEvent>, String> {
         let handle = self.get_or_create(conversation_id).await?;
         Ok(handle.broadcast_tx.subscribe())
+    }
+
+    /// Peek at the runtime handle for a conversation without starting one.
+    /// Returns `None` if no runtime is currently registered for `conversation_id`.
+    ///
+    /// REQ-BED-032: the hard-delete cascade uses this to broadcast the
+    /// `ConversationHardDeleted` event onto the existing per-conversation
+    /// channel — if any. Spinning up a runtime for a conversation that's
+    /// about to be deleted would be wasted work (the executor would
+    /// observe the row gone seconds later).
+    pub async fn try_get_handle(&self, conversation_id: &str) -> Option<ConversationHandle> {
+        let runtimes = self.runtimes.read().await;
+        runtimes.get(conversation_id).map(|h| ConversationHandle {
+            event_tx: h.event_tx.clone(),
+            broadcast_tx: h.broadcast_tx.clone(),
+        })
     }
 
     /// Determine the resume state for a conversation.

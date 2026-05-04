@@ -239,8 +239,10 @@ mod tests {
             "test-conv".to_string(),
             PathBuf::from("/tmp"),
             Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
         )
     }
 
