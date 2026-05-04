@@ -70,9 +70,11 @@ const HANDLE_NOT_FOUND_HINT: &str =
 // Request shape
 // ---------------------------------------------------------------------------
 
-/// Raw input shape. The `oneOf` constraint at the schema layer keeps mutual
-/// exclusion structural for backends that validate the schema; we still
-/// re-check at runtime per REQ-BASH-010.
+/// Raw input shape. Mutual exclusion between `cmd` / `peek` / `wait` /
+/// `kill` is enforced at runtime per REQ-BASH-010 — Anthropic's
+/// tool-use API rejects top-level `oneOf` in `input_schema`, so the
+/// schema documents the constraint in its description and we validate
+/// here.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBashInput {

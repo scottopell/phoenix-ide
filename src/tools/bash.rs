@@ -104,12 +104,17 @@ For complex scripts, write them to a file first and execute the file."#
     }
 
     fn input_schema(&self) -> Value {
+        // Anthropic's tool-use API rejects `oneOf` / `allOf` / `anyOf` at the
+        // top level of input_schema, so mutual exclusivity between cmd / peek
+        // / wait / kill is documented in the description and enforced at
+        // runtime via the `mutually_exclusive_modes` error envelope.
         json!({
             "type": "object",
+            "description": "Exactly one of `cmd`, `peek`, `wait`, or `kill` must be set per call. Setting more than one (or none) returns the `mutually_exclusive_modes` error.",
             "properties": {
                 "cmd": {
                     "type": "string",
-                    "description": "Shell command to execute via bash -c (spawn). Will be wrapped as `bash -c \"exec <cmd>\"` so the bash process replaces itself with the user command and exit signals propagate cleanly."
+                    "description": "Shell command to execute via `bash -c` (spawn). The bash wrapper stays alive as the parent of the user command; signal info propagates either via `WIFSIGNALED` directly or via the 128+signum exit-code convention."
                 },
                 "wait_seconds": {
                     "type": "integer",
@@ -140,13 +145,7 @@ For complex scripts, write them to a file first and execute the file."#
                     "enum": ["default", "slow", "background"],
                     "description": "DEPRECATED — alias for wait_seconds (default=30, slow=900, background=0); removed in the second Phoenix release after this revision lands."
                 }
-            },
-            "oneOf": [
-                { "required": ["cmd"] },
-                { "required": ["peek"] },
-                { "required": ["wait"] },
-                { "required": ["kill"] }
-            ]
+            }
         })
     }
 

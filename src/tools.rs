@@ -658,8 +658,14 @@ mod tests {
 
     /// REQ-BASH-010 / task 02697: the bash tool's input schema must reach
     /// every registry that exposes bash, including sub-agent registries,
-    /// with the new `oneOf` operation-key structure (`cmd|peek|wait|kill`)
-    /// and the deprecated `mode` enum kept as a backward-compat alias.
+    /// with all four operation keys (`cmd|peek|wait|kill`) declared as
+    /// optional properties, and the deprecated `mode` enum kept as a
+    /// backward-compat alias.
+    ///
+    /// Anthropic's tool-use API rejects top-level `oneOf` / `allOf` /
+    /// `anyOf` in input_schema, so mutual exclusivity between the four
+    /// operation keys is documented in the schema description and
+    /// enforced at runtime via `mutually_exclusive_modes`.
     #[test]
     fn bash_input_schema_flows_through_to_subagent_registries() {
         for (label, registry) in [
@@ -671,39 +677,41 @@ mod tests {
                 .find_tool("bash")
                 .unwrap_or_else(|| panic!("{label} registry missing bash"));
             let schema = bash.input_schema();
-            let one_of = schema
-                .get("oneOf")
-                .and_then(|v| v.as_array())
-                .unwrap_or_else(|| panic!("{label} bash schema missing oneOf"));
-            assert_eq!(
-                one_of.len(),
-                4,
-                "{label} bash schema oneOf should have 4 branches (cmd/peek/wait/kill)"
+
+            // The Anthropic API rejects top-level oneOf/allOf/anyOf.
+            assert!(
+                schema.get("oneOf").is_none(),
+                "{label}: bash schema must not use top-level oneOf (Anthropic API rejects)"
             );
-            // Walk the oneOf branches; collect the `required` keys that
-            // appear so we can verify the four operation modes are
-            // structurally distinct.
-            let required_keys: BTreeSet<String> = one_of
-                .iter()
-                .filter_map(|branch| {
-                    branch
-                        .get("required")
-                        .and_then(|r| r.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|s| s.as_str())
-                        .map(String::from)
-                })
-                .collect();
-            for key in &["cmd", "peek", "wait", "kill"] {
-                assert!(
-                    required_keys.contains(*key),
-                    "{label}: bash schema oneOf missing branch requiring `{key}`"
-                );
-            }
+            assert!(
+                schema.get("allOf").is_none(),
+                "{label}: bash schema must not use top-level allOf"
+            );
+            assert!(
+                schema.get("anyOf").is_none(),
+                "{label}: bash schema must not use top-level anyOf"
+            );
+
+            // Mutual exclusivity is documented in the description.
+            let description = schema
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or_else(|| panic!("{label}: bash schema missing description"));
+            assert!(
+                description.contains("Exactly one"),
+                "{label}: bash schema description should declare mutual exclusivity"
+            );
+
             let properties = schema
                 .get("properties")
                 .and_then(|p| p.as_object())
-                .unwrap();
+                .unwrap_or_else(|| panic!("{label}: bash schema missing properties"));
+            for key in &["cmd", "peek", "wait", "kill"] {
+                assert!(
+                    properties.contains_key(*key),
+                    "{label}: bash schema missing operation key `{key}`"
+                );
+            }
             assert!(properties.contains_key("wait_seconds"));
             assert!(properties.contains_key("signal"));
             assert!(properties.contains_key("lines"));
