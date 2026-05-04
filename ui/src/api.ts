@@ -249,10 +249,12 @@ export interface SkillEntry {
   /**
    * Where this skill was discovered. Either a discovery directory like
    * `".claude/skills"` / `".agents/skills"` for filesystem skills, or the
-   * literal `"builtin"` for skills bundled with the phoenix binary.
+   * literal `"builtin"` for skills bundled with the phoenix binary
+   * (extracted to `<HOME>/.phoenix-ide/builtin-skills/` at startup).
    */
   source: string;
-  /** Absolute path to the SKILL.md file. Empty string for built-in skills. */
+  /** Absolute path to the SKILL.md file. Always populated; built-in skills
+   *  point at their extracted location. */
   path: string;
 }
 

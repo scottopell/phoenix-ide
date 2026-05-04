@@ -143,8 +143,6 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/skills",
             get(list_conversation_skills),
         )
-        // Built-in skill body fetch (REQ-BS-003)
-        .route("/api/builtin-skills/:name", get(read_builtin_skill))
         // Task listing
         .route("/api/conversations/:id/tasks", get(list_conversation_tasks))
         // Projects (REQ-PROJ-014)
@@ -2094,21 +2092,6 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
     Ok(Json(ListFilesResponse { items }))
 }
 
-/// Read the body of a built-in skill by name (REQ-BS-003).
-///
-/// Returns the same shape as `read_file` so the `SkillViewer` UI component can
-/// use one rendering path for filesystem and built-in skills.
-async fn read_builtin_skill(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> Result<Json<ReadFileResponse>, AppError> {
-    let skill = crate::skills::builtin::find(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Built-in skill '{name}' not found")))?;
-    Ok(Json(ReadFileResponse {
-        content: skill.content.to_string(),
-        encoding: "utf-8".to_string(),
-    }))
-}
-
 /// Read file contents with text encoding validation (REQ-PF-005)
 async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileResponse>, AppError> {
     let path = PathBuf::from(&query.path);
@@ -2375,8 +2358,8 @@ async fn list_conversation_skills(
                 crate::system_prompt::SkillSource::Filesystem { path, source_dir } => {
                     (source_dir.clone(), path.to_string_lossy().to_string())
                 }
-                crate::system_prompt::SkillSource::Builtin => {
-                    ("builtin".to_string(), String::new())
+                crate::system_prompt::SkillSource::Builtin { path } => {
+                    ("builtin".to_string(), path.to_string_lossy().to_string())
                 }
             };
             SkillEntry {

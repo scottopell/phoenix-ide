@@ -5,7 +5,7 @@
 
 pub mod builtin;
 
-use crate::system_prompt::{SkillMetadata, SkillSource};
+use crate::system_prompt::SkillMetadata;
 
 /// The result of invoking a skill.
 #[derive(Debug, Clone)]
@@ -46,23 +46,17 @@ pub fn invoke_skill(
             )
         })?;
 
-    let raw_content = match &skill.source {
-        SkillSource::Filesystem { path, .. } => std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?,
-        SkillSource::Builtin => builtin::find(&skill.name)
-            .map(|b| b.content.to_string())
-            .ok_or_else(|| {
-                format!("Built-in skill '{skill_name}' is registered but content is missing")
-            })?,
-    };
+    // Both filesystem and built-in skills are real files on disk — built-ins
+    // are extracted at server startup so the SKILL.md and any companion files
+    // (`references/*.md`, scripts, etc.) live under
+    // `<HOME>/.phoenix-ide/builtin-skills/<name>/`.
+    let raw_content = std::fs::read_to_string(skill.skill_md_path())
+        .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?;
 
     // REQ-SK-001: Strip YAML frontmatter
     let body = strip_frontmatter(&raw_content);
 
-    // REQ-SK-003: Prepend base directory.
-    // Built-ins surface a `builtin://` marker rather than a fabricated path so
-    // the LLM does not attempt filesystem reads against a directory that does
-    // not exist.
+    // REQ-SK-003: Prepend base directory so the LLM can read companion files.
     let skill_dir = skill.skill_dir();
     let body_with_dir = format!("Base directory for this skill: {skill_dir}\n\n{body}");
 
@@ -300,22 +294,52 @@ mod tests {
     }
 
     #[test]
-    fn test_invoke_skill_builtin_returns_registry_content() {
-        // Use the live registry with $HOME pinned to the tempdir so a
-        // developer's ~/.claude/skills/caveman/ can't shadow the built-in.
+    fn test_invoke_skill_builtin_reads_from_extracted_dir() {
+        // Extract built-ins into an isolated tempdir, point discovery at it,
+        // and pin $HOME so a developer's ~/.claude/skills/caveman/ can't
+        // shadow the built-in.
         let tmp = TempDir::new().unwrap();
-        let skills = crate::system_prompt::discover_skills_with_home(tmp.path(), Some(tmp.path()));
+        let extract_dir = tmp.path().join("builtin-skills");
+        crate::skills::builtin::extract_to(&extract_dir).unwrap();
+
+        let skills = crate::system_prompt::discover_skills_with_options(
+            tmp.path(),
+            Some(tmp.path()),
+            Some(&extract_dir),
+        );
         let result = invoke_skill("caveman", "", &skills).unwrap();
         assert_eq!(result.name, "caveman");
         assert!(
-            result.skill_dir.starts_with("builtin://"),
-            "built-in skill_dir should be a synthetic marker, got {}",
+            result.skill_dir.starts_with(extract_dir.to_str().unwrap()),
+            "built-in skill_dir should point at the extract directory, got {}",
             result.skill_dir
         );
-        // Body should contain the level descriptions from the vendored markdown
-        assert!(result.body.contains("caveman"));
+        // Body should contain content from the vendored markdown
+        assert!(result.body.contains("Caveman Mode"));
         // Frontmatter is stripped
         assert!(!result.body.starts_with("---"));
+    }
+
+    #[test]
+    fn test_invoke_skill_builtin_can_read_companion_files() {
+        // Verifies the whole point of the disk-extraction design: a built-in
+        // skill's companion files (e.g. allium/references/language-reference.md)
+        // are real files the LLM can read.
+        let tmp = TempDir::new().unwrap();
+        let extract_dir = tmp.path().join("builtin-skills");
+        crate::skills::builtin::extract_to(&extract_dir).unwrap();
+
+        let companion = extract_dir
+            .join("allium")
+            .join("references")
+            .join("language-reference.md");
+        assert!(
+            companion.is_file(),
+            "allium reference should be on disk after extraction: {}",
+            companion.display()
+        );
+        let content = std::fs::read_to_string(&companion).unwrap();
+        assert!(!content.is_empty());
     }
 
     #[test]
