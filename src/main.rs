@@ -139,16 +139,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // operational breadcrumb.
     if which::which("tmux").is_ok() {
         tracing::info!("tmux binary detected on PATH; in-app terminals will attach to per-conversation tmux sessions");
-        // Best-effort version probe: warn if below 3.2 (Phoenix's
-        // declared minimum). Phoenix's tmux servers are spawned with
-        // `tmux -f <phoenix-conf>` so user-config interactions are
-        // already isolated, but version-specific bugs (e.g. tmux 3.2a
-        // send-keys parser quirks under custom user config) are easier
-        // to diagnose with the version logged at startup.
+        // Best-effort version probe: warn if below 3.3 (Phoenix's
+        // declared minimum). 3.3 is the floor because tmux 3.2's
+        // send-keys argument parser emits chatty "no current client"
+        // and "not in a mode" diagnostics for client-less servers,
+        // which agents misinterpret as failures even though the keys
+        // do reach the pane. tmux 3.3 reworked send-keys to not need
+        // a client at all.
         if let Ok(out) = std::process::Command::new("tmux").arg("-V").output() {
             let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
             tracing::info!(version = %v, "tmux version");
-            // Parse "tmux M.m" / "tmux M.ma" — minimum: 3.2.
+            // Parse "tmux M.m" / "tmux M.ma" — minimum: 3.3.
             if let Some(rest) = v.strip_prefix("tmux ") {
                 let digits: String = rest
                     .chars()
@@ -156,10 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
                 let mut parts = digits.split('.').filter_map(|s| s.parse::<u32>().ok());
                 if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
-                    if (major, minor) < (3, 2) {
+                    if (major, minor) < (3, 3) {
                         tracing::warn!(
                             version = %v,
-                            "tmux version below Phoenix's declared minimum (3.2); some features may misbehave"
+                            "tmux version below Phoenix's declared minimum (3.3); send-keys and other client-context commands may emit benign \"no current client\" warnings that agents misread as failures. Upgrade to tmux 3.3+."
                         );
                     }
                 }
