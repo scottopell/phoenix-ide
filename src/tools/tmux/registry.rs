@@ -36,6 +36,17 @@ const DEFAULT_SOCKET_SUBDIR: &str = "tmux-sockets";
 /// `TMUX_DEFAULT_SESSION`).
 pub const TMUX_DEFAULT_SESSION: &str = "main";
 
+/// Filename for the Phoenix-shipped tmux server config, written into
+/// the socket directory and passed via `tmux -f` on every invocation.
+/// The leading underscore avoids collision with the `conv-<id>.sock`
+/// socket-file naming pattern.
+const SERVER_CONFIG_FILENAME: &str = "_phoenix.tmux.conf";
+
+/// Embedded Phoenix tmux server config. Source-of-truth lives in
+/// `src/tools/tmux/server.conf`; the file is written into the socket
+/// directory at registry-init time (see [`TmuxRegistry::ensure_runtime_assets`]).
+pub const SERVER_CONFIG_TEXT: &str = include_str!("server.conf");
+
 /// Errors surfaced by the tmux registry. The tmux tool translates these
 /// into the stable error envelope on the agent's response.
 #[derive(Debug, Error)]
@@ -172,30 +183,52 @@ impl TmuxRegistry {
         &self.socket_dir
     }
 
-    /// Idempotent mkdir of the socket directory with permissions 0700
-    /// (REQ-TMUX-001). Called lazily on first use.
-    fn ensure_socket_dir(&self) -> Result<(), TmuxError> {
-        if self.socket_dir.exists() {
-            return Ok(());
-        }
-        std::fs::create_dir_all(&self.socket_dir).map_err(|source| TmuxError::SocketDirCreate {
-            path: self.socket_dir.clone(),
-            source,
-        })?;
-        // Lock the directory down to the current user only. The socket
-        // path is a security boundary — anyone who can read it can
-        // attach to every conversation's tmux server.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&self.socket_dir, perms).map_err(|source| {
+    /// Path to the Phoenix-shipped tmux server config file. Always
+    /// passed via `tmux -f <path>` so the per-conversation tmux servers
+    /// run in a deterministic config independent of the user's own
+    /// `~/.tmux.conf` / `~/.config/tmux/tmux.conf`.
+    pub fn config_path(&self) -> PathBuf {
+        self.socket_dir.join(SERVER_CONFIG_FILENAME)
+    }
+
+    /// Idempotent mkdir of the socket directory (perms 0700) AND write
+    /// of the Phoenix server config file. Called lazily on first use.
+    /// Re-writing the config file each time is safe and ensures bumps
+    /// to [`SERVER_CONFIG_TEXT`] propagate without manual intervention.
+    fn ensure_runtime_assets(&self) -> Result<(), TmuxError> {
+        if !self.socket_dir.exists() {
+            std::fs::create_dir_all(&self.socket_dir).map_err(|source| {
                 TmuxError::SocketDirCreate {
                     path: self.socket_dir.clone(),
                     source,
                 }
             })?;
+            // Lock the directory down to the current user only. The socket
+            // path is a security boundary — anyone who can read it can
+            // attach to every conversation's tmux server.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o700);
+                std::fs::set_permissions(&self.socket_dir, perms).map_err(|source| {
+                    TmuxError::SocketDirCreate {
+                        path: self.socket_dir.clone(),
+                        source,
+                    }
+                })?;
+            }
         }
+
+        // Write the Phoenix-shipped config file. Overwrite each time so
+        // a bump to SERVER_CONFIG_TEXT lands without operator action.
+        let config_path = self.config_path();
+        std::fs::write(&config_path, SERVER_CONFIG_TEXT).map_err(|source| {
+            TmuxError::SocketDirCreate {
+                path: config_path,
+                source,
+            }
+        })?;
+
         Ok(())
     }
 
@@ -218,7 +251,7 @@ impl TmuxRegistry {
         if !self.binary_available {
             return Err(TmuxError::BinaryUnavailable);
         }
-        self.ensure_socket_dir()?;
+        self.ensure_runtime_assets()?;
 
         let server_arc = self.get_or_insert(conversation_id).await;
 
@@ -251,7 +284,7 @@ impl TmuxRegistry {
                 server.status = ServerStatus::Live;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path).await?;
+                spawn_session(&server.socket_path, &self.config_path()).await?;
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -263,7 +296,7 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path).await?;
+                spawn_session(&server.socket_path, &self.config_path()).await?;
                 server.status = ServerStatus::Live;
             }
         }
@@ -327,8 +360,19 @@ impl TmuxRegistry {
         };
 
         if self.binary_available {
+            // `kill-server` connects to an existing server (which already
+            // has its config loaded), so `-f` is functionally a no-op
+            // here — included for symmetry with other Phoenix tmux
+            // invocations and to harden against an unlikely auto-spawn
+            // path on some tmux versions.
             let kill = tokio::process::Command::new("tmux")
-                .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
+                .args([
+                    "-f",
+                    &self.config_path().to_string_lossy(),
+                    "-S",
+                    &socket_path.to_string_lossy(),
+                    "kill-server",
+                ])
                 .env_remove("TMUX")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -390,10 +434,15 @@ pub async fn cascade_tmux_on_delete(
 
 /// Spawn a fresh detached tmux session named `main` against
 /// `socket_path` (REQ-TMUX-002 / `tmux_default_session`). This is the
-/// only place `new-session -d` is issued.
-pub async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
+/// only place `new-session -d` is issued, and therefore the only place
+/// where `-f <config_path>` actually loads the Phoenix-shipped config —
+/// subsequent invocations against the same socket connect to the
+/// already-running server and inherit its loaded config.
+pub async fn spawn_session(socket_path: &Path, config_path: &Path) -> Result<(), TmuxError> {
     let output = tokio::process::Command::new("tmux")
         .args([
+            "-f",
+            &config_path.to_string_lossy(),
             "-S",
             &socket_path.to_string_lossy(),
             "new-session",
@@ -471,11 +520,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_socket_dir_sets_0700_perms() {
+    async fn ensure_runtime_assets_sets_0700_perms_and_writes_config_file() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("nested").join("tmux-sockets");
         let reg = TmuxRegistry::with_socket_dir_and_binary(dir.clone(), false);
-        reg.ensure_socket_dir().expect("mkdir");
+        reg.ensure_runtime_assets().expect("mkdir + config write");
         let meta = std::fs::metadata(&dir).unwrap();
         #[cfg(unix)]
         {
@@ -483,6 +532,21 @@ mod tests {
             assert_eq!(meta.permissions().mode() & 0o777, 0o700);
         }
         let _ = meta;
+
+        // Phoenix server config is materialized in the socket dir.
+        let config_path = reg.config_path();
+        assert!(config_path.exists(), "config file should exist");
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(written, SERVER_CONFIG_TEXT);
+    }
+
+    #[test]
+    fn config_path_is_in_socket_dir() {
+        let reg = TmuxRegistry::with_socket_dir_and_binary("/tmp/x".into(), false);
+        assert_eq!(
+            reg.config_path(),
+            std::path::PathBuf::from("/tmp/x/_phoenix.tmux.conf")
+        );
     }
 
     #[tokio::test]

@@ -319,6 +319,7 @@ async fn resolve_exec_plan(conversation_id: &str, runtime: &Arc<RuntimeManager>)
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {
                 socket_path: server.socket_path.clone(),
+                config_path: registry.config_path(),
             }
         }
         Err(e) => {

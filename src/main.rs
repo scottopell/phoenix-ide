@@ -139,6 +139,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // operational breadcrumb.
     if which::which("tmux").is_ok() {
         tracing::info!("tmux binary detected on PATH; in-app terminals will attach to per-conversation tmux sessions");
+        // Best-effort version probe: warn if below 3.2 (Phoenix's
+        // declared minimum). Phoenix's tmux servers are spawned with
+        // `tmux -f <phoenix-conf>` so user-config interactions are
+        // already isolated, but version-specific bugs (e.g. tmux 3.2a
+        // send-keys parser quirks under custom user config) are easier
+        // to diagnose with the version logged at startup.
+        if let Ok(out) = std::process::Command::new("tmux").arg("-V").output() {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            tracing::info!(version = %v, "tmux version");
+            // Parse "tmux M.m" / "tmux M.ma" — minimum: 3.2.
+            if let Some(rest) = v.strip_prefix("tmux ") {
+                let digits: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                let mut parts = digits.split('.').filter_map(|s| s.parse::<u32>().ok());
+                if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
+                    if (major, minor) < (3, 2) {
+                        tracing::warn!(
+                            version = %v,
+                            "tmux version below Phoenix's declared minimum (3.2); some features may misbehave"
+                        );
+                    }
+                }
+            }
+        }
     } else {
         tracing::info!(
             "tmux binary not found on PATH; in-app terminals will spawn $SHELL directly"

@@ -163,12 +163,23 @@ fresh server."#
             let server = server_arc.read().await;
             server.socket_path.clone()
         };
+        let config_path = ctx.tmux_registry().config_path();
 
-        // Build the full argv with `-S <conv-sock>` prepended (REQ-TMUX-011).
-        // No agent arg is parsed, rewritten, or stripped; if the agent
-        // passes their own `-L` or `-S`, tmux's CLI parser surfaces a
-        // usage error which we return verbatim as stderr.
-        let mut full_args: Vec<String> = vec!["-S".into(), socket_path.to_string_lossy().into()];
+        // Build the full argv with `-f <phoenix-conf> -S <conv-sock>`
+        // prepended (REQ-TMUX-011). No agent arg is parsed, rewritten,
+        // or stripped; if the agent passes their own `-L` or `-S`,
+        // tmux's CLI parser surfaces a usage error which we return
+        // verbatim as stderr.
+        //
+        // `-f` only loads when tmux must spawn a fresh server. For a
+        // running server the flag is benign; we include it so any
+        // auto-spawn path uses the Phoenix config.
+        let mut full_args: Vec<String> = vec![
+            "-f".into(),
+            config_path.to_string_lossy().into(),
+            "-S".into(),
+            socket_path.to_string_lossy().into(),
+        ];
         full_args.extend(parsed.args);
 
         let started = Instant::now();
@@ -515,14 +526,25 @@ mod tests {
             .await;
 
         let conv_sock = socket_dir.join("conv-conv-dashL.sock");
-        let conv_sock_or_dir_count = std::fs::read_dir(&socket_dir)
+        // Permitted entries in the socket dir: the conversation's own
+        // socket and the Phoenix-shipped tmux config file. Anything
+        // else (e.g. a `weird`-labeled socket the agent tried to coerce
+        // tmux into creating) is a structural escape and fails the
+        // test.
+        let unexpected: Vec<_> = std::fs::read_dir(&socket_dir)
             .unwrap()
             .filter_map(Result::ok)
-            .count();
+            .filter(|entry| {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                !(s == "_phoenix.tmux.conf" || s.starts_with("conv-conv-dashL.sock"))
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            conv_sock_or_dir_count <= 1,
-            "only the conversation's own socket should exist under {socket_dir:?}; \
-             found {conv_sock_or_dir_count} entries"
+            unexpected.is_empty(),
+            "only the conv socket + Phoenix tmux config should appear under {socket_dir:?}; \
+             unexpected entries: {unexpected:?}"
         );
 
         // The cleanup applies to whichever socket actually got

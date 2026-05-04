@@ -21,16 +21,24 @@ use std::{
 
 /// What the PTY child should exec into.
 ///
-/// `Tmux` carries the conversation's resolved socket path; the child
-/// will run `tmux -S <socket> attach -t main` with `TMUX` removed from
-/// its environment to avoid outer-tmux nesting refusal (REQ-TMUX-004).
+/// `Tmux` carries the conversation's resolved socket path and the
+/// Phoenix-shipped tmux config path; the child will run `tmux -f
+/// <config> -S <socket> attach -t main` with `TMUX` removed from its
+/// environment to avoid outer-tmux nesting refusal (REQ-TMUX-004). The
+/// `-f <config>` flag is benign on attach (the server is already
+/// running with its loaded config) but keeps every Phoenix-issued tmux
+/// command consistent and protects against tmux auto-spawning a fresh
+/// server with default config if the conversation socket is gone.
 ///
 /// `Shell` is the v1 fallback: `$SHELL -i` (REQ-TERM-001/002). It runs
 /// when the tmux binary isn't available on the host or when the caller
 /// chose not to attach (e.g. tests).
 #[derive(Debug, Clone)]
 pub enum PtyExecPlan {
-    Tmux { socket_path: PathBuf },
+    Tmux {
+        socket_path: PathBuf,
+        config_path: PathBuf,
+    },
     Shell,
 }
 
@@ -116,8 +124,14 @@ pub fn spawn_pty(
                 .collect();
 
             match plan {
-                PtyExecPlan::Tmux { socket_path } => {
+                PtyExecPlan::Tmux {
+                    socket_path,
+                    config_path,
+                } => {
                     let tmux_c = CString::new("tmux").unwrap();
+                    let dash_f = CString::new("-f").unwrap();
+                    let conf_c = CString::new(config_path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| CString::new("").unwrap());
                     let dash_s = CString::new("-S").unwrap();
                     let sock_c = CString::new(socket_path.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| CString::new("").unwrap());
@@ -127,8 +141,16 @@ pub fn spawn_pty(
                     // `tmux` may not be on a known absolute path; use
                     // `execvpe` to traverse PATH. nix exposes execvp;
                     // we want envp control too, so call libc directly.
-                    let argv: Vec<CString> =
-                        vec![tmux_c.clone(), dash_s, sock_c, attach, dash_t, main_c];
+                    let argv: Vec<CString> = vec![
+                        tmux_c.clone(),
+                        dash_f,
+                        conf_c,
+                        dash_s,
+                        sock_c,
+                        attach,
+                        dash_t,
+                        main_c,
+                    ];
                     exec_via_path(&tmux_c, &argv, &env_cstrings);
                     eprintln!("execvpe tmux: {}", std::io::Error::last_os_error());
                     unsafe { libc::_exit(1) };
@@ -302,13 +324,18 @@ mod tests {
     }
 
     #[test]
-    fn pty_exec_plan_tmux_carries_socket_path() {
+    fn pty_exec_plan_tmux_carries_socket_path_and_config_path() {
         let plan = PtyExecPlan::Tmux {
             socket_path: PathBuf::from("/tmp/phoenix-ide/tmux-sockets/conv-test.sock"),
+            config_path: PathBuf::from("/tmp/phoenix-ide/tmux-sockets/_phoenix.tmux.conf"),
         };
         match plan {
-            PtyExecPlan::Tmux { socket_path } => {
+            PtyExecPlan::Tmux {
+                socket_path,
+                config_path,
+            } => {
                 assert!(socket_path.to_string_lossy().contains("conv-test"));
+                assert!(config_path.to_string_lossy().ends_with(".tmux.conf"));
             }
             PtyExecPlan::Shell => panic!("expected Tmux variant"),
         }
