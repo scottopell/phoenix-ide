@@ -838,6 +838,45 @@ export const api = {
     return resp.json();
   },
 
+  /** POST /api/chains/:rootId/archive — archive every member of the chain
+   *  atomically. Mirrors `archiveConversation` for chain-scope. */
+  async archiveChain(rootId: string): Promise<void> {
+    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/archive`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to archive chain');
+    }
+  },
+
+  /** POST /api/chains/:rootId/unarchive — unarchive every member of the
+   *  chain atomically. */
+  async unarchiveChain(rootId: string): Promise<void> {
+    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/unarchive`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to unarchive chain');
+    }
+  },
+
+  /** DELETE /api/chains/:rootId — hard-delete every member of the chain.
+   *  Refused atomically (no partial wipe) if any member is busy. */
+  async deleteChain(rootId: string): Promise<void> {
+    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}`, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409) {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
+      throw new Error(err.error || 'Failed to delete chain');
+    }
+  },
+
 };
 
 // ---------------------------------------------------------------------------

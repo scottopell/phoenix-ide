@@ -86,6 +86,7 @@ const makeMember = (
   message_count: 12,
   updated_at: '2026-04-29T12:00:00Z',
   position,
+  has_worktree: false,
   ...overrides,
 });
 
