@@ -10,7 +10,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import { FileTree } from './FileTree';
-import { computeAncestors } from './computeAncestors';
+import { computeAncestors, isUnderRoot } from './computeAncestors';
 
 // /api/files/list response shapes — keyed by absolute path.
 const FS: Record<string, Array<{
@@ -77,12 +77,39 @@ describe('computeAncestors', () => {
   });
 });
 
+describe('isUnderRoot', () => {
+  it('true for root itself, files at root, and deep descendants', () => {
+    expect(isUnderRoot('/proj', '/proj')).toBe(true);
+    expect(isUnderRoot('/proj', '/proj/README.md')).toBe(true);
+    expect(isUnderRoot('/proj', '/proj/ui/src/x.ts')).toBe(true);
+  });
+
+  it('handles trailing slash on rootPath', () => {
+    expect(isUnderRoot('/proj/', '/proj/x.ts')).toBe(true);
+  });
+
+  it('false for sibling-prefix paths and unrelated paths', () => {
+    // /proj-other shares the textual prefix /proj but is NOT under it —
+    // catches the naive `startsWith(rootPath)` bug.
+    expect(isUnderRoot('/proj', '/proj-other/x.ts')).toBe(false);
+    expect(isUnderRoot('/proj', '/elsewhere/x.ts')).toBe(false);
+  });
+});
+
 describe('FileTree — reveal active file', () => {
   let scrollSpy: ReturnType<typeof vi.fn>;
+  // Capture happy-dom's pre-existing descriptor so afterEach can restore
+  // the prototype to exactly the state other tests expect — leaving a stub
+  // installed on Element.prototype creates cross-test coupling.
+  let originalScrollDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
     installFetchMock();
     // happy-dom does not implement scrollIntoView; install a spy stub.
+    originalScrollDescriptor = Object.getOwnPropertyDescriptor(
+      Element.prototype,
+      'scrollIntoView',
+    );
     scrollSpy = vi.fn();
     Object.defineProperty(Element.prototype, 'scrollIntoView', {
       configurable: true,
@@ -98,6 +125,13 @@ describe('FileTree — reveal active file', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     cleanup();
+    if (originalScrollDescriptor) {
+      Object.defineProperty(Element.prototype, 'scrollIntoView', originalScrollDescriptor);
+    } else {
+      // happy-dom didn't have a descriptor; remove the stub so we don't
+      // leave an unowned property on Element.prototype.
+      delete (Element.prototype as unknown as { scrollIntoView?: unknown }).scrollIntoView;
+    }
   });
 
   it('expands ancestor directories and scrolls the active row into view', async () => {
@@ -149,5 +183,27 @@ describe('FileTree — reveal active file', () => {
     // invoked on.
     const calledOn = scrollSpy.mock.contexts[0] as HTMLElement;
     expect(calledOn).toBe(rowEl);
+  });
+
+  it('does NOT scroll or expand when activeFile is outside rootPath', async () => {
+    // Guards against the dropped-comment regression: out-of-root activeFile
+    // used to leave lastRevealedRef = null, so the scroll effect would
+    // re-query (and fail) on every childItems update. Now the reveal effect
+    // marks it as already-revealed and the scroll effect short-circuits.
+    const onFileSelect = vi.fn();
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={onFileSelect}
+        activeFile="/elsewhere/some-file.ts"
+        conversationId="conv-test-2"
+      />,
+    );
+
+    await screen.findByText('README.md');
+    // Sanity: nothing under /proj/ui got auto-expanded by an out-of-root file.
+    expect(screen.queryByText('FileTree.tsx')).not.toBeInTheDocument();
+    // And no scroll was attempted on the active row (because there is none).
+    expect(scrollSpy).not.toHaveBeenCalled();
   });
 });
