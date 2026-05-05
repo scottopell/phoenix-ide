@@ -416,15 +416,7 @@ where
             return;
         }
 
-        // Derive repo root: if working_dir is inside a worktree
-        // ({root}/.phoenix/worktrees/{id}), walk up to the .phoenix
-        // ancestor's parent; otherwise working_dir IS the root.
-        let wd = &self.context.working_dir;
-        let repo_root = wd
-            .ancestors()
-            .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
-            .and_then(|phoenix_dir| phoenix_dir.parent())
-            .map_or_else(|| wd.clone(), std::path::Path::to_path_buf);
+        let repo_root = crate::git_ops::repo_root_from_working_dir(&self.context.working_dir);
 
         let worktree_path = repo_root
             .join(".phoenix")
@@ -2068,6 +2060,11 @@ where
         plan: String,
     ) -> Result<(), String> {
         let cwd = self.context.working_dir.clone();
+        // The spec invariant WorktreePathDerivedFromConversation requires
+        // the worktree path to be rooted at the repo root, not at cwd.
+        // For Managed conversations cwd IS the Explore worktree, so we
+        // derive repo_root explicitly here and pass it separately.
+        let repo_root = crate::git_ops::repo_root_from_working_dir(&cwd);
         let conv_id = self.context.conversation_id.clone();
         let desired_base_branch = self.context.desired_base_branch.clone();
         let storage = self.storage.clone();
@@ -2081,6 +2078,7 @@ where
         let result = tokio::task::spawn_blocking(move || {
             execute_approve_task_blocking(
                 &cwd,
+                &repo_root,
                 &conv_id,
                 &title,
                 &priority,
@@ -2657,9 +2655,17 @@ pub(crate) static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::
 
 /// Blocking implementation of approve task git operations.
 /// Runs on a blocking thread via `spawn_blocking`.
+///
+/// `cwd` is where git commands run (the Explore worktree for Managed
+/// conversations, or the repo root for Direct/legacy paths).
+/// `repo_root` is the git repository root, used for the canonical worktree
+/// path formula: `{repo_root}/.phoenix/worktrees/{conv_id}`.
+/// These are distinct parameters because for Managed conversations `cwd`
+/// IS the Explore worktree, not the repo root.
 #[allow(clippy::too_many_lines)] // Sequential git flow; splitting hurts readability
 fn execute_approve_task_blocking(
     cwd: &std::path::Path,
+    repo_root: &std::path::Path,
     conv_id: &str,
     title: &str,
     priority: &str,
@@ -2745,19 +2751,10 @@ fn execute_approve_task_blocking(
     );
 
     // 5. Create .phoenix/worktrees/ directory for the worktree.
-    //
-    // When called from a Managed Explore conversation, `cwd` IS already the
-    // early worktree ({repo_root}/.phoenix/worktrees/{conv_id}).  Computing
-    // phoenix_dir relative to `cwd` would produce a doubly-nested path and
-    // cause `early_worktree_exists` to always be false.  Walk up to the repo
-    // root first (same logic as `cleanup_worktree_if_present`).
-    let repo_root_for_wt = cwd
-        .ancestors()
-        .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
-        .and_then(|p| p.parent())
-        .map_or_else(|| cwd.to_path_buf(), std::path::Path::to_path_buf);
-
-    let phoenix_dir = repo_root_for_wt.join(".phoenix").join("worktrees");
+    //    Use repo_root (not cwd): for Managed conversations cwd IS the Explore
+    //    worktree, and the spec invariant WorktreePathDerivedFromConversation
+    //    requires the path to be anchored at the repo root.
+    let phoenix_dir = repo_root.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
         .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
 

@@ -620,6 +620,24 @@ pub(crate) fn find_active_branch_conversation_slug(
 
 /// Ensure .gitignore in the given directory contains `.phoenix/`.
 /// Creates .gitignore if it doesn't exist. Stages the change if modified.
+/// Derive the repo root from any path that may be inside a Phoenix worktree.
+///
+/// Phoenix worktrees live at `{repo_root}/.phoenix/worktrees/{conv_id}`.
+/// If `path` is inside such a worktree, walks up to the `.phoenix` ancestor
+/// and returns its parent (the repo root).  If no `.phoenix` ancestor is
+/// found, returns `path` unchanged — the path IS the repo root (Direct mode,
+/// legacy Managed, or already-root callers).
+///
+/// This is the canonical implementation; all other callers that need the repo
+/// root from a working_dir should use this function rather than re-implementing
+/// the ancestor walk.
+pub(crate) fn repo_root_from_working_dir(path: &Path) -> std::path::PathBuf {
+    path.ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
+        .and_then(|phoenix_dir| phoenix_dir.parent())
+        .map_or_else(|| path.to_path_buf(), std::path::Path::to_path_buf)
+}
+
 pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
     use std::io::Write as _;
 

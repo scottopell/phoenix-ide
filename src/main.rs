@@ -380,12 +380,8 @@ async fn reconcile_worktrees(db: &Database) {
             // Legacy: use git rev-parse from the conversation's cwd
             db::detect_git_repo_root(std::path::Path::new(&conv.cwd))
         } else {
-            // Walk up from worktree path to find .phoenix parent
-            std::path::Path::new(wt_path)
-                .ancestors()
-                .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
-                .and_then(|phoenix_dir| phoenix_dir.parent())
-                .map(|p| p.to_string_lossy().to_string())
+            let root = crate::git_ops::repo_root_from_working_dir(std::path::Path::new(wt_path));
+            Some(root.to_string_lossy().to_string())
         };
 
         if let Some(ref root) = project_root {
