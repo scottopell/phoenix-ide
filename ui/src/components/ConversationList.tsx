@@ -434,7 +434,7 @@ export function ConversationList({
         <div className="view-header">
           <h2>Conversations</h2>
           <div className="view-header-actions">
-            {archivedConversations.length > 0 && (
+            {(archivedConversations.length > 0 || showArchived) && (
               <button
                 className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
                 onClick={onToggleArchived}
@@ -449,7 +449,7 @@ export function ConversationList({
           </div>
         </div>
       )}
-      {sidebarMode && archivedConversations.length > 0 && (
+      {sidebarMode && (archivedConversations.length > 0 || showArchived) && (
         <div className="sidebar-archive-toggle">
           <button
             className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
