@@ -6,31 +6,38 @@ artifact: src/api/sse.rs
 ---
 
 Force-close every SSE stream after a bounded lifetime so HTTP/1.1
-connection saturation between client and server is self-healing.
+connection exhaustion is self-healing without protocol changes.
 
 ## Symptom
 
-Multiple Phoenix tabs/devices behind a single proxy can saturate the
-proxy's HTTP/1.1 connection pool to phoenix. Each open conversation page
-holds a `/api/conversations/:id/stream` SSE — long-lived by design.
-When the pool fills, new requests (e.g. POST `/approve-task`) queue at
-the proxy and "pend forever" from the browser's view.
-
-Phoenix logs look healthy throughout — only successful API polls — because
-the queued requests never reach phoenix at all.
+The browser's connection to phoenix can wedge: new requests (e.g. POST
+`/approve-task`, fresh page loads, asset fetches) "pend forever" in
+network devtools, while phoenix's logs show only successful API polls.
+The queued requests never reach phoenix at all.
 
 ## Root cause
 
-`sse_stream()` in `src/api/sse.rs:40` produces a stream with
-`KeepAlive` set but no maximum lifetime. SSE connections live until the
-client gives up, which for a foregrounded tab is effectively forever.
+The path is direct: browser ↔ phoenix over plain HTTP/1.1 (no proxy
+terminating between them). HTTP/1.1 caps a browser at **6 concurrent
+connections per origin**. Each open conversation page holds one SSE
+stream (`/api/conversations/:id/stream`) — a long-lived connection that
+permanently occupies one of those 6 slots.
+
+With ~6 conversation tabs open, the slot pool is full. The 7th request
+queues in the browser's connection scheduler and never gets dispatched.
+From the browser's perspective: "pending forever." From phoenix's: it
+never happens.
+
+`sse_stream()` in `src/api/sse.rs:40` sets `KeepAlive` but no maximum
+lifetime, so SSE connections live until the client gives up — which
+for a foregrounded tab is effectively never.
 
 ## Fix
 
-Cap stream lifetime (e.g. 30 minutes) and force-close. The browser's
-`EventSource` auto-reconnects, briefly freeing the connection slot at
-the proxy and any intermediates. This makes saturation self-healing
-without changing the protocol or requiring HTTP/2.
+Cap stream lifetime (e.g. 30 minutes) and force-close from the server.
+The browser's `EventSource` auto-reconnects, freeing the slot
+momentarily and letting any queued requests drain. Saturation becomes
+self-healing without changing the protocol.
 
 Existing `ConnectionMachine` on the client (referenced in
 `src/api/sse.rs:25`) already handles broadcast-lag-induced closes;
@@ -49,11 +56,13 @@ mostly free.
 
 ## Notes
 
-Companion task: shutdown-sse-deadline (bound the same problem at process
-exit). Bigger-but-conditional alternative not pursued here: HTTP/2 (h2c),
-which multiplexes streams over a single TCP connection — only helps if
-the proxy speaks HTTP/2 to phoenix downstream. Keeping HTTP/2 on the
-shelf pending proxy investigation.
+Companion tasks:
+- shutdown-sse-deadline (02703): bound the same hang at process exit
+- http2-tls (TBD): structural fix that eliminates the 6-connection
+  limit entirely via HTTP/2 stream multiplexing — bigger project
+  (requires TLS) and only worth doing if the lifetime fix here proves
+  insufficient.
 
-Discovered 2026-05-05 during prod incident; full diagnosis lives in the
-companion task and conversation history.
+Discovered 2026-05-05 during a prod incident triggered by clicking
+"Approve task" with multiple conversation tabs open. Full diagnosis is
+in the companion tasks and conversation history.

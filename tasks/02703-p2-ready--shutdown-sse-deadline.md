@@ -46,8 +46,8 @@ already follows the same "bounded final cleanup" pattern — mirror it.
 ## Notes
 
 Discovered 2026-05-05 during a prod incident where the user's browser
-showed "pending forever" on an Approve Task POST. Investigation found the
-proxy connection pool saturated by pinned SSE streams, and a 23h-old
-zombie phoenix process holding fd=15 on a stuck SSE stream from a
-different proxy IP. Companion task: bounded SSE stream lifetime
-(self-healing on the stream side too).
+showed "pending forever" on an Approve Task POST. Investigation found a
+23h-old zombie phoenix process holding fd=15 on a stuck SSE stream from
+a different remote client — graceful shutdown had been waiting on that
+stream since the prior deploy. Companion task: bounded SSE stream
+lifetime (self-healing on the stream side too).
