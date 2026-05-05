@@ -138,9 +138,18 @@ export function useCreateConversation(navigate: (path: string) => void) {
     return () => { clearTimeout(timer); setBranchSearchLoading(false); };
   }, [isGitDir, mode, cwd, branchSearch]);
 
+  // Resolve once and reuse: conflict check, canSend gating, and submission
+  // must all key off the same branch value. Detached-HEAD (currentBranch
+  // null) falls through to defaultBranch — and the conflict check has to
+  // see that fallback too, otherwise an active conversation on default
+  // would only surface as a backend 409 at submit time.
+  const effectiveBranch = (mode === 'branch' || mode === 'managed')
+    ? (baseBranch ?? currentBranch ?? defaultBranch)
+    : null;
+
   // Check if selected branch has a conflict (active conversation already using it).
-  const selectedBranchConflict = (mode === 'branch' || mode === 'managed')
-    ? branches.find(b => b.name === (baseBranch ?? currentBranch))?.conflict_slug ?? null
+  const selectedBranchConflict = effectiveBranch
+    ? branches.find(b => b.name === effectiveBranch)?.conflict_slug ?? null
     : null;
 
   const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && !selectedBranchConflict;
@@ -205,17 +214,14 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
-      const resolvedBaseBranch = (mode === 'managed' || mode === 'branch')
-        ? (baseBranch ?? currentBranch ?? defaultBranch)
-        : null;
-      if ((mode === 'managed' || mode === 'branch') && !resolvedBaseBranch) {
+      if ((mode === 'managed' || mode === 'branch') && !effectiveBranch) {
         setError('Pick a base branch for Managed/Branch mode.');
         setCreating(false);
         return;
       }
       const conv = await api.createConversation(
         trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode,
-        resolvedBaseBranch,
+        effectiveBranch,
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
