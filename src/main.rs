@@ -376,8 +376,9 @@ async fn reconcile_worktrees(db: &Database) {
 
         // Derive project root from worktree path: {root}/.phoenix/worktrees/{id}
         // If worktree_path is empty, try to detect from the conversation's current cwd
-        let project_root = if wt_path.is_empty() {
-            // Legacy: use git rev-parse from the conversation's cwd
+        let project_root = if is_sentinel(wt_path) {
+            // wt_path is empty or a __LEGACY sentinel: no valid worktree path to
+            // derive the repo root from, so run git rev-parse from conv.cwd instead.
             db::detect_git_repo_root(std::path::Path::new(&conv.cwd))
         } else {
             let root = crate::git_ops::repo_root_from_working_dir(std::path::Path::new(wt_path));
