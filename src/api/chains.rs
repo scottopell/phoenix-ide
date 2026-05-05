@@ -71,6 +71,11 @@ pub struct ChainView {
 }
 
 /// Per-member summary on the chain page (REQ-CHN-003).
+///
+/// `has_worktree` is true when the member is in `Work` or `Branch` mode
+/// (i.e. owns a git worktree directory on disk). The chain delete confirm
+/// uses this to render an accurate worktree count without loading every
+/// conversation client-side.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ChainMemberSummary {
@@ -80,6 +85,7 @@ pub struct ChainMemberSummary {
     pub message_count: i64,
     pub updated_at: DateTime<Utc>,
     pub position: ChainPosition,
+    pub has_worktree: bool,
 }
 
 /// Where a member sits in its chain (REQ-CHN-003 / REQ-CHN-009-style emphasis).
@@ -436,6 +442,7 @@ fn build_member_summaries(members: &[Conversation]) -> Vec<ChainMemberSummary> {
                 message_count: conv.message_count,
                 updated_at: conv.updated_at,
                 position,
+                has_worktree: conv.conv_mode.worktree_path().is_some(),
             }
         })
         .collect()
@@ -486,7 +493,7 @@ fn map_chain_qa_error(e: ChainQaError) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, MessageContent};
+    use crate::db::{ConvMode, Database, MessageContent, NonEmptyString};
 
     /// Mirror of the `chain_qa` test helper — builds a linear chain and
     /// links `continued_in_conv_id` between successive members.
@@ -729,6 +736,58 @@ mod tests {
             .expect("build_view_for_test should succeed for valid chain");
         assert_eq!(view.qa_history.len(), 1);
         assert_eq!(view.qa_history[0].question, "what happened?");
+    }
+
+    #[tokio::test]
+    async fn has_worktree_reflects_member_mode() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["hw-a", "hw-b", "hw-c", "hw-d"]).await;
+        add_continuation_summary(&db, "hw-a", "summary").await;
+        add_continuation_summary(&db, "hw-b", "summary").await;
+        add_continuation_summary(&db, "hw-c", "summary").await;
+
+        // hw-a: Explore (default — no worktree)
+        // hw-b: Direct (no worktree)
+        // hw-c: Work (worktree)
+        // hw-d: Branch (worktree)
+        db.update_conversation_mode("hw-b", &ConvMode::Direct)
+            .await
+            .unwrap();
+        db.update_conversation_mode(
+            "hw-c",
+            &ConvMode::Work {
+                branch_name: NonEmptyString::new("task-x").unwrap(),
+                worktree_path: NonEmptyString::new("/tmp/wt/c").unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("TKX").unwrap(),
+                task_title: NonEmptyString::new("test").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_mode(
+            "hw-d",
+            &ConvMode::Branch {
+                branch_name: NonEmptyString::new("feature-x").unwrap(),
+                worktree_path: NonEmptyString::new("/tmp/wt/d").unwrap(),
+                base_branch: NonEmptyString::new("feature-x").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let view = build_view_for_test(&db, &chain_qa, "hw-a").await.unwrap();
+
+        let by_id: std::collections::HashMap<&str, &ChainMemberSummary> = view
+            .members
+            .iter()
+            .map(|m| (m.conv_id.as_str(), m))
+            .collect();
+        assert!(!by_id["hw-a"].has_worktree, "Explore has no worktree");
+        assert!(!by_id["hw-b"].has_worktree, "Direct has no worktree");
+        assert!(by_id["hw-c"].has_worktree, "Work has a worktree");
+        assert!(by_id["hw-d"].has_worktree, "Branch has a worktree");
     }
 
     // ----- name editing semantics ----------------------------------------
