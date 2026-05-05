@@ -620,35 +620,61 @@ async fn create_conversation(
             ));
         }
 
-        // REQ-PROJ-028: If a base_branch is specified, create the worktree immediately
-        // so the agent explores the selected branch's code, not the main checkout.
-        if let Some(ref base_branch) = req.base_branch {
-            let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
-                AppError::BadRequest("Could not determine git repository root".to_string())
-            })?;
-            let conv_id = id.clone();
-            let branch = base_branch.clone();
-            let repo = repo_root.clone();
-
-            let result = tokio::task::spawn_blocking(move || {
-                create_managed_explore_worktree_blocking(&repo, &conv_id, &branch)
-            })
-            .await
-            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
-
-            match result {
-                Ok(worktree_path) => (crate::db::ConvMode::Explore, worktree_path),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to create early worktree for Managed mode, falling back to repo root"
-                    );
-                    (crate::db::ConvMode::Explore, req.cwd.clone())
-                }
-            }
+        // REQ-PROJ-028: Managed mode allocates an Explore worktree on the chosen
+        // branch up-front so the agent's view tracks the selected branch (not the
+        // main checkout) from message zero. base_branch is required — silently
+        // falling back to the repo root creates a divergence between the LLM's
+        // worktree (correct after task approval) and the terminal pane (frozen
+        // at the original spawn cwd) that surfaces as a footgun later.
+        //
+        // For `mode=auto` (the SDK / seed path), the caller has not made an
+        // explicit branch choice — they delegated the decision to the backend.
+        // Infer the current branch from the cwd. For an explicit `mode=managed`
+        // (the form path), require an explicit base_branch — the form picks one
+        // deliberately and the caller deserves a 400 if it's missing.
+        let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
+            AppError::BadRequest("Could not determine git repository root".to_string())
+        })?;
+        let inferred_base = if req.mode.as_deref() == Some("auto") && req.base_branch.is_none() {
+            run_git(
+                std::path::Path::new(&repo_root),
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+            )
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "HEAD")
         } else {
-            (crate::db::ConvMode::Explore, req.cwd.clone())
-        }
+            None
+        };
+        let base_branch = req
+            .base_branch
+            .as_deref()
+            .or(inferred_base.as_deref())
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Managed mode requires base_branch (the branch to allocate \
+                     the Explore worktree against)"
+                        .to_string(),
+                )
+            })?;
+
+        let conv_id = id.clone();
+        let branch = base_branch.to_string();
+        let repo = repo_root.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            create_managed_explore_worktree_blocking(&repo, &conv_id, &branch)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+
+        let worktree_path = match result {
+            Ok(p) => p,
+            Err(ManagedWorktreeError::BadRequest(msg)) => return Err(AppError::BadRequest(msg)),
+            Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
+        };
+
+        (crate::db::ConvMode::Explore, worktree_path)
     } else {
         (crate::db::ConvMode::Direct, req.cwd.clone())
     };
@@ -854,20 +880,36 @@ fn create_branch_worktree_blocking(
 /// Creates a temporary branch `task-pending-{conv_id_prefix}` from the
 /// base branch. At approval time, `execute_approve_task_blocking` detects
 /// the existing worktree and renames the branch.
+enum ManagedWorktreeError {
+    /// User-input failure (e.g. branch doesn't exist locally or at origin).
+    BadRequest(String),
+    /// Infrastructure failure (worktree creation, generic git errors).
+    Git(String),
+}
+
 fn create_managed_explore_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     base_branch: &str,
-) -> Result<String, String> {
+) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
 
-    materialize_branch(cwd, base_branch).map_err(|e| e.to_string())?;
+    materialize_branch(cwd, base_branch).map_err(|e| match e {
+        GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
+            "Branch '{b}' not found locally or at origin",
+        )),
+        other => ManagedWorktreeError::Git(other.to_string()),
+    })?;
 
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
 
     let worktree_path_str = create_worktree(cwd, conv_id, &temp_branch, Some(base_branch))
-        .map_err(|e| format!("Failed to create early worktree from '{base_branch}': {e}"))?;
+        .map_err(|e| {
+            ManagedWorktreeError::Git(format!(
+                "Failed to create early worktree from '{base_branch}': {e}",
+            ))
+        })?;
 
     tracing::info!(
         conv_id = %conv_id,
