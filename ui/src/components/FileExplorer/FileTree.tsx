@@ -9,13 +9,14 @@
  * REQ-FE-009: Active file highlight, loading indicators
  */
 
-import { memo, useState, useEffect, useCallback, useMemo, createContext, useContext } from 'react';
+import { memo, useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } from 'react';
 import {
   ChevronRight,
   ChevronDown,
   Loader2,
   AlertCircle,
 } from 'lucide-react';
+import { computeAncestors, isUnderRoot } from './computeAncestors';
 
 // Types
 export interface FileItem {
@@ -177,6 +178,7 @@ const FileTreeItem = memo(function FileTreeItem({
         role="button"
         tabIndex={isDisabled ? -1 : 0}
         title={isDisabled ? 'Non-text file' : item.path}
+        data-path={item.path}
       >
         {item.is_directory && (
           <span className="ft-expand-icon">
@@ -249,6 +251,11 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   }));
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
   const [childItems, setChildItems] = useState<Map<string, FileItem[]>>(new Map());
+  const treeRootRef = useRef<HTMLDivElement | null>(null);
+  // Tracks the activeFile we last successfully scrolled to, so an updated
+  // childItems map (from any later directory load) doesn't yank scroll
+  // position back to the same row over and over.
+  const lastRevealedRef = useRef<string | null>(null);
 
   // When conversation changes, atomically load new expansion state
   useEffect(() => {
@@ -265,6 +272,69 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
 
   // Convenience alias
   const expandedPaths = expansion.paths;
+
+  // Reveal-on-active-file: when activeFile changes, expand every ancestor
+  // directory between rootPath and the file. The existing
+  // expanded-but-not-loaded effect below picks up the merged paths and
+  // fetches their children, so the row eventually materializes in the DOM
+  // and the scroll effect (further down) brings it into view.
+  //
+  // Keyed on [activeFile, rootPath] only — NOT on expandedPaths — so a user
+  // who manually collapses an ancestor of the current activeFile doesn't get
+  // their collapse undone on the next re-render.
+  useEffect(() => {
+    if (!activeFile) return;
+    // Out-of-root activeFile (cwd mismatch / cross-tree open): there's nothing
+    // to scroll to in this tree. Mark it as already-revealed so the scroll
+    // effect's guard short-circuits and we don't burn a querySelector on
+    // every subsequent childItems update.
+    if (!isUnderRoot(rootPath, activeFile)) {
+      lastRevealedRef.current = activeFile;
+      return;
+    }
+    // In-root: a fresh activeFile means the scroll effect should re-attempt
+    // until the row appears in the DOM.
+    lastRevealedRef.current = null;
+    const ancestors = computeAncestors(rootPath, activeFile);
+    if (ancestors.length === 0) return; // file directly at root — no ancestors
+    setExpansion(prev => {
+      let changed = false;
+      const next = new Set(prev.paths);
+      for (const a of ancestors) {
+        if (!next.has(a)) {
+          next.add(a);
+          changed = true;
+        }
+      }
+      return changed ? { ...prev, paths: next } : prev;
+    });
+  }, [activeFile, rootPath]);
+
+  // Scroll-into-view: try to bring the active row on-screen. Re-runs whenever
+  // childItems changes because a freshly-loaded directory may finally include
+  // the active row in the DOM. The lastRevealedRef guard makes this a one-shot
+  // per activeFile, so subsequent unrelated childItems updates don't re-scroll
+  // (and out-of-root activeFiles are short-circuited by the reveal effect
+  // above setting lastRevealedRef directly).
+  useEffect(() => {
+    if (!activeFile) return;
+    if (lastRevealedRef.current === activeFile) return;
+    const root = treeRootRef.current;
+    if (!root) return;
+    // CSS.escape handles paths with quotes, backslashes, or any other char
+    // that would break a raw attribute-selector string. Wrap in try/catch as
+    // a belt-and-suspenders guard against any environment without CSS.escape.
+    let el: HTMLElement | null = null;
+    try {
+      const selector = `[data-path="${CSS.escape(activeFile)}"]`;
+      el = root.querySelector<HTMLElement>(selector);
+    } catch {
+      return;
+    }
+    if (!el) return;
+    el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    lastRevealedRef.current = activeFile;
+  }, [activeFile, childItems]);
 
   // Load root directory contents
   useEffect(() => {
@@ -400,7 +470,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
 
   return (
     <TreeCollectionsCtx.Provider value={treeCollections}>
-      <div className="ft-root">
+      <div className="ft-root" ref={treeRootRef}>
         <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
         {visibleItems.map(item => {
           const isExpanded = expandedPaths.has(item.path);

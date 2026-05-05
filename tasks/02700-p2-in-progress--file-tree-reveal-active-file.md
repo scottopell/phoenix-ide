@@ -2,7 +2,7 @@
 created: 2026-05-05
 priority: p2
 status: in-progress
-artifact: pending
+artifact: ui/src/components/FileExplorer/FileTree.tsx
 ---
 
 # file-tree-reveal-active-file
@@ -78,4 +78,23 @@ Mock `Element.prototype.scrollIntoView` (jsdom doesn't implement it) and assert 
 - New test passes; `./dev.py check` is clean.
 
 ## Progress
+
+- Implemented `computeAncestors(rootPath, activeFile)` in a new
+  `computeAncestors.ts` (kept out of `FileTree.tsx` so the component file
+  stays a pure-component module for fast-refresh).
+- Added a reveal-on-active-file effect in `FileTree` keyed on
+  `[activeFile, rootPath]` that merges ancestor directories into
+  `expansion.paths`. The pre-existing "expanded but not yet loaded" effect
+  picks them up and fetches children.
+- Added a separate scroll-into-view effect keyed on `[activeFile, childItems]`
+  with a `lastRevealedRef` one-shot guard — re-runs as new directories
+  finish loading until the active row appears, then stops.
+- Tagged each `FileTreeItem` row with `data-path={item.path}` so the scroll
+  effect can locate the row via a scoped `querySelector`.
+- Added `FileTree.test.tsx` covering `computeAncestors` (4 unit cases) and
+  the integration scenario: deeply-nested file initially collapsed → set
+  `activeFile` → ancestors expand, sibling becomes reachable, active row
+  highlighted, `scrollIntoView` invoked on the right element.
+
+`./dev.py check` clean (12/12).
 
