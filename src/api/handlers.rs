@@ -3589,7 +3589,7 @@ mod hard_delete_cascade_tests {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cd-a", "cd-b", "cd-c"]).await;
 
-        crate::api::chains::delete_chain_handler(
+        let _ = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
             axum::extract::Path("cd-a".to_string()),
         )
