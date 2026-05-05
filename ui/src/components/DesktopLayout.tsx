@@ -11,6 +11,7 @@ import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
+import { conversationListsEqual } from '../utils/conversationDiff';
 
 interface DesktopLayoutProps {
   children: React.ReactNode;
@@ -46,23 +47,36 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
-  // Load conversations for sidebar
+  // Load conversations for sidebar.
+  //
+  // Idempotency: setConversations is skipped when the new server response
+  // matches the current state by `(id, updated_at)` per row. The sidebar
+  // uses `updated_at DESC` ordering and the server bumps it on every
+  // mutation that should affect display (state transitions, message inserts,
+  // archive, rename). When nothing has changed, the array reference stays
+  // stable and downstream renders / chain grouping memos don't churn.
   const loadConversations = useCallback(async (silent = false) => {
     if (loadingRef.current && silent) return;
     loadingRef.current = true;
     try {
       const cached = await cacheDB.getAllConversations();
       if (cached.length > 0) {
-        setConversations(cached.filter(c => !c.archived));
-        setArchivedConversations(cached.filter(c => c.archived));
+        const cachedActive = cached.filter(c => !c.archived);
+        const cachedArchived = cached.filter(c => c.archived);
+        setConversations(prev => conversationListsEqual(prev, cachedActive) ? prev : cachedActive);
+        setArchivedConversations(prev =>
+          conversationListsEqual(prev, cachedArchived) ? prev : cachedArchived,
+        );
       }
       if (navigator.onLine) {
         const [freshActive, freshArchived] = await Promise.all([
           api.listConversations(),
           api.listArchivedConversations(),
         ]);
-        setConversations(freshActive);
-        setArchivedConversations(freshArchived);
+        setConversations(prev => conversationListsEqual(prev, freshActive) ? prev : freshActive);
+        setArchivedConversations(prev =>
+          conversationListsEqual(prev, freshArchived) ? prev : freshArchived,
+        );
         if (!silent) {
           await cacheDB.syncConversations([...freshActive, ...freshArchived]);
         }
@@ -86,10 +100,15 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => clearInterval(interval);
   }, [isDesktop, loadConversations]);
 
-  // Refresh after navigating
-  useEffect(() => {
-    if (isDesktop) loadConversations(true);
-  }, [location.pathname, isDesktop, loadConversations]);
+  // Note: a previous version refreshed the sidebar on every navigation.
+  // That has been removed — every change-driven case is now covered
+  // explicitly:
+  //   * Conversation create / archive / unarchive / delete / rename →
+  //     `onConversationCreated` callback (see Sidebar handlers).
+  //   * Hard-delete cascade → `phoenix:conversation-hard-deleted` window event
+  //     (effect below).
+  //   * Otherwise → the 5s poll, which is now idempotent so it's free when
+  //     nothing has changed.
 
   // REQ-BED-032: when the per-conversation SSE stream surfaces a
   // hard-delete cascade event, refresh the sidebar immediately rather
@@ -134,7 +153,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // See task 08664: previously the early-return on !isDesktop produced a
   // different React tree, unmounting ConversationPage and resetting its state.
   return (
-    <FileExplorerProvider>
+    <FileExplorerProvider scopeKey={activeSlug ?? undefined}>
       <div className={isDesktop ? 'desktop-layout' : undefined}>
         {isDesktop && (
           <Sidebar

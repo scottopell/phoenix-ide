@@ -37,8 +37,26 @@ const DiffViewerStateContext = createContext<DiffViewerStateValue | null>(null);
  * closes the other so the user always sees a single viewer beside the
  * chat.
  */
-export function DiffViewerStateProvider({ children }: { children: ReactNode }) {
+interface DiffViewerStateProviderProps {
+  children: ReactNode;
+  /**
+   * Scope identifier (typically the active conversation slug). When this
+   * changes, any open diff payload is dropped so the viewer never shows a
+   * diff from the previous scope. Synchronous reset via the "adjust state
+   * during render" pattern — the first render after a scope change already
+   * has the cleared state.
+   */
+  scopeKey?: string | undefined;
+}
+
+export function DiffViewerStateProvider({ children, scopeKey }: DiffViewerStateProviderProps) {
   const [payload, setPayload] = useState<DiffViewerPayload | null>(null);
+  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
+
+  if (trackedScope !== scopeKey) {
+    setTrackedScope(scopeKey);
+    if (payload !== null) setPayload(null);
+  }
 
   const open = useCallback((p: DiffViewerPayload) => setPayload(p), []);
   const close = useCallback(() => setPayload(null), []);

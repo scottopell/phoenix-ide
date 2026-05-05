@@ -20,7 +20,7 @@ import {
   fireEvent,
   waitFor,
 } from '@testing-library/react';
-import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom';
 import { ChainPage } from './ChainPage';
 import type {
   ChainView,
@@ -547,6 +547,92 @@ describe('ChainPage — snapshot staleness (REQ-CHN-005)', () => {
     });
     expect(screen.queryByText(/answered when/)).not.toBeInTheDocument();
     expect(screen.queryByText(/answered with/)).not.toBeInTheDocument();
+  });
+});
+
+describe('ChainPage — per-rootConvId state reset (task 02703)', () => {
+  // The page is no longer remounted by `key={rootConvId}`. Instead, the
+  // synchronous reset block at the top of ChainPage clears chain-scoped state
+  // when the rootConvId param changes. This test verifies the user can never
+  // see chain A's content under chain B's selection.
+  function ChainNavApp() {
+    return (
+      <MemoryRouter initialEntries={[`/chains/root-A`]}>
+        <Routes>
+          <Route
+            path="/chains/:rootConvId"
+            element={
+              <>
+                <ChainPage />
+                <NavLinks />
+              </>
+            }
+          />
+          <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
+          <Route path="/" element={<div data-testid="home">home</div>} />
+        </Routes>
+      </MemoryRouter>
+    );
+  }
+
+  function NavLinks() {
+    const nav = useNavigate();
+    return (
+      <>
+        <button data-testid="go-A" onClick={() => nav('/chains/root-A')}>A</button>
+        <button data-testid="go-B" onClick={() => nav('/chains/root-B')}>B</button>
+      </>
+    );
+  }
+
+  it('clears the draft and in-flight pile when rootConvId changes', async () => {
+    const { api } = await import('../api');
+    const chainA = makeChain({
+      root_conv_id: 'root-A',
+      chain_name: 'chain A',
+      display_name: 'chain A',
+      members: [makeMember('A1', 'root'), makeMember('A2', 'latest')],
+      current_member_count: 2,
+    });
+    const chainB = makeChain({
+      root_conv_id: 'root-B',
+      chain_name: 'chain B',
+      display_name: 'chain B',
+      members: [makeMember('B1', 'root'), makeMember('B2', 'latest')],
+      current_member_count: 2,
+    });
+    const getChain = api.getChain as ReturnType<typeof vi.fn>;
+    // First load: chain A. Second load (after nav to B): chain B.
+    getChain.mockImplementation((rootId: string) => {
+      if (rootId === 'root-A') return Promise.resolve(chainA);
+      if (rootId === 'root-B') return Promise.resolve(chainB);
+      return Promise.reject(new Error('unknown chain'));
+    });
+
+    render(<ChainNavApp />);
+
+    // Wait for chain A to load and type a draft.
+    await waitFor(() => {
+      expect(screen.getByText('Title A1')).toBeInTheDocument();
+    });
+    const textareaA = screen.getByRole('textbox', { name: 'Question' });
+    fireEvent.change(textareaA, { target: { value: 'draft for chain A' } });
+    expect((textareaA as HTMLTextAreaElement).value).toBe('draft for chain A');
+
+    // Navigate to chain B. The synchronous reset block must clear the draft
+    // and the in-flight pile so we never see chain A's draft under chain B.
+    fireEvent.click(screen.getByTestId('go-B'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Title B1')).toBeInTheDocument();
+    });
+    // Active textarea is empty after the chain swap.
+    const textareaB = screen.getByRole('textbox', { name: 'Question' });
+    expect((textareaB as HTMLTextAreaElement).value).toBe('');
+    // Chain A's members are no longer in the DOM — confirms the swap actually
+    // happened and we're not just looking at stale residue.
+    expect(screen.queryByText('Title A1')).not.toBeInTheDocument();
+    expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
   });
 });
 

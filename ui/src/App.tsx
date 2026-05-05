@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
-import { BrowserRouter, Routes, Route, useParams } from 'react-router-dom';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -36,21 +36,14 @@ function RouteFallback() {
   return <div style={{ minHeight: '100vh' }} />;
 }
 
-// Force a fresh ConversationPage instance per slug so per-conversation
-// component state (queued messages, refs, image attachments) cannot bleed
-// across navigations between two `/c/:slug` routes.
-function KeyedConversationPage() {
-  const { slug } = useParams<{ slug: string }>();
-  return <ConversationPage key={slug} />;
-}
-
-// Same idea for the chain page: a fresh component instance per root id so
-// the in-flight Q&A buffer, EventSource, and inline-edit state never bleed
-// across navigations between two chains.
-function KeyedChainPage() {
-  const { rootConvId } = useParams<{ rootConvId: string }>();
-  return <ChainPage key={rootConvId} />;
-}
+// NOTE: ConversationPage and ChainPage previously sat behind keyed wrapper
+// components (`<ConversationPage key={slug}>` / `<ChainPage key={rootConvId}>`)
+// to force a fresh React tree per slug. That hammer caused the entire content
+// area to flash blank on every conversation→conversation navigation
+// (task 02703). Per-conversation state that the key= was protecting is now
+// reset explicitly inside each page on slug / rootConvId change (see the
+// "reset per-scope state" pattern in ConversationPage / ChainPage and the
+// `scopeKey` prop on the per-conversation context providers).
 
 type AuthState =
   | { status: 'checking' }
@@ -80,8 +73,8 @@ function AppRoutes() {
               <Routes>
                 <Route path="/" element={<ConversationListPage />} />
                 <Route path="/new" element={<NewConversationPage />} />
-                <Route path="/c/:slug" element={<KeyedConversationPage />} />
-                <Route path="/chains/:rootConvId" element={<KeyedChainPage />} />
+                <Route path="/c/:slug" element={<ConversationPage />} />
+                <Route path="/chains/:rootConvId" element={<ChainPage />} />
               </Routes>
             </DesktopLayout>
           } />

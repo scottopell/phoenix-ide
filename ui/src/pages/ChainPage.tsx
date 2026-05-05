@@ -79,6 +79,31 @@ export function ChainPage() {
   const [submitting, setSubmitting] = useState(false);
   const [sseLost, setSseLost] = useState(false);
 
+  // ---------------------------------------------------------------------------
+  // Per-rootConvId state reset (task 02703).
+  //
+  // Previously KeyedChainPage used `key={rootConvId}` to force a fresh React
+  // tree on every chain change, which caused the entire content area to
+  // flash blank on every navigation. We instead keep the page mounted and
+  // reset chain-scoped state explicitly here. Synchronous reset ("adjust
+  // state during render":
+  // https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes)
+  // so the first render after rootConvId changes shows clean state — never
+  // content from the previous chain.
+  const [lastRootConvId, setLastRootConvId] = useState<string | undefined>(rootConvId);
+  if (lastRootConvId !== rootConvId) {
+    setLastRootConvId(rootConvId);
+    setChain(null);
+    setLoadError(null);
+    setLoading(true);
+    setInflight({});
+    setInflightOrder([]);
+    setDraft('');
+    setSubmitting(false);
+    setSseLost(false);
+    setDeleteConfirmOpen(false);
+  }
+
   // Imperative handle to the active pair's textarea so we can refocus it
   // immediately after submit (the user agreed they should be able to type the
   // next question without waiting for the answer).
