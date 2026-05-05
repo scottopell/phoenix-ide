@@ -851,6 +851,22 @@ impl Database {
         Ok(row)
     }
 
+    /// Return `Some(root_id)` if `conv_id` is a member of a chain (≥2
+    /// members), else `None`. Used by per-conversation lifecycle handlers
+    /// to refuse archive/delete on chain members and route the caller to
+    /// the chain endpoint via `conflict_slug`.
+    pub async fn chain_root_if_member(&self, conv_id: &str) -> DbResult<Option<String>> {
+        let Some(root) = self.chain_root_of(conv_id).await? else {
+            return Ok(None);
+        };
+        let len = self.chain_members_forward(&root).await?.len();
+        if len >= 2 {
+            Ok(Some(root))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Set or clear the `chain_name` on a conversation (REQ-CHN-007).
     ///
     /// Phase 2 owns the column write; the API layer (Phase 4) is responsible
@@ -1038,6 +1054,51 @@ impl Database {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Archive every member of the chain rooted at `root_id` atomically.
+    ///
+    /// Walks `continued_in_conv_id` forward via a recursive CTE and sets
+    /// `archived = 1` on every member in a single transaction. Caller must
+    /// have already validated that `root_id` is a chain root (chain length
+    /// ≥ 2); a single-member root is just a regular conversation and should
+    /// take the per-conversation path.
+    pub async fn archive_chain(&self, root_id: &str) -> DbResult<u64> {
+        self.set_chain_archived(root_id, true).await
+    }
+
+    /// Unarchive every member of the chain rooted at `root_id` atomically.
+    pub async fn unarchive_chain(&self, root_id: &str) -> DbResult<u64> {
+        self.set_chain_archived(root_id, false).await
+    }
+
+    async fn set_chain_archived(&self, root_id: &str, archived: bool) -> DbResult<u64> {
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE conversations
+             SET archived = ?1, updated_at = ?2
+             WHERE id IN (
+                 WITH RECURSIVE chain(id, next_id) AS (
+                     SELECT id, continued_in_conv_id FROM conversations WHERE id = ?3
+                     UNION ALL
+                     SELECT c.id, c.continued_in_conv_id
+                     FROM conversations c
+                     JOIN chain ON c.id = chain.next_id
+                 )
+                 SELECT id FROM chain
+             )",
+        )
+        .bind(archived)
+        .bind(&now)
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(root_id.to_string()));
+        }
+        Ok(result.rows_affected())
     }
 
     /// Delete a conversation and all its messages
@@ -2735,6 +2796,51 @@ mod tests {
 
         let root = db.chain_root_of("ghost").await.unwrap();
         assert_eq!(root, None);
+    }
+
+    /// `archive_chain` flips `archived = 1` on every member of the chain
+    /// in a single transaction. A non-chain id (single-member root) still
+    /// updates the row but is not exercised here — chain validation is
+    /// the API layer's responsibility.
+    #[tokio::test]
+    async fn test_archive_chain_flips_all_members() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["arc-a", "arc-b", "arc-c"]).await;
+
+        let n = db.archive_chain("arc-a").await.unwrap();
+        assert_eq!(n, 3);
+        for id in ["arc-a", "arc-b", "arc-c"] {
+            let conv = db.get_conversation(id).await.unwrap();
+            assert!(conv.archived, "{id} should be archived");
+        }
+
+        let n = db.unarchive_chain("arc-a").await.unwrap();
+        assert_eq!(n, 3);
+        for id in ["arc-a", "arc-b", "arc-c"] {
+            let conv = db.get_conversation(id).await.unwrap();
+            assert!(!conv.archived, "{id} should be unarchived");
+        }
+    }
+
+    /// `chain_root_if_member` returns Some(root) for any chain member
+    /// (root, mid, leaf) and None for solo conversations.
+    #[tokio::test]
+    async fn test_chain_root_if_member() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["m-a", "m-b", "m-c"]).await;
+        db.create_conversation("solo-x", "slug-solo-x", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        for id in ["m-a", "m-b", "m-c"] {
+            assert_eq!(
+                db.chain_root_if_member(id).await.unwrap(),
+                Some("m-a".to_string()),
+                "{id} should report root m-a",
+            );
+        }
+        assert_eq!(db.chain_root_if_member("solo-x").await.unwrap(), None);
+        assert_eq!(db.chain_root_if_member("nonexistent").await.unwrap(), None);
     }
 
     // ------------------------------------------------------------------

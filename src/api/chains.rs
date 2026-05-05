@@ -32,7 +32,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::AppError;
+use super::handlers::{run_hard_delete_cascade, AppError};
+use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
@@ -196,6 +197,74 @@ pub async fn set_chain_name(
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
+}
+
+/// `POST /api/chains/:rootId/archive` — archive every member of the chain
+/// atomically. Single-member roots are not chains; the per-conversation
+/// `/archive` endpoint owns those.
+pub async fn archive_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    validate_chain_root(&state, &root_id).await?;
+    state.db.archive_chain(&root_id).await.map_err(db_to_app)?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// `POST /api/chains/:rootId/unarchive`
+pub async fn unarchive_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    validate_chain_root(&state, &root_id).await?;
+    state
+        .db
+        .unarchive_chain(&root_id)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
+///
+/// Pre-checks every member's busy state up front and refuses the whole
+/// operation if any member is busy (atomic refuse — no partial wipe).
+/// Iterates root-first so the existing FK on `continued_in_conv_id`
+/// (`NO ACTION`) does not reject the row delete: the root has no
+/// incoming reference, and removing it frees its successor to be
+/// deleted next. Reuses [`run_hard_delete_cascade`] per-member so
+/// bash / tmux / worktree cleanup runs identically to the per-
+/// conversation path.
+pub async fn delete_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    validate_chain_root(&state, &root_id).await?;
+
+    let member_ids = state
+        .db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(db_to_app)?;
+
+    for id in &member_ids {
+        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
+        if conv.state.is_busy() {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot delete chain: member {id} is busy. Cancel the in-flight \
+                     operation first, then retry.",
+                ),
+                "cancel_first",
+            ))));
+        }
+    }
+
+    for id in &member_ids {
+        run_hard_delete_cascade(&state, id).await?;
+    }
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 /// `GET /api/chains/:rootId/stream`
