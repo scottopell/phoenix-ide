@@ -205,9 +205,17 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
+      const resolvedBaseBranch = (mode === 'managed' || mode === 'branch')
+        ? (baseBranch ?? currentBranch ?? defaultBranch)
+        : null;
+      if ((mode === 'managed' || mode === 'branch') && !resolvedBaseBranch) {
+        setError('Pick a base branch for Managed/Branch mode.');
+        setCreating(false);
+        return;
+      }
       const conv = await api.createConversation(
         trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode,
-        (mode === 'managed' || mode === 'branch') ? baseBranch : null,
+        resolvedBaseBranch,
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());

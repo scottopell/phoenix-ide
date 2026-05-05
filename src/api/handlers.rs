@@ -620,35 +620,34 @@ async fn create_conversation(
             ));
         }
 
-        // REQ-PROJ-028: If a base_branch is specified, create the worktree immediately
-        // so the agent explores the selected branch's code, not the main checkout.
-        if let Some(ref base_branch) = req.base_branch {
-            let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
-                AppError::BadRequest("Could not determine git repository root".to_string())
-            })?;
-            let conv_id = id.clone();
-            let branch = base_branch.clone();
-            let repo = repo_root.clone();
+        // REQ-PROJ-028: Managed mode allocates an Explore worktree on the chosen
+        // branch up-front so the agent's view tracks the selected branch (not the
+        // main checkout) from message zero. base_branch is required — silently
+        // falling back to the repo root creates a divergence between the LLM's
+        // worktree (correct after task approval) and the terminal pane (frozen
+        // at the original spawn cwd) that surfaces as a footgun later.
+        let base_branch = req.base_branch.as_deref().ok_or_else(|| {
+            AppError::BadRequest(
+                "Managed mode requires base_branch (the branch to allocate the \
+                 Explore worktree against)"
+                    .to_string(),
+            )
+        })?;
 
-            let result = tokio::task::spawn_blocking(move || {
-                create_managed_explore_worktree_blocking(&repo, &conv_id, &branch)
-            })
-            .await
-            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+        let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
+            AppError::BadRequest("Could not determine git repository root".to_string())
+        })?;
+        let conv_id = id.clone();
+        let branch = base_branch.to_string();
 
-            match result {
-                Ok(worktree_path) => (crate::db::ConvMode::Explore, worktree_path),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to create early worktree for Managed mode, falling back to repo root"
-                    );
-                    (crate::db::ConvMode::Explore, req.cwd.clone())
-                }
-            }
-        } else {
-            (crate::db::ConvMode::Explore, req.cwd.clone())
-        }
+        let worktree_path = tokio::task::spawn_blocking(move || {
+            create_managed_explore_worktree_blocking(&repo_root, &conv_id, &branch)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+        .map_err(AppError::Internal)?;
+
+        (crate::db::ConvMode::Explore, worktree_path)
     } else {
         (crate::db::ConvMode::Direct, req.cwd.clone())
     };
