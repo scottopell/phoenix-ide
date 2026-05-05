@@ -389,6 +389,8 @@ async fn reconcile_worktrees(db: &Database) {
         };
 
         if let Some(ref root) = project_root {
+            // Allowed recovery mutation: worktree is gone, so reset cwd to
+            // project root so the conversation loads into a valid directory.
             if let Err(e) = db.update_conversation_cwd(&conv.id, root).await {
                 tracing::error!(conv_id = %conv.id, error = %e, "Failed to reset cwd");
             }

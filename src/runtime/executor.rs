@@ -1999,11 +1999,15 @@ where
     ) -> Result<(), String> {
         let conv_id = &self.context.conversation_id;
 
-        // Atomically update state and cwd. Mode is preserved (Branch stays Branch,
-        // Work stays Work) — the conversation is terminal, mode is frozen.
+        // Update state. Mode is preserved (Branch stays Branch, Work stays Work).
         self.storage
             .update_state(conv_id, &ConvState::Terminal)
             .await?;
+        // Load-bearing cwd reset: the worktree is gone by this point, but API
+        // handlers (search_files, list_skills, list_tasks, get_system_prompt)
+        // read conv.cwd for terminal conversations without a state guard.
+        // Resetting to repo_root gives them a valid directory rather than a
+        // deleted worktree path.
         self.storage
             .update_conversation_cwd(conv_id, &repo_root)
             .await?;
@@ -2112,17 +2116,17 @@ where
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)
                     .await?;
 
-                // Update conversation CWD to the worktree path
+                // For Managed conversations (REQ-PROJ-028): the early Explore
+                // worktree is promoted in place (branch rename, same path), so
+                // this write is a no-op — worktree_path == conv.cwd already.
+                // For legacy Managed conversations whose cwd was the repo root,
+                // this is load-bearing: it moves cwd to the new worktree path.
                 storage
                     .update_conversation_cwd(
                         &self.context.conversation_id,
                         &approval_result.worktree_path,
                     )
                     .await?;
-
-                // Replace working_dir to point at the worktree directory.
-                // Field-level mutation (not full replacement) so we don't lose
-                // is_sub_agent, context_exhaustion_behavior, or future fields.
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
 
                 // Upgrade tool registry from Explore to Work mode so the agent
@@ -2741,7 +2745,19 @@ fn execute_approve_task_blocking(
     );
 
     // 5. Create .phoenix/worktrees/ directory for the worktree.
-    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
+    //
+    // When called from a Managed Explore conversation, `cwd` IS already the
+    // early worktree ({repo_root}/.phoenix/worktrees/{conv_id}).  Computing
+    // phoenix_dir relative to `cwd` would produce a doubly-nested path and
+    // cause `early_worktree_exists` to always be false.  Walk up to the repo
+    // root first (same logic as `cleanup_worktree_if_present`).
+    let repo_root_for_wt = cwd
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
+        .and_then(|p| p.parent())
+        .map_or_else(|| cwd.to_path_buf(), std::path::Path::to_path_buf);
+
+    let phoenix_dir = repo_root_for_wt.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
         .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
 
