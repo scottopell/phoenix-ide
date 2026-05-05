@@ -1,9 +1,10 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getDisplayState } from '../api';
-import type { Conversation, Project } from '../api';
+import type { ChainView, Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
+import { ChainDeleteConfirm } from './ChainDeleteConfirm';
 import { RenameDialog } from './RenameDialog';
 import { ThemeToggle } from './ThemeToggle';
 import { useTheme } from '../hooks';
@@ -44,6 +45,7 @@ export function Sidebar({
   const { theme, toggleTheme } = useTheme();
   const [showArchived, setShowArchived] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
+  const [deleteChainTarget, setDeleteChainTarget] = useState<ChainView | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [projects, setProjects] = useState<Project[]>([]);
@@ -101,6 +103,44 @@ export function Sidebar({
       console.error('Failed to delete:', err);
     }
   }, [deleteTarget, onConversationCreated]);
+
+  const handleArchiveChain = useCallback(async (rootId: string) => {
+    try {
+      await api.archiveChain(rootId);
+      onConversationCreated();
+    } catch (err) {
+      console.error('Failed to archive chain:', err);
+    }
+  }, [onConversationCreated]);
+
+  const handleUnarchiveChain = useCallback(async (rootId: string) => {
+    try {
+      await api.unarchiveChain(rootId);
+      onConversationCreated();
+    } catch (err) {
+      console.error('Failed to unarchive chain:', err);
+    }
+  }, [onConversationCreated]);
+
+  const requestDeleteChain = useCallback(async (rootId: string) => {
+    try {
+      const view = await api.getChain(rootId);
+      setDeleteChainTarget(view);
+    } catch (err) {
+      console.error('Failed to load chain for delete:', err);
+    }
+  }, []);
+
+  const handleDeleteChain = useCallback(async () => {
+    if (!deleteChainTarget) return;
+    try {
+      await api.deleteChain(deleteChainTarget.root_conv_id);
+      setDeleteChainTarget(null);
+      onConversationCreated();
+    } catch (err) {
+      console.error('Failed to delete chain:', err);
+    }
+  }, [deleteChainTarget, onConversationCreated]);
 
   const handleRename = useCallback(async (newName: string) => {
     if (!renameTarget) return;
@@ -214,6 +254,9 @@ export function Sidebar({
           onUnarchive={handleUnarchive}
           onDelete={handleSetDeleteTarget}
           onRename={handleSetRenameTarget}
+          onArchiveChain={handleArchiveChain}
+          onUnarchiveChain={handleUnarchiveChain}
+          onDeleteChain={requestDeleteChain}
           onConversationClick={handleConversationClick}
           activeSlug={activeSlug}
           sidebarMode
@@ -227,6 +270,12 @@ export function Sidebar({
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ChainDeleteConfirm
+        visible={deleteChainTarget !== null}
+        chain={deleteChainTarget}
+        onConfirm={handleDeleteChain}
+        onCancel={() => setDeleteChainTarget(null)}
       />
       <RenameDialog
         visible={renameTarget !== null}

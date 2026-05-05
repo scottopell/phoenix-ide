@@ -3,7 +3,10 @@
 //! REQ-API-001 through REQ-API-010
 
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
-use super::chains::{get_chain, set_chain_name, stream_chain, submit_chain_question};
+use super::chains::{
+    archive_chain_handler, delete_chain_handler, get_chain, set_chain_name, stream_chain,
+    submit_chain_question, unarchive_chain_handler,
+};
 use super::git_handlers::{get_conversation_diff, list_git_branches};
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
@@ -127,6 +130,15 @@ pub fn create_router(state: AppState) -> Router {
             axum::routing::patch(set_chain_name),
         )
         .route("/api/chains/:rootId/stream", get(stream_chain))
+        .route("/api/chains/:rootId/archive", post(archive_chain_handler))
+        .route(
+            "/api/chains/:rootId/unarchive",
+            post(unarchive_chain_handler),
+        )
+        .route(
+            "/api/chains/:rootId",
+            axum::routing::delete(delete_chain_handler),
+        )
         // Directory browser (REQ-API-008)
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
@@ -1743,10 +1755,43 @@ async fn respond_to_question(
 // Lifecycle (REQ-API-006)
 // ============================================================
 
+/// Refuse per-conversation lifecycle ops (archive / unarchive / delete) on
+/// chain members. A chain is an atomic unit; mutating one member would
+/// either fragment the chain (delete) or produce a half-state where the
+/// sidebar shows part of the chain hidden (archive). The caller is
+/// directed to `/api/chains/:rootId/{op}` via `conflict_slug` carrying
+/// the root's slug.
+async fn refuse_if_chain_member(state: &AppState, id: &str, op: &str) -> Result<(), AppError> {
+    let db = state.runtime.db();
+    let Some(root_id) = db
+        .chain_root_if_member(id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let root = db
+        .get_conversation(&root_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut response = ConflictErrorResponse::new(
+        format!(
+            "Cannot {op} a single chain member. Use the chain endpoint to {op} the whole chain.",
+        ),
+        "chain_member",
+    );
+    if let Some(slug) = root.slug {
+        response = response.with_conflict_slug(slug);
+    }
+    Err(AppError::Conflict(Box::new(response)))
+}
+
 async fn archive_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    refuse_if_chain_member(&state, &id, "archive").await?;
+
     state
         .runtime
         .db()
@@ -1761,6 +1806,8 @@ async fn unarchive_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    refuse_if_chain_member(&state, &id, "unarchive").await?;
+
     state
         .runtime
         .db()
@@ -1804,6 +1851,7 @@ async fn delete_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    refuse_if_chain_member(&state, &id, "delete").await?;
     run_hard_delete_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -3509,5 +3557,120 @@ mod hard_delete_cascade_tests {
             );
             assert!(state.db.get_conversation(id).await.is_err());
         }
+    }
+
+    /// Build a 2-member chain via raw SQL — same trick as the chains.rs
+    /// test helper. The cascade tests only need the linkage; they don't
+    /// exercise the continue_conversation gating on context_exhausted.
+    async fn build_chain_for_test(state: &AppState, ids: &[&str]) {
+        for id in ids {
+            state
+                .db
+                .create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
+                .await
+                .expect("create");
+        }
+        for pair in ids.windows(2) {
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(pair[1])
+                .bind(pair[0])
+                .execute(state.db.pool())
+                .await
+                .expect("link");
+        }
+    }
+
+    /// Per-conversation `delete` must refuse a chain member with a 409
+    /// pointing at the chain root. Solo conversations remain deletable.
+    #[tokio::test]
+    async fn delete_refuses_chain_member_with_409() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["chn-a", "chn-b"]).await;
+
+        // Refused for the root of a chain.
+        let err = run_hard_delete_for_router("chn-a", &state)
+            .await
+            .expect_err("must refuse chain root");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "chain_member");
+                assert_eq!(detail.conflict_slug.as_deref(), Some("slug-chn-a"));
+            }
+            other => panic!("expected 409, got {other:?}"),
+        }
+
+        // Refused for a non-root member, with the same root slug.
+        let err = run_hard_delete_for_router("chn-b", &state)
+            .await
+            .expect_err("must refuse mid/leaf chain member");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "chain_member");
+                assert_eq!(detail.conflict_slug.as_deref(), Some("slug-chn-a"));
+            }
+            other => panic!("expected 409, got {other:?}"),
+        }
+
+        // Both rows still present.
+        assert!(state.db.get_conversation("chn-a").await.is_ok());
+        assert!(state.db.get_conversation("chn-b").await.is_ok());
+    }
+
+    /// Mirror of the per-conversation `delete_conversation` axum handler
+    /// body so the test exercises the chain-member guard + cascade pair
+    /// without hitting the router.
+    async fn run_hard_delete_for_router(id: &str, state: &AppState) -> Result<(), AppError> {
+        refuse_if_chain_member(state, id, "delete").await?;
+        run_hard_delete_cascade(state, id).await
+    }
+
+    /// `delete_chain_handler` walks the chain leaf-first and removes
+    /// every member, leaving no rows behind.
+    #[tokio::test]
+    async fn chain_delete_handler_removes_every_member() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["cd-a", "cd-b", "cd-c"]).await;
+
+        let _ = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("cd-a".to_string()),
+        )
+        .await
+        .expect("chain delete");
+
+        for id in ["cd-a", "cd-b", "cd-c"] {
+            assert!(
+                state.db.get_conversation(id).await.is_err(),
+                "{id} must be gone after chain delete"
+            );
+        }
+    }
+
+    /// If any member of a chain is busy, `delete_chain_handler` refuses
+    /// the whole operation up-front — no rows removed.
+    #[tokio::test]
+    async fn chain_delete_refuses_if_any_member_busy() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["cb-a", "cb-b"]).await;
+        state
+            .db
+            .update_conversation_state("cb-b", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("set busy");
+
+        let err = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("cb-a".to_string()),
+        )
+        .await
+        .expect_err("must refuse while busy");
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "cancel_first"),
+            other => panic!("expected 409, got {other:?}"),
+        }
+
+        // Both rows still present.
+        assert!(state.db.get_conversation("cb-a").await.is_ok());
+        assert!(state.db.get_conversation("cb-b").await.is_ok());
     }
 }

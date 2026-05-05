@@ -2,12 +2,13 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels } from '../modelsPoller';
-import type { Conversation } from '../api';
+import type { ChainView, Conversation } from '../api';
 import { useModels, useAutoAuth } from '../hooks';
 import { cacheDB } from '../cache';
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
 
@@ -20,6 +21,7 @@ const AlertTriangle = () => (
 );
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
+import { computeChainRoots } from '../utils/chains';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
@@ -43,6 +45,11 @@ export function ConversationListPage() {
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
+  // Chain delete confirmation state. We fetch the full ChainView when a
+  // user invokes "Delete chain" so the confirm dialog can show member count
+  // + worktree count without forcing every list query to carry the chain
+  // detail.
+  const [deleteChainTarget, setDeleteChainTarget] = useState<ChainView | null>(null);
 
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
@@ -227,6 +234,102 @@ export function ConversationListPage() {
     }
   };
 
+  /** Whether `conv` is part of the chain rooted at `rootId`, given the
+   *  population of conversations to consider. Walks chain pointers via the
+   *  shared `computeChainRoots` helper so the rule matches the sidebar's
+   *  grouping. */
+  const isMemberOfChain = (
+    conv: Conversation,
+    rootId: string,
+    all: Conversation[],
+  ): boolean => {
+    const roots = computeChainRoots(all);
+    return roots.get(conv.id) === rootId;
+  };
+
+  const handleArchiveChain = async (rootId: string) => {
+    try {
+      if (isOnline) {
+        await api.archiveChain(rootId);
+        await loadConversations();
+      } else {
+        await queueOperation({
+          type: 'archive_chain',
+          conversationId: rootId,
+          payload: {},
+          createdAt: new Date(),
+          retryCount: 0,
+          status: 'pending',
+        });
+        // Optimistically move every chain member to the archived list.
+        setConversations(prev => {
+          const moving = prev.filter(c => isMemberOfChain(c, rootId, prev));
+          if (moving.length === 0) return prev;
+          setArchivedConversations(arch => [
+            ...arch,
+            ...moving.map(c => ({ ...c, archived: true })),
+          ]);
+          return prev.filter(c => !moving.includes(c));
+        });
+      }
+    } catch (err) {
+      console.error('Failed to archive chain:', err);
+      showError(err instanceof Error ? err.message : 'Failed to archive chain', 5000);
+    }
+  };
+
+  const handleUnarchiveChain = async (rootId: string) => {
+    try {
+      if (isOnline) {
+        await api.unarchiveChain(rootId);
+        await loadConversations();
+      } else {
+        await queueOperation({
+          type: 'unarchive_chain',
+          conversationId: rootId,
+          payload: {},
+          createdAt: new Date(),
+          retryCount: 0,
+          status: 'pending',
+        });
+        setArchivedConversations(prev => {
+          const moving = prev.filter(c => isMemberOfChain(c, rootId, prev));
+          if (moving.length === 0) return prev;
+          setConversations(active => [
+            ...active,
+            ...moving.map(c => ({ ...c, archived: false })),
+          ]);
+          return prev.filter(c => !moving.includes(c));
+        });
+      }
+    } catch (err) {
+      console.error('Failed to unarchive chain:', err);
+      showError(err instanceof Error ? err.message : 'Failed to unarchive chain', 5000);
+    }
+  };
+
+  const requestDeleteChain = async (rootId: string) => {
+    try {
+      const view = await api.getChain(rootId);
+      setDeleteChainTarget(view);
+    } catch (err) {
+      console.error('Failed to load chain for delete:', err);
+      showError(err instanceof Error ? err.message : 'Failed to load chain', 5000);
+    }
+  };
+
+  const handleDeleteChain = async () => {
+    if (!deleteChainTarget) return;
+    try {
+      await api.deleteChain(deleteChainTarget.root_conv_id);
+      setDeleteChainTarget(null);
+      await loadConversations();
+    } catch (err) {
+      console.error('Failed to delete chain:', err);
+      showError(err instanceof Error ? err.message : 'Failed to delete chain', 5000);
+    }
+  };
+
   const handleRename = async (newName: string) => {
     if (!renameTarget) return;
     try {
@@ -356,6 +459,9 @@ export function ConversationListPage() {
                 setRenameError(undefined);
                 setRenameTarget(conv);
               }}
+              onArchiveChain={handleArchiveChain}
+              onUnarchiveChain={handleUnarchiveChain}
+              onDeleteChain={requestDeleteChain}
               onConversationClick={handleConversationClick}
               authChip={authChip}
             />
@@ -371,6 +477,12 @@ export function ConversationListPage() {
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ChainDeleteConfirm
+        visible={deleteChainTarget !== null}
+        chain={deleteChainTarget}
+        onConfirm={handleDeleteChain}
+        onCancel={() => setDeleteChainTarget(null)}
       />
       <RenameDialog
         visible={renameTarget !== null}

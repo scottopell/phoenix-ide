@@ -38,6 +38,7 @@ import {
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
+import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 
 // Markdown plugin set, hoisted so the array identity is stable across
 // renders (matches the pattern in StreamingMessage.tsx).
@@ -68,6 +69,7 @@ export function ChainPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [inflight, setInflight] = useState<Record<string, InflightQa>>({});
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   // Submission order for in-flight entries. We display newest-first, so we
   // walk this list in reverse on render. (Object key order on `inflight`
   // alone is not a reliable ordering source — Record iteration order is not
@@ -325,6 +327,26 @@ export function ChainPage() {
             );
           }
         }}
+        onArchiveToggle={async () => {
+          if (!rootConvId) return;
+          try {
+            if (chain.archived) {
+              await api.unarchiveChain(rootConvId);
+            } else {
+              await api.archiveChain(rootConvId);
+            }
+            navigate('/');
+          } catch (err) {
+            setLoadError(
+              err instanceof Error
+                ? err.message
+                : chain.archived
+                  ? 'Failed to unarchive chain'
+                  : 'Failed to archive chain',
+            );
+          }
+        }}
+        onDelete={() => setDeleteConfirmOpen(true)}
       />
       <div className="chain-page-body">
         <ChainMembersColumn
@@ -355,6 +377,24 @@ export function ChainPage() {
           }}
         />
       </div>
+      <ChainDeleteConfirm
+        visible={deleteConfirmOpen}
+        chain={chain}
+        onConfirm={async () => {
+          if (!rootConvId) return;
+          try {
+            await api.deleteChain(rootConvId);
+            setDeleteConfirmOpen(false);
+            navigate('/');
+          } catch (err) {
+            setLoadError(
+              err instanceof Error ? err.message : 'Failed to delete chain',
+            );
+            setDeleteConfirmOpen(false);
+          }
+        }}
+        onCancel={() => setDeleteConfirmOpen(false)}
+      />
     </div>
   );
 }
@@ -366,9 +406,13 @@ export function ChainPage() {
 interface ChainPageHeaderProps {
   chain: ChainView;
   onRename: (name: string | null) => Promise<void>;
+  /** Toggles the chain's archived state — Archive when chain.archived is
+   *  false, Unarchive when true. The parent picks which API call to fire. */
+  onArchiveToggle: () => void | Promise<void>;
+  onDelete: () => void;
 }
 
-function ChainPageHeader({ chain, onRename }: ChainPageHeaderProps) {
+function ChainPageHeader({ chain, onRename, onArchiveToggle, onDelete }: ChainPageHeaderProps) {
   const [editing, setEditing] = useState(false);
   // The text input is pre-populated with the actual override (`chain_name`),
   // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
@@ -447,6 +491,22 @@ function ChainPageHeader({ chain, onRename }: ChainPageHeaderProps) {
         {' · '}
         {chain.current_total_messages} messages
       </span>
+      <div className="chain-page-actions">
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => void onArchiveToggle()}
+        >
+          {chain.archived ? 'Unarchive' : 'Archive'}
+        </button>
+        <button
+          type="button"
+          className="btn-danger"
+          onClick={onDelete}
+        >
+          Delete
+        </button>
+      </div>
     </header>
   );
 }

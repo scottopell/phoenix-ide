@@ -3271,6 +3271,29 @@ html * {
   margin-bottom: 20px;
 }
 
+.chain-delete-confirm {
+  max-width: 480px;
+}
+
+.chain-delete-confirm .confirm-message p {
+  margin: 0 0 8px 0;
+}
+
+.chain-delete-bullets {
+  margin: 0 0 12px 18px;
+  padding: 0;
+  list-style: disc;
+}
+
+.chain-delete-bullets li {
+  margin: 4px 0;
+}
+
+.chain-delete-final {
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
 .modal-actions {
   display: flex;
   gap: 12px;
@@ -5823,6 +5846,47 @@ html * {
   letter-spacing: 0.3px;
 }
 
+.conv-chain-menu-container {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.conv-chain-menu-btn {
+  background: transparent;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  color: var(--text-muted);
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+
+.conv-chain-menu-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.conv-chain-actions {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 10;
+  min-width: 180px;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  padding: 6px;
+}
+
+.conv-chain-actions .action-btn {
+  flex: none;
+  text-align: left;
+}
+
 .conv-chain-members {
   list-style: none;
   margin: 0;
@@ -8164,6 +8228,19 @@ html * {
 .chain-page-meta {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.chain-page-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.chain-page-actions .btn-secondary,
+.chain-page-actions .btn-danger {
+  padding: 6px 14px;
+  font-size: 13px;
 }
 
 /* Two-column body — members on the left, Q&A on the right. */

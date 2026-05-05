@@ -10,6 +10,7 @@ import { createConversationSource } from './sources/ConversationSource';
 import { createFileSource } from './sources/FileSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
+import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
 
 const SEARCH_DEBOUNCE_MS = 120;
@@ -96,7 +97,16 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
         archiveCurrent: currentSlug
           ? () => {
               const conv = conversations.find(c => c.slug === currentSlug);
-              if (conv) {
+              if (!conv) return;
+              // Chain members must archive at the chain level — per-conv
+              // archive returns 409 chain_member. Walk to the chain root and
+              // call the chain endpoint instead. Standalone conversations
+              // keep the per-conv path.
+              const roots = computeChainRoots(conversations);
+              const rootId = roots.get(conv.id);
+              if (rootId) {
+                api.archiveChain(rootId).then(() => navigate('/'));
+              } else {
                 api.archiveConversation(conv.id).then(() => navigate('/'));
               }
             }

@@ -3,5 +3,10 @@ import type { ChainPosition } from "./ChainPosition";
 
 /**
  * Per-member summary on the chain page (REQ-CHN-003).
+ *
+ * `has_worktree` is true when the member is in `Work` or `Branch` mode
+ * (i.e. owns a git worktree directory on disk). The chain delete confirm
+ * uses this to render an accurate worktree count without loading every
+ * conversation client-side.
  */
-export type ChainMemberSummary = { conv_id: string, slug: string | null, title: string | null, message_count: number, updated_at: string, position: ChainPosition, };
+export type ChainMemberSummary = { conv_id: string, slug: string | null, title: string | null, message_count: number, updated_at: string, position: ChainPosition, has_worktree: boolean, };

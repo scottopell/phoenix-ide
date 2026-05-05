@@ -306,3 +306,175 @@ function PathReader({ onPath }: { onPath: (p: string) => void }) {
   onPath(loc.pathname);
   return null;
 }
+
+// Chain-atomic lifecycle (task 02701): the chain block header carries a `⋮`
+// menu with chain-scope actions. Member rows hide their own
+// Archive/Unarchive/Delete entries — only Rename remains, since lifecycle
+// ops on a chain member return 409 server-side.
+describe('Chain lifecycle UI (task 02701)', () => {
+  const chainConvs = (overrides: { archived?: boolean } = {}) => {
+    const archivedBase = overrides.archived !== undefined
+      ? { archived: overrides.archived }
+      : {};
+    const root = makeConv('cr', 'root-slug', {
+      updated_at: '2024-01-01T00:00:00Z',
+      continued_in_conv_id: 'cl',
+      chain_name: 'auth refactor',
+      ...archivedBase,
+    });
+    const leaf = makeConv('cl', 'leaf-slug', {
+      updated_at: '2024-02-01T00:00:00Z',
+      ...archivedBase,
+    });
+    return [leaf, root];
+  };
+
+  it('chain header ⋮ menu shows Rename / Archive / Delete in the active list', () => {
+    const onArchiveChain = vi.fn();
+    const onDeleteChain = vi.fn();
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={chainConvs()}
+          onArchiveChain={onArchiveChain}
+          onDeleteChain={onDeleteChain}
+        />
+      </MemoryRouter>,
+    );
+
+    const menuBtn = container.querySelector(
+      '.conv-chain-menu-btn',
+    ) as HTMLButtonElement;
+    expect(menuBtn).not.toBeNull();
+    fireEvent.click(menuBtn);
+
+    const actions = container.querySelector('.conv-chain-actions');
+    expect(actions).not.toBeNull();
+    const labels = Array.from(
+      actions!.querySelectorAll<HTMLButtonElement>('.action-btn'),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toEqual([
+      'Rename chain…',
+      'Archive chain',
+      'Delete chain',
+    ]);
+  });
+
+  it('chain header ⋮ menu shows Unarchive in the archived list', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          archivedConversations={chainConvs({ archived: true })}
+          showArchived
+        />
+      </MemoryRouter>,
+    );
+
+    const menuBtn = container.querySelector(
+      '.conv-chain-menu-btn',
+    ) as HTMLButtonElement;
+    fireEvent.click(menuBtn);
+
+    const labels = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        '.conv-chain-actions .action-btn',
+      ),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toEqual([
+      'Rename chain…',
+      'Unarchive chain',
+      'Delete chain',
+    ]);
+  });
+
+  it('Archive chain action invokes onArchiveChain with the rootId', () => {
+    const onArchiveChain = vi.fn();
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={chainConvs()}
+          onArchiveChain={onArchiveChain}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(container.querySelector('.conv-chain-menu-btn')!);
+    const archiveBtn = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        '.conv-chain-actions .action-btn',
+      ),
+    ).find((b) => b.textContent?.trim() === 'Archive chain');
+    fireEvent.click(archiveBtn!);
+
+    expect(onArchiveChain).toHaveBeenCalledTimes(1);
+    expect(onArchiveChain).toHaveBeenCalledWith('cr');
+  });
+
+  it('chain member row dropdown shows only Rename', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={chainConvs()}
+        />
+      </MemoryRouter>,
+    );
+
+    const memberRow = container.querySelector(
+      '.conv-item-chain-member',
+    ) as HTMLElement;
+    expect(memberRow).not.toBeNull();
+    const rowMenuBtn = memberRow.querySelector(
+      '.conv-item-menu-btn',
+    ) as HTMLButtonElement;
+    fireEvent.click(rowMenuBtn);
+
+    const labels = Array.from(
+      memberRow.querySelectorAll<HTMLButtonElement>(
+        '.conv-item-actions .action-btn',
+      ),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toEqual(['Rename']);
+  });
+
+  it('standalone row dropdown still shows Rename / Archive / Delete', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[makeConv('s', 'standalone-slug')]}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(container.querySelector('.conv-item-menu-btn')!);
+    const labels = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        '.conv-item-actions .action-btn',
+      ),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toEqual(['Rename', 'Archive', 'Delete']);
+  });
+
+  it('archived list groups chains the same as the active list', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          archivedConversations={chainConvs({ archived: true })}
+          showArchived
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.conv-chain-block')).not.toBeNull();
+    expect(
+      container.querySelector('.conv-chain-name-label')!.textContent,
+    ).toBe('auth refactor');
+  });
+});

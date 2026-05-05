@@ -23,6 +23,14 @@ interface ConversationListProps {
   onUnarchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
+  /** Chain-scope archive/unarchive/delete. Triggered from the chain block
+   *  header `⋮` menu. Per-member rows never invoke these — they hide the
+   *  affordance entirely so the only path to a chain lifecycle op is the
+   *  chain header. The rename callback is per-member rename and reuses
+   *  `onRename` (slugs stay per-conversation). */
+  onArchiveChain?: (rootId: string) => void;
+  onUnarchiveChain?: (rootId: string) => void;
+  onDeleteChain?: (rootId: string) => void;
   onConversationClick?: (conv: Conversation) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
@@ -39,6 +47,9 @@ export function ConversationList({
   onUnarchive,
   onDelete,
   onRename,
+  onArchiveChain,
+  onUnarchiveChain,
+  onDeleteChain,
   onConversationClick,
   activeSlug,
   sidebarMode,
@@ -46,11 +57,17 @@ export function ConversationList({
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // Chain-block menu open state. Tracked separately from `expandedId` so a
+  // member row's dropdown and a chain header dropdown can never both be open
+  // at once but also can't share a key with a conversation row of the same
+  // id.
+  const [expandedChainId, setExpandedChainId] = useState<string | null>(null);
   // Per-chain collapse state. NOT persisted across navigations
   // (specs/chains/design.md "Sidebar Grouping"). A chain absent from the
   // map is considered expanded (the default).
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
+  const chainMenuRef = useRef<HTMLDivElement>(null);
 
   // Close context menu on click-outside
   useEffect(() => {
@@ -64,30 +81,39 @@ export function ConversationList({
     return () => document.removeEventListener('mousedown', handleMouseDown);
   }, [expandedId]);
 
+  useEffect(() => {
+    if (!expandedChainId) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if (chainMenuRef.current && !chainMenuRef.current.contains(e.target as Node)) {
+        setExpandedChainId(null);
+      }
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    return () => document.removeEventListener('mousedown', handleMouseDown);
+  }, [expandedChainId]);
+
   const displayList = showArchived ? archivedConversations : conversations;
 
-  // Chain grouping applies to the active list in both sidebar and full-page
-  // mode. Archived list stays flat — REQ-CHN-002 scopes chain navigation to
-  // active conversations (the server already filters `archived = 0`).
-  const groupedItems: SidebarItem[] | null = useMemo(() => {
-    if (showArchived) return null;
+  // Chain grouping applies to both active and archived lists. Archive is a
+  // chain-level op now (chains/lifecycle), so the same chain block renders
+  // in either view.
+  const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
     return groupConversationsForSidebar(displayList, roots);
-  }, [showArchived, displayList]);
+  }, [displayList]);
 
   // Keyboard navigation traverses the flat list of conversations as
   // displayed. For chain blocks the order is members-in-chain-order
   // interleaved with standalones at the chain block's recency rank, so a
   // user pressing j/k walks through the same items they see.
   const keyboardItems = useMemo(() => {
-    if (!groupedItems) return displayList;
     const out: Conversation[] = [];
     for (const item of groupedItems) {
       if (item.kind === 'single') out.push(item.conversation);
       else out.push(...item.members);
     }
     return out;
-  }, [groupedItems, displayList]);
+  }, [groupedItems]);
 
   const { selectedId } = useKeyboardNav({
     items: keyboardItems,
@@ -104,7 +130,14 @@ export function ConversationList({
 
   const toggleActions = (e: React.MouseEvent, convId: string) => {
     e.stopPropagation();
+    setExpandedChainId(null);
     setExpandedId(expandedId === convId ? null : convId);
+  };
+
+  const toggleChainActions = (e: React.MouseEvent, rootId: string) => {
+    e.stopPropagation();
+    setExpandedId(null);
+    setExpandedChainId(expandedChainId === rootId ? null : rootId);
   };
 
   const toggleChainCollapsed = (rootId: string) => {
@@ -223,39 +256,43 @@ export function ConversationList({
               >
                 Rename
               </button>
-              {showArchived ? (
+              {!isChainMember && (
+                showArchived ? (
+                  <button
+                    className="action-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedId(null);
+                      onUnarchive(conv);
+                    }}
+                  >
+                    Restore
+                  </button>
+                ) : (
+                  <button
+                    className="action-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedId(null);
+                      onArchive(conv);
+                    }}
+                  >
+                    Archive
+                  </button>
+                )
+              )}
+              {!isChainMember && (
                 <button
-                  className="action-btn"
+                  className="action-btn danger"
                   onClick={(e) => {
                     e.stopPropagation();
                     setExpandedId(null);
-                    onUnarchive(conv);
+                    onDelete(conv);
                   }}
                 >
-                  Restore
-                </button>
-              ) : (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setExpandedId(null);
-                    onArchive(conv);
-                  }}
-                >
-                  Archive
+                  Delete
                 </button>
               )}
-              <button
-                className="action-btn danger"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setExpandedId(null);
-                  onDelete(conv);
-                }}
-              >
-                Delete
-              </button>
             </div>
           )}
         </div>
@@ -308,6 +345,71 @@ export function ConversationList({
             <span className="conv-chain-name-label">{item.displayName}</span>
             <span className="conv-chain-count">{item.members.length}</span>
           </button>
+          <div
+            ref={expandedChainId === item.rootId ? chainMenuRef : undefined}
+            className="conv-chain-menu-container"
+          >
+            <button
+              className="conv-chain-menu-btn"
+              onClick={(e) => toggleChainActions(e, item.rootId)}
+              title="Chain actions"
+              aria-label="Chain actions"
+            >
+              ⋮
+            </button>
+            {expandedChainId === item.rootId && (
+              <div className="conv-item-actions conv-chain-actions">
+                <button
+                  className="action-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setExpandedChainId(null);
+                    // Per-conversation rename on the root: chain "rename" =
+                    // setting the chain_name override on the root via
+                    // /api/chains/:rootId/name. Chains are renamed from the
+                    // ChainPage header today; surfacing it here would mean
+                    // duplicating that input. Open the chain page instead.
+                    navigate(`/chains/${item.rootId}`);
+                  }}
+                >
+                  Rename chain…
+                </button>
+                {showArchived ? (
+                  <button
+                    className="action-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedChainId(null);
+                      onUnarchiveChain?.(item.rootId);
+                    }}
+                  >
+                    Unarchive chain
+                  </button>
+                ) : (
+                  <button
+                    className="action-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedChainId(null);
+                      onArchiveChain?.(item.rootId);
+                    }}
+                  >
+                    Archive chain
+                  </button>
+                )}
+                <button
+                  className="action-btn danger"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setExpandedChainId(null);
+                    onDeleteChain?.(item.rootId);
+                  }}
+                >
+                  Delete chain
+                </button>
+              </div>
+            )}
+          </div>
         </div>
         {!collapsed && (
           <ul className="conv-chain-members">
@@ -332,7 +434,7 @@ export function ConversationList({
         <div className="view-header">
           <h2>Conversations</h2>
           <div className="view-header-actions">
-            {archivedConversations.length > 0 && (
+            {(archivedConversations.length > 0 || showArchived) && (
               <button
                 className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
                 onClick={onToggleArchived}
@@ -347,7 +449,7 @@ export function ConversationList({
           </div>
         </div>
       )}
-      {sidebarMode && archivedConversations.length > 0 && (
+      {sidebarMode && (archivedConversations.length > 0 || showArchived) && (
         <div className="sidebar-archive-toggle">
           <button
             className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
@@ -363,12 +465,10 @@ export function ConversationList({
           <li className="empty-state">
             <p>{showArchived ? 'No archived conversations' : 'No conversations yet'}</p>
           </li>
-        ) : groupedItems ? (
+        ) : (
           groupedItems.map(item =>
             item.kind === 'single' ? renderConvRow(item.conversation) : renderChainBlock(item),
           )
-        ) : (
-          displayList.map(conv => renderConvRow(conv))
         )}
       </ul>
     </section>

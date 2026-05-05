@@ -32,7 +32,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::AppError;
+use super::handlers::{run_hard_delete_cascade, AppError};
+use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
@@ -63,6 +64,11 @@ pub struct ChainView {
     pub root_conv_id: String,
     pub chain_name: Option<String>,
     pub display_name: String,
+    /// `true` when the chain is archived. Chain archive is a write-cascade
+    /// across all members, so any member's `archived` flag is authoritative;
+    /// we read it off the root for clarity. Lets the UI render Unarchive
+    /// instead of Archive on archived chain pages.
+    pub archived: bool,
     pub members: Vec<ChainMemberSummary>,
     pub qa_history: Vec<ChainQaRow>,
     pub current_member_count: i64,
@@ -70,6 +76,11 @@ pub struct ChainView {
 }
 
 /// Per-member summary on the chain page (REQ-CHN-003).
+///
+/// `has_worktree` is true when the member is in `Work` or `Branch` mode
+/// (i.e. owns a git worktree directory on disk). The chain delete confirm
+/// uses this to render an accurate worktree count without loading every
+/// conversation client-side.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
 pub struct ChainMemberSummary {
@@ -79,6 +90,7 @@ pub struct ChainMemberSummary {
     pub message_count: i64,
     pub updated_at: DateTime<Utc>,
     pub position: ChainPosition,
+    pub has_worktree: bool,
 }
 
 /// Where a member sits in its chain (REQ-CHN-003 / REQ-CHN-009-style emphasis).
@@ -196,6 +208,80 @@ pub async fn set_chain_name(
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
+}
+
+/// `POST /api/chains/:rootId/archive` — archive every member of the chain
+/// atomically. Single-member roots are not chains; the per-conversation
+/// `/archive` endpoint owns those.
+pub async fn archive_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    validate_chain_root(&state, &root_id).await?;
+    state.db.archive_chain(&root_id).await.map_err(db_to_app)?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// `POST /api/chains/:rootId/unarchive`
+pub async fn unarchive_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    validate_chain_root(&state, &root_id).await?;
+    state
+        .db
+        .unarchive_chain(&root_id)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
+///
+/// Pre-checks every member's busy state up front and refuses the whole
+/// operation if any member is busy (atomic refuse — no partial wipe).
+/// Iterates root-first so the existing FK on `continued_in_conv_id`
+/// (`NO ACTION`) does not reject the row delete: the root has no
+/// incoming reference, and removing it frees its successor to be
+/// deleted next. Reuses [`run_hard_delete_cascade`] per-member so
+/// bash / tmux / worktree cleanup runs identically to the per-
+/// conversation path.
+pub async fn delete_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    validate_chain_root(&state, &root_id).await?;
+
+    let member_ids = state
+        .db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(db_to_app)?;
+
+    for id in &member_ids {
+        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
+        if conv.state.is_busy() {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot delete chain: member {id} is busy. Cancel the in-flight \
+                     operation first, then retry.",
+                ),
+                "cancel_first",
+            ))));
+        }
+    }
+
+    // TOCTOU note: the busy precheck is best-effort. A member can transition
+    // to busy after this loop and before/during its individual cascade, in
+    // which case `run_hard_delete_cascade` returns a 409 mid-iteration with
+    // earlier members already deleted. Same shape as per-conversation delete
+    // (which has no precheck at all). A locking mitigation belongs in a
+    // future task — not in this PR.
+    for id in &member_ids {
+        run_hard_delete_cascade(&state, id).await?;
+    }
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 /// `GET /api/chains/:rootId/stream`
@@ -324,6 +410,7 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         root_conv_id: root_conv.id.clone(),
         chain_name: root_conv.chain_name.clone(),
         display_name,
+        archived: root_conv.archived,
         members: summaries,
         qa_history,
         current_member_count,
@@ -367,6 +454,7 @@ fn build_member_summaries(members: &[Conversation]) -> Vec<ChainMemberSummary> {
                 message_count: conv.message_count,
                 updated_at: conv.updated_at,
                 position,
+                has_worktree: conv.conv_mode.worktree_path().is_some(),
             }
         })
         .collect()
@@ -417,7 +505,7 @@ fn map_chain_qa_error(e: ChainQaError) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, MessageContent};
+    use crate::db::{ConvMode, Database, MessageContent, NonEmptyString};
 
     /// Mirror of the `chain_qa` test helper — builds a linear chain and
     /// links `continued_in_conv_id` between successive members.
@@ -493,6 +581,7 @@ mod tests {
             root_conv_id: root_conv.id.clone(),
             chain_name: root_conv.chain_name.clone(),
             display_name,
+            archived: root_conv.archived,
             members: summaries,
             qa_history,
             current_member_count,
@@ -660,6 +749,58 @@ mod tests {
             .expect("build_view_for_test should succeed for valid chain");
         assert_eq!(view.qa_history.len(), 1);
         assert_eq!(view.qa_history[0].question, "what happened?");
+    }
+
+    #[tokio::test]
+    async fn has_worktree_reflects_member_mode() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["hw-a", "hw-b", "hw-c", "hw-d"]).await;
+        add_continuation_summary(&db, "hw-a", "summary").await;
+        add_continuation_summary(&db, "hw-b", "summary").await;
+        add_continuation_summary(&db, "hw-c", "summary").await;
+
+        // hw-a: Explore (default — no worktree)
+        // hw-b: Direct (no worktree)
+        // hw-c: Work (worktree)
+        // hw-d: Branch (worktree)
+        db.update_conversation_mode("hw-b", &ConvMode::Direct)
+            .await
+            .unwrap();
+        db.update_conversation_mode(
+            "hw-c",
+            &ConvMode::Work {
+                branch_name: NonEmptyString::new("task-x").unwrap(),
+                worktree_path: NonEmptyString::new("/tmp/wt/c").unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("TKX").unwrap(),
+                task_title: NonEmptyString::new("test").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_mode(
+            "hw-d",
+            &ConvMode::Branch {
+                branch_name: NonEmptyString::new("feature-x").unwrap(),
+                worktree_path: NonEmptyString::new("/tmp/wt/d").unwrap(),
+                base_branch: NonEmptyString::new("feature-x").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let view = build_view_for_test(&db, &chain_qa, "hw-a").await.unwrap();
+
+        let by_id: std::collections::HashMap<&str, &ChainMemberSummary> = view
+            .members
+            .iter()
+            .map(|m| (m.conv_id.as_str(), m))
+            .collect();
+        assert!(!by_id["hw-a"].has_worktree, "Explore has no worktree");
+        assert!(!by_id["hw-b"].has_worktree, "Direct has no worktree");
+        assert!(by_id["hw-c"].has_worktree, "Work has a worktree");
+        assert!(by_id["hw-d"].has_worktree, "Branch has a worktree");
     }
 
     // ----- name editing semantics ----------------------------------------
