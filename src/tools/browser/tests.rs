@@ -71,6 +71,7 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         Arc::new(crate::llm::ModelRegistry::new_empty()),
         crate::terminal::ActiveTerminals::new(),
         Arc::new(crate::tools::TmuxRegistry::new()),
+        None,
     );
     (ctx, manager)
 }

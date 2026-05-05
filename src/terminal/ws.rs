@@ -58,8 +58,22 @@ async fn handle_socket(
     db: crate::db::Database,
     runtime: Arc<RuntimeManager>,
 ) {
-    let cwd = match db.get_conversation(&conversation_id).await {
-        Ok(conv) => std::path::PathBuf::from(&conv.cwd),
+    let (cwd, worktree_path) = match db.get_conversation(&conversation_id).await {
+        Ok(conv) => {
+            // worktree_path for socket keying (task 03001): use the typed
+            // worktree field for Work/Branch, cwd for Explore (REQ-PROJ-028
+            // guarantees cwd IS the worktree for Explore), None for Direct.
+            let wt = conv
+                .conv_mode
+                .worktree_path()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    use crate::db::ConvMode;
+                    matches!(conv.conv_mode, ConvMode::Explore)
+                        .then(|| std::path::PathBuf::from(&conv.cwd))
+                });
+            (std::path::PathBuf::from(&conv.cwd), wt)
+        }
         Err(e) => {
             tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
             return;
@@ -85,6 +99,7 @@ async fn handle_socket(
         &conversation_id,
         &terminals,
         &cwd,
+        worktree_path.as_deref(),
         initial_dims,
         &mut ws_sender,
         &runtime,
@@ -240,6 +255,7 @@ async fn acquire_handle(
     conversation_id: &str,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
+    worktree_path: Option<&std::path::Path>,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     runtime: &Arc<RuntimeManager>,
@@ -256,7 +272,7 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, cwd, runtime).await;
+    let plan = resolve_exec_plan(conversation_id, worktree_path, cwd, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -311,8 +327,13 @@ async fn acquire_handle(
 /// server on first call (REQ-TMUX-002), reuses it after Phoenix
 /// restart (REQ-TMUX-005), and recreates over a stale socket
 /// (REQ-TMUX-006).
+///
+/// `worktree_path` controls socket keying: `Some` for Work/Branch/Explore
+/// (socket tied to the worktree so continuations share the session),
+/// `None` for Direct (socket tied to conversation_id). See task 03001.
 async fn resolve_exec_plan(
     conversation_id: &str,
+    worktree_path: Option<&std::path::Path>,
     cwd: &std::path::Path,
     runtime: &Arc<RuntimeManager>,
 ) -> PtyExecPlan {
@@ -320,7 +341,7 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry.ensure_live(conversation_id, cwd).await {
+    match registry.ensure_live(conversation_id, worktree_path, cwd).await {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {

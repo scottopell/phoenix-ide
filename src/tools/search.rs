@@ -414,6 +414,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            None,
         )
     }
 

@@ -22,6 +22,14 @@
 --     and the direct-PTY fallback. Multi-attach is deferred to a future
 --     revision.
 --
+-- Socket-path keying (task 03001):
+--   Work/Branch/Explore conversations key the socket to the worktree path
+--   (wt-{hash(worktree_path)}.sock) so continuations automatically share
+--   the same tmux session — the worktree IS the coding environment.
+--   Direct-mode conversations key the socket to the conversation_id
+--   (conv-{id}.sock) as a fallback (no worktree to anchor to).
+--   Sub-agents are excluded from tmux access entirely (task 03001).
+--
 -- Requirement traceability: REQ-TMUX-001 through REQ-TMUX-013
 -- Dependencies: specs/bedrock/bedrock.allium
 
@@ -58,9 +66,11 @@ external entity TmuxBinary {
 }
 
 -- The Unix-domain socket the tmux server binds. Filesystem path is
--- ~/.phoenix-ide/tmux-sockets/conv-<id>.sock (REQ-TMUX-001). Phoenix's
--- role is creating the directory, unlinking stale files on detection,
--- and deleting the file on conversation hard-delete.
+-- keyed to the worktree path for Work/Branch/Explore conversations
+-- (~/.phoenix-ide/tmux-sockets/wt-{hash}.sock, task 03001) and to
+-- conversation_id for Direct mode (conv-<id>.sock). Phoenix's role is
+-- creating the directory, unlinking stale files on detection, and deleting
+-- the file on conversation hard-delete.
 external entity TmuxSocketFile {
     path: String
 }
@@ -118,6 +128,8 @@ enum ToolResponseStatus {
 -- One TmuxServer per conversation. Created on first observation (any tmux
 -- operation triggers ensure_live which lazily registers the entity).
 -- Conversations with no tmux operation never have an entry.
+-- Sub-agents never have an entry (tmux tool excluded from sub-agent
+-- registries, task 03001).
 entity TmuxServer {
     conversation: bedrock/Conversation
 
@@ -130,8 +142,12 @@ entity TmuxServer {
         terminal: gone
     }
 
-    -- The socket file path, computed from conversation_id at registry-
-    -- entry creation time and stable for the entity's lifetime.
+    -- The socket file path. Keyed to the worktree path for Work/Branch/
+    -- Explore conversations (wt-{hash(worktree_path)}.sock) so that
+    -- context-exhaustion continuations automatically share the same session.
+    -- Keyed to conversation_id for Direct-mode conversations (no worktree).
+    -- Computed once at entry creation and stable for the entity's lifetime.
+    -- (task 03001)
     socket_path: String
 }
 
@@ -406,12 +422,17 @@ rule UserOpensTerminalWithoutTmux {
 ------------------------------------------------------------
 
 -- REQ-TMUX-007: conversation hard-delete cascades to tmux server.
+-- Exception: if the conversation's worktree was transferred to a
+-- continuation (continued_in_conv_id is set), the tmux session is still
+-- live for that continuation — skip kill and unlink. The registry entry
+-- is still removed. (task 03001)
 rule ServerKilledByConversationDelete {
     when: ConversationHardDeleted(conversation)
 
     requires: exists TmuxServer{conversation: conversation}
     let server = TmuxServer{conversation: conversation}
     requires: server.status != gone
+    requires: conversation.continued_in_conv_id = null
 
     ensures: TmuxServerKilled(server.socket_path)
     ensures: SocketFileUnlinked(server.socket_path)
@@ -427,6 +448,20 @@ rule ServerKilledByConversationDelete {
         -- a transaction with the conversation row delete; the cascade
         -- orchestrator runs both in the same handler and logs partial
         -- failure.
+}
+
+-- When a conversation's worktree was transferred to a continuation, the
+-- hard-delete only removes the registry entry; the tmux server and socket
+-- file are left intact for the continuation to use. (task 03001)
+rule ServerPreservedForContinuation {
+    when: ConversationHardDeleted(conversation)
+
+    requires: exists TmuxServer{conversation: conversation}
+    let server = TmuxServer{conversation: conversation}
+    requires: conversation.continued_in_conv_id != null
+
+    ensures: not exists TmuxServer{conversation: conversation}
+    -- TmuxServerKilled and SocketFileUnlinked are NOT ensured.
 }
 
 -- REQ-TMUX-008 (soft-state preservation contract): expressed as a
@@ -446,6 +481,8 @@ rule ServerKilledByConversationDelete {
 -- REQ-TMUX-001
 invariant SocketPathDeterministic {
     for s in TmuxServer:
+        -- Work/Branch/Explore: socket_path = wt-{hash(worktree_path)}.sock
+        -- Direct: socket_path = conv-{conversation_id}.sock
         s.socket_path = socket_path_for(s.conversation)
 }
 
@@ -469,6 +506,11 @@ surface AgentTmuxAccess {
     facing agent: LlmAgent
 
     context conversation: bedrock/Conversation
+
+    -- Sub-agents are excluded: TmuxTool is absent from for_subagent_explore()
+    -- and for_subagent_work(). The tmux session belongs to the worktree's
+    -- owning conversation, not its sub-agents. (task 03001)
+    requires: not conversation.is_sub_agent
 
     exposes:
         TmuxServer.status

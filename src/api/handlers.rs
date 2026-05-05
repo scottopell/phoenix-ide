@@ -1909,9 +1909,14 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     }
 
     // Step 3: tmux server.
-    let tmux_report =
-        crate::tools::tmux::registry::cascade_tmux_on_delete(state.runtime.tmux_registry(), id)
-            .await;
+    let tmux_worktree = conv.conv_mode.worktree_path().map(std::path::Path::new);
+    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
+        state.runtime.tmux_registry(),
+        id,
+        tmux_worktree,
+        conv.continued_in_conv_id.as_deref(),
+    )
+    .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
         let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
         tracing::warn!(
