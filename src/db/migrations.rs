@@ -39,6 +39,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_chain_name_and_chain_qa",
         sql: MIGRATION_005,
     },
+    Migration {
+        version: 6,
+        name: "archive_partially_archived_chains",
+        sql: MIGRATION_006,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -142,6 +147,49 @@ CREATE TABLE IF NOT EXISTS chain_qa (
 CREATE INDEX IF NOT EXISTS idx_chain_qa_root ON chain_qa(root_conv_id, created_at);
 ";
 
+/// Coerce legacy partially-archived chains to fully archived.
+///
+/// Before chain-as-unit lifecycle (PR #21), per-member archive on a chain
+/// member was permitted, producing chains with mixed `archived` state — one
+/// member hidden, the rest visible. After PR #21, per-member archive on chain
+/// members returns 409, so a partial chain has no API path back to a coherent
+/// state and the UI would render the leftover unarchived members alongside
+/// the chain block (with per-row Restore that 409s). Migrate by archiving
+/// the entire chain — preserves the user's "I wanted this hidden" intent and
+/// gives them an Unarchive Chain action to bring it back.
+const MIGRATION_006: &str = r"
+WITH RECURSIVE
+chain_members(root_id, member_id) AS (
+    -- Roots: rows whose id is not referenced by any predecessor pointer.
+    SELECT c.id, c.id
+    FROM conversations c
+    WHERE NOT EXISTS (
+        SELECT 1 FROM conversations p WHERE p.continued_in_conv_id = c.id
+    )
+    UNION ALL
+    SELECT cm.root_id, c.continued_in_conv_id
+    FROM chain_members cm
+    JOIN conversations c ON c.id = cm.member_id
+    WHERE c.continued_in_conv_id IS NOT NULL
+),
+mixed_roots AS (
+    SELECT cm.root_id
+    FROM chain_members cm
+    JOIN conversations c ON c.id = cm.member_id
+    GROUP BY cm.root_id
+    HAVING COUNT(*) >= 2
+       AND SUM(CASE WHEN c.archived THEN 1 ELSE 0 END) > 0
+       AND SUM(CASE WHEN c.archived THEN 1 ELSE 0 END) < COUNT(*)
+)
+UPDATE conversations
+SET archived = 1
+WHERE id IN (
+    SELECT cm.member_id
+    FROM chain_members cm
+    WHERE cm.root_id IN (SELECT root_id FROM mixed_roots)
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -224,6 +272,7 @@ mod tests {
                 state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
                 cwd TEXT NOT NULL DEFAULT '/tmp', \
                 user_initiated BOOLEAN NOT NULL DEFAULT 1, \
+                archived BOOLEAN NOT NULL DEFAULT 0, \
                 state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
                 created_at TEXT NOT NULL DEFAULT '2025-01-01', \
                 updated_at TEXT NOT NULL DEFAULT '2025-01-01'\
@@ -240,7 +289,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 5);
+        assert_eq!(first, 6);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -502,5 +551,87 @@ mod tests {
             indexes.iter().any(|n| n == "idx_chain_qa_root"),
             "Expected idx_chain_qa_root index, got: {indexes:?}"
         );
+    }
+
+    /// Migration 006: a chain with mixed `archived` state has every member
+    /// flipped to archived; fully-archived and fully-unarchived chains are
+    /// untouched; standalones are untouched.
+    #[tokio::test]
+    async fn migration_006_archives_partially_archived_chains() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // Chain A: 3 members, only mid is archived → migration archives all 3.
+        // Chain B: 2 members, both archived already → unchanged.
+        // Chain C: 2 members, neither archived → unchanged.
+        // Standalone S: archived in isolation → unchanged.
+        for (id, archived) in [
+            ("a-root", 0),
+            ("a-mid", 1),
+            ("a-leaf", 0),
+            ("b-root", 1),
+            ("b-leaf", 1),
+            ("c-root", 0),
+            ("c-leaf", 0),
+            ("solo-s", 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, \
+                 archived, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, '{\"mode\":\"Explore\"}', '{\"type\":\"idle\"}', \
+                 '/tmp', 1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(archived)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        // Wire chain edges *after* migrations so 003 (the column) is in place.
+        for (parent, child) in [
+            ("a-root", "a-mid"),
+            ("a-mid", "a-leaf"),
+            ("b-root", "b-leaf"),
+            ("c-root", "c-leaf"),
+        ] {
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(child)
+                .bind(parent)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // Re-run the partial-archive cleanup directly so we exercise it on
+        // the now-wired chain (the migration table thinks 006 is done).
+        sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
+
+        let archived_for = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("SELECT archived FROM conversations WHERE id = ?1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .get::<bool, _>("archived")
+            }
+        };
+
+        // Chain A: every member ends archived.
+        assert!(archived_for("a-root").await);
+        assert!(archived_for("a-mid").await);
+        assert!(archived_for("a-leaf").await);
+        // Chain B: untouched (already fully archived).
+        assert!(archived_for("b-root").await);
+        assert!(archived_for("b-leaf").await);
+        // Chain C: untouched (none archived).
+        assert!(!archived_for("c-root").await);
+        assert!(!archived_for("c-leaf").await);
+        // Standalone: untouched.
+        assert!(archived_for("solo-s").await);
     }
 }

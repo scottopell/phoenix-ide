@@ -39,7 +39,19 @@ export class SyncQueue {
           op.payload.name
         );
         break;
-      
+
+      case 'archive_chain':
+        await api.archiveChain(op.conversationId);
+        break;
+
+      case 'unarchive_chain':
+        await api.unarchiveChain(op.conversationId);
+        break;
+
+      case 'delete_chain':
+        await api.deleteChain(op.conversationId);
+        break;
+
       default:
         throw new Error(`Unknown operation type: ${(op as PendingOperation).type}`);
     }

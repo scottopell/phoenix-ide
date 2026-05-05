@@ -64,6 +64,11 @@ pub struct ChainView {
     pub root_conv_id: String,
     pub chain_name: Option<String>,
     pub display_name: String,
+    /// `true` when the chain is archived. Chain archive is a write-cascade
+    /// across all members, so any member's `archived` flag is authoritative;
+    /// we read it off the root for clarity. Lets the UI render Unarchive
+    /// instead of Archive on archived chain pages.
+    pub archived: bool,
     pub members: Vec<ChainMemberSummary>,
     pub qa_history: Vec<ChainQaRow>,
     pub current_member_count: i64,
@@ -266,6 +271,12 @@ pub async fn delete_chain_handler(
         }
     }
 
+    // TOCTOU note: the busy precheck is best-effort. A member can transition
+    // to busy after this loop and before/during its individual cascade, in
+    // which case `run_hard_delete_cascade` returns a 409 mid-iteration with
+    // earlier members already deleted. Same shape as per-conversation delete
+    // (which has no precheck at all). A locking mitigation belongs in a
+    // future task — not in this PR.
     for id in &member_ids {
         run_hard_delete_cascade(&state, id).await?;
     }
@@ -399,6 +410,7 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         root_conv_id: root_conv.id.clone(),
         chain_name: root_conv.chain_name.clone(),
         display_name,
+        archived: root_conv.archived,
         members: summaries,
         qa_history,
         current_member_count,
@@ -569,6 +581,7 @@ mod tests {
             root_conv_id: root_conv.id.clone(),
             chain_name: root_conv.chain_name.clone(),
             display_name,
+            archived: root_conv.archived,
             members: summaries,
             qa_history,
             current_member_count,

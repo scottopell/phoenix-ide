@@ -111,6 +111,7 @@ const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   root_conv_id: ROOT_ID,
   chain_name: 'auth refactor',
   display_name: 'auth refactor',
+  archived: false,
   members: [
     makeMember('m1', 'root'),
     makeMember('m2', 'continuation'),

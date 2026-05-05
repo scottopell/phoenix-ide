@@ -13,4 +13,11 @@ import type { ChainQaRow } from "./ChainQaRow";
  * `current_total_messages` let the UI compute staleness against each
  * stored Q&A's snapshot integers (REQ-CHN-005) without a second roundtrip.
  */
-export type ChainView = { root_conv_id: string, chain_name: string | null, display_name: string, members: Array<ChainMemberSummary>, qa_history: Array<ChainQaRow>, current_member_count: number, current_total_messages: number, };
+export type ChainView = { root_conv_id: string, chain_name: string | null, display_name: string, 
+/**
+ * `true` when the chain is archived. Chain archive is a write-cascade
+ * across all members, so any member's `archived` flag is authoritative;
+ * we read it off the root for clarity. Lets the UI render Unarchive
+ * instead of Archive on archived chain pages.
+ */
+archived: boolean, members: Array<ChainMemberSummary>, qa_history: Array<ChainQaRow>, current_member_count: number, current_total_messages: number, };

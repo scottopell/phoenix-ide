@@ -21,6 +21,7 @@ const AlertTriangle = () => (
 );
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
+import { computeChainRoots } from '../utils/chains';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
@@ -233,10 +234,44 @@ export function ConversationListPage() {
     }
   };
 
+  /** Whether `conv` is part of the chain rooted at `rootId`, given the
+   *  population of conversations to consider. Walks chain pointers via the
+   *  shared `computeChainRoots` helper so the rule matches the sidebar's
+   *  grouping. */
+  const isMemberOfChain = (
+    conv: Conversation,
+    rootId: string,
+    all: Conversation[],
+  ): boolean => {
+    const roots = computeChainRoots(all);
+    return roots.get(conv.id) === rootId;
+  };
+
   const handleArchiveChain = async (rootId: string) => {
     try {
-      await api.archiveChain(rootId);
-      await loadConversations();
+      if (isOnline) {
+        await api.archiveChain(rootId);
+        await loadConversations();
+      } else {
+        await queueOperation({
+          type: 'archive_chain',
+          conversationId: rootId,
+          payload: {},
+          createdAt: new Date(),
+          retryCount: 0,
+          status: 'pending',
+        });
+        // Optimistically move every chain member to the archived list.
+        setConversations(prev => {
+          const moving = prev.filter(c => isMemberOfChain(c, rootId, prev));
+          if (moving.length === 0) return prev;
+          setArchivedConversations(arch => [
+            ...arch,
+            ...moving.map(c => ({ ...c, archived: true })),
+          ]);
+          return prev.filter(c => !moving.includes(c));
+        });
+      }
     } catch (err) {
       console.error('Failed to archive chain:', err);
       showError(err instanceof Error ? err.message : 'Failed to archive chain', 5000);
@@ -245,8 +280,28 @@ export function ConversationListPage() {
 
   const handleUnarchiveChain = async (rootId: string) => {
     try {
-      await api.unarchiveChain(rootId);
-      await loadConversations();
+      if (isOnline) {
+        await api.unarchiveChain(rootId);
+        await loadConversations();
+      } else {
+        await queueOperation({
+          type: 'unarchive_chain',
+          conversationId: rootId,
+          payload: {},
+          createdAt: new Date(),
+          retryCount: 0,
+          status: 'pending',
+        });
+        setArchivedConversations(prev => {
+          const moving = prev.filter(c => isMemberOfChain(c, rootId, prev));
+          if (moving.length === 0) return prev;
+          setConversations(active => [
+            ...active,
+            ...moving.map(c => ({ ...c, archived: false })),
+          ]);
+          return prev.filter(c => !moving.includes(c));
+        });
+      }
     } catch (err) {
       console.error('Failed to unarchive chain:', err);
       showError(err instanceof Error ? err.message : 'Failed to unarchive chain', 5000);

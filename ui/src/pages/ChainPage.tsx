@@ -327,14 +327,22 @@ export function ChainPage() {
             );
           }
         }}
-        onArchive={async () => {
+        onArchiveToggle={async () => {
           if (!rootConvId) return;
           try {
-            await api.archiveChain(rootConvId);
+            if (chain.archived) {
+              await api.unarchiveChain(rootConvId);
+            } else {
+              await api.archiveChain(rootConvId);
+            }
             navigate('/');
           } catch (err) {
             setLoadError(
-              err instanceof Error ? err.message : 'Failed to archive chain',
+              err instanceof Error
+                ? err.message
+                : chain.archived
+                  ? 'Failed to unarchive chain'
+                  : 'Failed to archive chain',
             );
           }
         }}
@@ -398,11 +406,13 @@ export function ChainPage() {
 interface ChainPageHeaderProps {
   chain: ChainView;
   onRename: (name: string | null) => Promise<void>;
-  onArchive: () => void | Promise<void>;
+  /** Toggles the chain's archived state — Archive when chain.archived is
+   *  false, Unarchive when true. The parent picks which API call to fire. */
+  onArchiveToggle: () => void | Promise<void>;
   onDelete: () => void;
 }
 
-function ChainPageHeader({ chain, onRename, onArchive, onDelete }: ChainPageHeaderProps) {
+function ChainPageHeader({ chain, onRename, onArchiveToggle, onDelete }: ChainPageHeaderProps) {
   const [editing, setEditing] = useState(false);
   // The text input is pre-populated with the actual override (`chain_name`),
   // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
@@ -485,9 +495,9 @@ function ChainPageHeader({ chain, onRename, onArchive, onDelete }: ChainPageHead
         <button
           type="button"
           className="btn-secondary"
-          onClick={() => void onArchive()}
+          onClick={() => void onArchiveToggle()}
         >
-          Archive
+          {chain.archived ? 'Unarchive' : 'Archive'}
         </button>
         <button
           type="button"

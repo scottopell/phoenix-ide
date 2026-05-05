@@ -16,7 +16,16 @@ export interface PendingOperationPayload {
 
 export interface PendingOperation {
   id: string;
-  type: 'send_message' | 'archive' | 'unarchive' | 'delete' | 'rename';
+  type:
+    | 'send_message'
+    | 'archive'
+    | 'unarchive'
+    | 'delete'
+    | 'rename'
+    | 'archive_chain'
+    | 'unarchive_chain'
+    | 'delete_chain';
+  /** Per-conv ops use the conversation id; chain ops use the chain root id. */
   conversationId: string;
   payload: PendingOperationPayload;
   createdAt: Date;
