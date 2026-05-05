@@ -416,7 +416,11 @@ where
             return;
         }
 
-        let repo_root = crate::git_ops::repo_root_from_working_dir(&self.context.working_dir);
+        // Direct mode and legacy Managed have working_dir == repo_root, so fall
+        // back to working_dir when the strict Phoenix-worktree predicate fails.
+        let wd = &self.context.working_dir;
+        let repo_root =
+            crate::git_ops::repo_root_from_phoenix_worktree(wd).unwrap_or_else(|| wd.clone());
 
         let worktree_path = repo_root
             .join(".phoenix")
@@ -2062,9 +2066,10 @@ where
         let cwd = self.context.working_dir.clone();
         // The spec invariant WorktreePathDerivedFromConversation requires
         // the worktree path to be rooted at the repo root, not at cwd.
-        // For Managed conversations cwd IS the Explore worktree, so we
-        // derive repo_root explicitly here and pass it separately.
-        let repo_root = crate::git_ops::repo_root_from_working_dir(&cwd);
+        // For Managed conversations cwd IS the Explore worktree; for legacy
+        // pre-REQ-PROJ-028 Managed conversations cwd IS already the repo root.
+        let repo_root =
+            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let conv_id = self.context.conversation_id.clone();
         let desired_base_branch = self.context.desired_base_branch.clone();
         let storage = self.storage.clone();
@@ -2805,8 +2810,12 @@ fn execute_approve_task_blocking(
             .map_err(|e| format!("Failed to write task file in worktree: {e}"))?;
         tracing::info!(file = %wt_filepath.display(), "Task file written in early worktree");
 
-        // Remove the task file from cwd (it was written there for ID scanning)
-        let _ = std::fs::remove_file(&filepath);
+        // No remove_file(&filepath) here: in the early-worktree branch the task
+        // file is only written to wt_filepath, never to filepath. Before the
+        // REQ-PROJ-028 path fix, cwd and worktree_path differed (a nested
+        // worktree was being created) so the remove was a harmless no-op on a
+        // non-existent file. Now cwd == worktree_path, which means filepath ==
+        // wt_filepath, and the remove would delete the file we just wrote.
 
         // Ensure .gitignore contains .phoenix/ in the worktree
         ensure_gitignore_has_phoenix(&worktree_path)?;
@@ -3354,6 +3363,160 @@ mod context_exhausted_preserves_worktree_tests {
             !Path::new(&wt_path).exists(),
             "Non-ContextExhausted terminal exit must still reap stray worktrees \
              (the original 4a94509 intent for Explore-mode leaks)"
+        );
+    }
+}
+
+// ============================================================
+// CWD immutability: task 02702
+// ============================================================
+//
+// Verifies that for Managed conversations the Explore worktree is promoted
+// in place at approval time (branch renamed, same path returned) so
+// conv.cwd never changes across the Explore→Work transition.
+
+#[cfg(test)]
+mod cwd_immutability_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    fn init_repo() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+                "-q",
+            ][..],
+        ] {
+            let s = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {args:?} failed");
+        }
+        (tmp, root)
+    }
+
+    /// Create an Explore worktree at the canonical Phoenix path
+    /// `{repo}/.phoenix/worktrees/{conv_id}` on a temp branch, exactly as
+    /// `create_managed_explore_worktree_blocking` does.
+    fn add_explore_worktree(repo: &Path, conv_id: &str, base_branch: &str) -> PathBuf {
+        let id_prefix: String = conv_id.chars().take(8).collect();
+        let temp_branch = format!("task-pending-{id_prefix}");
+        let wt = repo.join(".phoenix").join("worktrees").join(conv_id);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        let s = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                &temp_branch,
+                wt.to_str().unwrap(),
+                base_branch,
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(s.success(), "git worktree add failed");
+        wt
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        let o = std::process::Command::new("git")
+            .args(["branch", "--list", branch])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+    }
+
+    fn worktree_list(repo: &Path) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string()
+    }
+
+    /// Core task-02702 regression:
+    ///
+    /// For a Managed conversation, `execute_approve_task_blocking` must
+    /// detect the early Explore worktree and promote it in place (branch
+    /// rename only). The returned `worktree_path` must equal the original
+    /// Explore worktree path, so `conv.cwd` is unchanged at approval time.
+    #[test]
+    fn approve_task_returns_same_path_as_explore_worktree() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "test-conv-immutable-cwd";
+        let base_branch = "main";
+
+        // Simulate REQ-PROJ-028: create the early Explore worktree
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let explore_wt_str = explore_wt.to_string_lossy().to_string();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "Fix the login bug",
+            "p2",
+            "1. Investigate\n2. Fix\n3. Test",
+            Some(base_branch),
+        )
+        .expect("approve_task_blocking failed");
+
+        // The path must not change: Explore worktree promoted in place.
+        assert_eq!(
+            result.worktree_path, explore_wt_str,
+            "worktree_path must equal original Explore worktree path; \
+             a different value means a nested worktree was created"
+        );
+
+        // The temp branch must be gone, renamed to the task branch.
+        let id_prefix: String = conv_id.chars().take(8).collect();
+        let temp_branch = format!("task-pending-{id_prefix}");
+        assert!(
+            !branch_exists(&repo_root, &temp_branch),
+            "temp branch {temp_branch} should have been renamed, not left behind"
+        );
+        assert!(
+            branch_exists(&repo_root, &result.branch_name),
+            "task branch {} must exist after approval",
+            result.branch_name
+        );
+
+        // Only two worktree entries: the main checkout and the one Explore/Work
+        // worktree. A nested worktree would show a third entry.
+        let wt_list = worktree_list(&repo_root);
+        let entry_count = wt_list
+            .split("\n\n")
+            .filter(|s| !s.trim().is_empty())
+            .count();
+        assert_eq!(
+            entry_count, 2,
+            "expected exactly 2 worktree entries (main + promoted worktree), got {entry_count}:\n{wt_list}"
+        );
+
+        // No nested .phoenix directory inside the worktree (the pre-fix symptom).
+        assert!(
+            !explore_wt.join(".phoenix").exists(),
+            ".phoenix must not exist inside the worktree; \
+             its presence means a nested worktree was created"
         );
     }
 }

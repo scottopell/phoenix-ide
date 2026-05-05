@@ -413,8 +413,7 @@ pub fn build_system_prompt_with_home(
     }
 
     // Add worktree grounding when working_dir is inside a .phoenix/worktrees/ path
-    let repo_root = crate::git_ops::repo_root_from_working_dir(working_dir);
-    if repo_root != working_dir {
+    if let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(working_dir) {
         let _ = write!(
             prompt,
             "\n\nYou are working in a git worktree. Your working directory is the worktree, \

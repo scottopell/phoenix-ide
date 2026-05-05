@@ -363,8 +363,11 @@ async fn reconcile_worktrees(db: &Database) {
         }
         reverted += 1;
 
-        let root = crate::git_ops::repo_root_from_working_dir(std::path::Path::new(wt_path));
-        let project_root = Some(root.to_string_lossy().to_string());
+        // wt_path is always {root}/.phoenix/worktrees/{id} for a real Phoenix
+        // worktree. If the strict predicate fails the row is malformed; skip it.
+        let project_root =
+            crate::git_ops::repo_root_from_phoenix_worktree(std::path::Path::new(wt_path))
+                .map(|p| p.to_string_lossy().to_string());
 
         if let Some(ref root) = project_root {
             // Allowed recovery mutation: worktree is gone, so reset cwd to
