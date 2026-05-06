@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 import { ConversationStore } from './ConversationStore';
 import { ConversationContext } from './ConversationContext';
-import { useConversationsRefresh } from './useConversationsRefresh';
+import { useConversationsRefreshDriver } from './useConversationsRefresh';
 
 /**
  * Mounts the conversation store and the periodic refresh service that
@@ -28,10 +28,12 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
 
 /**
  * Internal: lives inside the provider so it can read the context the
- * provider just installed. The hook handles the polling + cache + online
- * + hard-delete listeners; this component is just a scope.
+ * provider just installed. The driver hook installs the polling +
+ * online + hard-delete listeners; this component is the single mount
+ * point for those side effects. Other consumers grab `refresh` via
+ * `useConversationsRefresh`, which is now side-effect-free.
  */
 function ConversationsRefreshDriver() {
-  useConversationsRefresh();
+  useConversationsRefreshDriver();
   return null;
 }

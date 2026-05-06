@@ -35,10 +35,14 @@ import type {
 // ---------------------------------------------------------------------------
 
 type ChainEventHandler = (evt: ChainSseEventData) => void;
+type ChainErrorHandler = () => void;
 
 interface SseHandle {
   close: () => void;
   emit: (evt: ChainSseEventData) => void;
+  /** Trigger the EventSource error path — invokes the handleErr that
+   *  ChainPage installed in its SSE subscription. */
+  emitErr: () => void;
 }
 
 let sseHandles: SseHandle[] = [];
@@ -54,10 +58,11 @@ vi.mock('../api', async () => {
       setChainName: vi.fn(),
     },
     subscribeToChainStream: vi.fn(
-      (_rootId: string, onEvent: ChainEventHandler) => {
+      (_rootId: string, onEvent: ChainEventHandler, onErr?: ChainErrorHandler) => {
         const handle: SseHandle = {
           close: vi.fn(),
           emit: (evt) => onEvent(evt),
+          emitErr: () => onErr?.(),
         };
         sseHandles.push(handle);
         return {
@@ -392,6 +397,60 @@ describe('ChainPage — submit + stream', () => {
       expect(document.activeElement).toBe(textarea);
     });
     expect(screen.getByText('first question')).toBeInTheDocument();
+  });
+
+  it('SSE error after a question is submitted dispatches SSE_LOST (live inflight, not stale closure)', async () => {
+    // Codex review on PR #26: handleErr previously closed over the
+    // render-time `atom.inflight`, which was empty when the SSE effect
+    // mounted. A question submitted afterward expanded the live
+    // inflight, but the closure still saw {} — so the connection-lost
+    // affordance never appeared during exactly the in-flight scenario
+    // it was meant to cover. The fix routes through `inflightRef`.
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain());
+    let resolvePost: (v: { chain_qa_id: string }) => void = () => {};
+    (api.submitChainQuestion as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise<{ chain_qa_id: string }>((res) => {
+        resolvePost = res;
+      }),
+    );
+
+    renderAt(ROOT_ID);
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+    expect(sseHandles).toHaveLength(1);
+
+    // No inflight yet — emitErr must NOT raise the SSE_LOST banner.
+    act(() => {
+      sseHandles[0]!.emitErr();
+    });
+    expect(screen.queryByText(/Connection lost/i)).not.toBeInTheDocument();
+
+    // Submit a question — expands inflight via OPTIMISTIC_INFLIGHT_ADD
+    // (synchronous; fires before the POST resolves).
+    const textarea = screen.getByRole('textbox', { name: 'Question' });
+    fireEvent.change(textarea, { target: { value: 'mid-stream q' } });
+    fireEvent.click(screen.getByRole('button', { name: /Ask|Sending/ }));
+    await waitFor(() => {
+      expect(screen.getByText('mid-stream q')).toBeInTheDocument();
+    });
+
+    // Now SSE errors. The handler must read the LIVE inflight and
+    // dispatch SSE_LOST.
+    act(() => {
+      sseHandles[0]!.emitErr();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Connection lost/i)).toBeInTheDocument();
+    });
+
+    // Cleanup: resolve the held POST so the test doesn't leave a
+    // pending promise.
+    await act(async () => {
+      resolvePost({ chain_qa_id: 'qa-real' });
+      await Promise.resolve();
+    });
   });
 });
 

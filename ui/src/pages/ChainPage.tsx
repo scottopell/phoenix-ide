@@ -79,6 +79,15 @@ export function ChainPage() {
   // next question without waiting for the answer).
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // Live mirror of `atom.inflight` for the SSE error handler. The error
+  // handler closes over render-time state, but the user can submit a new
+  // question (which expands `inflight`) AFTER the SSE effect mounted.
+  // Without this ref, `handleErr` would see the stale empty inflight from
+  // mount time and fail to dispatch SSE_LOST in exactly the scenario the
+  // affordance is meant to cover. (Codex review on PR #26.)
+  const inflightRef = useRef(atom.inflight);
+  inflightRef.current = atom.inflight;
+
   /** Refresh the chain snapshot. Used after submit/complete/fail. The atom
    *  routing (08682) makes this safe across navigation: an in-flight
    *  `getChain(rootId)` that resolves after we navigate elsewhere
@@ -165,9 +174,10 @@ export function ChainPage() {
     const handleErr = () => {
       // EventSource will auto-reconnect on its own. We surface a "connection
       // lost" affordance only if there is in-flight work that depends on it.
-      // Reading from the atom on every error is fine — atoms are read via
-      // the routed store and reflect the latest dispatched state.
-      if (Object.keys(atom.inflight).length > 0) {
+      // Read inflight via a ref so the live state is observed — a question
+      // submitted after this effect ran would not appear in the render-time
+      // closure of `atom.inflight`.
+      if (Object.keys(inflightRef.current).length > 0) {
         dispatch({ type: 'SSE_LOST' });
       }
     };
@@ -175,12 +185,6 @@ export function ChainPage() {
     const es = subscribeToChainStream(rootConvId, handleEvent, handleErr);
     dispatch({ type: 'SSE_RESTORED' });
     return () => es.close();
-    // `atom.inflight` intentionally omitted from deps: re-subscribing on
-    // every in-flight change would close and re-open the EventSource
-    // mid-stream. The closure reads `atom.inflight` only inside `handleErr`,
-    // and reading a stale value there is acceptable (the next error will
-    // see the current value via the latest closure).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rootConvId, dispatch, refresh]);
 
   /**
