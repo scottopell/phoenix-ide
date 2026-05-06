@@ -1,8 +1,9 @@
 export { ConversationProvider } from './ConversationProvider';
 export { ConversationStore } from './ConversationStore';
+export { useConversationsRefresh } from './useConversationsRefresh';
 export {
   useConversationAtom,
-  useConversationByActiveSlug,
+  useConversationSnapshot,
   useConversationsList,
   useConversationSelectors,
 } from './useConversationAtom';

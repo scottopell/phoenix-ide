@@ -24,7 +24,6 @@ const AlertTriangle = () => (
 );
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
-import { computeChainRoots } from '../utils/chains';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
@@ -205,18 +204,15 @@ export function ConversationListPage() {
     }
   };
 
-  /** Whether `conv` is part of the chain rooted at `rootId`, given the
-   *  population of conversations to consider. Walks chain pointers via the
-   *  shared `computeChainRoots` helper so the rule matches the sidebar's
-   *  grouping. */
-  const isMemberOfChain = (
-    conv: Conversation,
-    rootId: string,
-    all: readonly Conversation[],
-  ): boolean => {
-    const roots = computeChainRoots(all);
-    return roots.get(conv.id) === rootId;
-  };
+  // (Pre-08684 ConversationListPage held a chain-grouping helper here used
+  // only by the offline-queue optimistic flip in handleArchiveChain /
+  // handleUnarchiveChain. With ConversationStore as the single source of
+  // truth, those handlers no longer mutate a local list — they enqueue
+  // the op and let refresh() reconcile when the queue drains. The helper,
+  // along with the `computeChainRoots` import it depended on, is gone.
+  // If a future change wants eager-flip-on-queue back, dispatch
+  // local_conversation_update against each chain member's atom and
+  // re-import the helper.)
 
   const handleArchiveChain = async (rootId: string) => {
     try {
@@ -233,13 +229,8 @@ export function ConversationListPage() {
           status: 'pending',
         });
         // Offline path: the queued op will fire on reconnect; refresh()
-        // then reconciles. (Pre-08684 the page locally moved every chain
-        // member between the two arrays — with the store-as-source-of-
-        // truth, the same store-level mutation would need to be done as
-        // a series of local_conversation_updates against each member's
-        // atom. Deferred until we have a concrete need; the offline
-        // indicator already signals the queue.)
-        void isMemberOfChain;
+        // then reconciles. The offline indicator already signals the
+        // queue is pending.
       }
     } catch (err) {
       console.error('Failed to archive chain:', err);

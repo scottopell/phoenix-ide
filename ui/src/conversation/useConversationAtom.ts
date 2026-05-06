@@ -74,10 +74,10 @@ export function useConversationSelectors(slug: string) {
  * Replaces the old per-field `useConversationCwd` bridge from task
  * 08612: the store is now the single source of truth for the
  * conversation row, so a per-field selector is no longer needed.
- * Consumers read `useConversationByActiveSlug(slug)?.cwd` and the same
+ * Consumers read `useConversationSnapshot(slug)?.cwd` and the same
  * principle applies to every other field.
  */
-export function useConversationByActiveSlug(slug: string | null): Conversation | null {
+export function useConversationSnapshot(slug: string | null): Conversation | null {
   const store = useConversationStore();
 
   const subscribe = useCallback(

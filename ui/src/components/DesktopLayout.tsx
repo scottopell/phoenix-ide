@@ -1,9 +1,9 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
   useConversationsList,
   useConversationsRefresh,
-  useConversationByActiveSlug,
+  useConversationSnapshot,
 } from '../conversation';
 import { useResizablePane } from '../hooks';
 import { Sidebar } from './Sidebar';
@@ -53,21 +53,15 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
-  // Extract active slug and find active conversation. Reading
-  // `useConversationByActiveSlug(activeSlug)` subscribes only to that
-  // slug's atom — token streaming on a non-active conversation does
-  // not re-render this layout. Returns null until the SSE init or a
-  // poll has populated the row.
+  // Extract active slug. `useConversationSnapshot` reads the row directly
+  // from the store — polling and SSE both write through the same atom,
+  // so this is the single source of truth for the active conversation.
+  // Returns null until polling or SSE init has populated the row
+  // (typically one tick after navigation; `if (!conversation)` callers
+  // downstream paint a skeleton during that window).
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;
-  const activeConversationFromAtom = useConversationByActiveSlug(activeSlug);
-  // Fallback to scanning the derived list while the per-slug atom is
-  // still empty (e.g. first paint after navigation, before SSE init
-  // has landed). Both paths read the same store so they cannot diverge.
-  const activeConversation = useMemo(
-    () => activeConversationFromAtom ?? conversations.find((c) => c.slug === activeSlug) ?? null,
-    [activeConversationFromAtom, conversations, activeSlug],
-  );
+  const activeConversation = useConversationSnapshot(activeSlug);
 
   const effectiveCwd = activeConversation?.cwd ?? '/';
 

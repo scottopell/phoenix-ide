@@ -1033,6 +1033,49 @@ describe('conversationReducer', () => {
       });
       expect(next.phase.type).toBe('awaiting_llm');
     });
+
+    it('drops a stale-epoch sse_error even when client-synthesized (no sequenceId)', () => {
+      // Cross-conversation contamination edge: a stale handler closure on
+      // conversation A's EventSource fires schema-violation handling AFTER
+      // navigation to B. handleSchemaViolation routes through the
+      // epoch-stamped dispatch, so the synthesized sse_error carries A's
+      // epoch. B's atom (different epoch) must reject it — otherwise an
+      // error toast for A pops up while the user is reading B.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        connectionEpoch: 7,
+      };
+      const next = dispatch(atom, {
+        type: 'sse_error',
+        epoch: 3, // stale: from A's connection generation
+        error: {
+          type: 'BackendError',
+          message: 'parse error from a stale connection',
+        },
+      });
+      expect(next).toBe(atom);
+      expect(next.uiError).toBeNull();
+    });
+
+    it('drops a stale-epoch sse_error that does carry a sequenceId', () => {
+      // Same as above but the wire emitted a real backend error with a
+      // sequenceId. The epoch guard runs BEFORE applyIfNewer; the
+      // sequenceId is fresh but the epoch isn't, so the error is dropped
+      // before it would otherwise pop a toast on the wrong atom.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        connectionEpoch: 7,
+      };
+      const next = dispatch(atom, {
+        type: 'sse_error',
+        epoch: 3,
+        sequenceId: 100,
+        error: { type: 'BackendError', message: 'wrong atom' },
+      });
+      expect(next).toBe(atom);
+      expect(next.uiError).toBeNull();
+      expect(next.lastSequenceId).toBe(0);
+    });
   });
 
   describe('local_phase_change', () => {
