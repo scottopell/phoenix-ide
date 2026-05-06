@@ -27,6 +27,7 @@ ROOT = Path(__file__).parent.resolve()
 UI_DIR = ROOT / "ui"
 PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
 VITE_PID_FILE = ROOT / ".vite.pid"
+VITE_PROXY_FILE = ROOT / ".vite.proxy"
 LOG_FILE = ROOT / "phoenix.log"
 
 
@@ -111,6 +112,9 @@ DEV_PORT_MAX = 8050
 
 # Database directory
 DB_DIR = Path.home() / ".phoenix-ide"
+TLS_CA_DIR = DB_DIR / "tls"
+TLS_BUNDLE_DIR = DB_DIR / "tls-bundles"
+TLS_INSTALL_DIR = DB_DIR / "tls"
 
 
 def _gateway_is_reachable(url: str) -> bool:
@@ -333,6 +337,8 @@ def stop_process(pid_file: Path, name: str) -> bool:
     finally:
         if pid_file.exists():
             pid_file.unlink()
+        if name == "Vite" and VITE_PROXY_FILE.exists():
+            VITE_PROXY_FILE.unlink()
         # Release database lock if stopping Phoenix
         if name == "Phoenix" and _db_lock is not None:
             _db_lock.release()
@@ -371,13 +377,67 @@ def build_rust(release: bool = True):
     subprocess.run(args, check=True, cwd=ROOT)
 
 
-def start_phoenix(port: int, release: bool = True):
+def tls_enabled_from_env(env: dict[str, str]) -> bool:
+    """Return whether the supplied Phoenix env config enables HTTPS."""
+    mode = env.get("PHOENIX_TLS", "").strip().lower()
+    has_manual_paths = bool(env.get("PHOENIX_TLS_CERT_PATH") and env.get("PHOENIX_TLS_KEY_PATH"))
+    return has_manual_paths or mode in {"1", "true", "on", "auto", "manual"}
+
+
+def maybe_enable_auto_tls(env: dict[str, str], tls: bool) -> bool:
+    """Apply the dev HTTPS shortcut without overriding explicit TLS config."""
+    if tls and not tls_enabled_from_env(env):
+        env["PHOENIX_TLS"] = "auto"
+    return tls_enabled_from_env(env)
+
+
+def _probe_phoenix_scheme(port: int) -> str | None:
+    import ssl
+    import urllib.request
+
+    for scheme in ("https", "http"):
+        context = ssl._create_unverified_context() if scheme == "https" else None
+        try:
+            with urllib.request.urlopen(
+                f"{scheme}://localhost:{port}/version",
+                timeout=1,
+                context=context,
+            ):
+                return scheme
+        except Exception:
+            continue
+    return None
+
+
+def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     """Start the Phoenix server."""
     global _db_lock
-    
+
+    db_path = get_db_path()
+    env = os.environ.copy()
+    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
+    env_file = _load_env_file(env)
+    # Dev-only overrides on top of the prod env. Lets dev disable
+    # PHOENIX_PASSWORD (or override anything else) without polluting the
+    # prod env file used by `./dev.py prod deploy`.
+    dev_env_file = _load_env_file(env, ".phoenix-ide.dev.env")
+    # Auto-detect gateway only if .phoenix-ide.env didn't provide LLM config
+    if not env.get("LLM_API_KEY_HELPER") and not env.get("LLM_GATEWAY"):
+        if gateway := get_llm_gateway():
+            env["LLM_GATEWAY"] = gateway
+    env["PHOENIX_PORT"] = str(port)
+    env["PHOENIX_DB_PATH"] = str(db_path)
+    phoenix_tls = maybe_enable_auto_tls(env, tls)
+
     if get_pid(PHOENIX_PID_FILE):
-        print("Phoenix server already running")
-        return
+        desired_scheme = "https" if phoenix_tls else "http"
+        current_scheme = _probe_phoenix_scheme(port)
+        if current_scheme == desired_scheme or (current_scheme is None and desired_scheme == "http"):
+            print("Phoenix server already running")
+            return phoenix_tls
+        print("Restarting Phoenix server for TLS mode change")
+        stop_process(PHOENIX_PID_FILE, "Phoenix")
+        time.sleep(0.5)
 
     binary = ROOT / "target" / ("release" if release else "debug") / "phoenix_ide"
     if not binary.exists():
@@ -385,7 +445,6 @@ def start_phoenix(port: int, release: bool = True):
         sys.exit(1)
 
     # Acquire database lock
-    db_path = get_db_path()
     _db_lock = DatabaseLock()
     if not _db_lock.acquire():
         print(f"ERROR: Database is locked by another process.", file=sys.stderr)
@@ -393,23 +452,10 @@ def start_phoenix(port: int, release: bool = True):
         print(f"  Run './dev.py down' in the other instance first.", file=sys.stderr)
         sys.exit(1)
 
-    env = os.environ.copy()
-    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
-    env_file = _load_env_file(env)
     if env_file:
         print(f"  Loaded env from {env_file}")
-    # Dev-only overrides on top of the prod env. Lets dev disable
-    # PHOENIX_PASSWORD (or override anything else) without polluting the
-    # prod env file used by `./dev.py prod deploy`.
-    dev_env_file = _load_env_file(env, ".phoenix-ide.dev.env")
     if dev_env_file:
         print(f"  Loaded dev overrides from {dev_env_file}")
-    # Auto-detect gateway only if .phoenix-ide.env didn't provide LLM config
-    if not env.get("LLM_API_KEY_HELPER") and not env.get("LLM_GATEWAY"):
-        if gateway := get_llm_gateway():
-            env["LLM_GATEWAY"] = gateway
-    env["PHOENIX_PORT"] = str(port)
-    env["PHOENIX_DB_PATH"] = str(db_path)
     # Default to debug logging in dev, can be overridden via RUST_LOG env var
     if "RUST_LOG" not in env:
         env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
@@ -435,19 +481,32 @@ def start_phoenix(port: int, release: bool = True):
 
     print(f"Started Phoenix server (PID {proc.pid}, port {port})")
     print(f"  Database: {db_path}")
+    if phoenix_tls:
+        tls_dir = env.get("PHOENIX_TLS_DIR", str(db_path.parent / "tls"))
+        print(f"  TLS: auto-managed local CA ({tls_dir})")
+    return phoenix_tls
 
 
-def start_vite(port: int, phoenix_port: int):
+def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
     """Start the Vite dev server."""
+    scheme = "https" if phoenix_tls else "http"
+    desired_proxy = f"{scheme}://localhost:{phoenix_port}"
     if get_pid(VITE_PID_FILE):
-        print("Vite dev server already running")
-        return
+        current_proxy = VITE_PROXY_FILE.read_text().strip() if VITE_PROXY_FILE.exists() else ""
+        if current_proxy == desired_proxy:
+            print("Vite dev server already running")
+            return
+        print("Restarting Vite dev server for API proxy change")
+        stop_process(VITE_PID_FILE, "Vite")
 
     ensure_ui_deps()
 
     env = node_env()
     # Pass Phoenix port to Vite for proxy configuration
     env["VITE_API_PORT"] = str(phoenix_port)
+    if phoenix_tls:
+        env["VITE_API_SCHEME"] = "https"
+        env.setdefault("VITE_API_PROXY_SECURE", "false")
     
     # Start Vite in background (bind to 0.0.0.0 for external access)
     proc = subprocess.Popen(
@@ -467,14 +526,20 @@ def start_vite(port: int, phoenix_port: int):
         sys.exit(1)
 
     print(f"Started Vite dev server (PID {proc.pid}, port {port})")
-    print(f"  Proxying /api to Phoenix on port {phoenix_port}")
+    VITE_PROXY_FILE.write_text(desired_proxy + "\n")
+    print(f"  Proxying /api to Phoenix at {desired_proxy}")
 
 
 # =============================================================================
 # Commands
 # =============================================================================
 
-def cmd_up(phoenix_port: int | None = None, vite_port: int | None = None, no_seed: bool = False):
+def cmd_up(
+    phoenix_port: int | None = None,
+    vite_port: int | None = None,
+    no_seed: bool = False,
+    tls: bool = False,
+):
     """Build and start Phoenix + Vite dev servers."""
     default_phoenix, default_vite = get_default_ports()
     phoenix_port = phoenix_port or default_phoenix
@@ -485,16 +550,19 @@ def cmd_up(phoenix_port: int | None = None, vite_port: int | None = None, no_see
     print()
     
     build_rust(release=True)
-    start_phoenix(port=phoenix_port)
-    start_vite(port=vite_port, phoenix_port=phoenix_port)
+    phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
+    start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
+    api_scheme = "https" if phoenix_tls else "http"
     print()
     print(f"Ready! UI: http://localhost:{vite_port}")
-    print(f"        API: http://localhost:{phoenix_port}")
+    print(f"        API: {api_scheme}://localhost:{phoenix_port}")
+    if phoenix_tls:
+        print(f" Direct UI: https://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
 
     if not no_seed:
         print()
-        cmd_seed(phoenix_port=phoenix_port, quiet_if_populated=True)
+        cmd_seed(phoenix_port=phoenix_port, quiet_if_populated=True, scheme=api_scheme)
 
 
 # ---------------------------------------------------------------------------
@@ -526,21 +594,27 @@ _SEED_EXPLORE_TEXT = "Analyze the project structure and summarise the key archit
 _SEED_BRANCH_TEXT  = "Review and tidy the open PR branch — fix lint warnings and update tests"
 
 
-def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) -> None:
+def cmd_seed(
+    phoenix_port: int | None = None,
+    quiet_if_populated: bool = False,
+    scheme: str = "http",
+) -> None:
     """Populate the dev DB with representative conversations for UI/QA testing."""
     import urllib.request
     import urllib.error
     import uuid as _uuid
+    import ssl
 
     default_phoenix, _ = get_default_ports()
     port = phoenix_port or default_phoenix
-    api  = f"http://localhost:{port}/api"
+    api  = f"{scheme}://localhost:{port}/api"
     db   = get_db_path()
+    ssl_context = ssl._create_unverified_context() if scheme == "https" else None
 
     # ------------------------------------------------------------------ helpers
 
     def _get(path: str) -> dict:
-        with urllib.request.urlopen(f"{api}{path}", timeout=5) as r:
+        with urllib.request.urlopen(f"{api}{path}", timeout=5, context=ssl_context) as r:
             return json.loads(r.read())
 
     def _post(path: str, body: dict | None = None) -> dict:
@@ -551,7 +625,7 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_context) as r:
             return json.loads(r.read())
 
     def _wait_done(conv_id: str, timeout: float = 15.0) -> str:
@@ -684,6 +758,183 @@ def cmd_seed(phoenix_port: int | None = None, quiet_if_populated: bool = False) 
     print("✓ Seed complete.")
 
 
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+
+def _tls_helper(args: list[str]) -> str:
+    result = subprocess.run(
+        ["cargo", "run", "--quiet", "--bin", "phoenix-tls", "--", *args],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        sys.exit(result.returncode)
+    return result.stdout
+
+
+def _sanitize_tls_name(name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in ".-" else "_" for c in name)
+    return safe.strip("._-") or "phoenix"
+
+
+def _default_tls_hosts(primary_host: str, extra_hosts: list[str] | None = None) -> list[str]:
+    hosts = [primary_host, "localhost", "127.0.0.1", "::1"]
+    if extra_hosts:
+        hosts.extend(extra_hosts)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for host in hosts:
+        host = host.strip()
+        if host and host not in seen:
+            seen.add(host)
+            deduped.append(host)
+    return deduped
+
+
+def _update_env_file(path: Path, updates: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text().splitlines() if path.exists() else []
+    seen: set[str] = set()
+    output: list[str] = []
+
+    for line in existing:
+        stripped = line.strip()
+        key, sep, _value = stripped.partition("=")
+        if sep and key in updates and not stripped.startswith("#"):
+            output.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            output.append(line)
+
+    missing = [key for key in updates if key not in seen]
+    if missing and output and output[-1].strip():
+        output.append("")
+    for key in missing:
+        output.append(f"{key}={updates[key]}")
+
+    path.write_text("\n".join(output) + "\n")
+
+
+def cmd_tls_ca(ca_dir: Path = TLS_CA_DIR) -> None:
+    """Create or show the Phoenix private CA."""
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    out = _tls_helper(["ca", "--dir", str(ca_dir)])
+    print(out, end="")
+    print("Trust the cert path above on browser machines. Keep the key path private.")
+    print("Do not copy the CA key to remote Phoenix hosts; use './dev.py tls issue <host>'.")
+
+
+def cmd_tls_issue(
+    host: str,
+    extra_hosts: list[str] | None = None,
+    ca_dir: Path = TLS_CA_DIR,
+    out_dir: Path = TLS_BUNDLE_DIR,
+    port: int = PROD_PORT,
+) -> None:
+    """Issue a per-host Phoenix TLS bundle from the local CA."""
+    import tarfile
+    import tempfile
+
+    hosts = _default_tls_hosts(host, extra_hosts)
+    bundle_name = _sanitize_tls_name(host)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = out_dir / f"{bundle_name}.tar.gz"
+
+    with tempfile.TemporaryDirectory(prefix="phoenix-tls-") as tmp:
+        tmp_path = Path(tmp)
+        cert_path = tmp_path / "server.pem"
+        key_path = tmp_path / "server-key.pem"
+        args = [
+            "issue",
+            "--ca-dir",
+            str(ca_dir),
+            "--cert",
+            str(cert_path),
+            "--key",
+            str(key_path),
+        ]
+        for item in hosts:
+            args.extend(["--host", item])
+        _tls_helper(args)
+
+        metadata = {
+            "host": host,
+            "hosts": hosts,
+            "port": port,
+            "cert": "server.pem",
+            "key": "server-key.pem",
+        }
+        metadata_path = tmp_path / "phoenix-tls.json"
+        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+
+        with tarfile.open(bundle_path, "w:gz") as tar:
+            tar.add(cert_path, arcname="server.pem")
+            tar.add(key_path, arcname="server-key.pem")
+            tar.add(metadata_path, arcname="phoenix-tls.json")
+
+    print(f"Bundle: {bundle_path}")
+    print(f"Hosts:  {', '.join(hosts)}")
+    print("Contains: server cert/key only; the CA private key stays local.")
+    print(f"Copy to host, then run: ./dev.py tls install ~/{bundle_path.name}")
+
+
+def cmd_tls_install(
+    bundle: Path,
+    install_dir: Path = TLS_INSTALL_DIR,
+    env_file: Path = ROOT / ".phoenix-ide.env",
+) -> None:
+    """Install a Phoenix TLS bundle and update repo-local env config."""
+    import tarfile
+    import tempfile
+
+    if not bundle.exists():
+        print(f"ERROR: bundle not found: {bundle}", file=sys.stderr)
+        sys.exit(1)
+
+    with tempfile.TemporaryDirectory(prefix="phoenix-tls-install-") as tmp:
+        tmp_path = Path(tmp)
+        with tarfile.open(bundle, "r:gz") as tar:
+            members = tar.getmembers()
+            names = {member.name for member in members}
+            expected = {"server.pem", "server-key.pem", "phoenix-tls.json"}
+            if names != expected or not all(member.isfile() for member in members):
+                print(f"ERROR: invalid TLS bundle contents: {sorted(names)}", file=sys.stderr)
+                sys.exit(1)
+            tar.extractall(tmp_path, filter="data")
+
+        metadata = json.loads((tmp_path / "phoenix-tls.json").read_text())
+        host = metadata["host"]
+        port = int(metadata.get("port", PROD_PORT))
+        name = _sanitize_tls_name(host)
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        cert_dest = install_dir / f"{name}.pem"
+        key_dest = install_dir / f"{name}-key.pem"
+        shutil.copy2(tmp_path / "server.pem", cert_dest)
+        shutil.copy2(tmp_path / "server-key.pem", key_dest)
+        cert_dest.chmod(0o644)
+        key_dest.chmod(0o600)
+
+    _update_env_file(
+        env_file,
+        {
+            "PHOENIX_TLS": "manual",
+            "PHOENIX_TLS_CERT_PATH": str(cert_dest),
+            "PHOENIX_TLS_KEY_PATH": str(key_dest),
+            "PHOENIX_PUBLIC_URL": f"https://{host}:{port}",
+        },
+    )
+
+    print(f"Installed cert: {cert_dest}")
+    print(f"Installed key:  {key_dest}")
+    print(f"Updated env:    {env_file}")
+    print("Run: ./dev.py prod deploy")
+
+
 def cmd_down():
     """Stop all servers."""
     stopped_any = False
@@ -702,7 +953,7 @@ def cmd_down():
         print("Nothing running")
 
 
-def cmd_restart(phoenix_port: int | None = None):
+def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
     """Rebuild Rust and restart Phoenix (Vite stays for hot reload)."""
     default_phoenix, default_vite = get_default_ports()
     phoenix_port = phoenix_port or default_phoenix
@@ -710,15 +961,20 @@ def cmd_restart(phoenix_port: int | None = None):
     build_rust(release=True)
     stop_process(PHOENIX_PID_FILE, "Phoenix")
     time.sleep(0.5)
-    start_phoenix(port=phoenix_port)
+    phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
+    api_scheme = "https" if phoenix_tls else "http"
     vite_pid = get_pid(VITE_PID_FILE)
     if vite_pid:
         print(f"Phoenix restarted. Vite still running for UI hot reload.")
         print(f"  UI:  http://localhost:{default_vite}")
-        print(f"  API: http://localhost:{phoenix_port}")
+        print(f"  API: {api_scheme}://localhost:{phoenix_port}")
+        if phoenix_tls:
+            print(f"  Direct UI: https://localhost:{phoenix_port}")
     else:
         print(f"Phoenix restarted. Vite not running (start with ./dev.py up).")
-        print(f"  API: http://localhost:{phoenix_port}")
+        print(f"  API: {api_scheme}://localhost:{phoenix_port}")
+        if phoenix_tls:
+            print(f"  Direct UI: https://localhost:{phoenix_port}")
 
 
 def cmd_status():
@@ -735,6 +991,8 @@ def cmd_status():
 
     if phoenix_pid:
         print(f"Phoenix: running (PID {phoenix_pid})")
+        if scheme := _probe_phoenix_scheme(default_phoenix):
+            print(f"  URL: {scheme}://localhost:{default_phoenix}")
     else:
         print("Phoenix: stopped")
 
@@ -745,8 +1003,16 @@ def cmd_status():
 
     if phoenix_pid:
         try:
+            import ssl
             import urllib.request
-            with urllib.request.urlopen(f"http://localhost:{default_phoenix}/api/models", timeout=2) as resp:
+
+            scheme = _probe_phoenix_scheme(default_phoenix) or "http"
+            context = ssl._create_unverified_context() if scheme == "https" else None
+            with urllib.request.urlopen(
+                f"{scheme}://localhost:{default_phoenix}/api/models",
+                timeout=2,
+                context=context,
+            ) as resp:
                 data = json.loads(resp.read())
                 print(f"Models:  {', '.join(data.get('models', []))}")
         except Exception:
@@ -1161,7 +1427,7 @@ def cmd_check():
     if failures:
         print()
         for name, output in failures:
-            print(f"\u2500\u2500 {name} {'\u2500' * (50 - len(name))}")
+            print(f"\u2500\u2500 {name} {'─' * (50 - len(name))}")
             if output:
                 print(output)
             print()
@@ -1533,7 +1799,8 @@ def _install_prod_env_file(env: dict[str, str], service_user: str) -> str | None
 
     # Re-escape embedded newlines (e.g. LLM_CUSTOM_HEADERS) so each line is a
     # single KEY=value pair. The Rust loader unescapes `\n` itself.
-    lines = [f"{k}={v.replace(chr(10), '\\n')}" for k, v in env.items()]
+    escaped_newline = "\\n"
+    lines = [f"{k}={v.replace(chr(10), escaped_newline)}" for k, v in env.items()]
     content = "\n".join(lines) + "\n"
 
     subprocess.run(["sudo", "mkdir", "-p", str(PROD_ENV_FILE.parent)], check=True)
@@ -1776,7 +2043,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
             print(f"  Database: {config.db_path}")
-            print(f"  URL: http://localhost:{PROD_PORT}")
+            print(f"  URL: {_prod_display_url()}")
         else:
             print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
     else:
@@ -1803,7 +2070,7 @@ def native_prod_deploy(version: str | None = None):
             print(f"  Port: {PROD_PORT}")
             print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
             print(f"  Database: {config.db_path}")
-            print(f"  URL: http://localhost:{PROD_PORT}")
+            print(f"  URL: {_prod_display_url()}")
         else:
             print(f"\n✗ Service failed to start", file=sys.stderr)
             subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
@@ -1868,6 +2135,35 @@ def _configure_llm_env(env: dict[str, str]) -> str:
     print("    2. Set ANTHROPIC_API_KEY in your environment", file=sys.stderr)
     print("    3. Run on a host with an exe.dev gateway", file=sys.stderr)
     sys.exit(1)
+
+
+def _repo_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    _load_env_file(env)
+    return env
+
+
+def _prod_display_url(env: dict[str, str] | None = None) -> str:
+    env = env or _repo_env()
+    if url := env.get("PHOENIX_PUBLIC_URL"):
+        return url
+    scheme = "https" if tls_enabled_from_env(env) else "http"
+    return f"{scheme}://localhost:{PROD_PORT}"
+
+
+def _prod_local_health_url(env: dict[str, str] | None = None) -> str:
+    env = env or _repo_env()
+    scheme = "https" if tls_enabled_from_env(env) else "http"
+    return f"{scheme}://localhost:{PROD_PORT}/version"
+
+
+def _open_prod_health(env: dict[str, str] | None = None, timeout: float = 5.0):
+    import ssl
+    import urllib.request
+
+    env = env or _repo_env()
+    context = ssl._create_unverified_context() if tls_enabled_from_env(env) else None
+    return urllib.request.urlopen(_prod_local_health_url(env), timeout=timeout, context=context)
 
 
 def prod_daemon_deploy():
@@ -1938,7 +2234,7 @@ def prod_daemon_deploy():
     # Health check
     try:
         import urllib.request
-        with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=5) as resp:
+        with _open_prod_health(env, timeout=5) as resp:
             version_text = resp.read().decode().strip()
             version_info = {"version": version_text}
     except Exception as e:
@@ -1953,6 +2249,7 @@ def prod_daemon_deploy():
     print(f"  Logs: {prod_log_path}")
     print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
     print(f"  LLM Mode: {llm_mode}")
+    print(f"  URL: {_prod_display_url(env)}")
     print()
     print("Use './dev.py prod status' to check status")
     print("Use './dev.py prod stop' to stop the server")
@@ -1979,12 +2276,12 @@ def prod_daemon_status():
         # Health check
         try:
             import urllib.request
-            urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2).close()
+            _open_prod_health(timeout=2).close()
             print(f"  Health: OK")
         except Exception as e:
             print(f"  Health: Unreachable ({type(e).__name__}: {e})")
         print(f"  Port: {PROD_PORT}")
-        print(f"  URL: http://localhost:{PROD_PORT}")
+        print(f"  URL: {_prod_display_url()}")
 
         if sha := read_deployed_sha():
             print(f"  Commit: {sha}")
@@ -2121,13 +2418,12 @@ def native_prod_status():
     if status == "active":
         print(f"Production: running")
         print(f"  Port: {PROD_PORT}")
-        print(f"  URL: http://localhost:{PROD_PORT}")
+        print(f"  URL: {_prod_display_url()}")
         print(f"  Database: {PROD_DB_PATH}")
 
         # Health check
         try:
-            import urllib.request
-            urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2).close()
+            _open_prod_health(timeout=2).close()
             print(f"  Health: OK")
         except Exception:
             print(f"  Health: not responding")
@@ -2305,12 +2601,11 @@ def launchd_prod_deploy(version: str | None = None):
         sys.exit(1)
 
     # Health check with retry (server may take a few seconds to bind the port)
-    import urllib.request
     health_version = None
     for attempt in range(5):
         time.sleep(2)
         try:
-            with urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=5) as resp:
+            with _open_prod_health(env_overrides, timeout=5) as resp:
                 health_version = resp.read().decode().strip()
             break
         except Exception:
@@ -2331,7 +2626,7 @@ def launchd_prod_deploy(version: str | None = None):
     print(f"  Database: {PROD_DB_PATH}")
     print(f"  Logs: {LAUNCHD_LOG_PATH}")
     print(f"  LLM: {llm_mode}")
-    print(f"  URL: http://localhost:{PROD_PORT}")
+    print(f"  URL: {_prod_display_url(env_overrides)}")
 
 
 def launchd_prod_status():
@@ -2364,8 +2659,7 @@ def launchd_prod_status():
 
     # Health check
     try:
-        import urllib.request
-        urllib.request.urlopen(f"http://localhost:{PROD_PORT}/version", timeout=2).close()
+        _open_prod_health(timeout=2).close()
         print(f"  Health: OK")
     except Exception:
         print(f"  Health: not responding")
@@ -2375,7 +2669,7 @@ def launchd_prod_status():
     print(f"  Port: {PROD_PORT}")
     print(f"  Database: {PROD_DB_PATH}")
     print(f"  Logs: {LAUNCHD_LOG_PATH}")
-    print(f"  URL: http://localhost:{PROD_PORT}")
+    print(f"  URL: {_prod_display_url()}")
 
 
 def launchd_prod_stop():
@@ -2679,6 +2973,8 @@ def main():
     up_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
     up_parser.add_argument("--vite-port", type=int, default=None, help="Vite port (default: auto from worktree hash)")
     up_parser.add_argument("--no-seed", action="store_true", default=False, help="Skip auto-seeding the dev DB on startup")
+    up_parser.add_argument("--https", dest="https", action="store_true", default=False, help="Serve Phoenix over auto-managed HTTPS")
+    up_parser.add_argument("--tls", dest="https", action="store_true", help=argparse.SUPPRESS)
 
     # down
     sub.add_parser("down", help="Stop all servers")
@@ -2686,6 +2982,8 @@ def main():
     # restart
     restart_parser = sub.add_parser("restart", help="Rebuild Rust and restart Phoenix")
     restart_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
+    restart_parser.add_argument("--https", dest="https", action="store_true", default=False, help="Serve Phoenix over auto-managed HTTPS")
+    restart_parser.add_argument("--tls", dest="https", action="store_true", help=argparse.SUPPRESS)
 
     # status
     sub.add_parser("status", help="Check what's running")
@@ -2699,6 +2997,22 @@ def main():
     # seed
     seed_parser = sub.add_parser("seed", help="Populate dev DB with representative conversations (idempotent)")
     seed_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto)")
+
+    # tls
+    tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
+    tls_sub = tls_parser.add_subparsers(dest="tls_command", required=True)
+    tls_ca = tls_sub.add_parser("ca", help="Create or show the Phoenix private CA")
+    tls_ca.add_argument("--dir", type=Path, default=TLS_CA_DIR, help=f"CA directory (default: {TLS_CA_DIR})")
+    tls_issue = tls_sub.add_parser("issue", help="Issue a per-host TLS bundle")
+    tls_issue.add_argument("host", help="Primary DNS name for the Phoenix host")
+    tls_issue.add_argument("--host", dest="extra_hosts", action="append", default=[], help="Additional DNS/IP SAN; repeatable")
+    tls_issue.add_argument("--ca-dir", type=Path, default=TLS_CA_DIR, help=f"CA directory (default: {TLS_CA_DIR})")
+    tls_issue.add_argument("--out-dir", type=Path, default=TLS_BUNDLE_DIR, help=f"Bundle output directory (default: {TLS_BUNDLE_DIR})")
+    tls_issue.add_argument("--port", type=int, default=PROD_PORT, help=f"Public Phoenix port (default: {PROD_PORT})")
+    tls_install = tls_sub.add_parser("install", help="Install a TLS bundle into this host's repo/env")
+    tls_install.add_argument("bundle", type=Path, help="Bundle created by ./dev.py tls issue")
+    tls_install.add_argument("--install-dir", type=Path, default=TLS_INSTALL_DIR, help=f"Certificate install directory (default: {TLS_INSTALL_DIR})")
+    tls_install.add_argument("--env-file", type=Path, default=ROOT / ".phoenix-ide.env", help="Env file to update (default: repo .phoenix-ide.env)")
 
     # prod
     prod_parser = sub.add_parser("prod", help="Production deployment")
@@ -2732,11 +3046,16 @@ def main():
     args = parser.parse_args()
 
     if args.command == "up":
-        cmd_up(phoenix_port=args.port, vite_port=args.vite_port, no_seed=args.no_seed)
+        cmd_up(
+            phoenix_port=args.port,
+            vite_port=args.vite_port,
+            no_seed=args.no_seed,
+            tls=args.https,
+        )
     elif args.command == "down":
         cmd_down()
     elif args.command == "restart":
-        cmd_restart(phoenix_port=args.port)
+        cmd_restart(phoenix_port=args.port, tls=args.https)
     elif args.command == "status":
         cmd_status()
     elif args.command == "check":
@@ -2746,6 +3065,19 @@ def main():
             sys.exit(1)
     elif args.command == "seed":
         cmd_seed(phoenix_port=args.port)
+    elif args.command == "tls":
+        if args.tls_command == "ca":
+            cmd_tls_ca(args.dir)
+        elif args.tls_command == "issue":
+            cmd_tls_issue(
+                args.host,
+                extra_hosts=args.extra_hosts,
+                ca_dir=args.ca_dir,
+                out_dir=args.out_dir,
+                port=args.port,
+            )
+        elif args.tls_command == "install":
+            cmd_tls_install(args.bundle, install_dir=args.install_dir, env_file=args.env_file)
     elif args.command == "prod":
         if args.prod_command == "build":
             cmd_prod_build(args.version)

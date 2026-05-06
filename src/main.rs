@@ -17,6 +17,8 @@ mod state_machine;
 mod system_prompt;
 mod terminal;
 mod title_generator;
+mod tls;
+mod tls_certs;
 mod tools;
 
 use api::{create_router, AppState};
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
+    let tls_source = tls::ConfigSource::from_env(&db_path)?;
 
     // Ensure database directory exists
     if let Some(parent) = PathBuf::from(&db_path).parent() {
@@ -263,17 +266,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get listener (either from systemd socket activation or bind fresh)
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = hot_restart::get_listener(addr).await?;
-    tracing::info!(
-        addr = %listener.local_addr()?,
-        socket_activated = hot_restart::is_socket_activated(),
-        "Phoenix IDE server listening"
-    );
+    let socket_activated = hot_restart::is_socket_activated();
+    if let Some(tls_source) = tls_source {
+        let loaded_tls = tls::load_config(&tls_source)?;
+        tracing::info!(
+            mode = loaded_tls.mode,
+            cert = %loaded_tls.cert_path.display(),
+            key = %loaded_tls.key_path.display(),
+            ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
+            "TLS enabled"
+        );
+        tls::serve_https(listener, app, loaded_tls.server, socket_activated).await?;
+    } else {
+        tracing::info!(
+            addr = %listener.local_addr()?,
+            socket_activated,
+            "Phoenix IDE server listening"
+        );
 
-    // Run server with graceful shutdown on signals
-    let server = axum::serve(listener, app);
-    server
-        .with_graceful_shutdown(hot_restart::shutdown_signal())
-        .await?;
+        // Run server with graceful shutdown on signals
+        let server = axum::serve(listener, app);
+        server
+            .with_graceful_shutdown(hot_restart::shutdown_signal())
+            .await?;
+    }
 
     // REQ-BASH-007: after the server stops accepting requests, walk the
     // live bash handle table and SIGKILL every process group as a final
