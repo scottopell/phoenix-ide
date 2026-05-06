@@ -618,6 +618,37 @@ pub(crate) fn find_active_branch_conversation_slug(
         .and_then(|c| c.slug.clone())
 }
 
+/// If `path` is inside a Phoenix worktree at `{repo_root}/.phoenix/worktrees/{id}`,
+/// returns `Some(repo_root)`.  Returns `None` otherwise — the input is not a
+/// Phoenix worktree path.
+///
+/// Strict match: requires the `.phoenix/worktrees/{id}` segment, not just a
+/// `.phoenix` ancestor.  `{repo_root}/src/...` returns `None`, even though it
+/// is inside the repo, because there is no Phoenix worktree above it.
+/// `{repo_root}/.phoenix/foo` (a non-worktree subdir of `.phoenix`) also returns
+/// `None`.
+///
+/// Callers that want the input path as a fallback when the predicate fails
+/// (e.g., Direct-mode conversations whose `working_dir` IS the repo root)
+/// should use `.unwrap_or_else(|| path.to_path_buf())` at the call site so the
+/// fallback is explicit rather than hidden in this helper.
+pub(crate) fn repo_root_from_phoenix_worktree(path: &Path) -> Option<std::path::PathBuf> {
+    // Walk up looking for `{repo_root}/.phoenix/worktrees/{id}` shape: an
+    // ancestor whose parent.file_name == "worktrees" and grandparent.file_name
+    // == ".phoenix".  Returning the great-grandparent gives `{repo_root}`.
+    path.ancestors()
+        .find(|p| {
+            p.parent().is_some_and(|parent| {
+                parent.file_name().is_some_and(|n| n == "worktrees")
+                    && parent
+                        .parent()
+                        .is_some_and(|gp| gp.file_name().is_some_and(|n| n == ".phoenix"))
+            })
+        })
+        .and_then(|conv_dir| conv_dir.parent()?.parent()?.parent())
+        .map(std::path::Path::to_path_buf)
+}
+
 /// Ensure .gitignore in the given directory contains `.phoenix/`.
 /// Creates .gitignore if it doesn't exist. Stages the change if modified.
 pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
@@ -664,6 +695,64 @@ mod tests {
         run_git(dir, &["config", "user.email", "probe@test"]).unwrap();
         run_git(dir, &["config", "user.name", "probe"]).unwrap();
         run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
+    }
+
+    #[test]
+    fn repo_root_from_phoenix_worktree_matches_canonical_shape() {
+        let root = Path::new("/repo");
+        let wt = Path::new("/repo/.phoenix/worktrees/abc123");
+        assert_eq!(
+            repo_root_from_phoenix_worktree(wt),
+            Some(root.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn repo_root_from_phoenix_worktree_matches_descendant_of_worktree() {
+        let root = Path::new("/repo");
+        let inside = Path::new("/repo/.phoenix/worktrees/abc123/src/main.rs");
+        assert_eq!(
+            repo_root_from_phoenix_worktree(inside),
+            Some(root.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn repo_root_from_phoenix_worktree_rejects_repo_root_itself() {
+        // A plain repo root has no `.phoenix/worktrees/{id}` ancestor.
+        assert_eq!(repo_root_from_phoenix_worktree(Path::new("/repo")), None);
+    }
+
+    #[test]
+    fn repo_root_from_phoenix_worktree_rejects_arbitrary_repo_subdir() {
+        // {repo_root}/src is inside the repo but not a Phoenix worktree —
+        // the original looser predicate would have returned `/repo/src`
+        // unchanged, which was the bug Copilot flagged.
+        assert_eq!(
+            repo_root_from_phoenix_worktree(Path::new("/repo/src")),
+            None
+        );
+    }
+
+    #[test]
+    fn repo_root_from_phoenix_worktree_rejects_non_worktree_phoenix_subdir() {
+        // {repo_root}/.phoenix/foo is under .phoenix but not a worktree —
+        // the original predicate (any `.phoenix` ancestor) would have
+        // claimed this is a worktree, which it isn't.
+        assert_eq!(
+            repo_root_from_phoenix_worktree(Path::new("/repo/.phoenix/foo")),
+            None
+        );
+        assert_eq!(
+            repo_root_from_phoenix_worktree(Path::new("/repo/.phoenix")),
+            None
+        );
+    }
+
+    #[test]
+    fn repo_root_from_phoenix_worktree_rejects_paths_outside_any_repo() {
+        assert_eq!(repo_root_from_phoenix_worktree(Path::new("/tmp/xyz")), None);
+        assert_eq!(repo_root_from_phoenix_worktree(Path::new("relative")), None);
     }
 
     #[test]

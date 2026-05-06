@@ -289,8 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Reconcile Work/Branch conversations whose worktree has been deleted or whose
-/// `worktree_path` is empty (legacy rows predating M3).
+/// Reconcile Work/Branch conversations whose worktree has been deleted.
 ///
 /// For each affected conversation: revert mode (Work -> Explore, Branch -> Direct),
 /// reset cwd to the project root, and run `git worktree prune` to clean stale
@@ -328,27 +327,17 @@ async fn reconcile_worktrees(db: &Database) {
             continue;
         }
 
-        let wt_path = conv.conv_mode.worktree_path().unwrap_or("");
-        let base_branch = conv.conv_mode.base_branch().unwrap_or("");
+        // Migration 002 guarantees Work/Branch rows have non-empty, non-sentinel
+        // worktree_path and base_branch. The only remaining reason to revert is a
+        // worktree directory that no longer exists on disk.
+        let wt_path = match conv.conv_mode.worktree_path() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue, // shouldn't happen post-M2; skip rather than corrupt
+        };
 
-        let is_sentinel = |s: &str| s.is_empty() || s.starts_with("__LEGACY");
-
-        // Legacy row (sentinel worktree_path or base_branch) or worktree directory missing on disk
-        let needs_revert = is_sentinel(wt_path)
-            || is_sentinel(base_branch)
-            || !std::path::Path::new(wt_path).exists();
-
-        if !needs_revert {
+        if std::path::Path::new(wt_path).exists() {
             continue;
         }
-
-        let reason = if is_sentinel(wt_path) {
-            "legacy row (missing worktree_path)"
-        } else if is_sentinel(base_branch) {
-            "legacy row (missing base_branch)"
-        } else {
-            "worktree directory missing"
-        };
 
         // Branch mode reverts to Direct (no Explore phase to fall back to).
         // Work mode reverts to Explore (Managed workflow fallback).
@@ -363,7 +352,7 @@ async fn reconcile_worktrees(db: &Database) {
         tracing::warn!(
             conv_id = %conv.id,
             worktree_path = wt_path,
-            reason,
+            reason = "worktree directory missing",
             revert_to = revert_label,
             "Reverting worktree conversation"
         );
@@ -374,21 +363,15 @@ async fn reconcile_worktrees(db: &Database) {
         }
         reverted += 1;
 
-        // Derive project root from worktree path: {root}/.phoenix/worktrees/{id}
-        // If worktree_path is empty, try to detect from the conversation's current cwd
-        let project_root = if wt_path.is_empty() {
-            // Legacy: use git rev-parse from the conversation's cwd
-            db::detect_git_repo_root(std::path::Path::new(&conv.cwd))
-        } else {
-            // Walk up from worktree path to find .phoenix parent
-            std::path::Path::new(wt_path)
-                .ancestors()
-                .find(|p| p.file_name().is_some_and(|n| n == ".phoenix"))
-                .and_then(|phoenix_dir| phoenix_dir.parent())
-                .map(|p| p.to_string_lossy().to_string())
-        };
+        // wt_path is always {root}/.phoenix/worktrees/{id} for a real Phoenix
+        // worktree. If the strict predicate fails the row is malformed; skip it.
+        let project_root =
+            crate::git_ops::repo_root_from_phoenix_worktree(std::path::Path::new(wt_path))
+                .map(|p| p.to_string_lossy().to_string());
 
         if let Some(ref root) = project_root {
+            // Allowed recovery mutation: worktree is gone, so reset cwd to
+            // project root so the conversation loads into a valid directory.
             if let Err(e) = db.update_conversation_cwd(&conv.id, root).await {
                 tracing::error!(conv_id = %conv.id, error = %e, "Failed to reset cwd");
             }

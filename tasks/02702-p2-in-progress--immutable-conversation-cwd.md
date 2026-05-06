@@ -1,7 +1,7 @@
 ---
 created: 2026-05-05
 priority: p2
-status: ready
+status: in-progress
 artifact: src/runtime/executor.rs
 ---
 

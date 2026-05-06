@@ -413,15 +413,12 @@ pub fn build_system_prompt_with_home(
     }
 
     // Add worktree grounding when working_dir is inside a .phoenix/worktrees/ path
-    let wd_str = working_dir.to_string_lossy();
-    if let Some(pos) = wd_str.find("/.phoenix/worktrees/") {
-        // Safety: `pos` is from `find()` on `wd_str`
-        #[allow(clippy::string_slice)]
-        let project_root = &wd_str[..pos];
+    if let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(working_dir) {
         let _ = write!(
             prompt,
             "\n\nYou are working in a git worktree. Your working directory is the worktree, \
-             not the main checkout at {project_root}. Stay grounded here for file operations."
+             not the main checkout at {}. Stay grounded here for file operations.",
+            repo_root.display()
         );
     }
 
