@@ -23,7 +23,9 @@ function skillDir(path: string): string {
 }
 
 /** Extract the project name or "User" from a skill's absolute path */
-function projectLabel(path: string): string {
+function projectLabel(skill: SkillEntry): string {
+  if (skill.source === 'builtin') return 'Built-in';
+  const path = skill.path;
   const markers = ['.claude/skills', '.agents/skills'];
   for (const marker of markers) {
     const idx = path.indexOf(marker);
@@ -51,6 +53,8 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
     setPromptError(null);
     setPromptContent(null);
 
+    // Built-ins are extracted to disk at server startup, so they share the
+    // same read endpoint as filesystem skills.
     fetch(`/api/files/read?path=${encodeURIComponent(skill.path)}`)
       .then(async (resp) => {
         if (!resp.ok) {
@@ -105,7 +109,7 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
           <div className="skill-viewer-section-title">Details</div>
           <div className="skill-viewer-detail-row">
             <span className="skill-viewer-detail-label">Project</span>
-            <span className="skill-viewer-detail-value">{projectLabel(skill.path)}</span>
+            <span className="skill-viewer-detail-value">{projectLabel(skill)}</span>
           </div>
           <div className="skill-viewer-detail-row">
             <span className="skill-viewer-detail-label">Source</span>
@@ -117,10 +121,12 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
               <span className="skill-viewer-detail-value">{skill.argument_hint}</span>
             </div>
           )}
-          <div className="skill-viewer-detail-row">
-            <span className="skill-viewer-detail-label">Path</span>
-            <span className="skill-viewer-detail-value">{skillDir(skill.path)}</span>
-          </div>
+          {skill.source !== 'builtin' && (
+            <div className="skill-viewer-detail-row">
+              <span className="skill-viewer-detail-label">Path</span>
+              <span className="skill-viewer-detail-value">{skillDir(skill.path)}</span>
+            </div>
+          )}
         </div>
 
         {/* Prompt section */}

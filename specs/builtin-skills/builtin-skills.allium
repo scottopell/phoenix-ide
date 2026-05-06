@@ -1,0 +1,172 @@
+-- allium: 3
+-- specs/builtin-skills/builtin-skills.allium
+--
+-- Scope: Built-in skills — embedding, startup extraction, discovery
+--        integration, override precedence
+-- Imports: skills (extends Skill discovery and invocation)
+-- Excludes: Filesystem skill discovery (already in skills.allium)
+--           Frontmatter parsing (already in skills.allium)
+--           Argument substitution (already in skills.allium)
+
+import skills
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A built-in skill is content compiled into the phoenix binary as part of
+-- an embedded directory tree. At server startup the tree is materialized
+-- to a real on-disk directory; from that point onward built-ins behave as
+-- ordinary filesystem skills.
+external entity BuiltinSkillAsset {
+    relative_path: String   -- path within the embedded tree, e.g. "caveman/SKILL.md"
+    content: Bytes          -- file content embedded as &'static [u8]
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Subdirectory under the phoenix data dir where built-ins are extracted.
+    -- Implementation: src/skills/builtin.rs EXTRACT_SUBDIR constant.
+    builtin_extract_subdir: String = "builtin-skills"
+
+    -- The embedded asset tree compiled into the binary.
+    -- Implementation: src/skills/builtin/ directory with rust_embed::RustEmbed.
+    builtin_assets: List<BuiltinSkillAsset> = []
+}
+
+------------------------------------------------------------
+-- Rules: Startup Extraction
+------------------------------------------------------------
+
+rule ExtractBuiltinAssets {
+    when: ServerStartup(home_dir)
+
+    let target = home_dir + "/.phoenix-ide/" + builtin_extract_subdir
+
+    ensures: for asset in builtin_assets:
+        FileWritten(
+            path: target + "/" + asset.relative_path,
+            content: asset.content
+        )
+
+    @guidance
+        -- Idempotent: writes are skipped when the existing file's bytes
+        -- already match the embedded asset.
+        -- Failure is non-fatal: extraction errors are logged at warn! and
+        -- the server continues. Built-ins simply won't appear in the catalog.
+        -- Implementation: extract_to() in src/skills/builtin.rs, called from
+        -- main() before the database opens.
+}
+
+------------------------------------------------------------
+-- Rules: Discovery Integration
+------------------------------------------------------------
+
+-- Built-in skills are discovered AFTER the user filesystem walk completes,
+-- by scanning the extraction directory. The existing name-dedup rule (first
+-- seen wins, defined in skills.allium DiscoverSkillCatalog) means a
+-- filesystem skill of the same name is already collected and the built-in
+-- is skipped.
+
+rule ScanBuiltinExtractDir {
+    when: FilesystemDiscoveryComplete(catalog, builtin_dir)
+
+    requires: directory_exists(builtin_dir)
+    -- directory_exists: black box
+
+    ensures: for child_dir in immediate_subdirectories(builtin_dir)
+             where has_skill_md(child_dir) and not name_taken(catalog, frontmatter_name(child_dir)):
+        SkillRegistered(
+            name: frontmatter_name(child_dir),
+            description: frontmatter_description(child_dir),
+            argument_hint: frontmatter_argument_hint(child_dir),
+            source: Builtin(path: child_dir + "/SKILL.md")
+        )
+    -- immediate_subdirectories / has_skill_md / frontmatter_*: black box helpers
+
+    @guidance
+        -- Sequencing matters: the filesystem walk runs first, then this
+        -- rule fires once over the extract directory, then the catalog is
+        -- sorted by name. Reordering would invert the precedence rule.
+        -- Implementation: collect_builtin_skills_from_dir() in
+        -- src/system_prompt.rs, called from discover_skills_with_options
+        -- after the walk-up + children + $HOME scans.
+}
+
+------------------------------------------------------------
+-- Rules: Invocation
+------------------------------------------------------------
+
+-- Built-in invocation has no dedicated rule because it is structurally
+-- identical to filesystem invocation: both source variants carry a real
+-- absolute path, and `invoke_skill` reads via std::fs::read_to_string in
+-- both cases. See skills.allium ExpandSkill.
+
+------------------------------------------------------------
+-- Rules: Catalog Rendering
+------------------------------------------------------------
+
+rule RenderBuiltinInCatalog {
+    when: CatalogEntryFormatted(skill)
+
+    requires: skill.source matches Builtin
+
+    ensures: entry_text = "- **" + skill.name + "** — " + skill.description + " (built-in)"
+
+    @guidance
+        -- Filesystem skills render with the path in backticks (existing
+        -- skills.allium InjectSkillCatalog rule). Built-ins render with
+        -- the literal "(built-in)" annotation so the catalog stays terse
+        -- and so the LLM can distinguish phoenix-bundled skills from
+        -- user-installed ones at a glance. The real extract path is still
+        -- available to the LLM via the `Base directory` line emitted when
+        -- the skill is invoked.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Both source variants imply a readable file on disk after extraction.
+-- For Filesystem this is the user's authored SKILL.md; for Builtin it is
+-- the file written by ExtractBuiltinAssets at server startup.
+invariant SourceImpliesReadableFile {
+    for skill in Skills:
+        file_exists(skill.path) and is_readable(skill.path)
+}
+
+-- Filesystem skills always shadow built-ins of the same name. The catalog
+-- never contains both a filesystem and a built-in entry with the same name.
+invariant FilesystemShadowsBuiltin {
+    for fs_skill in Skills where fs_skill.source matches Filesystem:
+        not exists builtin_skill in Skills
+            where builtin_skill.source matches Builtin
+              and builtin_skill.name = fs_skill.name
+}
+
+-- The existing SkillNamesUnique invariant from skills.allium remains in
+-- force and is reinforced here: built-ins do not break name uniqueness
+-- because they are filtered by the same name-dedup as filesystem skills.
+
+------------------------------------------------------------
+-- Resolved Decisions
+------------------------------------------------------------
+
+-- (resolved) Naming: built-in. Decided 2026-05-04.
+-- (resolved) Override: filesystem wins. Decided 2026-05-04.
+-- (resolved) UI grouping: separate "Built-in" group. Decided 2026-05-04.
+-- (resolved) Companion files: extract to disk; no separate API.
+--            Decided 2026-05-04. Built-in directories are materialized at
+--            startup so the LLM uses the same `cat`/`read` workflow it
+--            already uses for filesystem-skill companion files.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Pruning stale extracts: when a phoenix version removes or renames a built-in, the previously-extracted files remain under <HOME>/.phoenix-ide/builtin-skills/. Today the workaround is manual cleanup. If this becomes a real user complaint, design a mechanism that records the extracted asset list and removes leftovers without racing concurrent phoenix processes."
+
+open question "Disabling a built-in without providing a filesystem replacement: not currently supported. Workaround is an empty filesystem SKILL.md to shadow. If this becomes a real user request, design an opt-out config (e.g. ~/.phoenix-ide/disabled-skills.toml)."

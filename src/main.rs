@@ -88,6 +88,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Extract built-in skills to disk so they participate in normal skill
+    // discovery (filesystem-shadows-builtin override, companion-file reads,
+    // etc.). Failure is non-fatal — built-ins simply won't appear in the
+    // catalog and the user can still install filesystem skills.
+    if let Some(target) = skills::builtin::default_extract_dir() {
+        match skills::builtin::extract_to(&target) {
+            Ok(()) => tracing::info!(path = %target.display(), "extracted built-in skills"),
+            Err(e) => tracing::warn!(
+                path = %target.display(),
+                error = %e,
+                "failed to extract built-in skills",
+            ),
+        }
+    }
+
     // Initialize database
     tracing::info!(path = %db_path, "Opening database");
     let db = Database::open(&db_path).await?;

@@ -2707,12 +2707,22 @@ async fn list_conversation_skills(
 
     let skill_entries: Vec<SkillEntry> = skills
         .into_iter()
-        .map(|s| SkillEntry {
-            name: s.name,
-            description: s.description,
-            argument_hint: s.argument_hint,
-            source: s.source,
-            path: s.path.to_string_lossy().to_string(),
+        .map(|s| {
+            let (source, path) = match &s.source {
+                crate::system_prompt::SkillSource::Filesystem { path, source_dir } => {
+                    (source_dir.clone(), path.to_string_lossy().to_string())
+                }
+                crate::system_prompt::SkillSource::Builtin { path } => {
+                    ("builtin".to_string(), path.to_string_lossy().to_string())
+                }
+            };
+            SkillEntry {
+                name: s.name,
+                description: s.description,
+                argument_hint: s.argument_hint,
+                source,
+                path,
+            }
         })
         .collect();
 
