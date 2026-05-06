@@ -154,7 +154,7 @@ export function getDisplayState(stateType: string | undefined): 'idle' | 'workin
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
     case 'error': return 'error';
-    case 'context_exhausted': return 'terminal';
+    case 'context_exhausted': return 'awaiting_approval';
     case 'awaiting_task_approval': return 'awaiting_approval';
     case 'awaiting_user_response': return 'awaiting_approval';
     default: return stateType ? 'working' : 'idle';
