@@ -556,8 +556,6 @@ def cmd_up(
     print()
     print(f"Ready! UI: http://localhost:{vite_port}")
     print(f"        API: {api_scheme}://localhost:{phoenix_port}")
-    if phoenix_tls:
-        print(f" Direct UI: https://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
 
     if not no_seed:
@@ -957,24 +955,22 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
     """Rebuild Rust and restart Phoenix (Vite stays for hot reload)."""
     default_phoenix, default_vite = get_default_ports()
     phoenix_port = phoenix_port or default_phoenix
+    vite_was_running = get_pid(VITE_PID_FILE) is not None
 
     build_rust(release=True)
     stop_process(PHOENIX_PID_FILE, "Phoenix")
     time.sleep(0.5)
     phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
     api_scheme = "https" if phoenix_tls else "http"
-    vite_pid = get_pid(VITE_PID_FILE)
-    if vite_pid:
-        print(f"Phoenix restarted. Vite still running for UI hot reload.")
+
+    if vite_was_running:
+        start_vite(port=default_vite, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
+        print(f"Phoenix restarted. Vite ready for UI hot reload.")
         print(f"  UI:  http://localhost:{default_vite}")
         print(f"  API: {api_scheme}://localhost:{phoenix_port}")
-        if phoenix_tls:
-            print(f"  Direct UI: https://localhost:{phoenix_port}")
     else:
         print(f"Phoenix restarted. Vite not running (start with ./dev.py up).")
         print(f"  API: {api_scheme}://localhost:{phoenix_port}")
-        if phoenix_tls:
-            print(f"  Direct UI: https://localhost:{phoenix_port}")
 
 
 def cmd_status():

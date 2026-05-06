@@ -54,7 +54,8 @@ unless you copy them the CA private key. Do not do that for the normal flow.
 
 ## Development HTTPS
 
-Use this when you need to reproduce browser HTTP/2 behavior locally:
+Use this when the dev UI needs to talk to Phoenix over HTTPS, or when you need
+to probe Phoenix's HTTPS/HTTP/2 listener locally:
 
 ```bash
 ./dev.py up --https
@@ -73,17 +74,16 @@ already exists. The default CA directory is:
 ~/.phoenix-ide/tls
 ```
 
-The dev output prints the direct HTTPS URL, for example:
-
-```text
-Direct UI: https://localhost:8033
-```
-
 Vite still serves the dev UI over HTTP. When Phoenix is in HTTPS mode, `dev.py`
 configures Vite's API proxy to talk to Phoenix over HTTPS and disables proxy
-certificate verification for that local dev proxy. The embedded Phoenix UI is
-also available directly over HTTPS, which is the route to use when validating
-browser ALPN/HTTP/2 behavior.
+certificate verification for that local dev proxy. If `./dev.py restart`
+changes Phoenix between HTTP and HTTPS, `dev.py` restarts Vite so the proxy
+scheme matches the backend.
+
+`./dev.py up --https` does not build `ui/dist`, so the normal dev UI remains
+the Vite URL printed by `dev.py`. For ALPN/HTTP/2 checks, probe Phoenix
+endpoints such as `/version` directly. To load the embedded UI itself over
+HTTPS in a browser, use a production deployment or build `ui/dist` first.
 
 If the browser shows `ERR_CERT_AUTHORITY_INVALID`, the server is working but the
 browser machine does not yet trust the Phoenix CA.
@@ -279,7 +279,8 @@ Expected signals:
 Browser checks:
 
 1. Trust `phoenix-local-ca.pem` on the browser machine.
-2. Open `https://localhost:<port>` or `https://<host>:8031`.
+2. Open `https://<host>:8031` for a production/manual deployment, or
+   `https://localhost:<phoenix-port>` after building local embedded UI assets.
 3. Confirm the page loads without a certificate warning.
 4. In browser devtools, confirm requests use `h2` if the protocol column is
    enabled.

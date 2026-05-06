@@ -105,8 +105,8 @@ scp ~/.phoenix-ide/tls-bundles/phoenix-host.internal.tar.gz ssh-host:~/
 
 After install, `./dev.py prod deploy` reads `.phoenix-ide.env` and serves
 `https://phoenix-host.internal:8031`. For local development, `./dev.py up
---https` uses the same default CA directory and serves the embedded UI directly
-at `https://localhost:<port>` while Vite proxies API requests over HTTPS.
+--https` uses the same default CA directory, keeps the dev UI on the Vite URL,
+and proxies API requests to Phoenix over HTTPS.
 
 ### Publishing a Release
 
