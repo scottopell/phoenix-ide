@@ -1,7 +1,7 @@
 ---
 created: 2026-05-05
 priority: p1
-status: in-progress
+status: done
 artifact: ui/src/conversation/ConversationStore.ts
 ---
 
