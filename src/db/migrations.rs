@@ -202,12 +202,14 @@ WHERE id IN (
 /// Explore conversations always have a worktree (the conv runs in it
 /// pre-approval, REQ-PROJ-028); sub-agent Explore conversations do not.
 ///
-/// Heuristic for "top-level": `parent_conversation_id IS NULL`. Sub-agents
-/// always carry a parent pointer; user-initiated Explore convs never do.
-///
-/// For matching rows with non-empty `cwd`, set `conv_mode.worktree_path = cwd`.
-/// Sub-agent Explore rows are left alone — their `{"mode":"Explore"}` JSON
-/// deserialises to `worktree_path: None` via `#[serde(default)]`.
+/// Heuristic for "top-level managed": (a) `parent_conversation_id IS NULL`
+/// (sub-agents always carry a parent pointer) AND (b) `cwd` ends with
+/// `.phoenix/worktrees/{id}`, the canonical managed-worktree layout from
+/// `git_ops.rs`. The cwd-suffix check is load-bearing: legacy Explore rows
+/// can have `cwd = repo_root`, and migration 002 demotes invalid Work/Branch
+/// rows to `Explore` while leaving their old (non-managed) cwd intact.
+/// Without (b), unrelated Explore conversations sharing a cwd would key to
+/// the same worktree-scoped tmux socket and tear each other down on cascade.
 ///
 /// Without this backfill, existing top-level managed Explore conversations
 /// would lose tmux session continuity on the first restart after upgrade:
@@ -221,6 +223,7 @@ WHERE json_extract(conv_mode, '$.mode') = 'Explore'
   AND parent_conversation_id IS NULL
   AND cwd IS NOT NULL
   AND cwd != ''
+  AND cwd LIKE '%/.phoenix/worktrees/' || id
   AND json_extract(conv_mode, '$.worktree_path') IS NULL;
 ";
 
@@ -381,9 +384,13 @@ mod tests {
             .unwrap();
         let mode: String = row.get("conv_mode");
         let state: String = row.get("state");
-        // Migration 002 reverts to Explore; migration 007 then backfills
-        // worktree_path from cwd (top-level Explore, no parent_conversation_id).
-        assert_eq!(mode, "{\"mode\":\"Explore\",\"worktree_path\":\"/tmp\"}");
+        // Migration 002 reverts to Explore. Migration 007 only backfills
+        // `worktree_path` from cwd when cwd matches the canonical managed-
+        // worktree layout `.phoenix/worktrees/{id}`; cwd `/tmp` does not
+        // match, so the row stays as bare `{"mode":"Explore"}`. This is
+        // load-bearing: backfilling `/tmp` here would let two demoted convs
+        // share the same worktree-scoped tmux socket on cascade.
+        assert_eq!(mode, "{\"mode\":\"Explore\"}");
         assert_eq!(state, "{\"type\":\"idle\"}");
     }
 
@@ -433,8 +440,9 @@ mod tests {
             .await
             .unwrap();
         let mode: String = row.get("conv_mode");
-        // 002 reverts to Explore; 007 backfills worktree_path = cwd.
-        assert_eq!(mode, "{\"mode\":\"Explore\",\"worktree_path\":\"/tmp\"}");
+        // 002 reverts to Explore; 007 leaves it alone (cwd `/tmp` is not
+        // the canonical managed-worktree layout `.phoenix/worktrees/{id}`).
+        assert_eq!(mode, "{\"mode\":\"Explore\"}");
     }
 
     #[tokio::test]
@@ -699,17 +707,23 @@ mod tests {
 
         // (id, conv_mode, cwd, parent_conv_id) seed rows covering each case.
         let rows: &[(&str, &str, &str, Option<&str>)] = &[
-            // 1. Top-level Explore with cwd — should be backfilled.
-            ("top-explore", r#"{"mode":"Explore"}"#, "/work/conv-1", None),
-            // 2. Sub-agent Explore (parent set) — left alone.
+            // 1. Top-level managed Explore (cwd matches `.phoenix/worktrees/{id}`)
+            //    — backfilled.
+            (
+                "top-explore",
+                r#"{"mode":"Explore"}"#,
+                "/repo/.phoenix/worktrees/top-explore",
+                None,
+            ),
+            // 2. Sub-agent Explore (parent set) — left alone even if cwd matches
+            //    a managed-worktree-shaped path.
             (
                 "sub-explore",
                 r#"{"mode":"Explore"}"#,
-                "/work/parent",
+                "/repo/.phoenix/worktrees/top-explore",
                 Some("top-explore"),
             ),
-            // 3. Top-level Explore with empty cwd — not backfilled (NonEmptyString
-            //    would reject empty strings on deserialise).
+            // 3. Top-level Explore with empty cwd — not backfilled.
             ("empty-cwd", r#"{"mode":"Explore"}"#, "", None),
             // 4. Direct mode — untouched (mode != Explore).
             ("direct", r#"{"mode":"Direct"}"#, "/anywhere", None),
@@ -717,7 +731,22 @@ mod tests {
             (
                 "already",
                 r#"{"mode":"Explore","worktree_path":"/preexisting"}"#,
-                "/work/conv-5",
+                "/repo/.phoenix/worktrees/already",
+                None,
+            ),
+            // 6. Top-level Explore with a non-managed cwd (legacy pre-REQ-PROJ-028
+            //    row, or a row demoted by migration 002 with its old cwd intact)
+            //    — NOT backfilled. If we backfilled, two unrelated Explore convs
+            //    sharing this cwd would collide on the same tmux socket.
+            ("legacy-repo-root", r#"{"mode":"Explore"}"#, "/repo", None),
+            // 7. Top-level Explore whose cwd points at *another* conv's managed
+            //    worktree (pathological). The id-suffix predicate rejects this:
+            //    `/repo/.phoenix/worktrees/top-explore` does not end with this
+            //    row's id (`other-conv`).
+            (
+                "other-conv",
+                r#"{"mode":"Explore"}"#,
+                "/repo/.phoenix/worktrees/top-explore",
                 None,
             ),
         ];
@@ -750,10 +779,10 @@ mod tests {
             }
         };
 
-        // 1. Top-level Explore: worktree_path backfilled to cwd.
+        // 1. Top-level managed Explore: worktree_path backfilled to cwd.
         let top: serde_json::Value = serde_json::from_str(&mode_for("top-explore").await).unwrap();
         assert_eq!(top["mode"], "Explore");
-        assert_eq!(top["worktree_path"], "/work/conv-1");
+        assert_eq!(top["worktree_path"], "/repo/.phoenix/worktrees/top-explore");
 
         // 2. Sub-agent Explore: untouched (no worktree_path field).
         let sub: serde_json::Value = serde_json::from_str(&mode_for("sub-explore").await).unwrap();
@@ -777,9 +806,31 @@ mod tests {
         let pre: serde_json::Value = serde_json::from_str(&mode_for("already").await).unwrap();
         assert_eq!(pre["worktree_path"], "/preexisting");
 
+        // 6. Legacy non-managed cwd (e.g. repo root): NOT backfilled. Backfilling
+        //    would let two such rows collide on the same tmux socket.
+        let legacy: serde_json::Value =
+            serde_json::from_str(&mode_for("legacy-repo-root").await).unwrap();
+        assert_eq!(legacy["mode"], "Explore");
+        assert!(
+            legacy.get("worktree_path").is_none(),
+            "non-managed cwd must not be backfilled: {legacy:?}"
+        );
+
+        // 7. Cwd matches some other conv's managed-worktree path: NOT backfilled
+        //    (id-suffix predicate guards against cross-conversation collisions).
+        let other: serde_json::Value = serde_json::from_str(&mode_for("other-conv").await).unwrap();
+        assert_eq!(other["mode"], "Explore");
+        assert!(
+            other.get("worktree_path").is_none(),
+            "cwd pointing at another conv's worktree must not be backfilled: {other:?}"
+        );
+
         // Idempotency: re-run migration, no changes.
         sqlx::raw_sql(MIGRATION_007).execute(&pool).await.unwrap();
         let top2: serde_json::Value = serde_json::from_str(&mode_for("top-explore").await).unwrap();
-        assert_eq!(top2["worktree_path"], "/work/conv-1");
+        assert_eq!(
+            top2["worktree_path"],
+            "/repo/.phoenix/worktrees/top-explore"
+        );
     }
 }

@@ -26,7 +26,6 @@
 //! finishes.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -129,14 +128,23 @@ impl TmuxServer {
 }
 
 /// Compute the deterministic socket path for a worktree-scoped session
-/// (Work/Branch/Explore modes). The worktree path is hashed to a 16-char
-/// hex string so the socket filename is filesystem-safe and bounded in
-/// length regardless of the worktree path depth (task 03001).
+/// (Work/Branch/Explore modes). The worktree path is hashed with SHA-256
+/// (first 8 bytes → 16 hex chars) so the socket filename is filesystem-safe,
+/// bounded in length, **and stable across Rust/Phoenix releases** —
+/// `std::collections::hash_map::DefaultHasher` is explicitly not a persistent
+/// hash and would re-key every existing tmux session on toolchain upgrade
+/// (task 03001).
 pub fn socket_path_for_worktree(socket_dir: &Path, worktree_path: &Path) -> PathBuf {
-    use std::collections::hash_map::DefaultHasher;
-    let mut h = DefaultHasher::new();
-    worktree_path.hash(&mut h);
-    socket_dir.join(format!("wt-{:016x}.sock", h.finish()))
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(worktree_path.as_os_str().as_encoded_bytes());
+    let digest = h.finalize();
+    let prefix = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest is 32 bytes; first 8 always fits a u64"),
+    );
+    socket_dir.join(format!("wt-{prefix:016x}.sock"))
 }
 
 /// Compute the deterministic socket path for a Direct-mode conversation
@@ -624,6 +632,23 @@ mod tests {
         let wt_path = socket_path_for_worktree(&dir, &wt);
         let conv_path = socket_path_for(&dir, "some-conv-id");
         assert_ne!(wt_path, conv_path);
+    }
+
+    /// Pin the exact SHA-256 prefix for a fixed worktree path so a future
+    /// hash-algorithm regression (e.g. someone reverting to `DefaultHasher`)
+    /// fails loudly instead of silently re-keying every live tmux session.
+    #[test]
+    fn socket_path_for_worktree_uses_stable_sha256_prefix() {
+        let dir = PathBuf::from("/x/y");
+        let wt = PathBuf::from("/repo/.phoenix/worktrees/abc123");
+        // First 8 bytes of SHA-256("/repo/.phoenix/worktrees/abc123") as a
+        // big-endian u64. Computed once and pinned.
+        let p = socket_path_for_worktree(&dir, &wt);
+        assert_eq!(
+            p,
+            PathBuf::from("/x/y/wt-2e83c86fb0db24ce.sock"),
+            "socket path drifted — hash algorithm changed?"
+        );
     }
 
     #[test]
