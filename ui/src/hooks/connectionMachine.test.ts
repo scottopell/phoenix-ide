@@ -235,7 +235,7 @@ describe('connectionMachine', () => {
     it('CONNECT from disconnected goes to connecting', () => {
       const result = transition(initialState(), { type: 'CONNECT' }, onlineCtx);
       expect(result.state.state).toBe('connecting');
-      expect(result.effects).toContainEqual({ type: 'OPEN_SSE' });
+      expect(result.effects).toContainEqual({ type: 'OPEN_SSE', epoch: 1 });
     });
 
     it('SSE_ERROR increments attempt and schedules retry when online', () => {
@@ -286,13 +286,18 @@ describe('connectionMachine', () => {
         state: 'offline',
         attempt: 5,
         nextRetryMs: 30000,
+        epoch: 1,
       };
-      
+
       const result = transition(state, { type: 'BROWSER_ONLINE' }, onlineCtx);
-      
+
       expect(result.state.state).toBe('reconnecting');
       expect(result.effects).toContainEqual({ type: 'CANCEL_TIMERS' });
-      expect(result.effects).toContainEqual({ type: 'OPEN_SSE' });
+      // Task 08683: BROWSER_ONLINE bumps the epoch (it emits a fresh
+      // OPEN_SSE), so the new connection is distinguishable from the
+      // closed one.
+      expect(result.effects).toContainEqual({ type: 'OPEN_SSE', epoch: 2 });
+      expect(result.state.epoch).toBe(2);
     });
 
     it('reconnected state transitions to connected after display timer', () => {
@@ -300,11 +305,14 @@ describe('connectionMachine', () => {
         state: 'reconnected',
         attempt: 0,
         nextRetryMs: null,
+        epoch: 3,
       };
-      
+
       const result = transition(state, { type: 'RECONNECTED_DISPLAY_DONE' }, onlineCtx);
-      
+
       expect(result.state.state).toBe('connected');
+      // Display-done does not bump epoch; same connection generation.
+      expect(result.state.epoch).toBe(3);
     });
   });
 });

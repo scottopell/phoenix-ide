@@ -909,6 +909,132 @@ describe('conversationReducer', () => {
     });
   });
 
+  describe('connection epoch (task 08683)', () => {
+    it('createInitialAtom() starts with connectionEpoch=null', () => {
+      expect(createInitialAtom().connectionEpoch).toBeNull();
+    });
+
+    it('connection_opened lifts connectionEpoch from null', () => {
+      const atom = createInitialAtom();
+      const next = dispatch(atom, { type: 'connection_opened', epoch: 1 });
+      expect(next.connectionEpoch).toBe(1);
+    });
+
+    it('connection_opened advances epoch monotonically', () => {
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 1 });
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 5 });
+      expect(a2.connectionEpoch).toBe(5);
+    });
+
+    it('connection_opened drops a regression (stale OPEN_SSE closure)', () => {
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 5 });
+      // A stale OPEN_SSE executor running after a newer one already advanced
+      // the atom must not roll the epoch back — doing so would re-open the
+      // contamination window.
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 3 });
+      expect(a2).toBe(a1);
+      expect(a2.connectionEpoch).toBe(5);
+    });
+
+    it('connection_opened drops an equal epoch as a no-op', () => {
+      // Strictly monotonic. Repeating the same epoch is treated as a stale
+      // duplicate dispatch and does not produce a new atom reference.
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 4 });
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 4 });
+      expect(a2).toBe(a1);
+    });
+
+    it('first stamped action passes when atom epoch is null (bootstrap)', () => {
+      // Before connection_opened lands, atom.connectionEpoch is null.
+      // Stamped actions must still be accepted in this window or the
+      // connection never bootstraps. In practice useConnection always
+      // dispatches connection_opened before any stamped wire action, so
+      // this branch only covers the malformed-init edge case.
+      const atom = createInitialAtom();
+      const next = dispatch(atom, {
+        type: 'connection_state',
+        state: 'live',
+        epoch: 1,
+      });
+      expect(next.connectionState).toBe('live');
+    });
+
+    it('rejects stamped action when epoch does not match (cross-conv contamination)', () => {
+      // Atom is on connection generation 7; an event arrives stamped with
+      // generation 5. This is exactly the scenario where a stale
+      // EventSource for a different conversation slug fires through a
+      // dispatchRef that has already been re-bound to this atom's slug.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        connectionEpoch: 7,
+        connectionState: 'live',
+      };
+      const next = dispatch(atom, {
+        type: 'connection_state',
+        state: 'connecting',
+        epoch: 5,
+      });
+      // Atom unchanged: same reference, no state mutation.
+      expect(next).toBe(atom);
+      expect(next.connectionState).toBe('live');
+    });
+
+    it('accepts stamped action when epoch matches', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        connectionEpoch: 3,
+        connectionState: 'connecting',
+      };
+      const next = dispatch(atom, {
+        type: 'connection_state',
+        state: 'live',
+        epoch: 3,
+      });
+      expect(next.connectionState).toBe('live');
+    });
+
+    it('rejects a stale-epoch sse_message even if its sequence_id is fresh', () => {
+      // Defense in depth: the sequence-id guard would happily accept this
+      // message (lastSequenceId=0 < 100). The epoch guard sits *before*
+      // the reducer cases and rejects on identity, not freshness.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        connectionEpoch: 7,
+      };
+      const message: Message = {
+        message_id: 'msg-stale',
+        sequence_id: 100,
+        conversation_id: 'conv-1',
+        message_type: 'agent',
+        content: { text: 'from a stale connection' } as Message['content'],
+        created_at: '2024-01-01T00:00:00Z',
+      };
+      const next = dispatch(atom, {
+        type: 'sse_message',
+        message,
+        sequenceId: 100,
+        epoch: 5,
+      });
+      expect(next).toBe(atom);
+      expect(next.messages).toHaveLength(0);
+      expect(next.lastSequenceId).toBe(0);
+    });
+
+    it('client-originated actions (no epoch) pass through regardless of atom epoch', () => {
+      // local_phase_change is dispatched by the UI on send; it has no
+      // epoch field. The guard must not reject these.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        connectionEpoch: 7,
+      };
+      const next = dispatch(atom, {
+        type: 'local_phase_change',
+        phase: { type: 'awaiting_llm' },
+      });
+      expect(next.phase.type).toBe('awaiting_llm');
+    });
+  });
+
   describe('local_phase_change', () => {
     // Client-originated optimistic phase updates do NOT bump lastSequenceId
     // (they're not part of the server's total order). This test guards
