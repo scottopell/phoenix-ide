@@ -263,7 +263,9 @@ mod tests {
             archived: false,
             model: Some("claude-sonnet-4-5".to_string()),
             project_id: None,
-            conv_mode: ConvMode::Explore,
+            conv_mode: ConvMode::Explore {
+                worktree_path: None,
+            },
             desired_base_branch: None,
             message_count: 3,
             seed_parent_id: None,

@@ -184,6 +184,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            None,
         )
     }
 
@@ -197,6 +198,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            None,
         )
     }
 
@@ -810,6 +812,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            None,
         );
 
         let tool_future = tool.run(json!({"cmd": "sleep 60", "wait_seconds": 30}), c.clone());

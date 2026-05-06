@@ -139,10 +139,15 @@ pub struct ToolContext {
 
     /// Per-process tmux server registry (access via `tmux()` method).
     /// Owns the per-conversation tmux server entries (`Arc<RwLock<TmuxServer>>`)
-    /// and resolves the deterministic socket path
-    /// (`~/.phoenix-ide/tmux-sockets/conv-<id>.sock`). REQ-TMUX-001 /
+    /// and resolves the deterministic socket path. REQ-TMUX-001 /
     /// REQ-TMUX-013.
     tmux_registry: Arc<TmuxRegistry>,
+
+    /// The worktree path for this conversation, if in Work/Branch/Explore
+    /// mode. `None` for Direct-mode conversations. Used by `tmux()` to
+    /// key the socket to the worktree rather than the conversation ID so
+    /// the session survives context-exhaustion continuations (task 03001).
+    pub worktree_path: Option<PathBuf>,
 }
 
 impl ToolContext {
@@ -157,6 +162,7 @@ impl ToolContext {
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
         tmux_registry: Arc<TmuxRegistry>,
+        worktree_path: Option<PathBuf>,
     ) -> Self {
         Self {
             cancel,
@@ -167,6 +173,7 @@ impl ToolContext {
             llm_registry,
             terminals,
             tmux_registry,
+            worktree_path,
         }
     }
 
@@ -226,8 +233,15 @@ impl ToolContext {
         // `new-session -c` when a fresh server is spawned so the pane
         // shell starts in the conversation's project. Ignored on
         // re-attach (see `ensure_live` doc).
+        //
+        // `worktree_path` controls socket keying: worktree-scoped for
+        // Work/Branch/Explore, conv-scoped for Direct (task 03001).
         self.tmux_registry
-            .ensure_live(&self.conversation_id, &self.working_dir)
+            .ensure_live(
+                &self.conversation_id,
+                self.worktree_path.as_deref(),
+                &self.working_dir,
+            )
             .await
     }
 
@@ -401,14 +415,15 @@ impl ToolRegistry {
     }
 
     /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
-    /// Read-only tools + bash + `submit_result`/`submit_error`. No patch, no
-    /// spawn, no `ask_user`, no skill, no `propose_task`.
+    /// Read-only tools + bash + `submit_result`/`submit_error`. No tmux, no
+    /// patch, no spawn, no `ask_user`, no skill, no `propose_task`.
+    /// The tmux session belongs to the worktree's owning conversation, not
+    /// its sub-agents (task 03001).
     // TODO: read-only bash enforcement not yet implemented --
     // uses regular bash. See REQ-BASH-008 for the planned sandbox approach.
     pub fn for_subagent_explore() -> Self {
         let mut tools = read_only_tools();
         tools.push(Arc::new(BashTool));
-        tools.push(Arc::new(TmuxTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
         Self { tools }
@@ -628,11 +643,14 @@ mod tests {
             );
         }
 
-        // Sub-agent Explore: read-only + bash + tmux + submit. No patch, no spawn,
+        // Sub-agent Explore: read-only + bash + submit. No tmux, no patch, no spawn,
         // no ask_user, no propose_task, no parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore());
         assert!(sub_explore.contains("bash"));
-        assert!(sub_explore.contains("tmux"));
+        assert!(
+            !sub_explore.contains("tmux"),
+            "sub-agent explore must not have tmux (task 03001)"
+        );
         assert!(sub_explore.contains("submit_result"));
         assert!(sub_explore.contains("submit_error"));
         assert!(!sub_explore.contains("patch"));
@@ -650,7 +668,10 @@ mod tests {
         let sub_work = names(&ToolRegistry::for_subagent_work());
         assert!(sub_work.contains("bash"));
         assert!(sub_work.contains("patch"));
-        assert!(sub_work.contains("tmux"));
+        assert!(
+            !sub_work.contains("tmux"),
+            "sub-agent work must not have tmux (task 03001)"
+        );
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));

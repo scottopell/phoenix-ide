@@ -16,6 +16,7 @@ use crate::llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
+use crate::state_machine::state::ModeKind;
 use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
@@ -1490,6 +1491,10 @@ where
         let cancel_token_check = cancel_token.clone();
 
         // Create ToolContext for this invocation
+        // worktree_path: Some for Managed/Branch (working_dir IS the worktree),
+        // None for Direct (no worktree — socket keyed to conv_id). Task 03001.
+        let tmux_worktree =
+            (self.context.mode != ModeKind::Direct).then(|| self.context.working_dir.clone());
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -1499,6 +1504,7 @@ where
             self.llm_registry.clone(),
             self.terminals.clone(),
             self.tmux_registry.clone(),
+            tmux_worktree,
         );
 
         let conv_id = self.context.conversation_id.clone();

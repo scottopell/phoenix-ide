@@ -10,6 +10,13 @@
 //! memory `TmuxServer` entry is rebuilt on the first operation after
 //! restart by probing the socket.
 //!
+//! Socket path keying (task 03001): sockets are keyed to the *worktree
+//! path* for Work/Branch/Explore conversations, and to `conversation_id`
+//! only for Direct-mode conversations that have no worktree. This makes
+//! session continuity across context-exhaustion continuations correct by
+//! construction — the worktree is the logical coding environment, and the
+//! tmux session IS that environment's shell state.
+//!
 //! Lock ordering for `ensure_live`: acquire the registry's
 //! `RwLock<HashMap>` long enough to clone (or insert) the per-conversation
 //! `Arc<RwLock<TmuxServer>>`, then drop the outer lock and take the
@@ -97,7 +104,9 @@ pub enum ServerStatus {
 ///
 /// `socket_path` is computed once at entry creation and is stable for
 /// the entry's lifetime (REQ-TMUX-001 / `SocketPathDeterministic`
-/// invariant).
+/// invariant). For Work/Branch/Explore conversations the path is keyed
+/// to the worktree path; for Direct conversations it falls back to the
+/// conversation ID (task 03001).
 #[derive(Debug)]
 pub struct TmuxServer {
     /// The conversation this server belongs to. Read by the cascade
@@ -109,16 +118,37 @@ pub struct TmuxServer {
 }
 
 impl TmuxServer {
-    fn new(conversation_id: &str, socket_dir: &Path) -> Self {
+    fn new(conversation_id: &str, socket_path: PathBuf) -> Self {
         Self {
             conversation_id: conversation_id.to_string(),
-            socket_path: socket_path_for(socket_dir, conversation_id),
+            socket_path,
             status: ServerStatus::NotProbed,
         }
     }
 }
 
-/// Compute the deterministic socket path for a conversation
+/// Compute the deterministic socket path for a worktree-scoped session
+/// (Work/Branch/Explore modes). The worktree path is hashed with SHA-256
+/// (first 8 bytes → 16 hex chars) so the socket filename is filesystem-safe,
+/// bounded in length, **and stable across Rust/Phoenix releases** —
+/// `std::collections::hash_map::DefaultHasher` is explicitly not a persistent
+/// hash and would re-key every existing tmux session on toolchain upgrade
+/// (task 03001).
+pub fn socket_path_for_worktree(socket_dir: &Path, worktree_path: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(worktree_path.as_os_str().as_encoded_bytes());
+    let digest = h.finalize();
+    let prefix = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest is 32 bytes; first 8 always fits a u64"),
+    );
+    socket_dir.join(format!("wt-{prefix:016x}.sock"))
+}
+
+/// Compute the deterministic socket path for a Direct-mode conversation
+/// (no worktree). Retained for fallback and for Direct-mode conversations
 /// (REQ-TMUX-001).
 pub fn socket_path_for(socket_dir: &Path, conversation_id: &str) -> PathBuf {
     socket_dir.join(format!("conv-{conversation_id}.sock"))
@@ -271,6 +301,11 @@ impl TmuxRegistry {
     /// when the probe sees `Live` — re-attaching to an existing server
     /// uses whatever start directory was set when it was first spawned.
     ///
+    /// `worktree_path` controls socket keying (task 03001):
+    /// - `Some(path)` — Work/Branch/Explore: socket keyed to the worktree
+    ///   path so continuations automatically share the same session.
+    /// - `None` — Direct mode: socket keyed to `conversation_id`.
+    ///
     /// On `Live`: no spawn, status=Live.
     /// On `NoSocket`: spawn `main` session in `cwd`, status=Live.
     /// On `DeadSocket`: unlink stale file, spawn `main` session in
@@ -282,6 +317,7 @@ impl TmuxRegistry {
     pub async fn ensure_live(
         &self,
         conversation_id: &str,
+        worktree_path: Option<&Path>,
         cwd: &Path,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
         if !self.binary_available {
@@ -289,7 +325,12 @@ impl TmuxRegistry {
         }
         self.ensure_runtime_assets().await?;
 
-        let server_arc = self.get_or_insert(conversation_id).await;
+        let socket_path = match worktree_path {
+            Some(wt) => socket_path_for_worktree(&self.socket_dir, wt),
+            None => socket_path_for(&self.socket_dir, conversation_id),
+        };
+
+        let server_arc = self.get_or_insert(conversation_id, socket_path).await;
 
         let mut server = server_arc.write().await;
         // Probe under the per-conversation write lock — the only
@@ -335,7 +376,11 @@ impl TmuxRegistry {
     /// Get-or-create the entry without driving probe/spawn. Internal
     /// helper for `ensure_live`; not exposed because callers should
     /// always go through the probe-and-act sequence.
-    async fn get_or_insert(&self, conversation_id: &str) -> Arc<RwLock<TmuxServer>> {
+    async fn get_or_insert(
+        &self,
+        conversation_id: &str,
+        socket_path: PathBuf,
+    ) -> Arc<RwLock<TmuxServer>> {
         {
             let map = self.inner.read().await;
             if let Some(entry) = map.get(conversation_id) {
@@ -346,10 +391,7 @@ impl TmuxRegistry {
         if let Some(entry) = map.get(conversation_id) {
             return entry.clone();
         }
-        let entry = Arc::new(RwLock::new(TmuxServer::new(
-            conversation_id,
-            &self.socket_dir,
-        )));
+        let entry = Arc::new(RwLock::new(TmuxServer::new(conversation_id, socket_path)));
         map.insert(conversation_id.to_string(), entry.clone());
         entry
     }
@@ -357,15 +399,34 @@ impl TmuxRegistry {
     /// Best-effort tear-down of a conversation's tmux server, called
     /// from the bedrock hard-delete cascade (task 02696).
     ///
-    /// Postcondition: registry has no entry for `conversation_id`,
-    /// socket file is gone, and the tmux server process is gone.
-    /// Failures of `kill-server` (server already dead) and `remove_file`
-    /// (file already gone) are non-fatal; the cascade orchestrator
-    /// surfaces them via the structured error.
+    /// `worktree_path` is used only as a fallback when no registry entry
+    /// exists (same keying logic as `ensure_live`). Pass `None` for
+    /// Direct-mode conversations.
+    ///
+    /// `continued_in_conv_id`: if `Some` AND `worktree_path` is also `Some`,
+    /// the conversation's worktree was transferred to a continuation — the
+    /// tmux session keyed off that worktree path is still live for the
+    /// continuation, so we skip the kill and unlink entirely (task 03001).
+    /// The registry entry is still removed.
+    ///
+    /// For Direct conversations (no worktree, socket keyed off `conv-{id}`),
+    /// preservation is a category error: the continuation has its own
+    /// `conversation_id` and cannot reattach to a `conv-{parent_id}.sock`,
+    /// so we tear the server down even when `continued_in_conv_id.is_some()`.
+    ///
+    /// Postcondition: registry has no entry for `conversation_id`.
+    /// If `continued_in_conv_id` is None: socket file is gone and the
+    /// tmux server process is gone. Failures of `kill-server` (server
+    /// already dead) and `remove_file` (file already gone) are non-fatal.
     ///
     /// REQ-TMUX-007.
     #[allow(dead_code)] // Wired up in task 02696 (bedrock hard-delete cascade).
-    pub async fn cascade_on_delete(&self, conversation_id: &str) -> CascadeReport {
+    pub async fn cascade_on_delete(
+        &self,
+        conversation_id: &str,
+        worktree_path: Option<&Path>,
+        continued_in_conv_id: Option<&str>,
+    ) -> CascadeReport {
         let entry = {
             let mut map = self.inner.write().await;
             map.remove(conversation_id)
@@ -378,8 +439,33 @@ impl TmuxRegistry {
             // No registry entry — fall back to the deterministic path so
             // we still attempt cleanup of any orphaned socket from a
             // prior process.
-            socket_path_for(&self.socket_dir, conversation_id)
+            match worktree_path {
+                Some(wt) => socket_path_for_worktree(&self.socket_dir, wt),
+                None => socket_path_for(&self.socket_dir, conversation_id),
+            }
         };
+
+        // If the worktree was transferred to a continuation, leave the
+        // tmux server running — the continuation owns it now.
+        //
+        // Preservation is only valid when the socket is keyed off a
+        // worktree path the continuation also uses; for Direct conversations
+        // the socket is keyed off the (now-deleted) parent conversation_id
+        // and the continuation cannot reattach, so we fall through to the
+        // normal kill+unlink path.
+        if continued_in_conv_id.is_some() && worktree_path.is_some() {
+            tracing::debug!(
+                conv_id = %conversation_id,
+                continuation = %continued_in_conv_id.unwrap_or(""),
+                socket = %socket_path.display(),
+                "tmux: skipping server kill — worktree transferred to continuation (task 03001)"
+            );
+            return CascadeReport {
+                socket_path,
+                kill_server_error: None,
+                unlink_error: None,
+            };
+        }
 
         let mut report = CascadeReport {
             socket_path: socket_path.clone(),
@@ -449,15 +535,19 @@ pub struct CascadeReport {
 }
 
 /// Convenience function for the bedrock cascade orchestrator (task
-/// 02696). Equivalent to `registry.cascade_on_delete(conv_id).await` —
+/// 02696). Equivalent to `registry.cascade_on_delete(…).await` —
 /// kept as a free function for symmetry with the bash registry's
 /// `remove_conversation` API.
 #[allow(dead_code)] // Wired up in task 02696.
 pub async fn cascade_tmux_on_delete(
     registry: &Arc<TmuxRegistry>,
     conversation_id: &str,
+    worktree_path: Option<&Path>,
+    continued_in_conv_id: Option<&str>,
 ) -> CascadeReport {
-    registry.cascade_on_delete(conversation_id).await
+    registry
+        .cascade_on_delete(conversation_id, worktree_path, continued_in_conv_id)
+        .await
 }
 
 /// Spawn a fresh detached tmux session named `main` against
@@ -535,6 +625,45 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn socket_path_for_worktree_is_deterministic() {
+        let dir = PathBuf::from("/x/y");
+        let wt = PathBuf::from("/home/user/.phoenix-ide/worktrees/abc123");
+        let a = socket_path_for_worktree(&dir, &wt);
+        let b = socket_path_for_worktree(&dir, &wt);
+        assert_eq!(a, b);
+        // Socket name starts with "wt-" and ends with ".sock".
+        let name = a.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("wt-"), "expected wt- prefix, got {name}");
+        assert!(name.ends_with(".sock"), "expected .sock suffix, got {name}");
+    }
+
+    #[test]
+    fn socket_path_for_worktree_differs_from_conv_path() {
+        let dir = PathBuf::from("/x/y");
+        let wt = PathBuf::from("/some/worktree");
+        let wt_path = socket_path_for_worktree(&dir, &wt);
+        let conv_path = socket_path_for(&dir, "some-conv-id");
+        assert_ne!(wt_path, conv_path);
+    }
+
+    /// Pin the exact SHA-256 prefix for a fixed worktree path so a future
+    /// hash-algorithm regression (e.g. someone reverting to `DefaultHasher`)
+    /// fails loudly instead of silently re-keying every live tmux session.
+    #[test]
+    fn socket_path_for_worktree_uses_stable_sha256_prefix() {
+        let dir = PathBuf::from("/x/y");
+        let wt = PathBuf::from("/repo/.phoenix/worktrees/abc123");
+        // First 8 bytes of SHA-256("/repo/.phoenix/worktrees/abc123") as a
+        // big-endian u64. Computed once and pinned.
+        let p = socket_path_for_worktree(&dir, &wt);
+        assert_eq!(
+            p,
+            PathBuf::from("/x/y/wt-2e83c86fb0db24ce.sock"),
+            "socket path drifted — hash algorithm changed?"
+        );
+    }
+
+    #[test]
     fn socket_path_is_deterministic() {
         let dir = PathBuf::from("/x/y");
         let p = socket_path_for(&dir, "abc-123");
@@ -554,7 +683,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         assert!(matches!(
-            reg.ensure_live("conv-x", tmp.path()).await,
+            reg.ensure_live("conv-x", None, tmp.path()).await,
             Err(TmuxError::BinaryUnavailable)
         ));
     }
@@ -650,8 +779,64 @@ mod tests {
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         // No prior entry, no on-disk socket — cascade should be a no-op
         // that returns without errors.
-        let report = reg.cascade_on_delete("never-existed").await;
+        let report = reg.cascade_on_delete("never-existed", None, None).await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
+    }
+
+    /// Direct-mode (no worktree) continuations cannot inherit the parent's
+    /// `conv-{id}.sock` server — the continuation has its own conversation
+    /// id and would key a different socket. Even when `continued_in_conv_id`
+    /// is set, cascade must tear the orphan server down.
+    ///
+    /// Without the `worktree_path.is_some()` guard, this test would observe
+    /// the lingering socket file (preservation path returning early before
+    /// `remove_file`).
+    #[tokio::test]
+    async fn cascade_on_delete_direct_continuation_does_not_preserve() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        // Stage an orphaned socket file at the conv-{id} keyed path.
+        let socket_path = socket_path_for(tmp.path(), "parent-direct");
+        std::fs::write(&socket_path, b"stale").unwrap();
+        assert!(socket_path.exists(), "precondition: socket file staged");
+
+        // Direct conv (worktree_path = None) being continued. Preservation
+        // must NOT trigger — socket should be unlinked.
+        let report = reg
+            .cascade_on_delete("parent-direct", None, Some("child-conv"))
+            .await;
+        assert!(report.kill_server_error.is_none());
+        assert!(report.unlink_error.is_none());
+        assert!(
+            !socket_path.exists(),
+            "Direct continuation must not preserve socket; got lingering {}",
+            socket_path.display()
+        );
+    }
+
+    /// Worktree-backed continuations DO inherit the parent's tmux server
+    /// (socket keyed off the worktree path, which the continuation reuses).
+    /// Cascade must skip kill/unlink in this case.
+    #[tokio::test]
+    async fn cascade_on_delete_worktree_continuation_preserves_socket() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let worktree = std::path::PathBuf::from("/tmp/phoenix-test-worktree-preserve");
+        let socket_path = socket_path_for_worktree(tmp.path(), &worktree);
+        std::fs::write(&socket_path, b"live").unwrap();
+
+        let report = reg
+            .cascade_on_delete("parent-wt", Some(&worktree), Some("child-conv"))
+            .await;
+        assert!(report.kill_server_error.is_none());
+        assert!(report.unlink_error.is_none());
+        assert!(
+            socket_path.exists(),
+            "worktree-backed continuation must preserve socket at {}",
+            socket_path.display()
+        );
+        // Cleanup so the file doesn't leak into the next test run.
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

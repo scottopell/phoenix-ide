@@ -395,6 +395,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             registry,
+            None,
         )
     }
 
@@ -464,6 +465,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             registry,
+            None,
         );
 
         // First op spawns the session with `-c <cwd>`. Ask tmux for
@@ -659,6 +661,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             registry.clone(),
+            None,
         );
 
         // Issue a tmux command that will take a moment (the implicit

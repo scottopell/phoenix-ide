@@ -527,7 +527,11 @@ impl RuntimeManager {
         // Explore sub-agents are always Explore. Work sub-agents inherit
         // the parent's Work mode (branch, base_branch, worktree_path).
         let sub_conv_mode = match spec.mode {
-            SubAgentMode::Explore => ConvMode::Explore,
+            // Sub-agent Explore conversations have no worktree of their own;
+            // they share the parent's working directory and tmux server.
+            SubAgentMode::Explore => ConvMode::Explore {
+                worktree_path: None,
+            },
             SubAgentMode::Work => parent_conv.conv_mode.clone(),
         };
 
@@ -603,7 +607,7 @@ impl RuntimeManager {
         conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
 
@@ -790,7 +794,7 @@ impl RuntimeManager {
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
 
@@ -823,7 +827,7 @@ impl RuntimeManager {
         } else {
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {
-                ConvMode::Explore => {
+                ConvMode::Explore { .. } => {
                     if self.platform.has_sandbox() {
                         ToolRegistry::explore_with_sandbox()
                     } else {
@@ -1072,7 +1076,7 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
 fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
     match mode {
-        ConvMode::Explore => ModeContext::Explore,
+        ConvMode::Explore { .. } => ModeContext::Explore,
         ConvMode::Work {
             branch_name,
             base_branch,

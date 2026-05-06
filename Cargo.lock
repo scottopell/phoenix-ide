@@ -2006,6 +2006,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "socket2",
  "sqlx",

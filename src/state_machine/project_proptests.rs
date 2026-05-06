@@ -192,7 +192,7 @@ mod tests {
     fn is_valid_mode_transition(from: &ConvMode, to: &ConvMode) -> bool {
         matches!(
             (from, to),
-            (ConvMode::Explore, ConvMode::Work { .. })
+            (ConvMode::Explore { .. }, ConvMode::Work { .. })
                 | (ConvMode::Direct, ConvMode::Branch { .. })
         )
     }
@@ -203,7 +203,10 @@ mod tests {
         #[test]
         fn prop_terminal_modes_reject_transitions(mode in arb_work_mode()) {
             // Work is a terminal mode -- cannot transition to anything
-            prop_assert!(!is_valid_mode_transition(&mode, &ConvMode::Explore));
+            let explore = ConvMode::Explore {
+                worktree_path: None,
+            };
+            prop_assert!(!is_valid_mode_transition(&mode, &explore));
             prop_assert!(!is_valid_mode_transition(&mode, &ConvMode::Direct));
             // Cannot transition Work -> Work (different fields)
             let other_work = ConvMode::Work {

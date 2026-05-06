@@ -686,7 +686,14 @@ async fn create_conversation(
             Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
         };
 
-        (crate::db::ConvMode::Explore, worktree_path)
+        let worktree_nes = crate::db::NonEmptyString::new(&worktree_path)
+            .map_err(|_| AppError::Internal("managed worktree path was empty".to_string()))?;
+        (
+            crate::db::ConvMode::Explore {
+                worktree_path: Some(worktree_nes),
+            },
+            worktree_path,
+        )
     } else {
         (crate::db::ConvMode::Direct, req.cwd.clone())
     };
@@ -716,7 +723,7 @@ async fn create_conversation(
         .cheap_model_id_for_provider(registry_default);
     let resolved_model = req.model.as_deref().map_or_else(
         || {
-            if matches!(conv_mode, crate::db::ConvMode::Explore) {
+            if matches!(conv_mode, crate::db::ConvMode::Explore { .. }) {
                 cheap_for_explore
             } else {
                 registry_default.to_string()
@@ -1909,9 +1916,22 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     }
 
     // Step 3: tmux server.
-    let tmux_report =
-        crate::tools::tmux::registry::cascade_tmux_on_delete(state.runtime.tmux_registry(), id)
-            .await;
+    //
+    // worktree_path for socket keying (task 03001): use the typed worktree
+    // field for Work/Branch, cwd for Explore (REQ-PROJ-028 guarantees cwd IS
+    // the worktree for Explore), None for Direct. Mirrors the Explore
+    // fallback in src/terminal/ws.rs — without it, the cascade looks up the
+    // wrong (conv-{id}.sock) deterministic socket and the actual
+    // wt-{hash}.sock tmux server is orphaned.
+    let tmux_worktree_buf: Option<std::path::PathBuf> =
+        conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
+    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
+        state.runtime.tmux_registry(),
+        id,
+        tmux_worktree_buf.as_deref(),
+        conv.continued_in_conv_id.as_deref(),
+    )
+    .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
         let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
         tracing::warn!(
@@ -1991,18 +2011,21 @@ struct CascadeProjectsReport {
 ///
 /// No-op cases:
 ///   - `ConvMode::Direct` — no worktree was ever created.
-///   - `ConvMode::Explore` — pre-approval Explore conversations may have
-///     a temp worktree; this is currently created lazily and torn down
-///     on terminal-state transition (see `ExploreWorktreeCleanupOnTerminal`).
-///     Hard-delete may still race a non-terminal Explore worktree, but
-///     `ConvMode::Explore` carries no `worktree_path` field — there's
-///     nothing structurally addressable to remove here. If Explore
-///     worktree state migrates onto the mode in future, expand this
-///     branch.
+///   - `ConvMode::Explore { worktree_path: None }` — sub-agent Explore;
+///     no worktree of its own (REQ-PROJ-008 sub-agents share the parent's).
 ///   - Already-terminal Work/Branch conversations — abandon /
 ///     mark-merged already removed the worktree at terminal transition.
 ///     We still attempt removal (it's idempotent) so a partial-failure
 ///     prior abandon gets a second chance.
+///
+/// Explore-with-worktree (top-level managed): the worktree is normally torn
+/// down on terminal-state transition (`cleanup_worktree_if_present`). Hard-
+/// delete short-circuits that path — the row is removed before the executor
+/// reaches Terminal — so this cascade must remove the worktree itself, plus
+/// the temporary `task-pending-{id_prefix}` branch that
+/// `create_managed_explore_worktree_blocking` created (REQ-PROJ-028). The
+/// branch was never promoted to a real task branch; it would otherwise
+/// linger as a dangling ref.
 async fn cascade_projects_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
@@ -2018,7 +2041,22 @@ async fn cascade_projects_on_delete(
             worktree_path,
             ..
         } => (branch_name.to_string(), worktree_path.to_string(), false),
-        ConvMode::Direct | ConvMode::Explore => return CascadeProjectsReport::default(),
+        ConvMode::Explore {
+            worktree_path: Some(wt),
+        } => {
+            // Top-level managed Explore: temp branch follows the
+            // REQ-PROJ-028 naming scheme. `is_work_mode = true` so the
+            // blocking closure also runs `branch -D` on it.
+            let id_prefix: String = conv.id.chars().take(8).collect();
+            let temp_branch = format!("task-pending-{id_prefix}");
+            (temp_branch, wt.to_string(), true)
+        }
+        ConvMode::Direct
+        | ConvMode::Explore {
+            worktree_path: None,
+        } => {
+            return CascadeProjectsReport::default();
+        }
     };
 
     let mut report = CascadeProjectsReport {
