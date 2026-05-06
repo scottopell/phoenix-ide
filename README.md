@@ -131,29 +131,30 @@ https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x
 | `ANTHROPIC_API_KEY` | Direct Anthropic API key (alternative to gateway) | — |
 | `PHOENIX_PORT` | Server port | `8000` |
 | `PHOENIX_DB_PATH` | SQLite database path | `~/.phoenix-ide/phoenix.db` |
-| `PHOENIX_TLS` | HTTPS mode: `auto` for Phoenix-managed local CA, `manual` with cert/key paths, or `off` | `off` |
+| `PHOENIX_TLS` | HTTPS mode: `auto`/`on`/`true`/`1`, `manual`, or `off`/`none`/`false`/`0` | `off` |
 | `PHOENIX_TLS_HOSTS` | Comma-separated extra DNS/IP SANs for `PHOENIX_TLS=auto` | `localhost,127.0.0.1,::1` |
-| `PHOENIX_TLS_DIR` | Managed local CA and leaf certificate directory | next to the Phoenix DB |
-| `PHOENIX_TLS_CERT_PATH` | Manual TLS certificate PEM path | — |
-| `PHOENIX_TLS_KEY_PATH` | Manual TLS private key PEM path | — |
-| `PHOENIX_PUBLIC_URL` | Display URL used by `./dev.py prod status`/deploy output | derived from TLS mode |
+| `PHOENIX_TLS_DIR` | Managed local CA and auto-issued leaf certificate directory | parent of `PHOENIX_DB_PATH` + `/tls` |
+| `PHOENIX_TLS_CERT_PATH` | Manual TLS certificate PEM path; with key path, enables manual TLS even if `PHOENIX_TLS` is unset | — |
+| `PHOENIX_TLS_KEY_PATH` | Manual TLS private key PEM path; required with cert path | — |
+| `PHOENIX_PUBLIC_URL` | Display URL used by `./dev.py prod status`/deploy output; not read by the Rust server | derived from TLS mode |
 | `RUST_LOG` | Log level (`info`, `debug`, …) | — |
 
 TLS is opt-in. `PHOENIX_TLS=auto` creates a private Phoenix CA in
 `PHOENIX_TLS_DIR` if one is not already present, then rotates the server leaf
 certificate on startup. `PHOENIX_TLS=manual` serves the cert/key paths exactly as
 configured; this is what `./dev.py tls install` writes for remote production
-hosts.
+hosts. See [TLS.md](TLS.md) for the complete trust and deployment workflow.
 
 ## API Endpoints
 
 - `GET /api/conversations` - List all conversations
-- `POST /api/conversations` - Create new conversation
+- `POST /api/conversations/new` - Create new conversation
 - `GET /api/conversations/:id` - Get conversation details
 - `POST /api/conversations/:id/messages` - Send a message
-- `GET /api/conversations/:id/events` - SSE stream for real-time updates
+- `GET /api/conversations/:id/stream` - SSE stream for real-time updates
 
 ## Documentation
 
 - `specs/` — Per-tool and subsystem specs using the [spEARS methodology](SPEARS.md)
+- [TLS.md](TLS.md) — HTTPS, HTTP/2, private CA, and deployment workflow
 - [AGENTS.md](AGENTS.md) — Agent architecture and conventions
