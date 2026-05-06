@@ -90,6 +90,11 @@ export type ChainAction =
       partialAnswer: string | null;
     }
   | { type: 'INFLIGHT_DROP'; chainQaId: string }
+  // Submit happens against a client-minted temp id so the optimistic
+  // card appears synchronously; when the POST returns the real server
+  // id we rekey the entry so subsequent SSE token events (keyed on the
+  // server id) find it.
+  | { type: 'INFLIGHT_RECONCILE_ID'; tempId: string; realId: string }
 
   // Draft + UI affordances.
   | { type: 'DRAFT_CHANGED'; value: string }
@@ -203,6 +208,41 @@ export function chainReducer(atom: ChainAtom, action: ChainAction): ChainAtom {
         ...atom,
         inflight: next,
         inflightOrder: atom.inflightOrder.filter((id) => id !== action.chainQaId),
+      };
+    }
+
+    case 'INFLIGHT_RECONCILE_ID': {
+      // Rekey an optimistically-added entry from its client-minted temp
+      // id to the server-issued real id. SSE token events arrive keyed
+      // on the server id, so they need to find the entry under the new
+      // key. If `tempId === realId` (server happened to match what we
+      // minted, vanishingly unlikely but possible in tests) this is a
+      // no-op; if `tempId` is unknown the entire dispatch is a no-op
+      // (defensive against double-fire).
+      if (action.tempId === action.realId) return atom;
+      const entry = atom.inflight[action.tempId];
+      if (!entry) return atom;
+      // If something already lives under realId (e.g. a sibling-tab
+      // race) leave it alone and drop the temp — the persisted row
+      // will arrive via refetch.
+      if (atom.inflight[action.realId]) {
+        const stripped = { ...atom.inflight };
+        delete stripped[action.tempId];
+        return {
+          ...atom,
+          inflight: stripped,
+          inflightOrder: atom.inflightOrder.filter((id) => id !== action.tempId),
+        };
+      }
+      const nextInflight = { ...atom.inflight };
+      delete nextInflight[action.tempId];
+      nextInflight[action.realId] = { ...entry, chainQaId: action.realId };
+      return {
+        ...atom,
+        inflight: nextInflight,
+        inflightOrder: atom.inflightOrder.map((id) =>
+          id === action.tempId ? action.realId : id,
+        ),
       };
     }
 

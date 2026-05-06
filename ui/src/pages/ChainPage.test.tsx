@@ -22,6 +22,7 @@ import {
 } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom';
 import { ChainPage } from './ChainPage';
+import { ChainProvider } from '../chain';
 import type {
   ChainView,
   ChainQaRow,
@@ -125,13 +126,15 @@ const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
 
 function renderAt(rootId: string) {
   return render(
-    <MemoryRouter initialEntries={[`/chains/${rootId}`]}>
-      <Routes>
-        <Route path="/chains/:rootConvId" element={<ChainPage />} />
-        <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
-        <Route path="/" element={<div data-testid="home">home</div>} />
-      </Routes>
-    </MemoryRouter>,
+    <ChainProvider>
+      <MemoryRouter initialEntries={[`/chains/${rootId}`]}>
+        <Routes>
+          <Route path="/chains/:rootConvId" element={<ChainPage />} />
+          <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
+          <Route path="/" element={<div data-testid="home">home</div>} />
+        </Routes>
+      </MemoryRouter>
+    </ChainProvider>,
   );
 }
 
@@ -306,6 +309,54 @@ describe('ChainPage — submit + stream', () => {
     const after = document.querySelectorAll('.chain-qa-list > li');
     expect(after[0]?.querySelector('textarea')).not.toBeNull();
     expect(after[1]?.textContent).toContain('we landed X then Y');
+  });
+
+  it('optimistic submit: in-flight card appears and draft clears BEFORE the POST resolves (08682)', async () => {
+    // Pre-08682, submit() awaited the POST before doing any UI mutation, so
+    // the textarea was frozen for the round-trip and the in-flight card
+    // didn't exist until the POST returned. Now: optimistic dispatch lands
+    // synchronously, POST happens in the background, INFLIGHT_RECONCILE_ID
+    // rekeys to the server's id when the POST returns.
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain());
+
+    // Hold the POST until we explicitly resolve it.
+    let resolvePost: (v: { chain_qa_id: string }) => void = () => {};
+    const postPromise = new Promise<{ chain_qa_id: string }>((res) => {
+      resolvePost = res;
+    });
+    (api.submitChainQuestion as ReturnType<typeof vi.fn>).mockReturnValueOnce(postPromise);
+
+    renderAt(ROOT_ID);
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByRole('textbox', { name: 'Question' });
+    fireEvent.change(textarea, { target: { value: 'fast question' } });
+    expect((textarea as HTMLTextAreaElement).value).toBe('fast question');
+
+    fireEvent.click(screen.getByRole('button', { name: /Ask|Sending/ }));
+
+    // CRITICAL: at this point the POST has not resolved. The optimistic
+    // dispatch should already have landed.
+    await waitFor(() => {
+      // Draft cleared.
+      expect((textarea as HTMLTextAreaElement).value).toBe('');
+    });
+    // In-flight pair card is in the DOM.
+    expect(screen.getByText('fast question')).toBeInTheDocument();
+    // Textarea is NOT disabled — the user can keep typing.
+    expect(textarea).not.toBeDisabled();
+
+    // Now resolve the POST. The reconcile rekeys the optimistic entry; the
+    // user-visible state does not flicker.
+    await act(async () => {
+      resolvePost({ chain_qa_id: 'qa-real-id' });
+      await Promise.resolve();
+    });
+    // Card still rendered after rekey.
+    expect(screen.getByText('fast question')).toBeInTheDocument();
   });
 
   it('clears the active textarea and refocuses it after submit', async () => {
@@ -550,28 +601,33 @@ describe('ChainPage — snapshot staleness (REQ-CHN-005)', () => {
   });
 });
 
-describe('ChainPage — per-rootConvId state reset (task 02703)', () => {
-  // The page is no longer remounted by `key={rootConvId}`. Instead, the
-  // synchronous reset block at the top of ChainPage clears chain-scoped state
-  // when the rootConvId param changes. This test verifies the user can never
-  // see chain A's content under chain B's selection.
+describe('ChainPage — per-rootConvId state isolation (task 08682)', () => {
+  // The page is no longer remounted by `key={rootConvId}`. Chain-scoped state
+  // lives in `ChainStore`, keyed by rootConvId, so navigating from chain A to
+  // chain B routes to a different atom — chain B's render reads chain B's
+  // state by construction, never chain A's. This test verifies the user can
+  // never see chain A's content under chain B's selection. (Pre-08682 this
+  // was enforced by a synchronous reset block in render; now it's enforced
+  // by the routed-store contract.)
   function ChainNavApp() {
     return (
-      <MemoryRouter initialEntries={[`/chains/root-A`]}>
-        <Routes>
-          <Route
-            path="/chains/:rootConvId"
-            element={
-              <>
-                <ChainPage />
-                <NavLinks />
-              </>
-            }
-          />
-          <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
-          <Route path="/" element={<div data-testid="home">home</div>} />
-        </Routes>
-      </MemoryRouter>
+      <ChainProvider>
+        <MemoryRouter initialEntries={[`/chains/root-A`]}>
+          <Routes>
+            <Route
+              path="/chains/:rootConvId"
+              element={
+                <>
+                  <ChainPage />
+                  <NavLinks />
+                </>
+              }
+            />
+            <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
+            <Route path="/" element={<div data-testid="home">home</div>} />
+          </Routes>
+        </MemoryRouter>
+      </ChainProvider>
     );
   }
 
@@ -619,8 +675,9 @@ describe('ChainPage — per-rootConvId state reset (task 02703)', () => {
     fireEvent.change(textareaA, { target: { value: 'draft for chain A' } });
     expect((textareaA as HTMLTextAreaElement).value).toBe('draft for chain A');
 
-    // Navigate to chain B. The synchronous reset block must clear the draft
-    // and the in-flight pile so we never see chain A's draft under chain B.
+    // Navigate to chain B. The atom routing means chain B's render reads
+    // chain B's atom — the previous chain A draft and any in-flight pile
+    // are isolated to atom A and don't leak.
     fireEvent.click(screen.getByTestId('go-B'));
 
     await waitFor(() => {
@@ -631,6 +688,68 @@ describe('ChainPage — per-rootConvId state reset (task 02703)', () => {
     expect((textareaB as HTMLTextAreaElement).value).toBe('');
     // Chain A's members are no longer in the DOM — confirms the swap actually
     // happened and we're not just looking at stale residue.
+    expect(screen.queryByText('Title A1')).not.toBeInTheDocument();
+    expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
+  });
+
+  it('navigation mid-stream does not corrupt the destination chain (08682 dead-atom)', async () => {
+    // Pre-08682 regression: ChainPage held `chain` in component useState; an
+    // in-flight `getChain(A)` that resolved after we navigated to B would
+    // call `setChain(viewA)` against B's component instance, painting A's
+    // members on B's page. With ChainStore the resolution dispatches
+    // `LOAD_OK` against atom A; atom B is untouched.
+    const { api } = await import('../api');
+    const chainA = makeChain({
+      root_conv_id: 'root-A',
+      chain_name: 'chain A',
+      display_name: 'chain A',
+      members: [makeMember('A1', 'root'), makeMember('A2', 'latest')],
+      current_member_count: 2,
+    });
+    const chainB = makeChain({
+      root_conv_id: 'root-B',
+      chain_name: 'chain B',
+      display_name: 'chain B',
+      members: [makeMember('B1', 'root'), makeMember('B2', 'latest')],
+      current_member_count: 2,
+    });
+
+    // chainA's getChain hangs until we resolve it manually — simulating an
+    // in-flight network call that races with navigation. chainB resolves
+    // immediately.
+    let resolveA: (v: ChainView) => void = () => {};
+    const aPromise = new Promise<ChainView>((res) => {
+      resolveA = res;
+    });
+    const getChain = api.getChain as ReturnType<typeof vi.fn>;
+    getChain.mockImplementation((rootId: string) => {
+      if (rootId === 'root-A') return aPromise;
+      if (rootId === 'root-B') return Promise.resolve(chainB);
+      return Promise.reject(new Error('unknown chain'));
+    });
+
+    render(<ChainNavApp />);
+
+    // We're on chain A but the load is hanging — page shows the loading
+    // placeholder.
+    expect(await screen.findByText(/Loading chain/i)).toBeInTheDocument();
+
+    // Navigate to B before A resolves. B loads cleanly.
+    fireEvent.click(screen.getByTestId('go-B'));
+    await waitFor(() => {
+      expect(screen.getByText('Title B1')).toBeInTheDocument();
+    });
+
+    // Now resolve A's outstanding request — the dispatch lands in atom A,
+    // not in atom B. Chain B's render must remain showing chain B's data.
+    await act(async () => {
+      resolveA(chainA);
+      // Allow microtasks to flush.
+      await Promise.resolve();
+    });
+
+    // Chain B is still on screen; chain A's members never appeared.
+    expect(screen.getByText('Title B1')).toBeInTheDocument();
     expect(screen.queryByText('Title A1')).not.toBeInTheDocument();
     expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
   });

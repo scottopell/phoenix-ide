@@ -12,12 +12,17 @@
 // card refocuses for the next question. Persisted pairs render in reverse
 // chronological order below in-flight pairs.
 //
-// Optimistic-update pattern: the user submits a question, we eagerly render an
-// in-flight pair card with `answer = ''`, and SSE token events append to its
-// answer in component state. On `chain_qa_completed` / `chain_qa_failed` we
-// re-fetch the chain to pick up the canonical persisted row (which also bumps
-// `current_member_count` / `current_total_messages` if the chain advanced
-// while the question was streaming).
+// Optimistic submit (task 08682). The submit flow does NOT block on the POST:
+//   1. Mint a client-side temp id (`crypto.randomUUID()`).
+//   2. Dispatch `OPTIMISTIC_INFLIGHT_ADD` synchronously — the in-flight pair
+//      card appears, the draft clears, the textarea refocuses for the next
+//      question, all before the POST returns.
+//   3. POST `submitChainQuestion` in the background.
+//   4. On success, `INFLIGHT_RECONCILE_ID` rekeys the entry from the temp id
+//      to the server-issued real id so subsequent SSE token events find it.
+//   5. On failure, `INFLIGHT_DROP` removes the optimistic entry and
+//      `SUBMIT_FAIL` surfaces the error; the draft is preserved so the user
+//      can retry without retyping.
 //
 // REQ-CHN-006 visual independence: each Q&A entry renders as a self-contained
 // pair card with explicit `Q:` and `A:` rows — no chat-style ligatures, no
@@ -39,123 +44,88 @@ import {
   type ChainSseEventData,
 } from '../api';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
+import { useChainAtom, type InflightQa } from '../chain';
 
 // Markdown plugin set, hoisted so the array identity is stable across
 // renders (matches the pattern in StreamingMessage.tsx).
 const REMARK_PLUGINS = [remarkGfm];
 import { formatShortDateTime } from '../utils';
 
-/** Live, not-yet-persisted Q&A entry. We keep these in component state and
- *  merge them into the rendered list as if they were rows. On stream completion
- *  the entry is dropped and the persisted row from the refetched ChainView
- *  takes its place. */
-interface InflightQa {
-  chainQaId: string;
-  question: string;
-  answer: string;
-  /** True until the first token arrives — drives the skeleton vs streaming
-   *  visual split (REQ-CHN-004 pre-token vs streaming). */
-  preToken: boolean;
-  /** When the SSE stream errors, we surface the error inline and offer
-   *  re-ask while still keeping the question visible. */
-  error: string | null;
-}
-
 export function ChainPage() {
   const { rootConvId } = useParams<{ rootConvId: string }>();
   const navigate = useNavigate();
 
-  const [chain, setChain] = useState<ChainView | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [inflight, setInflight] = useState<Record<string, InflightQa>>({});
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-  // Submission order for in-flight entries. We display newest-first, so we
-  // walk this list in reverse on render. (Object key order on `inflight`
-  // alone is not a reliable ordering source — Record iteration order is not
-  // a guarantee we want to rely on for UI ordering.)
-  const [inflightOrder, setInflightOrder] = useState<string[]>([]);
-  const [draft, setDraft] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [sseLost, setSseLost] = useState(false);
-
   // ---------------------------------------------------------------------------
-  // Per-rootConvId state reset (task 02703).
-  //
-  // Previously KeyedChainPage used `key={rootConvId}` to force a fresh React
-  // tree on every chain change, which caused the entire content area to
-  // flash blank on every navigation. We instead keep the page mounted and
-  // reset chain-scoped state explicitly here. Synchronous reset ("adjust
-  // state during render":
-  // https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes)
-  // so the first render after rootConvId changes shows clean state — never
-  // content from the previous chain.
-  const [lastRootConvId, setLastRootConvId] = useState<string | undefined>(rootConvId);
-  if (lastRootConvId !== rootConvId) {
-    setLastRootConvId(rootConvId);
-    setChain(null);
-    setLoadError(null);
-    setLoading(true);
-    setInflight({});
-    setInflightOrder([]);
-    setDraft('');
-    setSubmitting(false);
-    setSseLost(false);
-    setDeleteConfirmOpen(false);
-  }
+  // Chain-scoped state lives in ChainStore (task 08682). Migrating off plain
+  // useState gave us:
+  //   - dead-atom protection on navigation (an in-flight `getChain(A)` that
+  //     resolves after navigating to chain B writes into atom A, not into
+  //     chain B's component state),
+  //   - per-key state by construction so we no longer need a synchronous
+  //     reset block on rootConvId change,
+  //   - a clean place for true optimistic submit (the dispatch is
+  //     synchronous; the POST round-trip happens in the background).
+  // ---------------------------------------------------------------------------
+  const [atom, dispatch] = useChainAtom(rootConvId ?? null);
+  const { chain, loadError, loading, inflight, inflightOrder, draft, submitting, sseLost } = atom;
+
+  // Component-local: the delete-confirm modal is a per-render-instance UI
+  // affordance, not chain state. It does not need to survive navigation
+  // (in fact: it should *not* — dialog open across nav would be a bug).
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
   // Imperative handle to the active pair's textarea so we can refocus it
   // immediately after submit (the user agreed they should be able to type the
   // next question without waiting for the answer).
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Keep a ref so SSE callbacks can append tokens without re-subscribing.
-  const inflightRef = useRef(inflight);
-  inflightRef.current = inflight;
-
-  /** Refresh the chain snapshot. Used after submit/complete/fail and on the
-   *  first mount. Network failure does not blow the page away if we already
-   *  have a snapshot — REQ-CHN-005 says history should persist. */
-  const refresh = useCallback(async (rootId: string) => {
-    try {
-      const view = await api.getChain(rootId);
-      setChain(view);
-      setLoadError(null);
-      return view;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to load chain';
-      setLoadError(msg);
-      return null;
-    }
-  }, []);
+  /** Refresh the chain snapshot. Used after submit/complete/fail. The atom
+   *  routing (08682) makes this safe across navigation: an in-flight
+   *  `getChain(rootId)` that resolves after we navigate elsewhere
+   *  dispatches LOAD_OK against atom `rootId`, not against whichever atom
+   *  is currently active.
+   *
+   *  Network failure does not blow the page away if we already have a
+   *  snapshot — the reducer's LOAD_FAIL preserves `chain`. */
+  const refresh = useCallback(
+    async (rootId: string) => {
+      try {
+        const view = await api.getChain(rootId);
+        dispatch({ type: 'LOAD_OK', view });
+        return view;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to load chain';
+        dispatch({ type: 'LOAD_FAIL', error: msg });
+        return null;
+      }
+    },
+    [dispatch],
+  );
 
   // Initial load.
   useEffect(() => {
     if (!rootConvId) return;
+    dispatch({ type: 'LOAD_BEGIN' });
     let cancelled = false;
-    setLoading(true);
     api
       .getChain(rootConvId)
       .then((view) => {
         if (cancelled) return;
-        setChain(view);
-        setLoadError(null);
+        dispatch({ type: 'LOAD_OK', view });
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setLoadError(err instanceof Error ? err.message : 'Failed to load chain');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+        const msg = err instanceof Error ? err.message : 'Failed to load chain';
+        dispatch({ type: 'LOAD_FAIL', error: msg });
       });
     return () => {
       cancelled = true;
     };
-  }, [rootConvId]);
+  }, [rootConvId, dispatch]);
 
   // SSE subscription. We open one EventSource for the chain and demux events
-  // by chain_qa_id against our own in-flight buffer. Close on unmount or root
-  // change so leaving the page tears down the connection cleanly.
+  // by chain_qa_id against the atom's in-flight buffer. Close on unmount or
+  // root change so leaving the page tears down the connection cleanly.
   useEffect(() => {
     if (!rootConvId) return;
 
@@ -164,58 +134,30 @@ export function ChainPage() {
       // Sibling-tab Q&A on the same chain falls through to a refetch when it
       // completes — but its tokens never bleed into our buffer.
       if (evt.type === 'chain_qa_token') {
-        setInflight((prev) => {
-          const cur = prev[evt.chain_qa_id];
-          if (!cur) return prev;
-          return {
-            ...prev,
-            [evt.chain_qa_id]: {
-              ...cur,
-              answer: cur.answer + evt.delta,
-              preToken: false,
-            },
-          };
+        dispatch({
+          type: 'TOKEN_APPENDED',
+          chainQaId: evt.chain_qa_id,
+          delta: evt.delta,
         });
       } else if (evt.type === 'chain_qa_completed') {
         // Drop the in-flight entry and refetch to pick up the persisted row.
-        setInflight((prev) => {
-          if (!(evt.chain_qa_id in prev)) return prev;
-          const next = { ...prev };
-          delete next[evt.chain_qa_id];
-          return next;
-        });
-        setInflightOrder((prev) => prev.filter((id) => id !== evt.chain_qa_id));
+        dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
         // Refetch so the persisted ChainQaRow replaces the optimistic entry.
         // Even for sibling-tab questions, refetching is the simplest way to
         // surface their newly-persisted answer.
         void refresh(rootConvId);
       } else if (evt.type === 'chain_qa_failed') {
-        setInflight((prev) => {
-          const cur = prev[evt.chain_qa_id];
-          if (!cur) return prev;
-          return {
-            ...prev,
-            [evt.chain_qa_id]: {
-              ...cur,
-              answer: evt.partial_answer ?? cur.answer,
-              error: evt.error,
-              preToken: false,
-            },
-          };
+        dispatch({
+          type: 'INFLIGHT_FAIL',
+          chainQaId: evt.chain_qa_id,
+          error: evt.error,
+          partialAnswer: evt.partial_answer ?? null,
         });
         // Refetch: server has persisted the failed row with `status=failed`,
         // so on next render we let the persisted row drive UI and drop our
         // optimistic entry.
         void refresh(rootConvId).then(() => {
-          setInflight((prev) => {
-            if (!(evt.chain_qa_id in prev)) return prev;
-            const next = { ...prev };
-            delete next[evt.chain_qa_id];
-            return next;
-          });
-          setInflightOrder((prev) =>
-            prev.filter((id) => id !== evt.chain_qa_id),
-          );
+          dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
         });
       }
     };
@@ -223,53 +165,68 @@ export function ChainPage() {
     const handleErr = () => {
       // EventSource will auto-reconnect on its own. We surface a "connection
       // lost" affordance only if there is in-flight work that depends on it.
-      if (Object.keys(inflightRef.current).length > 0) {
-        setSseLost(true);
+      // Reading from the atom on every error is fine — atoms are read via
+      // the routed store and reflect the latest dispatched state.
+      if (Object.keys(atom.inflight).length > 0) {
+        dispatch({ type: 'SSE_LOST' });
       }
     };
 
     const es = subscribeToChainStream(rootConvId, handleEvent, handleErr);
-    setSseLost(false);
+    dispatch({ type: 'SSE_RESTORED' });
     return () => es.close();
-  }, [rootConvId, refresh]);
+    // `atom.inflight` intentionally omitted from deps: re-subscribing on
+    // every in-flight change would close and re-open the EventSource
+    // mid-stream. The closure reads `atom.inflight` only inside `handleErr`,
+    // and reading a stale value there is acceptable (the next error will
+    // see the current value via the latest closure).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rootConvId, dispatch, refresh]);
 
+  /**
+   * Optimistic submit (task 08682 acceptance criterion).
+   *
+   * The dispatch happens synchronously before the POST so the in-flight
+   * pair card is in the DOM and the draft is cleared *immediately* on
+   * click. The textarea stays enabled across the round-trip; the
+   * `submitting` flag drives only the Ask button label and not the
+   * textarea's disabled prop. When the POST returns the real chain_qa_id,
+   * we rekey the optimistic entry so subsequent SSE tokens find it.
+   */
   const submit = useCallback(
     async (question: string) => {
       if (!rootConvId || !chain) return;
       const trimmed = question.trim();
       if (!trimmed) return;
-      setSubmitting(true);
+
+      const tempId = `temp-${crypto.randomUUID()}`;
+      // Synchronous: card appears + draft clears in the next render.
+      dispatch({ type: 'OPTIMISTIC_INFLIGHT_ADD', chainQaId: tempId, question: trimmed });
+      dispatch({ type: 'SUBMIT_BEGIN' });
+      // Refocus the active textarea immediately so the user can type the next
+      // question while the POST is in flight. Defer to a microtask so React
+      // has a chance to flush the value reset before we steal focus back.
+      queueMicrotask(() => {
+        activeTextareaRef.current?.focus();
+      });
+
       try {
         const { chain_qa_id } = await api.submitChainQuestion(rootConvId, trimmed);
-        setInflight((prev) => ({
-          ...prev,
-          [chain_qa_id]: {
-            chainQaId: chain_qa_id,
-            question: trimmed,
-            answer: '',
-            preToken: true,
-            error: null,
-          },
-        }));
-        setInflightOrder((prev) => [...prev, chain_qa_id]);
-        setDraft('');
-        // Refocus the active textarea so the user can immediately type the
-        // next question. We're reusing the same DOM node; it just got cleared.
-        // Defer to a microtask so React has a chance to flush the value reset
-        // before we steal focus back.
-        queueMicrotask(() => {
-          activeTextareaRef.current?.focus();
-        });
+        // Rekey the optimistic entry to the server's real id. Subsequent
+        // SSE token events keyed on chain_qa_id will now find it.
+        dispatch({ type: 'INFLIGHT_RECONCILE_ID', tempId, realId: chain_qa_id });
+        dispatch({ type: 'SUBMIT_OK' });
       } catch (err) {
-        // Surface the error to the user via a transient banner but keep the
-        // draft so they can retry without retyping.
         const msg = err instanceof Error ? err.message : 'Failed to submit question';
-        setLoadError(msg);
-      } finally {
-        setSubmitting(false);
+        // Drop the optimistic card and surface the error. The draft was
+        // already cleared in OPTIMISTIC_INFLIGHT_ADD; restore it so the
+        // user can retry without retyping.
+        dispatch({ type: 'INFLIGHT_DROP', chainQaId: tempId });
+        dispatch({ type: 'DRAFT_SET', value: trimmed });
+        dispatch({ type: 'SUBMIT_FAIL', error: msg });
       }
     },
-    [rootConvId, chain],
+    [rootConvId, chain, dispatch],
   );
 
   const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
@@ -281,11 +238,16 @@ export function ChainPage() {
    *  focus it. Do NOT auto-submit — REQ-CHN-007's editing pattern preserves
    *  user agency, and consistency with that precedent matters here. */
   const handleReask = (question: string) => {
-    setDraft(question);
+    dispatch({ type: 'DRAFT_SET', value: question });
     queueMicrotask(() => {
       activeTextareaRef.current?.focus();
     });
   };
+
+  const setDraft = useCallback(
+    (value: string) => dispatch({ type: 'DRAFT_CHANGED', value }),
+    [dispatch],
+  );
 
   // Persisted rows in chronological order (oldest first). We reverse on render
   // so the newest persisted card sits just below in-flight cards. In-flight
@@ -345,11 +307,12 @@ export function ChainPage() {
           if (!rootConvId) return;
           try {
             const updated = await api.setChainName(rootConvId, name);
-            setChain(updated);
+            dispatch({ type: 'LOAD_OK', view: updated });
           } catch (err) {
-            setLoadError(
-              err instanceof Error ? err.message : 'Failed to rename chain',
-            );
+            dispatch({
+              type: 'LOAD_FAIL',
+              error: err instanceof Error ? err.message : 'Failed to rename chain',
+            });
           }
         }}
         onArchiveToggle={async () => {
@@ -362,13 +325,15 @@ export function ChainPage() {
             }
             navigate('/');
           } catch (err) {
-            setLoadError(
-              err instanceof Error
-                ? err.message
-                : chain.archived
-                  ? 'Failed to unarchive chain'
-                  : 'Failed to archive chain',
-            );
+            dispatch({
+              type: 'LOAD_FAIL',
+              error:
+                err instanceof Error
+                  ? err.message
+                  : chain.archived
+                    ? 'Failed to unarchive chain'
+                    : 'Failed to archive chain',
+            });
           }
         }}
         onDelete={() => setDeleteConfirmOpen(true)}
@@ -397,7 +362,7 @@ export function ChainPage() {
             // Force the SSE effect to re-run by re-fetching first; the
             // EventSource itself will already be auto-reconnecting under the
             // hood, but this gives the user a clear "I tried" affordance.
-            setSseLost(false);
+            dispatch({ type: 'SSE_RESTORED' });
             if (rootConvId) void refresh(rootConvId);
           }}
         />
@@ -412,9 +377,10 @@ export function ChainPage() {
             setDeleteConfirmOpen(false);
             navigate('/');
           } catch (err) {
-            setLoadError(
-              err instanceof Error ? err.message : 'Failed to delete chain',
-            );
+            dispatch({
+              type: 'LOAD_FAIL',
+              error: err instanceof Error ? err.message : 'Failed to delete chain',
+            });
             setDeleteConfirmOpen(false);
           }
         }}
@@ -775,7 +741,9 @@ function ActivePairCard({
               }}
               placeholder="Ask the chain a question…"
               rows={2}
-              disabled={submitting}
+              // Task 08682: textarea is never disabled mid-keystroke. The
+              // submit flow is now optimistic; the user can type their
+              // next question while a previous one is still POST-ing.
               aria-label="Question"
             />
           </div>

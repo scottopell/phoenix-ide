@@ -239,4 +239,74 @@ describe('chainReducer', () => {
       expect(restored.sseLost).toBe(false);
     });
   });
+
+  describe('INFLIGHT_RECONCILE_ID', () => {
+    it('rekeys the entry from temp id to real id, preserving order slot', () => {
+      let atom = dispatch(createInitialChainAtom(), {
+        type: 'OPTIMISTIC_INFLIGHT_ADD',
+        chainQaId: 'temp-1',
+        question: 'q',
+      });
+      atom = dispatch(atom, { type: 'TOKEN_APPENDED', chainQaId: 'temp-1', delta: 'partial' });
+      atom = dispatch(atom, {
+        type: 'INFLIGHT_RECONCILE_ID',
+        tempId: 'temp-1',
+        realId: 'qa-real-7',
+      });
+      expect(atom.inflight['temp-1']).toBeUndefined();
+      expect(atom.inflight['qa-real-7']).toBeDefined();
+      // The accumulated answer carries over.
+      expect(atom.inflight['qa-real-7']?.answer).toBe('partial');
+      // The chainQaId field on the entry now points at the real id.
+      expect(atom.inflight['qa-real-7']?.chainQaId).toBe('qa-real-7');
+      // Order slot rekeyed in place.
+      expect(atom.inflightOrder).toEqual(['qa-real-7']);
+    });
+
+    it('is a no-op when temp id is unknown', () => {
+      const atom = createInitialChainAtom();
+      const next = dispatch(atom, {
+        type: 'INFLIGHT_RECONCILE_ID',
+        tempId: 'never-existed',
+        realId: 'whatever',
+      });
+      expect(next).toBe(atom);
+    });
+
+    it('is a no-op when temp id equals real id', () => {
+      let atom = dispatch(createInitialChainAtom(), {
+        type: 'OPTIMISTIC_INFLIGHT_ADD',
+        chainQaId: 'same',
+        question: 'q',
+      });
+      const before = atom;
+      atom = dispatch(atom, {
+        type: 'INFLIGHT_RECONCILE_ID',
+        tempId: 'same',
+        realId: 'same',
+      });
+      expect(atom).toBe(before);
+    });
+
+    it('drops temp entry if real id already occupied (sibling-tab race)', () => {
+      let atom = dispatch(createInitialChainAtom(), {
+        type: 'OPTIMISTIC_INFLIGHT_ADD',
+        chainQaId: 'temp-1',
+        question: 'mine',
+      });
+      atom = dispatch(atom, {
+        type: 'OPTIMISTIC_INFLIGHT_ADD',
+        chainQaId: 'qa-real-7',
+        question: 'sibling',
+      });
+      atom = dispatch(atom, {
+        type: 'INFLIGHT_RECONCILE_ID',
+        tempId: 'temp-1',
+        realId: 'qa-real-7',
+      });
+      expect(atom.inflight['temp-1']).toBeUndefined();
+      expect(atom.inflight['qa-real-7']?.question).toBe('sibling');
+      expect(atom.inflightOrder).toEqual(['qa-real-7']);
+    });
+  });
 });
