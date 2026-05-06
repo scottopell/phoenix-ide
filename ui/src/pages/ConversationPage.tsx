@@ -535,7 +535,7 @@ function ConversationPageContent() {
   };
 
   const handleTriggerContinuation = async () => {
-    if (!conversationId || atom.phase.type !== 'idle') return;
+    if (!conversationId) return;
 
     try {
       await api.triggerContinuation(conversationId);
