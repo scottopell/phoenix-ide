@@ -67,7 +67,7 @@ Companion to:
 - 02704 (bounded-sse-stream-lifetime) — fixes the per-origin
   saturation class. Doesn't catch leaks because EventSource
   reconnects on the lifetime boundary.
-- 02703 (shutdown-sse-deadline) — same surface area, different angle.
+- 02708 (shutdown-sse-deadline) — same surface area, different angle.
 
 The actual driver-side fix lives in the agent-browser tool, not this
 repo. This task is the phoenix-side observability that would have

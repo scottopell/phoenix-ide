@@ -57,7 +57,7 @@ mostly free.
 ## Notes
 
 Companion tasks:
-- shutdown-sse-deadline (02703): bound the same hang at process exit
+- shutdown-sse-deadline (02708): bound the same hang at process exit
 - http2-tls (TBD): structural fix that eliminates the 6-connection
   limit entirely via HTTP/2 stream multiplexing — bigger project
   (requires TLS) and only worth doing if the lifetime fix here proves

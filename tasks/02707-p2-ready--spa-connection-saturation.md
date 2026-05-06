@@ -153,7 +153,7 @@ parallel pollers again. Worth a structural audit pass.
 
 **Hot-path file.** `ui/src/conversation/useConversationsRefresh.ts`.
 
-### Task 02703-p2 — shutdown-sse-deadline (open, p2)
+### Task 02708 — shutdown-sse-deadline (open, p2)
 
 Server-side: cap graceful shutdown wait at 5–10 s so SSE clients
 can't pin the binary alive after a deploy. Independent of this task;

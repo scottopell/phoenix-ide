@@ -70,7 +70,7 @@ so TLS termination happens in the phoenix binary itself.
 
 ## Notes
 
-Filed 2026-05-05 as the structural follow-up to tasks 02703
+Filed 2026-05-05 as the structural follow-up to tasks 02708
 (shutdown-sse-deadline) and 02704 (bounded-sse-stream-lifetime). Do
 02704 first; only escalate to this task if saturation persists past
 the lifetime fix, since the cert-management overhead is real.
