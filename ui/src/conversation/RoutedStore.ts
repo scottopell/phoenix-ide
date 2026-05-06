@@ -29,6 +29,7 @@
 export class RoutedStore<K, S, A> {
   private atoms = new Map<K, S>();
   private listenersByKey = new Map<K, Set<() => void>>();
+  private anyListeners = new Set<() => void>();
   private readonly getInitial: (key: K) => S;
   private readonly reducer: (atom: S, action: A) => S;
 
@@ -80,6 +81,7 @@ export class RoutedStore<K, S, A> {
     if (next === current) return;
     this.atoms.set(key, next);
     this.notify(key);
+    this.notifyAny();
   }
 
   /**
@@ -95,6 +97,7 @@ export class RoutedStore<K, S, A> {
     if (next === current) return false;
     this.atoms.set(key, next);
     this.notify(key);
+    this.notifyAny();
     return true;
   }
 
@@ -104,10 +107,54 @@ export class RoutedStore<K, S, A> {
     return this.atoms.entries();
   }
 
+  /** Read an atom without creating one if absent. Returns undefined
+   *  for unobserved keys. Use {@link getSnapshot} when the caller wants
+   *  the lazy-create behaviour. */
+  protected atomByKey(key: K): S | undefined {
+    return this.atoms.get(key);
+  }
+
+  /** Remove an atom from the store. Notifies per-key listeners and
+   *  the any-listener if the atom existed. Returns true iff something
+   *  was removed. Listener buckets for the key are kept — future
+   *  subscriptions may still want to learn when a fresh atom is
+   *  observed under the same key. */
+  protected removeAtom(key: K): boolean {
+    if (!this.atoms.has(key)) return false;
+    this.atoms.delete(key);
+    this.notify(key);
+    this.notifyAny();
+    return true;
+  }
+
+  /**
+   * Subscribe to ANY atom change anywhere in the store. Fires once per
+   * mutation that produced a new atom reference, regardless of which
+   * key changed. List-derivation hooks (e.g. `useConversationsList`)
+   * use this so they re-derive whenever any atom in the store mutates.
+   *
+   * Note: this fires more often than per-key subscriptions — every
+   * dispatch that changes any atom triggers it. Consumers should derive
+   * a stable snapshot (e.g. with `(id, updated_at)` equality) so React
+   * elides re-renders when the derived value is unchanged.
+   */
+  subscribeAny(listener: () => void): () => void {
+    this.anyListeners.add(listener);
+    return () => {
+      this.anyListeners.delete(listener);
+    };
+  }
+
   private notify(key: K): void {
     const listeners = this.listenersByKey.get(key);
     if (!listeners) return;
     for (const listener of listeners) {
+      listener();
+    }
+  }
+
+  private notifyAny(): void {
+    for (const listener of this.anyListeners) {
       listener();
     }
   }
