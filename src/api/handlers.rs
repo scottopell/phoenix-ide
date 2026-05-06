@@ -2011,17 +2011,21 @@ struct CascadeProjectsReport {
 ///
 /// No-op cases:
 ///   - `ConvMode::Direct` — no worktree was ever created.
-///   - `ConvMode::Explore { .. }` — managed Explore conversations carry a
-///     `worktree_path` (Option, populated for top-level managed flow, None
-///     for sub-agents). The worktree is torn down on terminal-state
-///     transition (see `ExploreWorktreeCleanupOnTerminal`); cascade-delete
-///     here is a backstop. Today this branch is still no-op (Explore
-///     worktree teardown happens elsewhere); if that changes, expand here
-///     to read `worktree_path` and remove the directory.
+///   - `ConvMode::Explore { worktree_path: None }` — sub-agent Explore;
+///     no worktree of its own (REQ-PROJ-008 sub-agents share the parent's).
 ///   - Already-terminal Work/Branch conversations — abandon /
 ///     mark-merged already removed the worktree at terminal transition.
 ///     We still attempt removal (it's idempotent) so a partial-failure
 ///     prior abandon gets a second chance.
+///
+/// Explore-with-worktree (top-level managed): the worktree is normally torn
+/// down on terminal-state transition (`cleanup_worktree_if_present`). Hard-
+/// delete short-circuits that path — the row is removed before the executor
+/// reaches Terminal — so this cascade must remove the worktree itself, plus
+/// the temporary `task-pending-{id_prefix}` branch that
+/// `create_managed_explore_worktree_blocking` created (REQ-PROJ-028). The
+/// branch was never promoted to a real task branch; it would otherwise
+/// linger as a dangling ref.
 async fn cascade_projects_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
@@ -2037,7 +2041,22 @@ async fn cascade_projects_on_delete(
             worktree_path,
             ..
         } => (branch_name.to_string(), worktree_path.to_string(), false),
-        ConvMode::Direct | ConvMode::Explore { .. } => return CascadeProjectsReport::default(),
+        ConvMode::Explore {
+            worktree_path: Some(wt),
+        } => {
+            // Top-level managed Explore: temp branch follows the
+            // REQ-PROJ-028 naming scheme. `is_work_mode = true` so the
+            // blocking closure also runs `branch -D` on it.
+            let id_prefix: String = conv.id.chars().take(8).collect();
+            let temp_branch = format!("task-pending-{id_prefix}");
+            (temp_branch, wt.to_string(), true)
+        }
+        ConvMode::Direct
+        | ConvMode::Explore {
+            worktree_path: None,
+        } => {
+            return CascadeProjectsReport::default();
+        }
     };
 
     let mut report = CascadeProjectsReport {

@@ -403,10 +403,16 @@ impl TmuxRegistry {
     /// exists (same keying logic as `ensure_live`). Pass `None` for
     /// Direct-mode conversations.
     ///
-    /// `continued_in_conv_id`: if `Some`, the conversation's worktree was
-    /// transferred to a continuation — the tmux session is still live for
-    /// that continuation, so we skip the kill and unlink entirely
-    /// (task 03001). The registry entry is still removed.
+    /// `continued_in_conv_id`: if `Some` AND `worktree_path` is also `Some`,
+    /// the conversation's worktree was transferred to a continuation — the
+    /// tmux session keyed off that worktree path is still live for the
+    /// continuation, so we skip the kill and unlink entirely (task 03001).
+    /// The registry entry is still removed.
+    ///
+    /// For Direct conversations (no worktree, socket keyed off `conv-{id}`),
+    /// preservation is a category error: the continuation has its own
+    /// `conversation_id` and cannot reattach to a `conv-{parent_id}.sock`,
+    /// so we tear the server down even when `continued_in_conv_id.is_some()`.
     ///
     /// Postcondition: registry has no entry for `conversation_id`.
     /// If `continued_in_conv_id` is None: socket file is gone and the
@@ -441,7 +447,13 @@ impl TmuxRegistry {
 
         // If the worktree was transferred to a continuation, leave the
         // tmux server running — the continuation owns it now.
-        if continued_in_conv_id.is_some() {
+        //
+        // Preservation is only valid when the socket is keyed off a
+        // worktree path the continuation also uses; for Direct conversations
+        // the socket is keyed off the (now-deleted) parent conversation_id
+        // and the continuation cannot reattach, so we fall through to the
+        // normal kill+unlink path.
+        if continued_in_conv_id.is_some() && worktree_path.is_some() {
             tracing::debug!(
                 conv_id = %conversation_id,
                 continuation = %continued_in_conv_id.unwrap_or(""),
@@ -770,5 +782,61 @@ mod tests {
         let report = reg.cascade_on_delete("never-existed", None, None).await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
+    }
+
+    /// Direct-mode (no worktree) continuations cannot inherit the parent's
+    /// `conv-{id}.sock` server — the continuation has its own conversation
+    /// id and would key a different socket. Even when `continued_in_conv_id`
+    /// is set, cascade must tear the orphan server down.
+    ///
+    /// Without the `worktree_path.is_some()` guard, this test would observe
+    /// the lingering socket file (preservation path returning early before
+    /// `remove_file`).
+    #[tokio::test]
+    async fn cascade_on_delete_direct_continuation_does_not_preserve() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        // Stage an orphaned socket file at the conv-{id} keyed path.
+        let socket_path = socket_path_for(tmp.path(), "parent-direct");
+        std::fs::write(&socket_path, b"stale").unwrap();
+        assert!(socket_path.exists(), "precondition: socket file staged");
+
+        // Direct conv (worktree_path = None) being continued. Preservation
+        // must NOT trigger — socket should be unlinked.
+        let report = reg
+            .cascade_on_delete("parent-direct", None, Some("child-conv"))
+            .await;
+        assert!(report.kill_server_error.is_none());
+        assert!(report.unlink_error.is_none());
+        assert!(
+            !socket_path.exists(),
+            "Direct continuation must not preserve socket; got lingering {}",
+            socket_path.display()
+        );
+    }
+
+    /// Worktree-backed continuations DO inherit the parent's tmux server
+    /// (socket keyed off the worktree path, which the continuation reuses).
+    /// Cascade must skip kill/unlink in this case.
+    #[tokio::test]
+    async fn cascade_on_delete_worktree_continuation_preserves_socket() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let worktree = std::path::PathBuf::from("/tmp/phoenix-test-worktree-preserve");
+        let socket_path = socket_path_for_worktree(tmp.path(), &worktree);
+        std::fs::write(&socket_path, b"live").unwrap();
+
+        let report = reg
+            .cascade_on_delete("parent-wt", Some(&worktree), Some("child-conv"))
+            .await;
+        assert!(report.kill_server_error.is_none());
+        assert!(report.unlink_error.is_none());
+        assert!(
+            socket_path.exists(),
+            "worktree-backed continuation must preserve socket at {}",
+            socket_path.display()
+        );
+        // Cleanup so the file doesn't leak into the next test run.
+        let _ = std::fs::remove_file(&socket_path);
     }
 }
