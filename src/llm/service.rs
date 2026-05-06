@@ -31,8 +31,10 @@ pub struct LlmServiceImpl {
     /// Free-form metadata pairs injected as a top-level `tags` object on
     /// every outbound request. Phoenix doesn't interpret these — they're a
     /// pass-through channel for whatever proxy the request is routed
-    /// through. Only attached when `gateway` is set; direct provider APIs
-    /// reject unknown top-level fields.
+    /// through. Attached only when the request is going to a non-default
+    /// endpoint (`gateway` or the API-format-specific `*_base_url`); direct
+    /// provider APIs reject unknown top-level fields. See
+    /// `effective_request_tags`.
     pub request_tags: BTreeMap<String, String>,
     /// When true, `OpenAI` Responses requests target the `ChatGPT` backend
     /// (`chatgpt.com/backend-api/codex`) and the request body is adjusted:
@@ -96,10 +98,15 @@ impl LlmServiceImpl {
     }
 
     /// Returns the tags map to attach on the wire for this request. Empty
-    /// unless a gateway is configured — direct-to-provider calls go out
-    /// untagged so unknown-field rejection can't break us.
-    fn effective_request_tags(&self) -> &BTreeMap<String, String> {
-        if self.gateway.is_some() {
+    /// unless the request is routed through a non-default endpoint
+    /// (`LLM_GATEWAY`, or the API-format-specific `*_BASE_URL` override
+    /// that `build_discovery_config` documents as direct-auth gateway
+    /// mode). Direct-to-provider calls go out untagged so unknown-field
+    /// rejection can't break us. The codex bridge sets
+    /// `request_tags = BTreeMap::new()` in its constructor, so it stays
+    /// untagged even though it does set `openai_base_url`.
+    fn effective_request_tags(&self, format_base_url: Option<&str>) -> &BTreeMap<String, String> {
+        if self.gateway.is_some() || format_base_url.is_some() {
             &self.request_tags
         } else {
             empty_tags()
@@ -225,7 +232,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.anthropic_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(),
+                    self.effective_request_tags(self.anthropic_base_url.as_deref()),
                     request,
                 )
                 .await
@@ -239,7 +246,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.openai_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(),
+                    self.effective_request_tags(self.openai_base_url.as_deref()),
                     request,
                     self.use_codex_backend,
                 )
@@ -263,7 +270,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.anthropic_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(),
+                    self.effective_request_tags(self.anthropic_base_url.as_deref()),
                     request,
                     chunk_tx,
                 )
@@ -278,7 +285,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.openai_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(),
+                    self.effective_request_tags(self.openai_base_url.as_deref()),
                     request,
                     chunk_tx,
                     self.use_codex_backend,
@@ -291,5 +298,88 @@ impl LlmServiceImpl {
     /// Resolve auth credential for this request.
     async fn resolve_auth(&self) -> Result<super::ResolvedAuth, super::LlmError> {
         self.auth.resolve().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::all_models;
+    use crate::llm::registry::{AuthStyle, StaticCredential};
+
+    fn make_service(
+        gateway: Option<&str>,
+        anthropic_base_url: Option<&str>,
+        openai_base_url: Option<&str>,
+        tags: BTreeMap<String, String>,
+    ) -> LlmServiceImpl {
+        let spec = all_models()
+            .into_iter()
+            .find(|s| s.id == "claude-sonnet-4-6")
+            .expect("claude-sonnet-4-6 must be in the model registry");
+        let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::ApiKey);
+        LlmServiceImpl::new(
+            spec,
+            auth,
+            gateway.map(String::from),
+            anthropic_base_url.map(String::from),
+            openai_base_url.map(String::from),
+            vec![],
+            tags,
+        )
+    }
+
+    fn one_tag() -> BTreeMap<String, String> {
+        let mut t = BTreeMap::new();
+        t.insert("disable_data_logging".to_string(), "true".to_string());
+        t
+    }
+
+    #[test]
+    fn tags_attached_when_gateway_set() {
+        let svc = make_service(Some("https://gw.example/llm"), None, None, one_tag());
+        assert_eq!(svc.effective_request_tags(None).len(), 1);
+    }
+
+    #[test]
+    fn tags_attached_for_anthropic_base_url_only_path() {
+        // Reproduces the case Codex flagged: helper + ANTHROPIC_BASE_URL,
+        // no LLM_GATEWAY. The proxy is still in front; tags must reach it.
+        let svc = make_service(
+            None,
+            Some("https://proxy.example/anthropic/v1/messages"),
+            None,
+            one_tag(),
+        );
+        assert_eq!(
+            svc.effective_request_tags(svc.anthropic_base_url.as_deref())
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tags_dropped_for_direct_provider_call() {
+        // No gateway, no base_url override -> direct to api.anthropic.com,
+        // which 400s on unknown body fields. Drop the tags.
+        let svc = make_service(None, None, None, one_tag());
+        assert!(svc.effective_request_tags(None).is_empty());
+    }
+
+    #[test]
+    fn tags_isolated_per_api_format() {
+        // Anthropic via proxy, OpenAI direct: an OpenAI call must not
+        // pick up tags just because anthropic_base_url is set.
+        let svc = make_service(
+            None,
+            Some("https://proxy.example/anthropic/v1/messages"),
+            None,
+            one_tag(),
+        );
+        assert!(
+            svc.effective_request_tags(svc.openai_base_url.as_deref())
+                .is_empty(),
+            "OpenAI call must not inherit Anthropic's base-URL gate"
+        );
     }
 }
