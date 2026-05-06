@@ -78,7 +78,7 @@ Multi-provider LLM support routes through either the Anthropic API or an exe.dev
 ./dev.py lima destroy  # tear down VM
 ```
 
-### Optional HTTPS
+### Optional HTTPS Quick Start
 
 TLS is opt-in. The lowest-toil internal-DNS flow is a local Phoenix private CA
 that you trust once on your browser machine, then use to issue per-host leaf
@@ -92,22 +92,21 @@ remote host receives only its leaf cert and key.
 # Trust this CA cert once on the browser machine:
 #   ~/.phoenix-ide/tls/phoenix-local-ca.pem
 
-# Issue a bundle for a remote Phoenix host.
-./dev.py tls issue sopell3.workspace.infra.dog
+# Issue a bundle for the hostname you will open in the browser.
+./dev.py tls issue phoenix-host.internal
 
 # Copy only the bundle to the remote host.
-scp ~/.phoenix-ide/tls-bundles/sopell3.workspace.infra.dog.tar.gz sopell3:~/
+scp ~/.phoenix-ide/tls-bundles/phoenix-host.internal.tar.gz ssh-host:~/
 
 # On the remote host, from its phoenix-ide repo checkout:
-./dev.py tls install ~/sopell3.workspace.infra.dog.tar.gz
+./dev.py tls install ~/phoenix-host.internal.tar.gz
 ./dev.py prod deploy
 ```
 
 After install, `./dev.py prod deploy` reads `.phoenix-ide.env` and serves
-`https://sopell3.workspace.infra.dog:8031`. For local development,
-`./dev.py up --https` uses the same default CA directory and serves the embedded
-UI directly at `https://localhost:<port>` while Vite proxies API requests over
-HTTPS.
+`https://phoenix-host.internal:8031`. For local development, `./dev.py up
+--https` uses the same default CA directory and serves the embedded UI directly
+at `https://localhost:<port>` while Vite proxies API requests over HTTPS.
 
 ### Publishing a Release
 

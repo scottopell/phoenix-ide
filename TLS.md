@@ -41,11 +41,12 @@ For `https://localhost:<port>`, the certificate must include `localhost` or the
 loopback IP address you use. Phoenix includes `localhost`, `127.0.0.1`, and
 `::1` by default for auto-issued certificates and for `./dev.py tls issue`.
 
-For `https://sopell3.workspace.infra.dog:8031`, the certificate must include
-`sopell3.workspace.infra.dog`. It does not matter that `workspace.infra.dog` is
-internal DNS; browser TLS validation still requires a trusted issuer and a SAN
-matching the hostname. Public ACME/Let's Encrypt is not part of Phoenix's built
-in flow for this internal-DNS use case.
+For `https://phoenix-host.internal:8031`, the certificate must include
+`phoenix-host.internal`. It does not matter whether the hostname comes from
+public DNS, private DNS, `/etc/hosts`, or a VPN-only resolver; browser TLS
+validation still requires a trusted issuer and a SAN matching the hostname.
+Public ACME/Let's Encrypt is not part of Phoenix's built in flow for
+private/internal hostnames.
 
 Trusting the Phoenix CA means the browser machine will trust leaf certificates
 issued by that CA. It does not give remote hosts the ability to issue new certs
@@ -118,22 +119,28 @@ manual OS/browser action:
 
 ## Remote Production Flow
 
-Assume the remote host is reachable as:
+Assume:
+
+- You SSH to the remote machine as `ssh-host`.
+- You open Phoenix in the browser as `https://phoenix-host.internal:8031`.
+
+These may be the same string, but they do not have to be. The certificate must
+use the browser hostname:
 
 ```text
-sopell3.workspace.infra.dog
+phoenix-host.internal
 ```
 
 On the machine that owns the CA:
 
 ```bash
-./dev.py tls issue sopell3.workspace.infra.dog
+./dev.py tls issue phoenix-host.internal
 ```
 
 This writes:
 
 ```text
-~/.phoenix-ide/tls-bundles/sopell3.workspace.infra.dog.tar.gz
+~/.phoenix-ide/tls-bundles/phoenix-host.internal.tar.gz
 ```
 
 The bundle contains:
@@ -149,13 +156,13 @@ It does not contain `phoenix-local-ca-key.pem`.
 Copy the bundle to the remote host:
 
 ```bash
-scp ~/.phoenix-ide/tls-bundles/sopell3.workspace.infra.dog.tar.gz sopell3:~/
+scp ~/.phoenix-ide/tls-bundles/phoenix-host.internal.tar.gz ssh-host:~/
 ```
 
 On the remote host, from that host's Phoenix repo checkout:
 
 ```bash
-./dev.py tls install ~/sopell3.workspace.infra.dog.tar.gz
+./dev.py tls install ~/phoenix-host.internal.tar.gz
 ./dev.py prod deploy
 ```
 
@@ -170,16 +177,16 @@ It also updates the repo-local `.phoenix-ide.env`:
 
 ```env
 PHOENIX_TLS=manual
-PHOENIX_TLS_CERT_PATH=/home/<you>/.phoenix-ide/tls/sopell3.workspace.infra.dog.pem
-PHOENIX_TLS_KEY_PATH=/home/<you>/.phoenix-ide/tls/sopell3.workspace.infra.dog-key.pem
-PHOENIX_PUBLIC_URL=https://sopell3.workspace.infra.dog:8031
+PHOENIX_TLS_CERT_PATH=/home/<you>/.phoenix-ide/tls/phoenix-host.internal.pem
+PHOENIX_TLS_KEY_PATH=/home/<you>/.phoenix-ide/tls/phoenix-host.internal-key.pem
+PHOENIX_PUBLIC_URL=https://phoenix-host.internal:8031
 ```
 
 `./dev.py prod deploy` reads `.phoenix-ide.env`, installs the env into the
 production service environment where needed, and starts Phoenix on:
 
 ```text
-https://sopell3.workspace.infra.dog:8031
+https://phoenix-host.internal:8031
 ```
 
 This matches the intended remote workflow: keep a git checkout on the remote
@@ -190,8 +197,8 @@ host and run `./dev.py prod deploy` locally on that host.
 If one host needs additional SANs, pass repeated `--host` flags when issuing:
 
 ```bash
-./dev.py tls issue sopell3.workspace.infra.dog \
-  --host sopell3 \
+./dev.py tls issue phoenix-host.internal \
+  --host phoenix-host \
   --host 10.0.0.12
 ```
 
@@ -202,7 +209,7 @@ For auto mode without `dev.py tls issue`, use `PHOENIX_TLS_HOSTS`:
 
 ```env
 PHOENIX_TLS=auto
-PHOENIX_TLS_HOSTS=sopell3.workspace.infra.dog,sopell3,10.0.0.12
+PHOENIX_TLS_HOSTS=phoenix-host.internal,phoenix-host,10.0.0.12
 ```
 
 ## Environment Variables
@@ -248,9 +255,9 @@ CA. It does not rotate the CA automatically.
 For remote `manual` deployments, rotate by issuing and installing a new bundle:
 
 ```bash
-./dev.py tls issue sopell3.workspace.infra.dog
-scp ~/.phoenix-ide/tls-bundles/sopell3.workspace.infra.dog.tar.gz sopell3:~/
-ssh sopell3 'cd ~/phoenix-ide && ./dev.py tls install ~/sopell3.workspace.infra.dog.tar.gz && ./dev.py prod deploy'
+./dev.py tls issue phoenix-host.internal
+scp ~/.phoenix-ide/tls-bundles/phoenix-host.internal.tar.gz ssh-host:~/
+ssh ssh-host 'cd ~/phoenix-ide && ./dev.py tls install ~/phoenix-host.internal.tar.gz && ./dev.py prod deploy'
 ```
 
 ## Verification

@@ -39,7 +39,7 @@ mod_module_files = "deny"
 
 Or in `[workspace.lints.clippy]` if using workspace lints.
 
-Ref: `/home/exedev/RUST_BEST_PRACTICES.md` (from Datadog/lading)
+Ref: external Rust best-practices note.
 
 ## Notes
 
