@@ -30,7 +30,7 @@ import type { Conversation } from '../api';
  * not part of any chain."
  */
 export function computeChainRoots(
-  conversations: Conversation[],
+  conversations: readonly Conversation[],
 ): Map<string, string | null> {
   // Build an id -> conversation map and a successor -> predecessor map so
   // we can walk backward as well as forward without scanning the list per
@@ -128,7 +128,7 @@ export type SidebarItem =
  * most-recent member) and every standalone.
  */
 export function groupConversationsForSidebar(
-  conversations: Conversation[],
+  conversations: readonly Conversation[],
   chainRoots: Map<string, string | null>,
 ): SidebarItem[] {
   // Bucket members by root.

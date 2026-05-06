@@ -20,8 +20,9 @@ import {
   fireEvent,
   waitFor,
 } from '@testing-library/react';
-import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom';
 import { ChainPage } from './ChainPage';
+import { ChainProvider } from '../chain';
 import type {
   ChainView,
   ChainQaRow,
@@ -34,10 +35,14 @@ import type {
 // ---------------------------------------------------------------------------
 
 type ChainEventHandler = (evt: ChainSseEventData) => void;
+type ChainErrorHandler = () => void;
 
 interface SseHandle {
   close: () => void;
   emit: (evt: ChainSseEventData) => void;
+  /** Trigger the EventSource error path — invokes the handleErr that
+   *  ChainPage installed in its SSE subscription. */
+  emitErr: () => void;
 }
 
 let sseHandles: SseHandle[] = [];
@@ -53,10 +58,11 @@ vi.mock('../api', async () => {
       setChainName: vi.fn(),
     },
     subscribeToChainStream: vi.fn(
-      (_rootId: string, onEvent: ChainEventHandler) => {
+      (_rootId: string, onEvent: ChainEventHandler, onErr?: ChainErrorHandler) => {
         const handle: SseHandle = {
           close: vi.fn(),
           emit: (evt) => onEvent(evt),
+          emitErr: () => onErr?.(),
         };
         sseHandles.push(handle);
         return {
@@ -125,13 +131,15 @@ const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
 
 function renderAt(rootId: string) {
   return render(
-    <MemoryRouter initialEntries={[`/chains/${rootId}`]}>
-      <Routes>
-        <Route path="/chains/:rootConvId" element={<ChainPage />} />
-        <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
-        <Route path="/" element={<div data-testid="home">home</div>} />
-      </Routes>
-    </MemoryRouter>,
+    <ChainProvider>
+      <MemoryRouter initialEntries={[`/chains/${rootId}`]}>
+        <Routes>
+          <Route path="/chains/:rootConvId" element={<ChainPage />} />
+          <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
+          <Route path="/" element={<div data-testid="home">home</div>} />
+        </Routes>
+      </MemoryRouter>
+    </ChainProvider>,
   );
 }
 
@@ -308,6 +316,54 @@ describe('ChainPage — submit + stream', () => {
     expect(after[1]?.textContent).toContain('we landed X then Y');
   });
 
+  it('optimistic submit: in-flight card appears and draft clears BEFORE the POST resolves (08682)', async () => {
+    // Pre-08682, submit() awaited the POST before doing any UI mutation, so
+    // the textarea was frozen for the round-trip and the in-flight card
+    // didn't exist until the POST returned. Now: optimistic dispatch lands
+    // synchronously, POST happens in the background, INFLIGHT_RECONCILE_ID
+    // rekeys to the server's id when the POST returns.
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain());
+
+    // Hold the POST until we explicitly resolve it.
+    let resolvePost: (v: { chain_qa_id: string }) => void = () => {};
+    const postPromise = new Promise<{ chain_qa_id: string }>((res) => {
+      resolvePost = res;
+    });
+    (api.submitChainQuestion as ReturnType<typeof vi.fn>).mockReturnValueOnce(postPromise);
+
+    renderAt(ROOT_ID);
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByRole('textbox', { name: 'Question' });
+    fireEvent.change(textarea, { target: { value: 'fast question' } });
+    expect((textarea as HTMLTextAreaElement).value).toBe('fast question');
+
+    fireEvent.click(screen.getByRole('button', { name: /Ask|Sending/ }));
+
+    // CRITICAL: at this point the POST has not resolved. The optimistic
+    // dispatch should already have landed.
+    await waitFor(() => {
+      // Draft cleared.
+      expect((textarea as HTMLTextAreaElement).value).toBe('');
+    });
+    // In-flight pair card is in the DOM.
+    expect(screen.getByText('fast question')).toBeInTheDocument();
+    // Textarea is NOT disabled — the user can keep typing.
+    expect(textarea).not.toBeDisabled();
+
+    // Now resolve the POST. The reconcile rekeys the optimistic entry; the
+    // user-visible state does not flicker.
+    await act(async () => {
+      resolvePost({ chain_qa_id: 'qa-real-id' });
+      await Promise.resolve();
+    });
+    // Card still rendered after rekey.
+    expect(screen.getByText('fast question')).toBeInTheDocument();
+  });
+
   it('clears the active textarea and refocuses it after submit', async () => {
     const { api } = await import('../api');
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain());
@@ -341,6 +397,60 @@ describe('ChainPage — submit + stream', () => {
       expect(document.activeElement).toBe(textarea);
     });
     expect(screen.getByText('first question')).toBeInTheDocument();
+  });
+
+  it('SSE error after a question is submitted dispatches SSE_LOST (live inflight, not stale closure)', async () => {
+    // Codex review on PR #26: handleErr previously closed over the
+    // render-time `atom.inflight`, which was empty when the SSE effect
+    // mounted. A question submitted afterward expanded the live
+    // inflight, but the closure still saw {} — so the connection-lost
+    // affordance never appeared during exactly the in-flight scenario
+    // it was meant to cover. The fix routes through `inflightRef`.
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain());
+    let resolvePost: (v: { chain_qa_id: string }) => void = () => {};
+    (api.submitChainQuestion as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise<{ chain_qa_id: string }>((res) => {
+        resolvePost = res;
+      }),
+    );
+
+    renderAt(ROOT_ID);
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+    expect(sseHandles).toHaveLength(1);
+
+    // No inflight yet — emitErr must NOT raise the SSE_LOST banner.
+    act(() => {
+      sseHandles[0]!.emitErr();
+    });
+    expect(screen.queryByText(/Connection lost/i)).not.toBeInTheDocument();
+
+    // Submit a question — expands inflight via OPTIMISTIC_INFLIGHT_ADD
+    // (synchronous; fires before the POST resolves).
+    const textarea = screen.getByRole('textbox', { name: 'Question' });
+    fireEvent.change(textarea, { target: { value: 'mid-stream q' } });
+    fireEvent.click(screen.getByRole('button', { name: /Ask|Sending/ }));
+    await waitFor(() => {
+      expect(screen.getByText('mid-stream q')).toBeInTheDocument();
+    });
+
+    // Now SSE errors. The handler must read the LIVE inflight and
+    // dispatch SSE_LOST.
+    act(() => {
+      sseHandles[0]!.emitErr();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Connection lost/i)).toBeInTheDocument();
+    });
+
+    // Cleanup: resolve the held POST so the test doesn't leave a
+    // pending promise.
+    await act(async () => {
+      resolvePost({ chain_qa_id: 'qa-real' });
+      await Promise.resolve();
+    });
   });
 });
 
@@ -547,6 +657,160 @@ describe('ChainPage — snapshot staleness (REQ-CHN-005)', () => {
     });
     expect(screen.queryByText(/answered when/)).not.toBeInTheDocument();
     expect(screen.queryByText(/answered with/)).not.toBeInTheDocument();
+  });
+});
+
+describe('ChainPage — per-rootConvId state isolation (task 08682)', () => {
+  // The page is no longer remounted by `key={rootConvId}`. Chain-scoped state
+  // lives in `ChainStore`, keyed by rootConvId, so navigating from chain A to
+  // chain B routes to a different atom — chain B's render reads chain B's
+  // state by construction, never chain A's. This test verifies the user can
+  // never see chain A's content under chain B's selection. (Pre-08682 this
+  // was enforced by a synchronous reset block in render; now it's enforced
+  // by the routed-store contract.)
+  function ChainNavApp() {
+    return (
+      <ChainProvider>
+        <MemoryRouter initialEntries={[`/chains/root-A`]}>
+          <Routes>
+            <Route
+              path="/chains/:rootConvId"
+              element={
+                <>
+                  <ChainPage />
+                  <NavLinks />
+                </>
+              }
+            />
+            <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
+            <Route path="/" element={<div data-testid="home">home</div>} />
+          </Routes>
+        </MemoryRouter>
+      </ChainProvider>
+    );
+  }
+
+  function NavLinks() {
+    const nav = useNavigate();
+    return (
+      <>
+        <button data-testid="go-A" onClick={() => nav('/chains/root-A')}>A</button>
+        <button data-testid="go-B" onClick={() => nav('/chains/root-B')}>B</button>
+      </>
+    );
+  }
+
+  it('clears the draft and in-flight pile when rootConvId changes', async () => {
+    const { api } = await import('../api');
+    const chainA = makeChain({
+      root_conv_id: 'root-A',
+      chain_name: 'chain A',
+      display_name: 'chain A',
+      members: [makeMember('A1', 'root'), makeMember('A2', 'latest')],
+      current_member_count: 2,
+    });
+    const chainB = makeChain({
+      root_conv_id: 'root-B',
+      chain_name: 'chain B',
+      display_name: 'chain B',
+      members: [makeMember('B1', 'root'), makeMember('B2', 'latest')],
+      current_member_count: 2,
+    });
+    const getChain = api.getChain as ReturnType<typeof vi.fn>;
+    // First load: chain A. Second load (after nav to B): chain B.
+    getChain.mockImplementation((rootId: string) => {
+      if (rootId === 'root-A') return Promise.resolve(chainA);
+      if (rootId === 'root-B') return Promise.resolve(chainB);
+      return Promise.reject(new Error('unknown chain'));
+    });
+
+    render(<ChainNavApp />);
+
+    // Wait for chain A to load and type a draft.
+    await waitFor(() => {
+      expect(screen.getByText('Title A1')).toBeInTheDocument();
+    });
+    const textareaA = screen.getByRole('textbox', { name: 'Question' });
+    fireEvent.change(textareaA, { target: { value: 'draft for chain A' } });
+    expect((textareaA as HTMLTextAreaElement).value).toBe('draft for chain A');
+
+    // Navigate to chain B. The atom routing means chain B's render reads
+    // chain B's atom — the previous chain A draft and any in-flight pile
+    // are isolated to atom A and don't leak.
+    fireEvent.click(screen.getByTestId('go-B'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Title B1')).toBeInTheDocument();
+    });
+    // Active textarea is empty after the chain swap.
+    const textareaB = screen.getByRole('textbox', { name: 'Question' });
+    expect((textareaB as HTMLTextAreaElement).value).toBe('');
+    // Chain A's members are no longer in the DOM — confirms the swap actually
+    // happened and we're not just looking at stale residue.
+    expect(screen.queryByText('Title A1')).not.toBeInTheDocument();
+    expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
+  });
+
+  it('navigation mid-stream does not corrupt the destination chain (08682 dead-atom)', async () => {
+    // Pre-08682 regression: ChainPage held `chain` in component useState; an
+    // in-flight `getChain(A)` that resolved after we navigated to B would
+    // call `setChain(viewA)` against B's component instance, painting A's
+    // members on B's page. With ChainStore the resolution dispatches
+    // `LOAD_OK` against atom A; atom B is untouched.
+    const { api } = await import('../api');
+    const chainA = makeChain({
+      root_conv_id: 'root-A',
+      chain_name: 'chain A',
+      display_name: 'chain A',
+      members: [makeMember('A1', 'root'), makeMember('A2', 'latest')],
+      current_member_count: 2,
+    });
+    const chainB = makeChain({
+      root_conv_id: 'root-B',
+      chain_name: 'chain B',
+      display_name: 'chain B',
+      members: [makeMember('B1', 'root'), makeMember('B2', 'latest')],
+      current_member_count: 2,
+    });
+
+    // chainA's getChain hangs until we resolve it manually — simulating an
+    // in-flight network call that races with navigation. chainB resolves
+    // immediately.
+    let resolveA: (v: ChainView) => void = () => {};
+    const aPromise = new Promise<ChainView>((res) => {
+      resolveA = res;
+    });
+    const getChain = api.getChain as ReturnType<typeof vi.fn>;
+    getChain.mockImplementation((rootId: string) => {
+      if (rootId === 'root-A') return aPromise;
+      if (rootId === 'root-B') return Promise.resolve(chainB);
+      return Promise.reject(new Error('unknown chain'));
+    });
+
+    render(<ChainNavApp />);
+
+    // We're on chain A but the load is hanging — page shows the loading
+    // placeholder.
+    expect(await screen.findByText(/Loading chain/i)).toBeInTheDocument();
+
+    // Navigate to B before A resolves. B loads cleanly.
+    fireEvent.click(screen.getByTestId('go-B'));
+    await waitFor(() => {
+      expect(screen.getByText('Title B1')).toBeInTheDocument();
+    });
+
+    // Now resolve A's outstanding request — the dispatch lands in atom A,
+    // not in atom B. Chain B's render must remain showing chain B's data.
+    await act(async () => {
+      resolveA(chainA);
+      // Allow microtasks to flush.
+      await Promise.resolve();
+    });
+
+    // Chain B is still on screen; chain A's members never appeared.
+    expect(screen.getByText('Title B1')).toBeInTheDocument();
+    expect(screen.queryByText('Title A1')).not.toBeInTheDocument();
+    expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
   });
 });
 

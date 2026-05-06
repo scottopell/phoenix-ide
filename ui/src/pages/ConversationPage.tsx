@@ -83,9 +83,10 @@ const ChevronRightSmall = () => (
 );
 
 export function ConversationPage() {
+  const { slug } = useParams<{ slug: string }>();
   return (
-    <ReviewNotesProvider>
-      <DiffViewerStateProvider>
+    <ReviewNotesProvider scopeKey={slug}>
+      <DiffViewerStateProvider scopeKey={slug}>
         <ConversationPageContent />
       </DiffViewerStateProvider>
     </ReviewNotesProvider>
@@ -187,6 +188,49 @@ function ConversationPageContent() {
   // read the conversation above.
   const [contextExhaustedExpanded, setContextExhaustedExpanded] = useState(true);
   const [abandoningContextExhausted, setAbandoningContextExhausted] = useState(false);
+
+  // ---------------------------------------------------------------------------
+  // Per-slug state reset (task 02703).
+  //
+  // Previously KeyedConversationPage used `key={slug}` to force a fresh React
+  // tree on every conversation change. That caused the entire content area to
+  // flash blank on every navigation. We instead keep the page mounted across
+  // slug changes and reset the per-conversation state explicitly here.
+  //
+  // The reset is synchronous: when `slug` differs from `lastSlug`, we update
+  // `lastSlug` AND reset every per-conversation useState in the same render
+  // pass ("adjusting state during render":
+  // https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes).
+  // React detects this and re-renders before commit, so the first paint after
+  // a slug change shows clean state — NEVER content from the previous
+  // conversation. Honest UI: if the new conversation's data isn't ready, the
+  // `if (!conversation)` early-return below paints a clean skeleton.
+  //
+  // Refs (sendingMessagesRef, seedHydratedRef, cachedMsgCountRef) are also
+  // reset here. Mutating .current during render is safe because refs don't
+  // trigger re-renders. The refs live alongside this block (vs. their
+  // original declaration sites further down the file) so the reset can see
+  // them and the contract "these are per-slug state" is colocated.
+  const seedHydratedRef = useRef<string | null>(null);
+  const cachedMsgCountRef = useRef(0);
+  const [lastSlug, setLastSlug] = useState<string | undefined>(slug);
+  if (lastSlug !== slug) {
+    setLastSlug(slug);
+    // useState resets — React batches these into the same render.
+    setError(null);
+    setConversationIdForSSE(undefined);
+    setShowFileBrowser(false);
+    setMobileProseFile(null);
+    setImages([]);
+    setShowTaskApproval(false);
+    setShowFirstTaskWelcome(false);
+    setContextExhaustedExpanded(true);
+    setAbandoningContextExhausted(false);
+    // Ref resets — immediate, no re-render.
+    sendingMessagesRef.current = new Set();
+    seedHydratedRef.current = null;
+    cachedMsgCountRef.current = 0;
+  }
   // Terminal split-pane height — collapses to a 32px header strip
   const terminalPane = useResizablePane({
     key: 'terminal-height',
@@ -348,7 +392,8 @@ function ConversationPageContent() {
   // don't re-hydrate it. We push the draft into InputArea via its imperative
   // `setDraft` handle, which routes through `useDraft` so persistence picks
   // up normally from there.
-  const seedHydratedRef = useRef<string | null>(null);
+  // (`seedHydratedRef` is declared with the per-slug reset block above so it
+  //  resets to null on slug change.)
   useEffect(() => {
     if (!conversationId) return;
     if (seedHydratedRef.current === conversationId) return;
@@ -401,8 +446,9 @@ function ConversationPageContent() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [terminalPane]);
 
-  // Cache new messages as they arrive via SSE
-  const cachedMsgCountRef = useRef(0);
+  // Cache new messages as they arrive via SSE.
+  // (`cachedMsgCountRef` is declared with the per-slug reset block above so
+  //  it resets to 0 on slug change.)
   useEffect(() => {
     const msgs = atom.messages;
     if (msgs.length > cachedMsgCountRef.current) {

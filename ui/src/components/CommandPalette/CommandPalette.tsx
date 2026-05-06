@@ -16,7 +16,7 @@ import { useFocusScope } from '../../hooks/useFocusScope';
 const SEARCH_DEBOUNCE_MS = 120;
 
 interface CommandPaletteProps {
-  conversations: Conversation[];
+  conversations: readonly Conversation[];
 }
 
 export function CommandPalette({ conversations }: CommandPaletteProps) {

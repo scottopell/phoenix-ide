@@ -4,7 +4,10 @@ import { api } from '../api';
 import { refreshModels } from '../modelsPoller';
 import type { ChainView, Conversation } from '../api';
 import { useModels, useAutoAuth } from '../hooks';
-import { cacheDB } from '../cache';
+import {
+  useConversationsList,
+  useConversationsRefresh,
+} from '../conversation';
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -21,7 +24,6 @@ const AlertTriangle = () => (
 );
 import { Toast } from '../components/Toast';
 import { ConversationListSkeleton } from '../components/Skeleton';
-import { computeChainRoots } from '../utils/chains';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
@@ -29,11 +31,16 @@ import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 export function ConversationListPage() {
   const navigate = useNavigate();
   const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
+
+  // Task 08684: ConversationStore is the single source of truth. The
+  // shared `useConversationsRefresh` (mounted in ConversationProvider)
+  // owns the cache hydration, the 5s poll, and the cache writeback. This
+  // page reads the derived list straight off the store — no parallel
+  // useState arrays, no per-page polling timer.
+  const { refresh } = useConversationsRefresh();
+  const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
 
-  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const scrollRestoredRef = useRef(false);
   const pullStartY = useRef<number | null>(null);
@@ -42,6 +49,28 @@ export function ConversationListPage() {
   // App state for offline/sync status
   const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
   const { toasts, dismissToast, showWarning, showError } = useToast();
+
+  // Loading is derived: we're loading until we have at least one conversation
+  // observed *or* the cache hydration + first poll have completed (signalled
+  // by `isReady` being true and the list being populated, OR isReady true
+  // with no rows server-side which is also a valid empty state).
+  // Concretely: hide the skeleton as soon as we have any rows, OR when
+  // we've completed at least one refresh while online.
+  const [hasCompletedFirstFetch, setHasCompletedFirstFetch] = useState(false);
+  useEffect(() => {
+    if (!isReady) return;
+    let cancelled = false;
+    void refresh().then(() => {
+      if (!cancelled) setHasCompletedFirstFetch(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isReady, refresh]);
+  const loading =
+    !hasCompletedFirstFetch &&
+    conversations.length === 0 &&
+    archivedConversations.length === 0;
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
@@ -79,73 +108,11 @@ export function ConversationListPage() {
     };
   }, [showWarning, showError]);
 
-  // Load conversations: cache first, then network
-  const loadConversations = useCallback(async () => {
-    try {
-      // Step 1: Show cached data immediately
-      const cached = await cacheDB.getAllConversations();
-      const cachedActive = cached.filter(c => !c.archived);
-      const cachedArchived = cached.filter(c => c.archived);
-      if (cachedActive.length > 0 || cachedArchived.length > 0) {
-        setConversations(cachedActive);
-        setArchivedConversations(cachedArchived);
-        setLoading(false);
-      }
-
-      // Step 2: Fetch fresh if online
-      if (navigator.onLine) {
-        try {
-          const [freshActive, freshArchived] = await Promise.all([
-            api.listConversations(),
-            api.listArchivedConversations()
-          ]);
-          setConversations(freshActive);
-          setArchivedConversations(freshArchived);
-          
-          // Sync cache (removes stale entries, adds fresh ones)
-          await cacheDB.syncConversations([...freshActive, ...freshArchived]);
-        } catch (err) {
-          console.error('Failed to fetch fresh conversations:', err);
-          // Network failed, cached data still showing (if any)
-          if (cachedActive.length === 0 && cachedArchived.length === 0) {
-            showError('Failed to load conversations. Please check your connection.', 5000);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Failed to load conversations:', err);
-      showError('Failed to load conversations.', 5000);
-    } finally {
-      setLoading(false);
-    }
-  }, [showError]);
-
-  // Initial load when cache is ready
-  useEffect(() => {
-    if (isReady) {
-      loadConversations();
-    }
-  }, [isReady, loadConversations]);
-
-  // Periodic refresh for live state indicators (REQ-UI-012).
-  // Consolidated into a single interval that fires both list fetches — the
-  // credential/models poll is owned by the shared useModels() hook above, so
-  // only one timer lives on this page now instead of two.
-  useEffect(() => {
-    if (!isReady) return;
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible' && navigator.onLine) {
-        // Silent refresh - don't show loading state
-        api.listConversations().then(freshActive => {
-          setConversations(freshActive);
-        }).catch(() => {/* silent */});
-        api.listArchivedConversations().then(freshArchived => {
-          setArchivedConversations(freshArchived);
-        }).catch(() => {/* silent */});
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [isReady]);
+  // Removed: per-page loadConversations + periodic refresh. The shared
+  // `useConversationsRefresh` (mounted in ConversationProvider) owns the
+  // cache hydration, polling, online listener, and hard-delete cascade.
+  // This page calls `refresh()` after mutations that need an immediate
+  // resync, but never holds its own conversation arrays.
 
   // Restore scroll position after data loads
   useEffect(() => {
@@ -181,7 +148,7 @@ export function ConversationListPage() {
     try {
       if (isOnline) {
         await api.archiveConversation(conv.id);
-        await loadConversations();
+        await refresh();
       } else {
         await queueOperation({
           type: 'archive',
@@ -191,9 +158,15 @@ export function ConversationListPage() {
           retryCount: 0,
           status: 'pending'
         });
-        // Optimistically update UI
-        setConversations(prev => prev.filter(c => c.id !== conv.id));
-        setArchivedConversations(prev => [...prev, { ...conv, archived: true }]);
+        // Offline optimistic: the operation is queued, but the row in
+        // the store is still the pre-archive shape until the queue
+        // drains and the next `refresh()` picks up the server-side
+        // change. The UI will show the conversation as still-active
+        // until then; the offline indicator already conveys that the
+        // queue is pending. If we want eager-flip-on-queue we'd dispatch
+        // a `local_conversation_update` against the atom — deferred
+        // because the local mutation would then desync from anything
+        // SSE eventually sends.
       }
     } catch (err) {
       console.error('Failed to archive:', err);
@@ -204,7 +177,7 @@ export function ConversationListPage() {
     try {
       if (isOnline) {
         await api.unarchiveConversation(conv.id);
-        await loadConversations();
+        await refresh();
       } else {
         await queueOperation({
           type: 'unarchive',
@@ -214,9 +187,6 @@ export function ConversationListPage() {
           retryCount: 0,
           status: 'pending'
         });
-        // Optimistically update UI
-        setArchivedConversations(prev => prev.filter(c => c.id !== conv.id));
-        setConversations(prev => [...prev, { ...conv, archived: false }]);
       }
     } catch (err) {
       console.error('Failed to unarchive:', err);
@@ -228,30 +198,27 @@ export function ConversationListPage() {
     try {
       await api.deleteConversation(deleteTarget.id);
       setDeleteTarget(null);
-      await loadConversations();
+      await refresh();
     } catch (err) {
       console.error('Failed to delete:', err);
     }
   };
 
-  /** Whether `conv` is part of the chain rooted at `rootId`, given the
-   *  population of conversations to consider. Walks chain pointers via the
-   *  shared `computeChainRoots` helper so the rule matches the sidebar's
-   *  grouping. */
-  const isMemberOfChain = (
-    conv: Conversation,
-    rootId: string,
-    all: Conversation[],
-  ): boolean => {
-    const roots = computeChainRoots(all);
-    return roots.get(conv.id) === rootId;
-  };
+  // (Pre-08684 ConversationListPage held a chain-grouping helper here used
+  // only by the offline-queue optimistic flip in handleArchiveChain /
+  // handleUnarchiveChain. With ConversationStore as the single source of
+  // truth, those handlers no longer mutate a local list — they enqueue
+  // the op and let refresh() reconcile when the queue drains. The helper,
+  // along with the `computeChainRoots` import it depended on, is gone.
+  // If a future change wants eager-flip-on-queue back, dispatch
+  // local_conversation_update against each chain member's atom and
+  // re-import the helper.)
 
   const handleArchiveChain = async (rootId: string) => {
     try {
       if (isOnline) {
         await api.archiveChain(rootId);
-        await loadConversations();
+        await refresh();
       } else {
         await queueOperation({
           type: 'archive_chain',
@@ -261,16 +228,9 @@ export function ConversationListPage() {
           retryCount: 0,
           status: 'pending',
         });
-        // Optimistically move every chain member to the archived list.
-        setConversations(prev => {
-          const moving = prev.filter(c => isMemberOfChain(c, rootId, prev));
-          if (moving.length === 0) return prev;
-          setArchivedConversations(arch => [
-            ...arch,
-            ...moving.map(c => ({ ...c, archived: true })),
-          ]);
-          return prev.filter(c => !moving.includes(c));
-        });
+        // Offline path: the queued op will fire on reconnect; refresh()
+        // then reconciles. The offline indicator already signals the
+        // queue is pending.
       }
     } catch (err) {
       console.error('Failed to archive chain:', err);
@@ -282,7 +242,7 @@ export function ConversationListPage() {
     try {
       if (isOnline) {
         await api.unarchiveChain(rootId);
-        await loadConversations();
+        await refresh();
       } else {
         await queueOperation({
           type: 'unarchive_chain',
@@ -291,15 +251,6 @@ export function ConversationListPage() {
           createdAt: new Date(),
           retryCount: 0,
           status: 'pending',
-        });
-        setArchivedConversations(prev => {
-          const moving = prev.filter(c => isMemberOfChain(c, rootId, prev));
-          if (moving.length === 0) return prev;
-          setConversations(active => [
-            ...active,
-            ...moving.map(c => ({ ...c, archived: false })),
-          ]);
-          return prev.filter(c => !moving.includes(c));
         });
       }
     } catch (err) {
@@ -323,7 +274,7 @@ export function ConversationListPage() {
     try {
       await api.deleteChain(deleteChainTarget.root_conv_id);
       setDeleteChainTarget(null);
-      await loadConversations();
+      await refresh();
     } catch (err) {
       console.error('Failed to delete chain:', err);
       showError(err instanceof Error ? err.message : 'Failed to delete chain', 5000);
@@ -336,7 +287,7 @@ export function ConversationListPage() {
       await api.renameConversation(renameTarget.id, newName);
       setRenameTarget(null);
       setRenameError(undefined);
-      await loadConversations();
+      await refresh();
     } catch (err) {
       setRenameError(err instanceof Error ? err.message : 'Failed to rename');
     }
@@ -358,9 +309,9 @@ export function ConversationListPage() {
     if (pullDistance > 80 && window.scrollY === 0) {
       pullStartY.current = null;
       setRefreshing(true);
-      loadConversations().finally(() => setRefreshing(false));
+      void refresh().finally(() => setRefreshing(false));
     }
-  }, [refreshing, loadConversations]);
+  }, [refreshing, refresh]);
 
   const handleTouchEnd = useCallback(() => {
     pullStartY.current = null;

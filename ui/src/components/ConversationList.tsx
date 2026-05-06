@@ -14,8 +14,8 @@ import { useKeyboardNav } from '../hooks';
 
 
 interface ConversationListProps {
-  conversations: Conversation[];
-  archivedConversations: Conversation[];
+  conversations: readonly Conversation[];
+  archivedConversations: readonly Conversation[];
   showArchived: boolean;
   onToggleArchived: () => void;
   onNewConversation: () => void;

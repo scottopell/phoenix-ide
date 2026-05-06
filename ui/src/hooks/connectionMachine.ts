@@ -22,7 +22,13 @@ export type ConnectionInput =
   | { type: 'RECONNECTED_DISPLAY_DONE' };  // Brief "reconnected" display finished
 
 export type ConnectionEffect =
-  | { type: 'OPEN_SSE' }                   // Open EventSource connection
+  // Open EventSource connection. `epoch` is a per-machine monotonic
+  // counter, freshly minted by the transition that emits this effect.
+  // The hook captures this value in the EventSource handler closures so
+  // every dispatched event can be tagged with the connection generation
+  // that produced it; a stale handler firing into a different conversation
+  // atom is then rejected by epoch mismatch (task 08683).
+  | { type: 'OPEN_SSE'; epoch: number }
   | { type: 'CLOSE_SSE' }                  // Close EventSource connection
   | { type: 'SCHEDULE_RETRY'; delayMs: number }  // Schedule retry timer
   | { type: 'SCHEDULE_RECONNECTED_DISPLAY' }     // Schedule "reconnected" display timer
@@ -32,6 +38,11 @@ export interface ConnectionMachineState {
   state: ConnectionState;
   attempt: number;           // Current reconnection attempt (0 when connected)
   nextRetryMs: number | null; // For UI countdown display
+  /** Monotonic per-machine counter; incremented on every transition that
+   *  emits an `OPEN_SSE` effect. Used by the executor to stamp incoming
+   *  SSE events so the conversation atom can drop events from a stale
+   *  connection generation (cross-conversation contamination guard). */
+  epoch: number;
 }
 
 export interface ConnectionTransitionResult {
@@ -62,6 +73,7 @@ export function initialState(): ConnectionMachineState {
     state: 'disconnected',
     attempt: 0,
     nextRetryMs: null,
+    epoch: 0,
   };
 }
 
@@ -93,9 +105,10 @@ export function transition(
     case 'CONNECT': {
       // Can only connect from disconnected or if we want to force reconnect
       if (current.state === 'disconnected') {
-        effects.push({ type: 'OPEN_SSE' });
+        const nextEpoch = current.epoch + 1;
+        effects.push({ type: 'OPEN_SSE', epoch: nextEpoch });
         return {
-          state: { state: 'connecting', attempt: 0, nextRetryMs: null },
+          state: { state: 'connecting', attempt: 0, nextRetryMs: null, epoch: nextEpoch },
           effects,
         };
       }
@@ -107,7 +120,7 @@ export function transition(
       effects.push({ type: 'CLOSE_SSE' });
       effects.push({ type: 'CANCEL_TIMERS' });
       return {
-        state: { state: 'disconnected', attempt: 0, nextRetryMs: null },
+        state: { state: 'disconnected', attempt: 0, nextRetryMs: null, epoch: current.epoch },
         effects,
       };
     }
@@ -115,18 +128,18 @@ export function transition(
     case 'SSE_OPEN': {
       // Successfully connected
       effects.push({ type: 'CANCEL_TIMERS' });
-      
+
       // If we were reconnecting, show brief "reconnected" state
       if (current.state === 'reconnecting' || current.state === 'offline') {
         effects.push({ type: 'SCHEDULE_RECONNECTED_DISPLAY' });
         return {
-          state: { state: 'reconnected', attempt: 0, nextRetryMs: null },
+          state: { state: 'reconnected', attempt: 0, nextRetryMs: null, epoch: current.epoch },
           effects,
         };
       }
-      
+
       return {
-        state: { state: 'connected', attempt: 0, nextRetryMs: null },
+        state: { state: 'connected', attempt: 0, nextRetryMs: null, epoch: current.epoch },
         effects,
       };
     }
@@ -134,26 +147,26 @@ export function transition(
     case 'SSE_ERROR': {
       // Connection failed or lost
       effects.push({ type: 'CLOSE_SSE' });
-      
+
       // If browser is offline, go to offline state without scheduling retry
       // (we'll retry when BROWSER_ONLINE fires)
       if (!ctx.browserOnline) {
         effects.push({ type: 'CANCEL_TIMERS' });
         return {
-          state: { state: 'offline', attempt: current.attempt + 1, nextRetryMs: null },
+          state: { state: 'offline', attempt: current.attempt + 1, nextRetryMs: null, epoch: current.epoch },
           effects,
         };
       }
-      
+
       const nextAttempt = current.attempt + 1;
       const delayMs = getBackoffDelay(nextAttempt);
-      
+
       effects.push({ type: 'SCHEDULE_RETRY', delayMs });
-      
+
       const nextState: ConnectionState = nextAttempt >= OFFLINE_THRESHOLD ? 'offline' : 'reconnecting';
-      
+
       return {
-        state: { state: nextState, attempt: nextAttempt, nextRetryMs: delayMs },
+        state: { state: nextState, attempt: nextAttempt, nextRetryMs: delayMs, epoch: current.epoch },
         effects,
       };
     }
@@ -161,10 +174,11 @@ export function transition(
     case 'BROWSER_ONLINE': {
       // Browser came back online
       if (current.state === 'offline' || current.state === 'reconnecting') {
+        const nextEpoch = current.epoch + 1;
         effects.push({ type: 'CANCEL_TIMERS' });
-        effects.push({ type: 'OPEN_SSE' });
+        effects.push({ type: 'OPEN_SSE', epoch: nextEpoch });
         return {
-          state: { ...current, state: 'reconnecting', nextRetryMs: null },
+          state: { ...current, state: 'reconnecting', nextRetryMs: null, epoch: nextEpoch },
           effects,
         };
       }
@@ -177,7 +191,7 @@ export function transition(
         effects.push({ type: 'CLOSE_SSE' });
         effects.push({ type: 'CANCEL_TIMERS' });
         return {
-          state: { state: 'offline', attempt: current.attempt, nextRetryMs: null },
+          state: { state: 'offline', attempt: current.attempt, nextRetryMs: null, epoch: current.epoch },
           effects,
         };
       }
@@ -187,9 +201,10 @@ export function transition(
     case 'RETRY_TIMER_FIRED': {
       // Time to retry connection
       if (current.state === 'reconnecting' || current.state === 'offline') {
-        effects.push({ type: 'OPEN_SSE' });
+        const nextEpoch = current.epoch + 1;
+        effects.push({ type: 'OPEN_SSE', epoch: nextEpoch });
         return {
-          state: { ...current, nextRetryMs: null },
+          state: { ...current, nextRetryMs: null, epoch: nextEpoch },
           effects,
         };
       }
@@ -200,7 +215,7 @@ export function transition(
       // Transition from "reconnected" to "connected"
       if (current.state === 'reconnected') {
         return {
-          state: { state: 'connected', attempt: 0, nextRetryMs: null },
+          state: { state: 'connected', attempt: 0, nextRetryMs: null, epoch: current.epoch },
           effects,
         };
       }

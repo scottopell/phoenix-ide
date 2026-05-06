@@ -30,6 +30,13 @@ export interface ConversationAtom {
    *  `null` when not in `tool_executing`. Used by StateBar to render a live
    *  elapsed-time counter. */
   toolExecutingStartedAt: number | null;
+  /** Per-machine connection generation that produced the events this atom
+   *  has accepted. `null` until `connection_opened` lands. Wire-originated
+   *  actions tagged with a non-matching `epoch` are dropped at the reducer
+   *  boundary — the cross-conversation contamination guard from task 08683.
+   *  Updated monotonically: a stale `connection_opened` from an older
+   *  generation cannot regress the value. */
+  connectionEpoch: number | null;
 }
 
 export interface InitPayload {
@@ -47,19 +54,18 @@ export interface InitPayload {
 // one through a single `applyIfNewer` guard — see the comment on that helper
 // for the contract.
 //
-// Client-originated actions (`local_phase_change`, `local_conversation_update`,
-// `set_initial_data`, `connection_state`, `set_system_prompt`, `clear_error`,
-// and `sse_error` when synthesized client-side) do not go through
-// `applyIfNewer` and do not mutate `lastSequenceId`. (Wire-originated
-// `sse_error` carries a `sequenceId` and IS routed through `applyIfNewer`.)
-// They exist so UI code can optimistically reflect a
-// user action (e.g. "I pressed send; show 'awaiting_llm'") without
-// colliding with the server's total order — the real server-side phase
-// change arrives afterwards via `sse_state_change` and takes precedence
-// when its sequence_id lands.
+// Task 08683: every action whose origin is the `useConnection` hook (wire
+// events plus the synthesized `connection_state` + parse-failure `sse_error`)
+// also carries an `epoch` matching the `OPEN_SSE` generation that produced
+// it. The reducer rejects such actions when `epoch !== atom.connectionEpoch`,
+// closing the cross-conversation contamination window where a stale
+// EventSource fires into a freshly-navigated atom. Client-originated
+// actions (`local_phase_change`, `local_conversation_update`,
+// `set_initial_data`, `set_system_prompt`, `clear_error`) carry no epoch
+// and apply unconditionally.
 export type SSEAction =
-  | { type: 'sse_init'; payload: InitPayload }
-  | { type: 'sse_message'; message: Message; sequenceId: number }
+  | { type: 'sse_init'; payload: InitPayload; epoch?: number }
+  | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
   | {
       type: 'sse_message_updated';
       sequenceId: number;
@@ -68,20 +74,28 @@ export type SSEAction =
       content?: Message['content'];
       /** Typed tool-execution duration; present only for tool-result updates. */
       durationMs?: number;
+      epoch?: number;
     }
-  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState }
-  | { type: 'sse_agent_done'; sequenceId: number }
-  | { type: 'sse_token'; sequenceId: number; delta: string }
-  | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation> }
+  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState; epoch?: number }
+  | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
+  | { type: 'sse_token'; sequenceId: number; delta: string; epoch?: number }
+  | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   // `sequenceId` is present when the error originated on the wire (server's
   // monotonic counter) and absent when it was synthesized client-side for a
   // schema / parse violation in useConnection.ts. Wire-originated errors are
   // routed through `applyIfNewer` so a replay after reconnect cannot re-pop a
   // toast the user already dismissed; client-synthesized errors are not part
   // of the server's total order and apply unconditionally.
-  | { type: 'sse_error'; error: UIError; sequenceId?: number }
+  | { type: 'sse_error'; error: UIError; sequenceId?: number; epoch?: number }
   | { type: 'clear_error' }
-  | { type: 'connection_state'; state: ConversationAtom['connectionState'] }
+  | { type: 'connection_state'; state: ConversationAtom['connectionState']; epoch?: number }
+  // Synthesized by `useConnection` when an `OPEN_SSE` effect fires.
+  // Carries the connection generation that just opened, so the atom can
+  // start accepting events stamped with that epoch and reject events
+  // stamped with any prior generation. Monotonic: a smaller epoch than
+  // the atom's current value is dropped (a stale `OPEN_SSE` executor
+  // closure must not regress a newer connection's epoch).
+  | { type: 'connection_opened'; epoch: number }
   // Client-originated optimistic phase change. No sequence_id — not part of
   // the server's total order. Mutates `phase` only; does not touch
   // `lastSequenceId`. The authoritative server-side phase change arrives
@@ -114,6 +128,7 @@ export function createInitialAtom(): ConversationAtom {
     streamingBuffer: null,
     uiError: null,
     toolExecutingStartedAt: null,
+    connectionEpoch: null,
   };
 }
 
@@ -233,10 +248,50 @@ function applyIfNewer(
   return { ...apply(atom), lastSequenceId: sequenceId };
 }
 
+/**
+ * Task 08683: cross-conversation contamination guard.
+ *
+ * Wire-originated actions and the synthesized `connection_state` action
+ * carry the `epoch` of the `useConnection` `OPEN_SSE` generation that
+ * produced them. When that epoch doesn't match the atom's current
+ * `connectionEpoch`, the action is from a stale connection — typically
+ * an EventSource that was opened for a different slug and hasn't fully
+ * closed yet. Drop it.
+ *
+ * Returns true when the action should be dropped. Logs in dev so silent
+ * drops are observable. Always returns false for actions without an
+ * `epoch` field (client-originated, or the bootstrap `connection_opened`
+ * which has its own monotonic check inside the reducer).
+ */
+function isStaleEpoch(atom: ConversationAtom, action: SSEAction): boolean {
+  // `connection_opened` carries the new epoch as data; it must not be
+  // pre-rejected by the guard. The reducer's case applies its own
+  // monotonic check.
+  if (action.type === 'connection_opened') return false;
+  if (!('epoch' in action) || action.epoch === undefined) return false;
+  // First connection on a fresh atom: connectionEpoch is null. Accepting
+  // the first stamped action is what brings the atom online; rejecting
+  // here would deadlock the bootstrap. The `connection_opened` event
+  // dispatched alongside `OPEN_SSE` lifts `connectionEpoch` to a real
+  // value before any other stamped action arrives.
+  if (atom.connectionEpoch === null) return false;
+  if (action.epoch === atom.connectionEpoch) return false;
+  if (import.meta.env.DEV) {
+    console.debug('[sse] dropping stale-epoch action', {
+      actionType: action.type,
+      actionEpoch: action.epoch,
+      atomConnectionEpoch: atom.connectionEpoch,
+    });
+  }
+  return true;
+}
+
 export function conversationReducer(
   atom: ConversationAtom,
   action: SSEAction
 ): ConversationAtom {
+  if (isStaleEpoch(atom, action)) return atom;
+
   switch (action.type) {
     case 'sse_init': {
       const p = action.payload;
@@ -464,6 +519,23 @@ export function conversationReducer(
 
     case 'connection_state':
       return { ...atom, connectionState: action.state };
+
+    case 'connection_opened': {
+      // Monotonic update only. A stale `OPEN_SSE` executor closure
+      // running after a newer connection has already advanced the atom
+      // must not regress `connectionEpoch` — doing so would re-open the
+      // contamination window for events that should now be rejected.
+      if (atom.connectionEpoch !== null && action.epoch <= atom.connectionEpoch) {
+        if (import.meta.env.DEV) {
+          console.debug('[sse] dropping stale connection_opened', {
+            actionEpoch: action.epoch,
+            atomConnectionEpoch: atom.connectionEpoch,
+          });
+        }
+        return atom;
+      }
+      return { ...atom, connectionEpoch: action.epoch };
+    }
 
     case 'local_phase_change':
       // Optimistic client-side phase update — does NOT bump lastSequenceId.

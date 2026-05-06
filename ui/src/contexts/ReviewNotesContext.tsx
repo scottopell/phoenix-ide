@@ -83,8 +83,28 @@ const ReviewNotesContext = createContext<ReviewNotesValue | null>(null);
  * — that's a deliberate scope (a "review session" is bounded by the
  * conversation visit).
  */
-export function ReviewNotesProvider({ children }: { children: ReactNode }) {
+export function ReviewNotesProvider({
+  children,
+  scopeKey,
+}: {
+  children: ReactNode;
+  /**
+   * Scope identifier (typically the active conversation slug). When this
+   * changes, the notes pile is cleared — a review session is bounded by the
+   * conversation visit (matching the docstring above), so navigating to a
+   * different conversation must not carry notes across.
+   */
+  scopeKey?: string | undefined;
+}) {
   const [notes, setNotes] = useState<ReviewNote[]>([]);
+  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
+
+  if (trackedScope !== scopeKey) {
+    // Synchronous reset (adjust state during render). Children never see
+    // notes from the previous scope.
+    setTrackedScope(scopeKey);
+    if (notes.length > 0) setNotes([]);
+  }
 
   const addNote = useCallback(
     (anchor: NoteAnchor, lineContent: string, body: string) => {

@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { api } from '../api';
-import type { Conversation } from '../api';
-import { cacheDB } from '../cache';
+import {
+  useConversationsList,
+  useConversationsRefresh,
+  useConversationSnapshot,
+} from '../conversation';
 import { useResizablePane } from '../hooks';
-import { useConversationCwd } from '../conversation';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
@@ -32,11 +33,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     defaultSize: 220,
     collapseThreshold: 120,
   });
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const location = useLocation();
   const { toasts, dismissToast, showSuccess } = useToast();
-  const loadingRef = useRef(false);
+
+  // Task 08684: ConversationStore is the single source of truth.
+  // The store-owned `useConversationsRefresh` (mounted in
+  // ConversationProvider) handles the 5s poll + cache + online +
+  // hard-delete cascade. This layout reads the derived list and the
+  // per-slug active row directly off the store — no parallel
+  // `Conversation[]` state, no per-field bridge hooks.
+  const { refresh: refreshConversations } = useConversationsRefresh();
+  const { active: conversations, archived: archivedConversations } = useConversationsList();
 
   // Media query listener
   useEffect(() => {
@@ -46,87 +53,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
-  // Load conversations for sidebar
-  const loadConversations = useCallback(async (silent = false) => {
-    if (loadingRef.current && silent) return;
-    loadingRef.current = true;
-    try {
-      const cached = await cacheDB.getAllConversations();
-      if (cached.length > 0) {
-        setConversations(cached.filter(c => !c.archived));
-        setArchivedConversations(cached.filter(c => c.archived));
-      }
-      if (navigator.onLine) {
-        const [freshActive, freshArchived] = await Promise.all([
-          api.listConversations(),
-          api.listArchivedConversations(),
-        ]);
-        setConversations(freshActive);
-        setArchivedConversations(freshArchived);
-        if (!silent) {
-          await cacheDB.syncConversations([...freshActive, ...freshArchived]);
-        }
-      }
-    } catch {
-      // silent
-    } finally {
-      loadingRef.current = false;
-    }
-  }, []);
-
-  // Initial load + periodic refresh
-  useEffect(() => {
-    if (!isDesktop) return;
-    loadConversations();
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible' && navigator.onLine) {
-        loadConversations(true);
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [isDesktop, loadConversations]);
-
-  // Refresh after navigating
-  useEffect(() => {
-    if (isDesktop) loadConversations(true);
-  }, [location.pathname, isDesktop, loadConversations]);
-
-  // REQ-BED-032: when the per-conversation SSE stream surfaces a
-  // hard-delete cascade event, refresh the sidebar immediately rather
-  // than waiting for the 5s polling tick. The cascade today emits on
-  // the per-conversation channel only (see `run_hard_delete_cascade` in
-  // `src/api/handlers.rs`), so this listener fires only for the tab the
-  // user just closed — other tabs catch up via polling.
-  useEffect(() => {
-    if (!isDesktop) return;
-    const handler = () => loadConversations(true);
-    window.addEventListener('phoenix:conversation-hard-deleted', handler);
-    return () => window.removeEventListener('phoenix:conversation-hard-deleted', handler);
-  }, [isDesktop, loadConversations]);
-
-  // Extract active slug and find active conversation
+  // Extract active slug. `useConversationSnapshot` reads the row directly
+  // from the store — polling and SSE both write through the same atom,
+  // so this is the single source of truth for the active conversation.
+  // Returns null until polling or SSE init has populated the row
+  // (typically one tick after navigation; `if (!conversation)` callers
+  // downstream paint a skeleton during that window).
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;
-  const activeConversation = useMemo(
-    () => conversations.find(c => c.slug === activeSlug) ?? null,
-    [conversations, activeSlug],
-  );
+  const activeConversation = useConversationSnapshot(activeSlug);
 
-  // Active-conversation cwd reactivity: the periodic poll
-  // (`loadConversations` every 5s) eventually picks up cwd transitions
-  // (Explore → Work after task approval, complete/abandon revert) but
-  // with up to ~5s of lag, leaving the file explorer stuck on the old
-  // root. Subscribe to the conversation atom for the active slug —
-  // that's updated immediately by `sse_conversation_update` events the
-  // backend emits when it mutates `cwd`. Atom value wins; poll is the
-  // fallback on first render before the SSE init lands. Task 08612.
-  //
-  // `useConversationCwd` is a selector hook: it only re-renders when
-  // the cwd string actually changes. Subscribing to the full atom would
-  // re-render on every `sse_token` because tokens churn the atom's
-  // `streamingBuffer` field, even though cwd never moves during streaming.
-  const liveCwd = useConversationCwd(activeSlug);
-  const effectiveCwd = liveCwd ?? activeConversation?.cwd ?? '/';
+  const effectiveCwd = activeConversation?.cwd ?? '/';
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
@@ -134,7 +71,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // See task 08664: previously the early-return on !isDesktop produced a
   // different React tree, unmounting ConversationPage and resetting its state.
   return (
-    <FileExplorerProvider>
+    <FileExplorerProvider scopeKey={activeSlug ?? undefined}>
       <div className={isDesktop ? 'desktop-layout' : undefined}>
         {isDesktop && (
           <Sidebar
@@ -143,7 +80,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             conversations={conversations}
             archivedConversations={archivedConversations}
             activeSlug={activeSlug}
-            onConversationCreated={() => loadConversations(true)}
+            onConversationCreated={() => refreshConversations()}
             width={sidebarPane.collapsed ? undefined : sidebarPane.size}
           />
         )}

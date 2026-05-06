@@ -1,5 +1,12 @@
 export { ConversationProvider } from './ConversationProvider';
-export { useConversationAtom, useConversationCwd, useConversationSelectors } from './useConversationAtom';
+export { ConversationStore } from './ConversationStore';
+export { useConversationsRefresh } from './useConversationsRefresh';
+export {
+  useConversationAtom,
+  useConversationSnapshot,
+  useConversationsList,
+  useConversationSelectors,
+} from './useConversationAtom';
 export { conversationReducer, createInitialAtom, breadcrumbFromPhase } from './atom';
 export type {
   ConversationAtom,
