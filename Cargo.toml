@@ -30,6 +30,9 @@ rusqlite = "0.32"
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
+# Socket configuration
+socket2 = "0.6"
+
 # Async utilities
 async-trait = "0.1"
 futures = "0.3"

@@ -18,7 +18,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 /// Flag indicating SIGHUP was received (reload requested)
@@ -57,7 +57,9 @@ pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
         if let Some(std_listener) = listenfd.take_tcp_listener(0)? {
             tracing::info!("Using systemd-provided TCP listener");
-            return TcpListener::from_std(std_listener);
+            let listener = TcpListener::from_std(std_listener)?;
+            configure_tcp_options(&listener)?;
+            return Ok(listener);
         }
 
         return Err(std::io::Error::new(
@@ -68,7 +70,38 @@ pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
     // Dev mode: bind fresh
     tracing::debug!(addr = %addr, "Binding fresh listener (no socket activation)");
-    TcpListener::bind(addr).await
+    let listener = TcpListener::bind(addr).await?;
+    configure_tcp_options(&listener)?;
+    Ok(listener)
+}
+
+/// Set TCP keepalive and user timeout on the listener socket.
+///
+/// Options are inherited by all accepted connections, so stale clients
+/// (e.g. SSE streams whose TCP FIN was lost in transit) are reaped within
+/// ~90s instead of the OS default of ~2 hours.
+///
+/// - `SO_KEEPALIVE` + `TCP_KEEPIDLE`/`INTVL`: reap truly idle connections
+/// - `TCP_USER_TIMEOUT`: reap connections where a write (e.g. SSE ping) goes
+///   unacknowledged — the critical path for our 15s app-level keepalive
+fn configure_tcp_options(listener: &TcpListener) -> std::io::Result<()> {
+    use socket2::{SockRef, TcpKeepalive};
+
+    let sock = SockRef::from(listener);
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10));
+
+    #[cfg(target_os = "linux")]
+    let keepalive = keepalive.with_retries(3);
+
+    sock.set_tcp_keepalive(&keepalive)?;
+
+    #[cfg(target_os = "linux")]
+    sock.set_tcp_user_timeout(Some(Duration::from_secs(60)))?;
+
+    Ok(())
 }
 
 /// Check if running under systemd socket activation.
