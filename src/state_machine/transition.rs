@@ -90,6 +90,61 @@ pub enum TransitionError {
     },
 }
 
+/// Synchronously check whether a `UserMessage` event would be accepted by
+/// `transition()` for the given parent-conversation state.
+///
+/// Returns `Ok(())` if the state would accept (and persist + send to LLM) a
+/// user message. Returns the same `TransitionError` variant `transition()`
+/// would produce, so callers can map it to a typed HTTP error.
+///
+/// Used by the `/api/conversations/:id/chat` handler to fail-fast with a 409
+/// instead of silently queueing the event into a runtime executor that will
+/// drop it when the executor wakes and observes a rejecting state. Without
+/// this precheck the chat POST returns 200, the optimistic UI transitions to
+/// `awaiting_llm`, and the only signal of rejection is a server-side log line
+/// (`"Transition rejected"`) — leaving the UI permanently in optimistic
+/// `awaiting_llm` while the server stays in the rejecting state.
+///
+/// The arms here mirror the rejection arms of `transition_core` and
+/// `transition_parent` for `UserMessage` events. Drift is caught by
+/// `prop_check_user_message_acceptable_matches_transition` in proptests.rs.
+///
+/// Only valid for parent (top-level) conversations. Sub-agent conversations
+/// don't accept chat HTTP traffic.
+pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), TransitionError> {
+    match state {
+        // Idle and Error: transition_core arm (Idle | Error, UserMessage) → LlmRequesting
+        ConvState::Idle | ConvState::Error { .. } => Ok(()),
+
+        // transition_core: AgentBusy
+        ConvState::LlmRequesting { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::AwaitingSubAgents { .. } => Err(TransitionError::AgentBusy),
+
+        // transition_core: CancellationInProgress
+        ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
+            Err(TransitionError::CancellationInProgress)
+        }
+
+        // transition_parent: explicit reject arms
+        ConvState::AwaitingTaskApproval { .. } => Err(TransitionError::AwaitingTaskApproval),
+        ConvState::AwaitingUserResponse { .. } => Err(TransitionError::AwaitingUserResponse),
+        ConvState::ContextExhausted { .. } => Err(TransitionError::ContextExhausted),
+        ConvState::Terminal => Err(TransitionError::ConversationTerminal),
+
+        // No explicit arm in transition_core/transition_parent — falls through
+        // to the catch-all `InvalidTransition`. Enumerated explicitly so
+        // adding a new state forces a decision here.
+        ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. } => Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: "UserMessage",
+        }),
+    }
+}
+
 /// Pure transition function — compatibility wrapper.
 ///
 /// Dispatches to `transition_parent` or `transition_sub_agent` based on
@@ -3056,6 +3111,33 @@ mod tests {
             ConvState::AwaitingContinuation { attempt: 1, .. }
         ));
         assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn check_user_message_acceptable_idle_ok() {
+        assert!(check_user_message_acceptable(&ConvState::Idle).is_ok());
+    }
+
+    #[test]
+    fn check_user_message_acceptable_context_exhausted_returns_typed_error() {
+        let state = ConvState::ContextExhausted {
+            summary: "summary".to_string(),
+        };
+        let err = check_user_message_acceptable(&state).expect_err("must reject");
+        assert!(matches!(err, TransitionError::ContextExhausted));
+    }
+
+    #[test]
+    fn check_user_message_acceptable_terminal_returns_typed_error() {
+        let err = check_user_message_acceptable(&ConvState::Terminal).expect_err("must reject");
+        assert!(matches!(err, TransitionError::ConversationTerminal));
+    }
+
+    #[test]
+    fn check_user_message_acceptable_busy_returns_agent_busy() {
+        let err = check_user_message_acceptable(&ConvState::LlmRequesting { attempt: 1 })
+            .expect_err("must reject");
+        assert!(matches!(err, TransitionError::AgentBusy));
     }
 
     #[test]

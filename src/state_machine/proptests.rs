@@ -587,6 +587,50 @@ proptest! {
         );
     }
 
+    // Drift protection: `check_user_message_acceptable` must agree with the
+    // actual `transition()` output for a UserMessage event in every state.
+    // The chat HTTP handler relies on this predicate to fail-fast with a 409;
+    // if it diverged from the transition arms, the handler would either
+    // accept events the executor will silently drop (the bug we're fixing)
+    // or reject events the executor would accept (a different regression).
+    #[test]
+    fn prop_check_user_message_acceptable_matches_transition(
+        state in arb_state(),
+        event in arb_user_message_event(),
+    ) {
+        use super::transition::check_user_message_acceptable;
+
+        let predicate = check_user_message_acceptable(&state);
+        let actual = transition(&state, &test_context(), event);
+
+        match (&predicate, &actual) {
+            (Ok(()), Ok(_)) => {}
+            (Err(p_err), Err(a_err)) => {
+                prop_assert_eq!(
+                    std::mem::discriminant(p_err),
+                    std::mem::discriminant(a_err),
+                    "predicate error variant {:?} disagrees with transition error variant {:?} \
+                     for state {:?}",
+                    p_err,
+                    a_err,
+                    state.variant_name()
+                );
+            }
+            (Ok(()), Err(a_err)) => prop_assert!(
+                false,
+                "predicate accepted but transition rejected for state {:?}: {:?}",
+                state.variant_name(),
+                a_err
+            ),
+            (Err(p_err), Ok(_)) => prop_assert!(
+                false,
+                "predicate rejected ({:?}) but transition accepted for state {:?}",
+                p_err,
+                state.variant_name()
+            ),
+        }
+    }
+
     // Invariant 6: PersistState effect always emitted on state change
     #[test]
     fn prop_state_changes_persist(state in arb_state(), event in arb_event()) {

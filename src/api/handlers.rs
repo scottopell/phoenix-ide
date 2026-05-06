@@ -29,7 +29,7 @@ use crate::git_ops::{
 };
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
-use crate::state_machine::{ConvState, Event};
+use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
 use crate::terminal::terminal_ws_handler;
 
 use axum::{
@@ -1460,6 +1460,35 @@ async fn send_chat(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    // Fail-fast when the state would reject UserMessage. Without this, the
+    // chat POST returns 200, the runtime drops the queued event with only a
+    // "Transition rejected" log line, and the optimistic UI is stuck on
+    // `awaiting_llm` forever (no SSE event flows back to undo the optimistic
+    // dispatch). A 409 lets the existing client-side error path
+    // (`markFailed` in ConversationPage.tsx) surface the rejection to the
+    // user with retry/dismiss controls.
+    if let Err(err) = check_user_message_acceptable(&conversation.state) {
+        let error_type = match err {
+            TransitionError::ContextExhausted => "context_exhausted",
+            TransitionError::ConversationTerminal => "conversation_terminal",
+            TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
+            TransitionError::AwaitingUserResponse => "awaiting_user_response",
+            TransitionError::AgentBusy => "agent_busy",
+            TransitionError::CancellationInProgress => "cancellation_in_progress",
+            TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
+        };
+        tracing::info!(
+            conv_id = %id,
+            state = conversation.state.variant_name(),
+            error_type,
+            "Chat rejected: conversation state cannot accept UserMessage"
+        );
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            err.to_string(),
+            error_type,
+        ))));
+    }
 
     let working_dir = std::path::PathBuf::from(&conversation.cwd);
     let expanded = crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
