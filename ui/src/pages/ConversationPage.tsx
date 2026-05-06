@@ -1098,6 +1098,7 @@ function ConversationPageContent() {
         onTriggerContinuation={handleTriggerContinuation}
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
+        onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
       />
       </div>
 

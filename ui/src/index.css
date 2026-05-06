@@ -5302,6 +5302,50 @@ html * {
   }
 }
 
+/* Files button — opens FileBrowserOverlay on widths below the desktop
+   breakpoint (1025px). Rendered alongside the chevron in the StateBar.
+   Visible footprint matches the chevron (32x32) so the bar's 42px height
+   isn't blown out, but a ::before pseudo-element inflates the hit area
+   to 44x44 (WCAG 2.5.5 / Apple HIG). The desktop FileExplorerPanel covers
+   widths >= 1025px, so ConversationPage omits onOpenFiles there and this
+   button does not render. */
+.statebar-files-btn {
+  position: relative;
+  background: none;
+  border: 0;
+  color: var(--text-muted);
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  margin-left: 4px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.statebar-files-btn::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+}
+
+.statebar-files-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.statebar-files-btn:active {
+  background: var(--bg-primary);
+}
+
+.statebar-files-btn:focus-visible {
+  outline: 2px solid var(--accent-blue, currentColor);
+  outline-offset: 2px;
+}
+
 /* IndexedDB init error state */
 .init-error {
   display: flex;
