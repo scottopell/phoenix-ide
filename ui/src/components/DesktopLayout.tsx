@@ -1,17 +1,17 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useLocation } from 'react-router-dom';
-import { api } from '../api';
-import type { Conversation } from '../api';
-import { cacheDB } from '../cache';
+import {
+  useConversationsList,
+  useConversationsRefresh,
+  useConversationByActiveSlug,
+} from '../conversation';
 import { useResizablePane } from '../hooks';
-import { useConversationCwd } from '../conversation';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
-import { conversationListsEqual } from '../utils/conversationDiff';
 
 interface DesktopLayoutProps {
   children: React.ReactNode;
@@ -33,11 +33,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     defaultSize: 220,
     collapseThreshold: 120,
   });
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const location = useLocation();
   const { toasts, dismissToast, showSuccess } = useToast();
-  const loadingRef = useRef(false);
+
+  // Task 08684: ConversationStore is the single source of truth.
+  // The store-owned `useConversationsRefresh` (mounted in
+  // ConversationProvider) handles the 5s poll + cache + online +
+  // hard-delete cascade. This layout reads the derived list and the
+  // per-slug active row directly off the store — no parallel
+  // `Conversation[]` state, no per-field bridge hooks.
+  const { refresh: refreshConversations } = useConversationsRefresh();
+  const { active: conversations, archived: archivedConversations } = useConversationsList();
 
   // Media query listener
   useEffect(() => {
@@ -47,105 +53,23 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
-  // Load conversations for sidebar.
-  //
-  // Idempotency: setConversations is skipped when the new server response
-  // matches the current state by `(id, updated_at)` per row. The sidebar
-  // uses `updated_at DESC` ordering and the server bumps it on every
-  // mutation that should affect display (state transitions, message inserts,
-  // archive, rename). When nothing has changed, the array reference stays
-  // stable and downstream renders / chain grouping memos don't churn.
-  const loadConversations = useCallback(async (silent = false) => {
-    if (loadingRef.current && silent) return;
-    loadingRef.current = true;
-    try {
-      const cached = await cacheDB.getAllConversations();
-      if (cached.length > 0) {
-        const cachedActive = cached.filter(c => !c.archived);
-        const cachedArchived = cached.filter(c => c.archived);
-        setConversations(prev => conversationListsEqual(prev, cachedActive) ? prev : cachedActive);
-        setArchivedConversations(prev =>
-          conversationListsEqual(prev, cachedArchived) ? prev : cachedArchived,
-        );
-      }
-      if (navigator.onLine) {
-        const [freshActive, freshArchived] = await Promise.all([
-          api.listConversations(),
-          api.listArchivedConversations(),
-        ]);
-        setConversations(prev => conversationListsEqual(prev, freshActive) ? prev : freshActive);
-        setArchivedConversations(prev =>
-          conversationListsEqual(prev, freshArchived) ? prev : freshArchived,
-        );
-        if (!silent) {
-          await cacheDB.syncConversations([...freshActive, ...freshArchived]);
-        }
-      }
-    } catch {
-      // silent
-    } finally {
-      loadingRef.current = false;
-    }
-  }, []);
-
-  // Initial load + periodic refresh
-  useEffect(() => {
-    if (!isDesktop) return;
-    loadConversations();
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible' && navigator.onLine) {
-        loadConversations(true);
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [isDesktop, loadConversations]);
-
-  // Note: a previous version refreshed the sidebar on every navigation.
-  // That has been removed — every change-driven case is now covered
-  // explicitly:
-  //   * Conversation create / archive / unarchive / delete / rename →
-  //     `onConversationCreated` callback (see Sidebar handlers).
-  //   * Hard-delete cascade → `phoenix:conversation-hard-deleted` window event
-  //     (effect below).
-  //   * Otherwise → the 5s poll, which is now idempotent so it's free when
-  //     nothing has changed.
-
-  // REQ-BED-032: when the per-conversation SSE stream surfaces a
-  // hard-delete cascade event, refresh the sidebar immediately rather
-  // than waiting for the 5s polling tick. The cascade today emits on
-  // the per-conversation channel only (see `run_hard_delete_cascade` in
-  // `src/api/handlers.rs`), so this listener fires only for the tab the
-  // user just closed — other tabs catch up via polling.
-  useEffect(() => {
-    if (!isDesktop) return;
-    const handler = () => loadConversations(true);
-    window.addEventListener('phoenix:conversation-hard-deleted', handler);
-    return () => window.removeEventListener('phoenix:conversation-hard-deleted', handler);
-  }, [isDesktop, loadConversations]);
-
-  // Extract active slug and find active conversation
+  // Extract active slug and find active conversation. Reading
+  // `useConversationByActiveSlug(activeSlug)` subscribes only to that
+  // slug's atom — token streaming on a non-active conversation does
+  // not re-render this layout. Returns null until the SSE init or a
+  // poll has populated the row.
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;
+  const activeConversationFromAtom = useConversationByActiveSlug(activeSlug);
+  // Fallback to scanning the derived list while the per-slug atom is
+  // still empty (e.g. first paint after navigation, before SSE init
+  // has landed). Both paths read the same store so they cannot diverge.
   const activeConversation = useMemo(
-    () => conversations.find(c => c.slug === activeSlug) ?? null,
-    [conversations, activeSlug],
+    () => activeConversationFromAtom ?? conversations.find((c) => c.slug === activeSlug) ?? null,
+    [activeConversationFromAtom, conversations, activeSlug],
   );
 
-  // Active-conversation cwd reactivity: the periodic poll
-  // (`loadConversations` every 5s) eventually picks up cwd transitions
-  // (Explore → Work after task approval, complete/abandon revert) but
-  // with up to ~5s of lag, leaving the file explorer stuck on the old
-  // root. Subscribe to the conversation atom for the active slug —
-  // that's updated immediately by `sse_conversation_update` events the
-  // backend emits when it mutates `cwd`. Atom value wins; poll is the
-  // fallback on first render before the SSE init lands. Task 08612.
-  //
-  // `useConversationCwd` is a selector hook: it only re-renders when
-  // the cwd string actually changes. Subscribing to the full atom would
-  // re-render on every `sse_token` because tokens churn the atom's
-  // `streamingBuffer` field, even though cwd never moves during streaming.
-  const liveCwd = useConversationCwd(activeSlug);
-  const effectiveCwd = liveCwd ?? activeConversation?.cwd ?? '/';
+  const effectiveCwd = activeConversation?.cwd ?? '/';
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
@@ -162,7 +86,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             conversations={conversations}
             archivedConversations={archivedConversations}
             activeSlug={activeSlug}
-            onConversationCreated={() => loadConversations(true)}
+            onConversationCreated={() => refreshConversations()}
             width={sidebarPane.collapsed ? undefined : sidebarPane.size}
           />
         )}

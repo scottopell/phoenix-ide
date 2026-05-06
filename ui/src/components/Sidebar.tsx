@@ -23,8 +23,8 @@ const ChevronRight = () => (
 interface SidebarProps {
   collapsed: boolean;
   onToggle: () => void;
-  conversations: Conversation[];
-  archivedConversations: Conversation[];
+  conversations: readonly Conversation[];
+  archivedConversations: readonly Conversation[];
   activeSlug: string | null;
   onConversationCreated: () => void;
   /** Width in px when expanded — driven by useResizablePane */

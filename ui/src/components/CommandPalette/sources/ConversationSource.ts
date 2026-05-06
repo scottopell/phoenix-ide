@@ -4,7 +4,7 @@ import type { PaletteSource, PaletteItem } from '../types';
 import { fuzzyMatch } from '../fuzzyMatch';
 
 export function createConversationSource(
-  conversations: Conversation[],
+  conversations: readonly Conversation[],
   onNavigate: (slug: string) => void,
 ): PaletteSource {
   return {
