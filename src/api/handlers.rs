@@ -1909,11 +1909,25 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     }
 
     // Step 3: tmux server.
-    let tmux_worktree = conv.conv_mode.worktree_path().map(std::path::Path::new);
+    //
+    // worktree_path for socket keying (task 03001): use the typed worktree
+    // field for Work/Branch, cwd for Explore (REQ-PROJ-028 guarantees cwd IS
+    // the worktree for Explore), None for Direct. Mirrors the Explore
+    // fallback in src/terminal/ws.rs — without it, the cascade looks up the
+    // wrong (conv-{id}.sock) deterministic socket and the actual
+    // wt-{hash}.sock tmux server is orphaned.
+    let tmux_worktree_buf: Option<std::path::PathBuf> = conv
+        .conv_mode
+        .worktree_path()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            matches!(conv.conv_mode, crate::db::ConvMode::Explore)
+                .then(|| std::path::PathBuf::from(&conv.cwd))
+        });
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         state.runtime.tmux_registry(),
         id,
-        tmux_worktree,
+        tmux_worktree_buf.as_deref(),
         conv.continued_in_conv_id.as_deref(),
     )
     .await;

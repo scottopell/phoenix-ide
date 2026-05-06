@@ -368,7 +368,11 @@ impl TmuxRegistry {
     /// Get-or-create the entry without driving probe/spawn. Internal
     /// helper for `ensure_live`; not exposed because callers should
     /// always go through the probe-and-act sequence.
-    async fn get_or_insert(&self, conversation_id: &str, socket_path: PathBuf) -> Arc<RwLock<TmuxServer>> {
+    async fn get_or_insert(
+        &self,
+        conversation_id: &str,
+        socket_path: PathBuf,
+    ) -> Arc<RwLock<TmuxServer>> {
         {
             let map = self.inner.read().await;
             if let Some(entry) = map.get(conversation_id) {
@@ -379,10 +383,7 @@ impl TmuxRegistry {
         if let Some(entry) = map.get(conversation_id) {
             return entry.clone();
         }
-        let entry = Arc::new(RwLock::new(TmuxServer::new(
-            conversation_id,
-            socket_path,
-        )));
+        let entry = Arc::new(RwLock::new(TmuxServer::new(conversation_id, socket_path)));
         map.insert(conversation_id.to_string(), entry.clone());
         entry
     }

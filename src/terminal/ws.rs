@@ -330,7 +330,7 @@ async fn acquire_handle(
 ///
 /// `worktree_path` controls socket keying: `Some` for Work/Branch/Explore
 /// (socket tied to the worktree so continuations share the session),
-/// `None` for Direct (socket tied to conversation_id). See task 03001.
+/// `None` for Direct (socket tied to `conversation_id`). See task 03001.
 async fn resolve_exec_plan(
     conversation_id: &str,
     worktree_path: Option<&std::path::Path>,
@@ -341,7 +341,10 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry.ensure_live(conversation_id, worktree_path, cwd).await {
+    match registry
+        .ensure_live(conversation_id, worktree_path, cwd)
+        .await
+    {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {

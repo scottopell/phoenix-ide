@@ -456,12 +456,17 @@ rule ServerKilledByConversationDelete {
 rule ServerPreservedForContinuation {
     when: ConversationHardDeleted(conversation)
 
-    requires: exists TmuxServer{conversation: conversation}
-    let server = TmuxServer{conversation: conversation}
     requires: conversation.continued_in_conv_id != null
 
     ensures: not exists TmuxServer{conversation: conversation}
     -- TmuxServerKilled and SocketFileUnlinked are NOT ensured.
+    --
+    -- Note: this rule fires whether or not a TmuxServer entry currently
+    -- exists for the conversation. If no entry exists (e.g., conversation
+    -- never used tmux), the post-condition is vacuously satisfied. The
+    -- code's skip-kill behaviour matches: it short-circuits on
+    -- continued_in_conv_id BEFORE looking at the registry entry, so the
+    -- absence of an entry doesn't change the outcome.
 }
 
 -- REQ-TMUX-008 (soft-state preservation contract): expressed as a
@@ -510,7 +515,7 @@ surface AgentTmuxAccess {
     -- Sub-agents are excluded: TmuxTool is absent from for_subagent_explore()
     -- and for_subagent_work(). The tmux session belongs to the worktree's
     -- owning conversation, not its sub-agents. (task 03001)
-    requires: not conversation.is_sub_agent
+    requires: conversation.kind = Parent
 
     exposes:
         TmuxServer.status

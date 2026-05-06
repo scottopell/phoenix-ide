@@ -647,7 +647,10 @@ mod tests {
         // no ask_user, no propose_task, no parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore());
         assert!(sub_explore.contains("bash"));
-        assert!(!sub_explore.contains("tmux"), "sub-agent explore must not have tmux (task 03001)");
+        assert!(
+            !sub_explore.contains("tmux"),
+            "sub-agent explore must not have tmux (task 03001)"
+        );
         assert!(sub_explore.contains("submit_result"));
         assert!(sub_explore.contains("submit_error"));
         assert!(!sub_explore.contains("patch"));
@@ -665,7 +668,10 @@ mod tests {
         let sub_work = names(&ToolRegistry::for_subagent_work());
         assert!(sub_work.contains("bash"));
         assert!(sub_work.contains("patch"));
-        assert!(!sub_work.contains("tmux"), "sub-agent work must not have tmux (task 03001)");
+        assert!(
+            !sub_work.contains("tmux"),
+            "sub-agent work must not have tmux (task 03001)"
+        );
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));
