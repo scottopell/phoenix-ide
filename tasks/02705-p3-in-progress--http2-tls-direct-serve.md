@@ -1,7 +1,7 @@
 ---
 created: 2026-05-05
 priority: p3
-status: ready
+status: in-progress
 artifact: src/main.rs
 ---
 
@@ -39,31 +39,34 @@ so TLS termination happens in the phoenix binary itself.
 - Cert + key loaded from configured paths; ALPN advertises h2 + http/1.1
 - HTTP/1.1 path remains supported for any non-browser client (curl,
   phoenix-client.py) that doesn't negotiate h2
-- Cert source: open question. Options range from a long-lived
-  self-signed cert (acceptable for a single-user dev tool with
-  trust-on-first-use) to whatever CA is appropriate for the
-  deployment environment
-- Cert rotation story: if self-signed, document the manual procedure;
-  if CA-issued, document the renewal path
+- Cert source: resolved as opt-in auto-managed private Phoenix CA for
+  single-user/internal-DNS deployments, with manual cert/key paths for
+  environments that already manage TLS externally.
+- Cert rotation story: `PHOENIX_TLS=auto` reuses the managed CA and rotates
+  the server leaf certificate on startup. For remote production hosts,
+  `./dev.py tls issue <host>` creates a host-specific bundle from the local CA
+  and `./dev.py tls install <bundle>` configures `PHOENIX_TLS=manual` without
+  copying the CA private key to the remote host.
 
 ## Done When
 
-- [ ] Phoenix serves HTTPS on the same port (or a configurable port)
+- [x] Phoenix serves HTTPS on the same port (or a configurable port)
 - [ ] Browser hits `https://...:8031` and negotiates h2 via ALPN
-- [ ] Multiple SSE streams + concurrent fetches succeed past the
+- [x] Multiple SSE streams + concurrent fetches succeed past the
       historical 6-connection threshold (manual repro: open 8+ tabs
       and verify a 9th request still completes)
-- [ ] HTTP/1.1 clients (curl without `--http2`) still work
-- [ ] Cert + key path configurable via env / dev.py
-- [ ] Cert source decision documented (self-signed vs CA-issued)
+- [x] HTTP/1.1 clients (curl without `--http2`) still work
+- [x] Cert + key path configurable via env / dev.py
+- [x] Cert source decision documented (self-signed vs CA-issued)
+- [x] `./dev.py up --https` and `./dev.py tls ca|issue|install` workflows exist
 
 ## Out of scope
 
-- Auto-cert management (ACME/Let's Encrypt) — phoenix is direct-internal,
-  not internet-facing, so ACME http-01 is not viable. Manual cert
-  installation is the baseline.
-- Reverse proxy alternative (Caddy etc.) — adds moving parts; not
-  worth it for a single-binary tool. Direct termination is simpler.
+- Public ACME management. Phoenix's target use here is single-user/internal
+  DNS. Public CA issuance may be appropriate for public DNS zones, but is not
+  Phoenix's built-in path.
+- Reverse proxy alternative (Caddy etc.) — adds moving parts; not worth it
+  for a single-binary tool. Direct termination is simpler.
 
 ## Notes
 
@@ -71,3 +74,18 @@ Filed 2026-05-05 as the structural follow-up to tasks 02703
 (shutdown-sse-deadline) and 02704 (bounded-sse-stream-lifetime). Do
 02704 first; only escalate to this task if saturation persists past
 the lifetime fix, since the cert-management overhead is real.
+
+Automated verification:
+
+- `curl -k https://127.0.0.1:8033/version` returns `HTTP/2 200`.
+- `curl -k --http1.1 https://127.0.0.1:8033/version` returns `HTTP/1.1 200 OK`.
+- `openssl s_client -alpn h2` negotiates `ALPN protocol: h2`.
+- Node `http2` smoke test opened 8 concurrent
+  `/api/conversations/:id/stream` SSE streams over one h2 session, then
+  completed a ninth `/version` request in 3 ms while all 8 SSE streams stayed
+  active.
+
+Browser verification is intentionally still unchecked: without trusting
+`~/.phoenix-ide/tls/phoenix-local-ca.pem`, the in-app browser stops at
+`ERR_CERT_AUTHORITY_INVALID`. That is the expected trust boundary, not a server
+failure.

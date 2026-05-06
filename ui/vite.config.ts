@@ -13,8 +13,11 @@ function gitkeep(): Plugin {
   };
 }
 
-// API port can be overridden via VITE_API_PORT env var
+// API endpoint can be overridden via env vars.
 const apiPort = process.env.VITE_API_PORT || '8000';
+const apiScheme = process.env.VITE_API_SCHEME || 'http';
+const proxySecure = process.env.VITE_API_PROXY_SECURE !== 'false';
+const apiTarget = `${apiScheme}://localhost:${apiPort}`;
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -23,13 +26,15 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       '/api': {
-        target: `http://localhost:${apiPort}`,
+        target: apiTarget,
         changeOrigin: true,
+        secure: proxySecure,
         ws: true, // proxy WebSocket upgrades (needed for terminal endpoint)
       },
       '/preview': {
-        target: `http://localhost:${apiPort}`,
+        target: apiTarget,
         changeOrigin: true,
+        secure: proxySecure,
       },
     },
   },

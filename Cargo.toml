@@ -8,6 +8,10 @@ rust-version = "1.94"
 name = "phoenix-monitor"
 path = "src/bin/monitor.rs"
 
+[[bin]]
+name = "phoenix-tls"
+path = "src/bin/tls.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -15,6 +19,13 @@ tokio = { version = "1", features = ["full"] }
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+time = "0.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "fs", "compression-full", "trace"] }
 
@@ -142,4 +153,3 @@ opt-level = 3
 # Database (rarely debugged)
 [profile.dev.package.sqlx]
 opt-level = 3
-

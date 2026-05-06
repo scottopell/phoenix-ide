@@ -35,7 +35,7 @@ a duplicate of what is already on screen.
 
 Observed visually: top of form shows `DIRECTORY` + `MODEL` pickers
 filled in; bottom of form shows the same values again as
-`[check ~/dd/datadog-agent/] [claude-4-6]` chips.
+`[check ~/work/example-repo/] [claude-4-6]` chips.
 
 ## Acceptance Criteria
 

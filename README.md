@@ -33,6 +33,9 @@ disclosure: essentials visible by default, details on demand.
 ./dev.py restart     # restart services
 ./dev.py status      # show running state
 ./dev.py check       # pre-commit checks (fmt, clippy, tests)
+
+# Optional: run the dev backend over HTTPS with h2 ALPN enabled
+./dev.py up --https
 ```
 
 ### Single-shot CLI
@@ -75,6 +78,36 @@ Multi-provider LLM support routes through either the Anthropic API or an exe.dev
 ./dev.py lima destroy  # tear down VM
 ```
 
+### Optional HTTPS Quick Start
+
+TLS is opt-in. The lowest-toil internal-DNS flow is a local Phoenix private CA
+that you trust once on your browser machine, then use to issue per-host leaf
+certificates. The CA private key stays on the machine where you issue certs; the
+remote host receives only its leaf cert and key.
+
+```bash
+# On the machine that owns the Phoenix CA, create/show the CA.
+./dev.py tls ca
+
+# Trust this CA cert once on the browser machine:
+#   ~/.phoenix-ide/tls/phoenix-local-ca.pem
+
+# Issue a bundle for the hostname you will open in the browser.
+./dev.py tls issue phoenix-host.internal
+
+# Copy only the bundle to the remote host.
+scp ~/.phoenix-ide/tls-bundles/phoenix-host.internal.tar.gz ssh-host:~/
+
+# On the remote host, from its phoenix-ide repo checkout:
+./dev.py tls install ~/phoenix-host.internal.tar.gz
+./dev.py prod deploy
+```
+
+After install, `./dev.py prod deploy` reads `.phoenix-ide.env` and serves
+`https://phoenix-host.internal:8031`. For local development, `./dev.py up
+--https` uses the same default CA directory, keeps the dev UI on the Vite URL,
+and proxies API requests to Phoenix over HTTPS.
+
 ### Publishing a Release
 
 ```bash
@@ -97,17 +130,30 @@ https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x
 | `ANTHROPIC_API_KEY` | Direct Anthropic API key (alternative to gateway) | — |
 | `PHOENIX_PORT` | Server port | `8000` |
 | `PHOENIX_DB_PATH` | SQLite database path | `~/.phoenix-ide/phoenix.db` |
+| `PHOENIX_TLS` | HTTPS mode: `auto`/`on`/`true`/`1`, `manual`, or `off`/`none`/`false`/`0` | `off` |
+| `PHOENIX_TLS_HOSTS` | Comma-separated extra DNS/IP SANs for `PHOENIX_TLS=auto` | `localhost,127.0.0.1,::1` |
+| `PHOENIX_TLS_DIR` | Managed local CA and auto-issued leaf certificate directory | parent of `PHOENIX_DB_PATH` + `/tls` |
+| `PHOENIX_TLS_CERT_PATH` | Manual TLS certificate PEM path; with key path, enables manual TLS even if `PHOENIX_TLS` is unset | — |
+| `PHOENIX_TLS_KEY_PATH` | Manual TLS private key PEM path; required with cert path | — |
+| `PHOENIX_PUBLIC_URL` | Display URL used by `./dev.py prod status`/deploy output; not read by the Rust server | derived from TLS mode |
 | `RUST_LOG` | Log level (`info`, `debug`, …) | — |
+
+TLS is opt-in. `PHOENIX_TLS=auto` creates a private Phoenix CA in
+`PHOENIX_TLS_DIR` if one is not already present, then rotates the server leaf
+certificate on startup. `PHOENIX_TLS=manual` serves the cert/key paths exactly as
+configured; this is what `./dev.py tls install` writes for remote production
+hosts. See [TLS.md](TLS.md) for the complete trust and deployment workflow.
 
 ## API Endpoints
 
 - `GET /api/conversations` - List all conversations
-- `POST /api/conversations` - Create new conversation
+- `POST /api/conversations/new` - Create new conversation
 - `GET /api/conversations/:id` - Get conversation details
 - `POST /api/conversations/:id/messages` - Send a message
-- `GET /api/conversations/:id/events` - SSE stream for real-time updates
+- `GET /api/conversations/:id/stream` - SSE stream for real-time updates
 
 ## Documentation
 
 - `specs/` — Per-tool and subsystem specs using the [spEARS methodology](SPEARS.md)
+- [TLS.md](TLS.md) — HTTPS, HTTP/2, private CA, and deployment workflow
 - [AGENTS.md](AGENTS.md) — Agent architecture and conventions

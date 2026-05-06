@@ -1,6 +1,7 @@
 /target
 .phoenix.pid
 .vite.pid
+.vite.proxy
 __pycache__/
 
 # Logs

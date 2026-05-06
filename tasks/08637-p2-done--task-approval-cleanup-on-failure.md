@@ -16,7 +16,7 @@ same conversation ID maps to the same worktree directory path, so
 `git worktree add` fails with "already exists."
 
 The user must manually `git worktree remove` + `git branch -D` before
-retrying. Hit in production on 2026-04-08 (task-02637 on sopell3).
+retrying. Hit in production on 2026-04-08.
 
 ## Root cause
 
