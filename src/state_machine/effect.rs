@@ -112,6 +112,10 @@ pub enum Effect {
     NotifyParent { outcome: SubAgentOutcome },
 
     /// Notify connected clients
+    // `data` is constructed by transition helpers but the executor now reads
+    // only `event_type`; the field will be removed when NotifyClient is
+    // replaced with typed effect variants (REQ-BED follow-up).
+    #[allow(dead_code)]
     NotifyClient { event_type: String, data: Value },
 
     /// Schedule a retry

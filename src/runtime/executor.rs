@@ -1055,7 +1055,10 @@ where
                 Ok(None)
             }
 
-            Effect::NotifyClient { event_type, data } => {
+            Effect::NotifyClient {
+                event_type,
+                data: _,
+            } => {
                 match event_type.as_str() {
                     "agent_done" => {
                         let _ = self
@@ -1063,40 +1066,11 @@ where
                             .send_seq(|seq| SseEvent::AgentDone { sequence_id: seq });
                     }
                     "state_change" => {
-                        // data should contain the full state object; deserialize to typed ConvState
-                        if let Some(state_val) = data.get("state") {
-                            match serde_json::from_value::<ConvState>(state_val.clone()) {
-                                Ok(typed_state) => {
-                                    let _ =
-                                        self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                                            sequence_id: seq,
-                                            state: typed_state,
-                                            display_state: self
-                                                .state
-                                                .display_state()
-                                                .as_str()
-                                                .to_string(),
-                                        });
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "Failed to deserialize NotifyClient state_change into ConvState; \
-                                         falling back to current executor state"
-                                    );
-                                    let _ =
-                                        self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                                            sequence_id: seq,
-                                            state: self.state.clone(),
-                                            display_state: self
-                                                .state
-                                                .display_state()
-                                                .as_str()
-                                                .to_string(),
-                                        });
-                                }
-                            }
-                        }
+                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                            sequence_id: seq,
+                            state: self.state.clone(),
+                            display_state: self.state.display_state().as_str().to_string(),
+                        });
                     }
                     _ => {}
                 }
