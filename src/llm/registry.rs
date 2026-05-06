@@ -168,6 +168,12 @@ pub struct LlmConfig {
     /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
     /// based on which provider is being called.
     pub custom_headers: Vec<(String, String)>,
+    /// Free-form metadata pairs forwarded as a top-level `tags` object on
+    /// every outbound LLM request (gateway-routed only). Parsed from
+    /// `LLM_REQUEST_TAGS` env var as comma-separated `key=value` pairs.
+    /// Phoenix doesn't interpret these — they're a pass-through channel for
+    /// whatever proxy sits in front of the model.
+    pub request_tags: std::collections::BTreeMap<String, String>,
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
@@ -198,6 +204,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("anthropic_base_url", &self.anthropic_base_url)
             .field("openai_base_url", &self.openai_base_url)
             .field("custom_headers", &self.custom_headers)
+            .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
@@ -216,6 +223,7 @@ impl Clone for LlmConfig {
             anthropic_base_url: self.anthropic_base_url.clone(),
             openai_base_url: self.openai_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
+            request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
             use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
@@ -234,6 +242,7 @@ impl Default for LlmConfig {
             anthropic_base_url: None,
             openai_base_url: None,
             custom_headers: Vec::new(),
+            request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
             use_codex_auth: false,
             codex_credential: None,
@@ -277,6 +286,12 @@ impl LlmConfig {
             })
             .unwrap_or_default();
 
+        let request_tags = std::env::var("LLM_REQUEST_TAGS")
+            .ok()
+            .as_deref()
+            .map(parse_request_tags)
+            .unwrap_or_default();
+
         let use_codex_auth = std::env::var("OPENAI_USE_CODEX_AUTH")
             .ok()
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
@@ -308,6 +323,7 @@ impl LlmConfig {
             anthropic_base_url,
             openai_base_url,
             custom_headers,
+            request_tags,
             auth_style: if std::env::var("LLM_AUTH_HEADER")
                 .ok()
                 .is_some_and(|v| v.eq_ignore_ascii_case("bearer"))
@@ -320,6 +336,27 @@ impl LlmConfig {
             codex_credential,
         }
     }
+}
+
+/// Parse the `LLM_REQUEST_TAGS` env-var format: comma-separated `key=value`
+/// pairs. Whitespace around keys/values is trimmed. Empty pairs and pairs
+/// without `=` are skipped. Empty keys are skipped (a value with no key has
+/// nothing useful to forward).
+fn parse_request_tags(raw: &str) -> std::collections::BTreeMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                return None;
+            }
+            let (k, v) = pair.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
 }
 
 /// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
@@ -629,6 +666,7 @@ impl ModelRegistry {
             config.anthropic_base_url.clone(),
             config.openai_base_url.clone(),
             config.custom_headers.clone(),
+            config.request_tags.clone(),
         ));
         Some(Arc::new(LoggingService::new(service)))
     }
@@ -795,6 +833,44 @@ mod tests {
                 "Expected claude or mock model, got {model_id}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_request_tags_basic() {
+        let tags = parse_request_tags("foo=bar,baz=qux");
+        assert_eq!(tags.get("foo"), Some(&"bar".to_string()));
+        assert_eq!(tags.get("baz"), Some(&"qux".to_string()));
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_request_tags_whitespace_trimmed() {
+        let tags = parse_request_tags("  foo = bar ,  baz=qux  ");
+        assert_eq!(tags.get("foo"), Some(&"bar".to_string()));
+        assert_eq!(tags.get("baz"), Some(&"qux".to_string()));
+    }
+
+    #[test]
+    fn test_parse_request_tags_empty_input() {
+        assert!(parse_request_tags("").is_empty());
+        assert!(parse_request_tags("   ").is_empty());
+        assert!(parse_request_tags(",,,").is_empty());
+    }
+
+    #[test]
+    fn test_parse_request_tags_skips_malformed() {
+        // missing '=' -> skipped; empty key -> skipped; empty value -> kept (intentional, "tag=" is a valid clear-flag idiom)
+        let tags = parse_request_tags("nokey,=onlyval,foo=,bar=baz");
+        assert_eq!(tags.get("foo"), Some(&String::new()));
+        assert_eq!(tags.get("bar"), Some(&"baz".to_string()));
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_request_tags_value_with_equals() {
+        // split_once on first '=' lets values contain '='
+        let tags = parse_request_tags("query=a=b=c");
+        assert_eq!(tags.get("query"), Some(&"a=b=c".to_string()));
     }
 
     #[test]

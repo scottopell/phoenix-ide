@@ -7,8 +7,17 @@ use super::{
     CODEX_BACKEND_URL,
 };
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+/// Empty placeholder used when no tags should be forwarded — keeps the
+/// provider-call signatures uniform without allocating per request.
+fn empty_tags() -> &'static BTreeMap<String, String> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    EMPTY.get_or_init(BTreeMap::new)
+}
 
 /// Unified service implementation that dispatches by API format
 pub struct LlmServiceImpl {
@@ -19,6 +28,12 @@ pub struct LlmServiceImpl {
     pub anthropic_base_url: Option<String>,
     pub openai_base_url: Option<String>,
     pub custom_headers: Vec<(String, String)>,
+    /// Free-form metadata pairs injected as a top-level `tags` object on
+    /// every outbound request. Phoenix doesn't interpret these — they're a
+    /// pass-through channel for whatever proxy the request is routed
+    /// through. Only attached when `gateway` is set; direct provider APIs
+    /// reject unknown top-level fields.
+    pub request_tags: BTreeMap<String, String>,
     /// When true, `OpenAI` Responses requests target the `ChatGPT` backend
     /// (`chatgpt.com/backend-api/codex`) and the request body is adjusted:
     /// `store: false` is set and a default `instructions` value is injected
@@ -32,6 +47,7 @@ pub struct LlmServiceImpl {
 }
 
 impl LlmServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         spec: ModelSpec,
         auth: LlmAuth,
@@ -39,6 +55,7 @@ impl LlmServiceImpl {
         anthropic_base_url: Option<String>,
         openai_base_url: Option<String>,
         custom_headers: Vec<(String, String)>,
+        request_tags: BTreeMap<String, String>,
     ) -> Self {
         Self {
             spec,
@@ -47,6 +64,7 @@ impl LlmServiceImpl {
             anthropic_base_url,
             openai_base_url,
             custom_headers,
+            request_tags,
             use_codex_backend: false,
             codex_credential: None,
         }
@@ -69,8 +87,22 @@ impl LlmServiceImpl {
             anthropic_base_url: None,
             openai_base_url: Some(CODEX_BACKEND_URL.to_string()),
             custom_headers,
+            // No gateway in front of the codex bridge — tags would be sent
+            // directly to chatgpt.com which rejects unknown body fields.
+            request_tags: BTreeMap::new(),
             use_codex_backend: true,
             codex_credential: Some(codex_credential),
+        }
+    }
+
+    /// Returns the tags map to attach on the wire for this request. Empty
+    /// unless a gateway is configured — direct-to-provider calls go out
+    /// untagged so unknown-field rejection can't break us.
+    fn effective_request_tags(&self) -> &BTreeMap<String, String> {
+        if self.gateway.is_some() {
+            &self.request_tags
+        } else {
+            empty_tags()
         }
     }
 }
@@ -193,6 +225,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.anthropic_base_url.as_deref(),
                     &headers,
+                    self.effective_request_tags(),
                     request,
                 )
                 .await
@@ -206,6 +239,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.openai_base_url.as_deref(),
                     &headers,
+                    self.effective_request_tags(),
                     request,
                     self.use_codex_backend,
                 )
@@ -229,6 +263,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.anthropic_base_url.as_deref(),
                     &headers,
+                    self.effective_request_tags(),
                     request,
                     chunk_tx,
                 )
@@ -243,6 +278,7 @@ impl LlmServiceImpl {
                     self.gateway.as_deref(),
                     self.openai_base_url.as_deref(),
                     &headers,
+                    self.effective_request_tags(),
                     request,
                     chunk_tx,
                     self.use_codex_backend,
