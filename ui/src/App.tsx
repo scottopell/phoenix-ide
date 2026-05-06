@@ -5,6 +5,7 @@ import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
 import { ThemeProvider } from './components/ThemeProvider';
 import { ConversationProvider } from './conversation';
+import { ChainProvider } from './chain';
 import { api } from './api';
 import './index.css';
 
@@ -135,7 +136,9 @@ function App() {
       <BrowserRouter>
         <FocusScopeProvider>
           <ConversationProvider>
-            <AppRoutes />
+            <ChainProvider>
+              <AppRoutes />
+            </ChainProvider>
           </ConversationProvider>
         </FocusScopeProvider>
       </BrowserRouter>
