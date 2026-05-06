@@ -779,6 +779,20 @@ def _sanitize_tls_name(name: str) -> str:
     return safe.strip("._-") or "phoenix"
 
 
+def _open_private_write(path: Path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _default_tls_hosts(primary_host: str, extra_hosts: list[str] | None = None) -> list[str]:
     hosts = [primary_host, "localhost", "127.0.0.1", "::1"]
     if extra_hosts:
@@ -869,10 +883,11 @@ def cmd_tls_issue(
         metadata_path = tmp_path / "phoenix-tls.json"
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
-        with tarfile.open(bundle_path, "w:gz") as tar:
-            tar.add(cert_path, arcname="server.pem")
-            tar.add(key_path, arcname="server-key.pem")
-            tar.add(metadata_path, arcname="phoenix-tls.json")
+        with _open_private_write(bundle_path) as bundle_file:
+            with tarfile.open(fileobj=bundle_file, mode="w:gz") as tar:
+                tar.add(cert_path, arcname="server.pem")
+                tar.add(key_path, arcname="server-key.pem")
+                tar.add(metadata_path, arcname="phoenix-tls.json")
 
     print(f"Bundle: {bundle_path}")
     print(f"Hosts:  {', '.join(hosts)}")
