@@ -291,9 +291,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Reconcile Work/Branch conversations whose worktree has been deleted.
 ///
-/// For each affected conversation: revert mode (Work -> Explore, Branch -> Direct),
-/// reset cwd to the project root, and run `git worktree prune` to clean stale
-/// worktree bookkeeping.
+/// A worktree-bound conversation whose on-disk worktree has vanished is no
+/// longer useful: it cannot run tools, it cannot complete its task, and
+/// silently demoting it to Explore/Direct + resetting cwd to the project
+/// root would mislead the user ("why is this conversation suddenly talking
+/// about main?"). Instead, mark the row as Terminal and leave `conv_mode`,
+/// `worktree_path`, and cwd untouched. The user keeps the history, sees the
+/// original mode/branch metadata, and can hard-delete when ready.
+///
+/// Also runs `git worktree prune` once per affected project root to clean
+/// stale worktree bookkeeping.
 ///
 /// REQ-BED-031 / REQ-PROJ-015 gate: skip `ContextExhausted` rows and rows whose
 /// `continued_in_conv_id` is set. Their worktree is intentionally preserved
@@ -309,13 +316,13 @@ async fn reconcile_worktrees(db: &Database) {
     };
 
     let mut pruned_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut reverted = 0usize;
+    let mut terminated = 0usize;
 
     for conv in &work_convs {
         // REQ-BED-031: context-exhausted conversations own their worktree
         // until the user acts. Don't compound a missing-on-disk anomaly by
-        // demoting — leave the row alone so Continue / Abandon / MarkAsMerged
-        // remain structurally available.
+        // marking terminal — leave the row alone so Continue / Abandon /
+        // MarkAsMerged remain structurally available.
         if matches!(conv.state, db::ConvState::ContextExhausted { .. }) {
             continue;
         }
@@ -326,9 +333,15 @@ async fn reconcile_worktrees(db: &Database) {
         if conv.continued_in_conv_id.is_some() {
             continue;
         }
+        // Already terminal — nothing to do (and we'd just be writing the
+        // same state back). Prune still happens via the per-root dedup
+        // below if any sibling conv triggers it.
+        if matches!(conv.state, db::ConvState::Terminal) {
+            continue;
+        }
 
         // Migration 002 guarantees Work/Branch rows have non-empty, non-sentinel
-        // worktree_path and base_branch. The only remaining reason to revert is a
+        // worktree_path and base_branch. The only remaining reason to act is a
         // worktree directory that no longer exists on disk.
         let wt_path = match conv.conv_mode.worktree_path() {
             Some(p) if !p.is_empty() => p,
@@ -339,44 +352,33 @@ async fn reconcile_worktrees(db: &Database) {
             continue;
         }
 
-        // Branch mode reverts to Direct (no Explore phase to fall back to).
-        // Work mode reverts to Explore (Managed workflow fallback).
-        let is_branch = matches!(conv.conv_mode, db::ConvMode::Branch { .. });
-        let revert_label = if is_branch { "Direct" } else { "Explore" };
-        let revert_mode = if is_branch {
-            db::ConvMode::Direct
-        } else {
-            db::ConvMode::Explore
-        };
-
         tracing::warn!(
             conv_id = %conv.id,
+            mode = conv.conv_mode.label(),
             worktree_path = wt_path,
             reason = "worktree directory missing",
-            revert_to = revert_label,
-            "Reverting worktree conversation"
+            "Marking orphaned worktree conversation as Terminal"
         );
 
-        if let Err(e) = db.update_conversation_mode(&conv.id, &revert_mode).await {
-            tracing::error!(conv_id = %conv.id, error = %e, "Failed to revert conv_mode");
+        if let Err(e) = db
+            .update_conversation_state(&conv.id, &db::ConvState::Terminal)
+            .await
+        {
+            tracing::error!(conv_id = %conv.id, error = %e, "Failed to mark orphan as Terminal");
             continue;
         }
-        reverted += 1;
+        terminated += 1;
 
         // wt_path is always {root}/.phoenix/worktrees/{id} for a real Phoenix
-        // worktree. If the strict predicate fails the row is malformed; skip it.
+        // worktree. If the strict predicate fails the row is malformed; skip
+        // pruning for this entry but the Terminal mark is already applied.
         let project_root =
             crate::git_ops::repo_root_from_phoenix_worktree(std::path::Path::new(wt_path))
                 .map(|p| p.to_string_lossy().to_string());
 
         if let Some(ref root) = project_root {
-            // Allowed recovery mutation: worktree is gone, so reset cwd to
-            // project root so the conversation loads into a valid directory.
-            if let Err(e) = db.update_conversation_cwd(&conv.id, root).await {
-                tracing::error!(conv_id = %conv.id, error = %e, "Failed to reset cwd");
-            }
-
-            // Prune stale worktrees in this project root (once per root)
+            // Prune stale worktrees in this project root (once per root).
+            // Hygiene only — does not depend on or affect the conv row.
             if pruned_roots.insert(root.clone()) {
                 let root_path = std::path::PathBuf::from(root);
                 if let Err(e) = std::process::Command::new("git")
@@ -390,10 +392,10 @@ async fn reconcile_worktrees(db: &Database) {
         }
     }
 
-    if reverted > 0 {
+    if terminated > 0 {
         tracing::info!(
             total_work = work_convs.len(),
-            reverted,
+            terminated,
             "Worktree reconciliation complete"
         );
     }
@@ -405,7 +407,8 @@ async fn reconcile_worktrees(db: &Database) {
 /// worktree directory:
 ///   a) state = `ContextExhausted` -> skipped, mode preserved
 ///   b) `continued_in_conv_id` = Some -> skipped, mode preserved
-///   c) neither (a) nor (b), genuine orphan -> demoted to Explore
+///   c) neither (a) nor (b), genuine orphan -> marked Terminal,
+///      mode/worktree_path/cwd preserved
 ///
 /// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
@@ -595,10 +598,11 @@ mod reconcile_worktrees_tests {
     }
 
     /// Case (c): genuine orphan — missing worktree, not exhausted, no
-    /// continuation. The existing demotion path fires: Work -> Explore,
-    /// cwd resets to project root.
+    /// continuation. The conversation is marked Terminal and mode/cwd/
+    /// worktree_path are preserved untouched. The user keeps the original
+    /// metadata for context and can hard-delete when ready.
     #[tokio::test]
-    async fn demotes_genuine_orphan_to_explore() {
+    async fn marks_genuine_orphan_terminal() {
         let (_git_tmp, repo_root) = init_repo();
         let db = fresh_db().await;
         let project = db
@@ -618,13 +622,60 @@ mod reconcile_worktrees_tests {
 
         let after = db.get_conversation(conv_id).await.unwrap();
         assert!(
-            matches!(after.conv_mode, ConvMode::Explore),
-            "genuine orphan (Idle, no continuation) demotes to Explore"
+            matches!(after.state, ConvState::Terminal),
+            "genuine orphan must be marked Terminal"
+        );
+        assert!(
+            matches!(after.conv_mode, ConvMode::Work { .. }),
+            "conv_mode must be preserved — user keeps original mode metadata"
         );
         assert_eq!(
-            after.cwd,
-            repo_root.to_string_lossy(),
-            "cwd resets to project root on demotion"
+            after.conv_mode.worktree_path(),
+            Some(wt_path.as_str()),
+            "worktree_path must be preserved untouched"
         );
+        assert_eq!(after.cwd, wt_path, "cwd must NOT be reset to project root");
+    }
+
+    /// Branch-mode genuine orphan — same treatment as Work: marked Terminal,
+    /// mode/cwd/worktree_path preserved.
+    #[tokio::test]
+    async fn marks_branch_orphan_terminal() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let conv_id = "branch-orphan";
+        let wt_path = repo_root
+            .join(".phoenix")
+            .join("worktrees")
+            .join(conv_id)
+            .to_string_lossy()
+            .to_string();
+        let mode = ConvMode::Branch {
+            branch_name: NonEmptyString::new("feature/x").unwrap(),
+            worktree_path: NonEmptyString::new(&wt_path).unwrap(),
+            base_branch: NonEmptyString::new("feature/x").unwrap(),
+        };
+        seed_work_conv(&db, conv_id, conv_id, &wt_path, &mode, &project.id).await;
+
+        assert!(!std::path::Path::new(&wt_path).exists());
+
+        reconcile_worktrees(&db).await;
+
+        let after = db.get_conversation(conv_id).await.unwrap();
+        assert!(
+            matches!(after.state, ConvState::Terminal),
+            "branch orphan must be marked Terminal"
+        );
+        assert!(
+            matches!(after.conv_mode, ConvMode::Branch { .. }),
+            "conv_mode must be preserved — no demotion to Direct"
+        );
+        assert_eq!(after.conv_mode.worktree_path(), Some(wt_path.as_str()));
+        assert_eq!(after.cwd, wt_path);
     }
 }

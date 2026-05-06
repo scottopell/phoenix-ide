@@ -941,23 +941,27 @@ rule ExploreSubAgentDirectory {
 -- Worktree reconciliation on server restart.
 -- Complements bedrock's ServerRestart rule (which resets conversation
 -- status to idle) with project-level cleanup: detect orphaned worktrees
--- and revert affected conversations to Explore mode.
+-- and mark affected conversations as Terminal.
 --
 -- REQ-PROJ-015 descoped the dedicated registry, but acknowledged that
 -- startup reconciliation handles orphan detection via ConvMode::Work
 -- queries. This rule models that existing behaviour.
--- Orphan detection: worktree is orphaned if worktree_path is empty,
--- base_branch is empty, or the path does not exist on disk. The revert
--- action is split by source mode (variant-based dispatch) because
--- allium does not support `if X then A else B` in ensures clauses:
 --
---   Work   -> Explore  (graceful degradation: project-bound, no worktree)
---   Branch -> Direct   ("Branch without worktree" is not a representable
---                       ConvMode state; falls further)
---   Explore with worktree -> Explore (drop the worktree fields only)
+-- Orphan detection: worktree is orphaned if worktree_path is empty,
+-- base_branch is empty, or the path does not exist on disk.
+--
+-- Disposition: a Work/Branch/Explore-with-worktree conversation whose
+-- on-disk worktree has vanished can no longer run tools, complete its
+-- task, or be continued meaningfully. Silently demoting to Explore/Direct
+-- and resetting cwd to the project root would mislead the user ("why is
+-- this conversation suddenly talking about main?"). Instead, mark the
+-- row as Terminal and leave conv_mode, worktree_path, and cwd untouched
+-- so the user keeps the original metadata for context and can hard-delete
+-- when ready. The state machine already gates further activity on
+-- Terminal, so no extra guards are needed.
 --
 -- project_id on the conversation row is preserved independently, so
--- sidebar grouping is retained for both reverts.
+-- sidebar grouping is retained.
 rule ServerRestartWorktreeReconciliationWork {
     when: ServerRestarted(conversation)
 
@@ -968,12 +972,12 @@ rule ServerRestartWorktreeReconciliationWork {
     -- preserved; skip them entirely. See @guidance.
     requires: conversation.parent_status != context_exhausted
     requires: conversation.continued_in_conv_id = absent
+    requires: conversation.state != terminal
     requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
         or not exists_on_disk(conversation.worktree_path)
 
-    ensures: conversation.mode = explore
-    ensures: conversation.working_dir = project_root(conversation)
+    ensures: conversation.state = terminal
     ensures: GitWorktreePruned(conversation.project)
 
     @guidance
@@ -985,22 +989,25 @@ rule ServerRestartWorktreeReconciliationWork {
         --   2. Skip context_exhausted rows (REQ-BED-031): the worktree
         --      is preserved pending user action (Continue / Abandon);
         --      missing-on-disk shouldn't happen for these but if it does,
-        --      don't compound the problem by demoting.
+        --      don't compound the problem by marking terminal.
         --   3. Skip rows with continued_in_conv_id set (REQ-BED-030): the
         --      parent's worktree_path is a history reference; the
         --      continuation owns the worktree. The continuation itself
         --      is reconciled under its own row.
-        --   4. For remaining rows: check worktree_path and base_branch
+        --   4. Skip rows already in Terminal (idempotent on restart loop).
+        --   5. For remaining rows: check worktree_path and base_branch
         --      non-empty (or not a __LEGACY_EMPTY__ sentinel from the
         --      NonEmptyString shim that was introduced in schema phase A1),
         --      and worktree directory exists on disk.
-        --   5. If any check fails: apply the mode-specific revert above.
-        --   6. Derive project root from worktree path
+        --   6. If any check fails: update conversation state to Terminal.
+        --      conv_mode, worktree_path, and cwd are NOT mutated — the
+        --      user keeps original metadata for context. The state
+        --      machine already gates further activity on Terminal.
+        --   7. Derive project root from worktree path
         --      ({root}/.phoenix/worktrees/{id} → {root})
-        --   7. Reset conversation cwd to project root
         --   8. Run `git worktree prune` in project root (once per unique
-        --      root, deduplicated across conversations)
-        --   9. Log summary: "{reverted} reverted out of {total} Work"
+        --      root, deduplicated across conversations) for git hygiene.
+        --   9. Log summary: "{terminated} terminated out of {total} Work"
         --
         -- The three orphan sources this recovers from:
         --   A. Legacy rows: pre-NonEmptyString data with empty or
@@ -1014,8 +1021,7 @@ rule ServerRestartWorktreeReconciliationWork {
         --      `git worktree prune` outside Phoenix. Same on-disk check.
         --
         -- Error handling:
-        --   - Database update failure: logged, conversation skipped
-        --   - CWD reset failure: logged, pruning still attempted
+        --   - State update failure: logged, conversation skipped
         --   - git worktree prune failure: logged at debug (non-fatal)
         --   - No exceptions propagated; process continues for remaining
         --     conversations
@@ -1029,24 +1035,25 @@ rule ServerRestartWorktreeReconciliationBranch {
     -- handed-off rows. See Work variant @guidance for rationale.
     requires: conversation.parent_status != context_exhausted
     requires: conversation.continued_in_conv_id = absent
+    requires: conversation.state != terminal
     requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
         or not exists_on_disk(conversation.worktree_path)
 
-    ensures: conversation.mode = direct
-    ensures: conversation.working_dir = project_root(conversation)
+    ensures: conversation.state = terminal
     ensures: GitWorktreePruned(conversation.project)
 
     @guidance
-        -- "Branch without worktree" is not a representable ConvMode state,
-        -- so the demote target is Direct rather than Explore. All other
-        -- semantics match the Work variant.
+        -- Same disposition as the Work variant: orphaned worktree →
+        -- mark Terminal, preserve mode/cwd/worktree_path. The previous
+        -- "demote Branch → Direct + reset cwd to project root" behaviour
+        -- has been retired in favour of preserving original metadata
+        -- and letting the user decide whether to hard-delete.
 }
 
 -- REQ-PROJ-028: Explore conversations with a worktree also need
--- reconciliation when the worktree is orphaned. Explore has no further
--- demote target -- the conversation stays Explore, but its worktree
--- fields are cleared and its cwd resets to the project root.
+-- reconciliation when the worktree is orphaned. Same disposition as
+-- Work/Branch — mark the row Terminal and preserve all fields.
 rule ServerRestartWorktreeReconciliationExplore {
     when: ServerRestarted(conversation)
 
@@ -1056,12 +1063,13 @@ rule ServerRestartWorktreeReconciliationExplore {
     -- its worktree is preserved pending user action.
     requires: conversation.parent_status != context_exhausted
     requires: conversation.continued_in_conv_id = absent
+    requires: conversation.state != terminal
     requires: conversation.worktree_path != ""
     requires: conversation.worktree_path = ""
         or conversation.base_branch = ""
         or not exists_on_disk(conversation.worktree_path)
 
-    ensures: conversation.working_dir = project_root(conversation)
+    ensures: conversation.state = terminal
     ensures: GitWorktreePruned(conversation.project)
 }
 
