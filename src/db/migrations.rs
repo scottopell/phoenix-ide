@@ -44,6 +44,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "archive_partially_archived_chains",
         sql: MIGRATION_006,
     },
+    Migration {
+        version: 7,
+        name: "backfill_explore_worktree_path",
+        sql: MIGRATION_007,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -190,6 +195,35 @@ WHERE id IN (
 );
 ";
 
+/// Backfill `worktree_path` onto top-level Explore conversations.
+///
+/// Phase 2 of task 03001 follow-up: `ConvMode::Explore` now carries an
+/// optional `worktree_path: Option<NonEmptyString>`. Top-level managed
+/// Explore conversations always have a worktree (the conv runs in it
+/// pre-approval, REQ-PROJ-028); sub-agent Explore conversations do not.
+///
+/// Heuristic for "top-level": `parent_conversation_id IS NULL`. Sub-agents
+/// always carry a parent pointer; user-initiated Explore convs never do.
+///
+/// For matching rows with non-empty `cwd`, set `conv_mode.worktree_path = cwd`.
+/// Sub-agent Explore rows are left alone — their `{"mode":"Explore"}` JSON
+/// deserialises to `worktree_path: None` via `#[serde(default)]`.
+///
+/// Without this backfill, existing top-level managed Explore conversations
+/// would lose tmux session continuity on the first restart after upgrade:
+/// the cwd-fallback in `terminal/ws.rs` and `api/handlers.rs` was removed
+/// in the same commit, so `worktree_path()` would return `None` and the
+/// session would key to a new conv-id-based socket.
+const MIGRATION_007: &str = r"
+UPDATE conversations
+SET conv_mode = json_set(conv_mode, '$.worktree_path', cwd)
+WHERE json_extract(conv_mode, '$.mode') = 'Explore'
+  AND parent_conversation_id IS NULL
+  AND cwd IS NOT NULL
+  AND cwd != ''
+  AND json_extract(conv_mode, '$.worktree_path') IS NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -271,6 +305,7 @@ mod tests {
                 conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', \
                 state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
                 cwd TEXT NOT NULL DEFAULT '/tmp', \
+                parent_conversation_id TEXT, \
                 user_initiated BOOLEAN NOT NULL DEFAULT 1, \
                 archived BOOLEAN NOT NULL DEFAULT 0, \
                 state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
@@ -289,7 +324,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 6);
+        assert_eq!(first, 7);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -346,7 +381,9 @@ mod tests {
             .unwrap();
         let mode: String = row.get("conv_mode");
         let state: String = row.get("state");
-        assert_eq!(mode, "{\"mode\":\"Explore\"}");
+        // Migration 002 reverts to Explore; migration 007 then backfills
+        // worktree_path from cwd (top-level Explore, no parent_conversation_id).
+        assert_eq!(mode, "{\"mode\":\"Explore\",\"worktree_path\":\"/tmp\"}");
         assert_eq!(state, "{\"type\":\"idle\"}");
     }
 
@@ -396,7 +433,8 @@ mod tests {
             .await
             .unwrap();
         let mode: String = row.get("conv_mode");
-        assert_eq!(mode, "{\"mode\":\"Explore\"}");
+        // 002 reverts to Explore; 007 backfills worktree_path = cwd.
+        assert_eq!(mode, "{\"mode\":\"Explore\",\"worktree_path\":\"/tmp\"}");
     }
 
     #[tokio::test]
@@ -633,5 +671,115 @@ mod tests {
         assert!(!archived_for("c-leaf").await);
         // Standalone: untouched.
         assert!(archived_for("solo-s").await);
+    }
+
+    /// Migration 007: top-level Explore conversations get `worktree_path`
+    /// backfilled from `cwd`; sub-agents and non-Explore rows are untouched.
+    #[tokio::test]
+    async fn migration_007_backfills_explore_worktree_path() {
+        let pool = test_pool().await;
+        // Need parent_conversation_id column for this migration.
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (\
+                id TEXT PRIMARY KEY, \
+                conv_mode TEXT NOT NULL, \
+                state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
+                cwd TEXT NOT NULL DEFAULT '/tmp', \
+                parent_conversation_id TEXT, \
+                user_initiated BOOLEAN NOT NULL DEFAULT 1, \
+                archived BOOLEAN NOT NULL DEFAULT 0, \
+                state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                created_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                updated_at TEXT NOT NULL DEFAULT '2025-01-01'\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // (id, conv_mode, cwd, parent_conv_id) seed rows covering each case.
+        let rows: &[(&str, &str, &str, Option<&str>)] = &[
+            // 1. Top-level Explore with cwd — should be backfilled.
+            ("top-explore", r#"{"mode":"Explore"}"#, "/work/conv-1", None),
+            // 2. Sub-agent Explore (parent set) — left alone.
+            (
+                "sub-explore",
+                r#"{"mode":"Explore"}"#,
+                "/work/parent",
+                Some("top-explore"),
+            ),
+            // 3. Top-level Explore with empty cwd — not backfilled (NonEmptyString
+            //    would reject empty strings on deserialise).
+            ("empty-cwd", r#"{"mode":"Explore"}"#, "", None),
+            // 4. Direct mode — untouched (mode != Explore).
+            ("direct", r#"{"mode":"Direct"}"#, "/anywhere", None),
+            // 5. Already-backfilled Explore — idempotent (worktree_path stays).
+            (
+                "already",
+                r#"{"mode":"Explore","worktree_path":"/preexisting"}"#,
+                "/work/conv-5",
+                None,
+            ),
+        ];
+
+        for (id, conv_mode, cwd, parent) in rows {
+            sqlx::query(
+                "INSERT INTO conversations (id, conv_mode, cwd, parent_conversation_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(id)
+            .bind(conv_mode)
+            .bind(cwd)
+            .bind(*parent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::raw_sql(MIGRATION_007).execute(&pool).await.unwrap();
+
+        let mode_for = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("SELECT conv_mode FROM conversations WHERE id = ?1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .get::<String, _>("conv_mode")
+            }
+        };
+
+        // 1. Top-level Explore: worktree_path backfilled to cwd.
+        let top: serde_json::Value = serde_json::from_str(&mode_for("top-explore").await).unwrap();
+        assert_eq!(top["mode"], "Explore");
+        assert_eq!(top["worktree_path"], "/work/conv-1");
+
+        // 2. Sub-agent Explore: untouched (no worktree_path field).
+        let sub: serde_json::Value = serde_json::from_str(&mode_for("sub-explore").await).unwrap();
+        assert_eq!(sub["mode"], "Explore");
+        assert!(
+            sub.get("worktree_path").is_none(),
+            "sub-agent Explore must not get a worktree_path: {sub:?}"
+        );
+
+        // 3. Empty cwd: not backfilled (would deserialise as empty NonEmptyString).
+        let empty: serde_json::Value = serde_json::from_str(&mode_for("empty-cwd").await).unwrap();
+        assert_eq!(empty["mode"], "Explore");
+        assert!(empty.get("worktree_path").is_none());
+
+        // 4. Direct: completely untouched.
+        let direct: serde_json::Value = serde_json::from_str(&mode_for("direct").await).unwrap();
+        assert_eq!(direct["mode"], "Direct");
+        assert!(direct.get("worktree_path").is_none());
+
+        // 5. Pre-existing worktree_path: untouched (idempotent).
+        let pre: serde_json::Value = serde_json::from_str(&mode_for("already").await).unwrap();
+        assert_eq!(pre["worktree_path"], "/preexisting");
+
+        // Idempotency: re-run migration, no changes.
+        sqlx::raw_sql(MIGRATION_007).execute(&pool).await.unwrap();
+        let top2: serde_json::Value = serde_json::from_str(&mode_for("top-explore").await).unwrap();
+        assert_eq!(top2["worktree_path"], "/work/conv-1");
     }
 }

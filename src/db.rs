@@ -364,7 +364,9 @@ impl Database {
             parent_id,
             model,
             None,
-            &ConvMode::Explore,
+            &ConvMode::Explore {
+                worktree_path: None,
+            },
             None,
             None,
             None,
@@ -2486,7 +2488,9 @@ mod tests {
             "parent-explore",
             "parent-explore",
             "/tmp/explore-cwd",
-            &ConvMode::Explore,
+            &ConvMode::Explore {
+                worktree_path: None,
+            },
         )
         .await;
 
@@ -2496,7 +2500,7 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         };
 
-        assert!(matches!(new_conv.conv_mode, ConvMode::Explore));
+        assert!(matches!(new_conv.conv_mode, ConvMode::Explore { .. }));
         assert_eq!(new_conv.cwd, parent.cwd);
         assert_eq!(new_conv.model, parent.model);
         let refreshed_parent = db.get_conversation("parent-explore").await.unwrap();

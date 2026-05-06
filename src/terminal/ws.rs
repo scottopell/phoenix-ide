@@ -60,18 +60,11 @@ async fn handle_socket(
 ) {
     let (cwd, worktree_path) = match db.get_conversation(&conversation_id).await {
         Ok(conv) => {
-            // worktree_path for socket keying (task 03001): use the typed
-            // worktree field for Work/Branch, cwd for Explore (REQ-PROJ-028
-            // guarantees cwd IS the worktree for Explore), None for Direct.
-            let wt = conv
-                .conv_mode
-                .worktree_path()
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    use crate::db::ConvMode;
-                    matches!(conv.conv_mode, ConvMode::Explore)
-                        .then(|| std::path::PathBuf::from(&conv.cwd))
-                });
+            // worktree_path for socket keying (task 03001 / Phase 2): typed
+            // on `ConvMode` for Work, Branch, and managed Explore. Sub-agent
+            // Explore returns None and never reaches this code (no user PTY),
+            // so no fallback is needed. Direct returns None (per-conv socket).
+            let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
             (std::path::PathBuf::from(&conv.cwd), wt)
         }
         Err(e) => {
@@ -328,9 +321,10 @@ async fn acquire_handle(
 /// restart (REQ-TMUX-005), and recreates over a stale socket
 /// (REQ-TMUX-006).
 ///
-/// `worktree_path` controls socket keying: `Some` for Work/Branch/Explore
-/// (socket tied to the worktree so continuations share the session),
-/// `None` for Direct (socket tied to `conversation_id`). See task 03001.
+/// `worktree_path` controls socket keying: `Some` for Work/Branch and
+/// top-level managed Explore (socket tied to the worktree so continuations
+/// share the session), `None` for Direct and sub-agent Explore (per-conv
+/// socket, or pass-through to parent server respectively). See task 03001.
 async fn resolve_exec_plan(
     conversation_id: &str,
     worktree_path: Option<&std::path::Path>,

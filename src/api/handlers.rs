@@ -686,7 +686,14 @@ async fn create_conversation(
             Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
         };
 
-        (crate::db::ConvMode::Explore, worktree_path)
+        let worktree_nes = crate::db::NonEmptyString::new(&worktree_path)
+            .map_err(|_| AppError::Internal("managed worktree path was empty".to_string()))?;
+        (
+            crate::db::ConvMode::Explore {
+                worktree_path: Some(worktree_nes),
+            },
+            worktree_path,
+        )
     } else {
         (crate::db::ConvMode::Direct, req.cwd.clone())
     };
@@ -716,7 +723,7 @@ async fn create_conversation(
         .cheap_model_id_for_provider(registry_default);
     let resolved_model = req.model.as_deref().map_or_else(
         || {
-            if matches!(conv_mode, crate::db::ConvMode::Explore) {
+            if matches!(conv_mode, crate::db::ConvMode::Explore { .. }) {
                 cheap_for_explore
             } else {
                 registry_default.to_string()
@@ -1916,14 +1923,8 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // fallback in src/terminal/ws.rs — without it, the cascade looks up the
     // wrong (conv-{id}.sock) deterministic socket and the actual
     // wt-{hash}.sock tmux server is orphaned.
-    let tmux_worktree_buf: Option<std::path::PathBuf> = conv
-        .conv_mode
-        .worktree_path()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            matches!(conv.conv_mode, crate::db::ConvMode::Explore)
-                .then(|| std::path::PathBuf::from(&conv.cwd))
-        });
+    let tmux_worktree_buf: Option<std::path::PathBuf> =
+        conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         state.runtime.tmux_registry(),
         id,
@@ -2010,14 +2011,13 @@ struct CascadeProjectsReport {
 ///
 /// No-op cases:
 ///   - `ConvMode::Direct` — no worktree was ever created.
-///   - `ConvMode::Explore` — pre-approval Explore conversations may have
-///     a temp worktree; this is currently created lazily and torn down
-///     on terminal-state transition (see `ExploreWorktreeCleanupOnTerminal`).
-///     Hard-delete may still race a non-terminal Explore worktree, but
-///     `ConvMode::Explore` carries no `worktree_path` field — there's
-///     nothing structurally addressable to remove here. If Explore
-///     worktree state migrates onto the mode in future, expand this
-///     branch.
+///   - `ConvMode::Explore { .. }` — managed Explore conversations carry a
+///     `worktree_path` (Option, populated for top-level managed flow, None
+///     for sub-agents). The worktree is torn down on terminal-state
+///     transition (see `ExploreWorktreeCleanupOnTerminal`); cascade-delete
+///     here is a backstop. Today this branch is still no-op (Explore
+///     worktree teardown happens elsewhere); if that changes, expand here
+///     to read `worktree_path` and remove the directory.
 ///   - Already-terminal Work/Branch conversations — abandon /
 ///     mark-merged already removed the worktree at terminal transition.
 ///     We still attempt removal (it's idempotent) so a partial-failure
@@ -2037,7 +2037,7 @@ async fn cascade_projects_on_delete(
             worktree_path,
             ..
         } => (branch_name.to_string(), worktree_path.to_string(), false),
-        ConvMode::Direct | ConvMode::Explore => return CascadeProjectsReport::default(),
+        ConvMode::Direct | ConvMode::Explore { .. } => return CascadeProjectsReport::default(),
     };
 
     let mut report = CascadeProjectsReport {

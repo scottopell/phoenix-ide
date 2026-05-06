@@ -200,13 +200,21 @@ ALTER TABLE messages RENAME COLUMN id TO message_id;
 /// All string fields in Work and Branch use `NonEmptyString` to make empty
 /// strings structurally unrepresentable. The migration system backfills
 /// legacy rows; deserialization of missing fields is now a hard error.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "mode")]
 pub enum ConvMode {
     /// Read-only mode. No file writes, no bash (unless sandboxed).
     /// Opt-in "Managed" workflow: `propose_task` available, gateway to Work.
-    #[default]
-    Explore,
+    ///
+    /// `worktree_path` is `Some` for top-level managed Explore conversations
+    /// (the conv runs in a dedicated worktree pre-approval) and `None` for
+    /// sub-agent Explore conversations (which share the parent's working
+    /// directory and have no worktree of their own). Migration 007 backfills
+    /// the field for legacy top-level Explore rows.
+    Explore {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<NonEmptyString>,
+    },
     /// Direct mode: full tool access, no lifecycle ceremony.
     /// Default for all new conversations (git and non-git).
     Direct,
@@ -238,11 +246,19 @@ pub enum ConvMode {
     },
 }
 
+impl Default for ConvMode {
+    fn default() -> Self {
+        Self::Explore {
+            worktree_path: None,
+        }
+    }
+}
+
 impl ConvMode {
     /// Human-readable label for UI display
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Explore => "Explore",
+            Self::Explore { .. } => "Explore",
             Self::Direct => "Direct",
             Self::Work { .. } => "Work",
             Self::Branch { .. } => "Branch",
@@ -255,17 +271,23 @@ impl ConvMode {
             Self::Work { branch_name, .. } | Self::Branch { branch_name, .. } => {
                 Some(branch_name.as_str())
             }
-            Self::Explore | Self::Direct => None,
+            Self::Explore { .. } | Self::Direct => None,
         }
     }
 
-    /// The worktree path if in Work or Branch mode, None otherwise.
+    /// The worktree path for this mode, if any.
+    ///
+    /// - Work/Branch always have one (typed `NonEmptyString`).
+    /// - Top-level managed Explore has one (typed `Option<NonEmptyString>`,
+    ///   `Some` for managed-flow rows, `None` for sub-agent Explore).
+    /// - Direct never has one.
     pub fn worktree_path(&self) -> Option<&str> {
         match self {
             Self::Work { worktree_path, .. } | Self::Branch { worktree_path, .. } => {
                 Some(worktree_path.as_str())
             }
-            Self::Explore | Self::Direct => None,
+            Self::Explore { worktree_path } => worktree_path.as_ref().map(NonEmptyString::as_str),
+            Self::Direct => None,
         }
     }
 
@@ -275,7 +297,7 @@ impl ConvMode {
             Self::Work { base_branch, .. } | Self::Branch { base_branch, .. } => {
                 Some(base_branch.as_str())
             }
-            Self::Explore | Self::Direct => None,
+            Self::Explore { .. } | Self::Direct => None,
         }
     }
 
@@ -284,7 +306,7 @@ impl ConvMode {
     pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::Work { task_id, .. } => Some(task_id.as_str()),
-            Self::Explore | Self::Direct | Self::Branch { .. } => None,
+            Self::Explore { .. } | Self::Direct | Self::Branch { .. } => None,
         }
     }
 
@@ -292,7 +314,7 @@ impl ConvMode {
     pub fn task_title(&self) -> Option<&str> {
         match self {
             Self::Work { task_title, .. } => Some(task_title.as_str()),
-            Self::Explore | Self::Direct | Self::Branch { .. } => None,
+            Self::Explore { .. } | Self::Direct | Self::Branch { .. } => None,
         }
     }
 
@@ -316,7 +338,7 @@ impl ConvMode {
                 worktree_path: worktree_path.clone(),
                 base_branch: base_branch.clone(),
             }),
-            Self::Explore | Self::Direct => None,
+            Self::Explore { .. } | Self::Direct => None,
         }
     }
 }
@@ -1074,7 +1096,12 @@ mod conv_mode_tests {
     fn test_explore_still_works() {
         let json = r#"{"mode":"Explore"}"#;
         let parsed: ConvMode = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed, ConvMode::Explore);
+        assert_eq!(
+            parsed,
+            ConvMode::Explore {
+                worktree_path: None
+            }
+        );
     }
 
     #[test]
@@ -1139,7 +1166,11 @@ mod conv_mode_tests {
         assert_eq!(config.worktree_path.as_str(), "/wt");
         assert_eq!(config.base_branch.as_str(), "main");
 
-        assert!(ConvMode::Explore.worktree_config().is_none());
+        assert!(ConvMode::Explore {
+            worktree_path: None
+        }
+        .worktree_config()
+        .is_none());
         assert!(ConvMode::Direct.worktree_config().is_none());
     }
 }
@@ -1233,7 +1264,9 @@ mod conversation_serde_tests {
             archived: false,
             model: None,
             project_id: None,
-            conv_mode: ConvMode::Explore,
+            conv_mode: ConvMode::Explore {
+                worktree_path: None,
+            },
             desired_base_branch: None,
             message_count: 0,
             seed_parent_id: None,

@@ -23,12 +23,15 @@
 --     revision.
 --
 -- Socket-path keying (task 03001):
---   Work/Branch/Explore conversations key the socket to the worktree path
---   (wt-{hash(worktree_path)}.sock) so continuations automatically share
---   the same tmux session — the worktree IS the coding environment.
+--   Work, Branch, and managed (top-level) Explore conversations key the
+--   socket to the worktree path (wt-{hash(worktree_path)}.sock) so
+--   continuations automatically share the same tmux session — the
+--   worktree IS the coding environment.
 --   Direct-mode conversations key the socket to the conversation_id
 --   (conv-{id}.sock) as a fallback (no worktree to anchor to).
---   Sub-agents are excluded from tmux access entirely (task 03001).
+--   Sub-agents are excluded from tmux access entirely (task 03001),
+--   so the question of socket keying for sub-agent Explore does not
+--   arise: ConvMode::Explore.worktree_path is None for sub-agents.
 --
 -- Requirement traceability: REQ-TMUX-001 through REQ-TMUX-013
 -- Dependencies: specs/bedrock/bedrock.allium
@@ -66,7 +69,7 @@ external entity TmuxBinary {
 }
 
 -- The Unix-domain socket the tmux server binds. Filesystem path is
--- keyed to the worktree path for Work/Branch/Explore conversations
+-- keyed to the worktree path for Work/Branch/managed-Explore conversations
 -- (~/.phoenix-ide/tmux-sockets/wt-{hash}.sock, task 03001) and to
 -- conversation_id for Direct mode (conv-<id>.sock). Phoenix's role is
 -- creating the directory, unlinking stale files on detection, and deleting
@@ -142,10 +145,13 @@ entity TmuxServer {
         terminal: gone
     }
 
-    -- The socket file path. Keyed to the worktree path for Work/Branch/
-    -- Explore conversations (wt-{hash(worktree_path)}.sock) so that
-    -- context-exhaustion continuations automatically share the same session.
+    -- The socket file path. Keyed to the worktree path for Work, Branch,
+    -- and managed (top-level) Explore conversations
+    -- (wt-{hash(worktree_path)}.sock) so that context-exhaustion
+    -- continuations automatically share the same session.
     -- Keyed to conversation_id for Direct-mode conversations (no worktree).
+    -- Sub-agent Explore conversations have no worktree (and no tmux access
+    -- per task 03001), so they never produce a TmuxServer entity.
     -- Computed once at entry creation and stable for the entity's lifetime.
     -- (task 03001)
     socket_path: String
@@ -486,7 +492,7 @@ rule ServerPreservedForContinuation {
 -- REQ-TMUX-001
 invariant SocketPathDeterministic {
     for s in TmuxServer:
-        -- Work/Branch/Explore: socket_path = wt-{hash(worktree_path)}.sock
+        -- Work/Branch/managed-Explore: socket_path = wt-{hash(worktree_path)}.sock
         -- Direct: socket_path = conv-{conversation_id}.sock
         s.socket_path = socket_path_for(s.conversation)
 }
