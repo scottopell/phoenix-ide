@@ -5,6 +5,7 @@ use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LL
 use super::LlmError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -29,12 +30,14 @@ fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> S
 // ---------------------------------------------------------------------------
 
 /// Complete using the `OpenAI` Responses API.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete(
     spec: &ModelSpec,
     api_key: &str,
     gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
@@ -46,6 +49,7 @@ pub async fn complete(
             gateway,
             base_url_override,
             custom_headers,
+            request_tags,
             request,
             &chunk_tx,
             use_codex_backend,
@@ -54,8 +58,11 @@ pub async fn complete(
     }
 
     let url = resolve_endpoint(gateway, base_url_override);
-    let responses_request =
+    let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
+    if !request_tags.is_empty() {
+        responses_request.tags = Some(request_tags.clone());
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_mins(5))
@@ -240,6 +247,7 @@ pub async fn complete_streaming(
     gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
     use_codex_backend: bool,
@@ -250,6 +258,9 @@ pub async fn complete_streaming(
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     responses_request.stream = Some(true);
+    if !request_tags.is_empty() {
+        responses_request.tags = Some(request_tags.clone());
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_mins(10))
@@ -506,6 +517,7 @@ fn translate_to_responses_request(
         // see the model batching too aggressively in practice.
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         include: Vec::new(),
+        tags: None,
     }
 }
 
@@ -626,6 +638,12 @@ pub(crate) struct ResponsesApiRequest {
     /// output item types such as encrypted reasoning.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) include: Vec<String>,
+    /// Free-form metadata forwarded to the gateway/proxy in front of the
+    /// model. See `AnthropicRequest::tags` for the rationale; same shape on
+    /// both wire formats. Set only when a gateway is configured; omitted
+    /// from the wire when empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tags: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -723,6 +741,44 @@ pub(crate) struct ResponsesApiContent {
 pub(crate) struct ResponsesApiUsage {
     pub(crate) input_tokens: u32,
     pub(crate) output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::{LlmRequest, PromptCacheKey};
+
+    fn empty_request() -> LlmRequest {
+        LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            cache_key: PromptCacheKey::stable("test"),
+        }
+    }
+
+    #[test]
+    fn test_request_tags_omitted_when_none() {
+        let req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("tags").is_none(),
+            "tags must be omitted from the wire when not set; got {json}"
+        );
+    }
+
+    #[test]
+    fn test_request_tags_serialized_when_set() {
+        let mut req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
+        let mut tags = BTreeMap::new();
+        tags.insert("disable_data_logging".to_string(), "true".to_string());
+        tags.insert("foo".to_string(), "bar".to_string());
+        req.tags = Some(tags);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["tags"]["disable_data_logging"], "true");
+        assert_eq!(json["tags"]["foo"], "bar");
+    }
 }
 
 #[cfg(test)]

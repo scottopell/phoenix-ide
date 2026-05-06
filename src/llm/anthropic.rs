@@ -8,6 +8,7 @@ use super::types::{
 use super::LlmError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Accumulates state across Anthropic SSE stream events to assemble the final response.
@@ -315,12 +316,14 @@ fn resolve_anthropic_url(gateway: Option<&str>, base_url_override: Option<&str>)
 ///
 /// Emits `TokenChunk::Text` events via `chunk_tx` as text tokens arrive,
 /// then returns the fully assembled `LlmResponse`.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
     auth: &super::ResolvedAuth,
     gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
 ) -> Result<LlmResponse, LlmError> {
@@ -334,6 +337,9 @@ pub async fn complete_streaming(
 
     let mut anthropic_request = translate_request(spec, request);
     anthropic_request.stream = Some(true);
+    if !request_tags.is_empty() {
+        anthropic_request.tags = Some(request_tags.clone());
+    }
 
     let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
@@ -412,12 +418,14 @@ pub async fn complete_streaming(
 }
 
 /// Complete using Anthropic Messages API
+#[allow(clippy::too_many_arguments)]
 pub async fn complete(
     spec: &ModelSpec,
     auth: &super::ResolvedAuth,
     gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
     let base_url = resolve_anthropic_url(gateway, base_url_override);
@@ -427,7 +435,10 @@ pub async fn complete(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let anthropic_request = translate_request(spec, request);
+    let mut anthropic_request = translate_request(spec, request);
+    if !request_tags.is_empty() {
+        anthropic_request.tags = Some(request_tags.clone());
+    }
 
     let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
@@ -556,6 +567,7 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
         stream: None,
+        tags: None,
     }
 }
 
@@ -906,6 +918,14 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicToolEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Free-form metadata forwarded to the gateway/proxy in front of the
+    /// model. Phoenix does not interpret these — they're a pass-through
+    /// channel for request-scoped instructions a proxy may consume (e.g.
+    /// routing, telemetry, compliance flags). Direct provider APIs reject
+    /// unknown top-level fields, so this is set only when a gateway is
+    /// configured; the field is omitted from the wire when empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1183,6 +1203,32 @@ mod tests {
     fn test_resolve_anthropic_url_trailing_slash_stripped() {
         let url = resolve_anthropic_url(Some("http://gateway.local/"), None);
         assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
+    }
+
+    #[test]
+    fn test_request_tags_omitted_when_none() {
+        let spec = test_spec(false);
+        let request = test_request_with_tools();
+        let req = translate_request(&spec, &request);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("tags").is_none(),
+            "tags must be omitted from the wire when not set; got {json}"
+        );
+    }
+
+    #[test]
+    fn test_request_tags_serialized_when_set() {
+        let spec = test_spec(false);
+        let request = test_request_with_tools();
+        let mut req = translate_request(&spec, &request);
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("disable_data_logging".to_string(), "true".to_string());
+        tags.insert("foo".to_string(), "bar".to_string());
+        req.tags = Some(tags);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["tags"]["disable_data_logging"], "true");
+        assert_eq!(json["tags"]["foo"], "bar");
     }
 
     #[test]
