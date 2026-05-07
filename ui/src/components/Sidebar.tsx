@@ -183,7 +183,7 @@ export function Sidebar({
         </button>
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
         <div className="sidebar-collapsed-dots">
-          {conversations.slice(0, 15).map(conv => {
+          {conversations.map(conv => {
             const displayState = getConvDisplayState(conv);
             const isActive = conv.slug === activeSlug;
             return (
