@@ -751,6 +751,53 @@ describe('ChainPage — per-rootConvId state isolation (task 08682)', () => {
     expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
   });
 
+  it('closes delete confirmation and rename editor when rootConvId changes', async () => {
+    const { api } = await import('../api');
+    const chainA = makeChain({
+      root_conv_id: 'root-A',
+      chain_name: 'chain A',
+      display_name: 'chain A',
+      members: [makeMember('A1', 'root'), makeMember('A2', 'latest')],
+      current_member_count: 2,
+    });
+    const chainB = makeChain({
+      root_conv_id: 'root-B',
+      chain_name: 'chain B',
+      display_name: 'chain B',
+      members: [makeMember('B1', 'root'), makeMember('B2', 'latest')],
+      current_member_count: 2,
+    });
+    const getChain = api.getChain as ReturnType<typeof vi.fn>;
+    getChain.mockImplementation((rootId: string) => {
+      if (rootId === 'root-A') return Promise.resolve(chainA);
+      if (rootId === 'root-B') return Promise.resolve(chainB);
+      return Promise.reject(new Error('unknown chain'));
+    });
+
+    render(<ChainNavApp />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Title A1')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(screen.getByText(/Delete chain “chain A”/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /chain A/ }));
+    const renameInput = screen.getByRole('textbox', { name: 'Chain name' });
+    fireEvent.change(renameInput, { target: { value: 'unsaved A name' } });
+    expect((renameInput as HTMLInputElement).value).toBe('unsaved A name');
+
+    fireEvent.click(screen.getByTestId('go-B'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Title B1')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Delete chain “chain A”/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Chain name' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /chain B/ })).toBeInTheDocument();
+  });
+
   it('navigation mid-stream does not corrupt the destination chain (08682 dead-atom)', async () => {
     // Pre-08682 regression: ChainPage held `chain` in component useState; an
     // in-flight `getChain(A)` that resolved after we navigated to B would

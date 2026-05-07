@@ -113,6 +113,7 @@ Pick whichever has the best cost/benefit; don't try to do all three.
 - `ConversationPage` viewer slots are provider-backed and now share the reset mechanism above.
 - `ConversationPage` page-local transient state (`error`, `conversationIdForSSE`, task-approval/credential/welcome overlays, image overlay, terminal expansion) still needs the next pass: classify each as conversation-scoped or intentionally transient/global and add route-level slug-switch regressions where needed.
 - `InputArea` is long-lived under the stable `ConversationPage` tree. Draft text is conversation-owned/persisted per `conversationId`, so `useDraft` now reads the target draft synchronously with `useScopedState` instead of effect-after-paint. Autocomplete, skill hint, expansion error, and voice input state are also conversation-scoped and reset via `useScopedState`; `InputArea.test.tsx` covers draft and autocomplete/hint reset on conversation switch.
+- `ChainPage` uses routed store atoms for durable per-chain data, but still had local UI affordances that should not cross `/chains/:rootConvId` navigation. Delete confirmation, inline rename edit mode, and unsaved rename text now reset via `useScopedState`; `ChainPage.test.tsx` covers root A → root B without keyed remount.
 
 ### Drift-prevention mechanism
 

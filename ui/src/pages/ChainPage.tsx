@@ -30,7 +30,7 @@
 // unfilled), which structurally communicates that the next question creates a
 // new pair rather than continuing a thread.
 
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useCallback } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
@@ -45,6 +45,7 @@ import {
 } from '../api';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { useChainAtom, type InflightQa } from '../chain';
+import { useScopedState } from '../hooks';
 
 // Markdown plugin set, hoisted so the array identity is stable across
 // renders (matches the pattern in StreamingMessage.tsx).
@@ -72,7 +73,7 @@ export function ChainPage() {
   // Component-local: the delete-confirm modal is a per-render-instance UI
   // affordance, not chain state. It does not need to survive navigation
   // (in fact: it should *not* — dialog open across nav would be a bug).
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useScopedState(rootConvId, false);
 
   // Imperative handle to the active pair's textarea so we can refocus it
   // immediately after submit (the user agreed they should be able to type the
@@ -408,18 +409,18 @@ interface ChainPageHeaderProps {
 }
 
 function ChainPageHeader({ chain, onRename, onArchiveToggle, onDelete }: ChainPageHeaderProps) {
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useScopedState(chain.root_conv_id, false);
   // The text input is pre-populated with the actual override (`chain_name`),
   // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
   // means "clear the override and fall back to title."
-  const [value, setValue] = useState(chain.chain_name ?? '');
+  const [value, setValue] = useScopedState(chain.root_conv_id, chain.chain_name ?? '');
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Keep the local value in sync if the prop changes while we're not editing
   // (e.g., after a successful PATCH refresh).
   useEffect(() => {
     if (!editing) setValue(chain.chain_name ?? '');
-  }, [chain.chain_name, editing]);
+  }, [chain.chain_name, editing, setValue]);
 
   useEffect(() => {
     if (editing) {
