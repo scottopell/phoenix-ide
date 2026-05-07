@@ -12,7 +12,7 @@ import {
 } from 'react';
 // Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
 import type { QueuedMessage } from '../hooks';
-import { useDraft } from '../hooks';
+import { useDraft, useScopedState } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
 import { isAgentWorking, isCancellingState } from '../utils';
@@ -100,24 +100,24 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [setDraft]);
 
   // Voice input: base text (accumulated finals) + interim (current partial)
-  const [voiceBase, setVoiceBase] = useState<string | null>(null); // null = not recording
-  const [voiceInterim, setVoiceInterim] = useState('');
+  const [voiceBase, setVoiceBase] = useScopedState<string | null>(conversationId, null); // null = not recording
+  const [voiceInterim, setVoiceInterim] = useScopedState(conversationId, '');
 
   // =========================================================================
   // Inline autocomplete state (REQ-IR-004, REQ-IR-005)
   // =========================================================================
 
   /** Active trigger state — null when no trigger is open */
-  const [activeTrigger, setActiveTrigger] = useState<TriggerState | null>(null);
+  const [activeTrigger, setActiveTrigger] = useScopedState<TriggerState | null>(conversationId, null);
   /**
    * File search results fetched from the server. Skill candidates are NOT
    * stored here — they're derived during render from `skillItems`
    * (see `acItems` useMemo below). This avoids the derived-state-in-effect
    * anti-pattern.
    */
-  const [fileAcItems, setFileAcItems] = useState<AutocompleteItem[]>([]);
+  const [fileAcItems, setFileAcItems] = useScopedState<AutocompleteItem[]>(conversationId, []);
   /** Inline error when an @ref or /skill fails to expand (REQ-IR-007) */
-  const [expansionError, setExpansionError] = useState<string | null>(null);
+  const [expansionError, setExpansionError] = useScopedState<string | null>(conversationId, null);
   /** Ref to abort any in-flight search request */
   const searchAbortRef = useRef<AbortController | null>(null);
   /** Debounce timer for search */
@@ -125,9 +125,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   /** Guard to prevent duplicate in-flight skill fetches */
   const fetchingSkillsRef = useRef(false);
   /** Cached skill list for the current conversation (REQ-IR-005) */
-  const [skillItems, setSkillItems] = useState<SkillEntry[]>([]);
+  const [skillItems, setSkillItems] = useScopedState<SkillEntry[]>(conversationId, []);
   /** Argument hint ghost text shown after a skill is selected (REQ-IR-005) */
-  const [skillArgumentHint, setSkillArgumentHint] = useState<string | null>(null);
+  const [skillArgumentHint, setSkillArgumentHint] = useScopedState<string | null>(conversationId, null);
 
   /**
    * Autocomplete items to display. Derived from the active trigger mode:
@@ -184,7 +184,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         setFileAcItems([]);
       }
     },
-    [conversationId],
+    [conversationId, setFileAcItems],
   );
 
   // =========================================================================
@@ -205,7 +205,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     } finally {
       fetchingSkillsRef.current = false;
     }
-  }, [conversationId]);
+  }, [conversationId, setSkillItems]);
 
   // Fire side effects (fetch) on trigger change. No state derivation here —
   // `acItems` is computed during render via useMemo above.
@@ -238,7 +238,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     return () => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     };
-  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems.length]);
+  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems.length, setFileAcItems]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -261,7 +261,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const trigger = detectTrigger(newValue, cursor);
       setActiveTrigger(trigger);
     },
-    [],
+    [setActiveTrigger, setExpansionError],
   );
 
   // =========================================================================
@@ -311,12 +311,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         }
       });
     },
-    [activeTrigger, voiceBase, draft, setDraft, setVoiceBase],
+    [activeTrigger, voiceBase, draft, setDraft, setVoiceBase, setActiveTrigger, setSkillArgumentHint],
   );
 
   const handleAcDismiss = useCallback(() => {
     setActiveTrigger(null);
-  }, []);
+  }, [setActiveTrigger]);
 
   // Clear argument hint when the user types past the skill name or clears input
   useEffect(() => {
@@ -331,13 +331,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     } else if (!text.trimStart().startsWith('/')) {
       setSkillArgumentHint(null);
     }
-  }, [draft, voiceBase, skillArgumentHint]);
+  }, [draft, voiceBase, skillArgumentHint, setSkillArgumentHint]);
 
   // =========================================================================
   // Keyboard handling (merged with autocomplete nav)
   // =========================================================================
 
-  const [acSelectedIndex, setAcSelectedIndex] = useState(0);
+  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(conversationId, 0);
 
   const filteredItems = useMemo(
     () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
@@ -346,7 +346,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   useEffect(() => {
     setAcSelectedIndex(0);
-  }, [activeTrigger?.query]);
+  }, [activeTrigger?.query, setAcSelectedIndex]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -515,7 +515,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const handleVoiceStart = useCallback(() => {
     setVoiceBase(draft);
     setVoiceInterim('');
-  }, [draft]);
+  }, [draft, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceEnd = useCallback(() => {
     setVoiceBase(prev => {
@@ -525,7 +525,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       return null;
     });
     setVoiceInterim('');
-  }, [setDraft]);
+  }, [setDraft, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceFinal = useCallback((text: string) => {
     if (!text) return;
@@ -534,11 +534,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       return prev.trim() ? prev.trimEnd() + ' ' + text : text;
     });
     setVoiceInterim('');
-  }, []);
+  }, [setVoiceBase, setVoiceInterim]);
 
   const handleVoiceInterim = useCallback((text: string) => {
     setVoiceInterim(text);
-  }, []);
+  }, [setVoiceInterim]);
 
   // =========================================================================
   // Textarea event handlers
@@ -563,7 +563,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const trigger = detectTrigger(currentVal, ta.selectionStart);
       setActiveTrigger(trigger);
     }
-  }, [voiceBase, draft]);
+  }, [voiceBase, draft, setActiveTrigger]);
 
   // =========================================================================
   // Derived state

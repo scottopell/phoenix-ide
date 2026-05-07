@@ -1,6 +1,17 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
+import { useScopedState } from './useScopedState';
 
 const DEBOUNCE_MS = 300;
+
+function readDraft(storageKey: string | null): string {
+  if (!storageKey) return '';
+  try {
+    return localStorage.getItem(storageKey) ?? '';
+  } catch (error) {
+    console.warn('Error reading draft from localStorage:', error);
+    return '';
+  }
+}
 
 /**
  * Hook for managing draft message text with debounced localStorage persistence.
@@ -12,19 +23,8 @@ export function useDraft(conversationId: string | undefined): [
   () => void
 ] {
   const storageKey = conversationId ? `phoenix:draft:${conversationId}` : null;
-  
-  // Load initial value from localStorage
-  const getInitialValue = (): string => {
-    if (!storageKey) return '';
-    try {
-      return localStorage.getItem(storageKey) ?? '';
-    } catch (error) {
-      console.warn('Error reading draft from localStorage:', error);
-      return '';
-    }
-  };
-
-  const [draft, setDraftState] = useState<string>(getInitialValue);
+  const initialDraft = readDraft(storageKey);
+  const [draft, setDraftState] = useScopedState(conversationId, initialDraft);
   const debounceRef = useRef<number | null>(null);
 
   // Save to localStorage (debounced)
@@ -55,7 +55,7 @@ export function useDraft(conversationId: string | undefined): [
       saveToStorage(value);
       debounceRef.current = null;
     }, DEBOUNCE_MS);
-  }, [saveToStorage]);
+  }, [saveToStorage, setDraftState]);
 
   // Clear draft (immediate, no debounce)
   const clearDraft = useCallback(() => {
@@ -73,22 +73,7 @@ export function useDraft(conversationId: string | undefined): [
         console.warn('Error clearing draft from localStorage:', error);
       }
     }
-  }, [storageKey]);
-
-  // Reload draft when conversationId changes
-  useEffect(() => {
-    if (!conversationId) {
-      setDraftState('');
-      return;
-    }
-    try {
-      const stored = localStorage.getItem(`phoenix:draft:${conversationId}`);
-      setDraftState(stored ?? '');
-    } catch (error) {
-      console.warn('Error reading draft from localStorage:', error);
-      setDraftState('');
-    }
-  }, [conversationId]);
+  }, [storageKey, setDraftState]);
 
   // Track current draft value for flush on unmount
   const draftRef = useRef(draft);

@@ -112,6 +112,7 @@ Pick whichever has the best cost/benefit; don't try to do all three.
 - `DesktopLayout` toasts via `useToast`: shell feedback state, not conversation payload; no reset required.
 - `ConversationPage` viewer slots are provider-backed and now share the reset mechanism above.
 - `ConversationPage` page-local transient state (`error`, `conversationIdForSSE`, task-approval/credential/welcome overlays, image overlay, terminal expansion) still needs the next pass: classify each as conversation-scoped or intentionally transient/global and add route-level slug-switch regressions where needed.
+- `InputArea` is long-lived under the stable `ConversationPage` tree. Draft text is conversation-owned/persisted per `conversationId`, so `useDraft` now reads the target draft synchronously with `useScopedState` instead of effect-after-paint. Autocomplete, skill hint, expansion error, and voice input state are also conversation-scoped and reset via `useScopedState`; `InputArea.test.tsx` covers draft and autocomplete/hint reset on conversation switch.
 
 ### Drift-prevention mechanism
 
