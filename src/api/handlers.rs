@@ -32,6 +32,8 @@ use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
 use crate::terminal::terminal_ws_handler;
 
+use super::browser_view::browser_view_ws_handler;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -80,6 +82,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/stream", get(stream_conversation))
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
+        // Live browser view WebSocket (REQ-BT-018)
+        .route(
+            "/api/conversations/:id/browser-view",
+            get(browser_view_ws_handler),
+        )
         // User actions (REQ-API-004)
         .route("/api/conversations/:id/chat", post(send_chat))
         .route("/api/conversations/:id/cancel", post(cancel_conversation))

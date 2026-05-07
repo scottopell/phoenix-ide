@@ -1926,3 +1926,118 @@ async fn test_key_press_unknown_key_returns_error() {
 
     shutdown_test(_manager, server).await;
 }
+
+// ============================================================================
+// Live View / Screencast (REQ-BT-018)
+// ============================================================================
+
+/// Smoke test: navigate, attach a viewer, observe at least one URL event
+/// and one frame, detach and verify the broker drops cleanly.
+///
+/// Validates the broker's lifecycle invariants in an end-to-end shape:
+///   1. attach_viewer() lazily starts the screencast on first attach.
+///   2. The viewer receives URL events (initial + post-navigation) and
+///      frame events (JPEG bytes after base64 decode).
+///   3. Dropping the last `Arc<ScreencastBroker>` stops the screencast
+///      — verified by re-attaching and getting a new broker instance.
+#[tokio::test]
+async fn test_screencast_attach_emits_frames_and_url() {
+    require_chrome!();
+    use crate::tools::browser::screencast::ScreencastEvent;
+
+    let server =
+        TestServer::start("<html><body><h1 id='hdr'>screencast probe</h1></body></html>").await;
+    let (ctx, manager) = test_context("test-screencast-frames");
+
+    // Trigger session creation by navigating; the screencast doesn't fire
+    // without a Page so we can't shortcut this.
+    let nav = BrowserNavigateTool
+        .run(json!({ "url": server.url() }), ctx.clone())
+        .await;
+    assert!(nav.success, "navigate failed: {}", nav.output);
+
+    let session_arc = manager
+        .get_existing("test-screencast-frames")
+        .await
+        .expect("session should exist after navigate");
+
+    // First attach: broker is created, screencast starts.
+    let (broker_a, mut rx_a, initial_url) = {
+        let s = session_arc.read().await;
+        s.attach_viewer().await.expect("attach_viewer")
+    };
+    assert!(
+        initial_url
+            .as_deref()
+            .map(|u| u.starts_with("http://"))
+            .unwrap_or(false),
+        "initial url should be the navigated page, got {initial_url:?}"
+    );
+    assert_eq!(
+        broker_a.viewer_count(),
+        1,
+        "first attach should leave 1 viewer"
+    );
+
+    // Wait for at least one frame to arrive. With a freshly painted page
+    // and everyNthFrame=1 this should land within a few hundred ms.
+    let mut got_frame = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !got_frame {
+        match tokio::time::timeout(Duration::from_millis(500), rx_a.recv()).await {
+            Ok(Ok(ScreencastEvent::Frame { jpeg })) => {
+                assert!(!jpeg.is_empty(), "frame should have non-empty JPEG bytes");
+                // JPEG SOI marker FFD8 — sanity check on the decode path.
+                assert_eq!(
+                    jpeg.get(0..2),
+                    Some([0xff, 0xd8].as_slice()),
+                    "frame should be a JPEG (SOI marker)"
+                );
+                got_frame = true;
+            }
+            Ok(Ok(ScreencastEvent::Url(_))) => continue,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(got_frame, "never received a frame within 5s");
+
+    // Second attach: same broker, viewer count goes to 2.
+    let (broker_b, mut _rx_b, _) = {
+        let s = session_arc.read().await;
+        s.attach_viewer().await.expect("attach_viewer #2")
+    };
+    assert_eq!(
+        broker_b.viewer_count(),
+        2,
+        "second attach should make 2 viewers"
+    );
+    assert!(
+        Arc::ptr_eq(&broker_a, &broker_b),
+        "both viewers should share the same broker instance"
+    );
+
+    // Drop both viewers — the broker should now be free to drop too.
+    let broker_a_ptr = Arc::as_ptr(&broker_a);
+    drop(broker_a);
+    drop(broker_b);
+    drop(rx_a);
+    drop(_rx_b);
+
+    // Tiny pause to let Drop run (it spawns a task to fire stopScreencast).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Third attach: a fresh broker should be allocated since the previous
+    // one died with the last viewer.
+    let (broker_c, _rx_c, _) = {
+        let s = session_arc.read().await;
+        s.attach_viewer().await.expect("attach_viewer #3")
+    };
+    assert!(
+        !std::ptr::eq(broker_a_ptr, Arc::as_ptr(&broker_c)),
+        "new broker after all viewers dropped"
+    );
+    drop(broker_c);
+
+    shutdown_test(manager, server).await;
+}

@@ -84,3 +84,81 @@ export function useDiffViewerState(): DiffViewerStateValue {
   }
   return ctx;
 }
+
+/* ── Browser view slot (REQ-BT-018) ────────────────────────────────────── */
+
+interface BrowserViewStateValue {
+  /** Whether the browser-view panel is currently mounted in the slot. */
+  open: boolean;
+  /** Sticky: flips true the first time a `browser_*` tool is observed in
+   *  this conversation. Drives the auto-mount-when-slot-empty rule and
+   *  also gates the manual-open affordance (no point letting the user open
+   *  an empty panel before there's any browser to show). */
+  hasActivated: boolean;
+  openPanel: () => void;
+  closePanel: () => void;
+  markActivated: () => void;
+}
+
+const BrowserViewStateContext = createContext<BrowserViewStateValue | null>(null);
+
+/**
+ * Conversation-scoped browser-view slot. Mutually exclusive with the
+ * prose reader (FileExplorerContext) and the diff viewer (above) —
+ * ConversationPage owns the resolution rules.
+ *
+ * `hasActivated` is sticky for the lifetime of the provider (= the lifetime
+ * of the conversation page). Auto-mount on first activation is the
+ * provider's responsibility-by-implication only: it just exposes the flag
+ * and the open/close ops; the page wires them together.
+ */
+interface BrowserViewStateProviderProps {
+  children: ReactNode;
+  /**
+   * Scope identifier (typically the active conversation slug). When this
+   * changes, the panel is closed and `hasActivated` is cleared so a new
+   * conversation never inherits the previous one's browser-view state.
+   * Synchronous reset via the "adjust state during render" pattern,
+   * matching `DiffViewerStateProvider` and `ReviewNotesProvider`.
+   */
+  scopeKey?: string | undefined;
+}
+
+export function BrowserViewStateProvider({ children, scopeKey }: BrowserViewStateProviderProps) {
+  const [open, setOpen] = useState(false);
+  const [hasActivated, setHasActivated] = useState(false);
+  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
+
+  if (trackedScope !== scopeKey) {
+    setTrackedScope(scopeKey);
+    if (open) setOpen(false);
+    if (hasActivated) setHasActivated(false);
+  }
+
+  const openPanel = useCallback(() => setOpen(true), []);
+  const closePanel = useCallback(() => setOpen(false), []);
+  const markActivated = useCallback(() => setHasActivated(true), []);
+
+  const value = useMemo<BrowserViewStateValue>(
+    () => ({ open, hasActivated, openPanel, closePanel, markActivated }),
+    [open, hasActivated, openPanel, closePanel, markActivated],
+  );
+
+  return (
+    <BrowserViewStateContext.Provider value={value}>
+      {children}
+    </BrowserViewStateContext.Provider>
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function useBrowserViewState(): BrowserViewStateValue {
+  const ctx = useContext(BrowserViewStateContext);
+  if (!ctx) {
+    throw new Error(
+      'useBrowserViewState must be used inside <BrowserViewStateProvider>. ' +
+        'Wrap the conversation page in the provider.',
+    );
+  }
+  return ctx;
+}

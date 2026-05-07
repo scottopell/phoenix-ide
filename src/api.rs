@@ -4,6 +4,7 @@
 
 mod assets;
 pub mod auth;
+mod browser_view;
 mod chains;
 mod git_handlers;
 mod handlers;

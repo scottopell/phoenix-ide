@@ -9296,3 +9296,167 @@ html * {
   border-left: 3px solid var(--accent-red);
 }
 
+
+/* ── Browser view panel (REQ-BT-018) ───────────────────────────────────── */
+
+/* Live mirror of the conversation's headless Chromium. View-only — the
+ * canvas itself has pointer-events: none (set inline on the element) so
+ * stray clicks can't be confused for input. */
+
+.browser-view-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  background: var(--surface-1, #1a1a1a);
+  overflow: hidden;
+}
+
+.browser-view-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--surface-2, #222);
+  border-bottom: 1px solid var(--border-subtle, #333);
+  flex-shrink: 0;
+  height: 32px;
+  box-sizing: border-box;
+  font-size: 11px;
+  color: var(--fg-muted, #aaa);
+}
+
+.browser-view-panel__status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--fg-muted, #888);
+  transition: background 150ms ease;
+}
+.browser-view-panel__status[data-status='live'] {
+  background: var(--accent-success, #4caf50);
+  box-shadow: 0 0 4px var(--accent-success, #4caf50);
+}
+.browser-view-panel__status[data-status='connecting'] {
+  background: var(--accent-warn, #e0a800);
+}
+.browser-view-panel__status[data-status='ended'],
+.browser-view-panel__status[data-status='no-session'] {
+  background: var(--fg-muted, #888);
+}
+.browser-view-panel__status[data-status='error'] {
+  background: var(--accent-danger, #d04444);
+}
+
+.browser-view-panel__url {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--mono-font, ui-monospace, monospace);
+  color: var(--fg-default, #d4d4d4);
+}
+
+.browser-view-panel__readonly {
+  flex-shrink: 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle, #333);
+  border-radius: 3px;
+  color: var(--fg-muted, #888);
+  cursor: help;
+}
+
+.browser-view-panel__close {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--fg-muted, #aaa);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+.browser-view-panel__close:hover {
+  background: var(--surface-3, #333);
+  color: var(--fg-default, #fff);
+}
+
+.browser-view-panel__stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+.browser-view-panel__canvas {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  /* Crisp pixels for the JPEG-decoded bitmap; without this, browsers can
+   * smooth in a way that looks blurry on a 1:1 viewport. */
+  image-rendering: auto;
+  background: #000;
+}
+
+.browser-view-panel__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--fg-muted, #aaa);
+  font-size: 13px;
+  pointer-events: none;
+  text-align: center;
+  padding: 16px;
+}
+.browser-view-panel__overlay-sub {
+  font-size: 11px;
+  color: var(--fg-muted, #888);
+}
+
+.browser-view-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+}
+.browser-view-overlay > .browser-view-panel {
+  width: 100%;
+  height: 100%;
+}
+
+.browser-view-launcher {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 12px 0;
+}
+.browser-view-launcher-btn {
+  background: var(--surface-2, #222);
+  color: var(--fg-muted, #aaa);
+  border: 1px solid var(--border-subtle, #333);
+  border-radius: 12px;
+  padding: 2px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.browser-view-launcher-btn:hover {
+  background: var(--surface-3, #2c2c2c);
+  color: var(--fg-default, #fff);
+}
