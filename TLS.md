@@ -48,6 +48,15 @@ validation still requires a trusted issuer and a SAN matching the hostname.
 Public ACME/Let's Encrypt is not part of Phoenix's built in flow for
 private/internal hostnames.
 
+If a TCP pass-through forwarder, SSH tunnel, or similar byte-level relay sits
+between the client and Phoenix, the forwarder is not the TLS endpoint. The
+client's TLS handshake terminates at Phoenix on the far side; the cert the
+client validates is whatever Phoenix serves, and SNI is whatever hostname the
+client typed. To support a forwarder-side alias (for example, a Bonjour
+`.local` name on your laptop forwarding to a remote Phoenix), add that alias
+as an extra SAN on the remote Phoenix's cert. Don't try to install a cert on
+the forwarder.
+
 Trusting the Phoenix CA means the browser machine will trust leaf certificates
 issued by that CA. It does not give remote hosts the ability to issue new certs
 unless you copy them the CA private key. Do not do that for the normal flow.
@@ -212,6 +221,42 @@ PHOENIX_TLS=auto
 PHOENIX_TLS_HOSTS=phoenix-host.internal,phoenix-host,10.0.0.12
 ```
 
+## Bonjour / mDNS Access
+
+To reach Phoenix from a phone or other device on the same LAN by a `.local`
+name (e.g. from Safari on iOS without configuring DNS), add the mDNS name as
+an extra SAN.
+
+Find your Mac's mDNS name — this is not always the Computer Name shown in
+the Sharing pane:
+
+```bash
+scutil --get LocalHostName
+```
+
+The resolvable name is `<that>.local`. Issue with it as an extra SAN:
+
+```bash
+./dev.py tls issue phoenix-host.internal --host <that>.local
+```
+
+macOS only advertises `LocalHostName` over mDNS while at least one service in
+System Settings → Sharing is enabled. With every service off, the name
+silently does not resolve — `mDNSResponder` runs and service browsing works,
+but `dns-sd -G <name>.local` returns nothing and clients hang. Enable any one
+service (Screen Sharing or File Sharing both work) to trigger advertisement.
+
+iOS trust requires two steps, unlike macOS:
+
+1. Install the `phoenix-local-ca.pem` profile on the phone (AirDrop or email
+   it, then accept in Settings → Profile Downloaded).
+2. Enable trust in Settings → General → About → Certificate Trust Settings.
+   Without this second step, iOS Safari rejects the cert with no obvious
+   diagnostic.
+
+If `LocalHostName` later changes, the cert's SAN no longer matches and you
+will need to reissue with the new name.
+
 ## Environment Variables
 
 | Variable | Meaning |
@@ -275,6 +320,16 @@ Expected signals:
 - Default curl should show `HTTP/2 200` when it supports HTTP/2.
 - `curl --http1.1` should show `HTTP/1.1 200 OK`.
 - `openssl s_client` should report `ALPN protocol: h2`.
+
+Cert SAN check (which names will validate against this server?):
+
+```bash
+echo | openssl s_client -connect <host>:<port> -servername <name> 2>/dev/null \
+  | openssl x509 -noout -ext subjectAltName
+```
+
+Prints the SAN list the running server is currently serving — fastest way to
+confirm a freshly-deployed cert actually contains the names you expected.
 
 Browser checks:
 
