@@ -107,7 +107,7 @@ export function InlineAutocomplete({
         <span className="iac-hint">{hint}</span>
       </div>
       <div className="iac-list" ref={listRef}>
-        {filtered.slice(0, 12).map((item, idx) => (
+        {filtered.map((item, idx) => (
           <button
             key={item.id}
             className={`iac-item ${idx === selectedIndex ? 'selected' : ''}`}
