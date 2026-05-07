@@ -12,7 +12,11 @@
 --           sequence_id total ordering; sse_message atomic triple
 --           (append + clear buffer + advance seq); streaming buffer
 --           phase coupling; wire vs local dispatch distinction;
---           init merge-by-id semantics for reconnect resync.
+--           init merge-by-id semantics for reconnect resync;
+--           connection-epoch monotonic guard (wire-side cross-conv
+--           contamination); expectedConversationId guard on
+--           client-originated actions (post-navigation stale-dispatch
+--           contamination).
 --
 -- Excludes: HTTP/SSE transport (see sse_wire spec, if written).
 --           ConnectionMachine (see connection_machine spec, if written).
@@ -97,6 +101,14 @@ entity ConversationAtom {
     streamingBuffer: StreamingBuffer?
     uiError: UIError?
     connectionState: String
+    -- The connection generation that produced wire events this atom is
+    -- accepting. Null until the first `connection_opened` lands; lifted
+    -- monotonically thereafter. Wire-originated actions stamped with a
+    -- non-matching epoch are dropped at the reducer boundary — the
+    -- cross-conversation contamination guard. Reset to null only via
+    -- explicit ConnectionReset (legitimate hook remount), which is what
+    -- separates "fresh generation" from "stale OPEN_SSE closure".
+    connectionEpoch: Integer?
 }
 
 ------------------------------------------------------------
@@ -370,22 +382,53 @@ rule SseErrorClientSynthesized {
 -- awaiting_llm the moment the POST returns, without waiting for the
 -- server's sse_state_change. Does NOT touch lastSequenceId; a
 -- subsequent wire event will overwrite phase authoritatively.
+--
+-- `expectedConversationId` is captured at dispatch time. The reducer
+-- drops the action when the atom is no longer that conversation —
+-- closes the leak where `await api.foo(...)` resolves into a slug-bound
+-- dispatch after navigation.
 rule LocalPhaseChangeApplied {
-    when: LocalPhaseChangeDispatched(atom, newPhase)
+    when: LocalPhaseChangeDispatched(atom, newPhase, expectedConversationId)
+
+    requires: atom.conversationId = expectedConversationId
 
     ensures: atom.phase = newPhase
     ensures: atom.lastSequenceId = atom.lastSequenceId
     ensures: atom.streamingBuffer = atom.streamingBuffer
 }
 
+rule LocalPhaseChangeStaleConversation {
+    when: LocalPhaseChangeDispatched(atom, newPhase, expectedConversationId)
+
+    requires: atom.conversationId != expectedConversationId
+
+    ensures: atom = atom
+
+    @guidance
+        -- Drop. The dispatch was bound to a conversation that is no
+        -- longer the atom's. Typical trigger: an in-flight
+        -- `await api.sendMessage(...)` resolved after the user
+        -- navigated away.
+}
+
 rule LocalConversationUpdateApplied {
-    when: LocalConversationUpdateDispatched(atom, updates)
+    when: LocalConversationUpdateDispatched(atom, updates, expectedConversationId)
+
+    requires: atom.conversationId = expectedConversationId
 
     ensures: atom.lastSequenceId = atom.lastSequenceId
 
     @guidance
         -- Shallow merge into atom.conversation. No-op if
         -- atom.conversation is null.
+}
+
+rule LocalConversationUpdateStaleConversation {
+    when: LocalConversationUpdateDispatched(atom, updates, expectedConversationId)
+
+    requires: atom.conversationId != expectedConversationId
+
+    ensures: atom = atom
 }
 
 rule ClearError {
@@ -400,6 +443,73 @@ rule ConnectionStateChanged {
 
     ensures: atom.connectionState = newState
     ensures: atom.lastSequenceId = atom.lastSequenceId
+}
+
+------------------------------------------------------------
+-- Rules — connection epoch lifecycle
+------------------------------------------------------------
+-- The wire-side cross-conversation contamination guard. Every
+-- wire-originated action carries an `epoch` matching the OPEN_SSE
+-- generation that produced it. The reducer's `isStaleEpoch` check
+-- (applied before per-action transitions) drops actions whose epoch
+-- doesn't match `atom.connectionEpoch`. The two rules below maintain
+-- `connectionEpoch` itself.
+
+-- `connection_opened` — dispatched from useConnection's OPEN_SSE
+-- effect handler with the freshly-minted epoch. Strictly monotonic:
+-- a stale OPEN_SSE executor closure firing after a newer one cannot
+-- regress the value (which would re-accept events the new generation
+-- has already superseded).
+rule ConnectionOpenedMonotonic {
+    when: ConnectionOpenedDispatched(atom, epoch)
+
+    requires: atom.connectionEpoch = null or epoch > atom.connectionEpoch
+
+    ensures: atom.connectionEpoch = epoch
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+}
+
+rule ConnectionOpenedRegressionDropped {
+    when: ConnectionOpenedDispatched(atom, epoch)
+
+    requires: atom.connectionEpoch != null
+    requires: epoch <= atom.connectionEpoch
+
+    ensures: atom = atom
+
+    @guidance
+        -- Within a single useConnection mount lifetime the machine
+        -- epoch counter is monotonic. An OPEN_SSE effect closure that
+        -- fires `connection_opened` with a lower epoch than the atom
+        -- already accepted is, by construction, stale — drop it.
+        --
+        -- Hook remount is the legitimate "lower epoch is correct"
+        -- scenario, but the hook handles that explicitly via
+        -- ConnectionReset (below) before any `connection_opened`
+        -- arrives. By the time this rule runs, the only way to
+        -- observe a regression is a stale closure, which must be
+        -- rejected.
+}
+
+-- `connection_reset` — dispatched from useConnection's mount effect
+-- before CONNECT. Nulls `connectionEpoch` so the freshly-mounted
+-- machine's first `connection_opened` (which may have a lower epoch
+-- than what the atom retains from a prior visit) is accepted by
+-- ConnectionOpenedMonotonic.
+rule ConnectionReset {
+    when: ConnectionResetDispatched(atom)
+
+    ensures: atom.connectionEpoch = null
+    ensures: atom.connectionState = "connecting"
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- This is the structural separation between "legitimate
+        -- remount" and "stale OPEN_SSE closure": only mount-time
+        -- code dispatches connection_reset. A stale executor cannot
+        -- forge it (no parallel path produces this action), so the
+        -- monotonic guard on connection_opened is preserved as a
+        -- correctness barrier.
 }
 
 -- Seeds initial data from localStorage cache or an initial REST fetch.
@@ -418,6 +528,33 @@ rule SetInitialDataNoOp {
     when: SetInitialDataDispatched(atom, snapshot)
 
     requires: atom.lastSequenceId > 0
+
+    ensures: atom = atom
+}
+
+-- `set_system_prompt` — fired from the page's getSystemPrompt fetch.
+-- Same expectedConversationId guard as the other client-originated
+-- mutations: a stale promise resolving after navigation lands on the
+-- old slug's bound dispatch and would otherwise write the prompt into
+-- whatever atom that dispatch points at.
+rule SetSystemPromptApplied {
+    when: SetSystemPromptDispatched(atom, systemPrompt, expectedConversationId)
+
+    requires: atom.conversationId = expectedConversationId
+
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- atom.systemPrompt = systemPrompt. The field is elided from
+        -- the entity schema above (along with conversation, etc.) to
+        -- keep the spec focused on the dynamics rather than the full
+        -- shape; the rule pins the cross-conv guard.
+}
+
+rule SetSystemPromptStaleConversation {
+    when: SetSystemPromptDispatched(atom, systemPrompt, expectedConversationId)
+
+    requires: atom.conversationId != expectedConversationId
 
     ensures: atom = atom
 }
@@ -458,6 +595,17 @@ invariant BufferSequenceWithinAtomSequence {
     for a in ConversationAtoms:
         a.streamingBuffer != null
             implies a.streamingBuffer.lastSequence <= a.lastSequenceId
+}
+
+-- The connection epoch is non-negative when set. The reducer rules
+-- (ConnectionOpenedMonotonic and ConnectionReset) maintain
+-- monotonicity-between-resets at the per-dispatch level — a stronger
+-- claim than this static invariant captures, but expressing it
+-- requires temporal quantification over event histories rather than
+-- the entity-snapshot quantification this dialect supports.
+invariant ConnectionEpochNonNegative {
+    for a in ConversationAtoms:
+        a.connectionEpoch != null implies a.connectionEpoch >= 0
 }
 
 ------------------------------------------------------------

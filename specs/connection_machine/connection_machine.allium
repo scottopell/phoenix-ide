@@ -17,12 +17,15 @@
 --
 -- Includes: State transitions keyed on CONNECT / DISCONNECT / SSE_OPEN /
 --           SSE_ERROR / BROWSER_ONLINE / BROWSER_OFFLINE /
---           RETRY_TIMER_FIRED / RECONNECTED_DISPLAY_DONE; the RetryTimer
---           entity ("at most one per client, only while reconnecting");
---           the EventSource entity ("exists iff the machine is in an
---           active state; bound to exactly one SseStream at a time");
---           server-close → client-reconnect coupling by reference to
---           sse_wire's SseStream.status transition.
+--           RETRY_TIMER_FIRED / RECONNECTED_DISPLAY_DONE / RETRY_NOW;
+--           the RetryTimer entity ("at most one per client, only while
+--           reconnecting"); the EventSource entity ("exists iff the
+--           machine is in an active state; bound to exactly one
+--           SseStream at a time"); server-close → client-reconnect
+--           coupling by reference to sse_wire's SseStream.status
+--           transition; the SSE_OPEN source-state guard that prevents
+--           buffered late init events from corrupting an already-stable
+--           state.
 --
 -- Excludes: The countdown-interval ticker (UI polish, modelled as
 --           @guidance); the reconnected-display grace timer as an
@@ -293,6 +296,32 @@ rule SseStreamOpenedFromReconnect {
         -- ReconnectedDisplayDone below.
 }
 
+-- SSE_OPEN source-state guard. A buffered MessageEvent fired by the
+-- browser after we already CLOSE_SSE'd would otherwise transition the
+-- machine into `connected` despite no live socket. The guard rejects
+-- SSE_OPEN from any state other than {connecting, reconnecting,
+-- offline} — the states where the executor genuinely expects an init.
+rule SseStreamOpenedDroppedFromStableState {
+    when: SseStreamOpenedByServer(client, stream)
+
+    requires: client.state in { live, reconnected_display, disconnected }
+
+    ensures: client = client
+
+    @guidance
+        -- connectionMachine.ts SSE_OPEN case:
+        --   if (current.state !== 'connecting' &&
+        --       current.state !== 'reconnecting' &&
+        --       current.state !== 'offline') {
+        --     return { state: current, effects };
+        --   }
+        --
+        -- Without this guard, a delayed init from a stale EventSource
+        -- could mark the new generation's machine `connected` before
+        -- its own stream actually opens — surfacing as a green
+        -- connection badge that has no actual socket behind it.
+}
+
 -- The server closed the stream (typically via sse_wire's LagCloseStream,
 -- but any server-side close — broadcast-channel drop, process exit,
 -- HTTP timeout — manifests identically on the client). EventSource's
@@ -416,14 +445,54 @@ rule BrowserReportedOnline {
     ensures: not exists RetryTimer{client: client}
 
     @guidance
-        -- Effects: [CANCEL_TIMERS, OPEN_SSE]. The retryNow() helper
-        -- (exposed by useConnection for the "Retry now" button) also
-        -- dispatches BROWSER_ONLINE — the user-triggered retry and
-        -- the browser's connectivity-regained path converge here.
+        -- Effects: [CANCEL_TIMERS, OPEN_SSE]. Triggered by the
+        -- browser's connectivity-regained `online` event and by the
+        -- visibility handler when navigator.onLine returns true.
+        --
+        -- The user-facing "Retry now" button dispatches RETRY_NOW
+        -- instead (see UserTriggeredRetryNow below), so the two paths
+        -- are kept distinct: BROWSER_ONLINE only acts from
+        -- {offline, reconnecting} on the rationale that other states
+        -- aren't waiting for connectivity, while RETRY_NOW honors the
+        -- user's explicit ask from `disconnected` too.
         --
         -- In states {connecting, live, disconnected, reconnected_display},
         -- BROWSER_ONLINE is a no-op (see the connectionMachine.ts
         -- guard `if (current.state === 'offline' || === 'reconnecting')`).
+}
+
+-- The user clicked the "Retry now" button. Dispatched as RETRY_NOW
+-- (distinct from BROWSER_ONLINE — same goal, broader source-state
+-- contract). Cancels any pending backoff and immediately opens a new
+-- EventSource. Honored from {disconnected, offline, reconnecting};
+-- a no-op in any active state, where a connection is either already
+-- live or already in flight.
+rule UserTriggeredRetryNow {
+    when: UserClickedRetryNow(client)
+
+    requires: client.state in { disconnected, offline, reconnecting }
+
+    ensures: client.attempt = 0
+    ensures: client.next_retry_ms = null
+    ensures: not exists RetryTimer{client: client}
+
+    @guidance
+        -- connectionMachine.ts RETRY_NOW case:
+        --   - state = disconnected → next_state = connecting
+        --   - state in {offline, reconnecting} → next_state = reconnecting
+        --   - other states → no-op
+        --
+        -- Effects: [CANCEL_TIMERS, OPEN_SSE]. The post-state split
+        -- (connecting vs reconnecting) is captured by the existing
+        -- transitions on ClientConnection.state — the rule doesn't
+        -- pin a single post-state because both are legal here.
+        --
+        -- Why distinct from BROWSER_ONLINE: a user clicking "Retry"
+        -- expects the action to do *something* even when the client
+        -- has been explicitly disconnected (e.g. after a hard logout
+        -- and re-auth). BROWSER_ONLINE preserves the older
+        -- "connectivity event from outside" semantics; RETRY_NOW is
+        -- the explicit user-intent channel.
 }
 
 -- window.offline fires. If the machine was doing anything active, tear
