@@ -783,6 +783,9 @@ pub struct BashRunTombstonePayload {
 pub struct BashWaiterPanickedPayload {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call (REQ-BASH-002).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     pub error_message: String,
 }
 
@@ -1042,6 +1045,25 @@ mod bash_tmux_wire_tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"], "label_too_long");
         assert_eq!(v["max_label_length"], 64);
+    }
+
+    #[test]
+    fn bash_waiter_panicked_with_label_round_trips() {
+        // Regression for the codex review on PR #42: BashWaiterPanickedPayload
+        // also carries `handle`, so it must echo `label` for consistency with
+        // the rest of REQ-BASH-002's "every response carrying the handle"
+        // contract.
+        let resp = BashResponse::WaiterPanicked(BashWaiterPanickedPayload {
+            handle: "b-9".into(),
+            cmd: "npm run dev".into(),
+            label: Some("dev-server".into()),
+            error_message: "the waiter task for this handle panicked; the process state is unknown"
+                .into(),
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "waiter_panicked");
+        assert_eq!(v["handle"], "b-9");
+        assert_eq!(v["label"], "dev-server");
     }
 
     #[test]

@@ -1338,6 +1338,7 @@ async fn terminal_or_panic_response(
             let typed = BashResponse::WaiterPanicked(BashWaiterPanickedPayload {
                 handle: handle.handle_id.to_string(),
                 cmd: cmd_override.unwrap_or(handle.cmd.as_str()).to_string(),
+                label,
                 error_message:
                     "the waiter task for this handle panicked; the process state is unknown"
                         .to_string(),

@@ -451,6 +451,7 @@ const BashWaiterPanickedPayloadSchema = v.looseObject({
   status: v.literal('waiter_panicked'),
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   error_message: v.string(),
 });
 

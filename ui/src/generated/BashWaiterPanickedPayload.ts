@@ -5,4 +5,8 @@
  * waiter task panicked; carries enough info for the agent to abandon
  * the handle.
  */
-export type BashWaiterPanickedPayload = { handle: string, cmd: string, error_message: string, };
+export type BashWaiterPanickedPayload = { handle: string, cmd: string, 
+/**
+ * Optional handle label set on the run call (REQ-BASH-002).
+ */
+label?: string | null, error_message: string, };
