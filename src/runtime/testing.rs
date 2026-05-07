@@ -1513,9 +1513,27 @@ mod tests {
 
         let result = transition(&state, &context, event);
 
-        // Should transition to Failed (not stuck in LlmRequesting)
-        let result = result.expect("Should produce Ok transition to Failed state");
-        assert!(matches!(result.new_state, ConvState::Failed { .. }));
+        // Should feed error results back to LLM (not transition to Failed)
+        let result = result.expect("Should produce Ok transition");
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "Should transition back to LlmRequesting to feed errors to LLM, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, crate::state_machine::effect::Effect::PersistCheckpoint { .. })),
+            "Should have PersistCheckpoint with error results"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, crate::state_machine::effect::Effect::RequestLlm)),
+            "Should have RequestLlm effect"
+        );
     }
 
     /// Test that parent conversations don't handle terminal tools specially
