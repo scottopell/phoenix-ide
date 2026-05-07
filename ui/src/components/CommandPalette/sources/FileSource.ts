@@ -24,7 +24,7 @@ export function createFileSource(
     async search(query: string, signal?: AbortSignal): Promise<PaletteItem[]> {
       if (!query.trim()) return [];
       try {
-        const result = await api.searchConversationFiles(convId, query, 15, signal);
+        const result = await api.searchConversationFiles(convId, query, 50, signal);
         return result.items.map(entry => toItem(entry.path, rootDir));
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') return [];
