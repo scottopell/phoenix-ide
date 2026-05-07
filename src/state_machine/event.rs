@@ -161,6 +161,12 @@ pub enum Event {
         user_agent: Option<String>,
         skill_invocation: Option<crate::skills::SkillInvocation>,
     },
+    /// Removes a steering entry from the executor's in-memory queue.
+    /// Intercepted by the executor before reaching the state machine.
+    /// The DB is updated by the cancel handler before this event is sent.
+    CancelSteerMessage {
+        message_id: String,
+    },
 }
 
 impl Event {
@@ -189,6 +195,7 @@ impl Event {
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
             Event::TaskResolved { .. } => "TaskResolved",
             Event::SteerMessage { .. } => "SteerMessage",
+            Event::CancelSteerMessage { .. } => "CancelSteerMessage",
         }
     }
 }
@@ -431,13 +438,13 @@ impl TryFrom<Event> for ParentEvent {
                 repo_root,
             })),
             // Sub-agent-only events are invalid for parent;
-            // SteerMessage is intercepted by the executor before conversion
-            Event::GraceTurnExhausted { .. } | Event::SteerMessage { .. } => {
-                Err(EventConversionError {
-                    event_variant: event.variant_name(),
-                    target_type: "ParentEvent",
-                })
-            }
+            // SteerMessage and CancelSteerMessage are intercepted by the executor before conversion
+            Event::GraceTurnExhausted { .. }
+            | Event::SteerMessage { .. }
+            | Event::CancelSteerMessage { .. } => Err(EventConversionError {
+                event_variant: event.variant_name(),
+                target_type: "ParentEvent",
+            }),
         }
     }
 }
@@ -533,13 +540,14 @@ impl TryFrom<Event> for SubAgentEvent {
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
             // Parent-only events are invalid for sub-agent;
-            // SteerMessage is intercepted by the executor before conversion
+            // SteerMessage and CancelSteerMessage are intercepted by the executor before conversion
             Event::TaskApprovalResponse { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
-            | Event::SteerMessage { .. } => Err(EventConversionError {
+            | Event::SteerMessage { .. }
+            | Event::CancelSteerMessage { .. } => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
             }),

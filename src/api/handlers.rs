@@ -1529,6 +1529,19 @@ async fn send_chat(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    // Steering queue idempotency: if message_id is already in the queue a
+    // retry returns the same accepted response without double-enqueuing.
+    if conversation
+        .steering_queue
+        .iter()
+        .any(|e| e.message_id == req.message_id)
+    {
+        return Ok(Json(ChatResponse {
+            queued: true,
+            steering: true,
+        }));
+    }
+
     // Fail-fast when the state would reject UserMessage. Without this, the
     // chat POST returns 200, the runtime drops the queued event with only a
     // "Transition rejected" log line, and the optimistic UI is stuck on
@@ -1804,19 +1817,18 @@ async fn cancel_steering_message(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // Also evict the runtime so the in-memory queue is refreshed on next access.
-    // Without this, the executor's in-memory `steering_queue` would still hold the
-    // entry and would deliver it even after the DB was updated.
-    //
-    // The eviction is best-effort: if the runtime is not running, `evict_runtime`
-    // is a no-op. If it IS running and actively processing, the entry will be
-    // removed on the next DB load (either when the executor checks for a queued
-    // message or via the `SteerMessage` channel). We also attempt to send a
-    // `SteerMessage` cancel via the runtime's channel if needed — for now, the
-    // simplest safe approach is to rely on the executor draining one-at-a-time
-    // and the DB being authoritative.
-    //
-    // TODO(task-01001): implement an in-process cancel channel for live executors.
+    // Notify the live executor (if running) to remove the entry from its
+    // in-memory queue. DB is already updated above, so the executor write
+    // in its SteerMessage handler is a no-op if the executor restarts.
+    if let Some(handle) = state.runtime.try_get_handle(&id).await {
+        let _ = handle
+            .event_tx
+            .send(Event::CancelSteerMessage {
+                message_id: message_id.clone(),
+            })
+            .await;
+    }
+
     tracing::info!(conv_id = %id, %message_id, "Steering message cancelled");
 
     Ok(Json(SuccessResponse { success: true }))

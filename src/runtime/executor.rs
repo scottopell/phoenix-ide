@@ -537,6 +537,20 @@ where
             return Ok(());
         }
 
+        // Cancel steering: remove entry from in-memory queue.
+        // DB is already updated by the cancel handler before this event arrives.
+        if let Event::CancelSteerMessage { message_id } = event {
+            let before = self.steering_queue.len();
+            self.steering_queue.retain(|e| e.message_id != message_id);
+            tracing::info!(
+                conv_id = %self.context.conversation_id,
+                %message_id,
+                removed = before - self.steering_queue.len(),
+                "Steering message cancelled in executor"
+            );
+            return Ok(());
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {

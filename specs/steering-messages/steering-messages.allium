@@ -134,10 +134,12 @@ rule EnqueueSteeringMessage {
         -- the expanded content is stored in llm_text. If expansion fails, the
         -- message is still enqueued with llm_text absent.
         --
-        -- Persistence (DB write) is synchronous and happens before the HTTP
-        -- response is returned. The SSE event is emitted after persistence so
-        -- that clients observing the SSE stream cannot see a queued entry that
-        -- was lost on crash.
+        -- Persistence order (P1): enqueue_steer_message() reads the current queue
+        -- from DB, appends the new SteerEntry, and writes the updated queue to DB
+        -- *before* sending Event::SteerMessage to the executor channel. The HTTP
+        -- response is returned only after the DB write succeeds. This guarantees
+        -- that a crash between acceptance and executor processing does not lose
+        -- the entry.
 }
 
 -- REQ-STEER-002
@@ -192,12 +194,12 @@ rule CancelSteeringMessage {
         -- a successful cancel from a cancel of an already-drained entry; this is
         -- intentional: the postcondition "entry is not in queue" holds in both cases.
         --
-        -- After the DB write, the runtime evicts the in-memory executor for this
-        -- conversation from its cache, if present. On the next access the executor
-        -- reloads the authoritative queue from DB. Eviction is best-effort: if
-        -- the executor is not currently cached, the eviction is a no-op and safety
-        -- is guaranteed because DB is the authority and the in-memory queue is
-        -- only a cache of it.
+        -- Cancel sequence (P2): the handler updates the DB first, then sends
+        -- Event::CancelSteerMessage{message_id} to the live executor (if one is
+        -- currently loaded) via try_get_handle(). The executor removes the matching
+        -- entry from its in-memory steering_queue without a further DB write.
+        -- If no executor is running, the DB update alone is sufficient: the next
+        -- executor to start loads the already-corrected queue from DB.
         --
         -- queue_position values reported in earlier SteerMessageQueuedEmitted
         -- events are not retroactively adjusted after a cancel. Clients should
