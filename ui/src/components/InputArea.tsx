@@ -468,7 +468,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
 
     if (!text && images.length === 0) return;
-    if (agentWorking && !isOffline) return;
+    // Allow send while agent is working — the server will queue it as a
+    // steering message and deliver it when the conversation reaches Idle.
 
     // Close autocomplete and ghost text on send
     setActiveTrigger(null);
@@ -571,7 +572,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
-  const sendEnabled = (!agentWorking || isOffline) && hasContent && !expansionError;
+  const sendEnabled = hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.
@@ -597,7 +598,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
     : agentWorking
-      ? 'Agent working... draft your next message'
+      ? 'Agent working... send to queue a follow-up'
       : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
