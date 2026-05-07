@@ -1209,6 +1209,23 @@ impl RuntimeManager {
         })
     }
 
+    /// Remove and return the evicted broadcaster for `conversation_id`, if any.
+    ///
+    /// An evicted broadcaster exists in the window between `evict_runtime` (model
+    /// upgrade) and the next `get_or_create` call for the same conversation. During
+    /// this window the broadcaster is not reachable via `try_get_handle`, so any
+    /// caller that needs to push a final event — most notably the hard-delete cascade
+    /// — must also check here.
+    pub async fn take_evicted_broadcaster(
+        &self,
+        conversation_id: &str,
+    ) -> Option<SseBroadcaster> {
+        self.evicted_broadcasters
+            .write()
+            .await
+            .remove(conversation_id)
+    }
+
     /// Determine the resume state for a conversation.
     ///
     /// Delegates to `recovery::should_auto_continue` for the actual logic.

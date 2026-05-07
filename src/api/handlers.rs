@@ -2205,6 +2205,18 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             });
     }
 
+    // Also reach SSE clients on any evicted-but-not-yet-replaced broadcaster.
+    // This covers the window between evict_runtime (model upgrade) and the next
+    // get_or_create: during that window try_get_handle returns None but clients
+    // are still subscribed to the stashed broadcaster.
+    if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
+        let conv_id = id.to_string();
+        let _ = tx.send_seq(|seq| SseEvent::ConversationHardDeleted {
+            sequence_id: seq,
+            conversation_id: conv_id,
+        });
+    }
+
     Ok(())
 }
 
