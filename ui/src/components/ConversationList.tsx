@@ -299,7 +299,10 @@ export function ConversationList({
   // member rows. Header click navigates to the chain page; the caret-only
   // affordance toggles collapse without navigating.
   const renderChainBlock = (item: Extract<SidebarItem, { kind: 'chain' }>) => {
-    const collapsed = collapsedChains.has(item.rootId);
+    const latestMember = item.members.find(m => m.id === item.latestMemberId);
+    const isCompleted = getConvDisplayState(latestMember) === 'terminal';
+    // Completed chains default collapsed; the toggle set tracks non-default state.
+    const collapsed = isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
     return (
       <li
         key={`chain:${item.rootId}`}
