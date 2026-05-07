@@ -718,25 +718,26 @@ mod tests {
         assert_eq!(v["max_wait_seconds"], 900);
     }
 
+    /// `since` alone (no `lines`) routes to incremental mode and is the
+    /// genuine intent of an incremental-peek user. With a non-existent
+    /// handle it surfaces handle_not_found, which is fine — we're checking
+    /// that the parser accepted `since` as the read mode.
     #[tokio::test]
-    async fn peek_args_mutually_exclusive_returns_error() {
-        // Note: since=5, not since=0. The parser now treats since=0 as
-        // absent (a default-fill from models that emit the schema's prior
-        // `minimum: 0`), so it would not collide with `lines=10`. A
-        // non-zero `since` still genuinely conflicts.
+    async fn peek_with_since_only_routes_to_incremental_mode() {
         let tool = BashTool;
         let result = tool
-            .run(json!({"peek": "b-1", "lines": 10, "since": 5}), ctx())
+            .run(json!({"peek": "b-nonexistent", "since": 5}), ctx())
             .await;
-        assert!(!result.success);
         let v = parse_response(&result);
-        assert_eq!(v["error"], "peek_args_mutually_exclusive");
+        assert_eq!(v["error"], "handle_not_found");
     }
 
-    /// Companion: lines + since=0 is now tolerated (the `since` is
-    /// dropped as a default-fill).
+    /// Companion: lines + since (any value) is now tolerated — `since` is
+    /// dropped silently as a likely default-fill, `lines` wins. Models on
+    /// structured-output APIs commonly emit both with their schema
+    /// minimums, and the prior mutex turned this into a hard error.
     #[tokio::test]
-    async fn peek_with_lines_and_since_zero_drops_since_silently() {
+    async fn peek_with_lines_and_since_drops_since_silently() {
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry);
@@ -750,9 +751,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        // Both lines and since set with non-default values — used to error.
         let peek = tool
             .run(
-                json!({"op": "peek", "handle": handle.clone(), "lines": 10, "since": 0}),
+                json!({"op": "peek", "handle": handle.clone(), "lines": 10, "since": 5}),
                 c.clone(),
             )
             .await;

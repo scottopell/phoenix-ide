@@ -497,9 +497,23 @@ fn parse_read_args(lines: Option<i64>, since: Option<i64>) -> Result<ReadArgs, B
     // legacy in-flight conversations and any model that ignores the bound.
     let since = since.filter(|n| *n > 0);
 
-    if lines.is_some() && since.is_some() {
-        return Err(BashError::PeekArgsMutuallyExclusive);
-    }
+    // When both `lines` and `since` are provided, prefer `lines` and drop
+    // `since`. Models on structured-output APIs default-fill optional
+    // integers with their schema minimums (`lines=200`, `since=1`); for
+    // a short command output, `since=1` returns nothing, leaving the
+    // agent to retry. `lines` is the safer default. Real incremental-peek
+    // users (subsequent peeks with a stored end_offset) typically omit
+    // `lines` entirely.
+    let since = if lines.is_some() && since.is_some() {
+        tracing::debug!(
+            "bash read window: both `lines` and `since` provided — preferring `lines` (likely \
+             default-fill); dropping `since`"
+        );
+        None
+    } else {
+        since
+    };
+
     let lines = match lines {
         None => None,
         Some(n) if n > 0 => Some(usize::try_from(n).unwrap_or(usize::MAX)),
