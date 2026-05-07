@@ -353,7 +353,10 @@ async fn enrich_conversation_with_seed(
 /// - `ContextExhausted` without a continuation → `"needs_action"` (user must act)
 /// - All other states → delegate to `ConvState::presentation_mode()`
 fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
-    if matches!(conv.state, crate::state_machine::ConvState::ContextExhausted { .. }) {
+    if matches!(
+        conv.state,
+        crate::state_machine::ConvState::ContextExhausted { .. }
+    ) {
         if conv.continued_in_conv_id.is_some() {
             return "done";
         }
@@ -374,7 +377,10 @@ fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
             "presentation_mode".to_string(),
             Value::String(conv_presentation_mode(conv).to_string()),
         );
-        map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
+        map.insert(
+            "requires_action".to_string(),
+            Value::Bool(conv_requires_action(conv)),
+        );
     }
     val
 }
@@ -391,7 +397,10 @@ async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conv
             "presentation_mode".to_string(),
             Value::String(conv_presentation_mode(conv).to_string()),
         );
-        map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
+        map.insert(
+            "requires_action".to_string(),
+            Value::Bool(conv_requires_action(conv)),
+        );
     }
     val
 }

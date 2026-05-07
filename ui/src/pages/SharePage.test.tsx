@@ -150,7 +150,7 @@ describe('SharePage SSE schema validation', () => {
         messages: [],
         agent_working: false,
         last_sequence_id: 0,
-        display_state: 'idle',
+        presentation_mode: 'idle',
         context_window_size: 0,
         breadcrumbs: [],
         commits_behind: 0,

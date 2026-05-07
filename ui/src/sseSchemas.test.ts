@@ -107,7 +107,7 @@ describe('parseEvent', () => {
 
   describe('init schema', () => {
     // Task 02677 tightened the init schema so that fields the Rust side
-    // always sets (display_state, context_window_size, breadcrumbs,
+    // always sets (presentation_mode, context_window_size, breadcrumbs,
     // commits_behind, commits_ahead, project_name) are required here
     // too. The generated TS type in `./generated/sse` is the source of
     // truth; the schema `satisfies v.GenericSchema<unknown, WireInitData>`
@@ -118,7 +118,7 @@ describe('parseEvent', () => {
       messages: [],
       agent_working: false,
       last_sequence_id: 0,
-      display_state: 'idle',
+      presentation_mode: 'idle',
       context_window_size: 0,
       breadcrumbs: [],
       commits_behind: 0,
@@ -397,7 +397,7 @@ describe('parseEvent', () => {
         makeEvent({
           sequence_id: 12,
           state: { type: 'awaiting_llm' },
-          display_state: 'working',
+          presentation_mode: 'working',
         }),
         'state_change',
         dispatch,
@@ -410,7 +410,7 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseStateChangeDataSchema,
-          makeEvent({ sequence_id: 12, display_state: 'working' }),
+          makeEvent({ sequence_id: 12, presentation_mode: 'working' }),
           'state_change',
           dispatch,
         );

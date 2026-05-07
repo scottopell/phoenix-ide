@@ -993,7 +993,6 @@ pub enum DisplayState {
     AwaitingApproval,
 }
 
-
 /// Executor lifecycle signal — forces explicit handling of terminal states (FM-5 prevention).
 ///
 /// The executor loop checks this after every transition. `Terminal` means the loop
@@ -1123,9 +1122,7 @@ impl ConvState {
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
-            ConvState::Terminal
-            | ConvState::Completed { .. }
-            | ConvState::Failed { .. } => "done",
+            ConvState::Terminal | ConvState::Completed { .. } | ConvState::Failed { .. } => "done",
             ConvState::LlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }

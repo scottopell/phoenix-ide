@@ -1499,12 +1499,18 @@ fn headless_conversations() {
                 .iter()
                 .filter(|c| c.presentation_mode == "working")
                 .collect();
-            let idle = convs.iter().filter(|c| c.presentation_mode == "idle").count();
+            let idle = convs
+                .iter()
+                .filter(|c| c.presentation_mode == "idle")
+                .count();
             let terminal = convs
                 .iter()
                 .filter(|c| c.presentation_mode == "done")
                 .count();
-            let error = convs.iter().filter(|c| c.presentation_mode == "error").count();
+            let error = convs
+                .iter()
+                .filter(|c| c.presentation_mode == "error")
+                .count();
 
             println!(
                 "Phoenix IDE — {total} conversations  idle:{idle} working:{} terminal:{terminal} error:{error}",
