@@ -293,6 +293,15 @@ pub enum SseWireEvent {
     /// `conversation_id` is implied by the per-conversation broadcaster
     /// scope and not re-emitted on the wire.
     BrowserSessionState { sequence_id: i64, active: bool },
+    /// A steering message was accepted and queued for later delivery.
+    /// Emitted immediately when the user's message is buffered rather than
+    /// processed. The UI shows the message with a "Queued" indicator.
+    SteerMessageQueued {
+        sequence_id: i64,
+        message_id: String,
+        /// Zero-based position in the steering queue.
+        queue_position: usize,
+    },
 }
 
 impl SseWireEvent {
@@ -311,6 +320,7 @@ impl SseWireEvent {
             SseWireEvent::Error { .. } => "error",
             SseWireEvent::ConversationHardDeleted { .. } => "conversation_hard_deleted",
             SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
+            SseWireEvent::SteerMessageQueued { .. } => "steer_message_queued",
         }
     }
 }
@@ -421,6 +431,15 @@ impl From<SseEvent> for SseWireEvent {
             } => SseWireEvent::BrowserSessionState {
                 sequence_id,
                 active,
+            },
+            SseEvent::SteerMessageQueued {
+                sequence_id,
+                message_id,
+                queue_position,
+            } => SseWireEvent::SteerMessageQueued {
+                sequence_id,
+                message_id,
+                queue_position,
             },
         }
     }

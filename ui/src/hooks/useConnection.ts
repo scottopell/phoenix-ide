@@ -16,6 +16,7 @@ import {
   SseErrorDataSchema,
   SseConversationHardDeletedDataSchema,
   SseBrowserSessionStateDataSchema,
+  SseSteerMessageQueuedDataSchema,
 } from '../sseSchemas';
 import {
   ConnectionState,
@@ -425,6 +426,21 @@ export function useConnection({
                 detail: { conversationId: res.data.conversation_id },
               }),
             );
+          });
+
+          // Steering message queued server-side. Client already transitioned
+          // the bubble to `steering_queued` on the POST response; this event
+          // validates the payload (so a Rust-side schema change surfaces as a
+          // tsc error) and is otherwise a no-op. The bubble auto-clears when
+          // the server echoes the delivered message as a `message` event.
+          on('steer_message_queued', (e) => {
+            parseEvent(
+              SseSteerMessageQueuedDataSchema,
+              e,
+              'steer_message_queued',
+              stampedDispatch,
+            );
+            // no-op: bubble state driven by POST response + message echo
           });
 
           on('error', (e) => {

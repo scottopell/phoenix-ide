@@ -6,7 +6,7 @@
 use crate::system_prompt::SkillMetadata;
 
 /// The result of invoking a skill.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillInvocation {
     /// The skill name (e.g., "build")
     pub name: String,

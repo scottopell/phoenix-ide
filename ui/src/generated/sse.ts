@@ -72,6 +72,10 @@ export type SseBrowserSessionStateData = Omit<
   Extract<SseWireEvent, { type: 'browser_session_state' }>,
   'type'
 >;
+export type SseSteerMessageQueuedData = Omit<
+  Extract<SseWireEvent, { type: 'steer_message_queued' }>,
+  'type'
+>;
 
 // Chain Q&A wire-event data shapes (Phoenix Chains v1). Same Extract +
 // Omit<…, 'type'> pattern as the conversation-scoped SSE events above.

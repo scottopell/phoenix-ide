@@ -40,6 +40,8 @@ interface MessageListProps {
   pendingMessages: QueuedMessage[];
   convState: ConversationState;
   onRetry: (localId: string) => void;
+  /** Called when the user presses the × button on a `steering_queued` bubble. */
+  onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string | undefined;
   conversationId?: string | undefined;
@@ -63,6 +65,7 @@ interface MessageListBodyProps {
   toolResults: Map<string, Message>;
   convState: ConversationState;
   onRetry: (localId: string) => void;
+  onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 }
 
@@ -79,6 +82,7 @@ const MessageListBody = memo(function MessageListBody({
   toolResults,
   convState,
   onRetry,
+  onCancelSteering,
   onOpenFile,
 }: MessageListBodyProps) {
   // Tracks whether the previous rendered message was an agent message, so
@@ -147,7 +151,12 @@ const MessageListBody = memo(function MessageListBody({
       })}
       {/* Render pending messages (queued client-side, not yet echoed). */}
       {pendingMessages.map((msg) => (
-        <QueuedUserMessage key={msg.localId} message={msg} onRetry={onRetry} />
+        <QueuedUserMessage
+          key={msg.localId}
+          message={msg}
+          onRetry={onRetry}
+          onCancelSteering={onCancelSteering}
+        />
       ))}
       {convState.type === 'awaiting_sub_agents' && (
         <SubAgentStatus stateData={convState} />
@@ -161,6 +170,7 @@ export function MessageList({
   pendingMessages,
   convState,
   onRetry,
+  onCancelSteering,
   onOpenFile,
   systemPrompt,
   conversationId,
@@ -357,6 +367,7 @@ export function MessageList({
               toolResults={toolResults}
               convState={convState}
               onRetry={onRetry}
+              onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
             />
           )}

@@ -540,6 +540,15 @@ impl StateStore for InMemoryStorage {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    async fn update_steering_queue(
+        &self,
+        _conv_id: &str,
+        _queue: &[crate::state_machine::event::SteerEntry],
+    ) -> Result<(), String> {
+        // In-memory storage doesn't persist the steering queue
+        Ok(())
+    }
 }
 
 // ============================================================================

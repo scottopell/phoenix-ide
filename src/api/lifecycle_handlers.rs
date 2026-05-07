@@ -649,6 +649,7 @@ mod tests {
             seed_label: None,
             continued_in_conv_id,
             chain_name: None,
+            steering_queue: vec![],
         }
     }
 

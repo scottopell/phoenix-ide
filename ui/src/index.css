@@ -2076,6 +2076,40 @@ pre:hover .copy-btn {
   color: var(--accent-red);
 }
 
+.message-status.queued {
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.queued-label {
+  font-size: 12px;
+  font-style: italic;
+}
+
+.cancel-steering-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 3px;
+  transition: color 150ms ease, background 150ms ease;
+}
+
+.cancel-steering-btn:hover {
+  color: var(--accent-red);
+  background: rgba(var(--accent-red-rgb, 220, 50, 47), 0.12);
+}
+
+/* Steering-queued message bubble: muted appearance */
+.message.user.steering-queued {
+  opacity: 0.65;
+}
+
 .sending-spinner {
   display: inline-block;
   animation: spin 1s linear infinite;

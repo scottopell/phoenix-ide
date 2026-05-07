@@ -427,6 +427,11 @@ pub struct Conversation {
     /// DB rows that predate this column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_name: Option<String>,
+    /// Steering messages queued while the conversation was busy.
+    /// Delivered (FIFO) when the conversation next reaches `Idle`.
+    /// `#[serde(default)]` handles old DB rows that predate this column.
+    #[serde(default)]
+    pub steering_queue: Vec<crate::state_machine::event::SteerEntry>,
 }
 
 /// Derive a human-readable title from a kebab-case slug.
@@ -1273,6 +1278,7 @@ mod conversation_serde_tests {
             seed_label: None,
             continued_in_conv_id,
             chain_name: None,
+            steering_queue: vec![],
         }
     }
 

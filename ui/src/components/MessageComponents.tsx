@@ -325,15 +325,38 @@ export const QueuedUserMessage = memo(QueuedUserMessageImpl);
 
 // Pending user message: queued client-side, not yet echoed by the server.
 // Failed-send messages render in InputArea, not here — this component assumes
-// the entry it receives is pending (task 02676).
-function QueuedUserMessageImpl({ message }: { message: QueuedMessage; onRetry: (localId: string) => void }) {
+// the entry it receives is either `pending` or `steering_queued` (task 02676).
+function QueuedUserMessageImpl({
+  message,
+  onCancelSteering,
+}: {
+  message: QueuedMessage;
+  onRetry: (localId: string) => void;
+  onCancelSteering?: ((localId: string) => void) | undefined;
+}) {
+  const isSteeringQueued = message.status === 'steering_queued';
   return (
-    <div className="message user">
+    <div className={`message user${isSteeringQueued ? ' steering-queued' : ''}`}>
       <div className="message-header">
         <span className="message-sender">You</span>
-        <span className="message-status sending" title="Sending...">
-          <span className="sending-spinner">⏳</span>
-        </span>
+        {isSteeringQueued ? (
+          <span className="message-status queued" title="Queued — will send when conversation is free">
+            <span className="queued-label">⏳ Queued</span>
+            {onCancelSteering && (
+              <button
+                className="cancel-steering-btn"
+                title="Cancel queued message"
+                onClick={() => onCancelSteering(message.localId)}
+              >
+                ×
+              </button>
+            )}
+          </span>
+        ) : (
+          <span className="message-status sending" title="Sending...">
+            <span className="sending-spinner">⏳</span>
+          </span>
+        )}
       </div>
       <div className="message-content">
         {message.text}

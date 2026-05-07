@@ -224,6 +224,16 @@ mod tests {
                 "sequence_id": sequence_id,
                 "active": active,
             }),
+            SseEvent::SteerMessageQueued {
+                sequence_id,
+                message_id,
+                queue_position,
+            } => json!({
+                "type": "steer_message_queued",
+                "sequence_id": sequence_id,
+                "message_id": message_id,
+                "queue_position": queue_position,
+            }),
         }
     }
 
@@ -280,6 +290,7 @@ mod tests {
             seed_label: None,
             continued_in_conv_id: None,
             chain_name: None,
+            steering_queue: vec![],
         }
     }
 
@@ -580,6 +591,16 @@ mod tests {
         assert_parity(&event);
         let typed = typed_sse_event_to_value(&event);
         assert_eq!(typed["active"], false);
+    }
+
+    #[test]
+    fn parity_steer_message_queued() {
+        let event = SseEvent::SteerMessageQueued {
+            sequence_id: 22,
+            message_id: "msg-steer-1".to_string(),
+            queue_position: 0,
+        };
+        assert_parity(&event);
     }
 
     // ------------------------------------------------------------------

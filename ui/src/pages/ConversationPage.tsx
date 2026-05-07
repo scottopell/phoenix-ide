@@ -291,7 +291,7 @@ function ConversationPageContent() {
   // Message queue management. `queuedMessages` is the raw store; the rendered
   // split between "pending in the message list" and "failed in the input area"
   // is derived below.
-  const { queuedMessages, enqueue, markFailed, dismiss } =
+  const { queuedMessages, enqueue, markFailed, markSteeringQueued, dismiss } =
     useMessageQueue(conversationId);
 
   // Pending messages shown in the conversation are a pure derivation of the
@@ -539,7 +539,7 @@ function ConversationPageContent() {
 
       try {
         if (isOnline) {
-          await api.sendMessage(conversationId, text, imgs, localId);
+          const result = await api.sendMessage(conversationId, text, imgs, localId);
           // Don't touch the queue here. The entry stays `pending` until
           // `atom.messages` contains a row with `message_id == localId`
           // (SSE echo), at which point `pendingMessages` filters it out
@@ -551,7 +551,15 @@ function ConversationPageContent() {
           // takes precedence. `local_phase_change` exists precisely to
           // carve out this "client-originated, not part of server total
           // order" action from the `applyIfNewer` guard (task 02675).
-          dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' } });
+          if (result.steering) {
+            // Conversation was busy — message queued server-side for delivery
+            // when the conversation next reaches Idle. Show a "Queued" pill
+            // on the message bubble instead of the normal sending spinner.
+            markSteeringQueued(localId);
+            // No phase change: the conversation is already running.
+          } else {
+            dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' } });
+          }
         } else {
           // Offline path: hand the send off to the offline operation queue
           // for replay when connectivity returns. The entry stays in
@@ -584,7 +592,7 @@ function ConversationPageContent() {
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isOnline, queueOperation, dispatch]
+    [conversationId, isOnline, queueOperation, dispatch, markSteeringQueued]
   );
 
   const sendMessageRef = useRef(sendMessage);
@@ -593,10 +601,13 @@ function ConversationPageContent() {
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
   // the server already has — those were filtered out by the derivation.
+  // Skip `steering_queued` messages — they are already held server-side and
+  // will be delivered automatically when the conversation reaches Idle.
   useEffect(() => {
     if (!isConnected || !conversationId) return;
 
     for (const msg of pendingMessages) {
+      if (msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images);
     }
@@ -634,6 +645,16 @@ function ConversationPageContent() {
       console.error('Failed to cancel:', err);
     }
   };
+
+  const handleCancelSteering = useCallback(async (localId: string) => {
+    if (!conversationId) return;
+    try {
+      await api.cancelSteeringMessage(conversationId, localId);
+      dismiss(localId);
+    } catch (err) {
+      console.error('Failed to cancel steering message:', err);
+    }
+  }, [conversationId, dismiss]);
 
   const handleTriggerContinuation = async () => {
     if (!conversationId) return;
@@ -974,6 +995,7 @@ function ConversationPageContent() {
         pendingMessages={pendingMessages}
         convState={convStateForChildren}
         onRetry={handleRetry}
+        onCancelSteering={handleCancelSteering}
         onOpenFile={handleOpenFileFromPatch}
         conversationId={conversationId}
         streamingBuffer={atom.streamingBuffer}

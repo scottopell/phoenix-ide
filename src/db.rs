@@ -170,6 +170,14 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Steering queue: pending user messages queued while the conversation
+        // was busy. Delivered FIFO when the conversation next reaches Idle.
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(&self.pool)
+        .await;
+
         Ok(())
     }
 
@@ -461,6 +469,7 @@ impl Database {
             continued_in_conv_id: None,
             // REQ-CHN-007: fresh conversations have no user-set chain name.
             chain_name: None,
+            steering_queue: vec![],
         })
     }
 
@@ -470,7 +479,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -490,7 +499,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -510,7 +519,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -529,7 +538,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -556,6 +565,29 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Update the steering queue for a conversation. Persists the FIFO queue
+    /// of pending steering messages to `conversations.steering_queue`.
+    pub async fn update_steering_queue(
+        &self,
+        id: &str,
+        queue: &[crate::state_machine::event::SteerEntry],
+    ) -> DbResult<()> {
+        let now = Utc::now();
+        let queue_json = serde_json::to_string(queue).unwrap_or_else(|_| "[]".to_string());
+        let result = sqlx::query(
+            "UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3",
+        )
+        .bind(&queue_json)
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -789,6 +821,7 @@ impl Database {
             // Continuations are not chain roots — chain_name lives on the
             // root only (REQ-CHN-007).
             chain_name: None,
+            steering_queue: vec![],
         };
         Ok(ContinueOutcome::Created(new_conversation))
     }
@@ -1012,7 +1045,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -1641,6 +1674,13 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .try_get::<Option<String>, _>("chain_name")
         .unwrap_or(None);
 
+    let steering_queue: Vec<crate::state_machine::event::SteerEntry> = row
+        .try_get::<Option<String>, _>("steering_queue")
+        .unwrap_or(None)
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
     Ok(Conversation {
         id,
         slug,
@@ -1664,6 +1704,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         seed_label,
         continued_in_conv_id,
         chain_name,
+        steering_queue,
     })
 }
 

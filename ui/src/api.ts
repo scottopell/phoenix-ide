@@ -477,7 +477,7 @@ export const api = {
     text: string,
     images: ImageData[] = [],
     localId: string,
-  ): Promise<{ queued: boolean }> {
+  ): Promise<{ queued: boolean; steering?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -495,6 +495,19 @@ export const api = {
     }
     if (!resp.ok) throw new Error('Failed to send message');
     return resp.json();
+  },
+
+  /** Cancel a pending steering message before it is delivered.
+   *  Calls `DELETE /api/conversations/:id/steering-queue/:message_id`.
+   *  404 is silently ignored — the message may have already been delivered.
+   */
+  async cancelSteeringMessage(convId: string, messageId: string): Promise<void> {
+    const resp = await fetch(
+      `/api/conversations/${convId}/steering-queue/${messageId}`,
+      { method: 'DELETE' },
+    );
+    if (resp.status === 404) return; // already delivered or never queued
+    if (!resp.ok) throw new Error('Failed to cancel steering message');
   },
 
   async getSystemPrompt(convId: string): Promise<string> {

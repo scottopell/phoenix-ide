@@ -38,6 +38,7 @@ import type {
   SseErrorData as WireErrorData,
   SseConversationHardDeletedData as WireConversationHardDeletedData,
   SseBrowserSessionStateData as WireBrowserSessionStateData,
+  SseSteerMessageQueuedData as WireSteerMessageQueuedData,
   SseBreadcrumb as GeneratedSseBreadcrumb,
   ChainQaTokenData as WireChainQaTokenData,
   ChainQaCompletedData as WireChainQaCompletedData,
@@ -291,6 +292,16 @@ export const SseBrowserSessionStateDataSchema = v.looseObject({
   active: v.boolean(),
 }) satisfies v.GenericSchema<unknown, WireBrowserSessionStateData>;
 
+/** `steer_message_queued`: a steering message was accepted and queued for
+ *  delivery when the conversation next reaches `Idle`. The UI uses this to
+ *  confirm the client-side `steering_queued` status and surface a queue
+ *  position indicator on the message bubble. */
+export const SseSteerMessageQueuedDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  message_id: v.string(),
+  queue_position: v.number(),
+}) satisfies v.GenericSchema<unknown, WireSteerMessageQueuedData>;
+
 // ---------------------------------------------------------------------------
 // Chain Q&A wire-event schemas (Phoenix Chains v1, REQ-CHN-004 / 005).
 //
@@ -352,6 +363,7 @@ export type SseConversationHardDeletedData = v.InferOutput<
 export type SseBrowserSessionStateData = v.InferOutput<
   typeof SseBrowserSessionStateDataSchema
 >;
+export type SseSteerMessageQueuedData = v.InferOutput<typeof SseSteerMessageQueuedDataSchema>;
 
 // ---------------------------------------------------------------------------
 // Bash and tmux tool response schemas (task 02697).

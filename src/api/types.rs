@@ -92,6 +92,11 @@ pub struct ConversationWithMessagesResponse {
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
     pub queued: bool,
+    /// Present and `true` when the message was accepted as a steering message
+    /// (the conversation was busy and the message was queued for later delivery).
+    /// Absent (`null`/`undefined` on the client) for normal immediate processing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub steering: bool,
 }
 
 /// Response for cancel action.

@@ -48,4 +48,8 @@ duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: 
  * `message` field. Kind-aware consumers can narrow against
  * `UserFacingError` (also exported by ts-rs for future use).
  */
-error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, } | { "type": "browser_session_state", sequence_id: number, active: boolean, };
+error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, } | { "type": "browser_session_state", sequence_id: number, active: boolean, } | { "type": "steer_message_queued", sequence_id: number, message_id: string, 
+/**
+ * Zero-based position in the steering queue.
+ */
+queue_position: number, };

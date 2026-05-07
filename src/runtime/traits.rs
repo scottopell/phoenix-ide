@@ -104,6 +104,14 @@ pub trait StateStore: Send + Sync {
         model: &str,
         usage: &crate::llm::Usage,
     ) -> Result<(), String>;
+
+    /// Update the steering queue for a conversation. Persists the FIFO queue
+    /// of pending steering messages to the DB.
+    async fn update_steering_queue(
+        &self,
+        conv_id: &str,
+        queue: &[crate::state_machine::event::SteerEntry],
+    ) -> Result<(), String>;
 }
 
 /// Client for making LLM requests
@@ -252,6 +260,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self)
             .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
             .await
+    }
+
+    async fn update_steering_queue(
+        &self,
+        conv_id: &str,
+        queue: &[crate::state_machine::event::SteerEntry],
+    ) -> Result<(), String> {
+        (**self).update_steering_queue(conv_id, queue).await
     }
 }
 
@@ -440,6 +456,17 @@ impl StateStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_steering_queue(
+        &self,
+        conv_id: &str,
+        queue: &[crate::state_machine::event::SteerEntry],
+    ) -> Result<(), String> {
+        self.db
+            .update_steering_queue(conv_id, queue)
             .await
             .map_err(|e| e.to_string())
     }

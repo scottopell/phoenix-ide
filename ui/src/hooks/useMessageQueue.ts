@@ -7,12 +7,15 @@ import type { ImageData } from '../api';
  * - `pending`: the client has attempted (or will attempt) to send it, and it
  *   has not yet been echoed back by the server. Rendered in the message list.
  * - `failed`: the POST was rejected. Rendered in the input area with retry UI.
+ * - `steering_queued`: the POST succeeded but the server queued the message
+ *   because the conversation was busy. Rendered in the message list with a
+ *   "Queued" indicator and a cancel button.
  *
  * "Sent" is NOT a state stored here — it is derived by comparing `localId`
  * against `atom.messages[*].message_id`. Once the server echoes the message,
  * the consumer filters it out of the rendered pending list automatically.
  */
-export type MessageStatus = 'pending' | 'failed';
+export type MessageStatus = 'pending' | 'failed' | 'steering_queued';
 
 export interface QueuedMessage {
   localId: string;
@@ -37,7 +40,7 @@ export function derivePendingMessages(
 ): QueuedMessage[] {
   const serverIds = new Set(serverMessageIds);
   return queuedMessages.filter(
-    (q) => q.status === 'pending' && !serverIds.has(q.localId),
+    (q) => (q.status === 'pending' || q.status === 'steering_queued') && !serverIds.has(q.localId),
   );
 }
 
@@ -55,6 +58,8 @@ interface UseMessageQueueReturn {
   enqueue: (text: string, images?: ImageData[]) => QueuedMessage;
   /** Mark a message as failed. */
   markFailed: (localId: string) => void;
+  /** Mark a message as steering_queued (server accepted but deferred). */
+  markSteeringQueued: (localId: string) => void;
   /** Retry a failed message (transitions failed → pending). */
   retry: (localId: string) => void;
   /** Dismiss a message without retrying. Used for explicit user actions. */
@@ -153,6 +158,15 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     );
   }, [updateMessages]);
 
+  // Mark a message as steering_queued (server accepted but deferred)
+  const markSteeringQueued = useCallback((localId: string) => {
+    updateMessages(prev =>
+      prev.map(m =>
+        m.localId === localId ? { ...m, status: 'steering_queued' as const } : m
+      )
+    );
+  }, [updateMessages]);
+
   // Retry a failed message (flip back to pending; the send effect picks it up)
   const retry = useCallback((localId: string) => {
     updateMessages(prev =>
@@ -171,6 +185,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     queuedMessages: messages,
     enqueue,
     markFailed,
+    markSteeringQueued,
     retry,
     dismiss,
   };

@@ -421,6 +421,15 @@ pub enum SseEvent {
         sequence_id: i64,
         active: bool,
     },
+    /// A steering message was accepted and queued for delivery when the
+    /// conversation next reaches `Idle`. The UI uses this to show the message
+    /// with a "Queued" indicator instead of "Sending...".
+    SteerMessageQueued {
+        sequence_id: i64,
+        message_id: String,
+        /// Zero-based position in the steering queue.
+        queue_position: usize,
+    },
 }
 
 impl RuntimeManager {
@@ -945,6 +954,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         )
+        .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
@@ -1029,6 +1039,27 @@ impl RuntimeManager {
             .send(event)
             .await
             .map_err(|e| format!("Failed to send event: {e}"))
+    }
+
+    /// Queue a steering message to be delivered when the conversation next
+    /// reaches `Idle`. Sends an `Event::SteerMessage` through the conversation's
+    /// event channel; the executor buffers it and delivers it automatically.
+    pub async fn enqueue_steer_message(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), String> {
+        // `event` must be `SteerMessage` — the executor interprets it as such.
+        debug_assert!(
+            matches!(event, Event::SteerMessage { .. }),
+            "enqueue_steer_message expects Event::SteerMessage"
+        );
+        let handle = self.get_or_create(conversation_id).await?;
+        handle
+            .event_tx
+            .send(event)
+            .await
+            .map_err(|e| format!("Failed to send steer message: {e}"))
     }
 
     /// Subscribe to conversation updates
