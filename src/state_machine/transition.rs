@@ -1428,17 +1428,23 @@ pub fn transition_parent(
 
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
-                    return Ok(
-                        ParentTransitionResult::new(ParentState::Core(CoreState::Error {
-                            message: msg.clone(),
-                            error_kind: ErrorKind::InvalidRequest,
-                        }))
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change(
-                            "error",
-                            json!({ "message": msg }),
-                        )),
-                    );
+                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let assistant_message =
+                        AssistantMessage::new(content, Some(usage_data), display_data);
+                    let error_results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
+                        .collect();
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, error_results)
+                            .expect("error_results.len() == tool_calls.len()");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::ProposeTask(ref input) = tool.input {
                     let tool_result = ToolResult::success(
@@ -1480,17 +1486,23 @@ pub fn transition_parent(
             {
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
-                    return Ok(
-                        ParentTransitionResult::new(ParentState::Core(CoreState::Error {
-                            message: msg.clone(),
-                            error_kind: ErrorKind::InvalidRequest,
-                        }))
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change(
-                            "error",
-                            json!({ "message": msg }),
-                        )),
-                    );
+                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let assistant_message =
+                        AssistantMessage::new(content, Some(usage_data), display_data);
+                    let error_results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
+                        .collect();
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, error_results)
+                            .expect("error_results.len() == tool_calls.len()");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::AskUserQuestion(ref input) = tool.input {
                     let tool_result = ToolResult::success(
@@ -1821,17 +1833,22 @@ pub fn transition_sub_agent(
                 if tool_calls.len() > 1 {
                     let msg =
                         "submit_result/submit_error must be the only tool in response".to_string();
-                    return Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
-                        error: msg.clone(),
-                        error_kind: ErrorKind::InvalidRequest,
-                    })
+                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let assistant_message =
+                        AssistantMessage::new(content, Some(usage_data), display_data);
+                    let error_results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
+                        .collect();
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
+                        .expect("error_results.len() == tool_calls.len()");
+                    return Ok(SubAgentTransitionResult::new(SubAgentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
-                    .with_effect(Effect::NotifyParent {
-                        outcome: SubAgentOutcome::Failure {
-                            error: msg,
-                            error_kind: ErrorKind::InvalidRequest,
-                        },
-                    }));
+                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::RequestLlm));
                 }
 
                 return match &terminal_tool.input {
@@ -2891,11 +2908,98 @@ mod tests {
             },
         );
 
-        let result = result.expect("Should produce Ok transition to Error state");
+        let result = result.expect("Should produce Ok transition");
         assert!(
-            matches!(result.new_state, ConvState::Error { .. }),
-            "Should transition to Error when ask_user_question mixed with other tools, got {:?}",
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "Should transition back to LlmRequesting when ask_user_question mixed with other tools, got {:?}",
             result.new_state
+        );
+        // All tool calls should have error results in the checkpoint
+        let has_checkpoint = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistCheckpoint { .. }));
+        assert!(
+            has_checkpoint,
+            "Should have PersistCheckpoint with error results"
+        );
+        // Should re-request the LLM
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Should have RequestLlm effect to feed errors back"
+        );
+    }
+
+    #[test]
+    fn test_propose_task_must_be_only_tool() {
+        use crate::llm::{ContentBlock, Usage};
+        use crate::state_machine::state::{BashInput, BashMode, ProposeTaskInput, ToolInput};
+
+        let ctx = test_context();
+        let propose_tool = ToolCall::new(
+            "tool-propose-1",
+            ToolInput::ProposeTask(ProposeTaskInput {
+                title: "Fix the bug".to_string(),
+                priority: "p1".to_string(),
+                plan: "Step 1: Do the thing".to_string(),
+            }),
+        );
+        let bash_tool = ToolCall::new(
+            "tool-bash-1",
+            ToolInput::Bash(BashInput {
+                command: "echo test".to_string(),
+                mode: BashMode::Default,
+            }),
+        );
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ctx,
+            Event::LlmResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "tool-propose-1".to_string(),
+                        name: "propose_task".to_string(),
+                        input: serde_json::json!({
+                            "title": "Fix the bug",
+                            "priority": "p1",
+                            "plan": "Step 1: Do the thing"
+                        }),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-bash-1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"command": "echo test"}),
+                    },
+                ],
+                tool_calls: vec![propose_tool, bash_tool],
+                end_turn: false,
+                usage: Usage::default(),
+            },
+        );
+
+        let result = result.expect("Should produce Ok transition");
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "Should transition back to LlmRequesting when propose_task mixed with other tools, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+            "Should have PersistCheckpoint with error results"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Should have RequestLlm effect to feed errors back"
         );
     }
 

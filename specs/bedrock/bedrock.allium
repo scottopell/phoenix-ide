@@ -310,15 +310,17 @@ rule LlmRespondsWithTools {
     ensures: ToolExecutionStarted(conversation, tool_calls.first)
 }
 
--- Intercepted tool mixed with other tools -> error
+-- Intercepted tool mixed with other tools -> error results fed back to LLM
 rule InterceptedToolNotSole {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count > 1
     requires: tool_calls.any(t => is_intercepted_tool(t.name))
-    ensures: conversation.core_status = error
-    ensures: conversation.error_message =
-        intercepted_tool_name(tool_calls) + " must be the only tool in response"
+    let msg = intercepted_tool_name(tool_calls) + " must be the only tool in response"
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: ToolRoundCheckpointed(conversation)  -- all tool_calls get ToolResult::error(msg)
+    ensures: LlmRequestDispatched(conversation)
 }
 
 -- ===========================================================
