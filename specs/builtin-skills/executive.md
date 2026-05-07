@@ -8,14 +8,14 @@ embedded directory tree. At server startup, the tree is materialized to
 filesystem skill: same path semantics, same companion-file workflow, same
 `Base directory` behavior. Built-ins flow through the existing skill
 discovery, catalog, invocation, and UI surfaces. A filesystem skill of the
-same name (e.g. `~/.claude/skills/caveman/`) shadows the built-in.
+same name (e.g. `~/.claude/skills/spears/`) shadows the built-in.
 
 The first batch ships:
 
-- **`/caveman`** — token-efficient response style with `lite` / `full` /
-  `ultra` / `wenyan` levels.
 - **`/allium`** — formal behavioral specification language, with the canonical
   `references/language-reference.md` shipped alongside the SKILL.md.
+- **`/spears`** — spEARS requirements-driven development workflow, with
+  workflow-specific reference files shipped alongside the SKILL.md.
 
 The mechanism is general — additional built-in skills are added by dropping
 a directory under `src/skills/builtin/` and committing.
@@ -35,8 +35,10 @@ can render `(built-in)` and the UI can group built-ins separately, but no
 component branches on it for content access.
 
 Discovery scans the user's `.claude/skills/` and `.agents/skills/` first,
-then the built-in extract directory; the existing name-dedup ("first seen
-wins") gives the user override for free.
+then the built-in extract directory. The existing name-dedup ("first seen
+wins") gives the user override for free. Extracted directories whose names
+are no longer embedded in the current binary are ignored, so removed built-ins
+do not remain visible after an upgrade.
 
 ## Status Summary
 
@@ -46,7 +48,7 @@ wins") gives the user override for free.
 | **REQ-BS-002:** Filesystem precedence on name collision | ✅ Complete | Built-in scan runs after filesystem walk; name dedup wins |
 | **REQ-BS-003:** Catalog rendering | ✅ Complete | `(built-in)` annotation in system prompt; `"Built-in"` group in UI |
 | **REQ-BS-004:** Invocation parity | ✅ Complete | Single `read_to_string` path; both sources use real disk paths |
-| **REQ-BS-005:** Caveman speech mode skill | ✅ Complete | Lite/full/ultra/wenyan levels |
+| **REQ-BS-005:** spEARS workflow skill | ✅ Complete | `spears/SKILL.md` + workflow references extracted at startup |
 | **REQ-BS-006:** Allium with companion files | ✅ Complete | `allium/SKILL.md` + `allium/references/language-reference.md` extracted at startup |
 
 ## Cross-Spec References

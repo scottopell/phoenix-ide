@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_invoke_skill_builtin_reads_from_extracted_dir() {
         // Extract built-ins into an isolated tempdir, point discovery at it,
-        // and pin $HOME so a developer's ~/.claude/skills/caveman/ can't
+        // and pin $HOME so a developer's ~/.claude/skills/spears/ can't
         // shadow the built-in.
         let tmp = TempDir::new().unwrap();
         let extract_dir = tmp.path().join("builtin-skills");
@@ -307,15 +307,15 @@ mod tests {
             Some(tmp.path()),
             Some(&extract_dir),
         );
-        let result = invoke_skill("caveman", "", &skills).unwrap();
-        assert_eq!(result.name, "caveman");
+        let result = invoke_skill("spears", "", &skills).unwrap();
+        assert_eq!(result.name, "spears");
         assert!(
             result.skill_dir.starts_with(extract_dir.to_str().unwrap()),
             "built-in skill_dir should point at the extract directory, got {}",
             result.skill_dir
         );
         // Body should contain content from the vendored markdown
-        assert!(result.body.contains("Caveman Mode"));
+        assert!(result.body.contains("spEARS"));
         // Frontmatter is stripped
         assert!(!result.body.starts_with("---"));
     }

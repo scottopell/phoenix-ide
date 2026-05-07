@@ -13,12 +13,13 @@
 //!
 //! ```
 //! src/skills/builtin/
-//!   caveman/
-//!     SKILL.md
 //!   allium/
 //!     SKILL.md
 //!     references/
 //!       language-reference.md
+//!   spears/
+//!     SKILL.md
+//!     references/
 //! ```
 //!
 //! ## Override
@@ -106,10 +107,9 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn skill_names_includes_caveman_and_allium() {
+    fn skill_names_includes_spears_and_allium_only() {
         let names = skill_names();
-        assert!(names.contains(&"caveman".to_string()), "got {names:?}");
-        assert!(names.contains(&"allium".to_string()), "got {names:?}");
+        assert_eq!(names, vec!["allium".to_string(), "spears".to_string()]);
     }
 
     #[test]
@@ -130,25 +130,26 @@ mod tests {
     fn extract_writes_skill_md_and_companions() {
         let tmp = TempDir::new().unwrap();
         extract_to(tmp.path()).expect("extraction should succeed");
-        assert!(tmp.path().join("caveman/SKILL.md").is_file());
         assert!(tmp.path().join("allium/SKILL.md").is_file());
         assert!(tmp
             .path()
             .join("allium/references/language-reference.md")
             .is_file());
+        assert!(tmp.path().join("spears/SKILL.md").is_file());
+        assert!(tmp.path().join("spears/references/discover.md").is_file());
     }
 
     #[test]
     fn extract_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         extract_to(tmp.path()).unwrap();
-        let mtime_first = std::fs::metadata(tmp.path().join("caveman/SKILL.md"))
+        let mtime_first = std::fs::metadata(tmp.path().join("spears/SKILL.md"))
             .unwrap()
             .modified()
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         extract_to(tmp.path()).unwrap();
-        let mtime_second = std::fs::metadata(tmp.path().join("caveman/SKILL.md"))
+        let mtime_second = std::fs::metadata(tmp.path().join("spears/SKILL.md"))
             .unwrap()
             .modified()
             .unwrap();
@@ -162,7 +163,7 @@ mod tests {
     fn extract_overwrites_modified_file() {
         let tmp = TempDir::new().unwrap();
         extract_to(tmp.path()).unwrap();
-        let target = tmp.path().join("caveman/SKILL.md");
+        let target = tmp.path().join("spears/SKILL.md");
         std::fs::write(&target, "tampered content").unwrap();
         extract_to(tmp.path()).unwrap();
         let restored = std::fs::read_to_string(&target).unwrap();
@@ -170,6 +171,6 @@ mod tests {
             restored, "tampered content",
             "extraction should restore tampered file"
         );
-        assert!(restored.contains("Caveman Mode"));
+        assert!(restored.contains("spEARS"));
     }
 }

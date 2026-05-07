@@ -18,12 +18,13 @@ header just like with user skills and can `cat references/foo.md` directly.
 
 ```
 src/skills/builtin/
-  caveman/
-    SKILL.md
   allium/
     SKILL.md
     references/
       language-reference.md
+  spears/
+    SKILL.md
+    references/
 ```
 
 Each subdirectory is one skill. `SKILL.md` is required (with the standard
@@ -74,7 +75,10 @@ The extraction is intentionally additive — it does not delete files that
 were present in a prior phoenix version but removed in this one. This keeps
 the operation race-safe across concurrent phoenix processes (dev worktree +
 prod), at the cost of leaving stale files when a built-in is renamed or
-removed. Operators can wipe `~/.phoenix-ide/builtin-skills/` to reset.
+removed. Discovery filters the extract directory through the current
+embedded skill-name set, so stale files can remain on disk but cannot keep
+a removed built-in visible in the catalog. Operators can wipe
+`~/.phoenix-ide/builtin-skills/` to reset the directory contents.
 
 ## Data Model
 
@@ -113,8 +117,9 @@ real path. Helpers on `SkillMetadata` (`skill_dir`, `skill_md_path`,
 2. Scan immediate children of `working_dir` (projects-directory case).
 3. Scan `$HOME/.claude/skills/` and `$HOME/.agents/skills/` if not visited.
 4. **Scan `builtin_dir`** (when `Some`) via `collect_builtin_skills_from_dir`.
-   Reuses the same dedup state, so any name already collected from the user
-   filesystem shadows the built-in.
+   Only directory names present in the current embedded skill-name set are
+   eligible. Reuses the same dedup state, so any name already collected from
+   the user filesystem shadows the built-in.
 5. Sort by name.
 
 Test seam: pass `builtin_dir = None` to assert filesystem-only behavior.
@@ -178,10 +183,10 @@ in the API handler:
 
 // Built-in skill
 {
-  "name": "caveman",
-  "description": "Talk like caveman ...",
+  "name": "spears",
+  "description": "spEARS methodology for requirements-driven development ...",
   "source": "builtin",
-  "path": "/home/user/.phoenix-ide/builtin-skills/caveman/SKILL.md"
+  "path": "/home/user/.phoenix-ide/builtin-skills/spears/SKILL.md"
 }
 ```
 
@@ -206,7 +211,7 @@ no built-in-specific HTTP endpoint.
 
 ## Override Test Matrix
 
-| Filesystem has `caveman` | Extract dir has `caveman` | Result |
+| Filesystem has `spears` | Extract dir has `spears` | Result |
 |---|---|---|
 | no  | no  | not present |
 | no  | yes | built-in served |
@@ -218,7 +223,8 @@ no built-in-specific HTTP endpoint.
 - **Disabling built-ins via config.** Workaround: drop an empty filesystem
   `SKILL.md` to shadow.
 - **Pruning stale extracts.** Renamed/removed built-ins leave their files in
-  the extract dir. Manual cleanup via `rm -rf ~/.phoenix-ide/builtin-skills/`.
+  the extract dir, but discovery ignores names that are no longer embedded.
+  Manual cleanup via `rm -rf ~/.phoenix-ide/builtin-skills/`.
 - **Per-version isolation.** Multiple phoenix binaries sharing one `$HOME`
   will overwrite each other's extracted files at startup. Acceptable today;
   revisit if needed.
@@ -227,12 +233,13 @@ no built-in-specific HTTP endpoint.
 
 - Unit: `extract_to` writes files, is idempotent, restores tampered files.
 - Discovery: built-in appears when no filesystem skill exists; filesystem
-  shadows built-in of same name; coexistence when names differ.
+  shadows built-in of same name; coexistence when names differ; stale
+  extracted directories are ignored when their name is no longer embedded.
 - System prompt: catalog renders `(built-in)` for built-in entries and the
   path for filesystem entries; the extract path does not leak into the
   catalog line.
 - Invocation: `invoke_skill` reads from the extracted path for built-ins
-  (verified end-to-end with the real registry — confirms caveman + allium
+  (verified end-to-end with the real registry — confirms spears + allium
   are present).
 - Companion-file access: the allium reference file is on disk after
   extraction (the value-prop test for the disk-extraction design).
