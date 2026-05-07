@@ -408,7 +408,7 @@ function ConversationPageContent() {
     if (!conversationId) return;
     api
       .getSystemPrompt(conversationId)
-      .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp }))
+      .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp, expectedConversationId: conversationId }))
       .catch((err) => console.warn('Failed to load system prompt:', err));
   }, [conversationId, dispatch]);
 
@@ -558,7 +558,7 @@ function ConversationPageContent() {
             markSteeringQueued(localId);
             // No phase change: the conversation is already running.
           } else {
-            dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' } });
+            dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' }, expectedConversationId: conversationId });
           }
         } else {
           // Offline path: hand the send off to the offline operation queue
@@ -672,7 +672,7 @@ function ConversationPageContent() {
     try {
       await api.upgradeModel(conversationId, newModelId);
       showInfo(`Switched to ${newModelId}`);
-      dispatch({ type: 'local_conversation_update', updates: { model: newModelId } });
+      dispatch({ type: 'local_conversation_update', updates: { model: newModelId }, expectedConversationId: conversationId });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
@@ -1187,14 +1187,14 @@ function ConversationPageContent() {
         <ErrorBanner
           message={convStateForChildren.message}
           onRetry={() => handleSend('continue', [])}
-          onDismiss={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' } })}
+          onDismiss={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
-          onSubmitted={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 } })}
+          onSubmitted={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
         />
       ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'terminal' ? (
         <>

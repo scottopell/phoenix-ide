@@ -979,16 +979,46 @@ describe('conversationReducer', () => {
       expect(next.connectionEpoch).toBe(1);
     });
 
-    it('connection_opened replaces epoch', () => {
-      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 5 });
-      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 1 });
-      expect(a2.connectionEpoch).toBe(1);
+    it('connection_opened advances epoch monotonically', () => {
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 1 });
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 5 });
+      expect(a2.connectionEpoch).toBe(5);
     });
 
-    it('connection_opened accepts equal epoch from a remounted hook', () => {
+    it('connection_opened drops a regression (stale OPEN_SSE closure)', () => {
+      // Within a single hook lifetime, the machine epoch is monotonic. A
+      // stale `OPEN_SSE` executor closure firing connection_opened with an
+      // older epoch must not regress the atom — that would re-accept events
+      // the new generation has already superseded.
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 5 });
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 3 });
+      expect(a2).toBe(a1);
+      expect(a2.connectionEpoch).toBe(5);
+    });
+
+    it('connection_opened drops an equal epoch as a no-op', () => {
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 4 });
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 4 });
+      expect(a2).toBe(a1);
+    });
+
+    it('connection_reset nulls connectionEpoch so the next remount can lift again', () => {
+      // Hook remount scenario: the atom retains epoch 5 from a prior visit.
+      // The new machine starts at epoch 0; without reset, monotonic guard
+      // would reject every connection_opened from the new generation.
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 5 });
+      const a2 = dispatch(a1, { type: 'connection_reset' });
+      expect(a2.connectionEpoch).toBeNull();
+      expect(a2.connectionState).toBe('connecting');
+      const a3 = dispatch(a2, { type: 'connection_opened', epoch: 1 });
+      expect(a3.connectionEpoch).toBe(1);
+    });
+
+    it('connection_state updates the visible lifecycle indicator', () => {
       const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 1 });
-      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 1 });
-      expect(a2.connectionEpoch).toBe(1);
+      expect(a1.connectionState).toBe('connecting');
+      const a2 = dispatch(a1, { type: 'connection_state', state: 'live', epoch: 1 });
+      expect(a2.connectionState).toBe('live');
     });
 
     it('first stamped action passes when atom epoch is null (bootstrap)', () => {
@@ -1068,16 +1098,20 @@ describe('conversationReducer', () => {
       expect(next.lastSequenceId).toBe(0);
     });
 
-    it('client-originated actions (no epoch) pass through regardless of atom epoch', () => {
-      // local_phase_change is dispatched by the UI on send; it has no
-      // epoch field. The guard must not reject these.
+    it('client-originated actions are gated by expectedConversationId, not epoch', () => {
+      // local_phase_change carries no epoch — the epoch guard ignores it.
+      // The guard against cross-conversation contamination is structural:
+      // the dispatch site captures conversationId, the reducer drops the
+      // action when the atom is no longer that conversation.
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        conversationId: 'conv-1',
         connectionEpoch: 7,
       };
       const next = dispatch(atom, {
         type: 'local_phase_change',
         phase: { type: 'awaiting_llm' },
+        expectedConversationId: 'conv-1',
       });
       expect(next.phase.type).toBe('awaiting_llm');
     });
@@ -1132,15 +1166,35 @@ describe('conversationReducer', () => {
     // against a future change that accidentally wires them through the
     // server-side dedup path.
     it('updates phase without touching lastSequenceId', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 42 };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        lastSequenceId: 42,
+      };
 
       const next = dispatch(atom, {
         type: 'local_phase_change',
         phase: { type: 'awaiting_llm' },
+        expectedConversationId: 'conv-1',
       });
 
       expect(next.phase.type).toBe('awaiting_llm');
       expect(next.lastSequenceId).toBe(42);
+    });
+
+    it('drops when expectedConversationId does not match (post-navigation resolve)', () => {
+      // `await api.sendMessage` resolved after the user navigated A→B.
+      // Dispatch was bound to A's atom but the atom is now showing B.
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-B',
+      };
+      const next = dispatch(atom, {
+        type: 'local_phase_change',
+        phase: { type: 'awaiting_llm' },
+        expectedConversationId: 'conv-A',
+      });
+      expect(next).toBe(atom);
     });
   });
 
@@ -1148,25 +1202,42 @@ describe('conversationReducer', () => {
     it('merges updates when conversation exists', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        conversationId: 'conv-1',
         conversation: testConversation,
       };
 
       const next = dispatch(atom, {
         type: 'local_conversation_update',
         updates: { model: 'new-model' },
+        expectedConversationId: 'conv-1',
       });
 
       expect(next.conversation?.model).toBe('new-model');
     });
 
     it('is a no-op when conversation is null', () => {
-      const atom = createInitialAtom();
+      const atom: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1' };
 
       const next = dispatch(atom, {
         type: 'local_conversation_update',
         updates: { model: 'new-model' },
+        expectedConversationId: 'conv-1',
       });
 
+      expect(next).toBe(atom);
+    });
+
+    it('drops when expectedConversationId does not match', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-B',
+        conversation: testConversation,
+      };
+      const next = dispatch(atom, {
+        type: 'local_conversation_update',
+        updates: { model: 'new-model' },
+        expectedConversationId: 'conv-A',
+      });
       expect(next).toBe(atom);
     });
   });
@@ -1206,12 +1277,26 @@ describe('conversationReducer', () => {
   });
 
   describe('set_system_prompt', () => {
-    it('stores system prompt in atom', () => {
-      const atom = createInitialAtom();
+    it('stores system prompt when expectedConversationId matches', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1' };
 
-      const next = dispatch(atom, { type: 'set_system_prompt', systemPrompt: 'You are helpful.' });
+      const next = dispatch(atom, {
+        type: 'set_system_prompt',
+        systemPrompt: 'You are helpful.',
+        expectedConversationId: 'conv-1',
+      });
 
       expect(next.systemPrompt).toBe('You are helpful.');
+    });
+
+    it('drops when expectedConversationId does not match', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-B' };
+      const next = dispatch(atom, {
+        type: 'set_system_prompt',
+        systemPrompt: 'late-resolving promise from conv-A',
+        expectedConversationId: 'conv-A',
+      });
+      expect(next).toBe(atom);
     });
   });
 });

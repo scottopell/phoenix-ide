@@ -32,8 +32,19 @@ export interface ConversationAtom {
   /** Per-connection generation that produced the events this atom has accepted.
    *  `null` until `connection_opened` lands. Wire-originated actions tagged
    *  with a non-matching `epoch` are dropped at the reducer boundary — the
-   *  cross-conversation contamination guard from task 08683. */
+   *  cross-conversation contamination guard from task 08683.
+   *
+   *  Strictly monotonic within a single useConnection mount lifetime:
+   *  a stale OPEN_SSE executor closure that fires after a newer one cannot
+   *  regress the value. On hook remount (e.g. revisiting the same slug after
+   *  navigation), the hook explicitly dispatches `connection_reset` to null
+   *  this field before the new generation's `connection_opened` arrives. */
   connectionEpoch: number | null;
+  /** Coarse connection lifecycle state, dispatched from `useConnection` so
+   *  the UI can render a connecting/live/reconnecting/failed indicator
+   *  without inferring from event timing. Always stamped with the connection
+   *  epoch (rejected if stale). */
+  connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
 }
 
 export interface InitPayload {
@@ -55,9 +66,13 @@ export interface InitPayload {
 // the `OPEN_SSE` generation that produced it. The reducer rejects such
 // actions when `epoch !== atom.connectionEpoch`, closing the
 // cross-conversation contamination window where a stale EventSource fires into
-// a freshly-navigated atom. Client-originated actions (`local_phase_change`,
-// `local_conversation_update`, `set_initial_data`, `set_system_prompt`,
-// `clear_error`) carry no epoch and apply unconditionally.
+// a freshly-navigated atom.
+//
+// Client-originated actions take a different guard: the call site captures the
+// conversationId at dispatch time and stamps it as `expectedConversationId`.
+// The reducer drops the action when the atom is no longer that conversation,
+// closing the contamination window where a slug-bound dispatch captured by an
+// in-flight `await api.foo(...)` resolves after the user has navigated away.
 export type SSEAction =
   | { type: 'sse_init'; payload: InitPayload; epoch?: number }
   | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
@@ -89,13 +104,32 @@ export type SSEAction =
   // start accepting events stamped with that epoch and reject events
   // stamped with any prior generation.
   | { type: 'connection_opened'; epoch: number }
+  // Synthesized by `useConnection` on hook mount, before any `OPEN_SSE`.
+  // Nulls `connectionEpoch` so the new machine's first `connection_opened`
+  // is accepted even when the atom retains a higher epoch from a prior
+  // visit. Carries no epoch itself — see comment above on the action class.
+  | { type: 'connection_reset' }
+  // Coarse connection lifecycle indicator, dispatched from useConnection.
+  | {
+      type: 'connection_state';
+      state: 'connecting' | 'live' | 'reconnecting' | 'failed';
+      epoch?: number;
+    }
   // Client-originated optimistic phase change. No sequence_id — not part of
   // the server's total order. Mutates `phase` only; does not touch
   // `lastSequenceId`. The authoritative server-side phase change arrives
   // later via `sse_state_change` and overrides this if it differs.
-  | { type: 'local_phase_change'; phase: ConversationState }
+  | {
+      type: 'local_phase_change';
+      phase: ConversationState;
+      expectedConversationId: string;
+    }
   // Client-originated optimistic conversation update (e.g. model swap confirmation).
-  | { type: 'local_conversation_update'; updates: Partial<Conversation> }
+  | {
+      type: 'local_conversation_update';
+      updates: Partial<Conversation>;
+      expectedConversationId: string;
+    }
   | {
       type: 'set_initial_data';
       conversationId: string;
@@ -104,7 +138,11 @@ export type SSEAction =
       phase: ConversationState;
       contextWindow: { used: number };
     }
-  | { type: 'set_system_prompt'; systemPrompt: string | null };
+  | {
+      type: 'set_system_prompt';
+      systemPrompt: string | null;
+      expectedConversationId: string;
+    };
 
 export function createInitialAtom(): ConversationAtom {
   return {
@@ -121,6 +159,7 @@ export function createInitialAtom(): ConversationAtom {
     uiError: null,
     toolExecutingStartedAt: null,
     connectionEpoch: null,
+    connectionState: 'connecting',
   };
 }
 
@@ -528,14 +567,41 @@ export function conversationReducer(
     case 'clear_error':
       return { ...atom, uiError: null };
 
-    case 'connection_opened':
+    case 'connection_opened': {
+      // Strictly monotonic. A stale OPEN_SSE executor closure firing after a
+      // newer one already advanced the atom must not regress the epoch — that
+      // would re-accept events the new generation has already superseded. The
+      // hook handles legitimate remount via an explicit `connection_reset`,
+      // so by the time this case runs an out-of-order epoch is always stale.
+      if (atom.connectionEpoch !== null && action.epoch <= atom.connectionEpoch) {
+        if (import.meta.env.DEV) {
+          console.debug('[sse] dropping stale connection_opened', {
+            actionEpoch: action.epoch,
+            atomConnectionEpoch: atom.connectionEpoch,
+          });
+        }
+        return atom;
+      }
       return { ...atom, connectionEpoch: action.epoch };
+    }
+
+    case 'connection_reset':
+      // Hook remount: drop the retained epoch so the new generation's
+      // `connection_opened` (which may be a lower number than what we last
+      // saw) can lift the atom forward. Reset the visible state too so the
+      // UI shows `connecting` until the new stream actually opens.
+      return { ...atom, connectionEpoch: null, connectionState: 'connecting' };
+
+    case 'connection_state':
+      return { ...atom, connectionState: action.state };
 
     case 'local_phase_change':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
       // Optimistic client-side phase update — does NOT bump lastSequenceId.
       return { ...atom, phase: action.phase };
 
     case 'local_conversation_update':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
       if (!atom.conversation) return atom;
       return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
 
@@ -552,6 +618,7 @@ export function conversationReducer(
       };
 
     case 'set_system_prompt':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
       return { ...atom, systemPrompt: action.systemPrompt };
   }
 }
