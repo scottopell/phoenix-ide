@@ -326,6 +326,7 @@ impl SseWireEvent {
 }
 
 impl From<SseEvent> for SseWireEvent {
+    #[allow(clippy::too_many_lines)]
     fn from(event: SseEvent) -> Self {
         match event {
             SseEvent::Init {
