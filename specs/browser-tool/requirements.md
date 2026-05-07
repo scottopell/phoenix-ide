@@ -469,18 +469,30 @@ THE SYSTEM SHALL fan out a single screencast source to all viewers via a broadca
 
 The panel SHALL share a mutually-exclusive slot with the prose reader (REQ-FE-PR) and the diff viewer: at most one of {prose, diff, browser, none} occupies the right-hand viewer slot at a time.
 
-WHEN the conversation observes its first `browser_*` tool execution
+WHEN `browser_session_active` transitions false→true on the conversation's SSE stream
   AND the right-hand viewer slot is empty
 THE SYSTEM SHALL automatically mount the live browser view in that slot.
 
-WHEN the conversation observes its first `browser_*` tool execution
+WHEN `browser_session_active` transitions false→true on the conversation's SSE stream
   AND the slot is already occupied (prose / diff)
 THE SYSTEM SHALL NOT displace the existing viewer; the user's reading is not interrupted. A persistent manual-open affordance SHALL remain available for the user to switch to the browser view explicitly.
+
+WHEN the user navigates to a conversation that already has `browser_session_active = true` at hydration time
+THE SYSTEM SHALL NOT auto-mount the browser view; only the manual-open affordance is shown. Auto-mount fires on the live transition observed during this page's lifetime, not on entry-with-existing-state.
+
+WHEN a browser session is created or destroyed in `BrowserSessionManager` (including idle cleanup)
+THE SYSTEM SHALL emit a `browser_session_state` SSE event carrying the new `active` value on the conversation's SSE stream.
+
+WHEN the UI receives a `browser_session_state` event
+THE SYSTEM SHALL update the conversation's `browser_session_active` field as the single source of truth for live-session state. The UI SHALL NOT infer session state from message history.
 
 The panel canvas SHALL have `pointer-events: none` so clicks and key presses on the rendered surface have no effect on the underlying page (REQ-BT-018-NG-INPUT below).
 
 WHEN the conversation is hard-deleted (existing cascade in `BrowserSessionManager::kill_session`)
 THE SYSTEM SHALL close any active live-view WebSocket cleanly, signalling "session ended" so the frontend stops reconnecting.
+
+WHEN no browser session exists for a conversation
+THE SYSTEM SHALL NOT poll or reconnect the live-view WebSocket for that conversation. Reconnect attempts are reserved for transient drops on a session that the server-authoritative signal indicates is still live.
 
 **Non-goals (locked in for MVP):**
 
@@ -488,12 +500,15 @@ THE SYSTEM SHALL close any active live-view WebSocket cleanly, signalling "sessi
 - **REQ-BT-018-NG-MULTITAB** — Tab / window management UI is out of scope. The panel always shows `BrowserSession.page` (the canonical first page). Additional CDP targets opened by the agent or by the page are not exposed.
 - **REQ-BT-018-NG-HANDOFF** — Take-over / driving handoff between agent and user is out of scope. The agent is the sole driver.
 - **REQ-BT-018-NG-HEADED** — Headed Chrome / VNC / Xvfb is not the architectural answer. The CDP screencast over the existing headless instance is.
+- **REQ-BT-018-NG-PROXY** — Inferring session liveness from `browser_*` tool calls in message history is explicitly out of scope. The server-authoritative `browser_session_state` SSE event (sourced from `BrowserSessionManager`'s create/destroy edges) is the only signal the UI is permitted to consult. Walking the message stream to decide whether a session "should" exist is a leaky proxy that diverges from server truth as soon as a session is reaped, killed, or never created in the first place.
 
 These non-goals are recorded so a future change does not silently "fix" one of them without re-opening the design discussion behind the locked decisions.
 
 **Rationale:** The agent's headless Chromium is invisible to the user by default. When the agent is iterating on a UI, the natural collaborative loop is "agent does X, user sees the result, user nudges." The screenshot tool covers point-in-time captures but not the continuous-feedback case. A live view over the existing CDP channel adds pure additive user value without changing any tool semantics; the agent's browser tools work identically whether or not anyone is watching.
 
 The slot-mutex + auto-mount-when-empty rule is the conservative choice: it never disrupts what the user is already reading, but the first time the agent needs the browser the panel just appears — no manual setup. The persistent manual-open affordance covers the "I had a diff open during first activation but now I want to see the browser" case.
+
+The auto-mount trigger is the server-authoritative `browser_session_state` lifecycle event, broadcast from `BrowserSessionManager` on session create and destroy (including idle cleanup) and bridged onto the per-conversation SSE stream. The UI watches the false→true edge of `browser_session_active` and reacts only to live transitions; entering a conversation that is already mid-session shows the manual-open affordance but does not auto-mount, and a conversation with no live session never causes the panel WebSocket to poll. This replaces an earlier message-walk proxy that produced two failure modes — auto-opening an empty panel for past conversations whose server-side session was long gone, and a "no-session"/"connecting" reconnect loop — both of which are structurally impossible under the lifecycle-event signal.
 
 **User Stories:** US-4 (also surfaces during US-1, US-2)
 

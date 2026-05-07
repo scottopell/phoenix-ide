@@ -85,14 +85,14 @@ export function useDiffViewerState(): DiffViewerStateValue {
 interface BrowserViewStateValue {
   /** Whether the browser-view panel is currently mounted in the slot. */
   open: boolean;
-  /** Sticky: flips true the first time a `browser_*` tool is observed in
-   *  this conversation. Drives the auto-mount-when-slot-empty rule and
-   *  also gates the manual-open affordance (no point letting the user open
-   *  an empty panel before there's any browser to show). */
-  hasActivated: boolean;
+  /** Server-authoritative: whether `BrowserSessionManager` currently holds a
+   *  live session for this conversation. Threaded through from
+   *  `atom.conversation.browser_session_active` — single source of truth.
+   *  Gates the manual-open affordance and is watched by ConversationPage to
+   *  decide auto-mount on the false→true edge. */
+  browserSessionActive: boolean;
   openPanel: () => void;
   closePanel: () => void;
-  markActivated: () => void;
 }
 
 const BrowserViewStateContext = createContext<BrowserViewStateValue | null>(null);
@@ -102,34 +102,40 @@ const BrowserViewStateContext = createContext<BrowserViewStateValue | null>(null
  * prose reader (FileExplorerContext) and the diff viewer (above) —
  * ConversationPage owns the resolution rules.
  *
- * `hasActivated` is sticky for the lifetime of the provider (= the lifetime
- * of the conversation page). Auto-mount on first activation is the
- * provider's responsibility-by-implication only: it just exposes the flag
- * and the open/close ops; the page wires them together.
+ * `browserSessionActive` is a pass-through prop: the parent reads it from
+ * the conversation atom and pushes it down. There is no provider-local
+ * mirror; that would be a parallel representation of the same fact.
  */
 interface BrowserViewStateProviderProps {
   children: ReactNode;
   /**
    * Scope identifier (typically the active conversation slug). When this
-   * changes, the panel is closed and `hasActivated` is cleared so a new
-   * conversation never inherits the previous one's browser-view state.
-   * Synchronous reset via the "adjust state during render" pattern,
-   * matching `DiffViewerStateProvider` and `ReviewNotesProvider`.
+   * changes, the panel is closed so a new conversation never inherits the
+   * previous one's panel-open state. Synchronous reset via the "adjust
+   * state during render" pattern, matching `DiffViewerStateProvider` and
+   * `ReviewNotesProvider`.
    */
   scopeKey?: string | undefined;
+  /**
+   * Server-authoritative live-session flag (see `BrowserViewStateValue`).
+   * Required: when the parent has no atom yet, pass `false`.
+   */
+  browserSessionActive: boolean;
 }
 
-export function BrowserViewStateProvider({ children, scopeKey }: BrowserViewStateProviderProps) {
+export function BrowserViewStateProvider({
+  children,
+  scopeKey,
+  browserSessionActive,
+}: BrowserViewStateProviderProps) {
   const [open, setOpen] = useScopedState(scopeKey, false);
-  const [hasActivated, setHasActivated] = useScopedState(scopeKey, false);
 
   const openPanel = useCallback(() => setOpen(true), [setOpen]);
   const closePanel = useCallback(() => setOpen(false), [setOpen]);
-  const markActivated = useCallback(() => setHasActivated(true), [setHasActivated]);
 
   const value = useMemo<BrowserViewStateValue>(
-    () => ({ open, hasActivated, openPanel, closePanel, markActivated }),
-    [open, hasActivated, openPanel, closePanel, markActivated],
+    () => ({ open, browserSessionActive, openPanel, closePanel }),
+    [open, browserSessionActive, openPanel, closePanel],
   );
 
   return (

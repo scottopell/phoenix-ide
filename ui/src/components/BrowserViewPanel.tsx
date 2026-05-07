@@ -16,10 +16,13 @@
  * non-goals in `tasks/05001-*.md` and `specs/browser-tool/requirements.md`
  * (REQ-BT-018).
  *
- * Reconnect strategy mirrors TerminalPanel: on transient drops, retry with
- * a small backoff. The "no-session" status is treated as "agent hasn't
- * touched the browser yet" — we keep the connection open and let the user
- * see the placeholder until the next attempt finds a session.
+ * Mount contract: the parent (ConversationPage) only mounts this panel
+ * when the server has reported a live browser session via the
+ * `browser_session_state` SSE event. On a transient drop after going live,
+ * we schedule one reconnect — the session is known to exist server-side.
+ * On `no-session`, `ended`, or `error`, we do NOT poll: the parent will
+ * unmount us when the live-session flag flips false. This avoids the
+ * forever-poll loop the old proxy logic relied on.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -59,6 +62,11 @@ export function BrowserViewPanel({
   const reconnectTimerRef = useRef<number | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>({ kind: 'connecting' });
+  /** Mirror of `status` so `ws.onclose` (which runs outside React's render
+   *  cycle) can read the current value without scheduling a setState that
+   *  would in turn need to perform a side effect. */
+  const statusRef = useRef<Status>(status);
+  statusRef.current = status;
   /** Bumping this triggers the connect effect to retear and reconnect. */
   const [reconnectNonce, setReconnectNonce] = useState(0);
 
@@ -147,17 +155,20 @@ export function BrowserViewPanel({
 
     ws.onclose = () => {
       if (cancelled) return;
-      // If we never flipped to 'live' or 'ended', this is a transient drop;
-      // schedule a quiet retry so the panel reconnects when the agent's
-      // session comes online (e.g. after the first browser_* tool fires).
-      setStatus((prev) => {
-        if (prev.kind === 'live') return { kind: 'ended' };
-        return prev;
-      });
-      reconnectTimerRef.current = window.setTimeout(() => {
-        reconnectTimerRef.current = null;
-        setReconnectNonce((n) => n + 1);
-      }, 1500);
+      // Only schedule a reconnect when we know the session was live —
+      // a real transient drop on a known-good session. On `no-session`,
+      // `ended`, or `error`, the parent owns the unmount decision via
+      // the `browser_session_state` SSE flag; polling here would just
+      // race against that signal. Status stays at whatever the WS last
+      // reported so the overlay doesn't flicker back to "Connecting…".
+      const wasLive = statusRef.current.kind === 'live';
+      if (wasLive) {
+        setStatus({ kind: 'ended' });
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          setReconnectNonce((n) => n + 1);
+        }, 1500);
+      }
     };
 
     return () => {

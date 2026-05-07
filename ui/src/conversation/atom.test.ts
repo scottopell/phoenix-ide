@@ -18,6 +18,7 @@ const testConversation: Conversation = {
   created_at: '2024-01-01T00:00:00Z',
   updated_at: '2024-01-01T00:00:00Z',
   message_count: 0,
+  browser_session_active: false,
 };
 
 function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'): Message {
@@ -681,6 +682,74 @@ describe('conversationReducer', () => {
       });
 
       expect(next.lastSequenceId).toBe(7);
+    });
+  });
+
+  describe('sse_browser_session_state', () => {
+    // REQ-BT-018: server-authoritative live-session edge. The reducer
+    // mutates conversation.browser_session_active as the single source of
+    // truth — no parallel sticky bool, no message-content scanning.
+    it('updates conversation.browser_session_active from false to true', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversation: { ...testConversation, browser_session_active: false },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_browser_session_state',
+        sequenceId: 12,
+        active: true,
+      });
+
+      expect(next.conversation?.browser_session_active).toBe(true);
+      expect(next.lastSequenceId).toBe(12);
+    });
+
+    it('updates conversation.browser_session_active from true to false', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversation: { ...testConversation, browser_session_active: true },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_browser_session_state',
+        sequenceId: 14,
+        active: false,
+      });
+
+      expect(next.conversation?.browser_session_active).toBe(false);
+      expect(next.lastSequenceId).toBe(14);
+    });
+
+    it('does not patch a non-existent conversation', () => {
+      // Init hasn't landed; conversation is null. The reducer must not
+      // synthesise a conversation row from nothing.
+      const atom = createInitialAtom();
+
+      const next = dispatch(atom, {
+        type: 'sse_browser_session_state',
+        sequenceId: 3,
+        active: true,
+      });
+
+      expect(next.conversation).toBeNull();
+    });
+
+    it('rejects a stale sequenceId', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 30,
+        conversation: { ...testConversation, browser_session_active: false },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_browser_session_state',
+        sequenceId: 29,
+        active: true,
+      });
+
+      expect(next).toBe(atom);
+      expect(next.conversation?.browser_session_active).toBe(false);
     });
   });
 

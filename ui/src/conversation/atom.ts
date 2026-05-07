@@ -80,6 +80,7 @@ export type SSEAction =
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
   | { type: 'sse_token'; sequenceId: number; delta: string; epoch?: number }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
+  | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
   // `sequenceId` is present when the error originated on the wire (server's
   // monotonic counter) and absent when it was synthesized client-side for a
   // schema / parse violation in useConnection.ts. Wire-originated errors are
@@ -497,6 +498,27 @@ export function conversationReducer(
         return {
           ...a,
           conversation: { ...a.conversation, ...action.updates },
+        };
+      });
+
+    case 'sse_browser_session_state':
+      // REQ-BT-018: server-authoritative live-session edge. Update only if
+      // this id is newer than anything we've seen. If the atom has no
+      // conversation yet (init hasn't landed) we drop the event — there's
+      // no struct to mutate, and init will carry the current value.
+      return applyIfNewer(atom, 'sse_browser_session_state', action.sequenceId, (a) => {
+        if (!a.conversation) {
+          if (import.meta.env.DEV) {
+            console.debug('[sse] dropping browser_session_state — no conversation', {
+              sequenceId: action.sequenceId,
+              active: action.active,
+            });
+          }
+          return a;
+        }
+        return {
+          ...a,
+          conversation: { ...a.conversation, browser_session_active: action.active },
         };
       });
 

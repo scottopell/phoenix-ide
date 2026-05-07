@@ -92,6 +92,12 @@ export interface Conversation {
   /** Server-computed presentation mode: idle | working | needs_action | error | done.
    *  Single source of truth for which visual indicator to render. */
   presentation_mode?: string;
+  /** Whether the conversation currently has a live browser session in the
+   *  server's `BrowserSessionManager`. Authoritative for UI gating of the
+   *  live-browser-view affordances (REQ-BT-018). Hydrated at SSE init from
+   *  the manager's `HashMap` and updated by `browser_session_state` events
+   *  on this conversation's stream. Always populated by the server. */
+  browser_session_active: boolean;
 }
 
 export interface Project {

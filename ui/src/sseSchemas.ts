@@ -37,6 +37,7 @@ import type {
   SseConversationUpdateData as WireConversationUpdateData,
   SseErrorData as WireErrorData,
   SseConversationHardDeletedData as WireConversationHardDeletedData,
+  SseBrowserSessionStateData as WireBrowserSessionStateData,
   SseBreadcrumb as GeneratedSseBreadcrumb,
   ChainQaTokenData as WireChainQaTokenData,
   ChainQaCompletedData as WireChainQaCompletedData,
@@ -280,6 +281,16 @@ export const SseConversationHardDeletedDataSchema = v.looseObject({
   conversation_id: v.string(),
 }) satisfies v.GenericSchema<unknown, WireConversationHardDeletedData>;
 
+/** `browser_session_state`: fired on the server's create / destroy edge for
+ *  a browser session in `BrowserSessionManager`. The UI uses this as the
+ *  single source of truth for whether to show / auto-mount the live browser
+ *  view (REQ-BT-018). Replaces the old client-side proxy that walked
+ *  messages looking for `browser_*` tool uses. */
+export const SseBrowserSessionStateDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  active: v.boolean(),
+}) satisfies v.GenericSchema<unknown, WireBrowserSessionStateData>;
+
 // ---------------------------------------------------------------------------
 // Chain Q&A wire-event schemas (Phoenix Chains v1, REQ-CHN-004 / 005).
 //
@@ -337,6 +348,9 @@ export type SseConversationBecameTerminalData = v.InferOutput<
 export type SseErrorData = v.InferOutput<typeof SseErrorDataSchema>;
 export type SseConversationHardDeletedData = v.InferOutput<
   typeof SseConversationHardDeletedDataSchema
+>;
+export type SseBrowserSessionStateData = v.InferOutput<
+  typeof SseBrowserSessionStateDataSchema
 >;
 
 // ---------------------------------------------------------------------------

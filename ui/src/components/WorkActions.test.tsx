@@ -29,7 +29,9 @@ const renderWithProviders = (ui: ReactElement) =>
     <FileExplorerProvider>
       <ReviewNotesProvider>
         <DiffViewerStateProvider>
-          <BrowserViewStateProvider>{ui}</BrowserViewStateProvider>
+          <BrowserViewStateProvider browserSessionActive={false}>
+            {ui}
+          </BrowserViewStateProvider>
         </DiffViewerStateProvider>
       </ReviewNotesProvider>
     </FileExplorerProvider>,

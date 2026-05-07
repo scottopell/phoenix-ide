@@ -16,6 +16,7 @@ function makeConv(id: string, updated_at: string, overrides: Partial<Conversatio
     message_count: 0,
     state: { type: 'idle' },
     archived: false,
+    browser_session_active: false,
     ...overrides,
   };
 }

@@ -68,6 +68,10 @@ export type SseConversationHardDeletedData = Omit<
   Extract<SseWireEvent, { type: 'conversation_hard_deleted' }>,
   'type'
 >;
+export type SseBrowserSessionStateData = Omit<
+  Extract<SseWireEvent, { type: 'browser_session_state' }>,
+  'type'
+>;
 
 // Chain Q&A wire-event data shapes (Phoenix Chains v1). Same Extract +
 // Omit<…, 'type'> pattern as the conversation-scoped SSE events above.

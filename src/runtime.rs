@@ -22,6 +22,7 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
+use crate::tools::browser::session::BrowserSessionLifecycleEvent;
 use crate::tools::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry, ToolRegistry};
 
 /// Type alias for production runtime with concrete implementations
@@ -82,6 +83,11 @@ pub struct RuntimeManager {
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    /// Receiver for browser session lifecycle edges. Taken once by
+    /// [`RuntimeManager::start_browser_lifecycle_bridge`] which spawns a
+    /// task that resolves `conversation_id` to its `SseBroadcaster` and
+    /// broadcasts [`SseEvent::BrowserSessionState`].
+    browser_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<BrowserSessionLifecycleEvent>>>,
 }
 
 /// Handle to interact with a running conversation
@@ -269,6 +275,12 @@ pub struct EnrichedConversation {
     /// case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_parent_slug: Option<String>,
+    /// Whether the conversation currently has a live browser session in
+    /// `BrowserSessionManager`. Read directly from the manager's `HashMap`
+    /// at hydration — single source of truth, no parallel bool. The
+    /// running session is updated via `SseEvent::BrowserSessionState`
+    /// after init.
+    pub browser_session_active: bool,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.
@@ -398,6 +410,17 @@ pub enum SseEvent {
         sequence_id: i64,
         conversation_id: String,
     },
+    /// Browser session liveness changed for this conversation. Emitted on
+    /// the create edge (`active = true`, fired only on actual `HashMap`
+    /// insertion in `BrowserSessionManager::get_session`) and the destroy
+    /// edge (`active = false`, fired only when a session was actually
+    /// removed — kill, idle cleanup). The UI uses this to drive the live
+    /// "browser session running" indicator without inferring it from the
+    /// presence of `browser_*` tool calls in message history.
+    BrowserSessionState {
+        sequence_id: i64,
+        active: bool,
+    },
 }
 
 impl RuntimeManager {
@@ -410,11 +433,18 @@ impl RuntimeManager {
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
+        // Browser session lifecycle channel. Unbounded because the volume is
+        // O(user-clicks-on-browser-tools) — a tightly bounded channel could
+        // drop edges and desync the UI's "session live" indicator. The
+        // matching `Receiver` is consumed by `start_browser_lifecycle_bridge`.
+        let (browser_lifecycle_tx, browser_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
             db,
             llm_registry,
             platform,
-            browser_sessions: Arc::new(BrowserSessionManager::default()),
+            browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
+                browser_lifecycle_tx,
+            )),
             bash_handles: Arc::new(BashHandleRegistry::new()),
             tmux_registry: Arc::new(TmuxRegistry::new()),
             mcp_manager,
@@ -425,6 +455,7 @@ impl RuntimeManager {
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
             credential_helper,
+            browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
         }
     }
 
@@ -460,6 +491,52 @@ impl RuntimeManager {
     #[allow(dead_code)] // Used internally by get_or_create
     fn cancel_tx(&self) -> mpsc::Sender<SubAgentCancelRequest> {
         self.cancel_tx.clone()
+    }
+
+    /// Start the bridge task that converts `BrowserSessionManager` lifecycle
+    /// edges into per-conversation SSE broadcasts. Must be called once after
+    /// `RuntimeManager::new`. If the receiver was already taken (double
+    /// call) this is a no-op.
+    pub async fn start_browser_lifecycle_bridge(self: &Arc<Self>) {
+        let rx = self.browser_lifecycle_rx.write().await.take();
+        let Some(mut rx) = rx else {
+            tracing::debug!("browser lifecycle bridge already started; skipping");
+            return;
+        };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let BrowserSessionLifecycleEvent {
+                    conversation_id,
+                    active,
+                } = event;
+                let runtimes = manager.runtimes.read().await;
+                let Some(handle) = runtimes.get(&conversation_id) else {
+                    tracing::debug!(
+                        conversation_id,
+                        active,
+                        "dropping browser session lifecycle event — no live runtime handle"
+                    );
+                    continue;
+                };
+                let broadcaster = handle.broadcast_tx.clone();
+                drop(runtimes);
+                if broadcaster
+                    .send_seq(|seq| SseEvent::BrowserSessionState {
+                        sequence_id: seq,
+                        active,
+                    })
+                    .is_err()
+                {
+                    tracing::debug!(
+                        conversation_id,
+                        active,
+                        "no SSE subscribers for browser session lifecycle event"
+                    );
+                }
+            }
+            tracing::info!("Browser lifecycle bridge stopped");
+        });
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests

@@ -64,6 +64,7 @@ impl AppState {
             credential_helper.clone(),
         ));
         runtime.start_sub_agent_handler().await;
+        runtime.start_browser_lifecycle_bridge().await;
         let terminals = runtime.terminals.clone();
         // Chain Q&A is constructed last so it can share the same `Database`
         // and `ModelRegistry` handles. Its internal `ChainRuntimeRegistry`

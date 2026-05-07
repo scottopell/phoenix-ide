@@ -86,7 +86,7 @@ export function WorkActions({
       >
         {diffFetch.status === 'loading' ? 'Loading...' : 'View Diff'}
       </button>
-      {browserView.hasActivated && !browserView.open && (
+      {browserView.browserSessionActive && !browserView.open && (
         <button
           type="button"
           className="work-actions-btn work-actions-view-browser"

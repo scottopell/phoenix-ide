@@ -216,6 +216,14 @@ mod tests {
                 "sequence_id": sequence_id,
                 "conversation_id": conversation_id,
             }),
+            SseEvent::BrowserSessionState {
+                sequence_id,
+                active,
+            } => json!({
+                "type": "browser_session_state",
+                "sequence_id": sequence_id,
+                "active": active,
+            }),
         }
     }
 
@@ -286,6 +294,7 @@ mod tests {
             shell: Some("/bin/zsh".to_string()),
             home_dir: Some("/home/alice".to_string()),
             seed_parent_slug: None,
+            browser_session_active: false,
         }
     }
 
@@ -545,6 +554,32 @@ mod tests {
             conversation_id: "conv-1".to_string(),
         };
         assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_browser_session_state_active() {
+        let event = SseEvent::BrowserSessionState {
+            sequence_id: 22,
+            active: true,
+        };
+        assert_parity(&event);
+        // Belt + braces: assert the typed wire output carries `active: true`
+        // under the `browser_session_state` discriminator.
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["type"], "browser_session_state");
+        assert_eq!(typed["active"], true);
+        assert_eq!(typed["sequence_id"], 22);
+    }
+
+    #[test]
+    fn parity_browser_session_state_inactive() {
+        let event = SseEvent::BrowserSessionState {
+            sequence_id: 23,
+            active: false,
+        };
+        assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["active"], false);
     }
 
     // ------------------------------------------------------------------

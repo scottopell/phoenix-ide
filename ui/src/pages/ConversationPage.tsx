@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -27,7 +27,7 @@ import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
-import { useConversationAtom } from '../conversation';
+import { useConversationAtom, useConversationSnapshot } from '../conversation';
 import { useResizablePane } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
@@ -92,11 +92,34 @@ export function ConversationPage() {
   return (
     <ReviewNotesProvider scopeKey={slug}>
       <DiffViewerStateProvider scopeKey={slug}>
-        <BrowserViewStateProvider scopeKey={slug}>
+        <BrowserViewWrapper slug={slug}>
           <ConversationPageContent />
-        </BrowserViewStateProvider>
+        </BrowserViewWrapper>
       </DiffViewerStateProvider>
     </ReviewNotesProvider>
+  );
+}
+
+/** Bridges the conversation atom's `browser_session_active` flag into the
+ *  `BrowserViewStateProvider`. Sits above `ConversationPageContent` so the
+ *  provider can be a thin pass-through. `useConversationSnapshot` returns
+ *  the same `Conversation` reference across renders unless the row itself
+ *  changes, so this wrapper does not re-render on token churn. */
+function BrowserViewWrapper({
+  slug,
+  children,
+}: {
+  slug: string | undefined;
+  children: ReactNode;
+}) {
+  const conversation = useConversationSnapshot(slug ?? null);
+  return (
+    <BrowserViewStateProvider
+      scopeKey={slug}
+      browserSessionActive={conversation?.browser_session_active ?? false}
+    >
+      {children}
+    </BrowserViewStateProvider>
   );
 }
 
@@ -491,46 +514,22 @@ function ConversationPageContent() {
     }
   }, [atom.conversation]);
 
-  // REQ-BT-018: detect first `browser_*` tool use and auto-mount the live
-  // view *only if the slot is empty*. After first activation the user's
-  // explicit slot choice is sticky — we never displace prose / diff.
-  //
-  // We walk the messages once after each update; the `hasActivated` flag is
-  // sticky in the provider, so once we set it we can safely fall through on
-  // subsequent renders without re-checking. The auto-mount itself only ever
-  // happens on the *transition* not-activated -> activated, by reading the
-  // slot state at that moment.
-  const browserHasActivated = browserView.hasActivated;
-  const markBrowserActivated = browserView.markActivated;
+  // REQ-BT-018: auto-mount the live browser view on the false→true edge of
+  // the server-authoritative `browser_session_active` flag, but only when
+  // the slot is empty. The `wasActive` ref lets a page that mounts with
+  // `active === true` skip auto-open, and also short-circuits re-runs
+  // triggered by prose/diff toggles after the session is already live.
+  const browserSessionActive = browserView.browserSessionActive;
   const openBrowserPanel = browserView.openPanel;
+  const prevBrowserSessionActiveRef = useRef(browserSessionActive);
   useEffect(() => {
-    if (browserHasActivated) return;
-    const found = atom.messages.some((m) => {
-      if (!Array.isArray(m.content)) return false;
-      for (const block of m.content) {
-        if (block.type === 'tool_use' && typeof block.name === 'string' && block.name.startsWith('browser_')) {
-          return true;
-        }
-      }
-      return false;
-    });
-    if (!found) return;
-    markBrowserActivated();
-    // Auto-mount only when the slot is empty (locked-in rule). Reading
-    // the slot state inside the effect rather than as a dep keeps the
-    // "only on the activation transition" semantics: if prose / diff
-    // open later they don't trip another auto-mount attempt.
+    const wasActive = prevBrowserSessionActiveRef.current;
+    prevBrowserSessionActiveRef.current = browserSessionActive;
+    if (wasActive || !browserSessionActive) return;
     if (!fileExplorer.proseReaderState && !diffViewer.payload) {
       openBrowserPanel();
     }
-  }, [
-    atom.messages,
-    browserHasActivated,
-    markBrowserActivated,
-    openBrowserPanel,
-    fileExplorer.proseReaderState,
-    diffViewer.payload,
-  ]);
+  }, [browserSessionActive, openBrowserPanel, fileExplorer.proseReaderState, diffViewer.payload]);
 
   // Stable refs — needed inside sendMessage which is memoized with a stable
   // identity across renders.
@@ -968,7 +967,7 @@ function ConversationPageContent() {
     >
       <div className="conversation-column">
       {seedBreadcrumb}
-      {browserView.hasActivated && !browserView.open && (
+      {browserView.browserSessionActive && !browserView.open && (
         <div className="browser-view-launcher">
           <button
             type="button"

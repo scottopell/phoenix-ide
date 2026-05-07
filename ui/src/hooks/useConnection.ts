@@ -15,6 +15,7 @@ import {
   SseConversationBecameTerminalDataSchema,
   SseErrorDataSchema,
   SseConversationHardDeletedDataSchema,
+  SseBrowserSessionStateDataSchema,
 } from '../sseSchemas';
 import {
   ConnectionState,
@@ -387,6 +388,25 @@ export function useConnection({
               type: 'sse_token',
               sequenceId: res.data.sequence_id,
               delta: res.data.text,
+            });
+          });
+
+          // REQ-BT-018: live-session create / destroy edge from
+          // BrowserSessionManager. Authoritative for whether the UI shows
+          // the browser-view affordances; the reducer mutates
+          // `conversation.browser_session_active` directly.
+          es.addEventListener('browser_session_state', (e) => {
+            const res = parseEvent(
+              SseBrowserSessionStateDataSchema,
+              e,
+              'browser_session_state',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_browser_session_state',
+              sequenceId: res.data.sequence_id,
+              active: res.data.active,
             });
           });
 

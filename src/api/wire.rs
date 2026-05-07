@@ -286,6 +286,13 @@ pub enum SseWireEvent {
         sequence_id: i64,
         conversation_id: String,
     },
+    /// Browser session liveness changed for the conversation this SSE
+    /// stream represents. `active = true` is fired exactly once when a
+    /// browser session is created in `BrowserSessionManager`; `false`
+    /// fires when it's removed (kill or idle cleanup). The
+    /// `conversation_id` is implied by the per-conversation broadcaster
+    /// scope and not re-emitted on the wire.
+    BrowserSessionState { sequence_id: i64, active: bool },
 }
 
 impl SseWireEvent {
@@ -303,6 +310,7 @@ impl SseWireEvent {
             SseWireEvent::ConversationUpdate { .. } => "conversation_update",
             SseWireEvent::Error { .. } => "error",
             SseWireEvent::ConversationHardDeleted { .. } => "conversation_hard_deleted",
+            SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
         }
     }
 }
@@ -406,6 +414,13 @@ impl From<SseEvent> for SseWireEvent {
             } => SseWireEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+            },
+            SseEvent::BrowserSessionState {
+                sequence_id,
+                active,
+            } => SseWireEvent::BrowserSessionState {
+                sequence_id,
+                active,
             },
         }
     }

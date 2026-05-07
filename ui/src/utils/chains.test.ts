@@ -17,6 +17,7 @@ const makeConv = (
   created_at: updated_at,
   updated_at,
   message_count: 1,
+  browser_session_active: false,
   ...overrides,
 });
 
