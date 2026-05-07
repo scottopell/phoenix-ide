@@ -423,56 +423,72 @@ to coerce bash into doing something it cannot.
 
 THE SYSTEM SHALL provide the bash tool schema with these properties:
 
-- `cmd` (optional string): shell command to execute. Required for spawn.
+- `op` (required enum: `spawn` | `peek` | `wait` | `kill`): operation
+  discriminator. The single source of truth for which operation to dispatch.
+- `cmd` (optional string): shell command to execute. Required when `op=spawn`.
+- `handle` (optional string): handle id. Required when `op=peek|wait|kill`.
 - `wait_seconds` (optional integer, default 30): time to block for the
-  foreground answer. Range [0, MAX_WAIT_SECONDS]. Used with `cmd` and
-  `wait`.
-- `peek` (optional string): handle ID to peek.
-- `wait` (optional string): handle ID to wait on.
-- `kill` (optional string): handle ID to kill.
-- `signal` (optional enum: `TERM` | `KILL`, default `TERM`): used with `kill`.
-- `lines` (optional integer): for peek/wait/spawn responses, return last N
-  lines. Mutually exclusive with `since`.
-- `since` (optional integer): for peek/wait/spawn responses, return lines from
-  offset K. Mutually exclusive with `lines`.
-- `mode` (optional, deprecated): backward-compatible alias for `wait_seconds`
-  values: `default` → 30, `slow` → 900, `background` → 0. Logs a deprecation
-  notice in the response.
+  foreground answer. Range [0, MAX_WAIT_SECONDS]. Used with `op=spawn` and
+  `op=wait`.
+- `signal` (optional enum: `TERM` | `KILL`, default `TERM`): used with
+  `op=kill`.
+- `lines` (optional integer, minimum 1): tail-mode read window — return the
+  last N lines. Mutually exclusive with `since`.
+- `since` (optional integer, minimum 1): incremental-mode read window —
+  return lines after offset K. Mutually exclusive with `lines`. Note: the
+  schema's `minimum: 1` is intentional. `since=0` is semantically equivalent
+  to a large `lines` value on a bounded ring and was a frequent default-fill
+  emission from OpenAI Responses API models; the parser SHALL silently
+  treat `since=0` as absent for tolerance with legacy/in-flight history.
 
-WHEN both `mode` and `wait_seconds` are supplied on the same call
-THE SYSTEM SHALL reject the call with `error: "mutually_exclusive_modes"`,
-`conflicting_args: ["mode", "wait_seconds"]`, and a `recommended_action`
-field directing the agent to remove the deprecated `mode` parameter
-THE SYSTEM SHALL NOT silently pick one — the precedence rule must be explicit.
+THE SYSTEM SHALL determine the operation from `op` when set. WHEN `op` is
+absent, THE SYSTEM SHALL infer the operation from a single non-empty
+legacy field among `{cmd, peek, wait, kill}` for backward compatibility
+with in-flight conversation history that predates the discriminator.
 
-THE SYSTEM SHALL enforce: exactly one of `{cmd, peek, wait, kill}` per call.
-WHEN zero or more than one is provided
-THE SYSTEM SHALL reject with `error: "mutually_exclusive_modes"` and a
-`conflicting_args` field listing the provided keys.
+THE SYSTEM SHALL treat empty strings on legacy operation-key fields
+(`peek=""`, `wait=""`, `kill=""`, `cmd=""`) as absent. This tolerance is
+required because OpenAI Responses API models default-fill every optional
+string property to `""`; without it, every bash call from a GPT model
+would trip the operation-key check.
+
+WHEN inference cannot determine a unique operation (zero non-empty legacy
+fields, or two or more), THE SYSTEM SHALL reject the call with
+`error: "mutually_exclusive_modes"` and a `conflicting_args` field listing
+the conflicting keys.
+
+THE SYSTEM SHALL silently drop `mode` when `wait_seconds` is also set;
+WHEN `mode` is set alone, the parser SHALL map it to its canonical
+`wait_seconds` value and emit a `deprecation_notice` field in the
+response. `mode` is no longer advertised in the schema.
 
 THE SYSTEM SHALL include the conversation's working directory in the tool
 description, as the prior revision did.
 
-THE `mode` parameter is deprecated and SHALL be removed in the second
-Phoenix release after this revision lands. The deprecation notice SHALL state
-this explicitly so callers can migrate; "future release" is not acceptable
-phrasing.
+**Rationale:** The original schema (revision 2) used four sibling optional
+string fields (`cmd`, `peek`, `wait`, `kill`) with mutual exclusion enforced
+only at runtime, because Anthropic's tool-use API rejects top-level
+`oneOf`/`anyOf`/`allOf`. This worked for Anthropic-trained models, which
+omit unused optional fields. It collapsed for OpenAI Responses API models,
+which default-fill every optional string property with `""` — every bash
+call from a GPT model emitted all four operation keys with three of them
+empty, tripping the mutex. Production audit (May 2026) found 100% of bash
+calls in a GPT-5 conversation failed this way.
 
-**Rationale:** The schema tells the agent what shapes of call are legal. The
-mutual-exclusion check turns the tool surface into a disjoint set of operations
-rather than a free-form bag of fields. The dual-pass rejection (folded into
-`mutually_exclusive_modes` with `conflicting_args: ["mode", "wait_seconds"]`)
-was added in revision 2 after a panel review flagged that the original draft
-silently picked one value and that older model snapshots routinely pass both
-"to be safe" — opposite intents (`background` = wait_seconds 0 vs
-`wait_seconds: 30` = wait 30s) would be silently resolved. Folding into a
-single error code (rather than introducing a separate
-`mode_and_wait_seconds_conflict`) keeps stable-id surface tight; the
-`recommended_action` field carries the directional guidance.
+The fix is structural: a single required `op` discriminator replaces the
+4-sibling pattern. `handle` is a single field whose meaning is determined
+by `op`, not encoded by which sibling was set. Empty strings on the now-
+legacy fields are tolerated for in-flight history. `mode` is dropped from
+the schema because GPT default-fills `mode="default"` alongside explicit
+`wait_seconds`, which the prior dual-pass rejection turned into a hard
+error; silently honoring the canonical `wait_seconds` is strictly better
+than failing the call.
 
-The committed removal version (second Phoenix release) replaces the prior
-"future release" phrasing, which the spEARS audit flagged as the exact prose
-hand-wave the audit was meant to catch.
+The dual-pass rationale from revision 2 (older model snapshots passing
+`mode=background` + `wait_seconds=30` "to be safe", with opposite intents)
+no longer applies once `mode` is off the schema and `wait_seconds` is the
+canonical knob. Mode collisions are now informational drift, not user
+intent ambiguity.
 
 ---
 

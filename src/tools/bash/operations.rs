@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
@@ -70,22 +70,29 @@ const HANDLE_NOT_FOUND_HINT: &str =
 // Request shape
 // ---------------------------------------------------------------------------
 
-/// Raw input shape. Mutual exclusion between `cmd` / `peek` / `wait` /
-/// `kill` is enforced at runtime per REQ-BASH-010 — Anthropic's
-/// tool-use API rejects top-level `oneOf` in `input_schema`, so the
-/// schema documents the constraint in its description and we validate
-/// here.
+/// Raw input shape.
+///
+/// Current schema (REQ-BASH-010): single `op` discriminator + per-op value
+/// fields (`cmd` for spawn, `handle` for peek/wait/kill). The legacy
+/// per-key shape (`peek`/`wait`/`kill` as string handles, `command` alias)
+/// is still accepted by the parser for backward compatibility with
+/// in-flight conversations whose history was written before the
+/// discriminator landed.
+///
+/// `mode` is silently ignored — the field is no longer in the schema but
+/// stored history may carry it. Empty strings on operation-key fields are
+/// treated as absent (`OpenAI` Responses API models default-fill every
+/// optional string property to ""; without this tolerance every bash call
+/// from a GPT model would trip the operation-key mutex).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBashInput {
     #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
     cmd: Option<String>,
     #[serde(default)]
-    peek: Option<String>,
-    #[serde(default)]
-    wait: Option<String>,
-    #[serde(default)]
-    kill: Option<String>,
+    handle: Option<String>,
     #[serde(default)]
     wait_seconds: Option<i64>,
     #[serde(default)]
@@ -94,12 +101,40 @@ struct RawBashInput {
     lines: Option<i64>,
     #[serde(default)]
     since: Option<i64>,
+
+    // Legacy fields — kept on the deserialize path so old in-flight
+    // conversations (and the GPT default-fill case) don't fail at parse.
+    // None of these appear in the current input_schema.
     #[serde(default)]
-    mode: Option<String>,
-    /// Legacy alias from the pre-handle revision. Some sub-agents and old
-    /// fixtures still pass `command=...`; treat it as `cmd`.
+    peek: Option<String>,
+    #[serde(default)]
+    wait: Option<String>,
+    #[serde(default)]
+    kill: Option<String>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Operation discriminator. Mirrors `Operation` in `specs/bash/bash.allium`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Spawn,
+    Peek,
+    Wait,
+    Kill,
+}
+
+impl Op {
+    fn as_field_name(self) -> &'static str {
+        match self {
+            Op::Spawn => "spawn",
+            Op::Peek => "peek",
+            Op::Wait => "wait",
+            Op::Kill => "kill",
+        }
+    }
 }
 
 /// Parsed read-window arguments (REQ-BASH-004). `lines` xor `since`.
@@ -254,6 +289,20 @@ impl BashError {
 
 /// Parse + validate the agent's request. Returns the typed `BashRequest`
 /// or a `BashError` ready to be returned as the tool output.
+///
+/// Tolerance rules (REQ-BASH-010):
+///
+/// - Operation comes from explicit `op` if present; otherwise inferred from
+///   the single non-empty legacy key among `cmd`/`peek`/`wait`/`kill`.
+/// - Empty strings on legacy operation-key fields are treated as absent.
+///   This is what makes the GPT default-fill case ("peek": "", "wait": "",
+///   "kill": "" alongside a real cmd) parse correctly.
+/// - `mode` is silently dropped if `wait_seconds` is set; if alone, mapped
+///   to the canonical `wait_seconds` with a deprecation notice. The schema
+///   no longer advertises `mode`.
+/// - `since=0` is treated as absent (default fill from models that emit
+///   the schema minimum). Non-zero `since` and `lines` together still
+///   produce `peek_args_mutually_exclusive`.
 #[allow(clippy::too_many_lines)]
 pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
     let raw: RawBashInput = serde_json::from_value(input).map_err(|e| {
@@ -262,147 +311,192 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
             message: format!("invalid bash input: {e}"),
             conflicting_args: vec![],
             recommended_action:
-                "send exactly one of cmd, peek, wait, kill, with the documented field types".into(),
+                "send `op` set to spawn|peek|wait|kill, with the documented field types".into(),
             extra: None,
         }
     })?;
 
-    // Operation-key mutual exclusion (REQ-BASH-010).
-    let mut provided: Vec<&'static str> = Vec::new();
-    if raw.cmd.is_some() || raw.command.is_some() {
-        provided.push("cmd");
-    }
-    if raw.peek.is_some() {
-        provided.push("peek");
-    }
-    if raw.wait.is_some() {
-        provided.push("wait");
-    }
-    if raw.kill.is_some() {
-        provided.push("kill");
-    }
-    if provided.len() != 1 {
-        let message = if provided.is_empty() {
-            "exactly one of cmd, peek, wait, kill must be provided".to_string()
-        } else {
-            format!(
-                "exactly one of cmd, peek, wait, kill must be provided; received: {}",
-                provided.join(", ")
-            )
-        };
-        return Err(BashError::MutuallyExclusiveModes {
-            message,
-            conflicting_args: provided,
-            recommended_action: "remove the extra operation keys; keep exactly one".into(),
-            extra: None,
-        });
-    }
+    let op = resolve_op(&raw)?;
 
-    // Mode/wait_seconds conflict (REQ-BASH-010).
-    if raw.mode.is_some() && raw.wait_seconds.is_some() {
-        let extra = json!({
-            "mode": raw.mode,
-            "wait_seconds": raw.wait_seconds,
-        });
-        return Err(BashError::MutuallyExclusiveModes {
-            message: "the deprecated 'mode' parameter cannot be used with 'wait_seconds'; pass \
-                 wait_seconds alone"
-                .into(),
-            conflicting_args: vec!["mode", "wait_seconds"],
-            recommended_action: "remove the deprecated 'mode' parameter; pass 'wait_seconds' alone"
-                .into(),
-            extra: Some(extra),
-        });
-    }
-
-    // Resolve wait_seconds. If `mode` is provided alone, map to its value
-    // and produce a deprecation notice (REQ-BASH-010).
-    let (effective_wait_seconds_opt, deprecation_notice) = if let Some(m) = raw.mode.as_deref() {
-        let mapped = match m {
-            "default" => 30u64,
-            "slow" => 900u64,
-            "background" => 0u64,
-            _ => {
-                return Err(BashError::MutuallyExclusiveModes {
-                    message: format!(
-                        "mode='{m}' is not recognized; valid values are 'default', 'slow', \
-                         'background' (all deprecated — use wait_seconds instead)"
-                    ),
-                    conflicting_args: vec!["mode"],
-                    recommended_action:
-                        "drop the 'mode' parameter; pass wait_seconds (integer seconds) instead"
-                            .into(),
-                    extra: None,
-                });
-            }
-        };
-        let notice = format!(
-            "the 'mode' parameter is deprecated and will be removed in the second Phoenix \
-             release after this revision; pass wait_seconds={mapped} instead"
-        );
-        (Some(mapped), Some(notice))
-    } else {
-        (None, None)
+    // mode handling: drop silently if wait_seconds is also set; honor
+    // alone for legacy callers. Unknown mode values fall back to default.
+    let (effective_wait_seconds_opt, deprecation_notice) = match (&raw.mode, raw.wait_seconds) {
+        (Some(m), None) => match m.as_str() {
+            "default" => (
+                Some(30u64),
+                Some("the 'mode' parameter is deprecated; pass wait_seconds=30 instead".into()),
+            ),
+            "slow" => (
+                Some(900u64),
+                Some("the 'mode' parameter is deprecated; pass wait_seconds=900 instead".into()),
+            ),
+            "background" => (
+                Some(0u64),
+                Some("the 'mode' parameter is deprecated; pass wait_seconds=0 instead".into()),
+            ),
+            _ => (None, None),
+        },
+        _ => (None, None),
     };
 
-    // Read args (REQ-BASH-004).
     let read_args = parse_read_args(raw.lines, raw.since)?;
 
-    // Dispatch.
-    if raw.cmd.is_some() || raw.command.is_some() {
-        let cmd = raw.cmd.or(raw.command).unwrap_or_default();
-        if cmd.is_empty() {
-            return Err(BashError::MutuallyExclusiveModes {
-                message: "cmd must be a non-empty shell command".into(),
-                conflicting_args: vec!["cmd"],
-                recommended_action: "supply a non-empty cmd string".into(),
-                extra: None,
-            });
-        }
-        let wait_seconds = resolve_wait_seconds(raw.wait_seconds, effective_wait_seconds_opt)?;
-        return Ok(BashRequest::Spawn {
-            cmd,
-            wait_seconds,
-            read_args,
-            deprecation_notice,
-        });
-    }
-    if let Some(handle_id) = raw.peek {
-        return Ok(BashRequest::Peek {
-            handle_id,
-            read_args,
-        });
-    }
-    if let Some(handle_id) = raw.wait {
-        let wait_seconds = resolve_wait_seconds(raw.wait_seconds, effective_wait_seconds_opt)?;
-        return Ok(BashRequest::Wait {
-            handle_id,
-            wait_seconds,
-            read_args,
-            deprecation_notice,
-        });
-    }
-    if let Some(handle_id) = raw.kill {
-        let signal = match raw.signal.as_deref() {
-            None | Some("TERM") => KillSignal::Term,
-            Some("KILL") => KillSignal::Kill,
-            Some(other) => {
-                return Err(BashError::MutuallyExclusiveModes {
-                    message: format!(
-                        "signal='{other}' is not recognized; valid values are 'TERM' or 'KILL'"
-                    ),
-                    conflicting_args: vec!["signal"],
-                    recommended_action: "use signal='TERM' (default) or signal='KILL'".into(),
+    match op {
+        Op::Spawn => {
+            let cmd = raw
+                .cmd
+                .filter(|s| !s.is_empty())
+                .or_else(|| raw.command.filter(|s| !s.is_empty()))
+                .ok_or_else(|| BashError::MutuallyExclusiveModes {
+                    message: "op=spawn requires a non-empty 'cmd'".into(),
+                    conflicting_args: vec!["cmd"],
+                    recommended_action: "supply cmd=<shell command>".into(),
                     extra: None,
-                });
-            }
-        };
-        return Ok(BashRequest::Kill { handle_id, signal });
+                })?;
+            let wait_seconds = resolve_wait_seconds(raw.wait_seconds, effective_wait_seconds_opt)?;
+            Ok(BashRequest::Spawn {
+                cmd,
+                wait_seconds,
+                read_args,
+                deprecation_notice,
+            })
+        }
+        Op::Peek => {
+            let handle_id = resolve_handle(&raw, Op::Peek)?;
+            Ok(BashRequest::Peek {
+                handle_id,
+                read_args,
+            })
+        }
+        Op::Wait => {
+            let handle_id = resolve_handle(&raw, Op::Wait)?;
+            let wait_seconds = resolve_wait_seconds(raw.wait_seconds, effective_wait_seconds_opt)?;
+            Ok(BashRequest::Wait {
+                handle_id,
+                wait_seconds,
+                read_args,
+                deprecation_notice,
+            })
+        }
+        Op::Kill => {
+            let handle_id = resolve_handle(&raw, Op::Kill)?;
+            let signal = match raw.signal.as_deref() {
+                None | Some("TERM") => KillSignal::Term,
+                Some("KILL") => KillSignal::Kill,
+                Some(other) => {
+                    return Err(BashError::MutuallyExclusiveModes {
+                        message: format!(
+                            "signal='{other}' is not recognized; valid values are 'TERM' or 'KILL'"
+                        ),
+                        conflicting_args: vec!["signal"],
+                        recommended_action: "use signal='TERM' (default) or signal='KILL'".into(),
+                        extra: None,
+                    });
+                }
+            };
+            Ok(BashRequest::Kill { handle_id, signal })
+        }
     }
-    unreachable!("provided.len() checked == 1 above")
+}
+
+/// Determine the operation. Explicit `op` wins; otherwise infer from the
+/// single non-empty legacy operation-key field. Empty strings on legacy
+/// fields are ignored (default-fill tolerance).
+fn resolve_op(raw: &RawBashInput) -> Result<Op, BashError> {
+    if let Some(s) = raw.op.as_deref().filter(|s| !s.is_empty()) {
+        return match s {
+            "spawn" => Ok(Op::Spawn),
+            "peek" => Ok(Op::Peek),
+            "wait" => Ok(Op::Wait),
+            "kill" => Ok(Op::Kill),
+            other => Err(BashError::MutuallyExclusiveModes {
+                message: format!(
+                    "op='{other}' is not recognized; valid values are spawn|peek|wait|kill"
+                ),
+                conflicting_args: vec!["op"],
+                recommended_action: "set op to one of: spawn, peek, wait, kill".into(),
+                extra: None,
+            }),
+        };
+    }
+
+    let cmd_set = raw.cmd.as_deref().is_some_and(|s| !s.is_empty())
+        || raw.command.as_deref().is_some_and(|s| !s.is_empty());
+    let peek_set = raw.peek.as_deref().is_some_and(|s| !s.is_empty());
+    let wait_set = raw.wait.as_deref().is_some_and(|s| !s.is_empty());
+    let kill_set = raw.kill.as_deref().is_some_and(|s| !s.is_empty());
+
+    let mut found: Vec<(Op, &'static str)> = Vec::new();
+    if cmd_set {
+        found.push((Op::Spawn, "cmd"));
+    }
+    if peek_set {
+        found.push((Op::Peek, "peek"));
+    }
+    if wait_set {
+        found.push((Op::Wait, "wait"));
+    }
+    if kill_set {
+        found.push((Op::Kill, "kill"));
+    }
+
+    match found.len() {
+        1 => Ok(found[0].0),
+        0 => Err(BashError::MutuallyExclusiveModes {
+            message: "no operation specified; set 'op' to one of spawn|peek|wait|kill".into(),
+            conflicting_args: vec![],
+            recommended_action: "set op=spawn|peek|wait|kill".into(),
+            extra: None,
+        }),
+        _ => {
+            let names: Vec<&'static str> = found.iter().map(|(_, n)| *n).collect();
+            Err(BashError::MutuallyExclusiveModes {
+                message: format!(
+                    "multiple operations specified ({}); set exactly one via 'op'",
+                    names.join(", ")
+                ),
+                conflicting_args: names,
+                recommended_action: "set 'op' to the operation you want and remove the others"
+                    .into(),
+                extra: None,
+            })
+        }
+    }
+}
+
+/// Resolve the handle id for peek/wait/kill. Prefers the canonical
+/// `handle` field; falls back to the legacy operation-key field for
+/// backward compatibility.
+fn resolve_handle(raw: &RawBashInput, op: Op) -> Result<String, BashError> {
+    let canonical = raw.handle.as_deref().filter(|s| !s.is_empty());
+    if let Some(h) = canonical {
+        return Ok(h.to_string());
+    }
+    let legacy = match op {
+        Op::Peek => raw.peek.as_deref(),
+        Op::Wait => raw.wait.as_deref(),
+        Op::Kill => raw.kill.as_deref(),
+        Op::Spawn => None,
+    }
+    .filter(|s| !s.is_empty());
+    legacy
+        .map(String::from)
+        .ok_or_else(|| BashError::MutuallyExclusiveModes {
+            message: format!("op={} requires a non-empty 'handle'", op.as_field_name()),
+            conflicting_args: vec!["handle"],
+            recommended_action: "supply handle=<id>".into(),
+            extra: None,
+        })
 }
 
 fn parse_read_args(lines: Option<i64>, since: Option<i64>) -> Result<ReadArgs, BashError> {
+    // since=0 is a default-fill from the schema's prior `minimum: 0`; it's
+    // also semantically equivalent to "tail of everything" on a bounded
+    // ring, so dropping it loses no information. The schema now advertises
+    // minimum: 1 to discourage emission, but the parser stays tolerant for
+    // legacy in-flight conversations and any model that ignores the bound.
+    let since = since.filter(|n| *n > 0);
+
     if lines.is_some() && since.is_some() {
         return Err(BashError::PeekArgsMutuallyExclusive);
     }
@@ -418,18 +512,7 @@ fn parse_read_args(lines: Option<i64>, since: Option<i64>) -> Result<ReadArgs, B
             });
         }
     };
-    let since = match since {
-        None => None,
-        Some(n) if n >= 0 => Some(u64::try_from(n).unwrap_or(0)),
-        Some(_) => {
-            return Err(BashError::MutuallyExclusiveModes {
-                message: "since must be a non-negative integer".into(),
-                conflicting_args: vec!["since"],
-                recommended_action: "pass since as a non-negative integer offset".into(),
-                extra: None,
-            });
-        }
-    };
+    let since = since.map(|n| u64::try_from(n).unwrap_or(0));
     Ok(ReadArgs { lines, since })
 }
 

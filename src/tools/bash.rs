@@ -52,45 +52,47 @@ impl Tool for BashTool {
         r#"Executes shell commands via bash -c, capturing combined stdout/stderr.
 Bash state changes (working dir, variables, aliases) don't persist between calls.
 
-Modes (exactly one per call):
+Pick one operation via `op`:
 
-  cmd=<string>     Spawn a new command. wait_seconds (default 30) is NOT a
-                   timeout — the process is NEVER killed when wait_seconds
-                   elapses. wait_seconds only controls how long this single
-                   tool call blocks before handing you back a handle so you
-                   can do other work. The process keeps running in the
-                   background until it exits naturally or you call
-                   kill=<handle>. A response with status="still_running"
-                   means the process is alive and will stay alive — peek
-                   it later, wait on it, or kill it explicitly.
+  op="spawn"  Spawn a new command. Required: cmd=<shell command>.
+              wait_seconds (default 30) is NOT a timeout — the process is
+              NEVER killed when wait_seconds elapses. wait_seconds only
+              controls how long this single tool call blocks before handing
+              you back a handle so you can do other work. The process keeps
+              running in the background until it exits naturally or you
+              call op="kill". A response with status="still_running" means
+              the process is alive and will stay alive — peek it later,
+              wait on it, or kill it explicitly.
 
-  peek=<handle>    Return the current ring buffer state for a handle.
-                   Use lines=N for the last N lines, or since=K for lines
-                   after offset K. status="tombstoned" in the response
-                   means the handle's process has finished — the
-                   final_cause field tells you how (exited normally, or
-                   killed by signal). status="kill_pending_kernel" means
-                   the kill signal you sent was delivered but the process
-                   is in uninterruptible kernel sleep — peek again later;
-                   sending kill again with the same signal does NOT
-                   compound (signals don't queue that way), but you can
-                   escalate by sending kill with signal=KILL.
+  op="peek"   Return the current ring buffer state for a handle. Required:
+              handle=<id>. Use lines=N for the last N lines, or since=K
+              for lines after offset K. status="tombstoned" in the
+              response means the handle's process has finished — the
+              final_cause field tells you how (exited normally, or killed
+              by signal). status="kill_pending_kernel" means the kill
+              signal you sent was delivered but the process is in
+              uninterruptible kernel sleep — peek again later; sending
+              kill again with the same signal does NOT compound (signals
+              don't queue that way), but you can escalate by sending
+              op="kill" with signal=KILL.
 
-  wait=<handle>    Block up to wait_seconds for an existing handle to exit.
-                   If wait_seconds elapses first, the SAME handle is
-                   returned with status="still_running" — never accumulate
-                   handles by repeated waits. If the handle has already
-                   finished, returns immediately with status="tombstoned".
+  op="wait"   Block up to wait_seconds for an existing handle to exit.
+              Required: handle=<id>. If wait_seconds elapses first, the
+              SAME handle is returned with status="still_running" — never
+              accumulate handles by repeated waits. If the handle has
+              already finished, returns immediately with
+              status="tombstoned".
 
-  kill=<handle>    Terminate a handle. Default signal is TERM; signal=KILL
-                   for immediate. The signal is sent EXACTLY ONCE; this
-                   tool does not auto-escalate TERM to KILL after a grace
-                   period. If your TERM doesn't take effect within
-                   ~30 seconds, the response is status="kill_pending_kernel"
-                   and you decide whether to escalate by calling kill
-                   again with signal=KILL. (Don't retry with signal=TERM:
-                   the kernel doesn't queue duplicate signals; the original
-                   TERM is still pending and a second TERM is a no-op.)
+  op="kill"   Terminate a handle. Required: handle=<id>. Default signal
+              is TERM; signal=KILL for immediate. The signal is sent
+              EXACTLY ONCE; this tool does not auto-escalate TERM to
+              KILL after a grace period. If your TERM doesn't take effect
+              within ~30 seconds, the response is
+              status="kill_pending_kernel" and you decide whether to
+              escalate by calling op="kill" again with signal=KILL.
+              (Don't retry with signal=TERM: the kernel doesn't queue
+              duplicate signals; the original TERM is still pending and
+              a second TERM is a no-op.)
 
 If you peek a handle and get error="handle_not_found", it likely means
 Phoenix restarted between when you spawned the process and now — bash
@@ -104,48 +106,51 @@ For complex scripts, write them to a file first and execute the file."#
     }
 
     fn input_schema(&self) -> Value {
-        // Anthropic's tool-use API rejects `oneOf` / `allOf` / `anyOf` at the
-        // top level of input_schema, so mutual exclusivity between cmd / peek
-        // / wait / kill is documented in the description and enforced at
-        // runtime via the `mutually_exclusive_modes` error envelope.
+        // Single discriminator (`op`) plus per-op value fields. This shape
+        // avoids the prior 4-sibling-string pattern, which models on the
+        // OpenAI Responses API would default-fill (every optional string
+        // emitted as ""), tripping the runtime mutex check. See
+        // specs/bash/requirements.md REQ-BASH-010.
         json!({
             "type": "object",
-            "description": "Exactly one of `cmd`, `peek`, `wait`, or `kill` must be set per call. Setting more than one (or none) returns the `mutually_exclusive_modes` error.",
+            "description": "Set `op` to spawn|peek|wait|kill. For op=spawn set `cmd`; for op=peek|wait|kill set `handle`.",
             "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["spawn", "peek", "wait", "kill"],
+                    "description": "Operation to perform."
+                },
                 "cmd": {
                     "type": "string",
-                    "description": "Shell command to execute via `bash -c` (spawn). The bash wrapper stays alive as the parent of the user command; signal info propagates either via `WIFSIGNALED` directly or via the 128+signum exit-code convention."
+                    "description": "Shell command to execute via `bash -c` (op=spawn). The bash wrapper stays alive as the parent of the user command; signal info propagates either via `WIFSIGNALED` directly or via the 128+signum exit-code convention."
+                },
+                "handle": {
+                    "type": "string",
+                    "description": "Handle id (op=peek|wait|kill)."
                 },
                 "wait_seconds": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 900,
-                    "description": "How long this single tool call blocks before handing back a handle (default 30). This is NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use kill=<handle> to actually terminate."
+                    "description": "How long this single tool call blocks before handing back a handle (default 30; op=spawn|wait). NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use op=kill to actually terminate."
                 },
-                "peek": { "type": "string", "description": "Handle id to peek" },
-                "wait": { "type": "string", "description": "Handle id to wait on" },
-                "kill": { "type": "string", "description": "Handle id to kill" },
                 "signal": {
                     "type": "string",
                     "enum": ["TERM", "KILL"],
-                    "description": "Signal to send (kill only); default TERM. Sent exactly once; no auto-escalation."
+                    "description": "Signal to send (op=kill only); default TERM. Sent exactly once; no auto-escalation."
                 },
                 "lines": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Tail mode: return last N lines"
+                    "description": "Tail mode: return last N lines (default 200)."
                 },
                 "since": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "Incremental mode: return lines from offset K"
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["default", "slow", "background"],
-                    "description": "DEPRECATED — alias for wait_seconds (default=30, slow=900, background=0); removed in the second Phoenix release after this revision lands."
+                    "minimum": 1,
+                    "description": "Incremental mode: return lines after offset K. Mutually exclusive with lines."
                 }
-            }
+            },
+            "required": ["op"]
         })
     }
 
@@ -654,7 +659,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode_plus_wait_seconds_returns_mutually_exclusive_modes() {
+    async fn mode_with_wait_seconds_silently_drops_mode() {
+        // Old behavior: mode + wait_seconds → mutually_exclusive_modes.
+        // New behavior: mode is silently dropped when wait_seconds is set.
+        // Rationale: GPT models default-fill `mode="default"` alongside
+        // explicit wait_seconds; failing the call is worse than picking
+        // the canonical knob.
         let tool = BashTool;
         let result = tool
             .run(
@@ -666,13 +676,12 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(!result.success);
+        assert!(result.success, "got: {}", result.output);
         let v = parse_response(&result);
-        assert_eq!(v["error"], "mutually_exclusive_modes");
-        let conflicting = v["conflicting_args"].as_array().unwrap();
-        let names: Vec<&str> = conflicting.iter().map(|x| x.as_str().unwrap()).collect();
-        assert!(names.contains(&"mode") && names.contains(&"wait_seconds"));
-        assert!(v["recommended_action"].as_str().unwrap().contains("mode"));
+        assert!(matches!(
+            v["status"].as_str().unwrap(),
+            "exited" | "still_running"
+        ));
     }
 
     #[tokio::test]
@@ -711,13 +720,46 @@ mod tests {
 
     #[tokio::test]
     async fn peek_args_mutually_exclusive_returns_error() {
+        // Note: since=5, not since=0. The parser now treats since=0 as
+        // absent (a default-fill from models that emit the schema's prior
+        // `minimum: 0`), so it would not collide with `lines=10`. A
+        // non-zero `since` still genuinely conflicts.
         let tool = BashTool;
         let result = tool
-            .run(json!({"peek": "b-1", "lines": 10, "since": 0}), ctx())
+            .run(json!({"peek": "b-1", "lines": 10, "since": 5}), ctx())
             .await;
         assert!(!result.success);
         let v = parse_response(&result);
         assert_eq!(v["error"], "peek_args_mutually_exclusive");
+    }
+
+    /// Companion: lines + since=0 is now tolerated (the `since` is
+    /// dropped as a default-fill).
+    #[tokio::test]
+    async fn peek_with_lines_and_since_zero_drops_since_silently() {
+        let tool = BashTool;
+        let registry = Arc::new(BashHandleRegistry::new());
+        let c = ctx_with_registry(registry);
+        let spawn = tool
+            .run(
+                json!({"op": "spawn", "cmd": "echo hi; sleep 5", "wait_seconds": 0}),
+                c.clone(),
+            )
+            .await;
+        let handle = parse_response(&spawn)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peek = tool
+            .run(
+                json!({"op": "peek", "handle": handle.clone(), "lines": 10, "since": 0}),
+                c.clone(),
+            )
+            .await;
+        assert!(peek.success, "got: {}", peek.output);
+        let _ = tool
+            .run(json!({"op": "kill", "handle": handle, "signal": "KILL"}), c)
+            .await;
     }
 
     #[tokio::test]
@@ -743,6 +785,88 @@ mod tests {
             .map(|x| x.as_str().unwrap())
             .collect();
         assert!(names.contains(&"cmd") && names.contains(&"peek"));
+    }
+
+    /// Regression for the production failure with GPT models on the
+    /// Responses API: every optional field is default-filled (empty
+    /// strings on the operation-key fields, `mode="default"`,
+    /// `wait_seconds=30`, `lines=1`, `since=0`, `signal="TERM"`). With
+    /// the discriminator-shaped schema and tolerance rules, this now
+    /// parses as a spawn with cmd.
+    #[tokio::test]
+    async fn gpt_default_fill_shape_is_tolerated() {
+        let tool = BashTool;
+        let result = tool
+            .run(
+                json!({
+                    "cmd": "echo hi",
+                    "kill": "", "peek": "", "wait": "",
+                    "mode": "default", "wait_seconds": 30,
+                    "lines": 1, "since": 0,
+                    "signal": "TERM"
+                }),
+                ctx(),
+            )
+            .await;
+        assert!(result.success, "got: {}", result.output);
+        let v = parse_response(&result);
+        assert!(matches!(
+            v["status"].as_str().unwrap(),
+            "exited" | "still_running"
+        ));
+    }
+
+    /// New schema shape using the `op` discriminator: spawn.
+    #[tokio::test]
+    async fn op_spawn_with_cmd_succeeds() {
+        let tool = BashTool;
+        let result = tool
+            .run(json!({"op": "spawn", "cmd": "echo hi"}), ctx())
+            .await;
+        assert!(result.success, "got: {}", result.output);
+    }
+
+    /// New schema shape: peek with handle field.
+    #[tokio::test]
+    async fn op_peek_with_handle_routes_through_lookup() {
+        let tool = BashTool;
+        let registry = Arc::new(BashHandleRegistry::new());
+        let c = ctx_with_registry(registry);
+
+        // Spawn first to get a real handle.
+        let spawn = tool
+            .run(
+                json!({"op": "spawn", "cmd": "sleep 5", "wait_seconds": 0}),
+                c.clone(),
+            )
+            .await;
+        let handle = parse_response(&spawn)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Peek using the new shape.
+        let peek = tool
+            .run(json!({"op": "peek", "handle": handle.clone()}), c.clone())
+            .await;
+        assert!(peek.success, "got: {}", peek.output);
+        let v = parse_response(&peek);
+        assert_eq!(v["handle"], handle);
+
+        // Cleanup.
+        let _ = tool
+            .run(json!({"op": "kill", "handle": handle, "signal": "KILL"}), c)
+            .await;
+    }
+
+    /// Sanity control: legacy shape (just `cmd`, no `op`) still works
+    /// via inference. Required so in-flight conversations whose history
+    /// uses the pre-discriminator shape don't break.
+    #[tokio::test]
+    async fn legacy_cmd_only_shape_still_succeeds() {
+        let tool = BashTool;
+        let result = tool.run(json!({"cmd": "echo hi"}), ctx()).await;
+        assert!(result.success, "got: {}", result.output);
     }
 
     // -----------------------------------------------------------------

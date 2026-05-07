@@ -21,52 +21,60 @@ in-memory only — they do not survive Phoenix restart.
 ```json
 {
   "type": "object",
+  "required": ["op"],
   "properties": {
-    "cmd":  { "type": "string",  "description": "Shell command to execute via bash -c (spawn). The bash wrapper stays alive as the parent of the user command; on exit the bash wrapper relays the user command's signal info through ExitStatus (`WIFSIGNALED` directly, or via the 128+signum exit-code convention when bash itself was not signaled — see REQ-BASH-006)." },
+    "op":     { "type": "string", "enum": ["spawn", "peek", "wait", "kill"],
+                "description": "Operation to perform." },
+    "cmd":    { "type": "string",
+                "description": "Shell command to execute via bash -c (op=spawn). The bash wrapper stays alive as the parent of the user command; on exit the bash wrapper relays the user command's signal info through ExitStatus (`WIFSIGNALED` directly, or via the 128+signum exit-code convention when bash itself was not signaled — see REQ-BASH-006)." },
+    "handle": { "type": "string",
+                "description": "Handle id (op=peek|wait|kill)." },
     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 900,
-                      "description": "How long this single tool call blocks before handing back a handle (default 30). This is NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use kill=<handle> to actually terminate." },
-
-    "peek": { "type": "string", "description": "Handle id to peek" },
-    "wait": { "type": "string", "description": "Handle id to wait on" },
-    "kill": { "type": "string", "description": "Handle id to kill" },
-
+                      "description": "How long this single tool call blocks before handing back a handle (default 30; op=spawn|wait). NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use op=kill to actually terminate." },
     "signal": { "type": "string", "enum": ["TERM", "KILL"],
-                "description": "Signal to send (kill only); default TERM. Sent exactly once; no auto-escalation." },
+                "description": "Signal to send (op=kill only); default TERM. Sent exactly once; no auto-escalation." },
     "lines":  { "type": "integer", "minimum": 1,
-                "description": "Tail mode: return last N lines" },
-    "since":  { "type": "integer", "minimum": 0,
-                "description": "Incremental mode: return lines from offset K" },
-
-    "mode": { "type": "string", "enum": ["default", "slow", "background"],
-              "description": "DEPRECATED — alias for wait_seconds; removed in the second Phoenix release after this revision lands." }
-  },
-  "oneOf": [
-    { "required": ["cmd"]  },
-    { "required": ["peek"] },
-    { "required": ["wait"] },
-    { "required": ["kill"] }
-  ]
+                "description": "Tail mode: return last N lines (default 200)." },
+    "since":  { "type": "integer", "minimum": 1,
+                "description": "Incremental mode: return lines after offset K. Mutually exclusive with `lines`." }
+  }
 }
 ```
 
-The `oneOf` clause makes mutual exclusion structural at the schema level;
-runtime check (`OperationKindMutuallyExclusive` in `bash.allium`) is a belt
-for backends that don't validate `oneOf`. Dual-pass `mode + wait_seconds` is
-rejected at runtime via `mutually_exclusive_modes` with
-`conflicting_args: ["mode", "wait_seconds"]` and a `recommended_action`
-field directing the agent to drop the deprecated `mode` parameter.
+`op` is a single discriminator. Anthropic's tool API rejects `oneOf` at the
+top level, so per-operation field requirements (e.g. spawn requires `cmd`,
+peek requires `handle`) are validated at runtime. The schema-level surface
+stays clean: every advertised field is optional except `op` itself.
+
+### Tolerance rules
+
+The parser accepts more than the schema advertises so in-flight conversations
+that predate the discriminator continue to work, and so OpenAI Responses API
+models — which default-fill optional string properties with `""` — don't
+fail on the operation-key check. Specifically:
+
+- WHEN `op` is absent, infer it from the single non-empty legacy field
+  among `{cmd, peek, wait, kill}`. Multiple non-empty legacy fields →
+  `mutually_exclusive_modes`.
+- Empty strings on any legacy operation-key field are treated as absent.
+- Empty `cmd` is treated as absent (op=spawn requires a non-empty value).
+- `since=0` is treated as absent (semantically equivalent to a large
+  `lines` value on a bounded ring; was a default-fill emission from the
+  prior `minimum: 0` schema).
+- `mode` is no longer in the schema. The parser still accepts it: silently
+  dropped when `wait_seconds` is also set; mapped to its canonical
+  `wait_seconds` value with a `deprecation_notice` when set alone.
 
 ### Operation Modes
 
-| Provided key | Operation | Required peers | Optional peers |
-|---|---|---|---|
-| `cmd`  | spawn | — | `wait_seconds`, `lines`/`since` (response window) |
-| `peek` | peek | — | `lines` xor `since` |
-| `wait` | wait | `wait_seconds` | `lines` xor `since` |
-| `kill` | kill | — | `signal` (default TERM) |
+| `op` value | Required peers | Optional peers |
+|---|---|---|
+| `spawn` | `cmd` | `wait_seconds`, `lines`/`since` (response window) |
+| `peek`  | `handle` | `lines` xor `since` |
+| `wait`  | `handle` | `wait_seconds`, `lines` xor `since` |
+| `kill`  | `handle` | `signal` (default TERM) |
 
-`mode` (deprecated) is honored only on spawn calls and only when
-`wait_seconds` is absent. Mapping when accepted:
+Legacy `mode` mapping when honored alone (no `wait_seconds`):
 
 | `mode` value | Equivalent `wait_seconds` |
 |---|---|
@@ -74,15 +82,10 @@ field directing the agent to drop the deprecated `mode` parameter.
 | `slow` | 900 |
 | `background` | 0 |
 
-When `mode` is supplied alongside `wait_seconds`, the call fails with
-`mutually_exclusive_modes` (with `conflicting_args` and
-`recommended_action`) rather than silently picking one. When
-`mode` is supplied alone, the response includes a `deprecation_notice`
-field stating the removal version explicitly. The field name is
-deliberately not underscore-prefixed (no `_deprecation`): leading-
-underscore is widely read by LLMs as "metadata; ignore," which is
-the opposite of the signal we want — the agent should attend to
-this field and migrate.
+The `deprecation_notice` field name is deliberately not underscore-prefixed
+(no `_deprecation`): leading-underscore is widely read by LLMs as "metadata;
+ignore," which is the opposite of the signal we want — the agent should
+attend to this field and migrate.
 
 ### Description Template (REQ-BASH-009, REQ-BASH-010)
 

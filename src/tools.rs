@@ -683,16 +683,13 @@ mod tests {
         }
     }
 
-    /// REQ-BASH-010 / task 02697: the bash tool's input schema must reach
-    /// every registry that exposes bash, including sub-agent registries,
-    /// with all four operation keys (`cmd|peek|wait|kill`) declared as
-    /// optional properties, and the deprecated `mode` enum kept as a
-    /// backward-compat alias.
-    ///
-    /// Anthropic's tool-use API rejects top-level `oneOf` / `allOf` /
-    /// `anyOf` in input_schema, so mutual exclusivity between the four
-    /// operation keys is documented in the schema description and
-    /// enforced at runtime via `mutually_exclusive_modes`.
+    /// REQ-BASH-010: the bash tool's input schema must reach every registry
+    /// that exposes bash, including sub-agent registries, with the `op`
+    /// discriminator + per-op value fields. Anthropic's tool-use API
+    /// rejects top-level `oneOf` / `allOf` / `anyOf` in input_schema, so
+    /// per-operation field requirements are validated at runtime; the
+    /// schema-level surface stays clean with `op` as the only required
+    /// field.
     #[test]
     fn bash_input_schema_flows_through_to_subagent_registries() {
         for (label, registry) in [
@@ -719,32 +716,49 @@ mod tests {
                 "{label}: bash schema must not use top-level anyOf"
             );
 
-            // Mutual exclusivity is documented in the description.
             let description = schema
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or_else(|| panic!("{label}: bash schema missing description"));
             assert!(
-                description.contains("Exactly one"),
-                "{label}: bash schema description should declare mutual exclusivity"
+                description.contains("op"),
+                "{label}: bash schema description should reference the `op` discriminator"
             );
 
             let properties = schema
                 .get("properties")
                 .and_then(|p| p.as_object())
                 .unwrap_or_else(|| panic!("{label}: bash schema missing properties"));
-            for key in &["cmd", "peek", "wait", "kill"] {
+            // Discriminator + per-op value fields.
+            for key in &["op", "cmd", "handle"] {
                 assert!(
                     properties.contains_key(*key),
-                    "{label}: bash schema missing operation key `{key}`"
+                    "{label}: bash schema missing field `{key}`"
                 );
             }
             assert!(properties.contains_key("wait_seconds"));
             assert!(properties.contains_key("signal"));
             assert!(properties.contains_key("lines"));
             assert!(properties.contains_key("since"));
-            // Deprecation alias still surfaces.
-            assert!(properties.contains_key("mode"));
+
+            // `op` is the only schema-required field.
+            let required = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .unwrap_or_else(|| panic!("{label}: bash schema missing `required`"));
+            let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["op"],
+                "{label}: only `op` should be schema-required"
+            );
+
+            // Deprecated `mode` is dropped from the schema (parser still
+            // tolerates it for in-flight history).
+            assert!(
+                !properties.contains_key("mode"),
+                "{label}: deprecated `mode` should no longer appear in the schema"
+            );
         }
     }
 }
