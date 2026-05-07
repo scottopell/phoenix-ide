@@ -173,6 +173,7 @@ export function ConversationList({
             <span
               className={`conv-state-dot ${getDisplayState(conv.state?.type)}`}
               title={(() => {
+                if (conv.state?.type === 'context_exhausted') return 'Context full';
                 const s = getDisplayState(conv.state?.type);
                 switch (s) {
                   case 'idle':
