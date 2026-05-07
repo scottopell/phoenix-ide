@@ -595,7 +595,7 @@ export function useConnection({
   }, [conversationId]);
 
   const retryNow = useCallback(() => {
-    dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
+    dispatchMachineRef.current({ type: 'RETRY_NOW' });
   }, []);
 
   return {

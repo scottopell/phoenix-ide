@@ -19,7 +19,8 @@ export type ConnectionInput =
   | { type: 'BROWSER_ONLINE' }             // navigator.onLine became true
   | { type: 'BROWSER_OFFLINE' }            // navigator.onLine became false
   | { type: 'RETRY_TIMER_FIRED' }          // Backoff timer completed
-  | { type: 'RECONNECTED_DISPLAY_DONE' };  // Brief "reconnected" display finished
+  | { type: 'RECONNECTED_DISPLAY_DONE' }   // Brief "reconnected" display finished
+  | { type: 'RETRY_NOW' };                 // User clicked the retry-now button
 
 export type ConnectionEffect =
   // Open EventSource connection. `epoch` is a per-machine monotonic
@@ -126,10 +127,16 @@ export function transition(
     }
 
     case 'SSE_OPEN': {
-      // Successfully connected
+      // Source-state guard: SSE_OPEN is meaningful only when we're actively
+      // trying to connect. From `disconnected`/`connected`/`reconnected` it
+      // would mean a buffered MessageEvent fired after we already reached a
+      // stable state; treat as no-op rather than silently transitioning to
+      // a state inconsistent with the open EventSource.
+      if (current.state !== 'connecting' && current.state !== 'reconnecting' && current.state !== 'offline') {
+        return { state: current, effects };
+      }
       effects.push({ type: 'CANCEL_TIMERS' });
 
-      // If we were reconnecting, show brief "reconnected" state
       if (current.state === 'reconnecting' || current.state === 'offline') {
         effects.push({ type: 'SCHEDULE_RECONNECTED_DISPLAY' });
         return {
@@ -205,6 +212,25 @@ export function transition(
         effects.push({ type: 'OPEN_SSE', epoch: nextEpoch });
         return {
           state: { ...current, nextRetryMs: null, epoch: nextEpoch },
+          effects,
+        };
+      }
+      return { state: current, effects };
+    }
+
+    case 'RETRY_NOW': {
+      // User-initiated reconnect. From a state where we'd otherwise wait
+      // (offline/reconnecting) we cancel the backoff and try immediately.
+      // From `disconnected` we treat it as a CONNECT. From states where a
+      // connection is already in progress or established it's a no-op.
+      if (current.state === 'reconnecting' || current.state === 'offline' || current.state === 'disconnected') {
+        const nextEpoch = current.epoch + 1;
+        effects.push({ type: 'CANCEL_TIMERS' });
+        effects.push({ type: 'OPEN_SSE', epoch: nextEpoch });
+        const nextState: ConnectionState =
+          current.state === 'disconnected' ? 'connecting' : 'reconnecting';
+        return {
+          state: { state: nextState, attempt: 0, nextRetryMs: null, epoch: nextEpoch },
           effects,
         };
       }
