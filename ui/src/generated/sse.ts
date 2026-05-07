@@ -24,7 +24,7 @@ export type { BashRunningPayload } from './BashRunningPayload';
 export type { BashStillRunningPayload } from './BashStillRunningPayload';
 export type { BashKillPendingKernelPayload } from './BashKillPendingKernelPayload';
 export type { BashTombstonedPayload } from './BashTombstonedPayload';
-export type { BashSpawnTombstonePayload } from './BashSpawnTombstonePayload';
+export type { BashRunTombstonePayload } from './BashRunTombstonePayload';
 export type { BashWaiterPanickedPayload } from './BashWaiterPanickedPayload';
 export type { BashRingWindow } from './BashRingWindow';
 export type { BashRingLine } from './BashRingLine';
