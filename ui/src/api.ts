@@ -89,6 +89,10 @@ export interface Conversation {
    *  this absent or null. The sidebar falls back to the root conversation's
    *  slug when this is null/absent. */
   chain_name?: string | null;
+  /** Server-computed: true when this conversation needs user attention —
+   *  context_exhausted without a continuation, or awaiting task/user approval.
+   *  Use getConvDisplayState(conv) instead of reading this directly. */
+  requires_action?: boolean;
 }
 
 export interface Project {
@@ -147,18 +151,26 @@ export type ConversationState =
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
-/** Derive the coarse display category from a conversation's state type.
- *  Use this instead of reading `display_state` off the conversation object. */
-export function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
+export type DisplayState = 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval';
+
+function getDisplayState(stateType: string | undefined): DisplayState {
   switch (stateType) {
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
     case 'error': return 'error';
-    case 'context_exhausted': return 'awaiting_approval';
+    case 'context_exhausted': return 'idle';
     case 'awaiting_task_approval': return 'awaiting_approval';
     case 'awaiting_user_response': return 'awaiting_approval';
     default: return stateType ? 'working' : 'idle';
   }
+}
+
+/** Single canonical function for determining a conversation's display state.
+ *  All status dot rendering must go through this — do not read conv.state.type
+ *  or conv.requires_action directly at call sites. */
+export function getConvDisplayState(conv: Conversation | undefined): DisplayState {
+  if (conv?.requires_action) return 'awaiting_approval';
+  return getDisplayState(conv?.state?.type);
 }
 
 export interface ToolCall {

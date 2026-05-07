@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getDisplayState } from '../api';
+import { getConvDisplayState } from '../api';
 import type { Conversation } from '../api';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 import {
@@ -171,23 +171,17 @@ export function ConversationList({
         <div className="conv-item-main" onClick={() => handleClick(conv)}>
           <div className="conv-item-slug">
             <span
-              className={`conv-state-dot ${getDisplayState(conv.state?.type)}`}
+              className={`conv-state-dot ${getConvDisplayState(conv)}`}
               title={(() => {
-                if (conv.state?.type === 'context_exhausted') return 'Context full';
-                const s = getDisplayState(conv.state?.type);
-                switch (s) {
-                  case 'idle':
-                    return 'Ready';
-                  case 'working':
-                    return 'Working';
-                  case 'error':
-                    return 'Error';
-                  case 'terminal':
-                    return 'Completed';
-                  case 'awaiting_approval':
-                    return 'Awaiting approval';
-                  default:
-                    return s;
+                if (conv.state?.type === 'context_exhausted') {
+                  return conv.requires_action ? 'Context full' : 'Continued';
+                }
+                switch (getConvDisplayState(conv)) {
+                  case 'idle': return 'Ready';
+                  case 'working': return 'Working';
+                  case 'error': return 'Error';
+                  case 'terminal': return 'Completed';
+                  case 'awaiting_approval': return 'Awaiting approval';
                 }
               })()}
             />

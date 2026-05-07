@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { api, getDisplayState } from '../api';
+import { api, getConvDisplayState } from '../api';
 import type { ChainView, Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -184,7 +184,7 @@ export function Sidebar({
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
         <div className="sidebar-collapsed-dots">
           {conversations.slice(0, 15).map(conv => {
-            const displayState = getDisplayState(conv.state?.type);
+            const displayState = getConvDisplayState(conv);
             const isActive = conv.slug === activeSlug;
             return (
               <button

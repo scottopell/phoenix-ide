@@ -350,6 +350,7 @@ fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
             "display_state".to_string(),
             Value::String(conv.state.display_state().as_str().to_string()),
         );
+        map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
     }
     val
 }
@@ -366,8 +367,19 @@ async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conv
             "display_state".to_string(),
             Value::String(conv.state.display_state().as_str().to_string()),
         );
+        map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
     }
     val
+}
+
+fn conv_requires_action(conv: &crate::db::Conversation) -> bool {
+    match &conv.state {
+        ConvState::ContextExhausted { .. } => conv.continued_in_conv_id.is_none(),
+        state => matches!(
+            state.display_state(),
+            crate::state_machine::state::DisplayState::AwaitingApproval
+        ),
+    }
 }
 
 // ============================================================
