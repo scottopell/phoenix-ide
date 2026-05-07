@@ -584,6 +584,11 @@ export function useConnection({
 
   useEffect(() => {
     if (conversationId) {
+      // Null the atom's retained `connectionEpoch` from a prior visit so
+      // the new generation's first `connection_opened` is accepted (the
+      // atom's monotonic guard would otherwise reject a lower epoch from
+      // the freshly-mounted machine).
+      dispatchRef.current({ type: 'connection_reset' });
       dispatchMachineRef.current({ type: 'CONNECT' });
     } else {
       dispatchMachineRef.current({ type: 'DISCONNECT' });
@@ -593,6 +598,27 @@ export function useConnection({
       dispatchMachineRef.current({ type: 'DISCONNECT' });
     };
   }, [conversationId]);
+
+  // Mirror machine state to the atom's `connectionState` so consumers that
+  // only have access to the atom (deeply nested components reading via
+  // useConversationAtom) can render the connection indicator without
+  // prop-drilling `connectionInfo`. Stamped with the machine epoch so a
+  // stale executor cannot override the current generation's value.
+  useEffect(() => {
+    const mapped: 'connecting' | 'live' | 'reconnecting' | 'failed' =
+      machineState.state === 'connected' || machineState.state === 'reconnected'
+        ? 'live'
+        : machineState.state === 'reconnecting'
+          ? 'reconnecting'
+          : machineState.state === 'offline'
+            ? 'failed'
+            : 'connecting';
+    dispatchRef.current({
+      type: 'connection_state',
+      state: mapped,
+      epoch: machineState.epoch,
+    });
+  }, [machineState.state, machineState.epoch]);
 
   const retryNow = useCallback(() => {
     dispatchMachineRef.current({ type: 'RETRY_NOW' });
