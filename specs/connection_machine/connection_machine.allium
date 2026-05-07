@@ -112,6 +112,16 @@ entity ClientConnection {
     attempt: Integer
     current_stream: sse_wire/SseStream?
     next_retry_ms: Integer?
+    -- Per-machine monotonic counter. Bumped on every transition that
+    -- emits an OPEN_SSE effect (CONNECT from disconnected, BROWSER_ONLINE
+    -- from offline/reconnecting, RETRY_TIMER_FIRED, RETRY_NOW). The
+    -- effect carries the new value so the executor can stamp every
+    -- dispatched SSE event with the connection generation that produced
+    -- it. The stamp is what conversation_atom.allium's
+    -- ConnectionOpenedMonotonic / isStaleEpoch rules consume — this
+    -- field IS the conversation_atom's `connectionEpoch`, observed at
+    -- the source rather than at the reducer.
+    epoch: Integer
 
     transitions state {
         disconnected -> connecting
@@ -192,8 +202,11 @@ rule ClientMounted {
         state: connecting,
         attempt: 0,
         current_stream: null,
-        next_retry_ms: null
+        next_retry_ms: null,
+        epoch: 1
     )
+
+    @effect: emits OPEN_SSE{epoch: 1}
 
     @guidance
         -- useConnection.ts:
@@ -417,6 +430,9 @@ rule RetryTimerFired {
 
     ensures: not exists RetryTimer{client: client}
     ensures: client.next_retry_ms = null
+    ensures: client.epoch = client.epoch + 1
+
+    @effect: emits OPEN_SSE{epoch: client.epoch}
 
     @guidance
         -- connectionMachine.ts RETRY_TIMER_FIRED emits effects=[OPEN_SSE]
@@ -442,7 +458,10 @@ rule BrowserReportedOnline {
 
     ensures: client.state = reconnecting
     ensures: client.next_retry_ms = null
+    ensures: client.epoch = client.epoch + 1
     ensures: not exists RetryTimer{client: client}
+
+    @effect: emits OPEN_SSE{epoch: client.epoch}
 
     @guidance
         -- Effects: [CANCEL_TIMERS, OPEN_SSE]. Triggered by the
@@ -474,7 +493,10 @@ rule UserTriggeredRetryNow {
 
     ensures: client.attempt = 0
     ensures: client.next_retry_ms = null
+    ensures: client.epoch = client.epoch + 1
     ensures: not exists RetryTimer{client: client}
+
+    @effect: emits OPEN_SSE{epoch: client.epoch}
 
     @guidance
         -- connectionMachine.ts RETRY_NOW case:
@@ -528,7 +550,10 @@ rule TabVisibilityRegained {
 
     ensures: client.state = reconnecting
     ensures: client.next_retry_ms = null
+    ensures: client.epoch = client.epoch + 1
     ensures: not exists RetryTimer{client: client}
+
+    @effect: emits OPEN_SSE{epoch: client.epoch}
 
     @guidance
         -- useConnection.ts:
@@ -647,6 +672,17 @@ invariant OfflineClearsSession {
 invariant AttemptNonNegative {
     for c in ClientConnections:
         c.attempt >= 0
+}
+
+-- Epoch is non-negative. The four rules that emit OPEN_SSE bump it
+-- monotonically; no rule ever decrements. (Hook remount destroys the
+-- ClientConnection entity and creates a fresh one with epoch=1, which
+-- is independent of any prior client's epoch — see
+-- conversation_atom.allium ConnectionReset for how the atom side
+-- handles this.)
+invariant EpochNonNegative {
+    for c in ClientConnections:
+        c.epoch >= 0
 }
 
 -- Retry delay ceiling. The backoff function is

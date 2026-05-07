@@ -127,10 +127,46 @@ actor ClientReducer {
 ------------------------------------------------------------
 -- Rules — wire-originated transitions
 ------------------------------------------------------------
--- Every wire rule routes through the applyIfNewer guard: the action's
--- sequence_id must strictly exceed atom.lastSequenceId, or the event is
--- dropped as a replay. On apply, lastSequenceId advances to the action's
--- sequence_id. Sse_init is the exception (see its rule below).
+-- Every wire rule routes through TWO guards in order:
+--
+--   1. isStaleEpoch (cross-conversation contamination guard): the
+--      action's epoch must equal atom.connectionEpoch. A mismatch
+--      means the action came from a stale EventSource (a different
+--      slug's connection that hadn't fully closed when this atom's
+--      generation took over). Captured by the WireActionStaleEpochDropped
+--      rule below; per-action rules implicitly assume this guard has
+--      already run.
+--
+--   2. applyIfNewer (replay guard): the action's sequence_id must
+--      strictly exceed atom.lastSequenceId, or the event is dropped
+--      as a replay. On apply, lastSequenceId advances to the action's
+--      sequence_id. Sse_init is the exception (see its rule below).
+
+-- Cross-conversation contamination drop. Any wire-originated action
+-- (those carrying an `epoch` field) whose epoch does not match the
+-- atom's `connectionEpoch` is dropped before any per-action rule
+-- fires. Bootstrap exception: when atom.connectionEpoch is null (the
+-- atom hasn't accepted any connection_opened yet), the first stamped
+-- action is allowed through so the connection can come online.
+rule WireActionStaleEpochDropped {
+    when: WireActionDispatched(atom, action)
+
+    requires: atom.connectionEpoch != null
+    requires: action.epoch != atom.connectionEpoch
+
+    ensures: atom = atom
+
+    @guidance
+        -- atom.ts:256-280 (isStaleEpoch). Applies to:
+        -- sse_init, sse_message, sse_message_updated, sse_state_change,
+        -- sse_agent_done, sse_token, sse_conversation_update,
+        -- sse_browser_session_state, sse_error, connection_state.
+        -- Bypassed for: connection_opened (which carries the epoch as
+        -- DATA, not as a stamp — the rule's monotonic check is the
+        -- guard there), connection_reset (no epoch, mount-only),
+        -- and all client-originated actions (gated by
+        -- expectedConversationId instead).
+}
 
 -- `init` on fresh connect: full state snapshot replaces atom.
 rule SseInitFreshConnect {
@@ -443,6 +479,15 @@ rule ConnectionStateChanged {
 
     ensures: atom.connectionState = newState
     ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- The action carries an `epoch` field stamped by useConnection.
+        -- Like all wire-stamped actions, it's gated by isStaleEpoch
+        -- before reaching this case: a connection_state from a stale
+        -- generation is dropped at the reducer boundary rather than
+        -- overwriting the live generation's value. The case itself
+        -- is unconditional only because the staleness check has
+        -- already run.
 }
 
 ------------------------------------------------------------
