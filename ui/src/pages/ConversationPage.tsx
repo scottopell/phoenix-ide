@@ -53,10 +53,15 @@ const CredentialHelperPanel = lazy(() =>
 const TerminalPanel = lazy(() =>
   import('../components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
 );
+const BrowserViewPanel = lazy(() =>
+  import('../components/BrowserViewPanel').then((m) => ({ default: m.BrowserViewPanel })),
+);
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import {
+  BrowserViewStateProvider,
   DiffViewerStateProvider,
+  useBrowserViewState,
   useDiffViewerState,
 } from '../contexts/ViewerStateContext';
 
@@ -87,7 +92,9 @@ export function ConversationPage() {
   return (
     <ReviewNotesProvider scopeKey={slug}>
       <DiffViewerStateProvider scopeKey={slug}>
-        <ConversationPageContent />
+        <BrowserViewStateProvider scopeKey={slug}>
+          <ConversationPageContent />
+        </BrowserViewStateProvider>
       </DiffViewerStateProvider>
     </ReviewNotesProvider>
   );
@@ -115,6 +122,9 @@ function ConversationPageContent() {
   // Diff viewer slot — lifted out of WorkActions so the diff can mount
   // inline beside chat at ≥1280px (task 08654 follow-on).
   const diffViewer = useDiffViewerState();
+  // Browser live-view slot (REQ-BT-018). Mutually exclusive with prose +
+  // diff. Auto-mount logic lives below in the messages effect.
+  const browserView = useBrowserViewState();
   // Single-slot model: opening one viewer closes the other so the user
   // never sees both fighting for the split pane. When both are set,
   // file wins (most-recent-action — fileExplorer.openFile is what
@@ -124,14 +134,30 @@ function ConversationPageContent() {
   // chain elsewhere; this effect catches the file-clicks-while-diff-open
   // case the click handlers don't reach.
   const closeDiff = diffViewer.close;
+  const closeBrowserView = browserView.closePanel;
   useEffect(() => {
     if (fileExplorer.proseReaderState && diffViewer.payload) {
       closeDiff();
     }
   }, [fileExplorer.proseReaderState, diffViewer.payload, closeDiff]);
+  // Browser view is mutually exclusive with prose + diff. If anything else
+  // is in the slot, close the browser view; the user's most recent action
+  // wins. The reverse direction (closing prose/diff when the user opens
+  // browser) is handled in `handleOpenBrowserView` below.
+  useEffect(() => {
+    if (browserView.open && (fileExplorer.proseReaderState || diffViewer.payload)) {
+      closeBrowserView();
+    }
+  }, [browserView.open, fileExplorer.proseReaderState, diffViewer.payload, closeBrowserView]);
   // Close handlers also clear the OTHER viewer to be safe (for cases
   // where state machines briefly hold both during transitions).
   const handleCloseDiff = useCallback(() => closeDiff(), [closeDiff]);
+  const handleCloseBrowserView = useCallback(() => closeBrowserView(), [closeBrowserView]);
+  const handleOpenBrowserView = useCallback(() => {
+    fileExplorer.closeFile();
+    closeDiff();
+    browserView.openPanel();
+  }, [fileExplorer, closeDiff, browserView]);
   const [isDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
   // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
   // Below this we keep the existing full-screen overlay UX; above, the
@@ -464,6 +490,47 @@ function ConversationPageContent() {
       void cacheDB.putConversation(atom.conversation);
     }
   }, [atom.conversation]);
+
+  // REQ-BT-018: detect first `browser_*` tool use and auto-mount the live
+  // view *only if the slot is empty*. After first activation the user's
+  // explicit slot choice is sticky — we never displace prose / diff.
+  //
+  // We walk the messages once after each update; the `hasActivated` flag is
+  // sticky in the provider, so once we set it we can safely fall through on
+  // subsequent renders without re-checking. The auto-mount itself only ever
+  // happens on the *transition* not-activated -> activated, by reading the
+  // slot state at that moment.
+  const browserHasActivated = browserView.hasActivated;
+  const markBrowserActivated = browserView.markActivated;
+  const openBrowserPanel = browserView.openPanel;
+  useEffect(() => {
+    if (browserHasActivated) return;
+    const found = atom.messages.some((m) => {
+      if (!Array.isArray(m.content)) return false;
+      for (const block of m.content) {
+        if (block.type === 'tool_use' && typeof block.name === 'string' && block.name.startsWith('browser_')) {
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!found) return;
+    markBrowserActivated();
+    // Auto-mount only when the slot is empty (locked-in rule). Reading
+    // the slot state inside the effect rather than as a dep keeps the
+    // "only on the activation transition" semantics: if prose / diff
+    // open later they don't trip another auto-mount attempt.
+    if (!fileExplorer.proseReaderState && !diffViewer.payload) {
+      openBrowserPanel();
+    }
+  }, [
+    atom.messages,
+    browserHasActivated,
+    markBrowserActivated,
+    openBrowserPanel,
+    fileExplorer.proseReaderState,
+    diffViewer.payload,
+  ]);
 
   // Stable refs — needed inside sendMessage which is memoized with a stable
   // identity across renders.
@@ -828,6 +895,19 @@ function ConversationPageContent() {
         </div>
       );
     }
+    if (browserView.open && conversationId) {
+      return (
+        <div id="app">
+          <Suspense fallback={null}>
+            <BrowserViewPanel
+              conversationId={conversationId}
+              onClose={handleCloseBrowserView}
+              inline
+            />
+          </Suspense>
+        </div>
+      );
+    }
   }
 
   const convStateForChildren = atom.phase;
@@ -870,8 +950,11 @@ function ConversationPageContent() {
   // horizontally.
   const splitPanePrs = fileExplorer.proseReaderState;
   const splitPaneDiff = diffViewer.payload;
+  const splitPaneBrowser = browserView.open;
   const showSplitPaneViewer =
-    isDesktop && isWideDesktop && (splitPanePrs !== null || splitPaneDiff !== null);
+    isDesktop
+    && isWideDesktop
+    && (splitPanePrs !== null || splitPaneDiff !== null || splitPaneBrowser);
 
   return (
     <div
@@ -885,6 +968,19 @@ function ConversationPageContent() {
     >
       <div className="conversation-column">
       {seedBreadcrumb}
+      {browserView.hasActivated && !browserView.open && (
+        <div className="browser-view-launcher">
+          <button
+            type="button"
+            className="browser-view-launcher-btn"
+            data-testid="browser-view-launcher"
+            onClick={handleOpenBrowserView}
+            title="Show live browser view"
+          >
+            ◍ Browser
+          </button>
+        </div>
+      )}
       <MessageList
         messages={atom.messages}
         pendingMessages={pendingMessages}
@@ -1247,6 +1343,19 @@ function ConversationPageContent() {
           />
         </Suspense>
       )}
+      {/* Browser view overlay: same fallback role as the diff overlay above
+          — mobile, narrow desktop, or any case where the split pane is
+          unavailable. REQ-BT-018. */}
+      {browserView.open && !showSplitPaneViewer && conversationId && (
+        <Suspense fallback={null}>
+          <div className="browser-view-overlay">
+            <BrowserViewPanel
+              conversationId={conversationId}
+              onClose={handleCloseBrowserView}
+            />
+          </div>
+        </Suspense>
+      )}
       {showSplitPaneViewer && (
         <>
           <div
@@ -1309,6 +1418,12 @@ function ConversationPageContent() {
                   onClose={handleCloseProseReader}
                   onSendNotes={handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
+                  inline
+                />
+              ) : splitPaneBrowser && conversationId ? (
+                <BrowserViewPanel
+                  conversationId={conversationId}
+                  onClose={handleCloseBrowserView}
                   inline
                 />
               ) : null}

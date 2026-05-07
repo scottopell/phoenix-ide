@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { useDiffViewerState } from '../contexts/ViewerStateContext';
+import { useBrowserViewState, useDiffViewerState } from '../contexts/ViewerStateContext';
 import { useFileExplorer } from '../hooks/useFileExplorer';
 
 type FetchState =
@@ -40,6 +40,7 @@ export function WorkActions({
   // a full-screen overlay on narrow desktop).
   const [diffFetch, setDiffFetch] = useState<FetchState>({ status: 'idle' });
   const diffViewer = useDiffViewerState();
+  const browserView = useBrowserViewState();
   const fileExplorer = useFileExplorer();
 
   // Clear stale errors when the agent runs (phaseType leaves idle then returns)
@@ -85,6 +86,24 @@ export function WorkActions({
       >
         {diffFetch.status === 'loading' ? 'Loading...' : 'View Diff'}
       </button>
+      {browserView.hasActivated && !browserView.open && (
+        <button
+          type="button"
+          className="work-actions-btn work-actions-view-browser"
+          data-testid="view-browser-button"
+          onClick={() => {
+            // REQ-BT-018: opening the browser view is mutually exclusive
+            // with the prose / diff slot. Close the others first so the
+            // ConversationPage mutex effect doesn't immediately bounce us.
+            fileExplorer.closeFile();
+            diffViewer.close();
+            browserView.openPanel();
+          }}
+          title="Show the live browser view"
+        >
+          View Browser
+        </button>
+      )}
       <button
         className="work-actions-btn work-actions-complete"
         disabled={isLoading || hasContinuation}

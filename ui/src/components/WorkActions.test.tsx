@@ -12,23 +12,25 @@ import type { ReactElement } from 'react';
 import { WorkActions } from './WorkActions';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import {
+  BrowserViewStateProvider,
   DiffViewerStateProvider,
   useDiffViewerState,
 } from '../contexts/ViewerStateContext';
 import type { DiffViewerPayload } from '../contexts/ViewerStateContext';
 import { FileExplorerProvider } from './FileExplorer';
 
-// All three providers are needed: FileExplorerProvider for the
+// All four providers are needed: FileExplorerProvider for the
 // useFileExplorer().closeFile call WorkActions makes during the
 // single-slot enforcement, ReviewNotesProvider for the diff viewer's
-// notes pile (when rendered by ConversationPage in production), and
-// DiffViewerStateProvider so the View-Diff click can publish its
-// payload.
+// notes context, and the two viewer-state providers (Diff + Browser)
+// so the View-Diff and View-Browser controls can publish their state.
 const renderWithProviders = (ui: ReactElement) =>
   render(
     <FileExplorerProvider>
       <ReviewNotesProvider>
-        <DiffViewerStateProvider>{ui}</DiffViewerStateProvider>
+        <DiffViewerStateProvider>
+          <BrowserViewStateProvider>{ui}</BrowserViewStateProvider>
+        </DiffViewerStateProvider>
       </ReviewNotesProvider>
     </FileExplorerProvider>,
   );

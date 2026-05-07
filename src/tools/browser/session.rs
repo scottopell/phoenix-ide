@@ -76,6 +76,11 @@ pub struct BrowserSession {
     pub console_logs: Arc<StdMutex<VecDeque<ConsoleEntry>>>,
     /// Last activity timestamp (for idle timeout)
     pub last_activity: Instant,
+    /// Lazily-created live-view broker (REQ-BT-018). The slot holds a
+    /// `Weak` so the broker is kept alive only by attached viewers; when
+    /// the last viewer drops, the broker drops, and `Page.stopScreencast`
+    /// fires automatically.
+    screencast: Arc<tokio::sync::Mutex<std::sync::Weak<super::screencast::ScreencastBroker>>>,
 }
 
 /// Maximum bytes stored per console arg in the capture buffer.
@@ -255,6 +260,7 @@ impl BrowserSession {
             page,
             console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
             last_activity: Instant::now(),
+            screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
         })
     }
 
@@ -330,6 +336,36 @@ impl BrowserSession {
         tracing::info!("Using Chrome at {:?}", info.executable_path);
 
         Self::launch_and_init(conversation_id, Some(&info.executable_path)).await
+    }
+
+    /// Attach a new live-view viewer (REQ-BT-018).
+    ///
+    /// Returns an `Arc<ScreencastBroker>` keeping the broker alive plus a
+    /// fresh broadcast receiver and the URL the page is currently on (if
+    /// known). The broker is created lazily on first attach and dropped
+    /// automatically when the last `Arc` returned from this method is
+    /// dropped — at which point `Page.stopScreencast` fires.
+    pub async fn attach_viewer(
+        &self,
+    ) -> Result<
+        (
+            Arc<super::screencast::ScreencastBroker>,
+            tokio::sync::broadcast::Receiver<super::screencast::ScreencastEvent>,
+            Option<String>,
+        ),
+        BrowserError,
+    > {
+        let mut slot = self.screencast.lock().await;
+        if let Some(broker) = slot.upgrade() {
+            let (rx, url) = broker.subscribe().await;
+            return Ok((broker, rx, url));
+        }
+        // No live broker — create one. The first attach pays the screencast
+        // start-up cost; subsequent attaches share the same broker.
+        let broker = super::screencast::ScreencastBroker::start(self.page.clone()).await?;
+        *slot = Arc::downgrade(&broker);
+        let (rx, url) = broker.subscribe().await;
+        Ok((broker, rx, url))
     }
 
     /// Set up console log listener (called after session is wrapped in Arc<RwLock>)
@@ -511,6 +547,16 @@ impl BrowserSessionManager {
         sessions.insert(conversation_id.to_string(), session_arc.clone());
 
         Ok(session_arc)
+    }
+
+    /// Get the session for a conversation **without creating one**.
+    ///
+    /// Used by the live-view WS endpoint, which deliberately must not spawn
+    /// a chromium just because someone opened the panel — the panel reflects
+    /// the agent's existing browser, not a new one.
+    pub async fn get_existing(&self, conversation_id: &str) -> Option<Arc<RwLock<BrowserSession>>> {
+        let sessions = self.sessions.read().await;
+        sessions.get(conversation_id).cloned()
     }
 
     /// Kill a specific session (called on conversation delete)

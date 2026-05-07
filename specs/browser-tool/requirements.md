@@ -31,6 +31,12 @@ As an AI agent testing PWAs, I need to verify service worker registration, cachi
 - Confirm requests are served from cache
 - Test offline behavior in isolation
 
+### US-4: Live Browser View (Collaborative Watching)
+
+As a user watching an agent work on a web app, I want to see what the agent is actually doing in the browser in real time, so I can give feedback while it works rather than asking the agent to take a screenshot or describe what it sees.
+
+**Motivation:** The agent's headless Chromium is invisible to the user by default. When the agent is iterating on a UI bug, building a feature, or scraping a page, the natural collaborative loop is "agent does X, user sees the result, user nudges." Without a live view, every step requires either a screenshot tool call (slow, snapshot-only) or the user opening the dev server URL in their own browser (different from what the agent sees, no shared frame of reference). A view-only mirror over CDP screencast closes that loop without introducing input arbitration questions.
+
 ---
 
 ## Core Requirements (MVP)
@@ -442,6 +448,57 @@ not silently broken.
 
 ---
 
+### REQ-BT-018: Live Browser View Side Panel
+
+The SYSTEM SHALL provide a view-only live mirror of the conversation's browser session as a right-hand side panel in the conversation UI. The panel SHALL render frames received from the headless Chromium over CDP `Page.startScreencast` so the user can watch the agent's browser activity in real time.
+
+WHEN the panel is mounted
+THE SYSTEM SHALL stream JPEG frames over a per-conversation WebSocket at `GET /api/conversations/:id/browser-view`, framed with a 1-byte tag (`0x00` = JPEG frame, `0x01` = URL change, `0x02` = status string).
+
+WHEN no browser session exists yet for the conversation
+THE SYSTEM SHALL respond with a `0x02 "no-session"` status frame and close cleanly, without spawning a Chromium just to satisfy the panel.
+
+WHEN the page navigates
+THE SYSTEM SHALL emit a `0x01` URL frame so the panel header reflects the current location.
+
+WHEN no viewer is attached
+THE SYSTEM SHALL stop the screencast (`Page.stopScreencast`) so the headless Chrome is not paying the per-frame paint cost when no one is watching. The screencast restarts on the next viewer attach.
+
+WHEN multiple viewers attach to the same conversation
+THE SYSTEM SHALL fan out a single screencast source to all viewers via a broadcast channel.
+
+The panel SHALL share a mutually-exclusive slot with the prose reader (REQ-FE-PR) and the diff viewer: at most one of {prose, diff, browser, none} occupies the right-hand viewer slot at a time.
+
+WHEN the conversation observes its first `browser_*` tool execution
+  AND the right-hand viewer slot is empty
+THE SYSTEM SHALL automatically mount the live browser view in that slot.
+
+WHEN the conversation observes its first `browser_*` tool execution
+  AND the slot is already occupied (prose / diff)
+THE SYSTEM SHALL NOT displace the existing viewer; the user's reading is not interrupted. A persistent manual-open affordance SHALL remain available for the user to switch to the browser view explicitly.
+
+The panel canvas SHALL have `pointer-events: none` so clicks and key presses on the rendered surface have no effect on the underlying page (REQ-BT-018-NG-INPUT below).
+
+WHEN the conversation is hard-deleted (existing cascade in `BrowserSessionManager::kill_session`)
+THE SYSTEM SHALL close any active live-view WebSocket cleanly, signalling "session ended" so the frontend stops reconnecting.
+
+**Non-goals (locked in for MVP):**
+
+- **REQ-BT-018-NG-INPUT** — User input into the browser view (clicks, typing, scroll, keyboard shortcuts) is out of scope. The mirror is read-only. Adding input would create an arbitration problem with the agent's tool-driven activity (REQ-BT-008 / REQ-BT-009 / REQ-BT-016) that this feature deliberately avoids.
+- **REQ-BT-018-NG-MULTITAB** — Tab / window management UI is out of scope. The panel always shows `BrowserSession.page` (the canonical first page). Additional CDP targets opened by the agent or by the page are not exposed.
+- **REQ-BT-018-NG-HANDOFF** — Take-over / driving handoff between agent and user is out of scope. The agent is the sole driver.
+- **REQ-BT-018-NG-HEADED** — Headed Chrome / VNC / Xvfb is not the architectural answer. The CDP screencast over the existing headless instance is.
+
+These non-goals are recorded so a future change does not silently "fix" one of them without re-opening the design discussion behind the locked decisions.
+
+**Rationale:** The agent's headless Chromium is invisible to the user by default. When the agent is iterating on a UI, the natural collaborative loop is "agent does X, user sees the result, user nudges." The screenshot tool covers point-in-time captures but not the continuous-feedback case. A live view over the existing CDP channel adds pure additive user value without changing any tool semantics; the agent's browser tools work identically whether or not anyone is watching.
+
+The slot-mutex + auto-mount-when-empty rule is the conservative choice: it never disrupts what the user is already reading, but the first time the agent needs the browser the panel just appears — no manual setup. The persistent manual-open affordance covers the "I had a diff open during first activation but now I want to see the browser" case.
+
+**User Stories:** US-4 (also surfaces during US-1, US-2)
+
+---
+
 ## Requirements Traceability
 
 | Requirement | User Story | MVP |
@@ -463,6 +520,7 @@ not silently broken.
 | REQ-BT-015: Access to Full Console Log Content | US-1, US-2 | 🟡 |
 | REQ-BT-016: Keyboard Shortcut Input | US-2 | ✅ |
 | REQ-BT-017: React Component Access | US-1, US-2 | ✅ |
+| REQ-BT-018: Live Browser View Side Panel | US-4, US-1, US-2 | ✅ |
 | REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |

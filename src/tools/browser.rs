@@ -6,6 +6,7 @@
 //! REQ-BT-017: React Component Access
 
 pub mod react;
+pub mod screencast;
 pub mod session;
 mod tools;
 
