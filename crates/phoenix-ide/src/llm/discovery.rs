@@ -12,6 +12,8 @@ pub struct DiscoveryConfig {
     pub anthropic_models_url: Option<String>,
     /// URL for `OpenAI` models endpoint
     pub openai_models_url: Option<String>,
+    /// Additional provider model endpoints: (provider header, URL)
+    pub extra_models_urls: Vec<(String, String)>,
     /// Auth token to send as Authorization: Bearer (if any)
     pub auth_token: Option<String>,
     /// Custom headers to inject on discovery requests
@@ -95,6 +97,21 @@ pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
         {
             Ok(m) => models.extend(m),
             Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
+        }
+    }
+
+    for (provider, url) in &config.extra_models_urls {
+        match discover_provider(
+            url,
+            provider,
+            config.auth_token.as_deref(),
+            &config.custom_headers,
+            &[],
+        )
+        .await
+        {
+            Ok(m) => models.extend(m),
+            Err(e) => tracing::warn!(provider = provider.as_str(), error = %e, "Discovery failed"),
         }
     }
 

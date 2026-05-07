@@ -11,7 +11,7 @@
 -- Excludes:
 --   - Git operations (see projects spec)
 --   - Individual tool implementations (bash, patch, etc.)
---   - LLM provider specifics (Anthropic, OpenAI wire formats)
+--   - Provider-specific wire mechanics beyond the normalized LLM response boundary
 --   - Database persistence mechanics (SQLite, serde)
 --   - SSE streaming / HTTP API design
 --   - UI rendering / display state mapping
@@ -31,6 +31,8 @@
 --
 -- Requirement traceability: REQ-BED-001 through REQ-BED-030
 -- (3 deprecated: REQ-BED-014, REQ-BED-015, REQ-BED-016)
+
+use "../llm/chat-responses.allium" as llm
 
 ------------------------------------------------------------
 -- External Entities
@@ -290,6 +292,29 @@ rule RejectMessageWhileBusy {
     when: UserSendsMessage(conversation, text, images?)
     requires: conversation.is_busy
     ensures: MessageRejected(conversation, reason: agent_busy)
+}
+
+-- ===========================================================
+-- CORE 2. LLM RESPONSE — NORMALIZED RESULT BOUNDARY
+-- ===========================================================
+
+-- Provider wire-format specs own translation into a normalized llm/LlmResponse.
+-- Bedrock owns the state transition that follows. This bridge turns the
+-- cross-spec normalized result into the existing Bedrock LlmResponds event
+-- without duplicating conversation-state rules in the wire-format spec.
+rule NormalizedLlmResponseBecomesBedrockEvent {
+    when: LlmResponseReady(conversation, response)
+
+    requires: conversation.core_status = llm_requesting
+    requires: llm/NormalizedLlmResponseReady(response)
+
+    ensures: LlmResponds(
+        conversation,
+        response.content_text,
+        response.tool_calls,
+        response.end_turn,
+        response.usage
+    )
 }
 
 -- ===========================================================

@@ -3,8 +3,8 @@
 #![allow(dead_code)] // new_empty() used in tests
 
 use super::{
-    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
-    LlmService, LlmServiceImpl, LoggingService, Provider,
+    all_models, codex_credential, discover_models, probe_gateway, AuthFamily, CodexCredential,
+    DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService, ModelFamily,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -359,6 +359,15 @@ fn parse_request_tags(raw: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+fn spec_discovery_names(spec: &super::ModelSpec) -> Vec<String> {
+    let mut names = vec![spec.id.clone(), spec.api_name.clone()];
+    if let Some(provider) = spec.gateway_provider_header() {
+        names.push(format!("{provider}/{}", spec.id));
+        names.push(format!("{provider}/{}", spec.api_name));
+    }
+    names
+}
+
 /// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
 /// Replaces the last path segment with `"models"`, stripping any query string first.
 fn derive_models_url(base_url: &str) -> Option<String> {
@@ -515,12 +524,10 @@ impl ModelRegistry {
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
         for spec in all_models() {
-            let prefixed_id = format!("{}/{}", spec.provider.header_value(), spec.id);
-            let prefixed_api = format!("{}/{}", spec.provider.header_value(), spec.api_name);
-            if discovered.contains(&spec.id)
-                || discovered.contains(&spec.api_name)
-                || discovered.contains(&prefixed_id)
-                || discovered.contains(&prefixed_api)
+            let discovered_names = spec_discovery_names(&spec);
+            if discovered_names
+                .iter()
+                .any(|name| discovered.contains(name))
             {
                 if let Some(service) = Self::try_create_model(&spec, config) {
                     services.insert(spec.id.clone(), service);
@@ -561,6 +568,10 @@ impl ModelRegistry {
                 DiscoveryConfig {
                     anthropic_models_url: Some(format!("{base}/anthropic/v1/models")),
                     openai_models_url: Some(format!("{base}/openai/v1/models")),
+                    extra_models_urls: vec![(
+                        "google".to_string(),
+                        format!("{base}/google/v1/models"),
+                    )],
                     auth_token: None, // Gateway handles auth
                     custom_headers: vec![],
                 },
@@ -583,6 +594,12 @@ impl ModelRegistry {
                         .openai_base_url
                         .as_deref()
                         .and_then(derive_models_url),
+                    extra_models_urls: config
+                        .openai_base_url
+                        .as_deref()
+                        .and_then(derive_models_url)
+                        .map(|url| vec![("google".to_string(), url)])
+                        .unwrap_or_default(),
                     auth_token,
                     custom_headers: headers,
                 },
@@ -599,7 +616,7 @@ impl ModelRegistry {
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
         // Mock provider needs no credentials
-        if spec.provider == Provider::Mock {
+        if spec.auth_family == AuthFamily::None {
             let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
             return Some(Arc::new(LoggingService::new(service)));
         }
@@ -607,7 +624,7 @@ impl ModelRegistry {
         // Codex ChatGPT auth is an explicit OpenAI opt-in. If enabled but the
         // credential failed to load, OpenAI models are unavailable rather than
         // silently falling through to another auth path.
-        if config.use_codex_auth && spec.provider == Provider::OpenAI {
+        if config.use_codex_auth && spec.auth_family == AuthFamily::OpenAI {
             let cred = config.codex_credential.as_ref()?;
             let auth = LlmAuth::new(
                 Arc::clone(cred) as Arc<dyn CredentialSource>,
@@ -643,19 +660,20 @@ impl ModelRegistry {
             )
         } else {
             // Direct mode: require real credentials per provider
-            match spec.provider {
-                Provider::Anthropic => {
+            match spec.auth_family {
+                AuthFamily::Anthropic => {
                     let key = config
                         .anthropic_api_key
                         .as_deref()
                         .filter(|k| !k.is_empty())?;
                     LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
-                Provider::OpenAI => {
+                AuthFamily::OpenAI => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
                     LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
-                Provider::Mock => unreachable!("handled above"),
+                AuthFamily::Gateway => return None,
+                AuthFamily::None => unreachable!("handled above"),
             }
         };
 
@@ -711,7 +729,7 @@ impl ModelRegistry {
             if self.services.contains_key(model_id) {
                 model_infos.push(crate::api::ModelInfo {
                     id: spec.id.clone(),
-                    provider: spec.provider.display_name().to_string(),
+                    provider: spec.family.display_name().to_string(),
                     description: spec.description.clone(),
                     context_window: spec.context_window,
                     recommended: spec.recommended,
@@ -782,14 +800,13 @@ impl ModelRegistry {
     /// Get the cheapest available model ID from the same provider family as `parent_model_id`.
     /// Falls back to `parent_model_id` if no cheap model is available for that provider.
     pub fn cheap_model_id_for_provider(&self, parent_model_id: &str) -> String {
-        use crate::llm::models::Provider;
+        let parent_family = self.specs.get(parent_model_id).map(|s| s.family);
 
-        let parent_provider = self.specs.get(parent_model_id).map(|s| s.provider);
-
-        let candidates: &[&str] = match parent_provider {
-            Some(Provider::Anthropic) => &["claude-haiku-4-5"],
-            Some(Provider::OpenAI) => &["gpt-5.4-mini"],
-            Some(Provider::Mock) => return "mock".to_string(),
+        let candidates: &[&str] = match parent_family {
+            Some(ModelFamily::Anthropic) => &["claude-haiku-4-5"],
+            Some(ModelFamily::OpenAI) => &["gpt-5.4-mini"],
+            Some(ModelFamily::Google) => &["gemini-2.5-flash"],
+            Some(ModelFamily::Mock) => return "mock".to_string(),
             None => return parent_model_id.to_string(),
         };
 
@@ -886,6 +903,7 @@ mod tests {
         // Should have models from multiple providers
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry.get("gemini-2.5-flash").is_some());
     }
 
     #[test]
@@ -946,6 +964,18 @@ mod tests {
         assert!(!registry.available_models().is_empty());
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry.get("gemini-2.5-flash").is_some());
+    }
+
+    #[test]
+    fn test_discovery_names_use_gateway_route_metadata() {
+        let spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gemini-2.5-flash")
+            .unwrap();
+        let names = spec_discovery_names(&spec);
+        assert!(names.contains(&"gemini-2.5-flash".to_string()));
+        assert!(names.contains(&"google/gemini-2.5-flash".to_string()));
     }
 
     /// Helper: build a CodexCredential pointing at a freshly-written valid
@@ -1079,16 +1109,16 @@ mod tests {
     #[test]
     fn test_derive_models_url_from_messages() {
         assert_eq!(
-            derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/messages"),
-            Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
+            derive_models_url("https://gateway.example.test/v1/messages"),
+            Some("https://gateway.example.test/v1/models".to_string())
         );
     }
 
     #[test]
     fn test_derive_models_url_from_responses() {
         assert_eq!(
-            derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/responses"),
-            Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
+            derive_models_url("https://gateway.example.test/v1/responses"),
+            Some("https://gateway.example.test/v1/models".to_string())
         );
     }
 

@@ -180,7 +180,10 @@ impl LlmServiceImpl {
             {
                 headers.push((
                     "provider".to_string(),
-                    self.spec.provider.header_value().to_string(),
+                    self.spec
+                        .gateway_provider_header()
+                        .unwrap_or("openai")
+                        .to_string(),
                 ));
             }
         }
@@ -237,7 +240,7 @@ impl LlmServiceImpl {
                 )
                 .await
             }
-            ApiFormat::OpenAIResponses => {
+            ApiFormat::OpenAIResponses | ApiFormat::OpenAIChat => {
                 let key = self.auth.resolve().await?.credential;
                 let headers = self.headers_for_provider();
                 openai::complete(
@@ -276,7 +279,7 @@ impl LlmServiceImpl {
                 )
                 .await
             }
-            ApiFormat::OpenAIResponses => {
+            ApiFormat::OpenAIResponses | ApiFormat::OpenAIChat => {
                 let key = self.auth.resolve().await?.credential;
                 let headers = self.headers_for_provider();
                 openai::complete_streaming(

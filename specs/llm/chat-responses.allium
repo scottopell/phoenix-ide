@@ -1,0 +1,363 @@
+-- allium: 3
+-- chat-responses.allium
+--
+-- Phoenix LLM Gateway Chat/Responses Behavioural Specification
+--
+-- Scope: Model routing and OpenAI-compatible wire-format behaviour for Phoenix LLM calls
+-- Includes: Model catalog metadata separation, gateway discovery matching,
+--           OpenAI Responses request/response behaviour, OpenAI-compatible
+--           Chat Completions request/response behaviour, streaming token and usage outcomes
+-- Excludes:
+--   - Anthropic Messages wire format (separate provider path)
+--   - OAuth/API-token retrieval and credential-helper execution
+--   - Concrete HTTP client mechanics, retry timing, status-code mapping
+--   - UI model picker rendering beyond user-visible model metadata
+--   - Provider-side model quality, pricing, rate limits, or access enablement
+--   - Phoenix conversation state machine (see bedrock.allium)
+--
+-- Distillation notes:
+--   The implementation deliberately avoids a single Provider concept. User-visible
+--   catalog family, credential requirement, gateway routing, and API wire format
+--   are distinct model facts because they vary independently.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ModelFamily { anthropic | openai | google | mock }
+enum CredentialFamily { anthropic_api_key | openai_api_key | gateway_credential | none }
+enum GatewayProviderAlias { anthropic | openai | google | mock }
+enum WireFormat { anthropic_messages | openai_responses | openai_chat_completions }
+enum ModelAccess { enabled | gated | unavailable }
+enum ResponseKind { final_answer | tool_request | malformed | empty }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value ModelRoute {
+    gateway_alias: GatewayProviderAlias
+    wire_format: WireFormat
+}
+
+value ToolCall {
+    tool_use_id: String
+    name: String
+    input: String
+}
+
+value ToolResult {
+    tool_use_id: String
+    content: String
+    is_error: Boolean
+    image_count: Integer
+}
+
+value MessagePart {
+    kind: text | image | tool_call | tool_result
+    text: String?
+    tool_call: ToolCall?
+    tool_result: ToolResult?
+}
+
+value UsageData {
+    input_tokens: Integer
+    output_tokens: Integer
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ModelSpec {
+    user_id: String
+    backend_id: String
+    family: ModelFamily
+    credential_family: CredentialFamily
+    route: ModelRoute?
+    context_window: Integer
+    recommended: Boolean
+    access: ModelAccess
+
+    invariant GatewayModelsHaveRoutes {
+        credential_family = gateway_credential -> route != null
+    }
+}
+
+entity LlmRequest {
+    model: ModelSpec
+    system_messages: List<MessagePart>
+    conversation_messages: List<MessagePart>
+    available_tools: List<ToolCall>
+    max_output_tokens: Integer?
+    cache_key: String
+    stream: Boolean
+}
+
+entity WireRequest {
+    model: ModelSpec
+    format: WireFormat
+    route: ModelRoute
+    messages: List<MessagePart>
+    tools: List<ToolCall>
+    max_output_tokens: Integer?
+    stream: Boolean
+    requests_usage_in_stream: Boolean
+    tags_forwarded: Boolean
+}
+
+entity WireResponse {
+    format: WireFormat
+    kind: ResponseKind
+    text: String?
+    tool_calls: List<ToolCall>
+    usage: UsageData?
+}
+
+entity LlmResponse {
+    model: ModelSpec
+    content_text: String?
+    tool_calls: List<ToolCall>
+    usage: UsageData
+    end_turn: Boolean
+}
+
+entity ModelCatalog {
+    models: Set<ModelSpec>
+    default_model: ModelSpec
+}
+
+------------------------------------------------------------
+-- Rules: Model Catalog and Discovery
+------------------------------------------------------------
+
+rule RegisteredModelRequiresSatisfiableCredentials {
+    when: RegisterModel(model, catalog)
+
+    requires: model.access = enabled
+    requires: model.credential_family != none or model.family = mock
+
+    ensures: model in catalog.models
+}
+
+rule GatewayDiscoveryMatchesRouteMetadata {
+    when: GatewayModelDiscovered(discovered_id, model, catalog)
+
+    requires: model.route != null
+    requires:
+        discovered_id = model.user_id
+        or discovered_id = model.backend_id
+        or discovered_id = model.route.gateway_alias + "/" + model.user_id
+        or discovered_id = model.route.gateway_alias + "/" + model.backend_id
+
+    ensures: model in catalog.models
+}
+
+rule FriendlyProviderLabelsUseModelFamily {
+    when: ModelListRequested(catalog)
+
+    ensures:
+        for model in catalog.models:
+            DisplayedProvider(model) = model.family
+            and DisplayedContextWindow(model) = model.context_window
+            and DisplayedRecommended(model) = model.recommended
+}
+
+rule GeminiFlashInitiallyEnabled {
+    when: DefaultGatewayCatalogBuilt(catalog)
+
+    ensures:
+        catalog.models.any(model =>
+            model.user_id = "gemini-2.5-flash"
+            and model.backend_id = "google/gemini-2.5-flash"
+            and model.family = google
+            and model.credential_family = gateway_credential
+            and model.route.gateway_alias = google
+            and model.route.wire_format = openai_chat_completions
+        )
+}
+
+------------------------------------------------------------
+-- Rules: Wire Request Translation
+------------------------------------------------------------
+
+rule ResponsesRequestTranslation {
+    when: TranslateToWire(request, wire)
+
+    requires: request.model.route.wire_format = openai_responses
+
+    ensures: wire.format = openai_responses
+    ensures: wire.route = request.model.route
+    ensures: wire.model = request.model
+    ensures: wire.max_output_tokens = request.max_output_tokens
+    ensures: wire.stream = request.stream
+    ensures: wire.messages = concat(request.system_messages, request.conversation_messages)
+    ensures: wire.tools = request.available_tools
+    ensures: wire.tags_forwarded = gateway_accepts_tags(request.model.route)
+    ensures: wire.tags_forwarded = gateway_accepts_tags(request.model.route)
+    ensures: cache_key_forwarded(wire, request.cache_key)
+}
+
+rule ChatCompletionsRequestTranslation {
+    when: TranslateToWire(request, wire)
+
+    requires: request.model.route.wire_format = openai_chat_completions
+
+    ensures: wire.format = openai_chat_completions
+    ensures: wire.route = request.model.route
+    ensures: wire.model = request.model
+    ensures: wire.max_output_tokens = request.max_output_tokens
+    ensures: wire.stream = request.stream
+    ensures: wire.messages = concat(request.system_messages, request.conversation_messages)
+    ensures: wire.tools = request.available_tools
+}
+
+rule ChatStreamingRequestsUsage {
+    when: TranslateToWire(request, wire)
+
+    requires: request.model.route.wire_format = openai_chat_completions
+    requires: request.stream = true
+
+    ensures: wire.requests_usage_in_stream = true
+}
+
+rule ChatToolResultImagesAreNotForwarded {
+    when: TranslateToWire(request, wire)
+
+    requires: request.model.route.wire_format = openai_chat_completions
+    requires:
+        request.conversation_messages.any(result =>
+            result.kind = tool_result
+            and result.tool_result.image_count > 0
+        )
+
+    ensures:
+        for result in wire.messages:
+            result.kind = tool_result -> result.tool_result.image_count = 0
+}
+
+------------------------------------------------------------
+-- Rules: Response Normalization
+------------------------------------------------------------
+
+rule ResponsesTextNormalizesToFinalAnswer {
+    when: NormalizeWireResponse(wire_response, response)
+
+    requires: wire_response.format = openai_responses
+    requires: wire_response.kind = final_answer
+    requires: wire_response.text != null
+
+    ensures: response.content_text = wire_response.text
+    ensures: response.tool_calls = {}
+    ensures: response.end_turn = true
+    ensures: response.usage = wire_response.usage
+    ensures: NormalizedLlmResponseReady(response)
+}
+
+rule ResponsesToolCallsKeepTurnOpen {
+    when: NormalizeWireResponse(wire_response, response)
+
+    requires: wire_response.format = openai_responses
+    requires: wire_response.kind = tool_request
+    requires: wire_response.tool_calls.count > 0
+
+    ensures: response.tool_calls = wire_response.tool_calls
+    ensures: response.end_turn = false
+    ensures: response.usage = wire_response.usage
+    ensures: NormalizedLlmResponseReady(response)
+}
+
+rule ChatTextNormalizesToFinalAnswer {
+    when: NormalizeWireResponse(wire_response, response)
+
+    requires: wire_response.format = openai_chat_completions
+    requires: wire_response.kind = final_answer
+    requires: wire_response.text != null
+
+    ensures: response.content_text = wire_response.text
+    ensures: response.tool_calls = {}
+    ensures: response.end_turn = true
+    ensures: response.usage = wire_response.usage
+    ensures: NormalizedLlmResponseReady(response)
+}
+
+rule ChatToolCallsKeepTurnOpen {
+    when: NormalizeWireResponse(wire_response, response)
+
+    requires: wire_response.format = openai_chat_completions
+    requires: wire_response.kind = tool_request
+    requires: wire_response.tool_calls.count > 0
+
+    ensures: response.tool_calls = wire_response.tool_calls
+    ensures: response.end_turn = false
+    ensures: response.usage = wire_response.usage
+    ensures: NormalizedLlmResponseReady(response)
+}
+
+rule EmptyModelOutputIsInvalid {
+    when: NormalizeWireResponse(wire_response, response)
+
+    requires: wire_response.kind = empty
+
+    rejects: response.created
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant DefaultModelIsAvailable {
+    for catalog in ModelCatalogs:
+        catalog.default_model in catalog.models
+}
+
+invariant LlmRequestCacheKeyPresent {
+    for request in LlmRequests:
+        request.cache_key != ""
+}
+
+invariant WireResponsesHaveUsageWhenSuccessful {
+    for wire_response in WireResponses:
+        wire_response.kind in { final_answer, tool_request }
+        -> wire_response.usage != null
+}
+
+invariant ChatCompletionsUsageIsPreserved {
+    for response in LlmResponse:
+        response.model.route.wire_format = openai_chat_completions
+        -> response.usage.input_tokens >= 0
+           and response.usage.output_tokens >= 0
+}
+
+invariant WireFormatDeterminesTranslationShape {
+    for request in WireRequest:
+        request.format = request.model.route.wire_format
+}
+
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface LlmGateway {
+    facing: PhoenixRuntime
+
+    context catalog: ModelCatalog
+    context request: LlmRequest
+    context wire: WireRequest
+    context wire_response: WireResponse
+    context response: LlmResponse
+
+    exposes:
+        catalog.models
+        catalog.default_model
+
+    provides:
+        RegisterModel(model, catalog)
+        GatewayModelDiscovered(discovered_id, model, catalog)
+        ModelListRequested(catalog)
+        DefaultGatewayCatalogBuilt(catalog)
+        TranslateToWire(request, wire)
+        NormalizeWireResponse(wire_response, response)
+        NormalizedLlmResponseReady(response)
+}

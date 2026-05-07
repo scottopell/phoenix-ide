@@ -1,6 +1,6 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
-use super::models::ModelSpec;
+use super::models::{ApiFormat, ModelSpec};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER};
 use super::LlmError;
 use reqwest::Client;
@@ -13,16 +13,38 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Determine the full endpoint URL.
-/// Priority: `base_url_override` (used as-is) > `gateway` > provider default.
-fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> String {
+fn resolve_endpoint(
+    spec: &ModelSpec,
+    gateway: Option<&str>,
+    base_url_override: Option<&str>,
+) -> String {
+    let suffix = match spec.api_format {
+        ApiFormat::OpenAIResponses => "responses",
+        ApiFormat::OpenAIChat => "chat/completions",
+        ApiFormat::Anthropic => {
+            unreachable!("anthropic requests do not use openai endpoint resolver")
+        }
+    };
+
     if let Some(url) = base_url_override {
-        return url.to_string();
+        return derive_sibling_endpoint(url, suffix);
     }
 
     match gateway {
-        Some(gw) => format!("{}/openai/v1/responses", gw.trim_end_matches('/')),
-        None => "https://api.openai.com/v1/responses".to_string(),
+        Some(gw) => {
+            let provider = spec.gateway_provider_header().unwrap_or("openai");
+            format!("{}/{provider}/v1/{suffix}", gw.trim_end_matches('/'))
+        }
+        None => format!("https://api.openai.com/v1/{suffix}"),
     }
+}
+
+fn derive_sibling_endpoint(base_url: &str, suffix: &str) -> String {
+    let path = base_url.split('?').next().unwrap_or(base_url);
+    let Some((prefix, _)) = path.split_once("/v1/") else {
+        return base_url.to_string();
+    };
+    format!("{prefix}/v1/{suffix}")
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +79,11 @@ pub async fn complete(
         .await;
     }
 
-    let url = resolve_endpoint(gateway, base_url_override);
+    let url = resolve_endpoint(spec, gateway, base_url_override);
+    if spec.api_format == ApiFormat::OpenAIChat {
+        return complete_chat_api(spec, api_key, &url, custom_headers, request_tags, request).await;
+    }
+
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     if !request_tags.is_empty() {
@@ -254,7 +280,20 @@ pub async fn complete_streaming(
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
-    let url = resolve_endpoint(gateway, base_url_override);
+    let url = resolve_endpoint(spec, gateway, base_url_override);
+    if spec.api_format == ApiFormat::OpenAIChat {
+        return complete_streaming_chat_api(
+            spec,
+            api_key,
+            &url,
+            custom_headers,
+            request_tags,
+            request,
+            chunk_tx,
+        )
+        .await;
+    }
+
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     responses_request.stream = Some(true);
@@ -321,6 +360,465 @@ pub async fn complete_streaming(
     }
 
     Ok(acc.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Chat Completions API
+// ---------------------------------------------------------------------------
+
+async fn complete_chat_api(
+    spec: &ModelSpec,
+    api_key: &str,
+    url: &str,
+    custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
+    request: &LlmRequest,
+) -> Result<LlmResponse, LlmError> {
+    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    if !request_tags.is_empty() {
+        chat_request.tags = Some(request_tags.clone());
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_mins(5))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut builder = client
+        .post(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("source", LLM_SOURCE_HEADER);
+    for (k, v) in custom_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let response = builder.json(&chat_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
+
+    if !status.is_success() {
+        if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
+            let message = error_resp.error.message;
+            return Err(match status.as_u16() {
+                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
+                429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+                400..=499 => {
+                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
+                }
+                500..=599 => LlmError::server_error(format!("Server error: {message}")),
+                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
+            });
+        }
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
+    }
+
+    let chat_response: ChatCompletionsResponse = serde_json::from_str(&body).map_err(|e| {
+        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    })?;
+
+    normalize_chat_response(chat_response)
+}
+
+async fn complete_streaming_chat_api(
+    spec: &ModelSpec,
+    api_key: &str,
+    url: &str,
+    custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
+    request: &LlmRequest,
+    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+) -> Result<LlmResponse, LlmError> {
+    use futures::StreamExt;
+
+    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    chat_request.stream = Some(true);
+    chat_request.stream_options = Some(ChatStreamOptions {
+        include_usage: true,
+    });
+    if !request_tags.is_empty() {
+        chat_request.tags = Some(request_tags.clone());
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_mins(10))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut builder = client
+        .post(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .header("source", LLM_SOURCE_HEADER);
+    for (k, v) in custom_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let response = builder.json(&chat_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        return Err(LlmError::from_http_status(status.as_u16(), &body));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut sse = crate::llm::sse::SseParser::new();
+    let mut acc = ChatStreamAccumulator::new();
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
+        for event in sse.push(&chunk) {
+            acc.process_event(&event.data, chunk_tx)?;
+            if acc.done {
+                break 'outer;
+            }
+        }
+    }
+
+    for event in sse.finish() {
+        acc.process_event(&event.data, chunk_tx)?;
+    }
+
+    acc.into_response()
+}
+
+#[allow(clippy::too_many_lines)]
+fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatCompletionsRequest {
+    use super::types::ImageSource;
+
+    let mut messages = Vec::new();
+    if !request.system.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(ChatContent::Text(
+                request
+                    .system
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    for msg in &request.messages {
+        let role = match msg.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let mut text_blocks = Vec::new();
+        let mut image_blocks = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_results = Vec::new();
+
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => text_blocks.push(text.as_str()),
+                ContentBlock::Image { source } => image_blocks.push(source),
+                ContentBlock::ToolUse { id, name, input } => {
+                    tool_calls.push(ChatToolCall {
+                        id: id.clone(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: name.clone(),
+                            arguments: serde_json::to_string(input)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        },
+                    });
+                }
+                ContentBlock::ToolResult { .. } => tool_results.push(block),
+                ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => {
+                    tracing::debug!(
+                        "Skipping Anthropic server block in chat completions translation"
+                    );
+                }
+            }
+        }
+
+        if !text_blocks.is_empty() || !image_blocks.is_empty() || !tool_calls.is_empty() {
+            let content = if image_blocks.is_empty() {
+                Some(ChatContent::Text(text_blocks.join("\n")))
+            } else {
+                let mut parts: Vec<ChatContentPart> = text_blocks
+                    .iter()
+                    .map(|text| ChatContentPart::Text {
+                        text: (*text).to_string(),
+                    })
+                    .collect();
+                for source in image_blocks {
+                    let ImageSource::Base64 { media_type, data } = source;
+                    parts.push(ChatContentPart::ImageUrl {
+                        image_url: ChatImageUrl {
+                            url: format!("data:{media_type};base64,{data}"),
+                        },
+                    });
+                }
+                Some(ChatContent::Parts(parts))
+            };
+
+            messages.push(ChatMessage {
+                role: role.to_string(),
+                content,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                tool_call_id: None,
+            });
+        }
+
+        for block in tool_results {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                images,
+                is_error,
+            } = block
+            {
+                if !images.is_empty() {
+                    tracing::debug!(
+                        n = images.len(),
+                        "dropping images from chat completions tool result — unsupported by this wire format"
+                    );
+                }
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(ChatContent::Text(if *is_error {
+                        format!("Error: {content}")
+                    } else {
+                        content.clone()
+                    })),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+        }
+    }
+
+    let tools = if request.tools.is_empty() {
+        None
+    } else {
+        Some(
+            request
+                .tools
+                .iter()
+                .map(|tool| ChatTool {
+                    r#type: "function".to_string(),
+                    function: ChatFunction {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.input_schema.clone(),
+                    },
+                })
+                .collect(),
+        )
+    };
+
+    ChatCompletionsRequest {
+        model: api_name.to_string(),
+        messages,
+        tools,
+        max_tokens: request.max_tokens,
+        stream: None,
+        stream_options: None,
+        tool_choice: if request.tools.is_empty() {
+            None
+        } else {
+            Some("auto".to_string())
+        },
+        parallel_tool_calls: if request.tools.is_empty() {
+            None
+        } else {
+            Some(true)
+        },
+        tags: None,
+    }
+}
+
+fn normalize_chat_response(resp: ChatCompletionsResponse) -> Result<LlmResponse, LlmError> {
+    let Some(choice) = resp.choices.into_iter().next() else {
+        return Err(LlmError::invalid_response(
+            "Chat completions returned no choices".to_string(),
+        ));
+    };
+    chat_message_to_response(choice.message, resp.usage)
+}
+
+fn chat_message_to_response(
+    message: ChatResponseMessage,
+    usage: Option<ChatUsage>,
+) -> Result<LlmResponse, LlmError> {
+    let mut content = Vec::new();
+    if let Some(text) = message.content {
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+    }
+    for call in message.tool_calls.unwrap_or_default() {
+        let input = serde_json::from_str(&call.function.arguments).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, arguments = %call.function.arguments, "Failed to parse chat tool arguments");
+            serde_json::Value::Object(serde_json::Map::new())
+        });
+        content.push(ContentBlock::ToolUse {
+            id: call.id,
+            name: call.function.name,
+            input,
+        });
+    }
+    if content.is_empty() {
+        return Err(LlmError::invalid_response(
+            "Chat completions returned empty response".to_string(),
+        ));
+    }
+    let has_tool_calls = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let usage = usage.unwrap_or_default();
+    Ok(LlmResponse {
+        content,
+        end_turn: !has_tool_calls,
+        usage: Usage {
+            input_tokens: u64::from(usage.prompt_tokens),
+            output_tokens: u64::from(usage.completion_tokens),
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        },
+    })
+}
+
+struct ChatStreamAccumulator {
+    content: String,
+    tool_calls: Vec<ChatToolCallBuilder>,
+    usage: Option<ChatUsage>,
+    done: bool,
+}
+
+impl ChatStreamAccumulator {
+    fn new() -> Self {
+        Self {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            done: false,
+        }
+    }
+
+    fn process_event(
+        &mut self,
+        data: &str,
+        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    ) -> Result<(), LlmError> {
+        if data == "[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
+            LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
+        })?;
+        self.usage = event.usage.or(self.usage.take());
+        for choice in event.choices {
+            if let Some(delta) = choice.delta.content {
+                if !delta.is_empty() {
+                    self.content.push_str(&delta);
+                    let _ = chunk_tx.send(super::TokenChunk::Text(delta));
+                }
+            }
+            for tool_delta in choice.delta.tool_calls.unwrap_or_default() {
+                let index = tool_delta.index.unwrap_or(self.tool_calls.len());
+                while self.tool_calls.len() <= index {
+                    self.tool_calls.push(ChatToolCallBuilder::default());
+                }
+                let builder = &mut self.tool_calls[index];
+                if let Some(id) = tool_delta.id {
+                    builder.id = id;
+                }
+                if let Some(function) = tool_delta.function {
+                    if let Some(name) = function.name {
+                        builder.name = name;
+                    }
+                    if let Some(arguments) = function.arguments {
+                        builder.arguments.push_str(&arguments);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_response(self) -> Result<LlmResponse, LlmError> {
+        let message = ChatResponseMessage {
+            content: if self.content.is_empty() {
+                None
+            } else {
+                Some(self.content)
+            },
+            tool_calls: if self.tool_calls.is_empty() {
+                None
+            } else {
+                Some(
+                    self.tool_calls
+                        .into_iter()
+                        .map(ChatToolCallBuilder::build)
+                        .collect(),
+                )
+            },
+        };
+        chat_message_to_response(message, self.usage)
+    }
+}
+
+#[derive(Default)]
+struct ChatToolCallBuilder {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ChatToolCallBuilder {
+    fn build(self) -> ChatToolCall {
+        ChatToolCall {
+            id: self.id,
+            r#type: "function".to_string(),
+            function: ChatFunctionCall {
+                name: self.name,
+                arguments: self.arguments,
+            },
+        }
+    }
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -599,7 +1097,155 @@ struct OpenAIError {
     code: Option<String>,
 }
 
-// Responses API types (for codex models)
+#[derive(Debug, Serialize)]
+struct ChatCompletionsRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ChatTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<ChatContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ChatImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct ChatImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ChatToolCall {
+    id: String,
+    r#type: String,
+    function: ChatFunctionCall,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ChatFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTool {
+    r#type: String,
+    function: ChatFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsResponse {
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamChunk {
+    #[serde(default)]
+    choices: Vec<ChatStreamChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamChoice {
+    delta: ChatDelta,
+    #[serde(default)]
+    _finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ChatFunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesApiRequest {
@@ -746,7 +1392,8 @@ pub(crate) struct ResponsesApiUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{LlmRequest, PromptCacheKey};
+    use crate::llm::models::{ApiFormat, AuthFamily, GatewayRoute, ModelFamily, ModelSpec};
+    use crate::llm::types::{LlmMessage, LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn empty_request() -> LlmRequest {
         LlmRequest {
@@ -756,6 +1403,104 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    fn gemini_spec() -> ModelSpec {
+        ModelSpec {
+            id: "gemini-2.5-flash".into(),
+            api_name: "google/gemini-2.5-flash".into(),
+            family: ModelFamily::Google,
+            auth_family: AuthFamily::Gateway,
+            gateway_route: Some(GatewayRoute::new("google")),
+            api_format: ApiFormat::OpenAIChat,
+            description: "test".into(),
+            context_window: 1_000_000,
+            recommended: false,
+            supports_tool_search: false,
+        }
+    }
+
+    #[test]
+    fn chat_endpoint_derived_from_responses_base_url() {
+        assert_eq!(
+            resolve_endpoint(
+                &gemini_spec(),
+                None,
+                Some("https://gateway.example.test/v1/responses"),
+            ),
+            "https://gateway.example.test/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_endpoint_uses_gateway_provider_alias() {
+        assert_eq!(
+            resolve_endpoint(&gemini_spec(), Some("http://gateway/llm"), None),
+            "http://gateway/llm/google/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_request_translates_tools_and_tool_results() {
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![
+                LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::Text { text: "hi".into() }],
+                },
+                LlmMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path":"x"}),
+                    }],
+                },
+                LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "contents".into(),
+                        images: vec![],
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read_file".into(),
+                description: "read".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                defer_loading: false,
+            }],
+            max_tokens: Some(10),
+            cache_key: PromptCacheKey::stable("test"),
+        };
+        let wire = serde_json::to_value(translate_to_chat_request(
+            "google/gemini-2.5-flash",
+            &request,
+        ))
+        .unwrap();
+        assert_eq!(wire["model"], "google/gemini-2.5-flash");
+        assert_eq!(
+            wire["messages"][1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(wire["messages"][2]["role"], "tool");
+        assert_eq!(wire["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn chat_streaming_requests_usage_chunk() {
+        let mut request = translate_to_chat_request("google/gemini-2.5-flash", &empty_request());
+        request.stream = Some(true);
+        request.stream_options = Some(ChatStreamOptions {
+            include_usage: true,
+        });
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["stream_options"]["include_usage"], true);
     }
 
     #[test]

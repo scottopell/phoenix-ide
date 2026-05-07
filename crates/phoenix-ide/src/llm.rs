@@ -73,7 +73,7 @@ pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
-pub use models::{all_models, ModelSpec, Provider};
+pub use models::{all_models, AuthFamily, ModelFamily, ModelSpec};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
 pub use registry::{

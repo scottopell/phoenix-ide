@@ -1074,14 +1074,16 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::models::{ApiFormat, ModelSpec, Provider};
+    use crate::llm::models::{ApiFormat, AuthFamily, GatewayRoute, ModelFamily, ModelSpec};
     use crate::llm::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn test_spec(supports_tool_search: bool) -> ModelSpec {
         ModelSpec {
             id: "test-model".into(),
             api_name: "test-model-api".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(GatewayRoute::new("anthropic")),
             api_format: ApiFormat::Anthropic,
             description: "test".into(),
             context_window: 200_000,
@@ -1182,9 +1184,9 @@ mod tests {
     fn test_resolve_anthropic_url_override_takes_priority() {
         let url = resolve_anthropic_url(
             Some("http://gateway.local"),
-            Some("https://ai-gateway.us1.ddbuild.io/v1/messages"),
+            Some("https://gateway.example.test/v1/messages"),
         );
-        assert_eq!(url, "https://ai-gateway.us1.ddbuild.io/v1/messages");
+        assert_eq!(url, "https://gateway.example.test/v1/messages");
     }
 
     #[test]

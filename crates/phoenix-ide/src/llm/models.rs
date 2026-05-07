@@ -3,30 +3,45 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
-/// LLM provider enumeration
+/// Credential/auth family required to satisfy a model request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Provider {
+pub enum AuthFamily {
     Anthropic,
     OpenAI,
+    Gateway,
+    None,
+}
+
+/// User-facing provider/catalog family. This is presentation metadata only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelFamily {
+    Anthropic,
+    OpenAI,
+    Google,
     Mock,
 }
 
-impl Provider {
-    /// Get the display name for this provider
+impl ModelFamily {
     pub fn display_name(self) -> &'static str {
         match self {
-            Provider::Anthropic => "Anthropic",
-            Provider::OpenAI => "OpenAI",
-            Provider::Mock => "Mock",
+            ModelFamily::Anthropic => "Anthropic",
+            ModelFamily::OpenAI => "OpenAI",
+            ModelFamily::Google => "Google",
+            ModelFamily::Mock => "Mock",
         }
     }
+}
 
-    /// Lowercase provider name for gateway `provider` header (e.g. "anthropic", "openai").
-    pub fn header_value(self) -> &'static str {
-        match self {
-            Provider::Anthropic => "anthropic",
-            Provider::OpenAI => "openai",
-            Provider::Mock => "mock",
+/// Gateway routing metadata: provider header plus path family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRoute {
+    pub provider_header: String,
+}
+
+impl GatewayRoute {
+    pub fn new(provider_header: impl Into<String>) -> Self {
+        Self {
+            provider_header: provider_header.into(),
         }
     }
 }
@@ -38,6 +53,8 @@ pub enum ApiFormat {
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
+    /// `OpenAI`-compatible Chat Completions API
+    OpenAIChat,
 }
 
 /// Model specification with metadata
@@ -47,8 +64,12 @@ pub struct ModelSpec {
     pub id: String,
     /// API name used by the provider (e.g., "claude-opus-4-5-20251101")
     pub api_name: String,
-    /// Provider for this model
-    pub provider: Provider,
+    /// Presentation-only model family
+    pub family: ModelFamily,
+    /// Credential/auth family
+    pub auth_family: AuthFamily,
+    /// Gateway provider alias/header
+    pub gateway_route: Option<GatewayRoute>,
     /// API format / wire protocol
     pub api_format: ApiFormat,
     /// Human-readable description
@@ -61,6 +82,26 @@ pub struct ModelSpec {
     pub supports_tool_search: bool,
 }
 
+impl ModelSpec {
+    pub fn gateway_provider_header(&self) -> Option<&str> {
+        self.gateway_route
+            .as_ref()
+            .map(|route| route.provider_header.as_str())
+    }
+}
+
+fn anthropic_route() -> GatewayRoute {
+    GatewayRoute::new("anthropic")
+}
+
+fn openai_route() -> GatewayRoute {
+    GatewayRoute::new("openai")
+}
+
+fn google_route() -> GatewayRoute {
+    GatewayRoute::new("google")
+}
+
 /// Get all available model specifications
 #[allow(clippy::too_many_lines)]
 pub fn all_models() -> Vec<ModelSpec> {
@@ -70,7 +111,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-opus-4-7".into(),
             api_name: "claude-opus-4-7".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.7 (most capable, slower)".into(),
             context_window: 200_000,
@@ -80,7 +123,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-opus-4-7-1m".into(),
             api_name: "claude-opus-4-7".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.7 (1M context)".into(),
             context_window: 1_000_000,
@@ -90,7 +135,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-opus-4-6".into(),
             api_name: "claude-opus-4-6".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 200_000,
@@ -100,7 +147,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
             api_name: "claude-sonnet-4-6".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Sonnet 4.6 (balanced performance)".into(),
             context_window: 200_000,
@@ -110,7 +159,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-haiku-4-5".into(),
             api_name: "claude-haiku-4-5-20251001".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
@@ -120,7 +171,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-opus-4-6-1m".into(),
             api_name: "claude-opus-4-6".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.6 (1M context, legacy)".into(),
             context_window: 1_000_000,
@@ -130,7 +183,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-sonnet-4-6-1m".into(),
             api_name: "claude-sonnet-4-6".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Sonnet 4.6 (1M context)".into(),
             context_window: 1_000_000,
@@ -140,7 +195,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-opus-4-5".into(),
             api_name: "claude-opus-4-5-20251101".into(),
-            provider: Provider::Anthropic,
+            family: ModelFamily::Anthropic,
+            auth_family: AuthFamily::Anthropic,
+            gateway_route: Some(anthropic_route()),
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.5 (legacy)".into(),
             context_window: 200_000,
@@ -152,7 +209,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "gpt-5.5".into(),
             api_name: "gpt-5.5".into(),
-            provider: Provider::OpenAI,
+            family: ModelFamily::OpenAI,
+            auth_family: AuthFamily::OpenAI,
+            gateway_route: Some(openai_route()),
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.5 (frontier, 1M context)".into(),
             context_window: 1_000_000,
@@ -162,7 +221,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "gpt-5.4".into(),
             api_name: "gpt-5.4".into(),
-            provider: Provider::OpenAI,
+            family: ModelFamily::OpenAI,
+            auth_family: AuthFamily::OpenAI,
+            gateway_route: Some(openai_route()),
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.4 (frontier, native computer use)".into(),
             context_window: 400_000,
@@ -172,7 +233,9 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "gpt-5.4-mini".into(),
             api_name: "gpt-5.4-mini".into(),
-            provider: Provider::OpenAI,
+            family: ModelFamily::OpenAI,
+            auth_family: AuthFamily::OpenAI,
+            gateway_route: Some(openai_route()),
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.4 Mini (fast, efficient)".into(),
             context_window: 400_000,
@@ -183,18 +246,35 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "gpt-5.3-codex".into(),
             api_name: "gpt-5.3-codex".into(),
-            provider: Provider::OpenAI,
+            family: ModelFamily::OpenAI,
+            auth_family: AuthFamily::OpenAI,
+            gateway_route: Some(openai_route()),
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.3 Codex (latest code model)".into(),
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
         },
+        // AI Gateway Google model (OpenAI-compatible chat/completions).
+        ModelSpec {
+            id: "gemini-2.5-flash".into(),
+            api_name: "google/gemini-2.5-flash".into(),
+            family: ModelFamily::Google,
+            auth_family: AuthFamily::Gateway,
+            gateway_route: Some(google_route()),
+            api_format: ApiFormat::OpenAIChat,
+            description: "Gemini 2.5 Flash via AI Gateway (chat completions)".into(),
+            context_window: 1_000_000,
+            recommended: false,
+            supports_tool_search: false,
+        },
         // Mock model for frontend development without API keys
         ModelSpec {
             id: "mock".into(),
             api_name: "mock".into(),
-            provider: Provider::Mock,
+            family: ModelFamily::Mock,
+            auth_family: AuthFamily::None,
+            gateway_route: Some(GatewayRoute::new("mock")),
             api_format: ApiFormat::Anthropic, // unused by mock, but needed for the struct
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
