@@ -32,7 +32,7 @@ use super::registry::{BashHandleError, ConversationHandles, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use crate::api::wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
-    BashRingLine, BashRingWindow, BashRunningPayload, BashSpawnTombstonePayload,
+    BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
     BashStillRunningPayload, BashTombstonedPayload, BashWaiterPanickedPayload,
 };
 use crate::tools::{ToolContext, ToolOutput};
@@ -55,6 +55,10 @@ pub const KILL_RESPONSE_TIMEOUT_SECONDS: u64 = 30;
 /// is supplied.
 pub const DEFAULT_PEEK_LINES: usize = 200;
 
+/// REQ-BASH-002 / REQ-BASH-010: soft cap on the optional run-call
+/// `label` length. Over-cap labels surface as `error: "label_too_long"`.
+pub const MAX_LABEL_LENGTH: usize = 64;
+
 // Hint text for the cap-rejection envelope (REQ-BASH-005).
 const CAP_HINT: &str =
     "kill or wait on a handle before spawning more, or use the tmux tool for long-runners";
@@ -70,20 +74,12 @@ const HANDLE_NOT_FOUND_HINT: &str =
 // Request shape
 // ---------------------------------------------------------------------------
 
-/// Raw input shape.
-///
-/// Current schema (REQ-BASH-010): single `op` discriminator + per-op value
-/// fields (`cmd` for spawn, `handle` for peek/wait/kill). The legacy
-/// per-key shape (`peek`/`wait`/`kill` as string handles, `command` alias)
-/// is still accepted by the parser for backward compatibility with
-/// in-flight conversations whose history was written before the
-/// discriminator landed.
-///
-/// `mode` is silently ignored — the field is no longer in the schema but
-/// stored history may carry it. Empty strings on operation-key fields are
-/// treated as absent (`OpenAI` Responses API models default-fill every
-/// optional string property to ""; without this tolerance every bash call
-/// from a GPT model would trip the operation-key mutex).
+/// Raw deserialised input. `op` is the required discriminator; `cmd` /
+/// `handle` / `wait_seconds` / `signal` / `lines` / `since` / `label` are
+/// the per-op fields advertised in the schema. `deny_unknown_fields`
+/// turns the retired affordances (`mode`, `command` alias for `cmd`, the
+/// legacy `peek` / `wait` / `kill` operation keys) into structured parse
+/// errors rather than silent acceptance — see REQ-BASH-010 rationale.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBashInput {
@@ -94,6 +90,8 @@ struct RawBashInput {
     #[serde(default)]
     handle: Option<String>,
     #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
     wait_seconds: Option<i64>,
     #[serde(default)]
     signal: Option<String>,
@@ -101,26 +99,13 @@ struct RawBashInput {
     lines: Option<i64>,
     #[serde(default)]
     since: Option<i64>,
-
-    // Legacy fields — kept on the deserialize path so old in-flight
-    // conversations (and the GPT default-fill case) don't fail at parse.
-    // None of these appear in the current input_schema.
-    #[serde(default)]
-    peek: Option<String>,
-    #[serde(default)]
-    wait: Option<String>,
-    #[serde(default)]
-    kill: Option<String>,
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
 }
 
-/// Operation discriminator. Mirrors `Operation` in `specs/bash/bash.allium`.
+/// Operation discriminator. Mirrors `OperationKind` in
+/// `specs/bash/bash.allium`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
-    Spawn,
+    Run,
     Peek,
     Wait,
     Kill,
@@ -129,7 +114,7 @@ enum Op {
 impl Op {
     fn as_field_name(self) -> &'static str {
         match self {
-            Op::Spawn => "spawn",
+            Op::Run => "run",
             Op::Peek => "peek",
             Op::Wait => "wait",
             Op::Kill => "kill",
@@ -149,11 +134,11 @@ pub struct ReadArgs {
 /// and `peek`.
 #[derive(Debug)]
 pub enum BashRequest {
-    Spawn {
+    Run {
         cmd: String,
+        label: Option<String>,
         wait_seconds: u64,
         read_args: ReadArgs,
-        deprecation_notice: Option<String>,
     },
     Peek {
         handle_id: String,
@@ -163,7 +148,6 @@ pub enum BashRequest {
         handle_id: String,
         wait_seconds: u64,
         read_args: ReadArgs,
-        deprecation_notice: Option<String>,
     },
     Kill {
         handle_id: String,
@@ -188,8 +172,16 @@ pub enum BashError {
     SpawnFailed {
         error_message: String,
     },
-    /// Either zero/multiple of `cmd|peek|wait|kill`, or `mode`+`wait_seconds`,
-    /// or some other operation-key conflict (REQ-BASH-010).
+    /// Run call carried a label longer than `MAX_LABEL_LENGTH`
+    /// (REQ-BASH-002 / REQ-BASH-010).
+    LabelTooLong {
+        max: usize,
+    },
+    /// Catch-all for input-shape failures the schema didn't catch:
+    /// missing/invalid `op`, missing required peer field for the chosen
+    /// op, invalid `lines` value, etc. (REQ-BASH-010). The variant name
+    /// is historical — the producer set has shrunk substantially since
+    /// the four-sibling shape was retired.
     MutuallyExclusiveModes {
         message: String,
         conflicting_args: Vec<&'static str>,
@@ -215,6 +207,7 @@ impl BashError {
                     .map(|s: &LiveHandleSummary| BashLiveHandleSummary {
                         handle: s.handle.as_str().to_string(),
                         cmd: s.cmd.clone(),
+                        label: s.label.clone(),
                         age_seconds: s.age_seconds,
                         status: "running".to_string(),
                     })
@@ -247,6 +240,10 @@ impl BashError {
             BashError::SpawnFailed { error_message } => {
                 BashErrorResponse::SpawnFailed { error_message }
             }
+            BashError::LabelTooLong { max } => BashErrorResponse::LabelTooLong {
+                error_message: format!("label exceeds the {max}-character cap"),
+                max_label_length: max,
+            },
             BashError::MutuallyExclusiveModes {
                 message,
                 conflicting_args,
@@ -286,75 +283,51 @@ impl BashError {
 /// Parse + validate the agent's request. Returns the typed `BashRequest`
 /// or a `BashError` ready to be returned as the tool output.
 ///
-/// Tolerance rules (REQ-BASH-010):
+/// Tolerance rules (REQ-BASH-010, revision 3):
 ///
-/// - Operation comes from explicit `op` if present; otherwise inferred from
-///   the single non-empty legacy key among `cmd`/`peek`/`wait`/`kill`.
-/// - Empty strings on legacy operation-key fields are treated as absent.
-///   This is what makes the GPT default-fill case ("peek": "", "wait": "",
-///   "kill": "" alongside a real cmd) parse correctly.
-/// - `mode` is silently dropped if `wait_seconds` is set; if alone, mapped
-///   to the canonical `wait_seconds` with a deprecation notice. The schema
-///   no longer advertises `mode`.
-/// - `since=0` is treated as absent (default fill from models that emit
-///   the schema minimum). Non-zero `since` and `lines` together still
-///   produce `peek_args_mutually_exclusive`.
-#[allow(clippy::too_many_lines)]
+/// - `op` is required. The retired affordances (legacy four-sibling
+///   `peek`/`wait`/`kill` keys, `mode` shim, `command` alias for `cmd`,
+///   bare `cmd` with no `op`) are no longer accepted; `deny_unknown_fields`
+///   on `RawBashInput` turns them into structured parse errors.
+/// - `since=0` is treated as absent (default-fill from models that emit
+///   the schema minimum despite `minimum: 1`). A `tracing::debug!` line
+///   names the dropped value.
+/// - When both `lines` and `since` are supplied, `lines` wins and `since`
+///   is silently dropped (default-fill collision on optional integers).
+///   A `tracing::debug!` line records the drop.
 pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
     let raw: RawBashInput = serde_json::from_value(input).map_err(|e| {
-        // Schema-level rejection — the agent passed a malformed shape.
+        // Schema-level rejection — the agent passed a malformed shape, or
+        // an unknown field (notably any of the retired affordances).
         BashError::MutuallyExclusiveModes {
             message: format!("invalid bash input: {e}"),
             conflicting_args: vec![],
             recommended_action:
-                "send `op` set to spawn|peek|wait|kill, with the documented field types".into(),
+                "send `op` set to run|peek|wait|kill, with the documented field types".into(),
             extra: None,
         }
     })?;
 
     let op = resolve_op(&raw)?;
-
-    // mode handling: drop silently if wait_seconds is also set; honor
-    // alone for legacy callers. Unknown mode values fall back to default.
-    let (effective_wait_seconds_opt, deprecation_notice) = match (&raw.mode, raw.wait_seconds) {
-        (Some(m), None) => match m.as_str() {
-            "default" => (
-                Some(30u64),
-                Some("the 'mode' parameter is deprecated; pass wait_seconds=30 instead".into()),
-            ),
-            "slow" => (
-                Some(900u64),
-                Some("the 'mode' parameter is deprecated; pass wait_seconds=900 instead".into()),
-            ),
-            "background" => (
-                Some(0u64),
-                Some("the 'mode' parameter is deprecated; pass wait_seconds=0 instead".into()),
-            ),
-            _ => (None, None),
-        },
-        _ => (None, None),
-    };
-
     let read_args = parse_read_args(raw.lines, raw.since)?;
 
     match op {
-        Op::Spawn => {
-            let cmd = raw
-                .cmd
-                .filter(|s| !s.is_empty())
-                .or_else(|| raw.command.filter(|s| !s.is_empty()))
-                .ok_or_else(|| BashError::MutuallyExclusiveModes {
-                    message: "op=spawn requires a non-empty 'cmd'".into(),
+        Op::Run => {
+            let cmd = raw.cmd.filter(|s| !s.is_empty()).ok_or_else(|| {
+                BashError::MutuallyExclusiveModes {
+                    message: "op=run requires a non-empty 'cmd'".into(),
                     conflicting_args: vec!["cmd"],
                     recommended_action: "supply cmd=<shell command>".into(),
                     extra: None,
-                })?;
-            let wait_seconds = resolve_wait_seconds(raw.wait_seconds, effective_wait_seconds_opt)?;
-            Ok(BashRequest::Spawn {
+                }
+            })?;
+            let label = parse_label(raw.label)?;
+            let wait_seconds = resolve_wait_seconds(raw.wait_seconds)?;
+            Ok(BashRequest::Run {
                 cmd,
+                label,
                 wait_seconds,
                 read_args,
-                deprecation_notice,
             })
         }
         Op::Peek => {
@@ -366,12 +339,11 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
         }
         Op::Wait => {
             let handle_id = resolve_handle(&raw, Op::Wait)?;
-            let wait_seconds = resolve_wait_seconds(raw.wait_seconds, effective_wait_seconds_opt)?;
+            let wait_seconds = resolve_wait_seconds(raw.wait_seconds)?;
             Ok(BashRequest::Wait {
                 handle_id,
                 wait_seconds,
                 read_args,
-                deprecation_notice,
             })
         }
         Op::Kill => {
@@ -395,87 +367,39 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
     }
 }
 
-/// Determine the operation. Explicit `op` wins; otherwise infer from the
-/// single non-empty legacy operation-key field. Empty strings on legacy
-/// fields are ignored (default-fill tolerance).
+/// Determine the operation. `op` is required; absent or invalid values
+/// surface as `mutually_exclusive_modes`.
 fn resolve_op(raw: &RawBashInput) -> Result<Op, BashError> {
-    if let Some(s) = raw.op.as_deref().filter(|s| !s.is_empty()) {
-        return match s {
-            "spawn" => Ok(Op::Spawn),
-            "peek" => Ok(Op::Peek),
-            "wait" => Ok(Op::Wait),
-            "kill" => Ok(Op::Kill),
-            other => Err(BashError::MutuallyExclusiveModes {
-                message: format!(
-                    "op='{other}' is not recognized; valid values are spawn|peek|wait|kill"
-                ),
-                conflicting_args: vec!["op"],
-                recommended_action: "set op to one of: spawn, peek, wait, kill".into(),
-                extra: None,
-            }),
-        };
-    }
-
-    let cmd_set = raw.cmd.as_deref().is_some_and(|s| !s.is_empty())
-        || raw.command.as_deref().is_some_and(|s| !s.is_empty());
-    let peek_set = raw.peek.as_deref().is_some_and(|s| !s.is_empty());
-    let wait_set = raw.wait.as_deref().is_some_and(|s| !s.is_empty());
-    let kill_set = raw.kill.as_deref().is_some_and(|s| !s.is_empty());
-
-    let mut found: Vec<(Op, &'static str)> = Vec::new();
-    if cmd_set {
-        found.push((Op::Spawn, "cmd"));
-    }
-    if peek_set {
-        found.push((Op::Peek, "peek"));
-    }
-    if wait_set {
-        found.push((Op::Wait, "wait"));
-    }
-    if kill_set {
-        found.push((Op::Kill, "kill"));
-    }
-
-    match found.len() {
-        1 => Ok(found[0].0),
-        0 => Err(BashError::MutuallyExclusiveModes {
-            message: "no operation specified; set 'op' to one of spawn|peek|wait|kill".into(),
+    let s = raw.op.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+        BashError::MutuallyExclusiveModes {
+            message: "op is required and must be one of: run, peek, wait, kill".into(),
             conflicting_args: vec![],
-            recommended_action: "set op=spawn|peek|wait|kill".into(),
+            recommended_action: "set op to one of: run, peek, wait, kill".into(),
+            extra: None,
+        }
+    })?;
+    match s {
+        "run" => Ok(Op::Run),
+        "peek" => Ok(Op::Peek),
+        "wait" => Ok(Op::Wait),
+        "kill" => Ok(Op::Kill),
+        other => Err(BashError::MutuallyExclusiveModes {
+            message: format!("op='{other}' is not recognized; valid values are run|peek|wait|kill"),
+            conflicting_args: vec!["op"],
+            recommended_action: "set op to one of: run, peek, wait, kill".into(),
             extra: None,
         }),
-        _ => {
-            let names: Vec<&'static str> = found.iter().map(|(_, n)| *n).collect();
-            Err(BashError::MutuallyExclusiveModes {
-                message: format!(
-                    "multiple operations specified ({}); set exactly one via 'op'",
-                    names.join(", ")
-                ),
-                conflicting_args: names,
-                recommended_action: "set 'op' to the operation you want and remove the others"
-                    .into(),
-                extra: None,
-            })
-        }
     }
 }
 
-/// Resolve the handle id for peek/wait/kill. Prefers the canonical
-/// `handle` field; falls back to the legacy operation-key field for
-/// backward compatibility.
+/// Resolve the handle id for peek/wait/kill from the canonical `handle`
+/// field. The legacy operation-key fallback (`raw.peek` / `raw.wait` /
+/// `raw.kill`) was retired alongside the four-sibling shape (REQ-BASH-010,
+/// revision 3).
 fn resolve_handle(raw: &RawBashInput, op: Op) -> Result<String, BashError> {
-    let canonical = raw.handle.as_deref().filter(|s| !s.is_empty());
-    if let Some(h) = canonical {
-        return Ok(h.to_string());
-    }
-    let legacy = match op {
-        Op::Peek => raw.peek.as_deref(),
-        Op::Wait => raw.wait.as_deref(),
-        Op::Kill => raw.kill.as_deref(),
-        Op::Spawn => None,
-    }
-    .filter(|s| !s.is_empty());
-    legacy
+    raw.handle
+        .as_deref()
+        .filter(|s| !s.is_empty())
         .map(String::from)
         .ok_or_else(|| BashError::MutuallyExclusiveModes {
             message: format!("op={} requires a non-empty 'handle'", op.as_field_name()),
@@ -485,23 +409,49 @@ fn resolve_handle(raw: &RawBashInput, op: Op) -> Result<String, BashError> {
         })
 }
 
+/// Validate and normalize the optional `label` for `op=run`. Empty
+/// strings (a frequent default-fill emission) are treated as absent;
+/// over-cap labels are rejected with `label_too_long` per REQ-BASH-002.
+fn parse_label(raw: Option<String>) -> Result<Option<String>, BashError> {
+    let Some(label) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if label.chars().count() > MAX_LABEL_LENGTH {
+        return Err(BashError::LabelTooLong {
+            max: MAX_LABEL_LENGTH,
+        });
+    }
+    Ok(Some(label))
+}
+
 fn parse_read_args(lines: Option<i64>, since: Option<i64>) -> Result<ReadArgs, BashError> {
-    // since=0 is a default-fill from the schema's prior `minimum: 0`; it's
-    // also semantically equivalent to "tail of everything" on a bounded
-    // ring, so dropping it loses no information. The schema now advertises
-    // minimum: 1 to discourage emission, but the parser stays tolerant for
-    // legacy in-flight conversations and any model that ignores the bound.
-    let since = since.filter(|n| *n > 0);
+    // since=0 is below the schema's advertised `minimum: 1`, but current
+    // OpenAI Responses-API models still emit it as a default-fill on
+    // optional integers. Treating it as absent routes through the default
+    // `lines` window. REQ-BASH-010 (revision 3) requires this be an
+    // auditable tolerance, not a silent one.
+    let since = match since {
+        Some(0) => {
+            tracing::debug!(
+                "bash read window: dropping since=0 (likely default-fill below schema \
+                 minimum: 1); routing through default `lines` window"
+            );
+            None
+        }
+        Some(n) if n > 0 => Some(n),
+        Some(_) | None => None,
+    };
 
     // When both `lines` and `since` are provided, prefer `lines` and drop
     // `since`. Models on structured-output APIs default-fill optional
-    // integers with their schema minimums (`lines=200`, `since=1`); for
-    // a short command output, `since=1` returns nothing, leaving the
-    // agent to retry. `lines` is the safer default. Real incremental-peek
+    // integers with their schema minimums (`lines=1`, `since=1`); for
+    // a short command output, `since=1` returns nothing while the request
+    // default `lines=200` returns the actual tail. Real incremental-peek
     // users (subsequent peeks with a stored end_offset) typically omit
     // `lines` entirely.
     let since = if lines.is_some() && since.is_some() {
         tracing::debug!(
+            dropped_since = ?since,
             "bash read window: both `lines` and `since` provided — preferring `lines` (likely \
              default-fill); dropping `since`"
         );
@@ -526,15 +476,8 @@ fn parse_read_args(lines: Option<i64>, since: Option<i64>) -> Result<ReadArgs, B
     Ok(ReadArgs { lines, since })
 }
 
-fn resolve_wait_seconds(raw: Option<i64>, from_mode: Option<u64>) -> Result<u64, BashError> {
-    let value: i64 = match (raw, from_mode) {
-        (Some(v), _) => v,
-        (None, Some(m)) => {
-            // mapped from mode — already in valid range.
-            return Ok(m);
-        }
-        (None, None) => i64::try_from(DEFAULT_WAIT_SECONDS).unwrap_or(30),
-    };
+fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
+    let value: i64 = raw.unwrap_or_else(|| i64::try_from(DEFAULT_WAIT_SECONDS).unwrap_or(30));
     let max_signed: i64 = i64::try_from(MAX_WAIT_SECONDS).unwrap_or(i64::MAX);
     if !(0..=max_signed).contains(&value) {
         return Err(BashError::WaitSecondsOutOfRange {
@@ -557,12 +500,12 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
     };
 
     match request {
-        BashRequest::Spawn {
+        BashRequest::Run {
             cmd,
+            label,
             wait_seconds,
             read_args,
-            deprecation_notice,
-        } => run_spawn(&cmd, wait_seconds, read_args, deprecation_notice, &ctx).await,
+        } => run_run(&cmd, label, wait_seconds, read_args, &ctx).await,
         BashRequest::Peek {
             handle_id,
             read_args,
@@ -571,30 +514,22 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
             handle_id,
             wait_seconds,
             read_args,
-            deprecation_notice,
-        } => {
-            run_wait(
-                &handle_id,
-                wait_seconds,
-                read_args,
-                deprecation_notice,
-                &ctx,
-            )
-            .await
-        }
+        } => run_wait(&handle_id, wait_seconds, read_args, &ctx).await,
         BashRequest::Kill { handle_id, signal } => run_kill(&handle_id, signal, &ctx).await,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Spawn
+// Run (formerly "spawn") — the agent's run-and-optionally-yield-a-handle
+// operation. The OS-level fork/exec is still called "spawn" within this
+// module where the distinction matters.
 // ---------------------------------------------------------------------------
 
-async fn run_spawn(
+async fn run_run(
     cmd: &str,
+    label: Option<String>,
     wait_seconds: u64,
     read_args: ReadArgs,
-    deprecation_notice: Option<String>,
     ctx: &ToolContext,
 ) -> ToolOutput {
     // REQ-BASH-011: safety check before reserving any resources.
@@ -614,7 +549,7 @@ async fn run_spawn(
     };
 
     // REQ-BASH-005: cap check + handle id allocation under the same write
-    // lock so two concurrent spawns can't both race past the cap.
+    // lock so two concurrent runs can't both race past the cap.
     let cap = registry.live_handle_cap();
     let ring_bytes_cap = registry.ring_bytes_cap();
     let handle_id;
@@ -626,22 +561,14 @@ async fn run_spawn(
         handle_id = handles.allocate_handle_id();
         // We deliberately do not insert the Handle yet — we need the pgid
         // from the spawned child. We hold the write lock across the spawn
-        // so no other spawn can race the cap check, then insert below.
+        // so no other run can race the cap check, then insert below.
         // Spawn is fast (a fork+exec) so this lock-hold is bounded.
-        match spawn_child(cmd, ctx, handle_id.clone(), ring_bytes_cap) {
+        match spawn_child(cmd, label, ctx, handle_id.clone(), ring_bytes_cap) {
             Ok((handle, child)) => {
                 let inserted = handles.insert(handle.clone());
                 drop(handles);
                 start_io_tasks(&inserted, child);
-                race_spawn_response(
-                    inserted,
-                    cmd,
-                    wait_seconds,
-                    read_args,
-                    deprecation_notice,
-                    ctx,
-                )
-                .await
+                race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
             Err(e) => {
                 // Drop the allocated handle id by NOT inserting — next
@@ -659,6 +586,7 @@ async fn run_spawn(
 #[allow(clippy::similar_names)]
 fn spawn_child(
     cmd: &str,
+    label: Option<String>,
     ctx: &ToolContext,
     handle_id: HandleId,
     ring_bytes_cap: usize,
@@ -717,6 +645,7 @@ fn spawn_child(
         ctx.conversation_id.clone(),
         handle_id,
         cmd.to_string(),
+        label,
         pgid,
         pid,
         ring_bytes_cap,
@@ -881,12 +810,11 @@ fn exit_status_to_cause(status: std::process::ExitStatus) -> FinalCause {
     }
 }
 
-async fn race_spawn_response(
+async fn race_run_response(
     handle: Arc<Handle>,
     cmd: &str,
     wait_seconds: u64,
     read_args: ReadArgs,
-    deprecation_notice: Option<String>,
     ctx: &ToolContext,
 ) -> ToolOutput {
     let mut exit_rx = handle.exit_observer();
@@ -895,18 +823,18 @@ async fn race_spawn_response(
     tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => {
-            // Spawn cancellation: treat as still_running — the agent
+            // Run cancellation: treat as still_running — the agent
             // can choose to peek/kill the handle later. We do not
             // proactively kill: that's what kill is for.
-            still_running_response(&handle, started.elapsed(), &read_args, deprecation_notice.as_deref(), cmd).await
+            still_running_response(&handle, started.elapsed(), &read_args, cmd).await
         }
         Ok(()) = exit_rx.changed() => {
             // Process exited (or waiter panicked). Either way, build the
             // appropriate response from current state.
-            terminal_or_panic_response(&handle, &read_args, true, false, deprecation_notice.as_deref(), Some(cmd)).await
+            terminal_or_panic_response(&handle, &read_args, true, false, Some(cmd)).await
         }
         () = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, deprecation_notice.as_deref(), cmd).await
+            still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, cmd).await
         }
     }
 }
@@ -920,7 +848,7 @@ async fn run_peek(handle_id: &str, read_args: ReadArgs, ctx: &ToolContext) -> To
         Ok(h) => h,
         Err(e) => return e.into_tool_output(),
     };
-    shape_handle_response(&handle, &read_args, ResponseKind::Peek, None, None).await
+    shape_handle_response(&handle, &read_args, ResponseKind::Peek, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +859,6 @@ async fn run_wait(
     handle_id: &str,
     wait_seconds: u64,
     read_args: ReadArgs,
-    deprecation_notice: Option<String>,
     ctx: &ToolContext,
 ) -> ToolOutput {
     let handle = match lookup_handle(ctx, handle_id).await {
@@ -943,14 +870,7 @@ async fn run_wait(
     // response immediately. Avoids the watch-channel-already-fired pitfall
     // (design.md "Watch-channel rule").
     if handle.state().await.is_terminal() {
-        return shape_handle_response(
-            &handle,
-            &read_args,
-            ResponseKind::Wait,
-            deprecation_notice.as_deref(),
-            None,
-        )
-        .await;
+        return shape_handle_response(&handle, &read_args, ResponseKind::Wait, None).await;
     }
 
     let mut exit_rx = handle.exit_observer();
@@ -958,14 +878,14 @@ async fn run_wait(
     tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => {
-            still_running_response(&handle, started.elapsed(), &read_args, deprecation_notice.as_deref(), &handle.cmd).await
+            still_running_response(&handle, started.elapsed(), &read_args, &handle.cmd).await
         }
         Ok(()) = exit_rx.changed() => {
-            terminal_or_panic_response(&handle, &read_args, false, false, deprecation_notice.as_deref(), None).await
+            terminal_or_panic_response(&handle, &read_args, false, false, None).await
         }
         () = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
             // Re-timeout: SAME handle id (REQ-BASH-003).
-            still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, deprecation_notice.as_deref(), &handle.cmd).await
+            still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, &handle.cmd).await
         }
     }
 }
@@ -992,7 +912,6 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
                     pending: false,
                 },
                 None,
-                None,
             )
             .await;
         }
@@ -1014,7 +933,6 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
                 &ReadArgs::default(),
                 ResponseKind::Kill { signal_sent: Some(signal), pending: !handle.state().await.is_terminal() },
                 None,
-                None,
             )
             .await
         }
@@ -1024,7 +942,6 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
                 &handle,
                 &ReadArgs::default(),
                 ResponseKind::Kill { signal_sent: Some(signal), pending: false },
-                None,
                 None,
             )
             .await
@@ -1040,7 +957,6 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
                 &handle,
                 &ReadArgs::default(),
                 ResponseKind::Kill { signal_sent: Some(signal), pending: true },
-                None,
                 None,
             )
             .await
@@ -1104,13 +1020,13 @@ async fn shape_handle_response(
     handle: &Arc<Handle>,
     read_args: &ReadArgs,
     kind: ResponseKind,
-    deprecation_notice: Option<&str>,
-    // Optional command override (for spawn responses where we want the
-    // original cmd text; for non-spawn we read handle.cmd).
+    // Optional command override (for run responses where we want the
+    // original cmd text; for non-run we read handle.cmd).
     cmd_override: Option<&str>,
 ) -> ToolOutput {
     let state = handle.state().await;
     let cmd = cmd_override.unwrap_or(handle.cmd.as_str()).to_string();
+    let label = handle.label.clone();
     let display = display_label(handle, kind);
     let signal_sent_top: Option<String> = match kind {
         ResponseKind::Kill {
@@ -1143,6 +1059,7 @@ async fn shape_handle_response(
                     BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
                         handle: handle.handle_id.to_string(),
                         cmd,
+                        label: label.clone(),
                         window,
                         kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
                         kill_attempted_at: kill_attempted_str
@@ -1159,17 +1076,18 @@ async fn shape_handle_response(
                     BashResponse::StillRunning(BashStillRunningPayload {
                         handle: handle.handle_id.to_string(),
                         cmd,
+                        label: label.clone(),
                         waited_ms: 0,
                         window,
                         kill_signal_sent: kill_signal_str,
                         kill_attempted_at: kill_attempted_str,
-                        deprecation_notice: deprecation_notice.map(String::from),
                     })
                 }
                 ResponseKind::Peek if is_kill_pending_kernel => {
                     BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
                         handle: handle.handle_id.to_string(),
                         cmd,
+                        label: label.clone(),
                         window,
                         kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
                         kill_attempted_at: kill_attempted_str
@@ -1191,6 +1109,7 @@ async fn shape_handle_response(
                     BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
                         handle: handle.handle_id.to_string(),
                         cmd,
+                        label: label.clone(),
                         window,
                         kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
                         kill_attempted_at: kill_attempted_str
@@ -1202,21 +1121,21 @@ async fn shape_handle_response(
                 ResponseKind::Peek => BashResponse::Running(BashRunningPayload {
                     handle: handle.handle_id.to_string(),
                     cmd,
+                    label: label.clone(),
                     window,
                     kill_signal_sent: kill_signal_str,
                     kill_attempted_at: kill_attempted_str,
                     display,
                     signal_sent: signal_sent_top,
-                    deprecation_notice: deprecation_notice.map(String::from),
                 }),
                 ResponseKind::Wait => BashResponse::StillRunning(BashStillRunningPayload {
                     handle: handle.handle_id.to_string(),
                     cmd,
+                    label: label.clone(),
                     waited_ms: 0,
                     window,
                     kill_signal_sent: kill_signal_str,
                     kill_attempted_at: kill_attempted_str,
-                    deprecation_notice: deprecation_notice.map(String::from),
                 }),
             }
         }
@@ -1226,6 +1145,7 @@ async fn shape_handle_response(
             BashResponse::Tombstoned(BashTombstonedPayload {
                 handle: handle.handle_id.to_string(),
                 cmd,
+                label: label.clone(),
                 final_cause: final_cause_str(&t.final_cause).to_string(),
                 exit_code: t.exit_code,
                 signal_number: t.signal_number,
@@ -1236,7 +1156,6 @@ async fn shape_handle_response(
                 window,
                 display,
                 signal_sent: signal_sent_top,
-                deprecation_notice: deprecation_notice.map(String::from),
             })
         }
     };
@@ -1257,18 +1176,18 @@ async fn shape_handle_response(
     ToolOutput::success(serialized).with_display(value)
 }
 
-/// Build a `still_running` response for spawn/wait/cancel paths. `elapsed`
+/// Build a `still_running` response for run/wait/cancel paths. `elapsed`
 /// is the wait window observed by the agent (for `waited_ms`).
 async fn still_running_response(
     handle: &Arc<Handle>,
     elapsed: Duration,
     read_args: &ReadArgs,
-    deprecation_notice: Option<&str>,
     cmd: &str,
 ) -> ToolOutput {
     let state = handle.state().await;
     let kill_attempt = handle.kill_attempt().await;
     let waited_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let label = handle.label.clone();
 
     let window = if let HandleState::Live(live) = state.as_ref() {
         let ring = live.ring.lock().await;
@@ -1295,11 +1214,12 @@ async fn still_running_response(
         BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
             handle: handle.handle_id.to_string(),
             cmd: cmd.to_string(),
+            label: label.clone(),
             window,
             kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
             kill_attempted_at: kill_attempted_str
                 .unwrap_or_else(|| format_systime(SystemTime::now())),
-            // No display label on spawn/wait still_running paths.
+            // No display label on run/wait still_running paths.
             display: String::new(),
             // No signal_sent echo: this is a passive wait, not a kill call.
             signal_sent: String::new(),
@@ -1308,11 +1228,11 @@ async fn still_running_response(
         BashResponse::StillRunning(BashStillRunningPayload {
             handle: handle.handle_id.to_string(),
             cmd: cmd.to_string(),
+            label,
             waited_ms,
             window,
             kill_signal_sent: kill_signal_str,
             kill_attempted_at: kill_attempted_str,
-            deprecation_notice: deprecation_notice.map(String::from),
         })
     };
 
@@ -1350,23 +1270,24 @@ async fn still_running_response(
 async fn terminal_or_panic_response(
     handle: &Arc<Handle>,
     read_args: &ReadArgs,
-    spawn_path: bool,
+    run_path: bool,
     cancelled: bool,
-    deprecation_notice: Option<&str>,
     cmd_override: Option<&str>,
 ) -> ToolOutput {
     let _ = cancelled; // unused for now; kept for symmetry with future cancel handling
     let state = handle.state().await;
+    let label = handle.label.clone();
     match state.as_ref() {
         HandleState::Tombstoned(t) => {
             let cmd = cmd_override.unwrap_or(handle.cmd.as_str()).to_string();
             let view = read_window_from_tombstone(t, read_args);
             let window = window_to_typed(&view);
 
-            let typed = if spawn_path {
-                let payload = BashSpawnTombstonePayload {
+            let typed = if run_path {
+                let payload = BashRunTombstonePayload {
                     handle: handle.handle_id.to_string(),
                     cmd,
+                    label: label.clone(),
                     final_cause: final_cause_str(&t.final_cause).to_string(),
                     exit_code: t.exit_code,
                     signal_number: t.signal_number,
@@ -1375,7 +1296,6 @@ async fn terminal_or_panic_response(
                     kill_signal_sent: t.kill_signal_sent.map(|s| s.as_str().to_string()),
                     kill_attempted_at: t.kill_attempted_at.map(format_systime),
                     window,
-                    deprecation_notice: deprecation_notice.map(String::from),
                 };
                 match &t.final_cause {
                     FinalCause::Exited { .. } => BashResponse::Exited(payload),
@@ -1385,6 +1305,7 @@ async fn terminal_or_panic_response(
                 BashResponse::Tombstoned(BashTombstonedPayload {
                     handle: handle.handle_id.to_string(),
                     cmd,
+                    label: label.clone(),
                     final_cause: final_cause_str(&t.final_cause).to_string(),
                     exit_code: t.exit_code,
                     signal_number: t.signal_number,
@@ -1398,7 +1319,6 @@ async fn terminal_or_panic_response(
                     // `shape_handle_response`).
                     display: String::new(),
                     signal_sent: None,
-                    deprecation_notice: deprecation_notice.map(String::from),
                 })
             };
 

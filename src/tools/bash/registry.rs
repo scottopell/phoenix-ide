@@ -47,6 +47,7 @@ pub enum BashHandleError {
 pub struct LiveHandleSummary {
     pub handle: HandleId,
     pub cmd: String,
+    pub label: Option<String>,
     pub age_seconds: u64,
 }
 
@@ -116,6 +117,7 @@ impl ConversationHandles {
                 out.push(LiveHandleSummary {
                     handle: h.handle_id.clone(),
                     cmd: h.cmd.clone(),
+                    label: h.label.clone(),
                     age_seconds,
                 });
             }
@@ -376,6 +378,7 @@ mod tests {
             conv.to_string(),
             HandleId::new(id),
             format!("cmd for {id}"),
+            None,
             12345,
             12345,
             ring_bytes_cap,
@@ -641,6 +644,7 @@ mod tests {
                 "conv-real".to_string(),
                 HandleId::new("b-1"),
                 "sleep 60".to_string(),
+                None,
                 pgid,
                 pid,
                 RING_BUFFER_BYTES,

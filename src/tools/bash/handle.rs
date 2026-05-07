@@ -199,6 +199,11 @@ pub struct Handle {
     pub conversation_id: String,
     pub handle_id: HandleId,
     pub cmd: String,
+    /// Optional human-readable annotation supplied at run-time. Echoed on
+    /// every response carrying the handle and on each `live_handles[]`
+    /// entry of the cap-reached error. See REQ-BASH-002 / REQ-BASH-010 and
+    /// the `Handle.label` field in `bash.allium`.
+    pub label: Option<String>,
     pub started_at: SystemTime,
     /// The current handle state. Always written through
     /// [`Self::transition_to_terminal`].
@@ -221,6 +226,7 @@ impl std::fmt::Debug for Handle {
             .field("conversation_id", &self.conversation_id)
             .field("handle_id", &self.handle_id)
             .field("cmd", &self.cmd)
+            .field("label", &self.label)
             .field("started_at", &self.started_at)
             .finish_non_exhaustive()
     }
@@ -230,7 +236,8 @@ impl Handle {
     /// Construct a fresh live handle for a freshly spawned child.
     ///
     /// `pgid` and `pid` are recorded; the ring is created at the
-    /// configured `RING_BUFFER_BYTES` cap.
+    /// configured `RING_BUFFER_BYTES` cap. `label` is optional metadata
+    /// supplied by the agent on the run call (REQ-BASH-002).
     // pgid/pid mirror the `Handle` entity field names from `bash.allium`;
     // renaming for clippy's similar-names lint would diverge from the spec.
     #[allow(clippy::similar_names)]
@@ -238,6 +245,7 @@ impl Handle {
         conversation_id: String,
         handle_id: HandleId,
         cmd: String,
+        label: Option<String>,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -252,6 +260,7 @@ impl Handle {
             conversation_id,
             handle_id,
             cmd,
+            label,
             started_at: SystemTime::now(),
             state: RwLock::new(Arc::new(HandleState::Live(live))),
             kill_attempt: RwLock::new(None),
@@ -483,6 +492,7 @@ mod tests {
             "conv-1".into(),
             HandleId::new("b-1"),
             "echo hi".into(),
+            None,
             12345,
             12345,
             super::super::ring::RING_BUFFER_BYTES,

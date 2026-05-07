@@ -45,24 +45,38 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> String {
-        // The negation-based framing (`NOT a timeout` / `NEVER killed` /
-        // `EXACTLY ONCE` / `does not auto-escalate`) is load-bearing —
-        // affirmative descriptions get pattern-matched into the POSIX
-        // `timeout(1)` / `kill PID` priors. See REQ-BASH-002 rationale.
+        // The negation-based framing (`does NOT detach` / `NOT a timeout` /
+        // `is NEVER killed` / `EXACTLY ONCE` / `does not auto-escalate`) is
+        // load-bearing — affirmative descriptions get pattern-matched into
+        // the POSIX `fork(2)` / `timeout(1)` / `kill PID` priors, and
+        // explicit negations override those priors. The cookbook block
+        // surfaces the `wait_seconds=0` "give me a handle now" affordance
+        // that would otherwise be buried inside the run paragraph. See
+        // REQ-BASH-002 / REQ-BASH-010 rationale.
         r#"Executes shell commands via bash -c, capturing combined stdout/stderr.
 Bash state changes (working dir, variables, aliases) don't persist between calls.
 
+Common patterns:
+  Run synchronously:    op="run", cmd="...", wait_seconds=30
+  Start in background:  op="run", cmd="...", wait_seconds=0   (returns a handle immediately)
+  Inspect progress:     op="peek", handle="b-3"
+  Wait for completion:  op="wait", handle="b-3", wait_seconds=60
+
 Pick one operation via `op`:
 
-  op="spawn"  Spawn a new command. Required: cmd=<shell command>.
-              wait_seconds (default 30) is NOT a timeout — the process is
-              NEVER killed when wait_seconds elapses. wait_seconds only
-              controls how long this single tool call blocks before handing
-              you back a handle so you can do other work. The process keeps
-              running in the background until it exits naturally or you
-              call op="kill". A response with status="still_running" means
-              the process is alive and will stay alive — peek it later,
-              wait on it, or kill it explicitly.
+  op="run"    Run a shell command. If it finishes within wait_seconds you
+              get its full output and exit code — same as if you'd run it
+              in a shell. If wait_seconds elapses first, the process keeps
+              running and you receive a handle to peek/wait/kill later.
+              op="run" does NOT detach: the handle is minted only when
+              wait_seconds elapses; for short commands you'll just get the
+              result. wait_seconds is NOT a process kill timeout: the
+              process is NEVER killed when wait_seconds elapses; it keeps
+              running and you receive a handle. Use op="kill" to actually
+              terminate. Set wait_seconds=0 to start a process and get its
+              handle back immediately without waiting for output. Pass an
+              optional label=<string> to annotate the handle (echoed on
+              every later response and visible in the cap-reached error).
 
   op="peek"   Return the current ring buffer state for a handle. Required:
               handle=<id>. Use lines=N for the last N lines, or since=K
@@ -95,7 +109,7 @@ Pick one operation via `op`:
               a second TERM is a no-op.)
 
 If you peek a handle and get error="handle_not_found", it likely means
-Phoenix restarted between when you spawned the process and now — bash
+Phoenix restarted between when you ran the command and now — bash
 handles do NOT survive Phoenix process restart. For processes that need
 to survive Phoenix restart, that need a TTY, that need stdin, or that
 are interactive REPLs, use the tmux tool instead.
@@ -106,33 +120,42 @@ For complex scripts, write them to a file first and execute the file."#
     }
 
     fn input_schema(&self) -> Value {
-        // Single discriminator (`op`) plus per-op value fields. This shape
-        // avoids the prior 4-sibling-string pattern, which models on the
-        // OpenAI Responses API would default-fill (every optional string
-        // emitted as ""), tripping the runtime mutex check. See
-        // specs/bash/requirements.md REQ-BASH-010.
+        // Single discriminator (`op`) plus per-op value fields. The
+        // four-sibling-string pattern was retired alongside the `op=run`
+        // rename: the LLM sees the current schema each turn and conforms
+        // to it; pre-discriminator history is inert text from the model's
+        // POV. `deny_unknown_fields` on the input deserializer makes any
+        // caller still emitting the retired affordances (`mode`, `command`
+        // alias, four-sibling op keys) surface as a structured parse error
+        // rather than silent acceptance — see specs/bash/requirements.md
+        // REQ-BASH-010 rationale (revision 3).
         json!({
             "type": "object",
-            "description": "Set `op` to spawn|peek|wait|kill. For op=spawn set `cmd`; for op=peek|wait|kill set `handle`.",
+            "description": "Set `op` to run|peek|wait|kill. For op=run set `cmd` (and optionally `label`); for op=peek|wait|kill set `handle`.",
             "properties": {
                 "op": {
                     "type": "string",
-                    "enum": ["spawn", "peek", "wait", "kill"],
+                    "enum": ["run", "peek", "wait", "kill"],
                     "description": "Operation to perform."
                 },
                 "cmd": {
                     "type": "string",
-                    "description": "Shell command to execute via `bash -c` (op=spawn). The bash wrapper stays alive as the parent of the user command; signal info propagates either via `WIFSIGNALED` directly or via the 128+signum exit-code convention."
+                    "description": "Shell command to execute via `bash -c` (op=run). The bash wrapper stays alive as the parent of the user command; signal info propagates either via `WIFSIGNALED` directly or via the 128+signum exit-code convention."
                 },
                 "handle": {
                     "type": "string",
                     "description": "Handle id (op=peek|wait|kill)."
                 },
+                "label": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "description": "Optional human-readable annotation for the spawned handle (op=run). Echoed on every response carrying the handle and on each entry of `live_handles[]` in the cap-reached error."
+                },
                 "wait_seconds": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 900,
-                    "description": "How long this single tool call blocks before handing back a handle (default 30; op=spawn|wait). NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use op=kill to actually terminate."
+                    "description": "How long this single tool call blocks before handing back a handle (default 30; op=run|wait). NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use op=kill to actually terminate."
                 },
                 "signal": {
                     "type": "string",
@@ -208,14 +231,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Done-when test cases (REQ-BASH integration)
+    // Happy paths (REQ-BASH-002, REQ-BASH-003 integration)
     // -----------------------------------------------------------------
 
     #[tokio::test]
-    async fn spawn_exits_within_wait_seconds_returns_exited() {
+    async fn run_exits_within_wait_seconds_returns_exited() {
         let tool = BashTool;
         let result = tool
-            .run(json!({"cmd": "echo hello", "wait_seconds": 5}), ctx())
+            .run(
+                json!({"op": "run", "cmd": "echo hello", "wait_seconds": 5}),
+                ctx(),
+            )
             .await;
         assert!(result.success, "got: {}", result.output);
         let v = parse_response(&result);
@@ -231,32 +257,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fast_exit_preserves_trailing_output_no_reader_race() {
         // Regression for the codex review: the waiter used to call
-        // transition_to_terminal as soon as child.wait() resolved, but
-        // the stdout reader task could still be holding kernel-buffered
-        // bytes that hadn't yet been appended to the live ring. Once
-        // tombstoned, the next reader append silently dropped those
-        // bytes.
-        //
-        // The race window opens between the reader's `read()` returning
-        // bytes and its subsequent `state()` lookup. For tiny payloads,
-        // the kernel typically returns all bytes in one read — the
-        // append happens before the waiter has a chance to tombstone.
-        // To force the race window open, emit enough bytes to require
-        // multiple read iterations: the waiter can win the schedule on
-        // ANY of the iterations after the child has exited.
+        // transition_to_terminal as soon as child.wait() resolved, but the
+        // stdout reader task could still be holding kernel-buffered bytes
+        // that hadn't yet been appended to the live ring. Once tombstoned,
+        // the next reader append silently dropped those bytes.
         //
         // Payload: ~30 KB of "hello\n" lines + a unique trailing
-        // unterminated marker. With the reader's 4 KB read buffer
-        // (see read_pipe_to_ring), that's ~7 read iterations per
-        // invocation. 50 iterations × 7 windows = 350 race chances.
+        // unterminated marker. With the reader's 4 KB read buffer (see
+        // read_pipe_to_ring), that's ~7 read iterations per invocation.
+        // 50 iterations × 7 windows = 350 race chances.
         let tool = BashTool;
         for i in 0..50 {
             let registry = Arc::new(BashHandleRegistry::new());
             let c = ctx_with_registry(registry);
             let marker = format!("final-marker-{i}");
-            // 5000 lines of "hello\n" = 30 000 bytes, then the marker.
             let cmd = format!("yes hello | head -n 5000; printf '{marker}'");
-            let r = tool.run(json!({"cmd": &cmd, "wait_seconds": 5}), c).await;
+            let r = tool
+                .run(json!({"op": "run", "cmd": &cmd, "wait_seconds": 5}), c)
+                .await;
             let v = parse_response(&r);
             assert_eq!(v["status"], "exited", "iter {i}: got {v}");
             let lines: Vec<String> = v["lines"]
@@ -275,10 +293,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_wait_seconds_elapses_returns_still_running_with_handle() {
+    async fn run_wait_seconds_elapses_returns_still_running_with_handle() {
         let tool = BashTool;
         let result = tool
-            .run(json!({"cmd": "sleep 10", "wait_seconds": 1}), ctx())
+            .run(
+                json!({"op": "run", "cmd": "sleep 10", "wait_seconds": 1}),
+                ctx(),
+            )
             .await;
         assert!(result.success, "got: {}", result.output);
         let v = parse_response(&result);
@@ -293,19 +314,20 @@ mod tests {
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry.clone());
 
-        // Spawn long-running process.
         let spawn = tool
-            .run(json!({"cmd": "sleep 20", "wait_seconds": 1}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": "sleep 20", "wait_seconds": 1}),
+                c.clone(),
+            )
             .await;
         let handle = parse_response(&spawn)["handle"]
             .as_str()
             .unwrap()
             .to_string();
 
-        // First re-wait: still_running, same handle.
         let r1 = tool
             .run(
-                json!({"wait": handle.clone(), "wait_seconds": 1}),
+                json!({"op": "wait", "handle": handle.clone(), "wait_seconds": 1}),
                 c.clone(),
             )
             .await;
@@ -313,10 +335,9 @@ mod tests {
         assert_eq!(v1["status"], "still_running");
         assert_eq!(v1["handle"], handle);
 
-        // Second re-wait: still_running, still the same handle.
         let r2 = tool
             .run(
-                json!({"wait": handle.clone(), "wait_seconds": 1}),
+                json!({"op": "wait", "handle": handle.clone(), "wait_seconds": 1}),
                 c.clone(),
             )
             .await;
@@ -324,8 +345,9 @@ mod tests {
         assert_eq!(v2["status"], "still_running");
         assert_eq!(v2["handle"], handle);
 
-        // Cleanup: kill the process so the test doesn't leave a sleep behind.
-        let _ = tool.run(json!({"kill": handle, "signal": "KILL"}), c).await;
+        let _ = tool
+            .run(json!({"op": "kill", "handle": handle, "signal": "KILL"}), c)
+            .await;
     }
 
     #[tokio::test]
@@ -334,9 +356,11 @@ mod tests {
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry);
 
-        // Process that exits cleanly on TERM.
         let spawn = tool
-            .run(json!({"cmd": "sleep 30", "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": "sleep 30", "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         let handle = parse_response(&spawn)["handle"]
             .as_str()
@@ -344,7 +368,10 @@ mod tests {
             .to_string();
 
         let kill = tool
-            .run(json!({"kill": handle.clone(), "signal": "TERM"}), c)
+            .run(
+                json!({"op": "kill", "handle": handle.clone(), "signal": "TERM"}),
+                c,
+            )
             .await;
         let v = parse_response(&kill);
         assert_eq!(v["status"], "tombstoned", "got response: {v}");
@@ -359,25 +386,10 @@ mod tests {
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry);
 
-        // Process that ignores TERM (trap '' TERM); will only die on KILL.
-        // We override KILL_RESPONSE_TIMEOUT for this test — but the constant
-        // is compile-time. Instead, we rely on the integration: TERM-trap
-        // bash, then a quick wait, then escalate. We use a much shorter
-        // poll: spawn, send TERM, then poll peek to see kill_pending_kernel
-        // would take 30s.
-        //
-        // Practical approach: use a process that ignores TERM, and verify
-        // that after sending TERM we can escalate to KILL and that
-        // escalation works (the process exits with signal 9). The
-        // "kill_pending_kernel returns after timeout" path is observed
-        // implicitly through the explicit-escalation test.
-        // Use a marker the bash interpreter must execute (echo) before
-        // the trap statement, so by the time we observe the marker via
-        // peek, we know the trap has been installed and bash is in the
-        // while-loop.
         let spawn = tool
             .run(
                 json!({
+                    "op": "run",
                     "cmd": "trap '' TERM; echo READY; while true; do sleep 1; done",
                     "wait_seconds": 0
                 }),
@@ -394,7 +406,9 @@ mod tests {
         let mut ready = false;
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let p = tool.run(json!({"peek": handle.clone()}), c.clone()).await;
+            let p = tool
+                .run(json!({"op": "peek", "handle": handle.clone()}), c.clone())
+                .await;
             let pv = parse_response(&p);
             if let Some(lines) = pv["lines"].as_array() {
                 if lines
@@ -413,29 +427,26 @@ mod tests {
         let kill_ctx = c.clone();
         let kill_task = tokio::spawn(async move {
             BashTool
-                .run(json!({"kill": kill_handle, "signal": "TERM"}), kill_ctx)
+                .run(
+                    json!({"op": "kill", "handle": kill_handle, "signal": "TERM"}),
+                    kill_ctx,
+                )
                 .await
         });
 
-        // Give the TERM kill task a moment to send the signal and start
-        // waiting on the response timeout.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Escalate via a fresh KILL call — this should succeed since the
-        // group leader is still alive. The bash group will be SIGKILLed.
         let kill_kill = tool
-            .run(json!({"kill": handle.clone(), "signal": "KILL"}), c.clone())
+            .run(
+                json!({"op": "kill", "handle": handle.clone(), "signal": "KILL"}),
+                c.clone(),
+            )
             .await;
         let v = parse_response(&kill_kill);
-        // The KILL escalation should land tombstoned with final_cause=killed.
         assert_eq!(v["status"], "tombstoned", "got: {v}");
         assert_eq!(v["final_cause"], "killed");
-        // signal_number=9 (KILL)
         assert_eq!(v["signal_number"], 9);
 
-        // Reap the original TERM kill task — it raced against the actual
-        // exit which we triggered with KILL; whichever lands, we just
-        // ensure the test cleanly completes.
         let _ = kill_task.await;
     }
 
@@ -445,67 +456,56 @@ mod tests {
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry);
 
-        // Use wait_seconds=0 so we always get a handle back even if the
-        // command exits in microseconds.
         let spawn = tool
-            .run(json!({"cmd": "true", "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": "true", "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         let handle = parse_response(&spawn)["handle"]
             .as_str()
-            .expect("spawn returns a handle when wait_seconds=0")
+            .expect("run with wait_seconds=0 returns a handle")
             .to_string();
 
-        // Wait for handle to reach terminal.
         let _ = tool
             .run(
-                json!({"wait": handle.clone(), "wait_seconds": 5}),
+                json!({"op": "wait", "handle": handle.clone(), "wait_seconds": 5}),
                 c.clone(),
             )
             .await;
 
-        // Now kill on already-terminal.
         let kill = tool
-            .run(json!({"kill": handle.clone(), "signal": "TERM"}), c)
+            .run(
+                json!({"op": "kill", "handle": handle.clone(), "signal": "TERM"}),
+                c,
+            )
             .await;
         let v = parse_response(&kill);
         assert_eq!(v["status"], "tombstoned");
-        // No signal_sent on the response — already terminal means no signal was sent.
         assert!(v.get("signal_sent").is_none() || v["signal_sent"] == Value::Null);
     }
 
     #[tokio::test]
     async fn external_kill_9_surfaces_signal_number_9() {
-        // This test verifies that an external SIGKILL hitting the user
-        // command's bash process surfaces as `signal_number: 9` on the
-        // handle response. With `bash -c "<cmd>"` and a non-tail-call-
-        // optimizable command (like a `while` loop), bash itself stays
-        // alive as the targetable process; pkill -f matches its argv,
-        // delivers SIGKILL, `Child::wait()` returns
-        // `ExitStatus::signal() == Some(9)`, and the handle reaches
-        // `tombstoned + killed + signal_number=9`. The compound-keep-bash-
-        // alive form here also matches the spec's tombstone-on-signal
-        // requirement (REQ-BASH-006) regardless of any `exec` wrapping
-        // strategy.
+        // External SIGKILL hitting the user command's bash process surfaces
+        // as `signal_number: 9` (REQ-BASH-006).
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry);
 
         let unique = format!("phoenix_ext_marker_{}", std::process::id());
-        // `while ... done` keeps the bash interpreter running rather than
-        // tail-call-optimizing into the inner sleep, so pkill -f against
-        // the unique marker (which appears in bash's argv) reaches the
-        // bash process.
         let cmd = format!("while true; do sleep 1; done # {unique}");
         let spawn = tool
-            .run(json!({"cmd": cmd, "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": cmd, "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         let v = parse_response(&spawn);
         let handle = v["handle"].as_str().unwrap().to_string();
 
-        // Brief delay so the bash process is observable.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // External SIGKILL against the bash process via its argv marker.
         let pkill = std::process::Command::new("pkill")
             .args(["-KILL", "-f", &unique])
             .status()
@@ -515,9 +515,11 @@ mod tests {
             "pkill exited with {pkill:?}"
         );
 
-        // Wait on the handle — should see tombstoned + killed + signal 9.
         let result = tool
-            .run(json!({"wait": handle.clone(), "wait_seconds": 5}), c)
+            .run(
+                json!({"op": "wait", "handle": handle.clone(), "wait_seconds": 5}),
+                c,
+            )
             .await;
         let v = parse_response(&result);
         assert_eq!(v["status"], "tombstoned", "got: {v}");
@@ -528,34 +530,21 @@ mod tests {
     #[tokio::test]
     async fn inner_process_signal_surfaces_via_128_plus_signum_convention() {
         // REQ-BASH-006: when bash itself stays alive and only its child
-        // gets signal-killed, bash exits NORMALLY with code 128+signum
-        // reporting the child's signal. `Child::wait()` returns
-        // `ExitStatus::code() == Some(137)` and `signal() == None` — the
-        // kernel did NOT mark the bash wait as WIFSIGNALED. Phoenix maps
-        // this case to `FinalCause::Killed { signal_number: 9, exit_code: 137 }`
-        // so the agent sees a consistent "killed" semantic regardless of
-        // which path (direct WIFSIGNALED vs. relayed-via-exit-code) tripped.
-        //
-        // The compound `&& echo ok` form keeps bash from tail-call-exec'ing
-        // into sleep (so bash stays alive as the parent), and short-circuits
-        // when sleep is signaled, so bash propagates sleep's 137 status
-        // rather than echo's 0.
+        // gets signal-killed, bash exits NORMALLY with code 128+signum.
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry.clone());
 
         let cmd = "sleep 8128 && echo ok";
         let spawn = tool
-            .run(json!({"cmd": cmd, "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": cmd, "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         let v = parse_response(&spawn);
         let handle = v["handle"].as_str().unwrap().to_string();
 
-        // Look up bash's pid through the registry (in-process), then find
-        // its child via `pgrep -P <bash_pid>` and SIGKILL by pid. Avoids
-        // `pkill -xf` argv matching, which is unreliable on darwin where
-        // KERN_PROCARGS2 reconstructs argv differently from Linux's
-        // /proc/PID/cmdline (NUL-separated).
         let bash_pid = {
             use crate::tools::bash::handle::HandleId;
             let conv = registry.get_or_create("test-conv").await;
@@ -567,7 +556,6 @@ mod tests {
             h.live_pid().await.expect("bash should be live")
         };
 
-        // Wait for bash to fork its inner sleep child.
         let inner_pid = loop {
             let out = std::process::Command::new("pgrep")
                 .args(["-P", &bash_pid.to_string()])
@@ -582,19 +570,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
 
-        // SIGKILL the inner sleep by pid. Bash's argv won't be touched, so
-        // bash stays alive and observes its child dying.
         let kill = std::process::Command::new("kill")
             .args(["-KILL", &inner_pid.to_string()])
             .status()
             .expect("kill should be available");
         assert!(kill.success(), "kill exited with {kill:?}");
 
-        // Wait on the handle — bash sees sleep die signaled, short-circuits
-        // the `&&`, and exits with code 137 (= 128 + SIGKILL). Phoenix
-        // remaps to FinalCause::Killed with signal_number=9, exit_code=137.
         let result = tool
-            .run(json!({"wait": handle.clone(), "wait_seconds": 5}), c)
+            .run(
+                json!({"op": "wait", "handle": handle.clone(), "wait_seconds": 5}),
+                c,
+            )
             .await;
         let v = parse_response(&result);
         assert_eq!(v["status"], "tombstoned", "got: {v}");
@@ -606,23 +592,29 @@ mod tests {
     #[tokio::test]
     async fn cap_rejection_returns_structured_live_handles_list() {
         let tool = BashTool;
-        // 2-handle cap.
         let registry = Arc::new(BashHandleRegistry::with_caps(ring::RING_BUFFER_BYTES, 2));
         let c = ctx_with_registry(registry);
 
-        // Spawn two long-runners — at the cap.
         let r1 = tool
-            .run(json!({"cmd": "sleep 30", "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": "sleep 30", "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         let h1 = parse_response(&r1)["handle"].as_str().unwrap().to_string();
         let r2 = tool
-            .run(json!({"cmd": "sleep 30", "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": "sleep 30", "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         let h2 = parse_response(&r2)["handle"].as_str().unwrap().to_string();
 
-        // Third spawn must fail with handle_cap_reached.
         let r3 = tool
-            .run(json!({"cmd": "echo nope", "wait_seconds": 0}), c.clone())
+            .run(
+                json!({"op": "run", "cmd": "echo nope", "wait_seconds": 0}),
+                c.clone(),
+            )
             .await;
         assert!(!r3.success);
         let v = parse_response(&r3);
@@ -638,10 +630,12 @@ mod tests {
         assert_eq!(live[0]["status"], "running");
         assert!(v["hint"].is_string());
 
-        // Cleanup.
         for h in [h1, h2] {
             let _ = tool
-                .run(json!({"kill": h, "signal": "KILL"}), c.clone())
+                .run(
+                    json!({"op": "kill", "handle": h, "signal": "KILL"}),
+                    c.clone(),
+                )
                 .await;
         }
     }
@@ -655,7 +649,7 @@ mod tests {
 
         let spawn = tool
             .run(
-                json!({"cmd": "sleep 10", "wait_seconds": 0}),
+                json!({"op": "run", "cmd": "sleep 10", "wait_seconds": 0}),
                 conv_a.clone(),
             )
             .await;
@@ -664,72 +658,35 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let foreign = tool.run(json!({"peek": handle.clone()}), conv_b).await;
+        let foreign = tool
+            .run(json!({"op": "peek", "handle": handle.clone()}), conv_b)
+            .await;
         assert!(!foreign.success);
         let v = parse_response(&foreign);
         assert_eq!(v["error"], "handle_not_found");
         assert_eq!(v["handle_id"], handle);
         assert!(v["hint"].as_str().unwrap().contains("tmux"));
 
-        // Cleanup.
         let _ = tool
-            .run(json!({"kill": handle, "signal": "KILL"}), conv_a)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn mode_with_wait_seconds_silently_drops_mode() {
-        // Old behavior: mode + wait_seconds → mutually_exclusive_modes.
-        // New behavior: mode is silently dropped when wait_seconds is set.
-        // Rationale: GPT models default-fill `mode="default"` alongside
-        // explicit wait_seconds; failing the call is worse than picking
-        // the canonical knob.
-        let tool = BashTool;
-        let result = tool
             .run(
-                json!({
-                    "cmd": "echo hi",
-                    "mode": "background",
-                    "wait_seconds": 30
-                }),
-                ctx(),
+                json!({"op": "kill", "handle": handle, "signal": "KILL"}),
+                conv_a,
             )
             .await;
-        assert!(result.success, "got: {}", result.output);
-        let v = parse_response(&result);
-        assert!(matches!(
-            v["status"].as_str().unwrap(),
-            "exited" | "still_running"
-        ));
     }
 
-    #[tokio::test]
-    async fn mode_alone_succeeds_and_includes_deprecation_notice() {
-        let tool = BashTool;
-        let result = tool
-            .run(json!({"cmd": "echo hi", "mode": "default"}), ctx())
-            .await;
-        assert!(result.success, "got: {}", result.output);
-        let v = parse_response(&result);
-        // Either exited (within 30s default) or still_running — both valid.
-        assert!(matches!(
-            v["status"].as_str().unwrap(),
-            "exited" | "still_running"
-        ));
-        let notice = v["deprecation_notice"]
-            .as_str()
-            .expect("deprecation_notice present");
-        // No leading underscore (intentional — see design.md): the agent
-        // should attend to this field.
-        assert!(!notice.is_empty());
-        assert!(notice.contains("deprecated"));
-    }
+    // -----------------------------------------------------------------
+    // Schema + tolerance (REQ-BASH-010, revision 3)
+    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn wait_seconds_out_of_range_returns_error() {
         let tool = BashTool;
         let result = tool
-            .run(json!({"cmd": "echo hi", "wait_seconds": 1000}), ctx())
+            .run(
+                json!({"op": "run", "cmd": "echo hi", "wait_seconds": 1000}),
+                ctx(),
+            )
             .await;
         assert!(!result.success);
         let v = parse_response(&result);
@@ -737,24 +694,22 @@ mod tests {
         assert_eq!(v["max_wait_seconds"], 900);
     }
 
-    /// `since` alone (no `lines`) routes to incremental mode and is the
-    /// genuine intent of an incremental-peek user. With a non-existent
-    /// handle it surfaces handle_not_found, which is fine — we're checking
-    /// that the parser accepted `since` as the read mode.
+    /// `since` alone (no `lines`) routes to incremental mode.
     #[tokio::test]
     async fn peek_with_since_only_routes_to_incremental_mode() {
         let tool = BashTool;
         let result = tool
-            .run(json!({"peek": "b-nonexistent", "since": 5}), ctx())
+            .run(
+                json!({"op": "peek", "handle": "b-nonexistent", "since": 5}),
+                ctx(),
+            )
             .await;
         let v = parse_response(&result);
         assert_eq!(v["error"], "handle_not_found");
     }
 
-    /// Companion: lines + since (any value) is now tolerated — `since` is
-    /// dropped silently as a likely default-fill, `lines` wins. Models on
-    /// structured-output APIs commonly emit both with their schema
-    /// minimums, and the prior mutex turned this into a hard error.
+    /// REQ-BASH-010 (rev 3) surviving tolerance: `lines` + `since` both
+    /// supplied — prefer `lines`, drop `since` silently with a debug log.
     #[tokio::test]
     async fn peek_with_lines_and_since_drops_since_silently() {
         let tool = BashTool;
@@ -762,7 +717,7 @@ mod tests {
         let c = ctx_with_registry(registry);
         let spawn = tool
             .run(
-                json!({"op": "spawn", "cmd": "echo hi; sleep 5", "wait_seconds": 0}),
+                json!({"op": "run", "cmd": "echo hi; sleep 5", "wait_seconds": 0}),
                 c.clone(),
             )
             .await;
@@ -770,7 +725,6 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        // Both lines and since set with non-default values — used to error.
         let peek = tool
             .run(
                 json!({"op": "peek", "handle": handle.clone(), "lines": 10, "since": 5}),
@@ -783,81 +737,17 @@ mod tests {
             .await;
     }
 
+    /// REQ-BASH-010 (rev 3) surviving tolerance: `since=0` is below the
+    /// schema's advertised `minimum: 1` but current GPT models still emit
+    /// it as a default-fill. Treat as absent.
     #[tokio::test]
-    async fn no_operation_keys_returns_mutually_exclusive_modes() {
-        let tool = BashTool;
-        let result = tool.run(json!({}), ctx()).await;
-        assert!(!result.success);
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "mutually_exclusive_modes");
-    }
-
-    #[tokio::test]
-    async fn multiple_operation_keys_returns_mutually_exclusive_modes() {
-        let tool = BashTool;
-        let result = tool.run(json!({"cmd": "echo", "peek": "b-1"}), ctx()).await;
-        assert!(!result.success);
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "mutually_exclusive_modes");
-        let names: Vec<&str> = v["conflicting_args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"cmd") && names.contains(&"peek"));
-    }
-
-    /// Regression for the production failure with GPT models on the
-    /// Responses API: every optional field is default-filled (empty
-    /// strings on the operation-key fields, `mode="default"`,
-    /// `wait_seconds=30`, `lines=1`, `since=0`, `signal="TERM"`). With
-    /// the discriminator-shaped schema and tolerance rules, this now
-    /// parses as a spawn with cmd.
-    #[tokio::test]
-    async fn gpt_default_fill_shape_is_tolerated() {
-        let tool = BashTool;
-        let result = tool
-            .run(
-                json!({
-                    "cmd": "echo hi",
-                    "kill": "", "peek": "", "wait": "",
-                    "mode": "default", "wait_seconds": 30,
-                    "lines": 1, "since": 0,
-                    "signal": "TERM"
-                }),
-                ctx(),
-            )
-            .await;
-        assert!(result.success, "got: {}", result.output);
-        let v = parse_response(&result);
-        assert!(matches!(
-            v["status"].as_str().unwrap(),
-            "exited" | "still_running"
-        ));
-    }
-
-    /// New schema shape using the `op` discriminator: spawn.
-    #[tokio::test]
-    async fn op_spawn_with_cmd_succeeds() {
-        let tool = BashTool;
-        let result = tool
-            .run(json!({"op": "spawn", "cmd": "echo hi"}), ctx())
-            .await;
-        assert!(result.success, "got: {}", result.output);
-    }
-
-    /// New schema shape: peek with handle field.
-    #[tokio::test]
-    async fn op_peek_with_handle_routes_through_lookup() {
+    async fn peek_with_since_zero_is_treated_as_absent() {
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
         let c = ctx_with_registry(registry);
-
-        // Spawn first to get a real handle.
         let spawn = tool
             .run(
-                json!({"op": "spawn", "cmd": "sleep 5", "wait_seconds": 0}),
+                json!({"op": "run", "cmd": "echo hi; sleep 5", "wait_seconds": 0}),
                 c.clone(),
             )
             .await;
@@ -865,39 +755,238 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-
-        // Peek using the new shape.
         let peek = tool
-            .run(json!({"op": "peek", "handle": handle.clone()}), c.clone())
+            .run(
+                json!({"op": "peek", "handle": handle.clone(), "since": 0}),
+                c.clone(),
+            )
             .await;
         assert!(peek.success, "got: {}", peek.output);
-        let v = parse_response(&peek);
-        assert_eq!(v["handle"], handle);
-
-        // Cleanup.
         let _ = tool
             .run(json!({"op": "kill", "handle": handle, "signal": "KILL"}), c)
             .await;
     }
 
-    /// Sanity control: legacy shape (just `cmd`, no `op`) still works
-    /// via inference. Required so in-flight conversations whose history
-    /// uses the pre-discriminator shape don't break.
     #[tokio::test]
-    async fn legacy_cmd_only_shape_still_succeeds() {
+    async fn missing_op_returns_mutually_exclusive_modes() {
+        let tool = BashTool;
+        let result = tool.run(json!({}), ctx()).await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
+        assert!(v["recommended_action"].as_str().unwrap().contains("run"));
+    }
+
+    #[tokio::test]
+    async fn unknown_op_value_returns_mutually_exclusive_modes() {
+        let tool = BashTool;
+        let result = tool
+            .run(json!({"op": "frobnicate", "cmd": "echo hi"}), ctx())
+            .await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
+    }
+
+    /// REQ-BASH-010 (rev 3): `op="spawn"` is no longer accepted. The
+    /// rename is hard with no alias.
+    #[tokio::test]
+    async fn op_spawn_returns_mutually_exclusive_modes() {
+        let tool = BashTool;
+        let result = tool
+            .run(json!({"op": "spawn", "cmd": "echo hi"}), ctx())
+            .await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
+    }
+
+    /// REQ-BASH-010 (rev 3): the legacy four-sibling shape is retired.
+    /// Top-level `peek` / `wait` / `kill` keys are unknown to the parser
+    /// and `deny_unknown_fields` rejects them.
+    #[tokio::test]
+    async fn legacy_top_level_peek_key_returns_parse_error() {
+        let tool = BashTool;
+        let result = tool.run(json!({"peek": "b-3"}), ctx()).await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
+        assert!(v["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field"));
+    }
+
+    /// REQ-BASH-010 (rev 3): the `mode` shim is retired.
+    #[tokio::test]
+    async fn legacy_mode_field_returns_parse_error() {
+        let tool = BashTool;
+        let result = tool
+            .run(
+                json!({"op": "run", "cmd": "echo hi", "mode": "default"}),
+                ctx(),
+            )
+            .await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
+    }
+
+    /// REQ-BASH-010 (rev 3): the `command` alias for `cmd` is retired.
+    #[tokio::test]
+    async fn legacy_command_alias_returns_parse_error() {
+        let tool = BashTool;
+        let result = tool
+            .run(json!({"op": "run", "command": "echo hi"}), ctx())
+            .await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
+    }
+
+    /// REQ-BASH-010 (rev 3): bare `cmd` with no `op` is no longer accepted.
+    #[tokio::test]
+    async fn bare_cmd_without_op_returns_mutually_exclusive_modes() {
         let tool = BashTool;
         let result = tool.run(json!({"cmd": "echo hi"}), ctx()).await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "mutually_exclusive_modes");
     }
 
     // -----------------------------------------------------------------
-    // Safety check still runs before spawn (REQ-BASH-011).
+    // Label round-trip (REQ-BASH-002 / REQ-BASH-010)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn label_round_trips_through_run_peek_wait_tombstone() {
+        let tool = BashTool;
+        let registry = Arc::new(BashHandleRegistry::new());
+        let c = ctx_with_registry(registry);
+
+        let run = tool
+            .run(
+                json!({
+                    "op": "run",
+                    "cmd": "sleep 1",
+                    "wait_seconds": 0,
+                    "label": "dev-server"
+                }),
+                c.clone(),
+            )
+            .await;
+        let v = parse_response(&run);
+        assert_eq!(v["status"], "still_running");
+        assert_eq!(v["label"], "dev-server");
+        let handle = v["handle"].as_str().unwrap().to_string();
+
+        let peek = tool
+            .run(json!({"op": "peek", "handle": handle.clone()}), c.clone())
+            .await;
+        assert_eq!(parse_response(&peek)["label"], "dev-server");
+
+        let wait = tool
+            .run(
+                json!({"op": "wait", "handle": handle.clone(), "wait_seconds": 5}),
+                c.clone(),
+            )
+            .await;
+        let wv = parse_response(&wait);
+        assert_eq!(wv["status"], "tombstoned");
+        assert_eq!(wv["label"], "dev-server");
+
+        let kill = tool
+            .run(json!({"op": "kill", "handle": handle, "signal": "TERM"}), c)
+            .await;
+        assert_eq!(parse_response(&kill)["label"], "dev-server");
+    }
+
+    #[tokio::test]
+    async fn label_appears_on_cap_reached_live_handles() {
+        let tool = BashTool;
+        let registry = Arc::new(BashHandleRegistry::with_caps(ring::RING_BUFFER_BYTES, 1));
+        let c = ctx_with_registry(registry);
+
+        let r1 = tool
+            .run(
+                json!({
+                    "op": "run",
+                    "cmd": "sleep 30",
+                    "wait_seconds": 0,
+                    "label": "first-job"
+                }),
+                c.clone(),
+            )
+            .await;
+        let h1 = parse_response(&r1)["handle"].as_str().unwrap().to_string();
+
+        let r2 = tool
+            .run(
+                json!({"op": "run", "cmd": "echo nope", "wait_seconds": 0}),
+                c.clone(),
+            )
+            .await;
+        assert!(!r2.success);
+        let v = parse_response(&r2);
+        assert_eq!(v["error"], "handle_cap_reached");
+        let live = v["live_handles"].as_array().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["label"], "first-job");
+
+        let _ = tool
+            .run(json!({"op": "kill", "handle": h1, "signal": "KILL"}), c)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn label_over_cap_returns_label_too_long() {
+        let tool = BashTool;
+        let oversized = "x".repeat(65);
+        let result = tool
+            .run(
+                json!({
+                    "op": "run",
+                    "cmd": "echo hi",
+                    "label": oversized
+                }),
+                ctx(),
+            )
+            .await;
+        assert!(!result.success);
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "label_too_long");
+        assert_eq!(v["max_label_length"], 64);
+    }
+
+    #[tokio::test]
+    async fn empty_label_is_treated_as_absent() {
+        let tool = BashTool;
+        let result = tool
+            .run(
+                json!({
+                    "op": "run",
+                    "cmd": "echo hi",
+                    "label": "",
+                    "wait_seconds": 5
+                }),
+                ctx(),
+            )
+            .await;
+        assert!(result.success, "got: {}", result.output);
+        let v = parse_response(&result);
+        assert!(v.get("label").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Safety check still runs before run (REQ-BASH-011).
     // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn test_blocked_git_add() {
         let tool = BashTool;
-        let result = tool.run(json!({"cmd": "git add -A"}), ctx()).await;
+        let result = tool
+            .run(json!({"op": "run", "cmd": "git add -A"}), ctx())
+            .await;
         assert!(!result.success);
         let v = parse_response(&result);
         assert_eq!(v["error"], "command_safety_rejected");
@@ -907,7 +996,9 @@ mod tests {
     #[tokio::test]
     async fn test_blocked_rm_rf_root() {
         let tool = BashTool;
-        let result = tool.run(json!({"cmd": "rm -rf /"}), ctx()).await;
+        let result = tool
+            .run(json!({"op": "run", "cmd": "rm -rf /"}), ctx())
+            .await;
         assert!(!result.success);
         let v = parse_response(&result);
         assert_eq!(v["error"], "command_safety_rejected");
@@ -917,7 +1008,9 @@ mod tests {
     #[tokio::test]
     async fn test_blocked_git_push_force() {
         let tool = BashTool;
-        let result = tool.run(json!({"cmd": "git push --force"}), ctx()).await;
+        let result = tool
+            .run(json!({"op": "run", "cmd": "git push --force"}), ctx())
+            .await;
         assert!(!result.success);
         let v = parse_response(&result);
         assert_eq!(v["error"], "command_safety_rejected");
@@ -930,10 +1023,11 @@ mod tests {
     #[tokio::test]
     async fn test_allowed_command_runs() {
         let tool = BashTool;
-        let result = tool.run(json!({"cmd": "echo hello"}), ctx()).await;
+        let result = tool
+            .run(json!({"op": "run", "cmd": "echo hello"}), ctx())
+            .await;
         assert!(result.success, "got: {}", result.output);
         let v = parse_response(&result);
-        // Either exited (fast-path) or still_running.
         assert!(matches!(
             v["status"].as_str().unwrap(),
             "exited" | "still_running"
@@ -941,10 +1035,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_spawn_yields_handle() {
-        // Cancellation during the spawn wait window leaves the process
-        // alive (we don't proactively kill on cancel — that's what kill
-        // is for). The agent gets the handle back to act on later.
+    async fn cancellation_during_run_yields_handle() {
+        // Cancellation during the run wait window leaves the process alive
+        // (we don't proactively kill on cancel — that's what kill is for).
+        // The agent gets the handle back to act on later.
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
         let cancel = CancellationToken::new();
@@ -960,17 +1054,20 @@ mod tests {
             None,
         );
 
-        let tool_future = tool.run(json!({"cmd": "sleep 60", "wait_seconds": 30}), c.clone());
+        let tool_future = tool.run(
+            json!({"op": "run", "cmd": "sleep 60", "wait_seconds": 30}),
+            c.clone(),
+        );
         let cancel_task = async {
             tokio::time::sleep(Duration::from_millis(200)).await;
             cancel.cancel();
         };
         let (result, ()) = tokio::join!(tool_future, cancel_task);
         let v = parse_response(&result);
-        // Either still_running or kill_pending_kernel; both carry a handle.
         assert!(v["handle"].is_string());
-        // Cleanup.
         let h = v["handle"].as_str().unwrap().to_string();
-        let _ = tool.run(json!({"kill": h, "signal": "KILL"}), c).await;
+        let _ = tool
+            .run(json!({"op": "kill", "handle": h, "signal": "KILL"}), c)
+            .await;
     }
 }

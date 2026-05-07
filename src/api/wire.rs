@@ -623,10 +623,10 @@ pub enum BashResponse {
     KillPendingKernel(BashKillPendingKernelPayload),
     /// Handle is terminal; served from tombstone (peek / wait / kill).
     Tombstoned(BashTombstonedPayload),
-    /// Spawn-path: process exited normally inside the wait window.
-    Exited(BashSpawnTombstonePayload),
-    /// Spawn-path: process was signal-terminated inside the wait window.
-    Killed(BashSpawnTombstonePayload),
+    /// Run-path: process exited normally inside the wait window.
+    Exited(BashRunTombstonePayload),
+    /// Run-path: process was signal-terminated inside the wait window.
+    Killed(BashRunTombstonePayload),
     /// Waiter task panicked; surface as a structured response so callers
     /// don't hang. Only fields needed for diagnosis are emitted.
     WaiterPanicked(BashWaiterPanickedPayload),
@@ -658,6 +658,11 @@ pub struct BashRingLine {
 pub struct BashRunningPayload {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call. Echoed verbatim on every
+    /// response carrying the handle so the agent can distinguish concurrent
+    /// handles (REQ-BASH-002).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     #[serde(flatten)]
     pub window: BashRingWindow,
     /// Set when a kill has been issued and is in flight against this
@@ -673,12 +678,10 @@ pub struct BashRunningPayload {
     /// Optional kill-response top-level field (kill response only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub signal_sent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub deprecation_notice: Option<String>,
 }
 
 /// `still_running` response payload. Distinguished from `running` by the
-/// `waited_ms` field and the absence of a `display` label (spawn / wait
+/// `waited_ms` field and the absence of a `display` label (run / wait
 /// re-timeout responses don't synthesize a label — REQ-BASH-002 /
 /// REQ-BASH-015).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -686,6 +689,9 @@ pub struct BashRunningPayload {
 pub struct BashStillRunningPayload {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call (REQ-BASH-002).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     pub waited_ms: u64,
     #[serde(flatten)]
     pub window: BashRingWindow,
@@ -693,8 +699,6 @@ pub struct BashStillRunningPayload {
     pub kill_signal_sent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub kill_attempted_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub deprecation_notice: Option<String>,
 }
 
 /// `kill_pending_kernel` response payload (REQ-BASH-003). The kill
@@ -705,6 +709,9 @@ pub struct BashStillRunningPayload {
 pub struct BashKillPendingKernelPayload {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call (REQ-BASH-002).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     #[serde(flatten)]
     pub window: BashRingWindow,
     pub kill_signal_sent: String,
@@ -721,6 +728,9 @@ pub struct BashKillPendingKernelPayload {
 pub struct BashTombstonedPayload {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call (REQ-BASH-002).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     pub final_cause: String,
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -738,18 +748,19 @@ pub struct BashTombstonedPayload {
     /// of an already-terminal handle).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub signal_sent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub deprecation_notice: Option<String>,
 }
 
-/// Spawn-path tombstone response (status `exited` or `killed`). Differs
+/// Run-path tombstone response (status `exited` or `killed`). Differs
 /// from [`BashTombstonedPayload`] by the absence of the synthesized
-/// `display` label — spawn responses carry the original `cmd` instead.
+/// `display` label — run responses carry the original `cmd` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../ui/src/generated/")]
-pub struct BashSpawnTombstonePayload {
+pub struct BashRunTombstonePayload {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call (REQ-BASH-002).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     pub final_cause: String,
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -762,8 +773,6 @@ pub struct BashSpawnTombstonePayload {
     pub kill_attempted_at: Option<String>,
     #[serde(flatten)]
     pub window: BashRingWindow,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub deprecation_notice: Option<String>,
 }
 
 /// `waiter_panicked` response. Surface for the rare case the bash
@@ -807,13 +816,20 @@ pub enum BashErrorResponse {
     SpawnFailed {
         error_message: String,
     },
-    /// Either zero/multiple of `cmd|peek|wait|kill`, or `mode`+`wait_seconds`,
-    /// or a malformed input (REQ-BASH-010). The dispatch flattens the
-    /// dual-pass case's `mode` / `wait_seconds` fields onto the top level
-    /// of the JSON envelope (see `BashError::into_tool_output`); they are
-    /// not modelled as typed fields here because the set of extras is
-    /// open (driven by the conflict shape) and giving them `ts_rs` typing
-    /// would lock the wire shape against fields the runtime adds.
+    /// Run call carried a `label` longer than `MAX_LABEL_LENGTH`
+    /// (REQ-BASH-002 / REQ-BASH-010). Structured so the agent can drop
+    /// or shorten the label and retry.
+    LabelTooLong {
+        error_message: String,
+        max_label_length: usize,
+    },
+    /// Catch-all for input-shape failures the schema didn't reject:
+    /// missing `op`, missing required peer field for the chosen op,
+    /// invalid `lines` value (REQ-BASH-010). The variant name is
+    /// historical — the original four-sibling shape made "mutually
+    /// exclusive" the natural framing — but the producers today are
+    /// generic input-shape errors. Renaming the wire string would be a
+    /// breaking change with no upside.
     MutuallyExclusiveModes {
         error_message: String,
         conflicting_args: Vec<String>,
@@ -828,6 +844,11 @@ pub enum BashErrorResponse {
 pub struct BashLiveHandleSummary {
     pub handle: String,
     pub cmd: String,
+    /// Optional handle label set on the run call (REQ-BASH-002). Echoed
+    /// here so the agent has something stable to identify the handle by
+    /// even when many concurrent commands share similar `cmd` prefixes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
     pub age_seconds: u64,
     /// Always `"running"` today; reserved for future state-aware listings.
     pub status: String,
@@ -869,6 +890,7 @@ mod bash_tmux_wire_tests {
         let resp = BashResponse::Running(BashRunningPayload {
             handle: "b-1".into(),
             cmd: "ls".into(),
+            label: None,
             window: BashRingWindow {
                 start_offset: 0,
                 end_offset: 1,
@@ -882,7 +904,6 @@ mod bash_tmux_wire_tests {
             kill_attempted_at: None,
             display: "peek b-1".into(),
             signal_sent: None,
-            deprecation_notice: None,
         });
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["status"], "running");
@@ -894,6 +915,29 @@ mod bash_tmux_wire_tests {
         assert_eq!(v["truncated_before"], false);
         assert_eq!(v["lines"][0]["offset"], 0);
         assert_eq!(v["lines"][0]["bytes"], "hello");
+        // label omitted on serialize when None.
+        assert!(v.get("label").is_none());
+    }
+
+    #[test]
+    fn bash_running_with_label_round_trips() {
+        let resp = BashResponse::Running(BashRunningPayload {
+            handle: "b-1".into(),
+            cmd: "npm run dev".into(),
+            label: Some("dev-server".into()),
+            window: BashRingWindow {
+                start_offset: 0,
+                end_offset: 0,
+                truncated_before: false,
+                lines: vec![],
+            },
+            kill_signal_sent: None,
+            kill_attempted_at: None,
+            display: "peek b-1".into(),
+            signal_sent: None,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["label"], "dev-server");
     }
 
     #[test]
@@ -901,6 +945,7 @@ mod bash_tmux_wire_tests {
         let resp = BashResponse::Tombstoned(BashTombstonedPayload {
             handle: "b-2".into(),
             cmd: "sleep 1".into(),
+            label: None,
             final_cause: "killed".into(),
             exit_code: None,
             signal_number: Some(15),
@@ -916,7 +961,6 @@ mod bash_tmux_wire_tests {
             },
             display: "kill b-2 (TERM)".into(),
             signal_sent: Some("TERM".into()),
-            deprecation_notice: None,
         });
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["status"], "tombstoned");
@@ -926,11 +970,12 @@ mod bash_tmux_wire_tests {
     }
 
     #[test]
-    fn bash_spawn_exited_status_is_exited_not_tombstoned() {
-        // REQ-BASH-002: spawn responses use `exited` / `killed` directly.
-        let resp = BashResponse::Exited(BashSpawnTombstonePayload {
+    fn bash_run_exited_status_is_exited_not_tombstoned() {
+        // REQ-BASH-002: run responses use `exited` / `killed` directly.
+        let resp = BashResponse::Exited(BashRunTombstonePayload {
             handle: "b-3".into(),
             cmd: "echo hi".into(),
+            label: None,
             final_cause: "exited".into(),
             exit_code: Some(0),
             signal_number: None,
@@ -947,11 +992,10 @@ mod bash_tmux_wire_tests {
                     bytes: "hi".into(),
                 }],
             },
-            deprecation_notice: None,
         });
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["status"], "exited");
-        // No display field on the spawn-tombstone shape.
+        // No display field on the run-tombstone shape.
         assert!(v.get("display").is_none());
     }
 
@@ -963,6 +1007,7 @@ mod bash_tmux_wire_tests {
             live_handles: vec![BashLiveHandleSummary {
                 handle: "b-1".into(),
                 cmd: "cargo test".into(),
+                label: Some("tests".into()),
                 age_seconds: 1820,
                 status: "running".into(),
             }],
@@ -972,24 +1017,31 @@ mod bash_tmux_wire_tests {
         assert_eq!(v["error"], "handle_cap_reached");
         assert_eq!(v["cap"], 8);
         assert_eq!(v["live_handles"][0]["handle"], "b-1");
+        assert_eq!(v["live_handles"][0]["label"], "tests");
         assert_eq!(v["live_handles"][0]["status"], "running");
     }
 
     #[test]
     fn bash_error_mutually_exclusive_modes_serializes_with_error_tag() {
         let resp = BashErrorResponse::MutuallyExclusiveModes {
-            error_message: "the deprecated 'mode' parameter cannot be used with 'wait_seconds'; \
-                            pass wait_seconds alone"
-                .into(),
-            conflicting_args: vec!["mode".into(), "wait_seconds".into()],
-            recommended_action: "remove the deprecated 'mode' parameter; pass 'wait_seconds' alone"
-                .into(),
+            error_message: "op is required and must be one of: run, peek, wait, kill".into(),
+            conflicting_args: vec![],
+            recommended_action: "set op to one of: run, peek, wait, kill".into(),
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"], "mutually_exclusive_modes");
         assert!(v["conflicting_args"].is_array());
-        // Extras (`mode`, `wait_seconds`) are merged in by
-        // `BashError::into_tool_output`, not by the typed struct itself.
+    }
+
+    #[test]
+    fn bash_error_label_too_long_serializes_with_error_tag() {
+        let resp = BashErrorResponse::LabelTooLong {
+            error_message: "label exceeds the 64-character cap".into(),
+            max_label_length: 64,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["error"], "label_too_long");
+        assert_eq!(v["max_label_length"], 64);
     }
 
     #[test]
