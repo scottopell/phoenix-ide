@@ -1,5 +1,6 @@
-import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
+import { useScopedState } from '../hooks/useScopedState';
 
 /**
  * Diff payload mounted by the active diff viewer (split-pane on wide
@@ -50,16 +51,10 @@ interface DiffViewerStateProviderProps {
 }
 
 export function DiffViewerStateProvider({ children, scopeKey }: DiffViewerStateProviderProps) {
-  const [payload, setPayload] = useState<DiffViewerPayload | null>(null);
-  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
+  const [payload, setPayload] = useScopedState<DiffViewerPayload | null>(scopeKey, null);
 
-  if (trackedScope !== scopeKey) {
-    setTrackedScope(scopeKey);
-    if (payload !== null) setPayload(null);
-  }
-
-  const open = useCallback((p: DiffViewerPayload) => setPayload(p), []);
-  const close = useCallback(() => setPayload(null), []);
+  const open = useCallback((p: DiffViewerPayload) => setPayload(p), [setPayload]);
+  const close = useCallback(() => setPayload(null), [setPayload]);
 
   const value = useMemo<DiffViewerStateValue>(
     () => ({ payload, open, close }),
@@ -125,19 +120,12 @@ interface BrowserViewStateProviderProps {
 }
 
 export function BrowserViewStateProvider({ children, scopeKey }: BrowserViewStateProviderProps) {
-  const [open, setOpen] = useState(false);
-  const [hasActivated, setHasActivated] = useState(false);
-  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
+  const [open, setOpen] = useScopedState(scopeKey, false);
+  const [hasActivated, setHasActivated] = useScopedState(scopeKey, false);
 
-  if (trackedScope !== scopeKey) {
-    setTrackedScope(scopeKey);
-    if (open) setOpen(false);
-    if (hasActivated) setHasActivated(false);
-  }
-
-  const openPanel = useCallback(() => setOpen(true), []);
-  const closePanel = useCallback(() => setOpen(false), []);
-  const markActivated = useCallback(() => setHasActivated(true), []);
+  const openPanel = useCallback(() => setOpen(true), [setOpen]);
+  const closePanel = useCallback(() => setOpen(false), [setOpen]);
+  const markActivated = useCallback(() => setHasActivated(true), [setHasActivated]);
 
   const value = useMemo<BrowserViewStateValue>(
     () => ({ open, hasActivated, openPanel, closePanel, markActivated }),

@@ -1,6 +1,7 @@
-import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { generateUUID } from '../utils/uuid';
+import { useScopedState } from '../hooks/useScopedState';
 
 /**
  * Which sub-section of the diff viewer a note was anchored in.
@@ -96,15 +97,7 @@ export function ReviewNotesProvider({
    */
   scopeKey?: string | undefined;
 }) {
-  const [notes, setNotes] = useState<ReviewNote[]>([]);
-  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
-
-  if (trackedScope !== scopeKey) {
-    // Synchronous reset (adjust state during render). Children never see
-    // notes from the previous scope.
-    setTrackedScope(scopeKey);
-    if (notes.length > 0) setNotes([]);
-  }
+  const [notes, setNotes] = useScopedState<ReviewNote[]>(scopeKey, []);
 
   const addNote = useCallback(
     (anchor: NoteAnchor, lineContent: string, body: string) => {
@@ -119,18 +112,18 @@ export function ReviewNotesProvider({
         },
       ]);
     },
-    [],
+    [setNotes],
   );
 
   const updateNote = useCallback((id: string, body: string) => {
     setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, body } : n)));
-  }, []);
+  }, [setNotes]);
 
   const removeNote = useCallback((id: string) => {
     setNotes((prev) => prev.filter((n) => n.id !== id));
-  }, []);
+  }, [setNotes]);
 
-  const clear = useCallback(() => setNotes([]), []);
+  const clear = useCallback(() => setNotes([]), [setNotes]);
 
   const notesForFile = useCallback(
     (absolutePath: string) =>

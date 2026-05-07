@@ -1,5 +1,6 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import type { ReactNode } from 'react';
+import { useScopedState } from '../../hooks/useScopedState';
 import { FileExplorerContext } from './fileExplorerTypes';
 import type { PatchContext, ProseReaderState } from './fileExplorerTypes';
 
@@ -19,26 +20,20 @@ interface FileExplorerProviderProps {
 }
 
 export function FileExplorerProvider({ children, scopeKey }: FileExplorerProviderProps) {
-  const [proseReaderState, setProseReaderState] = useState<ProseReaderState | null>(null);
-  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
-
-  if (trackedScope !== scopeKey) {
-    // Adjust state during render: React applies this and re-renders before
-    // commit, so children never see the old proseReaderState under the new
-    // scopeKey.
-    setTrackedScope(scopeKey);
-    if (proseReaderState !== null) setProseReaderState(null);
-  }
+  const [proseReaderState, setProseReaderState] = useScopedState<ProseReaderState | null>(
+    scopeKey,
+    null,
+  );
 
   const openFile = useCallback((path: string, rootDir: string, patchContext?: PatchContext) => {
     const state: ProseReaderState = { path, rootDir };
     if (patchContext) state.patchContext = patchContext;
     setProseReaderState(state);
-  }, []);
+  }, [setProseReaderState]);
 
   const closeFile = useCallback(() => {
     setProseReaderState(null);
-  }, []);
+  }, [setProseReaderState]);
 
   const activeFile = proseReaderState?.path ?? null;
 

@@ -1,7 +1,7 @@
 ---
 created: 2026-05-07
 priority: p1
-status: ready
+status: in-progress
 artifact: ui/src
 ---
 
@@ -86,6 +86,36 @@ Pick whichever has the best cost/benefit; don't try to do all three.
   every new context.
 - A regression test or two simulating the slug-A → slug-B navigation
   for whichever provider lacked the test.
+
+
+## Audit pass 2026-05-07
+
+### `createContext` inventory
+
+| Context | Scope | Status |
+| --- | --- | --- |
+| `ReviewNotesContext` (`ui/src/contexts/ReviewNotesContext.tsx`) | Conversation | Fixed/already correct: provider receives `scopeKey={slug}` from `ConversationPage`; migrated to shared `useScopedState`; provider reset test exists. |
+| `DiffViewerStateContext` (`ui/src/contexts/ViewerStateContext.tsx`) | Conversation | Fixed/already correct: provider receives `scopeKey={slug}` from `ConversationPage`; migrated to shared `useScopedState`; provider reset test exists. |
+| `BrowserViewStateContext` (`ui/src/contexts/ViewerStateContext.tsx`) | Conversation | Fixed/already correct: provider receives `scopeKey={slug}` from `ConversationPage`; migrated to shared `useScopedState`; provider reset test exists. |
+| `FileExplorerContext` (`ui/src/components/FileExplorer/fileExplorerTypes.ts`) | Conversation while on `/c/:slug`; shared undefined scope off conversation routes | Fixed/already correct: `DesktopLayout` derives `activeSlug` and passes it to `FileExplorerProvider`; migrated to shared `useScopedState`; provider reset test exists. |
+| `ConversationContext` (`ui/src/conversation/ConversationContext.ts`) | Global app store | Intentionally persistent. It owns normalized conversation atoms and the refresh driver; route consumers select by slug. Resetting on slug change would lose cache/store state. |
+| `ChainContext` (`ui/src/chain/ChainContext.ts`) | Global app store for chains | Intentionally persistent. Chain pages select by root conversation id; the store itself is not chain-scoped UI state. Follow-up audit should inspect `ChainPage` local state separately. |
+| `ThemeContext` (`ui/src/hooks/useTheme.ts`) | Global user preference | Intentionally persistent across conversations and routes. |
+| `FocusScopeContext` (`ui/src/hooks/useFocusScope.tsx`) | Element/modal focus stack | Intentionally element-scoped. Consumers register/unregister on mount with stable ids; it tracks active overlays/readers, not conversation payload. |
+| `TreeCollectionsCtx` (`ui/src/components/FileExplorer/FileTree.tsx`) | Local render optimization context | Intentionally local to a `FileTree` render. It exposes derived tree collections to descendants and does not outlive the tree instance as cross-conversation state. |
+
+### Long-lived state notes
+
+- `AppRoutes.showHelp`: global keyboard-help UI, intentionally persistent and not conversation data.
+- `DesktopLayout.isDesktop`: viewport-derived shell state, intentionally global.
+- `DesktopLayout` pane sizes/collapsed flags via `useResizablePane`: user-level layout preferences in localStorage, intentionally persistent across conversations.
+- `DesktopLayout` toasts via `useToast`: shell feedback state, not conversation payload; no reset required.
+- `ConversationPage` viewer slots are provider-backed and now share the reset mechanism above.
+- `ConversationPage` page-local transient state (`error`, `conversationIdForSSE`, task-approval/credential/welcome overlays, image overlay, terminal expansion) still needs the next pass: classify each as conversation-scoped or intentionally transient/global and add route-level slug-switch regressions where needed.
+
+### Drift-prevention mechanism
+
+Selected mechanism: shared `useScopedState(scopeKey, initialValue)` in `ui/src/hooks/useScopedState.ts`. Conversation-scoped providers now call this instead of hand-rolling `trackedScope` state. The hook itself has unit tests, and provider-specific reset tests remain as behavior guards.
 
 ## Why p1
 
