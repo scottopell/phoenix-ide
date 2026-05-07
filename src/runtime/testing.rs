@@ -1521,10 +1521,10 @@ mod tests {
             result.new_state
         );
         assert!(
-            result
-                .effects
-                .iter()
-                .any(|e| matches!(e, crate::state_machine::effect::Effect::PersistCheckpoint { .. })),
+            result.effects.iter().any(|e| matches!(
+                e,
+                crate::state_machine::effect::Effect::PersistCheckpoint { .. }
+            )),
             "Should have PersistCheckpoint with error results"
         );
         assert!(

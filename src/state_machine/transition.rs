@@ -1840,9 +1840,8 @@ pub fn transition_sub_agent(
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
                         .collect();
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, error_results)
-                            .expect("error_results.len() == tool_calls.len()");
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
+                        .expect("error_results.len() == tool_calls.len()");
                     return Ok(SubAgentTransitionResult::new(SubAgentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -2920,10 +2919,16 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, Effect::PersistCheckpoint { .. }));
-        assert!(has_checkpoint, "Should have PersistCheckpoint with error results");
+        assert!(
+            has_checkpoint,
+            "Should have PersistCheckpoint with error results"
+        );
         // Should re-request the LLM
         assert!(
-            result.effects.iter().any(|e| matches!(e, Effect::RequestLlm)),
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
             "Should have RequestLlm effect to feed errors back"
         );
     }
@@ -2990,7 +2995,10 @@ mod tests {
             "Should have PersistCheckpoint with error results"
         );
         assert!(
-            result.effects.iter().any(|e| matches!(e, Effect::RequestLlm)),
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
             "Should have RequestLlm effect to feed errors back"
         );
     }
