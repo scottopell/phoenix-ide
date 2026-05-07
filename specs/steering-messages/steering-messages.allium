@@ -12,7 +12,9 @@
 -- Excludes:
 --   - Conversation state machine transitions (see bedrock.allium)
 --   - LLM delivery after a drained entry becomes a UserMessage (see bedrock.allium)
---   - @file reference expansion mechanics (shared with normal send path)
+--   - @file / message expansion mechanics (the expand() call that produces
+--     llm_text and skill_invocation from the raw request text; governed
+--     by the inline-references spec and shared with the normal send path)
 --   - UI rendering of queued messages (steering bubble, cancel affordance)
 --   - Sub-agent conversations (steering only applies to Parent conversations)
 --
@@ -37,8 +39,8 @@ value SteerEntry {
     -- Human-readable display text. Always present.
     text: String
     -- Text sent to the LLM, with @file references expanded inline.
-    -- Absent when no expansion was requested or expansion failed; in that
-    -- case text is used for both display and LLM context.
+    -- Absent when expansion produced no change. Both llm_text and
+    -- skill_invocation below are outputs of the same expansion step.
     llm_text: String?
     -- Image attachments (mirrors the normal send path).
     images: List<ImageData>
@@ -46,7 +48,9 @@ value SteerEntry {
     message_id: String
     -- HTTP User-Agent of the originating client, for tracing.
     user_agent: String?
-    -- Skill invocation context, when the send was triggered by a skill.
+    -- Skill invocation context extracted by the message expander from the
+    -- request text. Absent when the message did not trigger a skill.
+    -- Populated by the same expand() call that fills llm_text.
     skill_invocation: SkillInvocation?
 }
 
