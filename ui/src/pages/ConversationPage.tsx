@@ -514,22 +514,33 @@ function ConversationPageContent() {
     }
   }, [atom.conversation]);
 
-  // REQ-BT-018: auto-mount the live browser view on the false→true edge of
-  // the server-authoritative `browser_session_active` flag, but only when
-  // the slot is empty. The `wasActive` ref lets a page that mounts with
-  // `active === true` skip auto-open, and also short-circuits re-runs
-  // triggered by prose/diff toggles after the session is already live.
+  // REQ-BT-018: react to edges of the server-authoritative
+  // `browser_session_active` flag. Rising edge (false→true) auto-mounts
+  // the live view if the slot is empty. Falling edge (true→false) closes
+  // the panel so the user isn't left staring at a stale "No browser yet"
+  // overlay after a kill / idle-cleanup. The `prevRef` is seeded with the
+  // current value so a page that mounts with `active === true` does NOT
+  // trigger auto-open — only in-page transitions do.
   const browserSessionActive = browserView.browserSessionActive;
   const openBrowserPanel = browserView.openPanel;
   const prevBrowserSessionActiveRef = useRef(browserSessionActive);
   useEffect(() => {
     const wasActive = prevBrowserSessionActiveRef.current;
     prevBrowserSessionActiveRef.current = browserSessionActive;
-    if (wasActive || !browserSessionActive) return;
-    if (!fileExplorer.proseReaderState && !diffViewer.payload) {
-      openBrowserPanel();
+    if (!wasActive && browserSessionActive) {
+      if (!fileExplorer.proseReaderState && !diffViewer.payload) {
+        openBrowserPanel();
+      }
+    } else if (wasActive && !browserSessionActive) {
+      closeBrowserView();
     }
-  }, [browserSessionActive, openBrowserPanel, fileExplorer.proseReaderState, diffViewer.payload]);
+  }, [
+    browserSessionActive,
+    openBrowserPanel,
+    closeBrowserView,
+    fileExplorer.proseReaderState,
+    diffViewer.payload,
+  ]);
 
   // Stable refs — needed inside sendMessage which is memoized with a stable
   // identity across renders.
